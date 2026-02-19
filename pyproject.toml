@@ -1,0 +1,20 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "omegalax"
+version = "0.1.0"
+description = "JAX-based VLM training codebase scaffold."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "absl-py",
+  "flax",
+  "jax",
+  "jaxtyping",
+  "optax",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["omegalax"]
