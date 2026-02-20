@@ -30,7 +30,8 @@
 - Supported models:
   - Qwen3 dense: `Qwen/Qwen3-0.6B`, `Qwen/Qwen3-1.7B`, `Qwen/Qwen3-4B`, `Qwen/Qwen3-8B`, `Qwen/Qwen3-14B`, `Qwen/Qwen3-32B`.
   - Qwen3 MoE: `Qwen/Qwen3-30B-A3B-Instruct-2507`.
-  - Qwen3.5 MoE text/VLM: `Qwen/Qwen3.5-397B-A17B`.
+  - Qwen3.5: `Qwen/Qwen3.5-397B-A17B`.
+  - Qwen3-VL: `Qwen/Qwen3-VL-2B-Instruct`.
 
 ## Install
 Use Python 3.11+ with a JAX build that matches your accelerator (e.g., `jax[cuda12]` for CUDA 12):
