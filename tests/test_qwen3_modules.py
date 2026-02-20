@@ -1,22 +1,21 @@
 """Module-level numerical equivalence tests.
 
-# FIXME (f.srambical)
 Each test feeds the **identical** input (produced by HF) into both the JAX
 and HuggingFace implementations of a single module so that per-module error
 is measured in isolation, without accumulation from prior layers.
 
 Empirically measured per-module error on Qwen3-0.6B (CPU, float32):
 
-  Module            max_diff    ULPs   Bottleneck?
-  ──────────────────────────────────────────────────
-  RMSNorm           ~1e-6       ~1     no
-  RoPE cos/sin      ~6e-8       <1     no
-  apply_rope        ~5e-7       ~2     no
-  linear (Q/K/V/O)  ~7e-6       6-13   YES — cross-framework BLAS
-  q_norm / k_norm   ~8e-6       ~2     no
-  full attention     ~1e-6       ~4     no
-  full MLP           ~1e-6       ~44*   no (* low abs, low max_val)
-  full decoder layer ~3e-6       ~5     no
+  Module            max_diff    ULPs
+  ──────────────────────────────────
+  RMSNorm           ~1e-6       ~1  
+  RoPE cos/sin      ~6e-8       <1  
+  apply_rope        ~5e-7       ~2  
+  linear (Q/K/V/O)  ~7e-6       6-13
+  q_norm / k_norm   ~8e-6       ~2  
+  full attention     ~1e-6       ~4  
+  full MLP           ~1e-6       ~44
+  full decoder layer ~3e-6       ~5  
 
 Linear projections dominate at 6-13 ULPs because XLA CPU and PyTorch CPU
 use different BLAS implementations with different dot-product accumulation
@@ -109,7 +108,7 @@ class Qwen3ModuleTest(absltest.TestCase):
 
     # 1. RMSNorm
     def test_rms_norm(self):
-        """Isolated RMSNorm with identical input — expect ~1 ULP."""
+        """Isolated RMSNorm with identical input."""
         jax_inp = _to_jax(self.hf_emb)
         with torch.no_grad():
             hf_out = self.hf_model.model.layers[0].input_layernorm(self.hf_emb)
@@ -118,7 +117,7 @@ class Qwen3ModuleTest(absltest.TestCase):
 
     # 2. RoPE
     def test_rope(self):
-        """RoPE sin/cos generation and application — expect <2 ULPs."""
+        """RoPE sin/cos generation and application."""
         seq_len = self.hf_emb.shape[1]
         head_dim = self.cfg.head_dim
 
@@ -148,7 +147,7 @@ class Qwen3ModuleTest(absltest.TestCase):
 
     # 3. Linear (Q projection)
     def test_linear_q_proj(self):
-        """Single linear projection — expect 6-13 ULPs (BLAS diff)."""
+        """Single linear projection."""
         with torch.no_grad():
             hf_normed = self.hf_model.model.layers[0].input_layernorm(self.hf_emb)
             hf_q = self.hf_model.model.layers[0].self_attn.q_proj(hf_normed)
@@ -159,7 +158,7 @@ class Qwen3ModuleTest(absltest.TestCase):
 
     # 4. Full Attention block
     def test_attention(self):
-        """Full attention block — expect ~4 ULPs."""
+        """Full attention block."""
         hf_layer = self.hf_model.model.layers[0]
         with torch.no_grad():
             hf_normed = hf_layer.input_layernorm(self.hf_emb)
@@ -189,7 +188,7 @@ class Qwen3ModuleTest(absltest.TestCase):
 
     # 5. MLP
     def test_mlp(self):
-        """Full MLP block — expect low absolute error."""
+        """Full MLP block."""
         with torch.no_grad():
             hf_normed = self.hf_model.model.layers[0].input_layernorm(self.hf_emb)
             seq_len = self.hf_emb.shape[1]
@@ -208,7 +207,7 @@ class Qwen3ModuleTest(absltest.TestCase):
 
     # 6. Single DecoderLayer
     def test_decoder_layer(self):
-        """Full decoder layer — expect ~5 ULPs."""
+        """Full decoder layer."""
         hf_layer = self.hf_model.model.layers[0]
         seq_len = self.hf_emb.shape[1]
         position_ids_torch = torch.arange(seq_len, dtype=torch.long).unsqueeze(0)
