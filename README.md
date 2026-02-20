@@ -87,7 +87,7 @@ model = create_qwen3_from_safe_tensors(ckpt_dir, "Qwen/Qwen3-8B")
 For Qwen3.5 and Qwen3-VL, use `create_qwen3_5_from_safe_tensors` or `create_qwen3_vl_from_safe_tensors` respectively. When starting from a raw HF config, `omegalax.models.qwen3_vl.make_vl_config_from_hf()` will build a matching JAX config.
 
 ## Tests
-Tests use `absltest` (unittest-compatible), so no pytest dependency is required. One-liners:
+Tests use `absltest`:
 - Smoke/tiny-model checks (CPU-friendly, no HF downloads):
 ```bash
 uv run --extra=torch-tests -- python -m unittest discover -s tests -p "test_*smoke.py"
