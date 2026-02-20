@@ -67,21 +67,28 @@ _QWEN3_MOE_SPECS: dict[str, dict[str, int | float | bool | str | None]] = {
 }
 
 
+_MODEL_ID_TO_SPEC: dict[str, str] = {}
+for _spec_key, _spec in _QWEN3_MOE_SPECS.items():
+    _MODEL_ID_TO_SPEC[_spec_key] = _spec_key
+    _hf_id = _spec.get("hf_repo_id")
+    if _hf_id:
+        _MODEL_ID_TO_SPEC[_hf_id] = _spec_key
+
+
 def list_qwen3_moe_model_ids() -> list[str]:
     return [spec["hf_repo_id"] for spec in _QWEN3_MOE_SPECS.values() if spec.get("hf_repo_id")]
 
 
 def get_moe_spec(model_id: str) -> dict[str, int | float | bool | str | None]:
-    key = model_id.lower().split("/")[-1].replace("_", "-")
-    spec = _QWEN3_MOE_SPECS.get(key)
-    if spec is None:
-        for s in _QWEN3_MOE_SPECS.values():
-            if s.get("hf_repo_id") and s["hf_repo_id"].lower() == model_id.lower():
-                spec = s
-                break
-    if spec is None:
-        raise ValueError(f"Unsupported Qwen3 MoE model_id '{model_id}'")
-    return dict(spec)
+    spec_key = _MODEL_ID_TO_SPEC.get(model_id)
+    if spec_key:
+        return dict(_QWEN3_MOE_SPECS[spec_key])
+    supported = sorted(_MODEL_ID_TO_SPEC.keys())
+    raise ValueError(f"Unsupported Qwen3 MoE model_id '{model_id}'. Supported ids: {supported}")
+
+
+def is_supported_moe_model_id(model_id: str) -> bool:
+    return model_id in _MODEL_ID_TO_SPEC
 
 
 def make_moe_config(model_id: str, use_sharding: bool = False) -> Qwen3MoeConfig:

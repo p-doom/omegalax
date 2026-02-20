@@ -11,10 +11,6 @@ class Arch(str, Enum):
     VLM = "vlm"
 
 
-def canonicalize_model_id(model_id: str) -> str:
-    return model_id.lower().replace("_", "-")
-
-
 from omegalax.models.qwen3.dense.config import get_dense_spec as _get_dense_spec
 from omegalax.models.qwen3.moe.config import get_moe_spec as _get_moe_spec
 from omegalax.models.qwen3_vl.config import get_vl_spec as _get_vl_spec

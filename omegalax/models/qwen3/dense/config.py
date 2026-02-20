@@ -104,12 +104,12 @@ _QWEN3_DENSE_SPECS: dict[str, dict[str, int | float | bool | str | None]] = {
 }
 
 
-def _canonicalize_qwen3_key(model_id: str) -> str:
-    key = model_id.lower().split("/")[-1].replace("_", "-")
-    for suffix in ("-base", "-instruct", "-chat", "-th", "-thinking"):
-        if key.endswith(suffix):
-            key = key[: -len(suffix)]
-    return key
+_MODEL_ID_TO_SPEC: dict[str, str] = {}
+for _spec_key, _spec in _QWEN3_DENSE_SPECS.items():
+    _MODEL_ID_TO_SPEC[_spec_key] = _spec_key
+    _hf_id = _spec.get("hf_repo_id")
+    if _hf_id:
+        _MODEL_ID_TO_SPEC[_hf_id] = _spec_key
 
 
 def list_qwen3_dense_model_ids() -> list[str]:
@@ -117,11 +117,15 @@ def list_qwen3_dense_model_ids() -> list[str]:
 
 
 def get_dense_spec(model_id: str) -> dict[str, int | float | bool | str | None]:
-    key = _canonicalize_qwen3_key(model_id)
-    spec = _QWEN3_DENSE_SPECS.get(key)
-    if spec is None:
-        raise ValueError(f"Unsupported Qwen3 dense model_id '{model_id}'")
-    return dict(spec)
+    spec_key = _MODEL_ID_TO_SPEC.get(model_id)
+    if spec_key:
+        return dict(_QWEN3_DENSE_SPECS[spec_key])
+    supported = sorted(_MODEL_ID_TO_SPEC.keys())
+    raise ValueError(f"Unsupported Qwen3 dense model_id '{model_id}'. Supported ids: {supported}")
+
+
+def is_supported_dense_model_id(model_id: str) -> bool:
+    return model_id in _MODEL_ID_TO_SPEC
 
 
 def make_dense_config(model_id: str, use_sharding: bool = False) -> Qwen3Config:

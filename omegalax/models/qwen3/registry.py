@@ -5,9 +5,20 @@ from typing import Callable, Type
 from flax import nnx
 
 from .config import Qwen3Config
-from .dense.config import get_dense_spec, list_qwen3_dense_model_ids, make_dense_config
+from .dense.config import (
+    get_dense_spec,
+    is_supported_dense_model_id,
+    list_qwen3_dense_model_ids,
+    make_dense_config,
+)
 from .dense.model import Qwen3Dense
-from .moe.config import Qwen3MoeConfig, get_moe_spec, list_qwen3_moe_model_ids, make_moe_config
+from .moe.config import (
+    Qwen3MoeConfig,
+    get_moe_spec,
+    is_supported_moe_model_id,
+    list_qwen3_moe_model_ids,
+    make_moe_config,
+)
 from .moe.model import Qwen3Moe
 
 
@@ -34,14 +45,16 @@ def get_model_cls(variant: str) -> Type[nnx.Module]:
 
 
 def infer_variant(model_id: str) -> str:
-    key = model_id.lower()
-    if "moe" in key:
+    if is_supported_moe_model_id(model_id):
         return "moe"
-    # Qwen3 MoE models use the AXB naming convention (e.g. 30B-A3B)
-    import re
-    if re.search(r"\d+b-a\d+b", key):
-        return "moe"
-    return "dense"
+    if is_supported_dense_model_id(model_id):
+        return "dense"
+    supported_dense = list_qwen3_dense_model_ids()
+    supported_moe = list_qwen3_moe_model_ids()
+    raise ValueError(
+        f"Unsupported Qwen3 model_id '{model_id}'. "
+        f"Supported dense: {supported_dense}; supported MoE: {supported_moe}"
+    )
 
 
 __all__ = [

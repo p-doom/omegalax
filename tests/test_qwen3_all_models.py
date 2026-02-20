@@ -11,7 +11,6 @@ Tolerance rationale (float32, CPU, highest matmul precision):
     tighter than the previous 1e-4); atol=1e-4 provides a floor for
     near-zero logits where absolute BLAS error dominates.
 """
-# FIXME (f.srambical)
 
 import gc
 import os

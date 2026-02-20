@@ -76,13 +76,12 @@ _QWEN3_VL_SPECS: dict[str, dict[str, Any]] = {
 }
 
 
-def _canonicalize_key(model_id: str) -> str:
-    key = model_id.lower().split("/")[-1].replace("_", "-")
-    # FIXME (f.srambical)
-    for suffix in ("-base", "-instruct", "-chat", "-th", "-thinking"):
-        if key.endswith(suffix):
-            key = key[: -len(suffix)]
-    return key
+_MODEL_ID_TO_SPEC: dict[str, str] = {}
+for _spec_key, _spec in _QWEN3_VL_SPECS.items():
+    _MODEL_ID_TO_SPEC[_spec_key] = _spec_key
+    _hf_id = _spec.get("hf_repo_id")
+    if _hf_id:
+        _MODEL_ID_TO_SPEC[_hf_id] = _spec_key
 
 
 def list_qwen3_vl_model_ids() -> list[str]:
@@ -90,16 +89,11 @@ def list_qwen3_vl_model_ids() -> list[str]:
 
 
 def get_vl_spec(model_id: str) -> dict[str, Any]:
-    key = _canonicalize_key(model_id)
-    spec = _QWEN3_VL_SPECS.get(key)
-    if spec is None:
-        for s in _QWEN3_VL_SPECS.values():
-            if s.get("hf_repo_id") and s["hf_repo_id"].lower() == model_id.lower():
-                spec = s
-                break
-    if spec is None:
-        raise ValueError(f"Unsupported Qwen3-VL model_id '{model_id}'. Use make_vl_config_from_hf() instead.")
-    return dict(spec)
+    spec_key = _MODEL_ID_TO_SPEC.get(model_id)
+    if spec_key:
+        return dict(_QWEN3_VL_SPECS[spec_key])
+    supported = sorted(_MODEL_ID_TO_SPEC.keys())
+    raise ValueError(f"Unsupported Qwen3-VL model_id '{model_id}'. Supported ids: {supported}")
 
 
 def make_vl_config(model_id: str) -> Qwen3VLConfig:
