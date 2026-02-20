@@ -146,7 +146,7 @@ class Qwen3ModuleTest(absltest.TestCase):
         jax_q_rope = apply_rope(q_jax, jax_sin, jax_cos)
         self._assert_close(jax_q_rope, hf_q_rope, atol=ROPE_ATOL, msg="apply_rope")
 
-    # 3. Linear (Q projection) — the main bottleneck
+    # 3. Linear (Q projection)
     def test_linear_q_proj(self):
         """Single linear projection — expect 6-13 ULPs (BLAS diff)."""
         with torch.no_grad():
