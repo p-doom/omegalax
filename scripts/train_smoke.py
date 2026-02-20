@@ -3,8 +3,8 @@ import argparse
 import jax
 import jax.numpy as jnp
 
-from omegalax.model import ModelConfig, decode
-from omegalax.training import TrainConfig, build_optimizer, init_model, make_train_step
+from omegalax.text import api as text_api
+from omegalax.trainers import text as text_trainer
 
 
 def make_synthetic_batch(rng: jax.Array, batch_size: int, seq_len: int, vocab_size: int) -> jax.Array:
@@ -16,6 +16,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-steps", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--seq-len", type=int, default=64)
+    parser.add_argument("--model-id", type=str, default="Qwen/Qwen3-0.6B")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--print-every", type=int, default=1)
     return parser.parse_args()
@@ -24,9 +25,9 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
-    model_cfg = ModelConfig.smoke()
-    train_cfg = TrainConfig.smoke()
-    train_cfg = TrainConfig(
+    model_cfg = text_api.registry.build_config(args.model_id)
+    train_cfg = text_trainer.TrainConfig.smoke()
+    train_cfg = text_trainer.TrainConfig(
         seed=args.seed,
         batch_size=args.batch_size,
         seq_len=args.seq_len,
@@ -39,9 +40,9 @@ def main() -> None:
     rng = jax.random.key(train_cfg.seed)
     rng, init_rng = jax.random.split(rng)
 
-    model = init_model(model_cfg, init_rng)
-    optimizer = build_optimizer(model, train_cfg)
-    train_step = make_train_step(model_cfg, pad_id=0)
+    model = text_trainer.init_model(model_cfg, init_rng)
+    optimizer = text_trainer.build_optimizer(model, train_cfg)
+    train_step = text_trainer.make_train_step(model_cfg, pad_id=0)
 
     for step in range(train_cfg.num_steps):
         rng, batch_rng = jax.random.split(rng)
@@ -57,9 +58,9 @@ def main() -> None:
             )
 
     prompt = make_synthetic_batch(rng, batch_size=1, seq_len=8, vocab_size=model_cfg.vocab_size)
-    cache = model.init_cache(model_cfg, batch_size=1, token_len=8, generate_steps=4, dtype=jnp.float32)
-    logits, cache = decode(model, cache, prompt, pad_id=0)
-    _ = jax.device_get((logits.shape, len(cache)))
+    cache = text_api.make_cache(model_cfg, batch_size=1, token_len=8, generate_steps=4, dtype=jnp.float32)
+    logits, cache, aux_loss = text_api.decode(model, cache, prompt, pad_id=0, cfg=model_cfg)
+    _ = jax.device_get((logits.shape, len(cache), float(aux_loss)))
     print("smoke training loop completed")
 
 
