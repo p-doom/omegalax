@@ -1,3 +1,7 @@
+"""Training helpers for text-only causal language models."""
+
+from __future__ import annotations
+
 import dataclasses
 
 from flax import nnx
@@ -5,7 +9,7 @@ import jax
 import jax.numpy as jnp
 import optax
 
-from .model import ModelConfig, Qwen3, forward
+from omegalax.text import api as text_api
 
 
 @dataclasses.dataclass(frozen=True)
@@ -23,26 +27,28 @@ class TrainConfig:
         return cls()
 
 
-def init_model(cfg: ModelConfig, rng: jax.Array) -> Qwen3:
-    return Qwen3(cfg, rngs=nnx.Rngs(rng))
+def init_model(cfg_or_model_id, rng: jax.Array) -> nnx.Module:
+    model, _ = text_api.init_model(cfg_or_model_id, rng)
+    return model
 
 
-def build_optimizer(model: Qwen3, train_cfg: TrainConfig) -> nnx.ModelAndOptimizer:
+def build_optimizer(model: nnx.Module, train_cfg: TrainConfig) -> nnx.ModelAndOptimizer:
     tx = optax.adamw(learning_rate=train_cfg.learning_rate, weight_decay=train_cfg.weight_decay)
     return nnx.ModelAndOptimizer(model, tx)
 
 
-def make_train_step(cfg: ModelConfig, pad_id: int = 0):
+def make_train_step(cfg: text_api.TextConfig, pad_id: int = 0):
     @nnx.jit(donate_argnums=0)
     def train_step(optimizer: nnx.ModelAndOptimizer, tokens: jax.Array):
-        def loss_fn(model: Qwen3):
-            logits = forward(model, tokens, pad_id).astype(jnp.float32)
+        def loss_fn(model):
+            logits, aux_loss = text_api.forward(model, tokens, pad_id, cfg)
+            logits = logits.astype(jnp.float32)
             targets = tokens[:, 1:]
             lm_logits = logits[:, :-1, :]
             mask = (targets != pad_id).astype(jnp.float32)
             ce = optax.softmax_cross_entropy_with_integer_labels(lm_logits, targets)
             denom = jnp.maximum(jnp.sum(mask), 1.0)
-            loss = jnp.sum(ce * mask) / denom
+            loss = jnp.sum(ce * mask) / denom + aux_loss
             acc = jnp.sum((jnp.argmax(lm_logits, axis=-1) == targets).astype(jnp.float32) * mask) / denom
             return loss, acc
 
