@@ -44,23 +44,41 @@ def main() -> None:
     optimizer = text_trainer.build_optimizer(model, train_cfg)
     train_step = text_trainer.make_train_step(model_cfg, pad_id=0)
 
+    prev_metrics: tuple[int, dict[str, jax.Array]] | None = None
+
+    def log_prev_metrics(force: bool = False) -> None:
+        nonlocal prev_metrics
+        if prev_metrics is None:
+            return
+
+        step_to_log, metrics_to_log = prev_metrics
+        should_print = step_to_log % train_cfg.print_every == 0
+        if not (should_print or force):
+            return
+
+        host_metrics = {k: float(v) for k, v in metrics_to_log.items()}
+        print(
+            f"step={step_to_log} "
+            f"loss={host_metrics['loss']:.4f} "
+            f"grad_norm={host_metrics['grad_norm']:.4f}"
+        )
+
     for step in range(train_cfg.num_steps):
         rng, batch_rng = jax.random.split(rng)
         batch = make_synthetic_batch(batch_rng, train_cfg.batch_size, train_cfg.seq_len, model_cfg.vocab_size)
         _, metrics = train_step(optimizer, batch)
-        if step % train_cfg.print_every == 0:
-            host_metrics = jax.device_get(metrics)
-            print(
-                f"step={step + 1} "
-                f"loss={float(host_metrics['loss']):.4f} "
-                f"acc={float(host_metrics['token_accuracy']):.4f} "
-                f"grad_norm={float(host_metrics['grad_norm']):.4f}"
-            )
+
+        # Log previous step metrics while this step runs to avoid per-step async bubbles.
+        log_prev_metrics()
+        prev_metrics = (step + 1, metrics)
+
+    # Flush last step.
+    log_prev_metrics(force=True)
 
     prompt = make_synthetic_batch(rng, batch_size=1, seq_len=8, vocab_size=model_cfg.vocab_size)
     cache = text_api.make_cache(model_cfg, batch_size=1, token_len=8, generate_steps=4, dtype=jnp.float32)
     logits, cache, aux_loss = text_api.decode(model, cache, prompt, pad_id=0, cfg=model_cfg)
-    _ = jax.device_get((logits.shape, len(cache), float(aux_loss)))
+    _ = jax.block_until_ready(aux_loss)
     print("smoke training loop completed")
 
 

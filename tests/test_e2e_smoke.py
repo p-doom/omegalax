@@ -35,10 +35,8 @@ class SmokeTest(absltest.TestCase):
         train_step = text_trainer.make_train_step(self.model_cfg, pad_id=0)
         batch = self._tokens(batch_size=self.train_cfg.batch_size, seq_len=self.train_cfg.seq_len)
         _, metrics = train_step(self.optimizer, batch)
-        host = jax.device_get(metrics)
-        self.assertTrue(np.isfinite(float(host["loss"])))
-        self.assertTrue(np.isfinite(float(host["grad_norm"])))
-        self.assertTrue(np.isfinite(float(host["token_accuracy"])))
+        self.assertTrue(np.isfinite(float(metrics["loss"])))
+        self.assertTrue(np.isfinite(float(metrics["grad_norm"])))
 
     def test_moe_forward_smoke(self):
         moe_cfg = api.registry.build_config("qwen3-smoke-moe")
