@@ -877,6 +877,7 @@ dependencies = [
     { name = "jax", extra = ["cuda12"] },
     { name = "jaxtyping" },
     { name = "optax" },
+    { name = "orbax-checkpoint" },
     { name = "safetensors" },
     { name = "transformers" },
 ]
@@ -895,6 +896,7 @@ requires-dist = [
     { name = "jax", extras = ["cuda12"] },
     { name = "jaxtyping" },
     { name = "optax" },
+    { name = "orbax-checkpoint" },
     { name = "safetensors" },
     { name = "torch", marker = "sys_platform == 'linux' and extra == 'torch-tests'", specifier = "==2.10.*" },
     { name = "transformers" },
