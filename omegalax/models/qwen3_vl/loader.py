@@ -89,7 +89,7 @@ def _get_key_and_transform_mapping(cfg: Qwen3VLConfig):
     return m
 
 
-def create_qwen3_vl_from_safe_tensors(file_dir: str, model_id: str = "") -> Qwen3VL:
+def create_qwen3_vl_from_safetensors(file_dir: str, model_id: str = "") -> Qwen3VL:
     """Load HuggingFace Qwen3-VL weights into a JAX Qwen3-VL model."""
     path = epath.Path(file_dir).expanduser()
     files = list(path.glob("*.safetensors"))

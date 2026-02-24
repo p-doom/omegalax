@@ -93,7 +93,7 @@ def _assign_to_state_dict(state_dict, dotted_key, value, errors, label):
         errors.append(f"Failed to assign '{label}': {type(e).__name__}: {e}")
 
 
-def create_qwen3_moe_from_safe_tensors(
+def create_qwen3_moe_from_safetensors(
     file_dir: str, model_id: str, use_sharding: bool = False,
 ) -> Qwen3Moe:
     cfg = make_moe_config(model_id, use_sharding=use_sharding)

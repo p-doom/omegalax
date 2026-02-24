@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import gc
+import json
+import re
 from enum import Enum
+from pathlib import Path
 from typing import Any
 
+import jax
 import jax.numpy as jnp
+import numpy as np
 import safetensors
+from safetensors import numpy as stnp
 from etils import epath
 from flax import nnx
 
@@ -79,7 +85,7 @@ def assert_dense_config(cfg: Qwen3Config, hf_cfg: dict[str, Any]):
         _require("rope_theta", cfg.rope_theta, hf_rope_theta)
 
 
-def create_qwen3_dense_from_safe_tensors(file_dir: str, model_id: str, use_sharding: bool = False) -> Qwen3Dense:
+def create_qwen3_dense_from_safetensors(file_dir: str, model_id: str, use_sharding: bool = False) -> Qwen3Dense:
     cfg = make_dense_config(model_id, use_sharding=use_sharding)
     files = list(epath.Path(file_dir).expanduser().glob("*.safetensors"))
     if not files:
@@ -127,3 +133,118 @@ def create_qwen3_dense_from_safe_tensors(file_dir: str, model_id: str, use_shard
 
     gc.collect()
     return nnx.merge(graph_def, state_dict)
+
+
+def _inverse_transform(value: np.ndarray, transform) -> np.ndarray:
+    """Apply the inverse of HF->JAX transform to produce HF layout."""
+    rule = transform.value if hasattr(transform, "value") else transform
+    if rule is None:
+        return value
+    permute_rule, reshape_rule, transpose_last = rule
+    inv = value
+    if transpose_last:
+        inv = inv.T
+    if reshape_rule is not None:
+        inv = inv.reshape(reshape_rule)
+    if permute_rule is not None:
+        # Inverse permutation: permute_rule gives HF->JAX; we need JAX->HF.
+        inv_perm = [0] * len(permute_rule)
+        for i, p in enumerate(permute_rule):
+            inv_perm[p] = i
+        inv = np.transpose(inv, inv_perm)
+    return inv
+
+
+def _to_regex(pattern: str) -> str:
+    escaped = re.escape(pattern)
+    escaped = re.sub(r"\\\\([0-9]+)", r"([0-9]+)", escaped)
+    return escaped
+
+
+def _hf_template(pattern: str) -> str:
+    """Convert an HF regex to a template usable with str.format."""
+    # Remove escaping and turn capture groups into {}.
+    template = pattern.replace(r"\.", ".")
+    template = re.sub(r"\([^\)]+\)", "{}", template)
+    return template
+
+
+def _build_inverse_mapping(cfg):
+    mapping = _get_key_and_transform_mapping(cfg)
+    inverse = []
+    for hf_pattern, (jax_pattern, transform) in mapping.items():
+        inverse.append((_to_regex(jax_pattern), _hf_template(hf_pattern), transform))
+    return inverse
+
+
+def _flatten_pure_state(tree: dict[str, Any]) -> dict[str, Any]:
+    flat: dict[str, Any] = {}
+
+    def _recurse(node: Any, path: list[str]):
+        if isinstance(node, dict):
+            for k, v in node.items():
+                _recurse(v, path + [str(k)])
+        else:
+            flat[".".join(path)] = node
+
+    _recurse(tree, [])
+    return flat
+
+
+def _make_hf_config_dict(cfg: Qwen3Config) -> dict[str, Any]:
+    return {
+        "vocab_size": cfg.vocab_size,
+        "num_hidden_layers": cfg.num_layers,
+        "hidden_size": cfg.emb_dim,
+        "num_attention_heads": cfg.num_heads,
+        "num_key_value_heads": cfg.num_kv_heads,
+        "head_dim": cfg.head_dim,
+        "intermediate_size": cfg.mlp_dim,
+        "rope_theta": cfg.rope_theta,
+        "tie_word_embeddings": cfg.tie_word_embeddings,
+        "model_type": "qwen2",
+    }
+
+
+def export_qwen3_dense_to_safetensors(model: Qwen3Dense, cfg: Qwen3Config, out_dir: str | Path) -> Path:
+    """Export a dense Qwen3 nnx model to HuggingFace-style safetensors."""
+    if cfg.variant != "dense":
+        raise ValueError("export_qwen3_dense_to_safetensors only supports dense Qwen3 configs.")
+
+    out_dir = Path(out_dir).expanduser()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    tensor_path = out_dir / "model.safetensors"
+    config_path = out_dir / "config.json"
+
+    graph_def, abs_state = nnx.split(model)
+    pure_state = nnx.to_pure_dict(abs_state)
+    flat_state = _flatten_pure_state(pure_state)
+    inverse_mapping = _build_inverse_mapping(cfg)
+
+    hf_tensors: dict[str, np.ndarray] = {}
+    unmapped: list[str] = []
+
+    for jax_key, value in flat_state.items():
+        matched = False
+        for jax_regex, hf_template, transform in inverse_mapping:
+            m = re.fullmatch(jax_regex, jax_key)
+            if not m:
+                continue
+            hf_key = hf_template.format(*m.groups())
+            arr = np.asarray(jax.device_get(value))
+            arr = _inverse_transform(arr, transform)
+            hf_tensors[hf_key] = arr
+            matched = True
+            break
+        if not matched:
+            unmapped.append(jax_key)
+
+    if unmapped:
+        missing = "\n".join(sorted(unmapped))
+        raise RuntimeError(f"Unmapped JAX parameters during export:\n{missing}")
+
+    stnp.save_file(hf_tensors, tensor_path)
+    with config_path.open("w") as f:
+        json.dump(_make_hf_config_dict(cfg), f, indent=2)
+
+    return tensor_path

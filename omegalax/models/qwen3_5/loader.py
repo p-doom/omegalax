@@ -213,7 +213,7 @@ _CONV3D_RE = re.compile(
 
 
 # Main loader
-def create_qwen3_5_from_safe_tensors(
+def create_qwen3_5_from_safetensors(
     file_dir: str, model_id: str
 ) -> Qwen3_5ForConditionalGeneration:
     """Load HuggingFace safetensors and return a Qwen3_5ForConditionalGeneration model."""

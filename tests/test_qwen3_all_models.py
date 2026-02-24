@@ -26,7 +26,7 @@ from huggingface_hub import snapshot_download
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 from omegalax.text import api
-from omegalax.models.qwen3.params import create_qwen3_from_safe_tensors
+from omegalax.models.qwen3.params import create_qwen3_from_safetensors
 
 jax.config.update("jax_default_matmul_precision", "highest")
 torch.backends.cuda.matmul.allow_tf32 = False
@@ -59,7 +59,7 @@ class Qwen3AllModelsTest(parameterized.TestCase):
         model_path = snapshot_download(model_id)
 
         cfg = api.registry.build_config(model_id)
-        jax_model = create_qwen3_from_safe_tensors(model_path, model_id)
+        jax_model = create_qwen3_from_safetensors(model_path, model_id)
 
         tokenizer = AutoTokenizer.from_pretrained(model_path)
 

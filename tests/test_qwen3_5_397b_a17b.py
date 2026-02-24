@@ -16,7 +16,7 @@ from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
 )
 
 from omegalax.models.qwen3_5.config import make_config
-from omegalax.models.qwen3_5.params import create_qwen3_5_from_safe_tensors
+from omegalax.models.qwen3_5.params import create_qwen3_5_from_safetensors
 
 jax.config.update("jax_default_matmul_precision", "highest")
 torch.backends.cuda.matmul.allow_tf32 = False
@@ -38,7 +38,7 @@ class Qwen3_5RealTest(absltest.TestCase):
         cls.pad_id = cls.tokenizer.pad_token_id or 0
 
         cls.jax_cfg = make_config(MODEL_ID)
-        cls.jax_model = create_qwen3_5_from_safe_tensors(cls.model_path, MODEL_ID)
+        cls.jax_model = create_qwen3_5_from_safetensors(cls.model_path, MODEL_ID)
 
         cls.hf_model = HFModel.from_pretrained(
             cls.model_path, torch_dtype=torch.float32,

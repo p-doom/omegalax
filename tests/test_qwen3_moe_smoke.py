@@ -21,7 +21,7 @@ from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 
 from omegalax.text import api
 from omegalax.models.qwen3.moe.config import make_moe_config
-from omegalax.models.qwen3.moe.params_moe import create_qwen3_moe_from_safe_tensors
+from omegalax.models.qwen3.moe.params_moe import create_qwen3_moe_from_safetensors
 
 jax.config.update("jax_default_matmul_precision", "highest")
 torch.backends.cuda.matmul.allow_tf32 = False
@@ -75,7 +75,7 @@ class Qwen3MoeWeightsTest(absltest.TestCase):
             json.dump(HF_SMOKE_CFG.to_dict(), f)
 
         cls.jax_cfg = make_moe_config(SMOKE_MOE_ID)
-        cls.jax_model = create_qwen3_moe_from_safe_tensors(cls.tmpdir, SMOKE_MOE_ID)
+        cls.jax_model = create_qwen3_moe_from_safetensors(cls.tmpdir, SMOKE_MOE_ID)
         cls.pad_id = 0
 
     def test_weight_loading_succeeds(self):

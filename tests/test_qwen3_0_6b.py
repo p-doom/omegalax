@@ -64,7 +64,7 @@ class Qwen3MappingTest(absltest.TestCase):
         ).eval()
         cls.pad_id = cls.tokenizer.pad_token_id or 0
 
-        cls.jax_model = params_dense.create_qwen3_dense_from_safe_tensors(cls.model_path, MODEL_ID)
+        cls.jax_model = params_dense.create_qwen3_dense_from_safetensors(cls.model_path, MODEL_ID)
 
     def _tokenize(self, texts: list[str]):
         chat_texts = [

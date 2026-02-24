@@ -13,7 +13,7 @@ from huggingface_hub import snapshot_download
 from transformers import AutoTokenizer, Qwen3MoeForCausalLM
 
 from omegalax.text import api
-from omegalax.models.qwen3.moe.params_moe import create_qwen3_moe_from_safe_tensors
+from omegalax.models.qwen3.moe.params_moe import create_qwen3_moe_from_safetensors
 
 jax.config.update("jax_default_matmul_precision", "highest")
 torch.backends.cuda.matmul.allow_tf32 = False
@@ -35,7 +35,7 @@ class Qwen3_30B_A3B_Test(absltest.TestCase):
         cls.pad_id = cls.tokenizer.pad_token_id or 0
 
         cls.cfg = api.registry.build_config(MODEL_ID)
-        cls.jax_model = create_qwen3_moe_from_safe_tensors(cls.model_path, MODEL_ID)
+        cls.jax_model = create_qwen3_moe_from_safetensors(cls.model_path, MODEL_ID)
 
         cls.hf_model = Qwen3MoeForCausalLM.from_pretrained(
             cls.model_path, torch_dtype=torch.float32,
