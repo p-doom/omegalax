@@ -175,6 +175,50 @@ class TextMLP(nnx.Module):
         return self.down_proj(nnx.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
+class TextMoEFeedForward(nnx.Module):
+    """Sparse MoE MLP mirroring the Qwen3 MoE structure."""
+
+    def __init__(self, cfg: Qwen3VLConfig, *, rngs: nnx.Rngs):
+        self.cfg = cfg
+        E, D, F = cfg.num_experts, cfg.emb_dim, cfg.moe_intermediate_size
+        init = nnx.initializers.lecun_normal()
+        self.gate_proj = nnx.Param(init(rngs.params(), (E, D, F)))
+        self.up_proj = nnx.Param(init(rngs.params(), (E, D, F)))
+        self.down_proj = nnx.Param(init(rngs.params(), (E, F, D)))
+        self.router = nnx.Linear(D, E, use_bias=False, rngs=rngs, dtype=jnp.float32)
+
+    def __call__(self, x: jax.Array) -> tuple[jax.Array, jax.Array]:
+        cfg = self.cfg
+        router_logits = self.router(x)
+        probs = jax.nn.softmax(router_logits.astype(jnp.float32), axis=-1)
+        topk_weights, topk_idx = jax.lax.top_k(probs, cfg.num_experts_per_tok)
+        if cfg.norm_topk_prob:
+            topk_weights = topk_weights / jnp.clip(
+                jnp.sum(topk_weights, axis=-1, keepdims=True), min=1e-9
+            )
+        topk_weights = topk_weights.astype(probs.dtype)
+
+        gate = jnp.einsum("btd,edf->btef", x, self.gate_proj[...])
+        up = jnp.einsum("btd,edf->btef", x, self.up_proj[...])
+        expert_hidden = nnx.silu(gate) * up
+        expert_out = jnp.einsum("btef,efd->bted", expert_hidden, self.down_proj[...])
+
+        b, t = x.shape[:2]
+        flat_out = expert_out.reshape(b * t, cfg.num_experts, cfg.emb_dim)
+        flat_idx = topk_idx.reshape(b * t, cfg.num_experts_per_tok)
+        gathered = jnp.take_along_axis(flat_out, flat_idx[..., None], axis=1)
+        gathered = gathered.reshape(b, t, cfg.num_experts_per_tok, cfg.emb_dim)
+        merged = jnp.sum(gathered * topk_weights[..., None], axis=-2)
+
+        # Load-balancing aux loss (Switch Transformer style)
+        expert_mask = jax.nn.one_hot(topk_idx, cfg.num_experts, dtype=probs.dtype)
+        tokens_per_expert = jnp.mean(expert_mask, axis=(0, 1))
+        router_prob_per_expert = jnp.mean(probs, axis=(0, 1))
+        aux_loss_raw = jnp.sum(tokens_per_expert * router_prob_per_expert) * cfg.num_experts
+        aux_loss = aux_loss_raw.astype(x.dtype)
+        return merged, aux_loss
+
+
 class TextAttention(nnx.Module):
     def __init__(self, cfg: Qwen3VLConfig, *, rngs: nnx.Rngs):
         linear = partial(nnx.Linear, use_bias=False, rngs=rngs, dtype=jnp.float32)
@@ -213,16 +257,23 @@ class TextAttention(nnx.Module):
 
 
 class TextDecoderLayer(nnx.Module):
-    def __init__(self, cfg: Qwen3VLConfig, *, rngs: nnx.Rngs):
+    def __init__(self, cfg: Qwen3VLConfig, layer_idx: int, *, rngs: nnx.Rngs):
+        self.layer_idx = layer_idx
         self.input_layernorm = RMSNorm(cfg.emb_dim, cfg.norm_eps, rngs=rngs)
         self.attn = TextAttention(cfg, rngs=rngs)
         self.post_attention_layernorm = RMSNorm(cfg.emb_dim, cfg.norm_eps, rngs=rngs)
-        self.mlp = TextMLP(cfg, rngs=rngs)
+        self.is_moe = cfg.is_moe_layer(layer_idx)
+        self.mlp = TextMoEFeedForward(cfg, rngs=rngs) if self.is_moe else TextMLP(cfg, rngs=rngs)
 
-    def __call__(self, x: jax.Array, sin: jax.Array, cos: jax.Array, mask: jax.Array | None) -> jax.Array:
+    def __call__(self, x: jax.Array, sin: jax.Array, cos: jax.Array, mask: jax.Array | None) -> tuple[jax.Array, jax.Array]:
         x = x + self.attn(self.input_layernorm(x), sin, cos, mask)
-        x = x + self.mlp(self.post_attention_layernorm(x))
-        return x
+        if self.is_moe:
+            ff_out, aux_loss = self.mlp(self.post_attention_layernorm(x))
+        else:
+            ff_out = self.mlp(self.post_attention_layernorm(x))
+            aux_loss = jnp.array(0.0, dtype=x.dtype)
+        x = x + ff_out
+        return x, aux_loss
 
 
 class TextModel(nnx.Module):
@@ -230,7 +281,7 @@ class TextModel(nnx.Module):
         self.embedder = nnx.Embed(
             num_embeddings=cfg.vocab_size, features=cfg.emb_dim, dtype=jnp.float32, rngs=rngs
         )
-        self.layers = nnx.List([TextDecoderLayer(cfg, rngs=rngs) for _ in range(cfg.num_layers)])
+        self.layers = nnx.List([TextDecoderLayer(cfg, layer_idx=i, rngs=rngs) for i in range(cfg.num_layers)])
         self.final_norm = RMSNorm(cfg.emb_dim, cfg.norm_eps, rngs=rngs)
 
 
@@ -302,13 +353,19 @@ class Qwen3VL(nnx.Module):
 
         # 7. Text decoder with deepstack
         hidden_states = inputs_embeds
+        aux_losses = []
         for layer_idx, layer in enumerate(self.text.layers):
-            hidden_states = layer(hidden_states, sin, cos, final_mask)
+            hidden_states, aux_loss = layer(hidden_states, sin, cos, final_mask)
+            aux_losses.append(aux_loss)
             if deepstack_features is not None and layer_idx < len(deepstack_features):
                 hidden_states = _deepstack_process(hidden_states, visual_pos_mask, deepstack_features[layer_idx])
 
         # 8. Final norm + LM head
-        return self.lm_head(self.text.final_norm(hidden_states))
+        logits = self.lm_head(self.text.final_norm(hidden_states))
+        if self.cfg.num_experts > 0:
+            total_aux = jnp.sum(jnp.stack(aux_losses)) if aux_losses else jnp.array(0.0, dtype=logits.dtype)
+            return logits, total_aux
+        return logits
 
 
 def _deepstack_process(

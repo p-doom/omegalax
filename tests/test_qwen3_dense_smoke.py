@@ -21,7 +21,7 @@ from transformers import Qwen3ForCausalLM
 
 from omegalax.text import api
 from omegalax.models.qwen3.dense.config import make_dense_config
-from omegalax.models.qwen3.dense.params_dense import create_qwen3_dense_from_safe_tensors
+from omegalax.models.qwen3.dense.params_dense import create_qwen3_dense_from_safetensors
 
 jax.config.update("jax_default_matmul_precision", "highest")
 torch.backends.cuda.matmul.allow_tf32 = False
@@ -68,7 +68,7 @@ class Qwen3DenseSmokeTest(absltest.TestCase):
             json.dump(HF_SMOKE_CFG.to_dict(), f)
 
         cls.jax_cfg = make_dense_config(SMOKE_ID)
-        cls.jax_model = create_qwen3_dense_from_safe_tensors(cls.tmpdir, SMOKE_ID)
+        cls.jax_model = create_qwen3_dense_from_safetensors(cls.tmpdir, SMOKE_ID)
         cls.pad_id = 0
 
     def _jax_prefill_logits(self, tokens_np: np.ndarray) -> np.ndarray:

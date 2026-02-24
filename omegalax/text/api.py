@@ -25,14 +25,6 @@ list_qwen3_dense_model_ids = qwen3_registry.list_qwen3_dense_model_ids
 list_qwen3_moe_model_ids = qwen3_registry.list_qwen3_moe_model_ids
 
 
-def _is_qwen3(model: nnx.Module) -> bool:
-    return isinstance(model, (Qwen3Dense, Qwen3Moe))
-
-
-def _is_qwen3_5_text(model: nnx.Module) -> bool:
-    return isinstance(model, Qwen3_5ForCausalLM)
-
-
 def init_model(model_or_id: str | TextConfig, rng: jax.Array, *, use_sharding: bool = False) -> tuple[nnx.Module, TextConfig]:
     """Initialize a text-only model (Qwen3 or Qwen3.5 text) and return (model, cfg)."""
     if isinstance(model_or_id, str):
@@ -57,14 +49,14 @@ def forward(model: nnx.Module, tokens: jax.Array, pad_id: int, cfg: TextConfig):
     """Forward pass for text-only models; returns logits and aux loss."""
     segment_ids = 1 * (tokens != pad_id)
 
-    if _is_qwen3(model):
+    if isinstance(model, (Qwen3Dense, Qwen3Moe)):
         if cfg.variant == "moe":
             logits, aux_loss = model(tokens, segment_ids, None, jnp.array(0, dtype=jnp.int32))
             return logits, aux_loss
         logits = model(tokens, segment_ids, None, jnp.array(0, dtype=jnp.int32))
         return logits, jnp.array(0.0, dtype=jnp.float32)
 
-    if _is_qwen3_5_text(model):
+    if isinstance(model, Qwen3_5ForCausalLM):
         logits, aux_loss = model(tokens, segment_ids, None, jnp.array(0, dtype=jnp.int32))
         return logits, aux_loss
 
@@ -73,7 +65,7 @@ def forward(model: nnx.Module, tokens: jax.Array, pad_id: int, cfg: TextConfig):
 
 def decode(model: nnx.Module, cache: Cache, tokens: jax.Array, pad_id: int, cfg: TextConfig):
     """Decode step for autoregressive generation (Qwen3 only)."""
-    if not _is_qwen3(model):
+    if not isinstance(model, (Qwen3Dense, Qwen3Moe)):
         raise NotImplementedError("decode is only implemented for Qwen3 text models.")
 
     segment_ids = 1 * (tokens != pad_id)

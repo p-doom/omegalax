@@ -1,6 +1,9 @@
 """Configuration for Qwen3.5 vision-language model."""
 
+from __future__ import annotations
+
 import dataclasses
+from typing import Any
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -15,8 +18,6 @@ class Qwen3_5VisionConfig:
     in_channels: int = 3
     out_hidden_size: int = 4096
     num_position_embeddings: int = 2304
-    hidden_act: str = "gelu"
-    norm_eps: float = 1e-6
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -27,12 +28,13 @@ class Qwen3_5TextConfig:
     num_attention_heads: int = 32
     num_key_value_heads: int = 2
     head_dim: int = 256
-    hidden_act: str = "silu"
     rms_norm_eps: float = 1e-6
     layer_types: tuple[str, ...] = ()
     rope_theta: float = 10_000_000
     partial_rotary_factor: float = 0.25
     mrope_section: tuple[int, ...] = (11, 11, 10)
+    # Stored for config fidelity; ignored in the forward pass (see HF source).
+    mrope_interleaved: bool = True
     attention_bias: bool = False
     tie_word_embeddings: bool = False
 
@@ -129,9 +131,61 @@ def get_qwen3_5_spec(model_id: str) -> dict:
 
 def make_config(model_id: str) -> Qwen3_5Config:
     spec = get_qwen3_5_spec(model_id)
-    vis_kw = spec.get("vision_config", {})
-    txt_kw = spec.get("text_config", {})
+    vis_kw = spec["vision_config"]
+    txt_kw = spec["text_config"]
     return Qwen3_5Config(
         vision_config=Qwen3_5VisionConfig(**vis_kw),
         text_config=Qwen3_5TextConfig(**txt_kw),
+    )
+
+
+def make_config_from_hf(hf_cfg: dict[str, Any]) -> Qwen3_5Config:
+    """Build a Qwen3_5Config from a HuggingFace config.json dict."""
+    vis = hf_cfg["vision_config"]
+    txt = hf_cfg["text_config"]
+    rope_params = txt["rope_parameters"]
+
+    return Qwen3_5Config(
+        vision_config=Qwen3_5VisionConfig(
+            depth=vis["depth"],
+            hidden_size=vis["hidden_size"],
+            intermediate_size=vis["intermediate_size"],
+            num_heads=vis["num_heads"],
+            patch_size=vis["patch_size"],
+            temporal_patch_size=vis["temporal_patch_size"],
+            spatial_merge_size=vis["spatial_merge_size"],
+            in_channels=vis["in_channels"],
+            out_hidden_size=vis["out_hidden_size"],
+            num_position_embeddings=vis["num_position_embeddings"],
+        ),
+        text_config=Qwen3_5TextConfig(
+            vocab_size=txt["vocab_size"],
+            hidden_size=txt["hidden_size"],
+            num_hidden_layers=txt["num_hidden_layers"],
+            num_attention_heads=txt["num_attention_heads"],
+            num_key_value_heads=txt["num_key_value_heads"],
+            head_dim=txt["head_dim"],
+            rms_norm_eps=txt["rms_norm_eps"],
+            layer_types=tuple(txt["layer_types"]),
+            rope_theta=rope_params["rope_theta"],
+            partial_rotary_factor=rope_params["partial_rotary_factor"],
+            mrope_section=tuple(rope_params["mrope_section"]),
+            mrope_interleaved=rope_params.get("mrope_interleaved", True),
+            attention_bias=txt["attention_bias"],
+            tie_word_embeddings=hf_cfg["tie_word_embeddings"],
+            linear_conv_kernel_dim=txt["linear_conv_kernel_dim"],
+            linear_key_head_dim=txt["linear_key_head_dim"],
+            linear_num_key_heads=txt["linear_num_key_heads"],
+            linear_num_value_heads=txt["linear_num_value_heads"],
+            linear_value_head_dim=txt["linear_value_head_dim"],
+            moe_intermediate_size=txt["moe_intermediate_size"],
+            shared_expert_intermediate_size=txt["shared_expert_intermediate_size"],
+            num_experts=txt["num_experts"],
+            num_experts_per_tok=txt["num_experts_per_tok"],
+            router_aux_loss_coef=txt["router_aux_loss_coef"],
+        ),
+        image_token_id=hf_cfg["image_token_id"],
+        video_token_id=hf_cfg["video_token_id"],
+        vision_start_token_id=hf_cfg["vision_start_token_id"],
+        vision_end_token_id=hf_cfg["vision_end_token_id"],
     )

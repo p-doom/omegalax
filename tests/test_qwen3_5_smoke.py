@@ -28,7 +28,7 @@ from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
 )
 
 from omegalax.models.qwen3_5.config import make_config
-from omegalax.models.qwen3_5.params import create_qwen3_5_from_safe_tensors
+from omegalax.models.qwen3_5.params import create_qwen3_5_from_safetensors
 
 jax.config.update("jax_default_matmul_precision", "highest")
 torch.backends.cuda.matmul.allow_tf32 = False
@@ -64,6 +64,7 @@ HF_TEXT_CFG = HFTextConfig(
         "partial_rotary_factor": 0.25,
         "rope_type": "default",
         "mrope_section": [2, 1, 1],
+        "mrope_interleaved": True,
     },
     layer_types=[
         "linear_attention",
@@ -113,7 +114,7 @@ class Qwen3_5WeightsTest(absltest.TestCase):
             json.dump(HF_CFG.to_dict(), f)
 
         cls.jax_cfg = make_config("qwen3.5-smoke")
-        cls.jax_model = create_qwen3_5_from_safe_tensors(cls.tmpdir, "qwen3.5-smoke")
+        cls.jax_model, _ = create_qwen3_5_from_safetensors(cls.tmpdir, "qwen3.5-smoke")
         cls.pad_id = 0
 
     def _jax_prefill_logits(self, tokens_np: np.ndarray) -> np.ndarray:

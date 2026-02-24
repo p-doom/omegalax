@@ -24,7 +24,7 @@ from transformers.models.qwen3_vl.configuration_qwen3_vl import (
     Qwen3VLVisionConfig as HFVisionConfig,
 )
 
-from omegalax.models.qwen3_vl import create_qwen3_vl_from_safe_tensors
+from omegalax.models.qwen3_vl import create_qwen3_vl_from_safetensors
 
 jax.config.update("jax_default_matmul_precision", "highest")
 torch.backends.cuda.matmul.allow_tf32 = False
@@ -90,7 +90,7 @@ class Qwen3VLSmokeTest(absltest.TestCase):
         with open(cfg_path, "w") as f:
             json.dump(HF_CFG.to_dict(), f)
 
-        cls.jax_model, cls.jax_cfg = create_qwen3_vl_from_safe_tensors(cls.tmpdir)
+        cls.jax_model, cls.jax_cfg = create_qwen3_vl_from_safetensors(cls.tmpdir)
 
     def test_weight_loading_succeeds(self):
         self.assertIsNotNone(self.jax_model)
