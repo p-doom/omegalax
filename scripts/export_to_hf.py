@@ -1,4 +1,4 @@
-"""Export a Qwen3 dense JAX model to HuggingFace safetensors."""
+"""Export any supported omegalax model to HuggingFace safetensors."""
 
 from __future__ import annotations
 
@@ -7,14 +7,16 @@ from pathlib import Path
 
 import jax
 
+from omegalax import export as export_lib
+from omegalax import registry
 from omegalax.text import api as text_api
 from omegalax.trainers import text as text_trainer
-from omegalax.models.qwen3.dense.params_dense import export_qwen3_dense_to_safetensors
+from omegalax.vlm import api as vlm_api
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Export a Qwen3 dense model to HF safetensors.")
-    parser.add_argument("--model-id", type=str, default="qwen3-smoke", help="Model id to export.")
+    parser = argparse.ArgumentParser(description="Export a model to HF safetensors.")
+    parser.add_argument("--model-id", type=str, required=True, help="Model id to export.")
     parser.add_argument("--checkpoint", type=str, default=None, help="Optional orbax checkpoint dir from training.")
     parser.add_argument("--out-dir", type=str, required=True, help="Destination directory for safetensors+config.")
     parser.add_argument("--seed", type=int, default=0, help="RNG seed used when initializing the model.")
@@ -24,11 +26,8 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_model(args) -> tuple[object, object]:
+def _load_text_model(args):
     model_cfg = text_api.registry.build_config(args.model_id)
-    if model_cfg.variant != "dense":
-        raise NotImplementedError("export_to_hf currently supports dense Qwen3 models only.")
-
     train_cfg = text_trainer.TrainConfig(
         seed=args.seed,
         batch_size=1,
@@ -53,11 +52,28 @@ def load_model(args) -> tuple[object, object]:
     return model, model_cfg
 
 
+def _load_vlm_model(args):
+    rng = jax.random.key(args.seed)
+    model, cfg = vlm_api.init_model(args.model_id, rng)
+    if args.checkpoint:
+        raise NotImplementedError("Checkpoint restoration for VLM exports is not implemented yet.")
+    return model, cfg
+
+
+def load_model(args):
+    arch = registry.resolve(args.model_id).arch
+    if arch == registry.Arch.TEXT:
+        return _load_text_model(args)
+    if arch == registry.Arch.VLM:
+        return _load_vlm_model(args)
+    raise ValueError(f"Unsupported architecture for model id '{args.model_id}'")
+
+
 def main() -> None:
     args = parse_args()
     model, cfg = load_model(args)
     out_dir = Path(args.out_dir)
-    path = export_qwen3_dense_to_safetensors(model, cfg, out_dir)
+    path = export_lib.export_model_to_hf(model, cfg, out_dir)
     print(f"Exported safetensors to {path}")
 
 

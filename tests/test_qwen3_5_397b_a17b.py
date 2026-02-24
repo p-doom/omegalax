@@ -38,7 +38,7 @@ class Qwen3_5RealTest(absltest.TestCase):
         cls.pad_id = cls.tokenizer.pad_token_id or 0
 
         cls.jax_cfg = make_config(MODEL_ID)
-        cls.jax_model = create_qwen3_5_from_safetensors(cls.model_path, MODEL_ID)
+        cls.jax_model, _ = create_qwen3_5_from_safetensors(cls.model_path, MODEL_ID)
 
         cls.hf_model = HFModel.from_pretrained(
             cls.model_path, torch_dtype=torch.float32,

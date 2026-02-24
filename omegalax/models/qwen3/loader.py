@@ -1,4 +1,4 @@
-"""Dispatch helpers for loading HuggingFace checkpoints."""
+"""Dispatch helpers for loading HuggingFace Qwen3 checkpoints."""
 
 from __future__ import annotations
 

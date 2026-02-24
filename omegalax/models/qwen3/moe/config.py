@@ -111,7 +111,7 @@ def make_moe_config(model_id: str, use_sharding: bool = False) -> Qwen3MoeConfig
         moe_intermediate_size=int(spec["moe_intermediate_size"]),
         num_experts=int(spec["num_experts"]),
         num_experts_per_tok=int(spec["num_experts_per_tok"]),
-        mlp_only_layers=tuple(spec.get("mlp_only_layers", ())),
-        decoder_sparse_step=int(spec.get("decoder_sparse_step", 1)),
-        norm_topk_prob=bool(spec.get("norm_topk_prob", True)),
+        mlp_only_layers=tuple(spec["mlp_only_layers"]),
+        decoder_sparse_step=int(spec["decoder_sparse_step"]),
+        norm_topk_prob=bool(spec["norm_topk_prob"]),
     )

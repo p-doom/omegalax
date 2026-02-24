@@ -72,14 +72,17 @@ def forward(
         return logits, aux_loss
 
     if _is_qwen3_vl(model):
-        logits = model(
+        outputs = model(
             tokens,
             attention_mask,
             position_ids=position_ids,
             pixel_values=pixel_values,
             image_grid_thw=image_grid_thw,
         )
-        return logits, jnp.array(0.0, dtype=jnp.float32)
+        if cfg.variant == "moe":
+            logits, aux_loss = outputs
+        else:
+            return outputs, jnp.array(0.0, dtype=jnp.float32)
 
     raise ValueError(f"Unsupported VLM model type: {type(model)}")
 

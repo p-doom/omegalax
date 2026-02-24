@@ -26,7 +26,7 @@
 ## Overview
 - Qwen3 dense and MoE (`omegalax/models/qwen3`) with cache-aware decode in `omegalax/text/api.py`.
 - Qwen3.5 MoE and Qwen3-VL (`omegalax/models/qwen3_5`, `omegalax/models/qwen3_vl`, `omegalax/vlm/api.py`).
-- HuggingFace safetensor loaders for all architectures: `create_qwen3_from_safe_tensors`, `create_qwen3_5_from_safe_tensors`, and `create_qwen3_vl_from_safe_tensors`.
+- HuggingFace safetensor loaders for all architectures: `create_qwen3_from_safetensors`, `create_qwen3_5_from_safetensors`, and `create_qwen3_vl_from_safetensors`.
 - Supported models:
   - Qwen3 dense: `Qwen/Qwen3-0.6B`, `Qwen/Qwen3-1.7B`, `Qwen/Qwen3-4B`, `Qwen/Qwen3-8B`, `Qwen/Qwen3-14B`, `Qwen/Qwen3-32B`.
   - Qwen3 MoE: `Qwen/Qwen3-30B-A3B-Instruct-2507`.
@@ -80,12 +80,12 @@ logits, aux_loss = vlm.api.forward(
 All loaders expect a directory containing safetensors and `config.json`:
 ```python
 from huggingface_hub import snapshot_download
-from omegalax.models.qwen3.params import create_qwen3_from_safe_tensors
+from omegalax.models.qwen3.params import create_qwen3_from_safetensors
 
 ckpt_dir = snapshot_download("Qwen/Qwen3-8B")
-model = create_qwen3_from_safe_tensors(ckpt_dir, "Qwen/Qwen3-8B")
+model = create_qwen3_from_safetensors(ckpt_dir, "Qwen/Qwen3-8B")
 ```
-For Qwen3.5 and Qwen3-VL, use `create_qwen3_5_from_safe_tensors` or `create_qwen3_vl_from_safe_tensors` respectively. When starting from a raw HF config, `omegalax.models.qwen3_vl.make_vl_config_from_hf()` will build a matching JAX config.
+For Qwen3.5 and Qwen3-VL, use `create_qwen3_5_from_safetensors` or `create_qwen3_vl_from_safetensors` respectively. When starting from a raw HF config, `omegalax.models.qwen3_vl.make_vl_config_from_hf()` will build a matching JAX config.
 
 ## Tests
 Tests use `absltest`:

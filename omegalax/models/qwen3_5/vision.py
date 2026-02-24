@@ -113,8 +113,8 @@ class VisionAttention(nnx.Module):
 
 class VisionBlock(nnx.Module):
     def __init__(self, cfg: Qwen3_5VisionConfig, *, rngs: nnx.Rngs):
-        self.norm1 = LayerNorm(cfg.hidden_size, cfg.norm_eps, rngs=rngs)
-        self.norm2 = LayerNorm(cfg.hidden_size, cfg.norm_eps, rngs=rngs)
+        self.norm1 = LayerNorm(cfg.hidden_size, 1e-6, rngs=rngs)
+        self.norm2 = LayerNorm(cfg.hidden_size, 1e-6, rngs=rngs)
         self.attn = VisionAttention(cfg, rngs=rngs)
         self.mlp = VisionMLP(cfg, rngs=rngs)
 
@@ -127,7 +127,7 @@ class VisionBlock(nnx.Module):
 class VisionPatchMerger(nnx.Module):
     def __init__(self, cfg: Qwen3_5VisionConfig, *, rngs: nnx.Rngs):
         merged_dim = cfg.hidden_size * (cfg.spatial_merge_size ** 2)
-        self.norm = LayerNorm(cfg.hidden_size, cfg.norm_eps, rngs=rngs)
+        self.norm = LayerNorm(cfg.hidden_size, 1e-6, rngs=rngs)
         self.fc1 = nnx.Linear(merged_dim, merged_dim, use_bias=True, rngs=rngs)
         self.fc2 = nnx.Linear(merged_dim, cfg.out_hidden_size, use_bias=True, rngs=rngs)
 

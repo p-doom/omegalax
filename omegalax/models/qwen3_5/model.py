@@ -139,11 +139,11 @@ class TextModel(nnx.Module):
 
     def __init__(self, cfg: Qwen3_5TextConfig, *, rngs: nnx.Rngs):
         self.cfg = cfg
-        self.embed_tokens = nnx.Embed(cfg.vocab_size, cfg.hidden_size, rngs=rngs)
+        self.embedder = nnx.Embed(cfg.vocab_size, cfg.hidden_size, rngs=rngs)
         self.layers = nnx.List([
             DecoderLayer(cfg, i, rngs=rngs) for i in range(cfg.num_hidden_layers)
         ])
-        self.norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, rngs=rngs)
+        self.final_norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, rngs=rngs)
 
     @jax.named_scope("text_model")
     def __call__(
@@ -167,7 +167,7 @@ class TextModel(nnx.Module):
         cfg = self.cfg
 
         if inputs_embeds is None:
-            x = self.embed_tokens(tokens)
+            x = self.embedder(tokens)
         else:
             x = inputs_embeds
 
@@ -206,7 +206,7 @@ class TextModel(nnx.Module):
             x, aux = layer(x, cos, sin, segment_ids, text_position_ids, attention_mask)
             aux_losses.append(aux)
 
-        x = self.norm(x)
+        x = self.final_norm(x)
         total_aux = jnp.sum(jnp.stack(aux_losses)) if aux_losses else jnp.array(0.0)
         return x, total_aux
 
@@ -216,12 +216,12 @@ class Qwen3_5ForCausalLM(nnx.Module):
     """Text-only causal language model."""
 
     def __init__(self, cfg: Qwen3_5TextConfig, *, rngs: nnx.Rngs):
-        self.text_model = TextModel(cfg, rngs=rngs)
+        self.text = TextModel(cfg, rngs=rngs)
         self.lm_head = nnx.Linear(cfg.hidden_size, cfg.vocab_size, use_bias=False, rngs=rngs)
 
     def __call__(self, tokens, segment_ids, cache, num_right_pads):
         del cache, num_right_pads
-        hidden, aux = self.text_model(tokens=tokens, segment_ids=segment_ids)
+        hidden, aux = self.text(tokens=tokens, segment_ids=segment_ids)
         return self.lm_head(hidden), aux
 
 
@@ -231,8 +231,8 @@ class Qwen3_5ForConditionalGeneration(nnx.Module):
 
     def __init__(self, cfg: Qwen3_5Config, *, rngs: nnx.Rngs):
         self.cfg = cfg
-        self.visual = VisionModel(cfg.vision_config, rngs=rngs)
-        self.text_model = TextModel(cfg.text_config, rngs=rngs)
+        self.vision = VisionModel(cfg.vision_config, rngs=rngs)
+        self.text = TextModel(cfg.text_config, rngs=rngs)
         self.lm_head = nnx.Linear(
             cfg.text_config.hidden_size, cfg.text_config.vocab_size, use_bias=False, rngs=rngs,
         )
@@ -253,10 +253,10 @@ class Qwen3_5ForConditionalGeneration(nnx.Module):
         """
         del cache, num_right_pads
 
-        inputs_embeds = self.text_model.embed_tokens(tokens)
+        inputs_embeds = self.text.embedder(tokens)
 
         if pixel_values is not None and image_grid_thw is not None:
-            image_embeds = self.visual(pixel_values, image_grid_thw)
+            image_embeds = self.vision(pixel_values, image_grid_thw)
             image_mask = (tokens == self.cfg.image_token_id)
             image_mask_3d = jnp.broadcast_to(
                 image_mask[:, :, None], inputs_embeds.shape
@@ -266,7 +266,7 @@ class Qwen3_5ForConditionalGeneration(nnx.Module):
             batch_indices, seq_indices = jnp.where(image_mask)
             inputs_embeds = inputs_embeds.at[batch_indices, seq_indices].set(image_embeds)
 
-        hidden, aux = self.text_model(
+        hidden, aux = self.text(
             inputs_embeds=inputs_embeds,
             segment_ids=segment_ids,
             position_ids=position_ids,
