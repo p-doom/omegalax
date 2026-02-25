@@ -89,6 +89,8 @@ def _abstract_train_state(optimizer: nnx.ModelAndOptimizer) -> dict[str, object]
 
 
 def _make_checkpoint_manager(save_dir: Path, save_interval: int | None) -> ocp.CheckpointManager:
+    """Orbax requires an absolute checkpoint path."""
+    save_dir = Path(save_dir).expanduser().resolve()
     handler_registry = ocp.handlers.DefaultCheckpointHandlerRegistry()
     handler_registry.add("train_state", ocp.args.PyTreeSave, ocp.handlers.PyTreeCheckpointHandler)
     handler_registry.add("train_state", ocp.args.PyTreeRestore, ocp.handlers.PyTreeCheckpointHandler)
@@ -160,7 +162,7 @@ def run_training(
 
     checkpoint_manager = None
     if save_dir is not None:
-        save_dir = Path(save_dir).expanduser()
+        save_dir = Path(save_dir).expanduser().resolve()
         save_dir.mkdir(parents=True, exist_ok=True)
         checkpoint_manager = _make_checkpoint_manager(save_dir, save_interval=save_every or None)
 
