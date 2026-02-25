@@ -81,6 +81,7 @@ def forward(
         )
         if cfg.variant == "moe":
             logits, aux_loss = outputs
+            return logits, aux_loss
         else:
             return outputs, jnp.array(0.0, dtype=jnp.float32)
 

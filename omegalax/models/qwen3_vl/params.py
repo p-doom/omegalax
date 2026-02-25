@@ -23,7 +23,7 @@ from .config import Qwen3VLConfig
 from .loader import _get_non_expert_mapping, create_qwen3_vl_from_safetensors
 from .model import Qwen3VL
 
-__all__ = ["create_qwen3_vl_from_safetensors", "_get_key_and_transform_mapping", "export_qwen3_vl_to_safetensors"]
+__all__ = ["create_qwen3_vl_from_safetensors", "export_qwen3_vl_to_safetensors"]
 
 
 def _make_hf_config_dict(cfg: Qwen3VLConfig) -> dict[str, Any]:
