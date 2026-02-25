@@ -18,7 +18,7 @@ from transformers import AutoConfig, AutoProcessor, Qwen3VLForConditionalGenerat
 
 from omegalax.models.params_utils import map_to_bonsai_key
 from omegalax.models.qwen3_vl import create_qwen3_vl_from_safetensors
-from omegalax.models.qwen3_vl.params import _get_key_and_transform_mapping
+from omegalax.models.qwen3_vl.loader import _get_non_expert_mapping
 from omegalax.models.qwen3_vl.config import make_vl_config_from_hf
 from omegalax.models.params_utils import load_hf_config
 
@@ -72,7 +72,7 @@ class Qwen3VLMappingTest(absltest.TestCase):
 
     def test_parameter_mapping_is_complete(self):
         """All HF keys should be mapped; all JAX leaves should be populated."""
-        mapping = _get_key_and_transform_mapping(self.cfg)
+        mapping = _get_non_expert_mapping()
         unmapped: list[str] = []
         for f in Path(self.model_path).glob("*.safetensors"):
             with safetensors.safe_open(f, framework="numpy") as sf:
