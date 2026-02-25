@@ -40,7 +40,8 @@ def assert_dense_config(cfg: Qwen3Config, hf_cfg: dict[str, Any]):
     _require("num_kv_heads", cfg.num_kv_heads, hf_cfg["num_key_value_heads"])
     _require("head_dim", cfg.head_dim, hf_cfg["head_dim"])
     _require("mlp_dim", cfg.mlp_dim, hf_cfg["intermediate_size"])
-    _require("rope_theta", cfg.rope_theta, hf_cfg["rope_theta"])
+    rope_params = hf_cfg.get("rope_parameters") or hf_cfg.get("rope_scaling") or {}
+    _require("rope_theta", cfg.rope_theta, rope_params.get("rope_theta") or hf_cfg.get("rope_theta"))
 
 
 def _get_key_and_transform_mapping(cfg):
@@ -68,7 +69,6 @@ def _get_key_and_transform_mapping(cfg):
 def _require(name: str, lhs: Any, rhs: Any):
     if lhs != rhs:
         raise ValueError(f"Config mismatch for {name}: expected {lhs}, found {rhs} in HF config")
-
 
 
 def create_qwen3_dense_from_safetensors(file_dir: str, model_id: str, use_sharding: bool = False) -> Qwen3Dense:

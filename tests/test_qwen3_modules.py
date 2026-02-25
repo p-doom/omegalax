@@ -96,9 +96,9 @@ class Qwen3ModuleTest(absltest.TestCase):
         with torch.no_grad():
             cls.hf_emb = cls.hf_model.model.embed_tokens(cls.inputs["input_ids"])
 
-        tokens_jax = jnp.asarray(np.array(cls.inputs["input_ids"].cpu(), dtype=np.int32))
-        cls.tokens_jax = tokens_jax
-        cls.segment_ids = jnp.array(1 * (tokens_jax != cls.pad_id), dtype=jnp.int32)
+        token_ids_BT = jnp.asarray(np.array(cls.inputs["input_ids"].cpu(), dtype=np.int32))
+        cls.token_ids_BT = token_ids_BT
+        cls.segment_ids_BT = jnp.array(1 * (token_ids_BT != cls.pad_id), dtype=jnp.int32)
 
     # Helpers
     def _assert_close(self, jax_val, hf_val, *, atol, rtol=0.0, msg=""):
@@ -183,7 +183,7 @@ class Qwen3ModuleTest(absltest.TestCase):
             )
 
         jax_normed = _to_jax(hf_normed)
-        jax_attn_out = self.jax_model.layers[0].attn(jax_normed, None, self.segment_ids)
+        jax_attn_out = self.jax_model.layers[0].attn(jax_normed, None, self.segment_ids_BT)
         self._assert_close(jax_attn_out, hf_attn_out, atol=ATTENTION_ATOL, msg="attention")
 
     # 5. MLP
@@ -230,7 +230,7 @@ class Qwen3ModuleTest(absltest.TestCase):
                 position_ids=position_ids_torch,
             )
 
-        jax_out = self.jax_model.layers[0](_to_jax(self.hf_emb), None, self.segment_ids)
+        jax_out = self.jax_model.layers[0](_to_jax(self.hf_emb), None, self.segment_ids_BT)
         self._assert_close(jax_out, hf_out, atol=DECODER_LAYER_ATOL, msg="decoder layer 0")
 
 

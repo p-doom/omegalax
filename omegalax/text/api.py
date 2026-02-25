@@ -29,6 +29,7 @@ def init_model(model_or_id: str | TextConfig, rng: jax.Array, *, use_sharding: b
     """Initialize a text-only model (Qwen3 or Qwen3.5 text) and return (model, cfg)."""
     if isinstance(model_or_id, str):
         key = model_or_id.lower()
+        # FIXME (f.srambical): this should not be heuristics-based
         if "qwen3.5" in key or "qwen3_5" in key:
             cfg = make_qwen3_5_config(model_or_id).text_config
             return Qwen3_5ForCausalLM(cfg, rngs=nnx.Rngs(rng)), cfg
@@ -45,40 +46,40 @@ def init_model(model_or_id: str | TextConfig, rng: jax.Array, *, use_sharding: b
     raise ValueError(f"Unsupported text config type: {type(cfg)}")
 
 
-def forward(model: nnx.Module, tokens: jax.Array, pad_id: int, cfg: TextConfig):
+def forward(model: nnx.Module, token_ids_BT: jax.Array, pad_id: int, cfg: TextConfig):
     """Forward pass for text-only models; returns logits and aux loss."""
-    segment_ids = 1 * (tokens != pad_id)
+    segment_ids_BT = 1 * (token_ids_BT != pad_id)
 
     if isinstance(model, (Qwen3Dense, Qwen3Moe)):
         if cfg.variant == "moe":
-            logits, aux_loss = model(tokens, segment_ids, None, jnp.array(0, dtype=jnp.int32))
-            return logits, aux_loss
-        logits = model(tokens, segment_ids, None, jnp.array(0, dtype=jnp.int32))
-        return logits, jnp.array(0.0, dtype=jnp.float32)
+            logits_BTV, aux_loss = model(token_ids_BT, segment_ids_BT, None, jnp.array(0, dtype=jnp.int32))
+            return logits_BTV, aux_loss
+        logits_BTV = model(token_ids_BT, segment_ids_BT, None, jnp.array(0, dtype=jnp.int32))
+        return logits_BTV, jnp.array(0.0, dtype=jnp.float32)
 
     if isinstance(model, Qwen3_5ForCausalLM):
-        logits, aux_loss = model(tokens, segment_ids, None, jnp.array(0, dtype=jnp.int32))
-        return logits, aux_loss
+        logits_BTV, aux_loss = model(token_ids_BT, segment_ids_BT, None, jnp.array(0, dtype=jnp.int32))
+        return logits_BTV, aux_loss
 
     raise ValueError(f"Unsupported text model type: {type(model)}")
 
 
-def decode(model: nnx.Module, cache: Cache, tokens: jax.Array, pad_id: int, cfg: TextConfig):
+def decode(model: nnx.Module, cache: Cache, token_ids_BT: jax.Array, pad_id: int, cfg: TextConfig):
     """Decode step for autoregressive generation (Qwen3 only)."""
     if not isinstance(model, (Qwen3Dense, Qwen3Moe)):
         raise NotImplementedError("decode is only implemented for Qwen3 text models.")
 
-    segment_ids = 1 * (tokens != pad_id)
-    num_right_pads = count_right_pads(tokens, pad_id)
-    outputs = model(tokens, segment_ids, cache, jnp.array(num_right_pads, dtype=jnp.int32))
+    segment_ids_BT = 1 * (token_ids_BT != pad_id)
+    num_right_pads = count_right_pads(token_ids_BT, pad_id)
+    outputs = model(token_ids_BT, segment_ids_BT, cache, jnp.array(num_right_pads, dtype=jnp.int32))
 
     if cfg.variant == "moe":
-        logits, aux_loss = outputs
+        logits_BTV, aux_loss = outputs
     else:
-        logits, aux_loss = outputs, jnp.array(0.0, dtype=jnp.float32)
+        logits_BTV, aux_loss = outputs, jnp.array(0.0, dtype=jnp.float32)
 
-    target_ind = tokens.shape[-1] - num_right_pads - 1
-    return logits[:, target_ind], cache, aux_loss
+    target_ind = token_ids_BT.shape[-1] - num_right_pads - 1
+    return logits_BTV[:, target_ind], cache, aux_loss
 
 
 def make_cache(cfg: TextConfig, batch_size: int, token_len: int, generate_steps: int, dtype: jnp.dtype = jnp.bfloat16):

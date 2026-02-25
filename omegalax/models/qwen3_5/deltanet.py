@@ -2,6 +2,17 @@
 
 This implements the chunked gated delta rule, a linear-attention variant
 that combines a depthwise causal Conv1D with a recurrent delta-rule update.
+
+Module-local dimension key (supplements the global key in models/__init__.py):
+
+B — batch size
+H — number of value heads (num_v_heads)
+T — sequence length
+A — key head dimension (linear_key_head_dim)
+U — value head dimension (linear_value_head_dim)
+J — number of chunks (total_T // chunk_size)
+L — chunk position (row / target)
+M — chunk position (column / source)
 """
 
 import jax
@@ -12,151 +23,135 @@ from .config import Qwen3_5TextConfig
 from .norms import RMSNormGated
 
 
-# Helpers
 def _l2norm(x: jax.Array, axis: int = -1, eps: float = 1e-6) -> jax.Array:
     inv_norm = jax.lax.rsqrt((x * x).sum(axis=axis, keepdims=True) + eps)
     return x * inv_norm
 
 
-def _causal_depthwise_conv1d(x: jax.Array, weight: jax.Array) -> jax.Array:
+def _causal_depthwise_conv1d(x_BCT: jax.Array, weight_CK: jax.Array) -> jax.Array:
     """Depthwise causal conv1d.
 
     Args:
-        x: (B, C, T)
-        weight: (C, K) — per-channel kernel
+        x_BCT: (B, C, T)
+        weight_CK: (C, K), per-channel kernel
     Returns:
         (B, C, T)
     """
-    K = weight.shape[1]
-    T = x.shape[2]
-    x_padded = jnp.pad(x, ((0, 0), (0, 0), (K - 1, 0)))
-    result = jnp.zeros_like(x)
+    K = weight_CK.shape[1]
+    T = x_BCT.shape[2]
+    x_padded = jnp.pad(x_BCT, ((0, 0), (0, 0), (K - 1, 0)))
+    result = jnp.zeros_like(x_BCT)
     for k in range(K):
-        result = result + weight[None, :, k : k + 1] * x_padded[:, :, k : k + T]
+        result = result + weight_CK[None, :, k : k + 1] * x_padded[:, :, k : k + T]
     return result
 
 
-# Chunked Gated Delta Rule (prefill path)
 def chunk_gated_delta_rule(
-    query: jax.Array,
-    key: jax.Array,
-    value: jax.Array,
-    g: jax.Array,
-    beta: jax.Array,
+    q_BTHA: jax.Array,
+    k_BTHA: jax.Array,
+    v_BTHU: jax.Array,
+    g_BTH: jax.Array,
+    beta_BTH: jax.Array,
     chunk_size: int = 64,
 ) -> jax.Array:
     """Chunked gated delta rule.
 
-    All inputs are in (B, T, H, D) layout.
+    All inputs are in (B, T, H, dim) layout.
     """
-    # L2 normalize Q, K
-    query = _l2norm(query, axis=-1)
-    key = _l2norm(key, axis=-1)
+    q_BTHA = _l2norm(q_BTHA, axis=-1)
+    k_BTHA = _l2norm(k_BTHA, axis=-1)
 
-    # Transpose to (B, H, T, D)
-    query, key, value = [x.transpose(0, 2, 1, 3).astype(jnp.float32) for x in (query, key, value)]
-    beta = beta.transpose(0, 2, 1).astype(jnp.float32)
-    g = g.transpose(0, 2, 1).astype(jnp.float32)
+    q_BHTA, k_BHTA, v_BHTU = [x.transpose(0, 2, 1, 3).astype(jnp.float32) for x in (q_BTHA, k_BTHA, v_BTHU)]
+    beta_BHT = beta_BTH.transpose(0, 2, 1).astype(jnp.float32)
+    g_BHT = g_BTH.transpose(0, 2, 1).astype(jnp.float32)
 
-    B, H, T, Dk = key.shape
-    Dv = value.shape[-1]
+    B, H, T, A = k_BHTA.shape
+    U = v_BHTU.shape[-1]
 
-    # Pad to chunk_size multiple
     pad_size = (chunk_size - T % chunk_size) % chunk_size
     if pad_size > 0:
-        query = jnp.pad(query, ((0, 0), (0, 0), (0, pad_size), (0, 0)))
-        key = jnp.pad(key, ((0, 0), (0, 0), (0, pad_size), (0, 0)))
-        value = jnp.pad(value, ((0, 0), (0, 0), (0, pad_size), (0, 0)))
-        beta = jnp.pad(beta, ((0, 0), (0, 0), (0, pad_size)))
-        g = jnp.pad(g, ((0, 0), (0, 0), (0, pad_size)))
+        q_BHTA = jnp.pad(q_BHTA, ((0, 0), (0, 0), (0, pad_size), (0, 0)))
+        k_BHTA = jnp.pad(k_BHTA, ((0, 0), (0, 0), (0, pad_size), (0, 0)))
+        v_BHTU = jnp.pad(v_BHTU, ((0, 0), (0, 0), (0, pad_size), (0, 0)))
+        beta_BHT = jnp.pad(beta_BHT, ((0, 0), (0, 0), (0, pad_size)))
+        g_BHT = jnp.pad(g_BHT, ((0, 0), (0, 0), (0, pad_size)))
     total_T = T + pad_size
 
-    scale = Dk ** -0.5
-    query = query * scale
+    scale = A ** -0.5
+    q_BHTA = q_BHTA * scale
 
-    v_beta = value * beta[..., None]
-    k_beta = key * beta[..., None]
+    vb_BHTU = v_BHTU * beta_BHT[..., None]
+    kb_BHTA = k_BHTA * beta_BHT[..., None]
 
-    NC = total_T // chunk_size
-    query = query.reshape(B, H, NC, chunk_size, Dk)
-    key = key.reshape(B, H, NC, chunk_size, Dk)
-    value = value.reshape(B, H, NC, chunk_size, Dv)
-    k_beta = k_beta.reshape(B, H, NC, chunk_size, Dk)
-    v_beta = v_beta.reshape(B, H, NC, chunk_size, Dv)
-    g = g.reshape(B, H, NC, chunk_size)
+    J = total_T // chunk_size
+    q_BHJLA = q_BHTA.reshape(B, H, J, chunk_size, A)
+    k_BHJLA = k_BHTA.reshape(B, H, J, chunk_size, A)
+    v_BHJLU = v_BHTU.reshape(B, H, J, chunk_size, U)
+    kb_BHJLA = kb_BHTA.reshape(B, H, J, chunk_size, A)
+    vb_BHJLU = vb_BHTU.reshape(B, H, J, chunk_size, U)
+    g_BHJL = g_BHT.reshape(B, H, J, chunk_size)
 
-    # Cumulative gate within chunks
-    g = jnp.cumsum(g, axis=-1)
+    g_BHJL = jnp.cumsum(g_BHJL, axis=-1)
 
-    # Decay mask: exp(g[..., i] - g[..., j]) for i >= j
-    g_row = g[..., :, None]  # (B, H, NC, CS, 1)
-    g_col = g[..., None, :]  # (B, H, NC, 1, CS)
+    g_row = g_BHJL[..., :, None]
+    g_col = g_BHJL[..., None, :]
     diff = g_row - g_col
     tril_mask = jnp.tril(jnp.ones((chunk_size, chunk_size)))
-    decay_mask = jnp.exp(diff * tril_mask) * tril_mask
+    decay_mask_LM = jnp.exp(diff * tril_mask) * tril_mask
 
-    # Within-chunk correction matrix
-    upper_mask = jnp.triu(jnp.ones((chunk_size, chunk_size), dtype=jnp.bool_))
-    attn = -(jnp.einsum("bhcid,bhcjd->bhcij", k_beta, key) * decay_mask)
-    attn = jnp.where(upper_mask, 0.0, attn)
+    upper_mask_LM = jnp.triu(jnp.ones((chunk_size, chunk_size), dtype=jnp.bool_))
+    attn_BHJLM = -(jnp.einsum("BHJLA,BHJMA->BHJLM", kb_BHJLA, k_BHJLA) * decay_mask_LM)
+    attn_BHJLM = jnp.where(upper_mask_LM, 0.0, attn_BHJLM)
 
-    # Sequential correction: (I + L)^{-1} approximation
     def correction_step(i, attn):
         row = attn[..., i, :]
         contribution = jnp.einsum("...j,...jk->...k", row, attn)
         new_row = row + contribution
         return attn.at[..., i, :].set(new_row)
 
-    attn = jax.lax.fori_loop(1, chunk_size, correction_step, attn)
-    attn = attn + jnp.eye(chunk_size)
+    attn_BHJLM = jax.lax.fori_loop(1, chunk_size, correction_step, attn_BHJLM)
+    attn_BHJLM = attn_BHJLM + jnp.eye(chunk_size)
 
-    # Modified V and cumulative decay K
-    value_corrected = jnp.einsum("bhcij,bhcjd->bhcid", attn, v_beta)
-    k_cumdecay = jnp.einsum("bhcij,bhcjd->bhcid", attn, k_beta * jnp.exp(g)[..., None])
+    v_corrected_BHJLU = jnp.einsum("BHJLM,BHJMU->BHJLU", attn_BHJLM, vb_BHJLU)
+    k_cumdecay_BHJLA = jnp.einsum("BHJLM,BHJMA->BHJLA", attn_BHJLM, kb_BHJLA * jnp.exp(g_BHJL)[..., None])
 
-    # Cross-chunk recurrence
-    last_state = jnp.zeros((B, H, Dk, Dv), dtype=jnp.float32)
-    core_out = jnp.zeros_like(value_corrected)
-    upper_mask_1 = jnp.triu(jnp.ones((chunk_size, chunk_size), dtype=jnp.bool_), k=1)
+    state_BHAU = jnp.zeros((B, H, A, U), dtype=jnp.float32)
+    upper_mask_1_LM = jnp.triu(jnp.ones((chunk_size, chunk_size), dtype=jnp.bool_), k=1)
 
     def chunk_step(carry, chunk_idx):
-        last_st = carry
-        q_i = query[:, :, chunk_idx]
-        k_i = key[:, :, chunk_idx]
-        v_i = value_corrected[:, :, chunk_idx]
-        g_i = g[:, :, chunk_idx]
-        kcd_i = k_cumdecay[:, :, chunk_idx]
-        dm_i = decay_mask[:, :, chunk_idx]
+        st_BHAU = carry
+        q_j_BHLA = q_BHJLA[:, :, chunk_idx]
+        k_j_BHMA = k_BHJLA[:, :, chunk_idx]
+        v_j_BHLU = v_corrected_BHJLU[:, :, chunk_idx]
+        g_j_BHL = g_BHJL[:, :, chunk_idx]
+        kcd_j_BHLA = k_cumdecay_BHJLA[:, :, chunk_idx]
+        dm_j_LM = decay_mask_LM[:, :, chunk_idx]
 
-        intra_attn = (jnp.einsum("bhid,bhjd->bhij", q_i, k_i) * dm_i)
-        intra_attn = jnp.where(upper_mask_1, 0.0, intra_attn)
+        intra_BHLM = (jnp.einsum("BHLA,BHMA->BHLM", q_j_BHLA, k_j_BHMA) * dm_j_LM)
+        intra_BHLM = jnp.where(upper_mask_1_LM, 0.0, intra_BHLM)
 
-        v_prime = jnp.einsum("bhid,bhdv->bhiv", kcd_i, last_st)
-        v_new = v_i - v_prime
+        v_prime_BHLU = jnp.einsum("BHLA,BHAU->BHLU", kcd_j_BHLA, st_BHAU)
+        v_new_BHLU = v_j_BHLU - v_prime_BHLU
 
-        attn_inter = jnp.einsum("bhi,bhiv->bhiv", jnp.exp(g_i), jnp.einsum("bhid,bhdv->bhiv", q_i, last_st))
-        chunk_out = attn_inter + jnp.einsum("bhij,bhjv->bhiv", intra_attn, v_new)
+        inter_BHLU = jnp.einsum("BHL,BHLU->BHLU", jnp.exp(g_j_BHL), jnp.einsum("BHLA,BHAU->BHLU", q_j_BHLA, st_BHAU))
+        chunk_out_BHLU = inter_BHLU + jnp.einsum("BHLM,BHMU->BHLU", intra_BHLM, v_new_BHLU)
 
-        # Update recurrent state
-        g_last = g_i[:, :, -1, None, None]  # (B, H, 1, 1)
-        g_decay = jnp.exp(g_i[:, :, -1:] - g_i)  # (B, H, CS)
-        k_decayed = k_i * g_decay[..., None]  # (B, H, CS, Dk)
-        new_state = last_st * jnp.exp(g_last) + jnp.einsum("bhid,bhiv->bhdv", k_decayed, v_new)
+        g_last = g_j_BHL[:, :, -1, None, None]
+        g_decay_BHL = jnp.exp(g_j_BHL[:, :, -1:] - g_j_BHL)
+        k_decayed_BHMA = k_j_BHMA * g_decay_BHL[..., None]
+        new_st_BHAU = st_BHAU * jnp.exp(g_last) + jnp.einsum("BHMA,BHMU->BHAU", k_decayed_BHMA, v_new_BHLU)
 
-        return new_state, chunk_out
+        return new_st_BHAU, chunk_out_BHLU
 
-    last_state, core_out_chunks = jax.lax.scan(
-        chunk_step, last_state, jnp.arange(NC)
+    state_BHAU, core_out_chunks = jax.lax.scan(
+        chunk_step, state_BHAU, jnp.arange(J)
     )
-    # core_out_chunks: (NC, B, H, CS, Dv) → (B, H, NC, CS, Dv)
-    core_out = core_out_chunks.transpose(1, 2, 0, 3, 4)
+    # core_out_chunks: (J, B, H, L, U) -> (B, H, J, L, U)
+    core_out_BHJLU = core_out_chunks.transpose(1, 2, 0, 3, 4)
 
-    # Reshape and trim
-    core_out = core_out.reshape(B, H, -1, Dv)[:, :, :T, :]
-    return core_out.transpose(0, 2, 1, 3)  # (B, T, H, Dv)
+    core_out_BHTU = core_out_BHJLU.reshape(B, H, -1, U)[:, :, :T, :]
+    return core_out_BHTU.transpose(0, 2, 1, 3)  # (B, T, H, U)
 
-
-# Gated Delta Net Module
 
 class GatedDeltaNet(nnx.Module):
     """Gated Delta Net linear attention block."""
@@ -174,72 +169,55 @@ class GatedDeltaNet(nnx.Module):
 
         conv_dim = self.key_dim * 2 + self.value_dim
 
-        # Projections
-        self.in_proj_qkv = nnx.Linear(D, conv_dim, use_bias=False, rngs=rngs)
-        self.in_proj_z = nnx.Linear(D, self.value_dim, use_bias=False, rngs=rngs)
-        self.in_proj_b = nnx.Linear(D, self.num_v_heads, use_bias=False, rngs=rngs)
-        self.in_proj_a = nnx.Linear(D, self.num_v_heads, use_bias=False, rngs=rngs)
+        self.in_proj_qkv = nnx.Linear(D, conv_dim, use_bias=False, rngs=rngs, dtype=cfg.dtype)
+        self.in_proj_z = nnx.Linear(D, self.value_dim, use_bias=False, rngs=rngs, dtype=cfg.dtype)
+        self.in_proj_b = nnx.Linear(D, self.num_v_heads, use_bias=False, rngs=rngs, dtype=cfg.dtype)
+        self.in_proj_a = nnx.Linear(D, self.num_v_heads, use_bias=False, rngs=rngs, dtype=cfg.dtype)
 
-        # Depthwise causal conv1d — stored as (conv_dim, kernel_size)
         self.conv_weight = nnx.Param(
             nnx.initializers.lecun_normal()(rngs.params(), (conv_dim, self.conv_kernel_size))
         )
 
-        # Gating parameters
         self.dt_bias = nnx.Param(jnp.ones(self.num_v_heads))
         self.A_log = nnx.Param(jnp.log(jax.random.uniform(rngs.params(), (self.num_v_heads,)) * 16))
 
-        # Output norm + projection
         self.norm = RMSNormGated(self.head_v_dim, cfg.rms_norm_eps, rngs=rngs)
-        self.out_proj = nnx.Linear(self.value_dim, D, use_bias=False, rngs=rngs)
+        self.out_proj = nnx.Linear(self.value_dim, D, use_bias=False, rngs=rngs, dtype=cfg.dtype)
 
     @jax.named_scope("gated_delta_net")
-    def __call__(self, x: jax.Array, attention_mask: jax.Array | None = None) -> jax.Array:
-        """Forward pass (prefill, no cache).
+    def __call__(self, hidden_BTD: jax.Array, attention_mask_BT: jax.Array | None = None) -> jax.Array:
+        if attention_mask_BT is not None and attention_mask_BT.shape[1] > 1:
+            hidden_BTD = hidden_BTD * attention_mask_BT[:, :, None]
 
-        Args:
-            x: (B, T, D)
-            attention_mask: (B, T) boolean — optional padding mask
-        """
-        if attention_mask is not None and attention_mask.shape[1] > 1:
-            x = x * attention_mask[:, :, None]
+        B, T, _ = hidden_BTD.shape
 
-        B, T, _ = x.shape
+        mixed_qkv_BCT = self.in_proj_qkv(hidden_BTD).transpose(0, 2, 1)
+        z_BTHU = self.in_proj_z(hidden_BTD).reshape(B, T, self.num_v_heads, self.head_v_dim)
+        b_BTH = self.in_proj_b(hidden_BTD)
+        a_BTH = self.in_proj_a(hidden_BTD)
 
-        # Project
-        mixed_qkv = self.in_proj_qkv(x).transpose(0, 2, 1)  # (B, conv_dim, T)
-        z = self.in_proj_z(x).reshape(B, T, self.num_v_heads, self.head_v_dim)
-        b = self.in_proj_b(x)  # (B, T, num_v_heads)
-        a = self.in_proj_a(x)  # (B, T, num_v_heads)
+        mixed_qkv_BCT = nnx.silu(_causal_depthwise_conv1d(mixed_qkv_BCT, self.conv_weight[...]))
+        mixed_qkv_BTC = mixed_qkv_BCT.transpose(0, 2, 1)
 
-        # Causal depthwise conv1d + SiLU
-        mixed_qkv = nnx.silu(_causal_depthwise_conv1d(mixed_qkv, self.conv_weight[...]))
-        mixed_qkv = mixed_qkv.transpose(0, 2, 1)  # (B, T, conv_dim)
-
-        # Split into Q, K, V
-        query, key, value = jnp.split(
-            mixed_qkv, [self.key_dim, self.key_dim * 2], axis=-1
+        q_BTHA, k_BTHA, v_BTHU = jnp.split(
+            mixed_qkv_BTC, [self.key_dim, self.key_dim * 2], axis=-1
         )
-        query = query.reshape(B, T, self.num_k_heads, self.head_k_dim)
-        key = key.reshape(B, T, self.num_k_heads, self.head_k_dim)
-        value = value.reshape(B, T, self.num_v_heads, self.head_v_dim)
+        q_BTHA = q_BTHA.reshape(B, T, self.num_k_heads, self.head_k_dim)
+        k_BTHA = k_BTHA.reshape(B, T, self.num_k_heads, self.head_k_dim)
+        v_BTHU = v_BTHU.reshape(B, T, self.num_v_heads, self.head_v_dim)
 
-        # Compute beta and gate
-        beta = jax.nn.sigmoid(b)  # (B, T, num_v_heads)
-        A = -jnp.exp(self.A_log[...].astype(jnp.float32))
-        g = A * jax.nn.softplus(a.astype(jnp.float32) + self.dt_bias[...])  # (B, T, num_v_heads)
+        beta_BTH = jax.nn.sigmoid(b_BTH)
+        A_H = -jnp.exp(self.A_log[...].astype(jnp.float32))
+        g_BTH = A_H * jax.nn.softplus(a_BTH.astype(jnp.float32) + self.dt_bias[...])
 
-        # GQA expansion for delta net
         if self.gqa_factor > 1:
-            query = jnp.repeat(query, self.gqa_factor, axis=2)
-            key = jnp.repeat(key, self.gqa_factor, axis=2)
+            q_BTHA = jnp.repeat(q_BTHA, self.gqa_factor, axis=2)
+            k_BTHA = jnp.repeat(k_BTHA, self.gqa_factor, axis=2)
 
-        # Chunked delta rule
-        core_out = chunk_gated_delta_rule(query, key, value, g, beta)
+        core_out_BTHU = chunk_gated_delta_rule(q_BTHA, k_BTHA, v_BTHU, g_BTH, beta_BTH)
 
-        # Gated norm + output projection
-        core_out_flat = core_out.reshape(-1, self.head_v_dim)
-        z_flat = z.reshape(-1, self.head_v_dim)
-        normed = self.norm(core_out_flat, z_flat)
-        normed = normed.reshape(B, T, -1)
-        return self.out_proj(normed)
+        core_flat = core_out_BTHU.reshape(-1, self.head_v_dim)
+        z_flat = z_BTHU.reshape(-1, self.head_v_dim)
+        normed = self.norm(core_flat, z_flat)
+        normed_BTD = normed.reshape(B, T, -1)
+        return self.out_proj(normed_BTD)

@@ -29,6 +29,7 @@ def init_model(model_or_id: str | VLMConfig, rng: jax.Array) -> tuple[nnx.Module
     """Initialize a vision-language model."""
     if isinstance(model_or_id, str):
         key = model_or_id.lower()
+        # FIXME (f.srambical): this should not be heuristics-based
         if "qwen3.5" in key or "qwen3_5" in key:
             cfg = make_qwen3_5_config(model_or_id)
             return Qwen3_5ForConditionalGeneration(cfg, rngs=nnx.Rngs(rng)), cfg
@@ -45,43 +46,43 @@ def init_model(model_or_id: str | VLMConfig, rng: jax.Array) -> tuple[nnx.Module
 
 def forward(
     model: nnx.Module,
-    tokens: jax.Array,
+    token_ids_BT: jax.Array,
     pad_id: int,
     cfg,
     *,
-    attention_mask: jax.Array | None = None,
+    attention_mask_BT: jax.Array | None = None,
     pixel_values: jax.Array | None = None,
     image_grid_thw: jax.Array | None = None,
-    position_ids: jax.Array | None = None,
+    position_ids_ZBT: jax.Array | None = None,
 ):
     """Forward pass for VLMs; supports text-only or multimodal batches."""
-    if attention_mask is None:
-        attention_mask = (tokens != pad_id).astype(jnp.int32)
+    if attention_mask_BT is None:
+        attention_mask_BT = (token_ids_BT != pad_id).astype(jnp.int32)
 
     if _is_qwen3_5_vlm(model):
-        segment_ids = attention_mask.astype(jnp.int32)
-        logits, aux_loss = model(
-            tokens,
-            segment_ids,
+        segment_ids_BT = attention_mask_BT.astype(jnp.int32)
+        logits_BTV, aux_loss = model(
+            token_ids_BT,
+            segment_ids_BT,
             None,
             jnp.array(0, dtype=jnp.int32),
             pixel_values=pixel_values,
             image_grid_thw=image_grid_thw,
-            position_ids=position_ids,
+            position_ids_ZBT=position_ids_ZBT,
         )
-        return logits, aux_loss
+        return logits_BTV, aux_loss
 
     if _is_qwen3_vl(model):
         outputs = model(
-            tokens,
-            attention_mask,
-            position_ids=position_ids,
+            token_ids_BT,
+            attention_mask_BT,
+            position_ids_ZBT=position_ids_ZBT,
             pixel_values=pixel_values,
             image_grid_thw=image_grid_thw,
         )
         if cfg.variant == "moe":
-            logits, aux_loss = outputs
-            return logits, aux_loss
+            logits_BTV, aux_loss = outputs
+            return logits_BTV, aux_loss
         else:
             return outputs, jnp.array(0.0, dtype=jnp.float32)
 

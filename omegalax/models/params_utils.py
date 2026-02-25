@@ -99,14 +99,14 @@ def init_expert_buffers(
     moe_dim: int,
     is_moe_layer: Callable[[int], bool],
 ) -> tuple[dict[tuple[int, str], np.ndarray], dict[tuple[int, str], int]]:
-    """Pre-allocate expert weight buffers (E, D, F) / (E, F, D). Returns (expert_arrays, expert_fill)."""
+    """Pre-allocate expert weight buffers: gate/up are (E, D, F), down is (E, F, D)."""
     expert_arrays: dict[tuple[int, str], np.ndarray] = {}
     expert_fill: dict[tuple[int, str], int] = {}
     for layer_idx in range(num_layers):
         if is_moe_layer(layer_idx):
-            expert_arrays[(layer_idx, "gate_proj")] = np.empty((num_experts, emb_dim, moe_dim), dtype=np.float32)
-            expert_arrays[(layer_idx, "up_proj")] = np.empty((num_experts, emb_dim, moe_dim), dtype=np.float32)
-            expert_arrays[(layer_idx, "down_proj")] = np.empty((num_experts, moe_dim, emb_dim), dtype=np.float32)
+            expert_arrays[(layer_idx, "gate_proj")] = np.empty((num_experts, emb_dim, moe_dim), dtype=np.float32)  # EDF
+            expert_arrays[(layer_idx, "up_proj")] = np.empty((num_experts, emb_dim, moe_dim), dtype=np.float32)  # EDF
+            expert_arrays[(layer_idx, "down_proj")] = np.empty((num_experts, moe_dim, emb_dim), dtype=np.float32)  # EFD
             for proj in ("gate_proj", "up_proj", "down_proj"):
                 expert_fill[(layer_idx, proj)] = 0
     return expert_arrays, expert_fill
@@ -129,10 +129,10 @@ def handle_moe_key(
     if gate_up_m:
         layer_idx = int(gate_up_m.group(1))
         if (layer_idx, "gate_proj") in expert_arrays:
-            tensor = np.asarray(get_tensor(torch_key))
-            gate, up = np.split(tensor, 2, axis=1)
-            expert_arrays[(layer_idx, "gate_proj")] = np.swapaxes(gate.astype(np.float32), 1, 2)
-            expert_arrays[(layer_idx, "up_proj")] = np.swapaxes(up.astype(np.float32), 1, 2)
+            fused_E2FD = np.asarray(get_tensor(torch_key))
+            gate_EFD, up_EFD = np.split(fused_E2FD, 2, axis=1)
+            expert_arrays[(layer_idx, "gate_proj")] = np.swapaxes(gate_EFD.astype(np.float32), 1, 2)  # -> EDF
+            expert_arrays[(layer_idx, "up_proj")] = np.swapaxes(up_EFD.astype(np.float32), 1, 2)  # -> EDF
             expert_fill[(layer_idx, "gate_proj")] = num_experts
             expert_fill[(layer_idx, "up_proj")] = num_experts
         else:
@@ -143,8 +143,8 @@ def handle_moe_key(
     if down_m:
         layer_idx = int(down_m.group(1))
         if (layer_idx, "down_proj") in expert_arrays:
-            tensor = np.asarray(get_tensor(torch_key))
-            expert_arrays[(layer_idx, "down_proj")] = np.swapaxes(tensor.astype(np.float32), 1, 2)
+            down_EDF = np.asarray(get_tensor(torch_key))
+            expert_arrays[(layer_idx, "down_proj")] = np.swapaxes(down_EDF.astype(np.float32), 1, 2)  # -> EFD
             expert_fill[(layer_idx, "down_proj")] = num_experts
         else:
             unmatched.append(torch_key)
@@ -225,24 +225,24 @@ def write_moe_experts_to_hf(
         if not is_moe_layer(layer_idx):
             continue
         params = expert_params.get(layer_idx, {})
-        gate = params.get("gate_proj")
-        up = params.get("up_proj")
-        down = params.get("down_proj")
-        if gate is None or up is None or down is None:
+        gate_EDF = params.get("gate_proj")
+        up_EDF = params.get("up_proj")
+        down_EFD = params.get("down_proj")
+        if gate_EDF is None or up_EDF is None or down_EFD is None:
             raise RuntimeError(
                 f"Missing expert weights for layer {layer_idx}: "
-                f"gate={gate is not None}, up={up is not None}, down={down is not None}"
+                f"gate={gate_EDF is not None}, up={up_EDF is not None}, down={down_EFD is not None}"
             )
-        gate_block = np.swapaxes(gate, 1, 2)
-        up_block = np.swapaxes(up, 1, 2)
-        gate_up = np.concatenate([gate_block, up_block], axis=1)
-        hf_tensors[f"{hf_prefix}.{layer_idx}.mlp.experts.gate_up_proj"] = gate_up.astype(np.float32)
-        down_block = np.swapaxes(down, 1, 2)
-        hf_tensors[f"{hf_prefix}.{layer_idx}.mlp.experts.down_proj"] = down_block.astype(np.float32)
-        router = router_params.get(layer_idx)
-        if router is None:
+        gate_EFD = np.swapaxes(gate_EDF, 1, 2)
+        up_EFD = np.swapaxes(up_EDF, 1, 2)
+        gate_up_E2FD = np.concatenate([gate_EFD, up_EFD], axis=1)
+        hf_tensors[f"{hf_prefix}.{layer_idx}.mlp.experts.gate_up_proj"] = gate_up_E2FD.astype(np.float32)
+        down_EDF = np.swapaxes(down_EFD, 1, 2)
+        hf_tensors[f"{hf_prefix}.{layer_idx}.mlp.experts.down_proj"] = down_EDF.astype(np.float32)
+        router_DE = router_params.get(layer_idx)
+        if router_DE is None:
             raise RuntimeError(f"Missing router weights for MoE layer {layer_idx}")
-        hf_tensors[f"{hf_prefix}.{layer_idx}.mlp.gate.weight"] = router.T.astype(np.float32)
+        hf_tensors[f"{hf_prefix}.{layer_idx}.mlp.gate.weight"] = router_DE.T.astype(np.float32)
 
 
 def find_safetensors(file_dir: str | epath.Path) -> list[epath.Path]:

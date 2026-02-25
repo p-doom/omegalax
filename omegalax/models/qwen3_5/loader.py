@@ -49,8 +49,7 @@ def _assert_config(cfg: Qwen3_5Config, hf_cfg: dict):
     _require("moe_intermediate_size", cfg.text_config.moe_intermediate_size, txt["moe_intermediate_size"])
     _require("rope_theta", cfg.text_config.rope_theta, rope_params["rope_theta"])
     _require("mrope_section", tuple(cfg.text_config.mrope_section), tuple(rope_params["mrope_section"]))
-    if "mrope_interleaved" in rope_params:
-        _require("mrope_interleaved", cfg.text_config.mrope_interleaved, rope_params["mrope_interleaved"])
+    _require("mrope_interleaved", cfg.text_config.mrope_interleaved, rope_params["mrope_interleaved"])
 
     _require("vision.hidden_size", cfg.vision_config.hidden_size, vis["hidden_size"])
     _require("vision.depth", cfg.vision_config.depth, vis["depth"])

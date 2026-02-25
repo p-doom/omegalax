@@ -5,6 +5,8 @@ from __future__ import annotations
 import dataclasses
 from typing import Any
 
+import jax.numpy as jnp
+
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class Qwen3VLVisionConfig:
@@ -20,6 +22,7 @@ class Qwen3VLVisionConfig:
     hidden_act: str
     num_position_embeddings: int
     deepstack_visual_indexes: tuple[int, ...]
+    dtype: Any = jnp.float32
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -46,6 +49,7 @@ class Qwen3VLConfig:
     mlp_only_layers: tuple[int, ...] = dataclasses.field(default_factory=tuple)
     decoder_sparse_step: int = 1
     norm_topk_prob: bool = True
+    dtype: Any = jnp.bfloat16
 
     def is_moe_layer(self, layer_idx: int) -> bool:
         return (
@@ -101,7 +105,7 @@ _QWEN3_VL_SPECS: dict[str, dict[str, Any]] = {
         "num_layers": 2,
         "num_heads": 4,
         "head_dim": 32,
-        "num_kv_heads": 4,
+        "num_kv_heads": 2,
         "rope_theta": 1_000_000,
         "norm_eps": 1e-6,
         "tie_word_embeddings": False,
@@ -111,7 +115,7 @@ _QWEN3_VL_SPECS: dict[str, dict[str, Any]] = {
         "vision_start_token_id": 4,
         "vision": {
             "hidden_size": 64,
-            "intermediate_size": 256,
+            "intermediate_size": 128,
             "num_heads": 4,
             "patch_size": 14,
             "temporal_patch_size": 2,
@@ -231,12 +235,34 @@ def make_vl_config(model_id: str) -> Qwen3VLConfig:
     )
 
 
+def _hf_torch_dtype_to_jnp(torch_dtype: str | None) -> Any:
+    # FIXME (f.srambical): find the ground-truth hf dtype strings and raise an error on others
+    """Map HuggingFace torch_dtype string to jnp.dtype. Defaults to bfloat16 for text."""
+    if torch_dtype is None:
+        return jnp.bfloat16
+    kind = (torch_dtype if isinstance(torch_dtype, str) else str(torch_dtype)).lower()
+    if "bfloat16" in kind or "bf16" in kind:
+        return jnp.bfloat16
+    if "float32" in kind or "fp32" in kind:
+        return jnp.float32
+    if "float16" in kind or "fp16" in kind:
+        return jnp.float16
+    return jnp.bfloat16
+
+
 def make_vl_config_from_hf(hf_cfg: dict[str, Any]) -> Qwen3VLConfig:
     """Build a Qwen3VLConfig from a HuggingFace config.json dict."""
     vis = hf_cfg["vision_config"]
     txt = hf_cfg["text_config"]
 
-    rope_params = txt["rope_parameters"]
+    rope_params = txt.get("rope_parameters") or txt.get("rope_scaling") or {}
+    torch_dtype = hf_cfg.get("torch_dtype")
+    text_dtype = _hf_torch_dtype_to_jnp(torch_dtype)
+    vision_dtype = (
+        _hf_torch_dtype_to_jnp(vis.get("torch_dtype"))
+        if vis.get("torch_dtype") is not None
+        else (text_dtype if torch_dtype is not None else jnp.float32)
+    )
 
     return Qwen3VLConfig(
         num_layers=txt["num_hidden_layers"],
@@ -246,13 +272,13 @@ def make_vl_config_from_hf(hf_cfg: dict[str, Any]) -> Qwen3VLConfig:
         num_heads=txt["num_attention_heads"],
         head_dim=txt["head_dim"],
         num_kv_heads=txt["num_key_value_heads"],
-        rope_theta=rope_params["rope_theta"],
+        rope_theta=rope_params.get("rope_theta") or txt["rope_theta"],
         norm_eps=txt["rms_norm_eps"],
         tie_word_embeddings=hf_cfg["tie_word_embeddings"],
         mrope_section=tuple(rope_params["mrope_section"]),
         # MoE fields are absent in dense configs.
         moe_intermediate_size=txt.get("moe_intermediate_size", 0),
-        num_experts=txt.get("num_experts", 0),
+        num_experts=txt.get("num_experts") or txt.get("num_local_experts", 0),
         num_experts_per_tok=txt.get("num_experts_per_tok", 0),
         mlp_only_layers=tuple(txt.get("mlp_only_layers", ())),
         decoder_sparse_step=txt.get("decoder_sparse_step", 1),
@@ -260,6 +286,7 @@ def make_vl_config_from_hf(hf_cfg: dict[str, Any]) -> Qwen3VLConfig:
         image_token_id=hf_cfg["image_token_id"],
         video_token_id=hf_cfg["video_token_id"],
         vision_start_token_id=hf_cfg["vision_start_token_id"],
+        dtype=text_dtype,
         vision=Qwen3VLVisionConfig(
             hidden_size=vis["hidden_size"],
             intermediate_size=vis["intermediate_size"],
@@ -273,5 +300,6 @@ def make_vl_config_from_hf(hf_cfg: dict[str, Any]) -> Qwen3VLConfig:
             hidden_act=vis["hidden_act"],
             num_position_embeddings=vis["num_position_embeddings"],
             deepstack_visual_indexes=tuple(vis["deepstack_visual_indexes"]),
+            dtype=vision_dtype,
         ),
     )

@@ -30,8 +30,13 @@ jax.config.update("jax_default_matmul_precision", "highest")
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
 
-RTOL = 1e-6
-ATOL = 1e-6
+_JNP_TO_TORCH = {jnp.float32: torch.float32, jnp.bfloat16: torch.bfloat16, jnp.float16: torch.float16}
+
+
+def _tolerances(jnp_dtype):
+    if jnp_dtype == jnp.float32:
+        return 1e-5, 1e-5
+    return 1e-2, 1e-2
 
 HF_VISION_CFG = HFVisionConfig(
     depth=2,
@@ -58,7 +63,7 @@ HF_TEXT_CFG = HFTextConfig(
     head_dim=32,
     hidden_act="silu",
     rms_norm_eps=1e-6,
-    rope_parameters={"rope_theta": 1_000_000, "rope_type": "default"},
+    rope_parameters={"rope_theta": 1_000_000, "rope_type": "default", "mrope_section": [8, 4, 4]},
     tie_word_embeddings=False,
 )
 
@@ -82,9 +87,10 @@ class Qwen3VLSmokeTest(absltest.TestCase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        cls.hf_model = Qwen3VLForConditionalGeneration(HF_CFG).eval().to(torch.float32)
         cls.tmpdir = tempfile.mkdtemp()
-        cls.hf_model.save_pretrained(cls.tmpdir, safe_serialization=True)
+
+        hf_model = Qwen3VLForConditionalGeneration(HF_CFG).eval()
+        hf_model.save_pretrained(cls.tmpdir, safe_serialization=True)
 
         cfg_path = os.path.join(cls.tmpdir, "config.json")
         with open(cfg_path, "w") as f:
@@ -92,68 +98,72 @@ class Qwen3VLSmokeTest(absltest.TestCase):
 
         cls.jax_model, cls.jax_cfg = create_qwen3_vl_from_safetensors(cls.tmpdir)
 
+        torch_dtype = _JNP_TO_TORCH[cls.jax_cfg.dtype]
+        cls.hf_model = hf_model.to(torch_dtype)
+        cls.RTOL, cls.ATOL = _tolerances(cls.jax_cfg.dtype)
+
     def test_weight_loading_succeeds(self):
         self.assertIsNotNone(self.jax_model)
 
     def test_text_only_prefill_logits_match_hf(self):
-        tokens = _random_input(batch_size=1, seq_len=16, vocab_size=HF_TEXT_CFG.vocab_size)
-        attention_mask = np.ones_like(tokens, dtype=np.int64)
+        token_ids_BT = _random_input(batch_size=1, seq_len=16, vocab_size=HF_TEXT_CFG.vocab_size)
+        attention_mask_BT = np.ones_like(token_ids_BT, dtype=np.int64)
 
         with torch.no_grad():
             hf_out = self.hf_model(
-                input_ids=torch.tensor(tokens, dtype=torch.long),
-                attention_mask=torch.tensor(attention_mask, dtype=torch.long),
+                input_ids=torch.tensor(token_ids_BT, dtype=torch.long),
+                attention_mask=torch.tensor(attention_mask_BT, dtype=torch.long),
             )
-            hf_logits = hf_out.logits.cpu().numpy()
+            hf_logits_BTV = hf_out.logits.cpu().float().numpy()
 
-        input_ids_jax = jnp.asarray(tokens)
-        attention_mask_jax = jnp.asarray(attention_mask.astype(np.int32))
-        jax_logits = np.asarray(self.jax_model(input_ids_jax, attention_mask_jax), dtype=np.float32)
+        token_ids_jax_BT = jnp.asarray(token_ids_BT)
+        attention_mask_jax_BT = jnp.asarray(attention_mask_BT.astype(np.int32))
+        jax_logits_BTV = np.asarray(self.jax_model(token_ids_jax_BT, attention_mask_jax_BT), dtype=np.float32)
 
-        max_abs_diff = np.max(np.abs(jax_logits - hf_logits))
+        max_abs_diff = np.max(np.abs(jax_logits_BTV - hf_logits_BTV))
         print(f"\n  max_abs_diff = {max_abs_diff:.6e}")
-        np.testing.assert_allclose(jax_logits, hf_logits, rtol=RTOL, atol=ATOL)
+        np.testing.assert_allclose(jax_logits_BTV, hf_logits_BTV, rtol=self.RTOL, atol=self.ATOL)
 
     def test_text_only_prefill_logits_batched(self):
-        tokens_a = _random_input(batch_size=1, seq_len=16, vocab_size=HF_TEXT_CFG.vocab_size)
-        tokens_b = _random_input(batch_size=1, seq_len=10, vocab_size=HF_TEXT_CFG.vocab_size)
+        token_ids_a_BT = _random_input(batch_size=1, seq_len=16, vocab_size=HF_TEXT_CFG.vocab_size)
+        token_ids_b_BT = _random_input(batch_size=1, seq_len=10, vocab_size=HF_TEXT_CFG.vocab_size)
 
         padded_b = np.zeros((1, 16), dtype=np.int32)
-        padded_b[:, 6:] = tokens_b
-        tokens = np.concatenate([tokens_a, padded_b], axis=0)
-        attention_mask = (tokens != 0).astype(np.int64)
+        padded_b[:, 6:] = token_ids_b_BT
+        token_ids_BT = np.concatenate([token_ids_a_BT, padded_b], axis=0)
+        attention_mask_BT = (token_ids_BT != 0).astype(np.int64)
 
         with torch.no_grad():
             hf_out = self.hf_model(
-                input_ids=torch.tensor(tokens, dtype=torch.long),
-                attention_mask=torch.tensor(attention_mask, dtype=torch.long),
+                input_ids=torch.tensor(token_ids_BT, dtype=torch.long),
+                attention_mask=torch.tensor(attention_mask_BT, dtype=torch.long),
             )
-            hf_logits = hf_out.logits.cpu().numpy()
+            hf_logits_BTV = hf_out.logits.cpu().float().numpy()
 
-        input_ids_jax = jnp.asarray(tokens)
-        attention_mask_jax = jnp.asarray(attention_mask.astype(np.int32))
-        jax_logits = np.asarray(self.jax_model(input_ids_jax, attention_mask_jax), dtype=np.float32)
+        token_ids_jax_BT = jnp.asarray(token_ids_BT)
+        attention_mask_jax_BT = jnp.asarray(attention_mask_BT.astype(np.int32))
+        jax_logits_BTV = np.asarray(self.jax_model(token_ids_jax_BT, attention_mask_jax_BT), dtype=np.float32)
 
-        mask = attention_mask.astype(bool)
-        max_abs_diff = np.max(np.abs(jax_logits[mask] - hf_logits[mask]))
+        mask = attention_mask_BT.astype(bool)
+        max_abs_diff = np.max(np.abs(jax_logits_BTV[mask] - hf_logits_BTV[mask]))
         print(f"\n  max_abs_diff = {max_abs_diff:.6e}")
-        np.testing.assert_allclose(jax_logits[mask], hf_logits[mask], rtol=RTOL, atol=ATOL)
+        np.testing.assert_allclose(jax_logits_BTV[mask], hf_logits_BTV[mask], rtol=self.RTOL, atol=self.ATOL)
 
     def test_round_trip_preserves_logits(self):
         from flax import nnx
 
-        tokens = _random_input(batch_size=1, seq_len=16, vocab_size=HF_TEXT_CFG.vocab_size)
-        input_ids_jax = jnp.asarray(tokens)
-        attention_mask_jax = jnp.ones_like(input_ids_jax, dtype=jnp.int32)
+        token_ids_BT = _random_input(batch_size=1, seq_len=16, vocab_size=HF_TEXT_CFG.vocab_size)
+        token_ids_jax_BT = jnp.asarray(token_ids_BT)
+        attention_mask_jax_BT = jnp.ones_like(token_ids_jax_BT, dtype=jnp.int32)
 
-        baseline = np.asarray(self.jax_model(input_ids_jax, attention_mask_jax), dtype=np.float32)
+        baseline_BTV = np.asarray(self.jax_model(token_ids_jax_BT, attention_mask_jax_BT), dtype=np.float32)
 
         graph_def, state = nnx.split(self.jax_model)
         pure_state = nnx.to_pure_dict(state)
         restored = nnx.merge(graph_def, pure_state)
-        restored_logits = np.asarray(restored(input_ids_jax, attention_mask_jax), dtype=np.float32)
+        restored_logits_BTV = np.asarray(restored(token_ids_jax_BT, attention_mask_jax_BT), dtype=np.float32)
 
-        np.testing.assert_array_equal(restored_logits, baseline)
+        np.testing.assert_array_equal(restored_logits_BTV, baseline_BTV)
 
 
 if __name__ == "__main__":

@@ -20,8 +20,8 @@ class RMSNorm(nnx.Module):
         dtype = x.dtype
         x_f32 = x.astype(jnp.float32)
         variance = jnp.mean(x_f32 ** 2, axis=-1, keepdims=True)
-        x_normed = x_f32 * jax.lax.rsqrt(variance + self.eps)
-        return ((1.0 + self.weight[...].astype(jnp.float32)) * x_normed).astype(dtype)
+        normed = x_f32 * jax.lax.rsqrt(variance + self.eps)
+        return ((1.0 + self.weight[...].astype(jnp.float32)) * normed).astype(dtype)
 
 
 class RMSNormGated(nnx.Module):
@@ -36,8 +36,8 @@ class RMSNormGated(nnx.Module):
         dtype = x.dtype
         x_f32 = x.astype(jnp.float32)
         variance = jnp.mean(x_f32 ** 2, axis=-1, keepdims=True)
-        x_normed = x_f32 * jax.lax.rsqrt(variance + self.eps)
-        out = self.weight[...] * x_normed.astype(dtype)
+        normed = x_f32 * jax.lax.rsqrt(variance + self.eps)
+        out = self.weight[...] * normed.astype(dtype)
         out = out * nnx.silu(gate.astype(jnp.float32))
         return out.astype(dtype)
 
@@ -56,5 +56,5 @@ class LayerNorm(nnx.Module):
         x_f32 = x.astype(jnp.float32)
         mean = jnp.mean(x_f32, axis=-1, keepdims=True)
         var = jnp.mean((x_f32 - mean) ** 2, axis=-1, keepdims=True)
-        x_normed = (x_f32 - mean) * jax.lax.rsqrt(var + self.eps)
-        return (self.weight[...] * x_normed + self.bias[...]).astype(dtype)
+        normed = (x_f32 - mean) * jax.lax.rsqrt(var + self.eps)
+        return (self.weight[...] * normed + self.bias[...]).astype(dtype)

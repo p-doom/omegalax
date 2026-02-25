@@ -21,8 +21,8 @@ class LayerNorm(nnx.Module):
     def __call__(self, x: jax.Array) -> jax.Array:
         mean = jnp.mean(x, axis=-1, keepdims=True)
         var = jnp.var(x, axis=-1, keepdims=True)
-        x_norm = (x - mean) * jax.lax.rsqrt(var + self.eps)
-        return self.scale[...] * x_norm + self.bias[...]
+        normed = (x - mean) * jax.lax.rsqrt(var + self.eps)
+        return self.scale[...] * normed + self.bias[...]
 
 
 class VisionPatchEmbed(nnx.Module):
@@ -30,22 +30,22 @@ class VisionPatchEmbed(nnx.Module):
 
     def __init__(self, config: Qwen3VLVisionConfig, *, rngs: nnx.Rngs):
         in_features = config.in_channels * config.temporal_patch_size * config.patch_size**2
-        self.proj = nnx.Linear(in_features, config.hidden_size, use_bias=True, rngs=rngs, dtype=jnp.float32)
+        self.proj = nnx.Linear(in_features, config.hidden_size, use_bias=True, rngs=rngs, dtype=config.dtype)
         self.in_features = in_features
 
-    def __call__(self, x: jax.Array) -> jax.Array:
-        x = x.reshape(-1, self.in_features)
-        return self.proj(x)
+    def __call__(self, pixels: jax.Array) -> jax.Array:
+        flat = pixels.reshape(-1, self.in_features)
+        return self.proj(flat)
 
 
 class VisionMLP(nnx.Module):
     def __init__(self, config: Qwen3VLVisionConfig, *, rngs: nnx.Rngs):
-        self.fc1 = nnx.Linear(config.hidden_size, config.intermediate_size, use_bias=True, rngs=rngs, dtype=jnp.float32)
-        self.fc2 = nnx.Linear(config.intermediate_size, config.hidden_size, use_bias=True, rngs=rngs, dtype=jnp.float32)
+        self.fc1 = nnx.Linear(config.hidden_size, config.intermediate_size, use_bias=True, rngs=rngs, dtype=config.dtype)
+        self.fc2 = nnx.Linear(config.intermediate_size, config.hidden_size, use_bias=True, rngs=rngs, dtype=config.dtype)
         self.act_fn = lambda x: jax.nn.gelu(x, approximate=True)
 
-    def __call__(self, x: jax.Array) -> jax.Array:
-        return self.fc2(self.act_fn(self.fc1(x)))
+    def __call__(self, hidden_ND: jax.Array) -> jax.Array:
+        return self.fc2(self.act_fn(self.fc1(hidden_ND)))
 
 
 def _rotate_half(x: jax.Array) -> jax.Array:
@@ -55,24 +55,21 @@ def _rotate_half(x: jax.Array) -> jax.Array:
 
 
 def apply_rotary_pos_emb_vision(
-    q: jax.Array, k: jax.Array, cos: jax.Array, sin: jax.Array
+    q_NHK: jax.Array, k_NHK: jax.Array, cos_NK: jax.Array, sin_NK: jax.Array
 ) -> tuple[jax.Array, jax.Array]:
     """Apply 2D rotary embeddings to vision query/key.
 
-    Uses full-size cos/sin (head_dim), matching HF's convention where
-    emb = cat([freqs, freqs]) before taking cos/sin.
-
     Args:
-        q, k: (seq_len, num_heads, head_dim)
-        cos, sin: (seq_len, head_dim)
+        q_NHK, k_NHK: (seq_len, num_heads, head_dim)
+        cos_NK, sin_NK: (seq_len, head_dim)
     """
-    orig_dtype = q.dtype
-    q, k = q.astype(jnp.float32), k.astype(jnp.float32)
-    cos = cos[:, None, :].astype(jnp.float32)
-    sin = sin[:, None, :].astype(jnp.float32)
-    q_rot = (q * cos) + (_rotate_half(q) * sin)
-    k_rot = (k * cos) + (_rotate_half(k) * sin)
-    return q_rot.astype(orig_dtype), k_rot.astype(orig_dtype)
+    orig_dtype = q_NHK.dtype
+    q_NHK, k_NHK = q_NHK.astype(jnp.float32), k_NHK.astype(jnp.float32)
+    cos_NK = cos_NK[:, None, :].astype(jnp.float32)
+    sin_NK = sin_NK[:, None, :].astype(jnp.float32)
+    q_rot_NHK = (q_NHK * cos_NK) + (_rotate_half(q_NHK) * sin_NK)
+    k_rot_NHK = (k_NHK * cos_NK) + (_rotate_half(k_NHK) * sin_NK)
+    return q_rot_NHK.astype(orig_dtype), k_rot_NHK.astype(orig_dtype)
 
 
 class VisionAttention(nnx.Module):
@@ -81,27 +78,27 @@ class VisionAttention(nnx.Module):
         self.num_heads = config.num_heads
         self.head_dim = config.hidden_size // config.num_heads
         self.scale = self.head_dim**-0.5
-        self.qkv = nnx.Linear(config.hidden_size, config.hidden_size * 3, use_bias=True, rngs=rngs, dtype=jnp.float32)
-        self.proj = nnx.Linear(config.hidden_size, config.hidden_size, use_bias=True, rngs=rngs, dtype=jnp.float32)
+        self.qkv = nnx.Linear(config.hidden_size, config.hidden_size * 3, use_bias=True, rngs=rngs, dtype=config.dtype)
+        self.proj = nnx.Linear(config.hidden_size, config.hidden_size, use_bias=True, rngs=rngs, dtype=config.dtype)
 
-    def __call__(self, x: jax.Array, cu_seqlens: list[int], cos: jax.Array, sin: jax.Array) -> jax.Array:
-        seq_len = x.shape[0]
-        qkv = self.qkv(x).reshape(seq_len, 3, self.num_heads, self.head_dim)
-        q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]
+    def __call__(self, hidden_ND: jax.Array, cu_seqlens: list[int], cos_NK: jax.Array, sin_NK: jax.Array) -> jax.Array:
+        N = hidden_ND.shape[0]
+        qkv = self.qkv(hidden_ND).reshape(N, 3, self.num_heads, self.head_dim)
+        q_NHK, k_NHK, v_NHK = qkv[:, 0], qkv[:, 1], qkv[:, 2]
 
-        q, k = apply_rotary_pos_emb_vision(q, k, cos, sin)
+        q_NHK, k_NHK = apply_rotary_pos_emb_vision(q_NHK, k_NHK, cos_NK, sin_NK)
 
         outputs = []
         for i in range(len(cu_seqlens) - 1):
             start, end = cu_seqlens[i], cu_seqlens[i + 1]
-            q_c, k_c, v_c = q[start:end], k[start:end], v[start:end]
-            attn = jnp.einsum("snh,tnh->nst", q_c, k_c) * self.scale
-            attn = jax.nn.softmax(attn.astype(jnp.float32), axis=-1).astype(q_c.dtype)
-            out = jnp.einsum("nst,tnh->snh", attn, v_c)
-            outputs.append(out)
+            q_c, k_c, v_c = q_NHK[start:end], k_NHK[start:end], v_NHK[start:end]
+            logits_HNN = jnp.einsum("NHK,MHK->HNM", q_c, k_c) * self.scale
+            weights_HNN = jax.nn.softmax(logits_HNN.astype(jnp.float32), axis=-1).astype(q_c.dtype)
+            out_NHK = jnp.einsum("HNM,MHK->NHK", weights_HNN, v_c)
+            outputs.append(out_NHK)
 
-        result = jnp.concatenate(outputs, axis=0).reshape(seq_len, -1)
-        return self.proj(result)
+        result_ND = jnp.concatenate(outputs, axis=0).reshape(N, -1)
+        return self.proj(result_ND)
 
 
 class VisionBlock(nnx.Module):
@@ -111,10 +108,10 @@ class VisionBlock(nnx.Module):
         self.attn = VisionAttention(config, rngs=rngs)
         self.mlp = VisionMLP(config, rngs=rngs)
 
-    def __call__(self, x: jax.Array, cu_seqlens: list[int], cos: jax.Array, sin: jax.Array) -> jax.Array:
-        x = x + self.attn(self.norm1(x), cu_seqlens, cos, sin)
-        x = x + self.mlp(self.norm2(x))
-        return x
+    def __call__(self, hidden_ND: jax.Array, cu_seqlens: list[int], cos_NK: jax.Array, sin_NK: jax.Array) -> jax.Array:
+        hidden_ND = hidden_ND + self.attn(self.norm1(hidden_ND), cu_seqlens, cos_NK, sin_NK)
+        hidden_ND = hidden_ND + self.mlp(self.norm2(hidden_ND))
+        return hidden_ND
 
 
 class VisionPatchMerger(nnx.Module):
@@ -124,17 +121,17 @@ class VisionPatchMerger(nnx.Module):
         self.use_postshuffle_norm = use_postshuffle_norm
         norm_dim = hidden_size if use_postshuffle_norm else config.hidden_size
         self.norm = LayerNorm(norm_dim, eps=1e-6, rngs=rngs)
-        self.fc1 = nnx.Linear(hidden_size, hidden_size, use_bias=True, rngs=rngs, dtype=jnp.float32)
-        self.fc2 = nnx.Linear(hidden_size, config.out_hidden_size, use_bias=True, rngs=rngs, dtype=jnp.float32)
+        self.fc1 = nnx.Linear(hidden_size, hidden_size, use_bias=True, rngs=rngs, dtype=config.dtype)
+        self.fc2 = nnx.Linear(hidden_size, config.out_hidden_size, use_bias=True, rngs=rngs, dtype=config.dtype)
 
-    def __call__(self, x: jax.Array) -> jax.Array:
+    def __call__(self, hidden_ND: jax.Array) -> jax.Array:
         if self.use_postshuffle_norm:
-            x = self.norm(x.reshape(-1, self.hidden_size))
+            normed = self.norm(hidden_ND.reshape(-1, self.hidden_size))
         else:
-            x = self.norm(x).reshape(-1, self.hidden_size)
+            normed = self.norm(hidden_ND).reshape(-1, self.hidden_size)
         # FIXME (f.srambical):  we should probably approximate the gelu for increased throughput,
         # even if that deviates from huggingface numerics
-        return self.fc2(jax.nn.gelu(self.fc1(x), approximate=False))
+        return self.fc2(jax.nn.gelu(self.fc1(normed), approximate=False))
 
 
 class VisionModel(nnx.Module):
@@ -143,7 +140,7 @@ class VisionModel(nnx.Module):
         self.spatial_merge_size = config.spatial_merge_size
         self.patch_embed = VisionPatchEmbed(config, rngs=rngs)
         self.pos_embed = nnx.Embed(
-            num_embeddings=config.num_position_embeddings, features=config.hidden_size, dtype=jnp.float32, rngs=rngs
+            num_embeddings=config.num_position_embeddings, features=config.hidden_size, dtype=config.dtype, rngs=rngs
         )
         self.num_grid_per_side = int(config.num_position_embeddings**0.5)
         head_dim = config.hidden_size // config.num_heads
@@ -187,7 +184,7 @@ class VisionModel(nnx.Module):
 
     def _interpolate_pos_embed(self, grid_thw_list: list[list[int]]) -> jax.Array:
         merge_size = self.spatial_merge_size
-        pos_weight = self.pos_embed.embedding[...]
+        pos_weight_VD = self.pos_embed.embedding[...]
         n = self.num_grid_per_side
 
         all_pos = []
@@ -213,43 +210,34 @@ class VisionModel(nnx.Module):
             w_cf = (dh[:, None] * (1 - dw)[None, :]).reshape(-1)
             w_cc = (dh[:, None] * dw[None, :]).reshape(-1)
 
-            pos = (
-                pos_weight[idx_ff] * w_ff[:, None]
-                + pos_weight[idx_fc] * w_fc[:, None]
-                + pos_weight[idx_cf] * w_cf[:, None]
-                + pos_weight[idx_cc] * w_cc[:, None]
+            pos_ND = (
+                pos_weight_VD[idx_ff] * w_ff[:, None]
+                + pos_weight_VD[idx_fc] * w_fc[:, None]
+                + pos_weight_VD[idx_cf] * w_cf[:, None]
+                + pos_weight_VD[idx_cc] * w_cc[:, None]
             )
-            pos = jnp.tile(pos, (t, 1))
-            pos = pos.reshape(t, h // merge_size, merge_size, w // merge_size, merge_size, -1)
-            pos = pos.transpose(0, 1, 3, 2, 4, 5).reshape(-1, pos.shape[-1])
-            all_pos.append(pos)
+            pos_ND = jnp.tile(pos_ND, (t, 1))
+            pos_ND = pos_ND.reshape(t, h // merge_size, merge_size, w // merge_size, merge_size, -1)
+            pos_ND = pos_ND.transpose(0, 1, 3, 2, 4, 5).reshape(-1, pos_ND.shape[-1])
+            all_pos.append(pos_ND)
 
         return jnp.concatenate(all_pos, axis=0)
 
     def __call__(
         self, pixel_values: jax.Array, grid_thw: jax.Array
     ) -> tuple[jax.Array, list[jax.Array]]:
-        """Forward pass for vision encoder.
-
-        Args:
-            pixel_values: flat pixel tensor
-            grid_thw: (num_images, 3) - temporal, height, width per image
-
-        Returns:
-            merged_features: (total_merged_tokens, out_hidden_size)
-            deepstack_features: list of (total_merged_tokens, out_hidden_size)
-        """
         grid_thw_list = grid_thw.tolist() if hasattr(grid_thw, "tolist") else [[int(v) for v in row] for row in grid_thw]
 
-        hidden_states = self.patch_embed(pixel_values)
-        pos_embeds = self._interpolate_pos_embed(grid_thw_list)
-        hidden_states = hidden_states + pos_embeds
+        hidden_ND = self.patch_embed(pixel_values)
+        pos_embeds_ND = self._interpolate_pos_embed(grid_thw_list)
+        hidden_ND = hidden_ND + pos_embeds_ND
 
-        rotary_emb = self._compute_rotary_pos_emb(grid_thw_list)
-        emb = jnp.concatenate([rotary_emb, rotary_emb], axis=-1)
-        cos, sin = jnp.cos(emb), jnp.sin(emb)
+        rotary_emb_NK = self._compute_rotary_pos_emb(grid_thw_list)
+        emb_NK = jnp.concatenate([rotary_emb_NK, rotary_emb_NK], axis=-1)
+        cos_NK, sin_NK = jnp.cos(emb_NK), jnp.sin(emb_NK)
+        cos_NK = cos_NK.astype(self.config.dtype)
+        sin_NK = sin_NK.astype(self.config.dtype)
 
-        # cu_seqlens from grid_thw
         cu_seqlens = [0]
         for t_val, h_val, w_val in grid_thw_list:
             t_val, h_val, w_val = int(t_val), int(h_val), int(w_val)
@@ -258,10 +246,10 @@ class VisionModel(nnx.Module):
 
         deepstack_features: list[jax.Array] = []
         for layer_num, blk in enumerate(self.blocks):
-            hidden_states = blk(hidden_states, cu_seqlens, cos, sin)
+            hidden_ND = blk(hidden_ND, cu_seqlens, cos_NK, sin_NK)
             if layer_num in self.deepstack_visual_indexes:
                 idx = list(self.deepstack_visual_indexes).index(layer_num)
-                deepstack_features.append(self.deepstack_mergers[idx](hidden_states))
+                deepstack_features.append(self.deepstack_mergers[idx](hidden_ND))
 
-        merged = self.merger(hidden_states)
-        return merged, deepstack_features
+        merged_ND = self.merger(hidden_ND)
+        return merged_ND, deepstack_features

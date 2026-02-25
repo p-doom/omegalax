@@ -24,11 +24,11 @@ class SmokeTest(absltest.TestCase):
         )
 
     def test_decode_shape(self):
-        tokens = self._tokens(batch_size=2, seq_len=16)
-        cache = api.make_cache(self.model_cfg, batch_size=2, token_len=16, generate_steps=4, dtype=jnp.float32)
-        logits, _, aux_loss = api.decode(self.model, cache, tokens, pad_id=0, cfg=self.model_cfg)
-        self.assertEqual(logits.shape, (2, self.model_cfg.vocab_size))
-        self.assertTrue(np.isfinite(np.asarray(logits)).all())
+        token_ids_BT = self._tokens(batch_size=2, seq_len=16)
+        cache = api.make_cache(self.model_cfg, batch_size=2, token_len=16, generate_steps=4, dtype=self.model_cfg.dtype)
+        logits_BV, _, aux_loss = api.decode(self.model, cache, token_ids_BT, pad_id=0, cfg=self.model_cfg)
+        self.assertEqual(logits_BV.shape, (2, self.model_cfg.vocab_size))
+        self.assertTrue(np.isfinite(np.asarray(logits_BV)).all())
         self.assertTrue(np.isfinite(float(aux_loss)))
 
     def test_train_step_smoke(self):
@@ -41,10 +41,10 @@ class SmokeTest(absltest.TestCase):
     def test_moe_forward_smoke(self):
         moe_cfg = api.registry.build_config("qwen3-smoke-moe")
         moe_model = text_trainer.init_model(moe_cfg, self.rng)
-        tokens = self._tokens(batch_size=2, seq_len=8)
-        logits, aux_loss = api.forward(moe_model, tokens, pad_id=0, cfg=moe_cfg)
-        self.assertEqual(logits.shape[:2], (2, 8))
-        self.assertTrue(np.isfinite(np.asarray(logits)).all())
+        token_ids_BT = self._tokens(batch_size=2, seq_len=8)
+        logits_BTV, aux_loss = api.forward(moe_model, token_ids_BT, pad_id=0, cfg=moe_cfg)
+        self.assertEqual(logits_BTV.shape[:2], (2, 8))
+        self.assertTrue(np.isfinite(np.asarray(logits_BTV)).all())
         self.assertTrue(np.isfinite(float(aux_loss)))
 
 

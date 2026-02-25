@@ -15,7 +15,8 @@ from .config import Qwen3_5TextConfig
 from .norms import RMSNorm
 from .rope import apply_text_rope
 
-_K_MASK: float = float(jnp.finfo(jnp.float32).min)
+def _mask_value(dtype: jnp.dtype) -> float:
+    return float(jnp.finfo(dtype).min)
 
 
 class Attention(nnx.Module):
@@ -24,10 +25,10 @@ class Attention(nnx.Module):
         nh = cfg.num_attention_heads
         nkv = cfg.num_key_value_heads
 
-        self.q_proj = nnx.Linear(cfg.hidden_size, nh * hd * 2, use_bias=cfg.attention_bias, rngs=rngs)
-        self.k_proj = nnx.Linear(cfg.hidden_size, nkv * hd, use_bias=cfg.attention_bias, rngs=rngs)
-        self.v_proj = nnx.Linear(cfg.hidden_size, nkv * hd, use_bias=cfg.attention_bias, rngs=rngs)
-        self.o_proj = nnx.Linear(nh * hd, cfg.hidden_size, use_bias=cfg.attention_bias, rngs=rngs)
+        self.q_proj = nnx.Linear(cfg.hidden_size, nh * hd * 2, use_bias=cfg.attention_bias, rngs=rngs, dtype=cfg.dtype)
+        self.k_proj = nnx.Linear(cfg.hidden_size, nkv * hd, use_bias=cfg.attention_bias, rngs=rngs, dtype=cfg.dtype)
+        self.v_proj = nnx.Linear(cfg.hidden_size, nkv * hd, use_bias=cfg.attention_bias, rngs=rngs, dtype=cfg.dtype)
+        self.o_proj = nnx.Linear(nh * hd, cfg.hidden_size, use_bias=cfg.attention_bias, rngs=rngs, dtype=cfg.dtype)
 
         self.q_norm = RMSNorm(hd, cfg.rms_norm_eps, rngs=rngs)
         self.k_norm = RMSNorm(hd, cfg.rms_norm_eps, rngs=rngs)
@@ -41,57 +42,45 @@ class Attention(nnx.Module):
     @jax.named_scope("attention")
     def __call__(
         self,
-        x: jax.Array,
-        cos: jax.Array,
-        sin: jax.Array,
-        segment_ids: jax.Array,
-        position_ids: jax.Array,
+        hidden_BTD: jax.Array,
+        cos_BTK: jax.Array,
+        sin_BTK: jax.Array,
+        segment_ids_BT: jax.Array,
+        position_ids_BT: jax.Array,
     ) -> jax.Array:
-        """Forward pass (prefill only, no cache).
+        B, T, _ = hidden_BTD.shape
 
-        Args:
-            x: (B, T, D)
-            cos, sin: (B, T, rotary_dim)
-            segment_ids: (B, T) — non-zero for real tokens
-            position_ids: (B, T) — for causal mask
-        """
-        B, T, _ = x.shape
+        q_out_BTHK2 = self.q_proj(hidden_BTD).reshape(B, T, self.num_heads, self.head_dim * 2)
+        q_BTHK, gate_BTHK = jnp.split(q_out_BTHK2, 2, axis=-1)
+        gate_BTD = gate_BTHK.reshape(B, T, -1)
 
-        # Q projection → query + output gate
-        q_out = self.q_proj(x).reshape(B, T, self.num_heads, self.head_dim * 2)
-        query, gate = jnp.split(q_out, 2, axis=-1)
-        gate = gate.reshape(B, T, -1)
+        q_BHTK = self.q_norm(q_BTHK).transpose(0, 2, 1, 3)
+        k_BGTK = self.k_norm(
+            self.k_proj(hidden_BTD).reshape(B, T, self.num_kv_heads, self.head_dim)
+        ).transpose(0, 2, 1, 3)
+        v_BGTK = self.v_proj(hidden_BTD).reshape(B, T, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
 
-        # K, V projections
-        query = self.q_norm(query).transpose(0, 2, 1, 3)  # (B, nh, T, hd)
-        key = self.k_norm(
-            self.k_proj(x).reshape(B, T, self.num_kv_heads, self.head_dim)
-        ).transpose(0, 2, 1, 3)  # (B, nkv, T, hd)
-        value = self.v_proj(x).reshape(B, T, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
+        q_BHTK, k_BGTK = apply_text_rope(q_BHTK, k_BGTK, cos_BTK, sin_BTK)
 
-        # Apply partial RoPE
-        query, key = apply_text_rope(query, key, cos, sin)
-
-        # GQA: expand K/V to match Q head count
         if self.n_rep > 1:
-            key = jnp.repeat(key, self.n_rep, axis=1)
-            value = jnp.repeat(value, self.n_rep, axis=1)
+            k_BHTK = jnp.repeat(k_BGTK, self.n_rep, axis=1)
+            v_BHTK = jnp.repeat(v_BGTK, self.n_rep, axis=1)
+        else:
+            k_BHTK = k_BGTK
+            v_BHTK = v_BGTK
 
-        # Attention
-        attn_logits = jnp.matmul(query, key.transpose(0, 1, 3, 2)) * self.scale
+        logits_BHTS = jnp.matmul(q_BHTK, k_BHTK.transpose(0, 1, 3, 2)) * self.scale
 
-        # Causal + segment mask
-        q_pos = position_ids[:, :, None]  # (B, T, 1)
-        k_pos = position_ids[:, None, :]  # (B, 1, T)
-        causal_mask = k_pos <= q_pos
-        seg_mask = segment_ids[:, :, None] == segment_ids[:, None, :]
-        combined_mask = (causal_mask & seg_mask)[:, None, :, :]  # (B, 1, T, T)
-        attn_logits = jnp.where(combined_mask, attn_logits, _K_MASK)
+        q_pos_BT1 = position_ids_BT[:, :, None]
+        k_pos_B1T = position_ids_BT[:, None, :]
+        causal_mask_BTS = k_pos_B1T <= q_pos_BT1
+        seg_mask_BTS = segment_ids_BT[:, :, None] == segment_ids_BT[:, None, :]
+        combined_mask_BTS = (causal_mask_BTS & seg_mask_BTS)[:, None, :, :]
+        logits_BHTS = jnp.where(combined_mask_BTS, logits_BHTS, _mask_value(logits_BHTS.dtype))
 
-        attn_weights = jax.nn.softmax(attn_logits.astype(jnp.float32), axis=-1).astype(attn_logits.dtype)
-        attn_out = jnp.matmul(attn_weights, value)  # (B, nh, T, hd)
-        attn_out = attn_out.transpose(0, 2, 1, 3).reshape(B, T, -1)
+        weights_BHTS = jax.nn.softmax(logits_BHTS.astype(jnp.float32), axis=-1).astype(logits_BHTS.dtype)
+        attn_out_BHTK = jnp.matmul(weights_BHTS, v_BHTK)
+        attn_out_BTD = attn_out_BHTK.transpose(0, 2, 1, 3).reshape(B, T, -1)
 
-        # Output gating
-        attn_out = attn_out * jax.nn.sigmoid(gate)
-        return self.o_proj(attn_out)
+        attn_out_BTD = attn_out_BTD * jax.nn.sigmoid(gate_BTD)
+        return self.o_proj(attn_out_BTD)

@@ -77,16 +77,16 @@ class Qwen3AllModelsTest(parameterized.TestCase):
             enable_thinking=True,
         )
         inputs = tokenizer(chat_text, return_tensors="pt", padding=True)
-        tokens = jnp.asarray(np.array(inputs["input_ids"].cpu(), dtype=np.int32))
+        token_ids_BT = jnp.asarray(np.array(inputs["input_ids"].cpu(), dtype=np.int32))
 
         with torch.no_grad():
-            hf_logits = hf_model(**inputs).logits.cpu().numpy()
+            hf_logits_BTV = hf_model(**inputs).logits.cpu().numpy()
 
-        jax_logits, _ = api.forward(jax_model, tokens, pad_id, cfg)
-        jax_logits = np.asarray(jax_logits, dtype=np.float32)
+        jax_logits_BTV, _ = api.forward(jax_model, token_ids_BT, pad_id, cfg)
+        jax_logits_BTV = np.asarray(jax_logits_BTV, dtype=np.float32)
 
         mask = inputs["attention_mask"].numpy().astype(bool)
-        j, h = jax_logits[mask], hf_logits[mask]
+        j, h = jax_logits_BTV[mask], hf_logits_BTV[mask]
         abs_diff = np.abs(j - h)
         max_abs = float(np.max(abs_diff))
         mean_abs = float(np.mean(abs_diff))
@@ -98,7 +98,7 @@ class Qwen3AllModelsTest(parameterized.TestCase):
 
         np.testing.assert_allclose(j, h, rtol=RTOL, atol=ATOL)
 
-        del hf_model, jax_model, jax_logits, hf_logits
+        del hf_model, jax_model, jax_logits_BTV, hf_logits_BTV
         gc.collect()
 
 

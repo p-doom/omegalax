@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import datetime
 import json
 from pathlib import Path
 
@@ -12,6 +13,11 @@ import jax.numpy as jnp
 import optax
 import orbax.checkpoint as ocp
 
+from omegalax.trainers.perf import (
+    per_device_flops_per_step,
+    step_metrics,
+    StepTimer,
+)
 from omegalax.vlm import api as vlm_api
 
 
@@ -44,28 +50,28 @@ def make_train_step(cfg, pad_id: int = 0):
     @nnx.jit(donate_argnums=0)
     def train_step(
         optimizer: nnx.ModelAndOptimizer,
-        tokens: jax.Array,
+        token_ids_BT: jax.Array,
         *,
-        attention_mask: jax.Array | None = None,
+        attention_mask_BT: jax.Array | None = None,
         pixel_values: jax.Array | None = None,
         image_grid_thw: jax.Array | None = None,
-        position_ids: jax.Array | None = None,
+        position_ids_ZBT: jax.Array | None = None,
     ):
         def loss_fn(model):
-            logits, aux_loss = vlm_api.forward(
+            logits_BTV, aux_loss = vlm_api.forward(
                 model,
-                tokens,
+                token_ids_BT,
                 pad_id,
                 cfg,
-                attention_mask=attention_mask,
+                attention_mask_BT=attention_mask_BT,
                 pixel_values=pixel_values,
                 image_grid_thw=image_grid_thw,
-                position_ids=position_ids,
+                position_ids_ZBT=position_ids_ZBT,
             )
-            logits = logits.astype(jnp.float32)
-            targets = tokens[:, 1:]
-            lm_logits = logits[:, :-1, :]
-            mask = attention_mask[:, 1:] if attention_mask is not None else (targets != pad_id)
+            logits_BTV = logits_BTV.astype(jnp.float32)
+            targets = token_ids_BT[:, 1:]
+            lm_logits = logits_BTV[:, :-1, :]
+            mask = attention_mask_BT[:, 1:] if attention_mask_BT is not None else (targets != pad_id)
             mask = mask.astype(jnp.float32)
             ce = optax.softmax_cross_entropy_with_integer_labels(lm_logits, targets)
             denom = jnp.maximum(jnp.sum(mask), 1.0)
@@ -149,6 +155,7 @@ def run_training(
     log_jsonl: str | Path | None = None,
     resume: bool = False,
     pad_id: int = 0,
+    peak_tflops: float | None = None,
 ) -> tuple[nnx.ModelAndOptimizer, dict[str, float]]:
     """Train a VLM with synthetic data; returns final optimizer + last metrics."""
     rng = jax.random.key(train_cfg.seed)
@@ -157,6 +164,12 @@ def run_training(
     model, model_cfg = vlm_api.init_model(model_id_or_cfg, init_rng)
     optimizer = build_optimizer(model, train_cfg)
     train_step = make_train_step(model_cfg, pad_id=pad_id)
+
+    per_device_flops = per_device_flops_per_step(
+        model_cfg, train_cfg.seq_len, train_cfg.batch_size
+    )
+    timer = StepTimer(warmup=2)
+    tokens_per_step = train_cfg.seq_len * train_cfg.batch_size
 
     checkpoint_manager = None
     if save_dir is not None:
@@ -173,7 +186,7 @@ def run_training(
         optimizer, start_step, rng = _restore_checkpoint(checkpoint_manager, optimizer, rng)
 
     last_metrics: dict[str, float] = {}
-    prev_metrics: tuple[int, dict[str, jax.Array]] | None = None
+    prev_metrics: tuple[int, dict[str, jax.Array], datetime.timedelta] | None = None
 
     def _log_prev_metrics(force: bool = False) -> None:
         """Log metrics for the previous step to avoid per-step device syncs."""
@@ -181,7 +194,7 @@ def run_training(
         if prev_metrics is None:
             return
 
-        step_to_log, metrics_to_log = prev_metrics
+        step_to_log, metrics_to_log, step_delta = prev_metrics
         should_print = log_every and step_to_log % log_every == 0
         should_write = log_path is not None
         if not (should_print or should_write or force):
@@ -189,12 +202,18 @@ def run_training(
 
         host_metrics = {k: float(v) for k, v in metrics_to_log.items()}
         host_metrics["step"] = step_to_log
+        perf = step_metrics(
+            per_device_flops, step_delta, tokens_per_step, peak_tflops
+        )
+        host_metrics.update(perf)
         last_metrics = host_metrics
 
         if should_print:
             print(
                 f"step={host_metrics['step']} loss={host_metrics['loss']:.4f} "
-                f"grad_norm={host_metrics['grad_norm']:.4f}"
+                f"grad_norm={host_metrics['grad_norm']:.4f} "
+                f"step_s={host_metrics['step_time_s']:.3f} tok/s/dev={host_metrics['tokens_per_sec_per_device']:.0f} "
+                f"TFLOP/s/dev={host_metrics['tflops_per_device']:.2f} mfu={host_metrics['mfu']:.4f}"
             )
 
         if should_write:
@@ -205,9 +224,10 @@ def run_training(
         rng, batch_rng = jax.random.split(rng)
         batch = make_synthetic_batch(batch_rng, train_cfg.batch_size, train_cfg.seq_len, model_cfg.vocab_size, pad_id)
         _, metrics = train_step(optimizer, batch)
+        step_delta = timer.step()
 
         _log_prev_metrics()
-        prev_metrics = (step + 1, metrics)
+        prev_metrics = (step + 1, metrics, step_delta)
 
         if checkpoint_manager is not None and save_every and (step + 1) % save_every == 0:
             _save_checkpoint(checkpoint_manager, optimizer, rng, step + 1)

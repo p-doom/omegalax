@@ -7,33 +7,35 @@ from .norms import RMSNorm
 from .rope import apply_rope, generate_pos_embeddings
 from .utils import compute_positions_from_segment_ids, count_left_pads, shard
 
-_K_MASK: float = float(jnp.finfo(jnp.float32).min)
+def _mask_value(dtype: jnp.dtype) -> float:
+    return float(jnp.finfo(dtype).min)
 
 
 class Attention(nnx.Module):
     def __init__(self, cfg, *, rngs: nnx.Rngs):
         self.shd_cfg = cfg.shd_cfg
+        self.dtype = cfg.dtype
         self.q_proj = shard(
             nnx.Linear(
-                cfg.emb_dim, cfg.num_heads * cfg.head_dim, use_bias=False, rngs=rngs, dtype=jnp.float32
+                cfg.emb_dim, cfg.num_heads * cfg.head_dim, use_bias=False, rngs=rngs, dtype=cfg.dtype
             ),
             self.shd_cfg.q_weight_ndh,
         )
         self.k_proj = shard(
             nnx.Linear(
-                cfg.emb_dim, cfg.num_kv_heads * cfg.head_dim, use_bias=False, rngs=rngs, dtype=jnp.float32
+                cfg.emb_dim, cfg.num_kv_heads * cfg.head_dim, use_bias=False, rngs=rngs, dtype=cfg.dtype
             ),
             self.shd_cfg.kv_weight_ndh,
         )
         self.v_proj = shard(
             nnx.Linear(
-                cfg.emb_dim, cfg.num_kv_heads * cfg.head_dim, use_bias=False, rngs=rngs, dtype=jnp.float32
+                cfg.emb_dim, cfg.num_kv_heads * cfg.head_dim, use_bias=False, rngs=rngs, dtype=cfg.dtype
             ),
             self.shd_cfg.kv_weight_ndh,
         )
         self.o_proj = shard(
             nnx.Linear(
-                cfg.num_heads * cfg.head_dim, cfg.emb_dim, use_bias=False, rngs=rngs, dtype=jnp.float32
+                cfg.num_heads * cfg.head_dim, cfg.emb_dim, use_bias=False, rngs=rngs, dtype=cfg.dtype
             ),
             self.shd_cfg.o_weight_nhd,
         )
@@ -47,81 +49,78 @@ class Attention(nnx.Module):
         self.num_kv_heads = cfg.num_kv_heads
 
     @jax.named_scope("attention")
-    def __call__(self, x: jax.Array, cache, segment_ids: jax.Array) -> jax.Array:
-        query_proj = shard(self.q_norm(self.q_proj(x).reshape((*x.shape[:2], self.num_heads, self.head_dim))), self.shd_cfg.act_btnh)
-        key_proj = shard(self.k_norm(self.k_proj(x).reshape((*x.shape[:2], self.num_kv_heads, self.head_dim))), self.shd_cfg.act_btnh)
-        value_proj = shard(self.v_proj(x).reshape((*x.shape[:2], self.num_kv_heads, self.head_dim)), self.shd_cfg.act_btnh)
+    def __call__(self, hidden_BTD: jax.Array, cache, segment_ids_BT: jax.Array) -> jax.Array:
+        q_BTHK = shard(self.q_norm(self.q_proj(hidden_BTD).reshape((*hidden_BTD.shape[:2], self.num_heads, self.head_dim))), self.shd_cfg.act_btnh)
+        k_BTGK = shard(self.k_norm(self.k_proj(hidden_BTD).reshape((*hidden_BTD.shape[:2], self.num_kv_heads, self.head_dim))), self.shd_cfg.act_btnh)
+        v_BTGK = shard(self.v_proj(hidden_BTD).reshape((*hidden_BTD.shape[:2], self.num_kv_heads, self.head_dim)), self.shd_cfg.act_btnh)
 
         if cache is None:
-            position_ids = compute_positions_from_segment_ids(segment_ids)
-            sin, cos = generate_pos_embeddings(position_ids, self.head_dim)
-            query_proj = apply_rope(query_proj, sin, cos)
-            key_proj = apply_rope(key_proj, sin, cos)
+            positions_BT = compute_positions_from_segment_ids(segment_ids_BT)
+            sin_BTK, cos_BTK = generate_pos_embeddings(positions_BT, self.head_dim)
+            sin_BTK = sin_BTK.astype(self.dtype)
+            cos_BTK = cos_BTK.astype(self.dtype)
 
-            b, t, n, h = query_proj.shape
-            query_proj_gqa = query_proj.reshape((b, t, self.num_kv_heads, self.n_rep, h))
-            prefill_attn_logits: jax.Array = jnp.asarray(
-                jnp.einsum(
-                    "BTKGH,BSKH->BTSKG", query_proj_gqa, key_proj, precision=jax.lax.Precision.HIGHEST
-                )
+            q_BTHK = apply_rope(q_BTHK, sin_BTK, cos_BTK)
+            k_BTGK = apply_rope(k_BTGK, sin_BTK, cos_BTK)
+
+            B, T, H, K = q_BTHK.shape
+            q_BTGRK = q_BTHK.reshape((B, T, self.num_kv_heads, self.n_rep, K))
+            logits_BTSGR: jax.Array = jnp.asarray(
+                jnp.einsum("BTGRK,BSGK->BTSGR", q_BTGRK, k_BTGK)
                 * self.scale
             )
 
-            q_pos = position_ids
-            k_pos = position_ids
-            causal_mask = k_pos[:, None, :] <= q_pos[:, :, None]
-            segment_mask = segment_ids[:, None, :] == segment_ids[:, :, None]
-            final_mask = causal_mask & segment_mask
-            attn_mask = final_mask[:, :, :, None, None]
-            prefill_attn_logits = jnp.where(
-                attn_mask, prefill_attn_logits, jnp.full_like(prefill_attn_logits, _K_MASK)
+            q_pos_BT = positions_BT
+            k_pos_BT = positions_BT
+            causal_mask_BTS = k_pos_BT[:, None, :] <= q_pos_BT[:, :, None]
+            segment_mask_BTS = segment_ids_BT[:, None, :] == segment_ids_BT[:, :, None]
+            final_mask_BTS = causal_mask_BTS & segment_mask_BTS
+            attn_mask = final_mask_BTS[:, :, :, None, None]
+            logits_BTSGR = jnp.where(
+                attn_mask, logits_BTSGR, _mask_value(logits_BTSGR.dtype)
             )
 
-            attn_weights = jax.nn.softmax(prefill_attn_logits.astype(jnp.float32), axis=2).astype(
-                prefill_attn_logits.dtype
+            weights_BTSGR = jax.nn.softmax(logits_BTSGR.astype(jnp.float32), axis=2).astype(
+                logits_BTSGR.dtype
             )
-            qkv = jnp.einsum(
-                "BTSKG,BSKH->BTKGH", attn_weights, value_proj, precision=jax.lax.Precision.HIGHEST
-            )
-            qkv = qkv.reshape((b, t, self.num_heads, h))
-            return shard(self.o_proj(qkv.reshape(b, t, self.num_heads * h)), self.shd_cfg.act_btd)
+            attn_BTGRK = jnp.einsum("BTSGR,BSGK->BTGRK", weights_BTSGR, v_BTGK)
+            attn_BTHK = attn_BTGRK.reshape((B, T, self.num_heads, K))
+            return shard(self.o_proj(attn_BTHK.reshape(B, T, self.num_heads * K)), self.shd_cfg.act_btd)
 
-        left_pads = count_left_pads(segment_ids)
-        left_pads = shard(left_pads, P(self.shd_cfg.act_btnh[0]))
-        cache.start_ind.set_value(jnp.where(cache.start_ind[...] < 0, left_pads, cache.start_ind[...]))
-        position_ids = compute_positions_from_segment_ids(segment_ids) + cache.cur_ind[...]
-        sin, cos = generate_pos_embeddings(position_ids, self.head_dim)
-        query_proj = apply_rope(query_proj, sin, cos)
-        key_proj = apply_rope(key_proj, sin, cos)
+        left_pads_B = count_left_pads(segment_ids_BT)
+        left_pads_B = shard(left_pads_B, P(self.shd_cfg.act_btnh[0]))
+        cache.start_ind.set_value(jnp.where(cache.start_ind[...] < 0, left_pads_B, cache.start_ind[...]))
+        positions_BT = compute_positions_from_segment_ids(segment_ids_BT) + cache.cur_ind[...]
+        sin_BTK, cos_BTK = generate_pos_embeddings(positions_BT, self.head_dim)
+        sin_BTK = sin_BTK.astype(self.dtype)
+        cos_BTK = cos_BTK.astype(self.dtype)
+        q_BTHK = apply_rope(q_BTHK, sin_BTK, cos_BTK)
+        k_BTGK = apply_rope(k_BTGK, sin_BTK, cos_BTK)
 
         slice_indices = (0, cache.cur_ind[...], 0, 0)
-        cache.v_cache[...] = jax.lax.dynamic_update_slice(cache.v_cache[...], value_proj, slice_indices)
-        cache.k_cache[...] = jax.lax.dynamic_update_slice(cache.k_cache[...], key_proj, slice_indices)
+        cache.v_cache[...] = jax.lax.dynamic_update_slice(cache.v_cache[...], v_BTGK, slice_indices)
+        cache.k_cache[...] = jax.lax.dynamic_update_slice(cache.k_cache[...], k_BTGK, slice_indices)
 
-        b, t, n, h = query_proj.shape
-        query_proj_gqa = query_proj.reshape((b, t, self.num_kv_heads, self.n_rep, h))
-        decode_attn_logits: jax.Array = jnp.asarray(
-            jnp.einsum(
-                "BTKGH,BSKH->BTSKG", query_proj_gqa, cache.k_cache[...], precision=jax.lax.Precision.HIGHEST
-            )
+        B, T, H, K = q_BTHK.shape
+        q_BTGRK = q_BTHK.reshape((B, T, self.num_kv_heads, self.n_rep, K))
+        logits_BTSGR: jax.Array = jnp.asarray(
+            jnp.einsum("BTGRK,BSGK->BTSGR", q_BTGRK, cache.k_cache[...])
             * self.scale
         )
 
-        q_pos = cache.cur_ind[...] + jnp.arange(t, dtype=jnp.int32)[None, :] - cache.start_ind[:, None]
+        q_pos_BT = cache.cur_ind[...] + jnp.arange(T, dtype=jnp.int32)[None, :] - cache.start_ind[:, None]
         ts = jnp.arange(cache.size, dtype=jnp.int32)
-        kv_segment_ids = (ts[None, :] >= cache.start_ind[:, None]) & (ts[None, :] < cache.cur_ind[...] + t)
-        k_pos = ts[None, :] - cache.start_ind[:, None]
-        causal_mask = k_pos[:, None, :] <= q_pos[:, :, None]
-        segment_mask = kv_segment_ids[:, None, :] == segment_ids[:, :, None]
-        final_mask = causal_mask & segment_mask
-        attn_mask = final_mask[:, :, :, None, None]
-        decode_attn_logits = jnp.where(attn_mask, decode_attn_logits, jnp.full_like(decode_attn_logits, _K_MASK))
+        kv_valid_BS = (ts[None, :] >= cache.start_ind[:, None]) & (ts[None, :] < cache.cur_ind[...] + T)
+        k_pos_BS = ts[None, :] - cache.start_ind[:, None]
+        causal_mask_BTS = k_pos_BS[:, None, :] <= q_pos_BT[:, :, None]
+        segment_mask_BTS = kv_valid_BS[:, None, :] == segment_ids_BT[:, :, None]
+        final_mask_BTS = causal_mask_BTS & segment_mask_BTS
+        attn_mask = final_mask_BTS[:, :, :, None, None]
+        logits_BTSGR = jnp.where(attn_mask, logits_BTSGR, _mask_value(logits_BTSGR.dtype))
 
-        attn_weights = jax.nn.softmax(decode_attn_logits.astype(jnp.float32), axis=2).astype(decode_attn_logits.dtype)
-        qkv = jnp.einsum(
-            "BTSKG,BSKH->BTKGH", attn_weights, cache.v_cache[...], precision=jax.lax.Precision.HIGHEST
-        )
-        qkv = qkv.reshape((b, t, self.num_heads, h))
+        weights_BTSGR = jax.nn.softmax(logits_BTSGR.astype(jnp.float32), axis=2).astype(logits_BTSGR.dtype)
+        attn_BTGRK = jnp.einsum("BTSGR,BSGK->BTGRK", weights_BTSGR, cache.v_cache[...])
+        attn_BTHK = attn_BTGRK.reshape((B, T, self.num_heads, K))
 
-        cache.cur_ind[...] = cache.cur_ind[...] + t
-        return shard(self.o_proj(qkv.reshape(b, t, self.num_heads * h)), self.shd_cfg.act_btd)
+        cache.cur_ind[...] = cache.cur_ind[...] + T
+        return shard(self.o_proj(attn_BTHK.reshape(B, T, self.num_heads * K)), self.shd_cfg.act_btd)

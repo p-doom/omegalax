@@ -5,6 +5,8 @@ from __future__ import annotations
 import dataclasses
 from typing import Any
 
+import jax.numpy as jnp
+
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class Qwen3_5VisionConfig:
@@ -18,6 +20,7 @@ class Qwen3_5VisionConfig:
     in_channels: int = 3
     out_hidden_size: int = 4096
     num_position_embeddings: int = 2304
+    dtype: Any = jnp.float32
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -51,6 +54,7 @@ class Qwen3_5TextConfig:
     num_experts: int = 512
     num_experts_per_tok: int = 10
     router_aux_loss_coef: float = 0.001
+    dtype: Any = jnp.bfloat16
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -139,11 +143,29 @@ def make_config(model_id: str) -> Qwen3_5Config:
     )
 
 
+def _hf_torch_dtype_to_jnp(torch_dtype: str | None) -> Any:
+    # FIXME (f.srambical): find the ground-truth hf dtype strings and raise an error on others
+    """Map HuggingFace torch_dtype string to jnp.dtype. Defaults to bfloat16 for text."""
+    if torch_dtype is None:
+        return jnp.bfloat16
+    kind = (torch_dtype if isinstance(torch_dtype, str) else str(torch_dtype)).lower()
+    if "bfloat16" in kind or "bf16" in kind:
+        return jnp.bfloat16
+    if "float32" in kind or "fp32" in kind:
+        return jnp.float32
+    if "float16" in kind or "fp16" in kind:
+        return jnp.float16
+    return jnp.bfloat16
+
+
 def make_config_from_hf(hf_cfg: dict[str, Any]) -> Qwen3_5Config:
     """Build a Qwen3_5Config from a HuggingFace config.json dict."""
     vis = hf_cfg["vision_config"]
     txt = hf_cfg["text_config"]
-    rope_params = txt["rope_parameters"]
+    rope_params = txt.get("rope_parameters") or txt.get("rope_scaling") or {}
+    torch_dtype = hf_cfg.get("torch_dtype")
+    text_dtype = _hf_torch_dtype_to_jnp(torch_dtype)
+    vision_dtype = _hf_torch_dtype_to_jnp(vis.get("torch_dtype")) if vis.get("torch_dtype") is not None else (text_dtype if torch_dtype is not None else jnp.float32)
 
     return Qwen3_5Config(
         vision_config=Qwen3_5VisionConfig(
@@ -157,6 +179,7 @@ def make_config_from_hf(hf_cfg: dict[str, Any]) -> Qwen3_5Config:
             in_channels=vis["in_channels"],
             out_hidden_size=vis["out_hidden_size"],
             num_position_embeddings=vis["num_position_embeddings"],
+            dtype=vision_dtype,
         ),
         text_config=Qwen3_5TextConfig(
             vocab_size=txt["vocab_size"],
@@ -167,10 +190,10 @@ def make_config_from_hf(hf_cfg: dict[str, Any]) -> Qwen3_5Config:
             head_dim=txt["head_dim"],
             rms_norm_eps=txt["rms_norm_eps"],
             layer_types=tuple(txt["layer_types"]),
-            rope_theta=rope_params["rope_theta"],
+            rope_theta=rope_params.get("rope_theta") or txt["rope_theta"],
             partial_rotary_factor=rope_params["partial_rotary_factor"],
             mrope_section=tuple(rope_params["mrope_section"]),
-            mrope_interleaved=rope_params.get("mrope_interleaved", True),
+            mrope_interleaved=rope_params["mrope_interleaved"],
             attention_bias=txt["attention_bias"],
             tie_word_embeddings=hf_cfg["tie_word_embeddings"],
             linear_conv_kernel_dim=txt["linear_conv_kernel_dim"],
@@ -180,9 +203,10 @@ def make_config_from_hf(hf_cfg: dict[str, Any]) -> Qwen3_5Config:
             linear_value_head_dim=txt["linear_value_head_dim"],
             moe_intermediate_size=txt["moe_intermediate_size"],
             shared_expert_intermediate_size=txt["shared_expert_intermediate_size"],
-            num_experts=txt["num_experts"],
+            num_experts=txt.get("num_experts") or txt.get("num_local_experts"),
             num_experts_per_tok=txt["num_experts_per_tok"],
             router_aux_loss_coef=txt["router_aux_loss_coef"],
+            dtype=text_dtype,
         ),
         image_token_id=hf_cfg["image_token_id"],
         video_token_id=hf_cfg["video_token_id"],

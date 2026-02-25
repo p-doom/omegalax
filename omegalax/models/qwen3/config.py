@@ -1,6 +1,7 @@
 import dataclasses
-from typing import TypeAlias
+from typing import Any, TypeAlias
 
+import jax.numpy as jnp
 from jax.sharding import PartitionSpec
 
 P = PartitionSpec
@@ -75,6 +76,7 @@ class Qwen3Config:
     norm_eps: float
     tie_word_embeddings: bool
     shd_cfg: ShardConfig = dataclasses.field(default_factory=ShardConfig.no_sharding)
+    dtype: Any = jnp.bfloat16
 
     @classmethod
     def with_sharding(cls, use_sharding: bool, **kwargs):

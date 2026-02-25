@@ -79,9 +79,9 @@ class Qwen3MappingTest(absltest.TestCase):
         return self.tokenizer(chat_texts, return_tensors="pt", padding=True, padding_side="left")
 
     def _jax_prefill_logits(self, input_ids: torch.Tensor) -> np.ndarray:
-        tokens = jnp.asarray(np.array(input_ids.cpu(), dtype=np.int32))
-        logits, _ = api.forward(self.jax_model, tokens, self.pad_id, self.cfg)
-        return np.asarray(logits, dtype=np.float32)
+        token_ids_BT = jnp.asarray(np.array(input_ids.cpu(), dtype=np.int32))
+        logits_BTV, _ = api.forward(self.jax_model, token_ids_BT, self.pad_id, self.cfg)
+        return np.asarray(logits_BTV, dtype=np.float32)
 
     def test_parameter_mapping_is_complete(self):
         # HF -> JAX mapping should cover every HF tensor key.
@@ -116,31 +116,31 @@ class Qwen3MappingTest(absltest.TestCase):
     def test_prefill_logits_match_hf(self):
         inputs = self._tokenize([PROMPT])
         with torch.no_grad():
-            hf_logits = self.hf_model(**inputs).logits.cpu().numpy()
-        jax_logits = self._jax_prefill_logits(inputs["input_ids"])
+            hf_logits_BTV = self.hf_model(**inputs).logits.cpu().numpy()
+        jax_logits_BTV = self._jax_prefill_logits(inputs["input_ids"])
         mask = inputs["attention_mask"].numpy().astype(bool)
-        np.testing.assert_allclose(jax_logits[mask], hf_logits[mask], rtol=RTOL, atol=ATOL)
+        np.testing.assert_allclose(jax_logits_BTV[mask], hf_logits_BTV[mask], rtol=RTOL, atol=ATOL)
 
     def test_prefill_logits_match_hf_batched(self):
         inputs = self._tokenize([PROMPT, "Who am I?"])
         with torch.no_grad():
-            hf_logits = self.hf_model(**inputs).logits.cpu().numpy()
-        jax_logits = self._jax_prefill_logits(inputs["input_ids"])
+            hf_logits_BTV = self.hf_model(**inputs).logits.cpu().numpy()
+        jax_logits_BTV = self._jax_prefill_logits(inputs["input_ids"])
         mask = inputs["attention_mask"].numpy().astype(bool)
-        np.testing.assert_allclose(jax_logits[mask], hf_logits[mask], rtol=RTOL, atol=ATOL)
+        np.testing.assert_allclose(jax_logits_BTV[mask], hf_logits_BTV[mask], rtol=RTOL, atol=ATOL)
 
     def test_round_trip_preserves_prefill_logits(self):
         inputs = self._tokenize([PROMPT])
-        baseline = self._jax_prefill_logits(inputs["input_ids"])
+        baseline_BTV = self._jax_prefill_logits(inputs["input_ids"])
 
         graph_def, state = nnx.split(self.jax_model)
         pure_state = nnx.to_pure_dict(state)
         restored = nnx.merge(graph_def, pure_state)
-        restored_tokens = jnp.asarray(np.array(inputs["input_ids"]), dtype=jnp.int32)
-        restored_logits, _ = api.forward(restored, restored_tokens, self.pad_id, self.cfg)
-        restored_logits = np.asarray(restored_logits)
+        restored_token_ids_BT = jnp.asarray(np.array(inputs["input_ids"]), dtype=jnp.int32)
+        restored_logits_BTV, _ = api.forward(restored, restored_token_ids_BT, self.pad_id, self.cfg)
+        restored_logits_BTV = np.asarray(restored_logits_BTV)
 
-        np.testing.assert_allclose(restored_logits, baseline, rtol=RTOL, atol=ATOL)
+        np.testing.assert_allclose(restored_logits_BTV, baseline_BTV, rtol=RTOL, atol=ATOL)
 
 
 if __name__ == "__main__":

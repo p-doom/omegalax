@@ -18,15 +18,15 @@ from .vision import VisionModel
 class MLP(nnx.Module):
     """Standard gated MLP (shared expert or dense fallback)."""
 
-    def __init__(self, hidden_size: int, intermediate_size: int, *, rngs: nnx.Rngs):
-        linear = partial(nnx.Linear, use_bias=False, rngs=rngs)
+    def __init__(self, hidden_size: int, intermediate_size: int, *, dtype=None, rngs: nnx.Rngs):
+        linear = partial(nnx.Linear, use_bias=False, rngs=rngs, dtype=dtype)
         self.gate_proj = linear(hidden_size, intermediate_size)
         self.up_proj = linear(hidden_size, intermediate_size)
         self.down_proj = linear(intermediate_size, hidden_size)
 
     @jax.named_scope("mlp")
-    def __call__(self, x: jax.Array) -> jax.Array:
-        return self.down_proj(nnx.silu(self.gate_proj(x)) * self.up_proj(x))
+    def __call__(self, hidden_BTD: jax.Array) -> jax.Array:
+        return self.down_proj(nnx.silu(self.gate_proj(hidden_BTD)) * self.up_proj(hidden_BTD))
 
 
 class MoEFeedForward(nnx.Module):
@@ -41,50 +41,45 @@ class MoEFeedForward(nnx.Module):
         init = nnx.initializers.lecun_normal()
         self.gate_up_proj = nnx.Param(init(rngs.params(), (E, 2 * F_moe, D)))
         self.down_proj = nnx.Param(init(rngs.params(), (E, D, F_moe)))
-        self.router = nnx.Linear(D, E, use_bias=False, rngs=rngs)
+        self.router = nnx.Linear(D, E, use_bias=False, rngs=rngs, dtype=cfg.dtype)
 
-        self.shared_expert = MLP(D, cfg.shared_expert_intermediate_size, rngs=rngs)
-        self.shared_expert_gate = nnx.Linear(D, 1, use_bias=False, rngs=rngs)
+        self.shared_expert = MLP(D, cfg.shared_expert_intermediate_size, dtype=cfg.dtype, rngs=rngs)
+        self.shared_expert_gate = nnx.Linear(D, 1, use_bias=False, rngs=rngs, dtype=cfg.dtype)
 
     @jax.named_scope("moe_ffn")
-    def __call__(self, x: jax.Array) -> tuple[jax.Array, jax.Array]:
+    def __call__(self, hidden_BTD: jax.Array) -> tuple[jax.Array, jax.Array]:
         cfg = self.cfg
-        B, T = x.shape[:2]
+        B, T = hidden_BTD.shape[:2]
 
-        # Router
-        router_logits = self.router(x)
-        probs = jax.nn.softmax(router_logits.astype(jnp.float32), axis=-1)
-        topk_weights, topk_idx = jax.lax.top_k(probs, cfg.num_experts_per_tok)
-        topk_weights = topk_weights / jnp.clip(
-            jnp.sum(topk_weights, axis=-1, keepdims=True), min=1e-9
+        router_logits_BTE = self.router(hidden_BTD)
+        probs_BTE = jax.nn.softmax(router_logits_BTE.astype(jnp.float32), axis=-1)
+        topk_weights_BTk, topk_idx_BTk = jax.lax.top_k(probs_BTE, cfg.num_experts_per_tok)
+        topk_weights_BTk = topk_weights_BTk / jnp.clip(
+            jnp.sum(topk_weights_BTk, axis=-1, keepdims=True), min=1e-9
         )
-        topk_weights = topk_weights.astype(probs.dtype)
+        topk_weights_BTk = topk_weights_BTk.astype(probs_BTE.dtype)
 
-        # All-expert computation with fused gate_up_proj: (E, 2*F, D)
-        gate_up = jnp.einsum("btd,efd->btef", x, self.gate_up_proj[...])
-        gate_out, up_out = jnp.split(gate_up, 2, axis=-1)
-        expert_hidden = nnx.silu(gate_out) * up_out
-        expert_out = jnp.einsum("btef,edf->bted", expert_hidden, self.down_proj[...])
+        gate_up_BTEF = jnp.einsum("BTD,EFD->BTEF", hidden_BTD, self.gate_up_proj[...])
+        gate_BTEF, up_BTEF = jnp.split(gate_up_BTEF, 2, axis=-1)
+        expert_hidden_BTEF = nnx.silu(gate_BTEF) * up_BTEF
+        expert_out_BTED = jnp.einsum("BTEF,EDF->BTED", expert_hidden_BTEF, self.down_proj[...])
 
-        # Top-k selection and merge
-        flat_out = expert_out.reshape(B * T, cfg.num_experts, cfg.hidden_size)
-        flat_idx = topk_idx.reshape(B * T, cfg.num_experts_per_tok)
+        flat_out = expert_out_BTED.reshape(B * T, cfg.num_experts, cfg.hidden_size)
+        flat_idx = topk_idx_BTk.reshape(B * T, cfg.num_experts_per_tok)
         gathered = jnp.take_along_axis(flat_out, flat_idx[..., None], axis=1)
         gathered = gathered.reshape(B, T, cfg.num_experts_per_tok, cfg.hidden_size)
-        moe_out = jnp.sum(gathered * topk_weights[..., None], axis=-2)
+        moe_out_BTD = jnp.sum(gathered * topk_weights_BTk[..., None], axis=-2)
 
-        # Shared expert with sigmoid gate
-        shared_out = self.shared_expert(x)
-        shared_gate = jax.nn.sigmoid(self.shared_expert_gate(x))
-        shared_out = shared_gate * shared_out
-        output = moe_out + shared_out
+        shared_out_BTD = self.shared_expert(hidden_BTD)
+        shared_gate = jax.nn.sigmoid(self.shared_expert_gate(hidden_BTD))
+        shared_out_BTD = shared_gate * shared_out_BTD
+        output_BTD = moe_out_BTD + shared_out_BTD
 
-        # Auxiliary load-balancing loss
-        load = jnp.mean(probs, axis=(0, 1))
-        uniform = jnp.full_like(load, 1.0 / cfg.num_experts)
-        aux_loss = cfg.router_aux_loss_coef * jnp.sum((load - uniform) ** 2)
+        load_E = jnp.mean(probs_BTE, axis=(0, 1))
+        uniform_E = jnp.full_like(load_E, 1.0 / cfg.num_experts)
+        aux_loss = cfg.router_aux_loss_coef * jnp.sum((load_E - uniform_E) ** 2)
 
-        return output, aux_loss
+        return output_BTD, aux_loss
 
 
 # Decoder Layer
@@ -105,32 +100,32 @@ class DecoderLayer(nnx.Module):
 
     def __call__(
         self,
-        x: jax.Array,
-        cos: jax.Array,
-        sin: jax.Array,
-        segment_ids: jax.Array,
-        position_ids: jax.Array,
-        attention_mask: jax.Array | None = None,
+        hidden_BTD: jax.Array,
+        cos_BTK: jax.Array,
+        sin_BTK: jax.Array,
+        segment_ids_BT: jax.Array,
+        position_ids_BT: jax.Array,
+        attention_mask_BT: jax.Array | None = None,
     ) -> tuple[jax.Array, jax.Array]:
-        residual = x
-        normed = self.input_layernorm(x)
+        residual_BTD = hidden_BTD
+        normed_BTD = self.input_layernorm(hidden_BTD)
 
         if self.layer_type == "full_attention":
-            attn_out = self.attn(normed, cos, sin, segment_ids, position_ids)
+            attn_out_BTD = self.attn(normed_BTD, cos_BTK, sin_BTK, segment_ids_BT, position_ids_BT)
         else:
-            linear_mask = attention_mask
-            if attention_mask is not None and jnp.all(attention_mask == 1):
+            linear_mask = attention_mask_BT
+            if attention_mask_BT is not None and jnp.all(attention_mask_BT == 1):
                 linear_mask = None
-            attn_out = self.linear_attn(normed, linear_mask)
+            attn_out_BTD = self.linear_attn(normed_BTD, linear_mask)
 
-        x = residual + attn_out
+        hidden_BTD = residual_BTD + attn_out_BTD
 
-        residual = x
-        normed = self.post_attention_layernorm(x)
-        ff_out, aux_loss = self.mlp(normed)
-        x = residual + ff_out
+        residual_BTD = hidden_BTD
+        normed_BTD = self.post_attention_layernorm(hidden_BTD)
+        ff_out_BTD, aux_loss = self.mlp(normed_BTD)
+        hidden_BTD = residual_BTD + ff_out_BTD
 
-        return x, aux_loss
+        return hidden_BTD, aux_loss
 
 
 # Text Model
@@ -139,7 +134,7 @@ class TextModel(nnx.Module):
 
     def __init__(self, cfg: Qwen3_5TextConfig, *, rngs: nnx.Rngs):
         self.cfg = cfg
-        self.embedder = nnx.Embed(cfg.vocab_size, cfg.hidden_size, rngs=rngs)
+        self.embedder = nnx.Embed(cfg.vocab_size, cfg.hidden_size, rngs=rngs, dtype=cfg.dtype)
         self.layers = nnx.List([
             DecoderLayer(cfg, i, rngs=rngs) for i in range(cfg.num_hidden_layers)
         ])
@@ -148,67 +143,51 @@ class TextModel(nnx.Module):
     @jax.named_scope("text_model")
     def __call__(
         self,
-        tokens: jax.Array | None = None,
-        inputs_embeds: jax.Array | None = None,
-        segment_ids: jax.Array | None = None,
-        position_ids: jax.Array | None = None,
+        token_ids_BT: jax.Array | None = None,
+        inputs_embeds_BTD: jax.Array | None = None,
+        segment_ids_BT: jax.Array | None = None,
+        position_ids_ZBT: jax.Array | None = None,
     ) -> tuple[jax.Array, jax.Array]:
-        """Forward pass (prefill).
-
-        Args:
-            tokens: (B, T) token IDs — or None if inputs_embeds given
-            inputs_embeds: (B, T, D) — optional pre-computed embeddings
-            segment_ids: (B, T) — 1 for real tokens, 0 for padding
-            position_ids: (3, B, T) — MRoPE position IDs
-        Returns:
-            hidden_states: (B, T, D)
-            total_aux_loss: scalar
-        """
         cfg = self.cfg
 
-        if inputs_embeds is None:
-            x = self.embedder(tokens)
+        if inputs_embeds_BTD is None:
+            hidden_BTD = self.embedder(token_ids_BT)
         else:
-            x = inputs_embeds
+            hidden_BTD = inputs_embeds_BTD
 
-        B, T, _ = x.shape
+        B, T, _ = hidden_BTD.shape
 
-        if segment_ids is None:
-            segment_ids = jnp.ones((B, T), dtype=jnp.int32)
+        if segment_ids_BT is None:
+            segment_ids_BT = jnp.ones((B, T), dtype=jnp.int32)
 
-        # Build position IDs for text-only (all 3 dims identical)
-        if position_ids is None:
+        if position_ids_ZBT is None:
             seq_pos = jnp.arange(T, dtype=jnp.int32)[None, :]
-            position_ids = jnp.broadcast_to(seq_pos, (B, T))
-            position_ids_3d = jnp.stack([position_ids] * 3, axis=0)
-        elif position_ids.ndim == 2:
-            position_ids_3d = jnp.stack([position_ids] * 3, axis=0)
-        else:
-            position_ids_3d = position_ids
+            position_ids_BT = jnp.broadcast_to(seq_pos, (B, T))
+            position_ids_ZBT = jnp.stack([position_ids_BT] * 3, axis=0)
+        elif position_ids_ZBT.ndim == 2:
+            position_ids_ZBT = jnp.stack([position_ids_ZBT] * 3, axis=0)
 
-        # Generate MRoPE cos/sin
-        cos, sin = generate_text_rope(
-            position_ids_3d,
+        cos_BTK, sin_BTK = generate_text_rope(
+            position_ids_ZBT,
             cfg.head_dim,
             cfg.partial_rotary_factor,
             cfg.rope_theta,
             cfg.mrope_section,
         )
+        cos_BTK = cos_BTK.astype(cfg.dtype)
+        sin_BTK = sin_BTK.astype(cfg.dtype)
 
-        # Attention mask for linear attention layers
-        attention_mask = (segment_ids != 0).astype(jnp.float32)
-
-        # Use first row of position_ids for causal mask positions
-        text_position_ids = position_ids_3d[0]
+        attention_mask_BT = (segment_ids_BT != 0).astype(jnp.float32)
+        text_position_ids_BT = position_ids_ZBT[0]
 
         aux_losses = []
         for layer in self.layers:
-            x, aux = layer(x, cos, sin, segment_ids, text_position_ids, attention_mask)
+            hidden_BTD, aux = layer(hidden_BTD, cos_BTK, sin_BTK, segment_ids_BT, text_position_ids_BT, attention_mask_BT)
             aux_losses.append(aux)
 
-        x = self.final_norm(x)
+        hidden_BTD = self.final_norm(hidden_BTD)
         total_aux = jnp.sum(jnp.stack(aux_losses)) if aux_losses else jnp.array(0.0)
-        return x, total_aux
+        return hidden_BTD, total_aux
 
 
 # Causal LM
@@ -217,12 +196,12 @@ class Qwen3_5ForCausalLM(nnx.Module):
 
     def __init__(self, cfg: Qwen3_5TextConfig, *, rngs: nnx.Rngs):
         self.text = TextModel(cfg, rngs=rngs)
-        self.lm_head = nnx.Linear(cfg.hidden_size, cfg.vocab_size, use_bias=False, rngs=rngs)
+        self.lm_head = nnx.Linear(cfg.hidden_size, cfg.vocab_size, use_bias=False, rngs=rngs, dtype=cfg.dtype)
 
-    def __call__(self, tokens, segment_ids, cache, num_right_pads):
+    def __call__(self, token_ids_BT, segment_ids_BT, cache, num_right_pads):
         del cache, num_right_pads
-        hidden, aux = self.text(tokens=tokens, segment_ids=segment_ids)
-        return self.lm_head(hidden), aux
+        hidden_BTD, aux = self.text(token_ids_BT=token_ids_BT, segment_ids_BT=segment_ids_BT)
+        return self.lm_head(hidden_BTD), aux
 
 
 # VLM
@@ -234,41 +213,36 @@ class Qwen3_5ForConditionalGeneration(nnx.Module):
         self.vision = VisionModel(cfg.vision_config, rngs=rngs)
         self.text = TextModel(cfg.text_config, rngs=rngs)
         self.lm_head = nnx.Linear(
-            cfg.text_config.hidden_size, cfg.text_config.vocab_size, use_bias=False, rngs=rngs,
+            cfg.text_config.hidden_size, cfg.text_config.vocab_size, use_bias=False, rngs=rngs, dtype=cfg.text_config.dtype,
         )
 
     def __call__(
         self,
-        tokens: jax.Array,
-        segment_ids: jax.Array,
+        token_ids_BT: jax.Array,
+        segment_ids_BT: jax.Array,
         cache,
         num_right_pads,
         pixel_values: jax.Array | None = None,
         image_grid_thw: jax.Array | None = None,
-        position_ids: jax.Array | None = None,
+        position_ids_ZBT: jax.Array | None = None,
     ):
-        """Forward pass.
-
-        For text-only input (no pixel_values), behaves like Qwen3_5ForCausalLM.
-        """
         del cache, num_right_pads
 
-        inputs_embeds = self.text.embedder(tokens)
+        inputs_embeds_BTD = self.text.embedder(token_ids_BT)
 
         if pixel_values is not None and image_grid_thw is not None:
-            image_embeds = self.vision(pixel_values, image_grid_thw)
-            image_mask = (tokens == self.cfg.image_token_id)
-            image_mask_3d = jnp.broadcast_to(
-                image_mask[:, :, None], inputs_embeds.shape
+            image_embeds_ND = self.vision(pixel_values, image_grid_thw)
+            image_mask_BT = (token_ids_BT == self.cfg.image_token_id)
+            image_mask_BTD = jnp.broadcast_to(
+                image_mask_BT[:, :, None], inputs_embeds_BTD.shape
             )
-            inputs_embeds = jnp.where(image_mask_3d, 0.0, inputs_embeds)
-            # Scatter image embeddings into placeholder positions
-            batch_indices, seq_indices = jnp.where(image_mask)
-            inputs_embeds = inputs_embeds.at[batch_indices, seq_indices].set(image_embeds)
+            inputs_embeds_BTD = jnp.where(image_mask_BTD, 0.0, inputs_embeds_BTD)
+            batch_indices, seq_indices = jnp.where(image_mask_BT)
+            inputs_embeds_BTD = inputs_embeds_BTD.at[batch_indices, seq_indices].set(image_embeds_ND)
 
-        hidden, aux = self.text(
-            inputs_embeds=inputs_embeds,
-            segment_ids=segment_ids,
-            position_ids=position_ids,
+        hidden_BTD, aux = self.text(
+            inputs_embeds_BTD=inputs_embeds_BTD,
+            segment_ids_BT=segment_ids_BT,
+            position_ids_ZBT=position_ids_ZBT,
         )
-        return self.lm_head(hidden), aux
+        return self.lm_head(hidden_BTD), aux
