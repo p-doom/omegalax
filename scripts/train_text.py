@@ -7,6 +7,7 @@ import argparse
 from pathlib import Path
 
 from omegalax.trainers import text as text_trainer
+from omegalax.trainers.perf import resolve_peak_tflops
 
 
 def _default_save_dir(model_id: str) -> Path:
@@ -29,6 +30,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-jsonl", type=str, default=None, help="Optional JSONL metrics file.")
     parser.add_argument("--resume", action="store_true", help="Resume from latest checkpoint if present.")
     parser.add_argument("--pad-id", type=int, default=0)
+    parser.add_argument(
+        "--peak-tflops",
+        type=str,
+        default=None,
+        help="Peak TFLOPS per device for MFU (e.g. 989 or h100_sxm). If unset, MFU is 0.",
+    )
     return parser.parse_args()
 
 
@@ -45,6 +52,7 @@ def main() -> None:
     )
     save_dir = Path(args.save_dir) if args.save_dir else _default_save_dir(args.model_id)
 
+    peak_tflops = resolve_peak_tflops(args.peak_tflops)
     _, last_metrics = text_trainer.run_training(
         args.model_id,
         train_cfg,
@@ -54,6 +62,7 @@ def main() -> None:
         log_jsonl=args.log_jsonl,
         resume=args.resume,
         pad_id=args.pad_id,
+        peak_tflops=peak_tflops,
     )
     if last_metrics:
         print(

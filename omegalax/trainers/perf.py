@@ -34,6 +34,25 @@ PEAK_TFLOPS: dict[str, float] = {
 }
 
 
+def resolve_peak_tflops(spec: str | float | None) -> float | None:
+    """Convert a peak-TFLOPS spec to a float for MFU.
+
+    Accepts: None; a float; or a preset name (exact key from PEAK_TFLOPS).
+    Raises ValueError if a string is given that is neither a preset nor a number.
+    """
+    if spec is None:
+        return None
+    s = str(spec)
+    if s in PEAK_TFLOPS:
+        return PEAK_TFLOPS[s]
+    try:
+        return float(s)
+    except ValueError as e:
+        raise ValueError(
+            f"Unknown peak_tflops {spec!r}. Use a key from {list(PEAK_TFLOPS)} or a number."
+        ) from e
+
+
 def training_flops_per_token(cfg: RunPerfConfig, seq_len: int) -> int:
     """Theoretical training FLOPs per token (forward + backward, x3).
 
@@ -234,7 +253,7 @@ def step_metrics(
     tokens_per_step: int,
     peak_tflops: float | None,
 ) -> dict[str, float]:
-    """Compute tokens/s, TFLOPS/device, and optionally MFU from step timing."""
+    """Compute tokens/s, TFLOPS/device, and MFU from step timing."""
     sec = step_delta.total_seconds()
     if sec <= 0:
         return {
