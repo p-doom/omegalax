@@ -5,7 +5,9 @@ from functools import partial
 import jax
 import jax.numpy as jnp
 from flax import nnx
+from jax.sharding import PartitionSpec, reshard
 
+from omegalax.models.shard_config import ShardConfig
 from .attention import Attention
 from .config import Qwen3_5Config, Qwen3_5TextConfig, Qwen3_5VisionConfig
 from .deltanet import GatedDeltaNet
@@ -13,12 +15,23 @@ from .norms import RMSNorm
 from .rope import generate_text_rope
 from .vision import VisionModel
 
+P = PartitionSpec
+
 
 # Feed-forward blocks
 class MLP(nnx.Module):
-    """Standard gated MLP (shared expert or dense fallback)."""
+    """Standard gated MLP."""
 
-    def __init__(self, hidden_size: int, intermediate_size: int, *, dtype=None, rngs: nnx.Rngs):
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        shd_cfg: ShardConfig,
+        *,
+        dtype=None,
+        rngs: nnx.Rngs,
+    ):
+        self.shd_cfg = shd_cfg
         linear = partial(nnx.Linear, use_bias=False, rngs=rngs, dtype=dtype)
         self.gate_proj = linear(hidden_size, intermediate_size)
         self.up_proj = linear(hidden_size, intermediate_size)
@@ -26,7 +39,10 @@ class MLP(nnx.Module):
 
     @jax.named_scope("mlp")
     def __call__(self, hidden_BTD: jax.Array) -> jax.Array:
-        return self.down_proj(nnx.silu(self.gate_proj(hidden_BTD)) * self.up_proj(hidden_BTD))
+        gate_BTF = self.gate_proj(hidden_BTD, out_sharding=self.shd_cfg.act_btf)
+        up_BTF = self.up_proj(hidden_BTD, out_sharding=self.shd_cfg.act_btf)
+        activated_BTF = reshard(nnx.silu(gate_BTF) * up_BTF, self.shd_cfg.act_btf)
+        return self.down_proj(activated_BTF, out_sharding=self.shd_cfg.act_btd)
 
 
 class MoEFeedForward(nnx.Module):
@@ -34,6 +50,7 @@ class MoEFeedForward(nnx.Module):
 
     def __init__(self, cfg: Qwen3_5TextConfig, *, rngs: nnx.Rngs):
         self.cfg = cfg
+        self.shd_cfg = cfg.shd_cfg
         E = cfg.num_experts
         D = cfg.hidden_size
         F_moe = cfg.moe_intermediate_size
@@ -43,15 +60,24 @@ class MoEFeedForward(nnx.Module):
         self.down_proj = nnx.Param(init(rngs.params(), (E, D, F_moe)))
         self.router = nnx.Linear(D, E, use_bias=False, rngs=rngs, dtype=cfg.dtype)
 
-        self.shared_expert = MLP(D, cfg.shared_expert_intermediate_size, dtype=cfg.dtype, rngs=rngs)
+        self.shared_expert = MLP(
+            D,
+            cfg.shared_expert_intermediate_size,
+            shd_cfg=cfg.shd_cfg,
+            dtype=cfg.dtype,
+            rngs=rngs,
+        )
         self.shared_expert_gate = nnx.Linear(D, 1, use_bias=False, rngs=rngs, dtype=cfg.dtype)
 
     @jax.named_scope("moe_ffn")
     def __call__(self, hidden_BTD: jax.Array) -> tuple[jax.Array, jax.Array]:
         cfg = self.cfg
         B, T = hidden_BTD.shape[:2]
+        batch_axis = self.shd_cfg.act_btd[0]
+        hidden_axis = self.shd_cfg.act_btd[2]
+        ff_axis = self.shd_cfg.act_btf[2]
 
-        router_logits_BTE = self.router(hidden_BTD)
+        router_logits_BTE = self.router(hidden_BTD, out_sharding=P(batch_axis, None, None))
         probs_BTE = jax.nn.softmax(router_logits_BTE.astype(jnp.float32), axis=-1)
         topk_weights_BTk, topk_idx_BTk = jax.lax.top_k(probs_BTE, cfg.num_experts_per_tok)
         topk_weights_BTk = topk_weights_BTk / jnp.clip(
@@ -59,21 +85,32 @@ class MoEFeedForward(nnx.Module):
         )
         topk_weights_BTk = topk_weights_BTk.astype(probs_BTE.dtype)
 
-        gate_up_BTEF = jnp.einsum("BTD,EFD->BTEF", hidden_BTD, self.gate_up_proj[...])
+        dense_hidden_BTD = reshard(hidden_BTD, P(batch_axis, None, None))
+        gate_up_BTEF = jnp.einsum(
+            "BTD,EFD->BTEF",
+            dense_hidden_BTD,
+            self.gate_up_proj[...],
+            out_sharding=P(batch_axis, None, None, ff_axis),
+        )
         gate_BTEF, up_BTEF = jnp.split(gate_up_BTEF, 2, axis=-1)
         expert_hidden_BTEF = nnx.silu(gate_BTEF) * up_BTEF
-        expert_out_BTED = jnp.einsum("BTEF,EDF->BTED", expert_hidden_BTEF, self.down_proj[...])
+        expert_out_BTED = jnp.einsum(
+            "BTEF,EDF->BTED",
+            expert_hidden_BTEF,
+            self.down_proj[...],
+            out_sharding=P(batch_axis, None, None, hidden_axis),
+        )
 
         flat_out = expert_out_BTED.reshape(B * T, cfg.num_experts, cfg.hidden_size)
         flat_idx = topk_idx_BTk.reshape(B * T, cfg.num_experts_per_tok)
         gathered = jnp.take_along_axis(flat_out, flat_idx[..., None], axis=1)
         gathered = gathered.reshape(B, T, cfg.num_experts_per_tok, cfg.hidden_size)
-        moe_out_BTD = jnp.sum(gathered * topk_weights_BTk[..., None], axis=-2)
+        moe_out_BTD = reshard(jnp.sum(gathered * topk_weights_BTk[..., None], axis=-2), self.shd_cfg.act_btd)
 
         shared_out_BTD = self.shared_expert(hidden_BTD)
-        shared_gate = jax.nn.sigmoid(self.shared_expert_gate(hidden_BTD))
+        shared_gate = jax.nn.sigmoid(self.shared_expert_gate(hidden_BTD, out_sharding=P(batch_axis, None, None)))
         shared_out_BTD = shared_gate * shared_out_BTD
-        output_BTD = moe_out_BTD + shared_out_BTD
+        output_BTD = reshard(moe_out_BTD + shared_out_BTD, self.shd_cfg.act_btd)
 
         load_E = jnp.mean(probs_BTE, axis=(0, 1))
         uniform_E = jnp.full_like(load_E, 1.0 / cfg.num_experts)
@@ -113,10 +150,7 @@ class DecoderLayer(nnx.Module):
         if self.layer_type == "full_attention":
             attn_out_BTD = self.attn(normed_BTD, cos_BTK, sin_BTK, segment_ids_BT, position_ids_BT)
         else:
-            linear_mask = attention_mask_BT
-            if attention_mask_BT is not None and jnp.all(attention_mask_BT == 1):
-                linear_mask = None
-            attn_out_BTD = self.linear_attn(normed_BTD, linear_mask)
+            attn_out_BTD = self.linear_attn(normed_BTD, attention_mask_BT)
 
         hidden_BTD = residual_BTD + attn_out_BTD
 
@@ -135,6 +169,7 @@ class TextModel(nnx.Module):
     def __init__(self, cfg: Qwen3_5TextConfig, *, rngs: nnx.Rngs):
         self.cfg = cfg
         self.embedder = nnx.Embed(cfg.vocab_size, cfg.hidden_size, rngs=rngs, dtype=cfg.dtype)
+        self.out_emb_shd = cfg.shd_cfg.act_btd
         self.layers = nnx.List([
             DecoderLayer(cfg, i, rngs=rngs) for i in range(cfg.num_hidden_layers)
         ])
@@ -151,7 +186,7 @@ class TextModel(nnx.Module):
         cfg = self.cfg
 
         if inputs_embeds_BTD is None:
-            hidden_BTD = self.embedder(token_ids_BT)
+            hidden_BTD = self.embedder.embedding[...].at[(token_ids_BT,)].get(out_sharding=self.out_emb_shd)
         else:
             hidden_BTD = inputs_embeds_BTD
 
@@ -196,12 +231,13 @@ class Qwen3_5ForCausalLM(nnx.Module):
 
     def __init__(self, cfg: Qwen3_5TextConfig, *, rngs: nnx.Rngs):
         self.text = TextModel(cfg, rngs=rngs)
+        self.logits_shd = P(cfg.shd_cfg.act_btd[0], None, None)
         self.lm_head = nnx.Linear(cfg.hidden_size, cfg.vocab_size, use_bias=False, rngs=rngs, dtype=cfg.dtype)
 
     def __call__(self, token_ids_BT, segment_ids_BT, cache, num_right_pads):
         del cache, num_right_pads
         hidden_BTD, aux = self.text(token_ids_BT=token_ids_BT, segment_ids_BT=segment_ids_BT)
-        return self.lm_head(hidden_BTD), aux
+        return self.lm_head(hidden_BTD, out_sharding=self.logits_shd), aux
 
 
 # VLM
@@ -210,8 +246,9 @@ class Qwen3_5ForConditionalGeneration(nnx.Module):
 
     def __init__(self, cfg: Qwen3_5Config, *, rngs: nnx.Rngs):
         self.cfg = cfg
-        self.vision = VisionModel(cfg.vision_config, rngs=rngs)
+        self.vision = VisionModel(cfg.vision_config, shd_cfg=cfg.text_config.shd_cfg, rngs=rngs)
         self.text = TextModel(cfg.text_config, rngs=rngs)
+        self.logits_shd = P(cfg.text_config.shd_cfg.act_btd[0], None, None)
         self.lm_head = nnx.Linear(
             cfg.text_config.hidden_size, cfg.text_config.vocab_size, use_bias=False, rngs=rngs, dtype=cfg.text_config.dtype,
         )
@@ -228,7 +265,7 @@ class Qwen3_5ForConditionalGeneration(nnx.Module):
     ):
         del cache, num_right_pads
 
-        inputs_embeds_BTD = self.text.embedder(token_ids_BT)
+        inputs_embeds_BTD = self.text.embedder.embedding[...].at[(token_ids_BT,)].get(out_sharding=self.text.out_emb_shd)
 
         if pixel_values is not None and image_grid_thw is not None:
             image_embeds_ND = self.vision(pixel_values, image_grid_thw)
@@ -245,4 +282,4 @@ class Qwen3_5ForConditionalGeneration(nnx.Module):
             segment_ids_BT=segment_ids_BT,
             position_ids_ZBT=position_ids_ZBT,
         )
-        return self.lm_head(hidden_BTD), aux
+        return self.lm_head(hidden_BTD, out_sharding=self.logits_shd), aux

@@ -4,7 +4,6 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 
-
 class RMSNorm(nnx.Module):
     """Qwen3.5 RMSNorm: output = (1 + weight) * norm(x).
 

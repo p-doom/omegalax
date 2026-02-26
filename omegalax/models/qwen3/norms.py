@@ -2,7 +2,7 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 
-from .config import ShardingSpec
+from omegalax.models.shard_config import ShardingSpec
 
 
 class RMSNorm(nnx.Module):

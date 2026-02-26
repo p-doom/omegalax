@@ -7,6 +7,8 @@ from typing import Any
 
 import jax.numpy as jnp
 
+from omegalax.models.shard_config import ShardConfig
+
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class Qwen3_5VisionConfig:
@@ -54,6 +56,7 @@ class Qwen3_5TextConfig:
     num_experts: int = 512
     num_experts_per_tok: int = 10
     router_aux_loss_coef: float = 0.001
+    shd_cfg: ShardConfig = dataclasses.field(default_factory=ShardConfig.default)
     dtype: Any = jnp.bfloat16
 
 
@@ -131,6 +134,14 @@ def get_qwen3_5_spec(model_id: str) -> dict:
         return dict(_QWEN3_5_SPECS[spec_key])
     supported = sorted(_MODEL_ID_TO_SPEC.keys())
     raise ValueError(f"Unsupported Qwen3.5 model_id '{model_id}'. Supported ids: {supported}")
+
+
+def is_supported_qwen3_5_model_id(model_id: str) -> bool:
+    return model_id in _MODEL_ID_TO_SPEC
+
+
+def list_supported_qwen3_5_model_ids() -> list[str]:
+    return sorted(_MODEL_ID_TO_SPEC.keys())
 
 
 def make_config(model_id: str) -> Qwen3_5Config:

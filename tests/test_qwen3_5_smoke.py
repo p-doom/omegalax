@@ -113,7 +113,11 @@ class Qwen3_5WeightsTest(absltest.TestCase):
         hf_model = HFModel(HF_CFG).eval()
         hf_model.save_pretrained(cls.tmpdir, safe_serialization=True)
 
-        cls.jax_model, cls.jax_cfg = create_qwen3_5_from_safetensors(cls.tmpdir)
+        cls.jax_model, cls.jax_cfg = create_qwen3_5_from_safetensors(
+            cls.tmpdir,
+            tp_size=1,
+            fsdp_size=1,
+        )
 
         torch_dtype = _JNP_TO_TORCH[cls.jax_cfg.text_config.dtype]
         cls.hf_model = hf_model.to(torch_dtype)

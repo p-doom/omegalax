@@ -28,13 +28,13 @@ _VARIANTS: dict[str, tuple[Callable[..., Qwen3Config], Callable[..., nnx.Module]
 }
 
 
-def build_config(model_id: str, *, variant: str | None = None, use_sharding: bool = False) -> Qwen3Config:
+def build_config(model_id: str, *, variant: str | None = None) -> Qwen3Config:
     if variant is None:
         variant = infer_variant(model_id)
     builder, _ = _VARIANTS.get(variant, (None, None))
     if builder is None:
         raise ValueError(f"Unknown Qwen3 variant '{variant}'")
-    return builder(model_id, use_sharding=use_sharding)
+    return builder(model_id)
 
 
 def get_model_cls(variant: str) -> Type[nnx.Module]:
@@ -57,12 +57,17 @@ def infer_variant(model_id: str) -> str:
     )
 
 
+def is_supported_model_id(model_id: str) -> bool:
+    return is_supported_dense_model_id(model_id) or is_supported_moe_model_id(model_id)
+
+
 __all__ = [
     "Qwen3Config",
     "Qwen3MoeConfig",
     "build_config",
     "get_model_cls",
     "infer_variant",
+    "is_supported_model_id",
     "list_qwen3_dense_model_ids",
     "list_qwen3_moe_model_ids",
     "Qwen3Dense",

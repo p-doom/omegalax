@@ -18,9 +18,12 @@ M — chunk position (column / source)
 import jax
 import jax.numpy as jnp
 from flax import nnx
+from jax.sharding import PartitionSpec, reshard
 
 from .config import Qwen3_5TextConfig
 from .norms import RMSNormGated
+
+P = PartitionSpec
 
 
 def _l2norm(x: jax.Array, axis: int = -1, eps: float = 1e-6) -> jax.Array:
@@ -52,6 +55,7 @@ def chunk_gated_delta_rule(
     v_BTHU: jax.Array,
     g_BTH: jax.Array,
     beta_BTH: jax.Array,
+    scan_state_shd: PartitionSpec,
     chunk_size: int = 64,
 ) -> jax.Array:
     """Chunked gated delta rule.
@@ -116,6 +120,7 @@ def chunk_gated_delta_rule(
     k_cumdecay_BHJLA = jnp.einsum("BHJLM,BHJMA->BHJLA", attn_BHJLM, kb_BHJLA * jnp.exp(g_BHJL)[..., None])
 
     state_BHAU = jnp.zeros((B, H, A, U), dtype=jnp.float32)
+    state_BHAU = reshard(state_BHAU, scan_state_shd)
     upper_mask_1_LM = jnp.triu(jnp.ones((chunk_size, chunk_size), dtype=jnp.bool_), k=1)
 
     def chunk_step(carry, chunk_idx):
@@ -140,6 +145,7 @@ def chunk_gated_delta_rule(
         g_decay_BHL = jnp.exp(g_j_BHL[:, :, -1:] - g_j_BHL)
         k_decayed_BHMA = k_j_BHMA * g_decay_BHL[..., None]
         new_st_BHAU = st_BHAU * jnp.exp(g_last) + jnp.einsum("BHMA,BHMU->BHAU", k_decayed_BHMA, v_new_BHLU)
+        new_st_BHAU = reshard(new_st_BHAU, scan_state_shd)
 
         return new_st_BHAU, chunk_out_BHLU
 
@@ -157,6 +163,7 @@ class GatedDeltaNet(nnx.Module):
     """Gated Delta Net linear attention block."""
 
     def __init__(self, cfg: Qwen3_5TextConfig, *, rngs: nnx.Rngs):
+        self.shd_cfg = cfg.shd_cfg
         D = cfg.hidden_size
         self.num_v_heads = cfg.linear_num_value_heads
         self.num_k_heads = cfg.linear_num_key_heads
@@ -181,20 +188,35 @@ class GatedDeltaNet(nnx.Module):
         self.dt_bias = nnx.Param(jnp.ones(self.num_v_heads))
         self.A_log = nnx.Param(jnp.log(jax.random.uniform(rngs.params(), (self.num_v_heads,)) * 16))
 
+        batch_axis = cfg.shd_cfg.act_btd[0]
+        head_axis = cfg.shd_cfg.act_btnh[2]
+        if batch_axis is None:
+            flat_axis = head_axis
+        elif head_axis is None or head_axis == batch_axis:
+            flat_axis = batch_axis
+        else:
+            flat_axis = (batch_axis, head_axis)
+        self.hidden_shd = cfg.shd_cfg.act_btd
+        self.scan_state_shd = P(batch_axis, head_axis, None, None)
+        self.flat_norm_shd = P(flat_axis, None)
         self.norm = RMSNormGated(self.head_v_dim, cfg.rms_norm_eps, rngs=rngs)
         self.out_proj = nnx.Linear(self.value_dim, D, use_bias=False, rngs=rngs, dtype=cfg.dtype)
 
     @jax.named_scope("gated_delta_net")
     def __call__(self, hidden_BTD: jax.Array, attention_mask_BT: jax.Array | None = None) -> jax.Array:
+        hidden_BTD = reshard(hidden_BTD, self.hidden_shd)
+
         if attention_mask_BT is not None and attention_mask_BT.shape[1] > 1:
             hidden_BTD = hidden_BTD * attention_mask_BT[:, :, None]
 
         B, T, _ = hidden_BTD.shape
 
-        mixed_qkv_BCT = self.in_proj_qkv(hidden_BTD).transpose(0, 2, 1)
-        z_BTHU = self.in_proj_z(hidden_BTD).reshape(B, T, self.num_v_heads, self.head_v_dim)
-        b_BTH = self.in_proj_b(hidden_BTD)
-        a_BTH = self.in_proj_a(hidden_BTD)
+        batch_axis = self.shd_cfg.act_btd[0]
+        head_axis = self.shd_cfg.act_btnh[2]
+        mixed_qkv_BCT = self.in_proj_qkv(hidden_BTD, out_sharding=self.shd_cfg.act_btf).transpose(0, 2, 1)
+        z_BTHU = self.in_proj_z(hidden_BTD, out_sharding=self.shd_cfg.act_btf).reshape(B, T, self.num_v_heads, self.head_v_dim)
+        b_BTH = self.in_proj_b(hidden_BTD, out_sharding=P(batch_axis, None, head_axis))
+        a_BTH = self.in_proj_a(hidden_BTD, out_sharding=P(batch_axis, None, head_axis))
 
         mixed_qkv_BCT = nnx.silu(_causal_depthwise_conv1d(mixed_qkv_BCT, self.conv_weight[...]))
         mixed_qkv_BTC = mixed_qkv_BCT.transpose(0, 2, 1)
@@ -211,13 +233,28 @@ class GatedDeltaNet(nnx.Module):
         g_BTH = A_H * jax.nn.softplus(a_BTH.astype(jnp.float32) + self.dt_bias[...])
 
         if self.gqa_factor > 1:
-            q_BTHA = jnp.repeat(q_BTHA, self.gqa_factor, axis=2)
-            k_BTHA = jnp.repeat(k_BTHA, self.gqa_factor, axis=2)
+            q_BTHA = jnp.broadcast_to(
+                q_BTHA[:, :, :, None, :],
+                (B, T, self.num_k_heads, self.gqa_factor, self.head_k_dim),
+            ).reshape(B, T, self.num_v_heads, self.head_k_dim)
+            k_BTHA = jnp.broadcast_to(
+                k_BTHA[:, :, :, None, :],
+                (B, T, self.num_k_heads, self.gqa_factor, self.head_k_dim),
+            ).reshape(B, T, self.num_v_heads, self.head_k_dim)
 
-        core_out_BTHU = chunk_gated_delta_rule(q_BTHA, k_BTHA, v_BTHU, g_BTH, beta_BTH)
+        core_out_BTHU = chunk_gated_delta_rule(
+            q_BTHA,
+            k_BTHA,
+            v_BTHU,
+            g_BTH,
+            beta_BTH,
+            scan_state_shd=self.scan_state_shd,
+        )
 
-        core_flat = core_out_BTHU.reshape(-1, self.head_v_dim)
-        z_flat = z_BTHU.reshape(-1, self.head_v_dim)
+        flat_rows = B * T * self.num_v_heads
+        core_flat = jax.lax.reshape(core_out_BTHU, (flat_rows, self.head_v_dim), out_sharding=self.flat_norm_shd)
+        z_flat = jax.lax.reshape(z_BTHU, (flat_rows, self.head_v_dim), out_sharding=self.flat_norm_shd)
         normed = self.norm(core_flat, z_flat)
-        normed_BTD = normed.reshape(B, T, -1)
-        return self.out_proj(normed_BTD)
+        normed_BTD = jax.lax.reshape(normed, (B, T, self.value_dim), out_sharding=self.shd_cfg.act_btd)
+        out_BTD = self.out_proj(normed_BTD, out_sharding=self.shd_cfg.act_btd)
+        return reshard(out_BTD, self.shd_cfg.act_btd)

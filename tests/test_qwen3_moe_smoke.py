@@ -71,6 +71,8 @@ class Qwen3MoeWeightsTest(absltest.TestCase):
     def setUpClass(cls):
         super().setUpClass()
         cls.tmpdir = tempfile.mkdtemp()
+        torch.manual_seed(0)
+        np.random.seed(0)
 
         hf_model = Qwen3MoeForCausalLM(HF_SMOKE_CFG).eval()
         hf_model.save_pretrained(cls.tmpdir, safe_serialization=True)
@@ -80,7 +82,12 @@ class Qwen3MoeWeightsTest(absltest.TestCase):
             json.dump(HF_SMOKE_CFG.to_dict(), f)
 
         cls.jax_cfg = make_moe_config(SMOKE_MOE_ID)
-        cls.jax_model = create_qwen3_moe_from_safetensors(cls.tmpdir, SMOKE_MOE_ID)
+        cls.jax_model = create_qwen3_moe_from_safetensors(
+            cls.tmpdir,
+            SMOKE_MOE_ID,
+            tp_size=1,
+            fsdp_size=1,
+        )
 
         torch_dtype = _JNP_TO_TORCH[cls.jax_cfg.dtype]
         cls.hf_model = hf_model.to(torch_dtype)

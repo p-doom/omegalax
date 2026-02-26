@@ -11,6 +11,7 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 
+from omegalax.models.shard_config import ShardConfig
 from .config import Qwen3_5VisionConfig
 from .norms import LayerNorm
 from .rope import apply_vision_rope, generate_vision_rope
@@ -134,7 +135,7 @@ class VisionPatchMerger(nnx.Module):
 class VisionModel(nnx.Module):
     """Full Qwen3.5 vision encoder."""
 
-    def __init__(self, cfg: Qwen3_5VisionConfig, *, rngs: nnx.Rngs):
+    def __init__(self, cfg: Qwen3_5VisionConfig, shd_cfg: ShardConfig, *, rngs: nnx.Rngs):
         self.cfg = cfg
         self.patch_embed = VisionPatchEmbed(cfg, rngs=rngs)
         self.pos_embed = nnx.Embed(

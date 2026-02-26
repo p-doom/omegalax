@@ -14,6 +14,7 @@ from safetensors import numpy as stnp
 from etils import epath
 from flax import nnx
 
+from omegalax.distributed.mesh import ensure_mesh
 from omegalax.models.params_utils import (
     Transform,
     assign_weights_from_eval_shape,
@@ -31,6 +32,8 @@ from omegalax.models.params_utils import (
     stoi,
     write_moe_experts_to_hf,
 )
+from omegalax.models.sharding_runtime import apply_sharding_to_model_state as apply_sharding_to_model_state_runtime
+from ..sharding import model_state_sharding
 from .config import Qwen3MoeConfig, make_moe_config
 from .model import Qwen3Moe
 
@@ -45,7 +48,7 @@ def _assert_moe_config(cfg: Qwen3MoeConfig, hf_cfg: dict[str, Any]):
     _require("emb_dim", cfg.emb_dim, hf_cfg["hidden_size"])
     _require("num_heads", cfg.num_heads, hf_cfg["num_attention_heads"])
     _require("num_kv_heads", cfg.num_kv_heads, hf_cfg["num_key_value_heads"])
-    _require("num_experts", cfg.num_experts, hf_cfg.get("num_experts") or hf_cfg.get("num_local_experts"))
+    _require("num_experts", cfg.num_experts, hf_cfg["num_experts"])
     _require("num_experts_per_tok", cfg.num_experts_per_tok, hf_cfg["num_experts_per_tok"])
     _require("moe_intermediate_size", cfg.moe_intermediate_size, hf_cfg["moe_intermediate_size"])
 
@@ -74,9 +77,13 @@ def _get_non_expert_mapping():
 
 
 def create_qwen3_moe_from_safetensors(
-    file_dir: str, model_id: str, use_sharding: bool = False,
+    file_dir: str,
+    model_id: str,
+    *,
+    tp_size: int | None = None,
+    fsdp_size: int | None = None,
 ) -> Qwen3Moe:
-    cfg = make_moe_config(model_id, use_sharding=use_sharding)
+    cfg = make_moe_config(model_id)
     files = find_safetensors(file_dir)
 
     hf_cfg = load_hf_config(epath.Path(file_dir))
@@ -136,7 +143,13 @@ def create_qwen3_moe_from_safetensors(
         state_dict["lm_head"]["kernel"] = state_dict["embedder"]["embedding"].T
 
     gc.collect()
-    return nnx.merge(graph_def, state_dict)
+    model = nnx.merge(graph_def, state_dict)
+    return apply_sharding_to_model_state_runtime(
+        model,
+        cfg.shd_cfg,
+        ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size),
+        model_state_sharding,
+    )
 
 
 def _make_hf_config_dict(cfg: Qwen3MoeConfig) -> dict[str, Any]:

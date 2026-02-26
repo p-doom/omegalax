@@ -59,7 +59,7 @@ class ExportRoundTripTest(absltest.TestCase):
         model = Qwen3Dense(cfg, rngs=rngs)
         with tempfile.TemporaryDirectory() as tmpdir:
             export_qwen3_dense_to_safetensors(model, cfg, tmpdir)
-            loaded = create_qwen3_dense_from_safetensors(tmpdir, "qwen3-smoke")
+            loaded = create_qwen3_dense_from_safetensors(tmpdir, "qwen3-smoke", tp_size=1, fsdp_size=1)
         _assert_params_equal(self, model, loaded)
 
     def test_qwen3_moe_round_trip(self):
@@ -68,7 +68,7 @@ class ExportRoundTripTest(absltest.TestCase):
         model = Qwen3Moe(cfg, rngs=rngs)
         with tempfile.TemporaryDirectory() as tmpdir:
             export_qwen3_moe_to_safetensors(model, cfg, tmpdir)
-            loaded = create_qwen3_moe_from_safetensors(tmpdir, "qwen3-smoke-moe")
+            loaded = create_qwen3_moe_from_safetensors(tmpdir, "qwen3-smoke-moe", tp_size=1, fsdp_size=1)
         _assert_params_equal(self, model, loaded)
 
     def test_qwen3_vl_round_trip(self):
@@ -77,7 +77,12 @@ class ExportRoundTripTest(absltest.TestCase):
         model = Qwen3VL(cfg, rngs=rngs)
         with tempfile.TemporaryDirectory() as tmpdir:
             export_qwen3_vl_to_safetensors(model, cfg, tmpdir)
-            loaded, _ = create_qwen3_vl_from_safetensors(tmpdir, "qwen3-vl-smoke")
+            loaded, _ = create_qwen3_vl_from_safetensors(
+                tmpdir,
+                "qwen3-vl-smoke",
+                tp_size=1,
+                fsdp_size=1,
+            )
         _assert_params_equal(self, model, loaded)
 
     def test_qwen3_vl_moe_round_trip(self):
@@ -86,7 +91,12 @@ class ExportRoundTripTest(absltest.TestCase):
         model = Qwen3VL(cfg, rngs=rngs)
         with tempfile.TemporaryDirectory() as tmpdir:
             export_qwen3_vl_to_safetensors(model, cfg, tmpdir)
-            loaded, _ = create_qwen3_vl_from_safetensors(tmpdir, "qwen3-vl-smoke-moe")
+            loaded, _ = create_qwen3_vl_from_safetensors(
+                tmpdir,
+                "qwen3-vl-smoke-moe",
+                tp_size=1,
+                fsdp_size=1,
+            )
         _assert_params_equal(self, model, loaded)
 
     def test_qwen3_5_round_trip(self):
@@ -95,7 +105,12 @@ class ExportRoundTripTest(absltest.TestCase):
         model = Qwen3_5ForConditionalGeneration(cfg, rngs=rngs)
         with tempfile.TemporaryDirectory() as tmpdir:
             export_qwen3_5_to_safetensors(model, cfg, tmpdir)
-            loaded, _ = create_qwen3_5_from_safetensors(tmpdir, "qwen3.5-smoke")
+            loaded, _ = create_qwen3_5_from_safetensors(
+                tmpdir,
+                "qwen3.5-smoke",
+                tp_size=1,
+                fsdp_size=1,
+            )
         _assert_params_equal(self, model, loaded)
 
 

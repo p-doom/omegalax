@@ -11,6 +11,7 @@ import safetensors
 from etils import epath
 from flax import nnx
 
+from omegalax.distributed.mesh import ensure_mesh
 from omegalax.models.params_utils import (
     Transform,
     assign_weights_from_eval_shape,
@@ -23,8 +24,10 @@ from omegalax.models.params_utils import (
     map_to_bonsai_key,
     stoi,
 )
+from omegalax.models.sharding_runtime import apply_sharding_to_model_state as apply_sharding_to_model_state_runtime
 from .config import Qwen3VLConfig, make_vl_config, make_vl_config_from_hf
 from .model import Qwen3VL
+from .sharding import model_state_sharding
 
 
 def _assert_vl_config(cfg: Qwen3VLConfig, hf_cfg: dict):
@@ -131,8 +134,16 @@ def _get_non_expert_mapping():
     return mapping
 
 
-def create_qwen3_vl_from_safetensors(file_dir: str, model_id: str = "", use_sharding: bool = False) -> tuple[Qwen3VL, Qwen3VLConfig]:
+def create_qwen3_vl_from_safetensors(
+    file_dir: str,
+    model_id: str = "",
+    *,
+    tp_size: int | None = None,
+    fsdp_size: int | None = None,
+) -> tuple[Qwen3VL, Qwen3VLConfig]:
     """Load HuggingFace Qwen3-VL safetensors into a JAX Qwen3-VL model."""
+    mesh = ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size)
+
     path = epath.Path(file_dir).expanduser()
     files = find_safetensors(file_dir)
 
@@ -208,4 +219,6 @@ def create_qwen3_vl_from_safetensors(file_dir: str, model_id: str = "", use_shar
         state_dict["lm_head"]["kernel"] = state_dict["text"]["embedder"]["embedding"].T
 
     gc.collect()
-    return nnx.merge(graph_def, state_dict), cfg
+    model = nnx.merge(graph_def, state_dict)
+    model = apply_sharding_to_model_state_runtime(model, cfg.shd_cfg, mesh, model_state_sharding)
+    return model, cfg

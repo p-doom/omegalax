@@ -68,7 +68,12 @@ class Qwen3VLMappingTest(absltest.TestCase):
 
         hf_cfg_dict = load_hf_config(cls.model_path)
         cls.cfg = make_vl_config_from_hf(hf_cfg_dict)
-        cls.jax_model, _ = create_qwen3_vl_from_safetensors(cls.model_path, MODEL_ID)
+        cls.jax_model, _ = create_qwen3_vl_from_safetensors(
+            cls.model_path,
+            MODEL_ID,
+            tp_size=1,
+            fsdp_size=1,
+        )
 
     def test_parameter_mapping_is_complete(self):
         """All HF keys should be mapped; all JAX leaves should be populated."""

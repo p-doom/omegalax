@@ -1,3 +1,4 @@
+import dataclasses
 import numpy as np
 from absl.testing import absltest
 import jax
@@ -14,8 +15,7 @@ class SmokeTest(absltest.TestCase):
         self.train_cfg = text_trainer.TrainConfig.smoke()
         self.rng = jax.random.key(0)
         self.rng, init_rng = jax.random.split(self.rng)
-        self.model = text_trainer.init_model(self.model_cfg, init_rng)
-        self.optimizer = text_trainer.build_optimizer(self.model, self.train_cfg)
+        self.model = text_trainer.init_model(self.model_cfg, init_rng, tp_size=1, fsdp_size=1)
 
     def _tokens(self, batch_size: int, seq_len: int) -> jax.Array:
         self.rng, rng = jax.random.split(self.rng)
@@ -32,15 +32,20 @@ class SmokeTest(absltest.TestCase):
         self.assertTrue(np.isfinite(float(aux_loss)))
 
     def test_train_step_smoke(self):
-        train_step = text_trainer.make_train_step(self.model_cfg, pad_id=0)
-        batch = self._tokens(batch_size=self.train_cfg.batch_size, seq_len=self.train_cfg.seq_len)
-        _, metrics = train_step(self.optimizer, batch)
+        one_step_cfg = dataclasses.replace(self.train_cfg, num_steps=1, batch_size=2, seq_len=8)
+        _, metrics = text_trainer.run_training(
+            self.model_cfg,
+            one_step_cfg,
+            log_every=0,
+            tp_size=1,
+            fsdp_size=1,
+        )
         self.assertTrue(np.isfinite(float(metrics["loss"])))
         self.assertTrue(np.isfinite(float(metrics["grad_norm"])))
 
     def test_moe_forward_smoke(self):
         moe_cfg = api.registry.build_config("qwen3-smoke-moe")
-        moe_model = text_trainer.init_model(moe_cfg, self.rng)
+        moe_model = text_trainer.init_model(moe_cfg, self.rng, tp_size=1, fsdp_size=1)
         token_ids_BT = self._tokens(batch_size=2, seq_len=8)
         logits_BTV, aux_loss = api.forward(moe_model, token_ids_BT, pad_id=0, cfg=moe_cfg)
         self.assertEqual(logits_BTV.shape[:2], (2, 8))

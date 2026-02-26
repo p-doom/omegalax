@@ -7,6 +7,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 
+from omegalax.models.shard_config import ShardConfig
 from .config import Qwen3VLVisionConfig
 
 
@@ -115,7 +116,13 @@ class VisionBlock(nnx.Module):
 
 
 class VisionPatchMerger(nnx.Module):
-    def __init__(self, config: Qwen3VLVisionConfig, *, use_postshuffle_norm: bool = False, rngs: nnx.Rngs):
+    def __init__(
+        self,
+        config: Qwen3VLVisionConfig,
+        *,
+        use_postshuffle_norm: bool = False,
+        rngs: nnx.Rngs,
+    ):
         hidden_size = config.hidden_size * (config.spatial_merge_size**2)
         self.hidden_size = hidden_size
         self.use_postshuffle_norm = use_postshuffle_norm
@@ -135,7 +142,7 @@ class VisionPatchMerger(nnx.Module):
 
 
 class VisionModel(nnx.Module):
-    def __init__(self, config: Qwen3VLVisionConfig, *, rngs: nnx.Rngs):
+    def __init__(self, config: Qwen3VLVisionConfig, shd_cfg: ShardConfig, *, rngs: nnx.Rngs):
         self.config = config
         self.spatial_merge_size = config.spatial_merge_size
         self.patch_embed = VisionPatchEmbed(config, rngs=rngs)
@@ -149,7 +156,10 @@ class VisionModel(nnx.Module):
         self.blocks = nnx.List([VisionBlock(config, rngs=rngs) for _ in range(config.depth)])
         self.merger = VisionPatchMerger(config, use_postshuffle_norm=False, rngs=rngs)
         self.deepstack_mergers = nnx.List(
-            [VisionPatchMerger(config, use_postshuffle_norm=True, rngs=rngs) for _ in config.deepstack_visual_indexes]
+            [
+                VisionPatchMerger(config, use_postshuffle_norm=True, rngs=rngs)
+                for _ in config.deepstack_visual_indexes
+            ]
         )
         self.deepstack_visual_indexes = config.deepstack_visual_indexes
 

@@ -82,7 +82,12 @@ class Qwen3ModuleTest(absltest.TestCase):
         cls.hf_model = Qwen3ForCausalLM.from_pretrained(
             cls.model_path, config=hf_cfg, torch_dtype=torch.float32
         ).eval()
-        cls.jax_model = params_dense.create_qwen3_dense_from_safetensors(cls.model_path, MODEL_ID)
+        cls.jax_model = params_dense.create_qwen3_dense_from_safetensors(
+            cls.model_path,
+            MODEL_ID,
+            tp_size=1,
+            fsdp_size=1,
+        )
 
         chat_text = cls.tokenizer.apply_chat_template(
             [{"role": "user", "content": PROMPT}],

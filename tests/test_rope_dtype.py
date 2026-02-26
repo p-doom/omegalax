@@ -142,7 +142,7 @@ class Qwen3_5VisionRopeDtypeTest(absltest.TestCase):
         cfg = make_config("qwen3.5-smoke")
         vis_cfg = cfg.vision_config
 
-        vision = vis_mod.VisionModel(vis_cfg, rngs=nnx.Rngs(0))
+        vision = vis_mod.VisionModel(vis_cfg, shd_cfg=cfg.text_config.shd_cfg, rngs=nnx.Rngs(0))
 
         block_calls = []
 
@@ -230,7 +230,7 @@ class Qwen3VLVisionRopeDtypeTest(absltest.TestCase):
         base_cfg = make_vl_config("qwen3-vl-smoke")
         vis_cfg = base_cfg.vision
 
-        vision = vis_mod.VisionModel(vis_cfg, rngs=nnx.Rngs(0))
+        vision = vis_mod.VisionModel(vis_cfg, shd_cfg=base_cfg.shd_cfg, rngs=nnx.Rngs(0))
 
         block_calls = []
 

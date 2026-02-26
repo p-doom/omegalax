@@ -1,18 +1,6 @@
 import jax
 import jax.numpy as jnp
-from jax.sharding import PartitionSpec, get_abstract_mesh, reshard
 from jaxtyping import Array
-
-from .config import ShardingSpec
-
-P = PartitionSpec
-
-
-def shard(x, s: ShardingSpec):
-    mesh = get_abstract_mesh()
-    if not mesh.empty and len(mesh.axis_names) > 0 and isinstance(x, (jax.Array, jnp.ndarray)):
-        return reshard(x, s)
-    return x
 
 
 def count_left_pads(token_ids_BT: Array) -> Array:

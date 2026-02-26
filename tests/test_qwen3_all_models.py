@@ -59,7 +59,12 @@ class Qwen3AllModelsTest(parameterized.TestCase):
         model_path = snapshot_download(model_id)
 
         cfg = api.registry.build_config(model_id)
-        jax_model = create_qwen3_from_safetensors(model_path, model_id)
+        jax_model = create_qwen3_from_safetensors(
+            model_path,
+            model_id,
+            tp_size=1,
+            fsdp_size=1,
+        )
 
         tokenizer = AutoTokenizer.from_pretrained(model_path)
 

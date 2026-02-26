@@ -7,6 +7,8 @@ from typing import Any
 
 import jax.numpy as jnp
 
+from omegalax.models.shard_config import ShardConfig
+
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class Qwen3VLVisionConfig:
@@ -49,6 +51,7 @@ class Qwen3VLConfig:
     mlp_only_layers: tuple[int, ...] = dataclasses.field(default_factory=tuple)
     decoder_sparse_step: int = 1
     norm_topk_prob: bool = True
+    shd_cfg: ShardConfig = dataclasses.field(default_factory=ShardConfig.default)
     dtype: Any = jnp.bfloat16
 
     def is_moe_layer(self, layer_idx: int) -> bool:
@@ -192,6 +195,14 @@ def get_vl_spec(model_id: str) -> dict[str, Any]:
         return dict(_QWEN3_VL_SPECS[spec_key])
     supported = sorted(_MODEL_ID_TO_SPEC.keys())
     raise ValueError(f"Unsupported Qwen3-VL model_id '{model_id}'. Supported ids: {supported}")
+
+
+def is_supported_qwen3_vl_model_id(model_id: str) -> bool:
+    return model_id in _MODEL_ID_TO_SPEC
+
+
+def list_supported_qwen3_vl_model_ids() -> list[str]:
+    return sorted(_MODEL_ID_TO_SPEC.keys())
 
 
 def make_vl_config(model_id: str) -> Qwen3VLConfig:

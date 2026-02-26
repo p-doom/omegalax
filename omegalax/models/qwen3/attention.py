@@ -1,11 +1,11 @@
 import jax
 import jax.numpy as jnp
 from flax import nnx
-from jax.sharding import PartitionSpec as P
+from jax.sharding import PartitionSpec as P, reshard
 
 from .norms import RMSNorm
 from .rope import apply_rope, generate_pos_embeddings
-from .utils import compute_positions_from_segment_ids, count_left_pads, shard
+from .utils import compute_positions_from_segment_ids, count_left_pads
 
 def _mask_value(dtype: jnp.dtype) -> float:
     return float(jnp.finfo(dtype).min)
@@ -15,29 +15,17 @@ class Attention(nnx.Module):
     def __init__(self, cfg, *, rngs: nnx.Rngs):
         self.shd_cfg = cfg.shd_cfg
         self.dtype = cfg.dtype
-        self.q_proj = shard(
-            nnx.Linear(
-                cfg.emb_dim, cfg.num_heads * cfg.head_dim, use_bias=False, rngs=rngs, dtype=cfg.dtype
-            ),
-            self.shd_cfg.q_weight_ndh,
+        self.q_proj = nnx.Linear(
+            cfg.emb_dim, cfg.num_heads * cfg.head_dim, use_bias=False, rngs=rngs, dtype=cfg.dtype
         )
-        self.k_proj = shard(
-            nnx.Linear(
-                cfg.emb_dim, cfg.num_kv_heads * cfg.head_dim, use_bias=False, rngs=rngs, dtype=cfg.dtype
-            ),
-            self.shd_cfg.kv_weight_ndh,
+        self.k_proj = nnx.Linear(
+            cfg.emb_dim, cfg.num_kv_heads * cfg.head_dim, use_bias=False, rngs=rngs, dtype=cfg.dtype
         )
-        self.v_proj = shard(
-            nnx.Linear(
-                cfg.emb_dim, cfg.num_kv_heads * cfg.head_dim, use_bias=False, rngs=rngs, dtype=cfg.dtype
-            ),
-            self.shd_cfg.kv_weight_ndh,
+        self.v_proj = nnx.Linear(
+            cfg.emb_dim, cfg.num_kv_heads * cfg.head_dim, use_bias=False, rngs=rngs, dtype=cfg.dtype
         )
-        self.o_proj = shard(
-            nnx.Linear(
-                cfg.num_heads * cfg.head_dim, cfg.emb_dim, use_bias=False, rngs=rngs, dtype=cfg.dtype
-            ),
-            self.shd_cfg.o_weight_nhd,
+        self.o_proj = nnx.Linear(
+            cfg.num_heads * cfg.head_dim, cfg.emb_dim, use_bias=False, rngs=rngs, dtype=cfg.dtype
         )
 
         self.q_norm = RMSNorm(cfg.head_dim, cfg.norm_eps, self.shd_cfg.rms_norm, rngs=rngs)
@@ -50,9 +38,12 @@ class Attention(nnx.Module):
 
     @jax.named_scope("attention")
     def __call__(self, hidden_BTD: jax.Array, cache, segment_ids_BT: jax.Array) -> jax.Array:
-        q_BTHK = shard(self.q_norm(self.q_proj(hidden_BTD).reshape((*hidden_BTD.shape[:2], self.num_heads, self.head_dim))), self.shd_cfg.act_btnh)
-        k_BTGK = shard(self.k_norm(self.k_proj(hidden_BTD).reshape((*hidden_BTD.shape[:2], self.num_kv_heads, self.head_dim))), self.shd_cfg.act_btnh)
-        v_BTGK = shard(self.v_proj(hidden_BTD).reshape((*hidden_BTD.shape[:2], self.num_kv_heads, self.head_dim)), self.shd_cfg.act_btnh)
+        q_proj_BTF = self.q_proj(hidden_BTD, out_sharding=self.shd_cfg.act_btf)
+        k_proj_BTF = self.k_proj(hidden_BTD, out_sharding=self.shd_cfg.act_btf)
+        v_proj_BTF = self.v_proj(hidden_BTD, out_sharding=self.shd_cfg.act_btf)
+        q_BTHK = reshard(self.q_norm(q_proj_BTF.reshape((*hidden_BTD.shape[:2], self.num_heads, self.head_dim))), self.shd_cfg.act_btnh)
+        k_BTGK = reshard(self.k_norm(k_proj_BTF.reshape((*hidden_BTD.shape[:2], self.num_kv_heads, self.head_dim))), self.shd_cfg.act_btnh)
+        v_BTGK = reshard(v_proj_BTF.reshape((*hidden_BTD.shape[:2], self.num_kv_heads, self.head_dim)), self.shd_cfg.act_btnh)
 
         if cache is None:
             positions_BT = compute_positions_from_segment_ids(segment_ids_BT)
@@ -85,10 +76,11 @@ class Attention(nnx.Module):
             )
             attn_BTGRK = jnp.einsum("BTSGR,BSGK->BTGRK", weights_BTSGR, v_BTGK)
             attn_BTHK = attn_BTGRK.reshape((B, T, self.num_heads, K))
-            return shard(self.o_proj(attn_BTHK.reshape(B, T, self.num_heads * K)), self.shd_cfg.act_btd)
+            out_BTD = self.o_proj(attn_BTHK.reshape(B, T, self.num_heads * K), out_sharding=self.shd_cfg.act_btd)
+            return reshard(out_BTD, self.shd_cfg.act_btd)
 
         left_pads_B = count_left_pads(segment_ids_BT)
-        left_pads_B = shard(left_pads_B, P(self.shd_cfg.act_btnh[0]))
+        left_pads_B = reshard(left_pads_B, P(self.shd_cfg.act_btnh[0]))
         cache.start_ind.set_value(jnp.where(cache.start_ind[...] < 0, left_pads_B, cache.start_ind[...]))
         positions_BT = compute_positions_from_segment_ids(segment_ids_BT) + cache.cur_ind[...]
         sin_BTK, cos_BTK = generate_pos_embeddings(positions_BT, self.head_dim)
@@ -123,4 +115,5 @@ class Attention(nnx.Module):
         attn_BTHK = attn_BTGRK.reshape((B, T, self.num_heads, K))
 
         cache.cur_ind[...] = cache.cur_ind[...] + T
-        return shard(self.o_proj(attn_BTHK.reshape(B, T, self.num_heads * K)), self.shd_cfg.act_btd)
+        out_BTD = self.o_proj(attn_BTHK.reshape(B, T, self.num_heads * K), out_sharding=self.shd_cfg.act_btd)
+        return reshard(out_BTD, self.shd_cfg.act_btd)

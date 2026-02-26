@@ -76,7 +76,7 @@ class Qwen3RegistryTest(absltest.TestCase):
                 self.assertEqual(getattr(cfg, field), value, msg=f"{model_id}: {field}")
 
     def test_unknown_alias_raises(self):
-        with self.assertRaisesRegex(ValueError, "Unsupported Qwen3 dense model_id"):
+        with self.assertRaisesRegex(ValueError, "Unsupported Qwen3 model_id"):
             api.registry.build_config("qwen3-0.6b-base")
 
     def test_tie_word_embeddings_mismatch_raises(self):

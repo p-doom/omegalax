@@ -6,6 +6,8 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+import jax
+
 from omegalax.trainers import text as text_trainer
 from omegalax.trainers.perf import resolve_peak_tflops
 
@@ -24,6 +26,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--tp-size", type=int, default=None)
+    parser.add_argument("--fsdp-size", type=int, default=None)
     parser.add_argument("--save-dir", type=str, default=None, help="Directory to store checkpoints/logs.")
     parser.add_argument("--save-every", type=int, default=50)
     parser.add_argument("--log-every", type=int, default=10)
@@ -41,6 +45,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    jax.distributed.initialize()
     train_cfg = text_trainer.TrainConfig(
         seed=args.seed,
         batch_size=args.batch_size,
@@ -63,6 +68,8 @@ def main() -> None:
         resume=args.resume,
         pad_id=args.pad_id,
         peak_tflops=peak_tflops,
+        tp_size=args.tp_size,
+        fsdp_size=args.fsdp_size,
     )
     if last_metrics:
         print(
