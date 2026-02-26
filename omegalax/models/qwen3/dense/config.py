@@ -128,10 +128,9 @@ def is_supported_dense_model_id(model_id: str) -> bool:
     return model_id in _MODEL_ID_TO_SPEC
 
 
-def make_dense_config(model_id: str, use_sharding: bool = False) -> Qwen3Config:
+def make_dense_config(model_id: str) -> Qwen3Config:
     spec = get_dense_spec(model_id)
     return Qwen3Config.with_sharding(
-        use_sharding,
         variant="dense",
         num_layers=int(spec["num_layers"]),
         vocab_size=int(spec["vocab_size"]),

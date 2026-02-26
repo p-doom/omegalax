@@ -13,6 +13,7 @@ from safetensors import numpy as stnp
 from etils import epath
 from flax import nnx
 
+from omegalax.distributed.mesh import ensure_mesh
 from omegalax.models.params_utils import (
     Transform,
     assign_weights_from_eval_shape,
@@ -26,9 +27,11 @@ from omegalax.models.params_utils import (
     save_hf_config,
     stoi,
 )
+from omegalax.models.sharding_runtime import apply_sharding_to_model_state as apply_sharding_to_model_state_runtime
 
 from .config import Qwen3Config, make_dense_config
 from .model import Qwen3Dense
+from ..sharding import model_state_sharding
 
 
 def assert_dense_config(cfg: Qwen3Config, hf_cfg: dict[str, Any]):
@@ -40,7 +43,8 @@ def assert_dense_config(cfg: Qwen3Config, hf_cfg: dict[str, Any]):
     _require("num_kv_heads", cfg.num_kv_heads, hf_cfg["num_key_value_heads"])
     _require("head_dim", cfg.head_dim, hf_cfg["head_dim"])
     _require("mlp_dim", cfg.mlp_dim, hf_cfg["intermediate_size"])
-    _require("rope_theta", cfg.rope_theta, hf_cfg["rope_theta"])
+    rope_params = hf_cfg.get("rope_parameters") or hf_cfg.get("rope_scaling") or {}
+    _require("rope_theta", cfg.rope_theta, rope_params.get("rope_theta") or hf_cfg.get("rope_theta"))
 
 
 def _get_key_and_transform_mapping(cfg):
@@ -70,9 +74,14 @@ def _require(name: str, lhs: Any, rhs: Any):
         raise ValueError(f"Config mismatch for {name}: expected {lhs}, found {rhs} in HF config")
 
 
-
-def create_qwen3_dense_from_safetensors(file_dir: str, model_id: str, use_sharding: bool = False) -> Qwen3Dense:
-    cfg = make_dense_config(model_id, use_sharding=use_sharding)
+def create_qwen3_dense_from_safetensors(
+    file_dir: str,
+    model_id: str,
+    *,
+    tp_size: int | None = None,
+    fsdp_size: int | None = None,
+) -> Qwen3Dense:
+    cfg = make_dense_config(model_id)
     files = find_safetensors(file_dir)
 
     hf_cfg = load_hf_config(epath.Path(file_dir))
@@ -103,7 +112,13 @@ def create_qwen3_dense_from_safetensors(file_dir: str, model_id: str, use_shardi
         state_dict["lm_head"]["kernel"] = state_dict["embedder"]["embedding"].T
 
     gc.collect()
-    return nnx.merge(graph_def, state_dict)
+    model = nnx.merge(graph_def, state_dict)
+    return apply_sharding_to_model_state_runtime(
+        model,
+        cfg.shd_cfg,
+        ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size),
+        model_state_sharding,
+    )
 
 
 def _make_hf_config_dict(cfg: Qwen3Config) -> dict[str, Any]:

@@ -33,6 +33,10 @@
   - Qwen3.5: `Qwen/Qwen3.5-397B-A17B`.
   - Qwen3-VL: `Qwen/Qwen3-VL-2B-Instruct`.
 
+## Tensor naming convention
+All tensor variables use [Shazeer's shape-suffix notation](https://medium.com/@noamshazeer/shape-suffixes-good-coding-style-f836e72e24fd).
+The full dimension key lives in the `omegalax.models` package docstring (`omegalax/models/__init__.py`).
+
 ## Install
 Use Python 3.11+ with a JAX build that matches your accelerator (e.g., `jax[cuda12]` for CUDA 12):
 ```bash

@@ -8,11 +8,16 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import nnx
+from jax.sharding import PartitionSpec, reshard
 
 from .config import Qwen3VLConfig
 from .vision import VisionModel
 
-_K_MASK: float = float(jnp.finfo(jnp.float32).min)
+P = PartitionSpec
+
+
+def _mask_value(dtype: jnp.dtype) -> float:
+    return float(jnp.finfo(dtype).min)
 
 
 class RMSNorm(nnx.Module):
@@ -23,49 +28,40 @@ class RMSNorm(nnx.Module):
     def __call__(self, x: jax.Array) -> jax.Array:
         dtype = x.dtype
         variance = jnp.mean(x.astype(jnp.float32) ** 2, axis=-1, keepdims=True)
-        x = x * jax.lax.rsqrt(variance + self.eps)
-        return (self.scale[...] * x).astype(dtype)
+        normed = x * jax.lax.rsqrt(variance + self.eps)
+        return (self.scale[...] * normed).astype(dtype)
 
 
-def apply_rope(x: jax.Array, sin: jax.Array, cos: jax.Array) -> jax.Array:
-    """Apply rotary position embedding.
-
-    Args:
-        x: (batch, seq_len, num_heads, head_dim)
-        sin, cos: (batch, seq_len, head_dim // 2)
-    """
-    half = x.shape[-1] // 2
-    x1, x2 = x[..., :half], x[..., half:]
-    sin = sin[:, :, None, :]
-    cos = cos[:, :, None, :]
-    return jnp.concatenate([x1 * cos - x2 * sin, x2 * cos + x1 * sin], axis=-1).astype(x.dtype)
+def apply_rope(x_BTHK: jax.Array, sin_BTK: jax.Array, cos_BTK: jax.Array) -> jax.Array:
+    half = x_BTHK.shape[-1] // 2
+    x1, x2 = x_BTHK[..., :half], x_BTHK[..., half:]
+    sin_BTK = sin_BTK[:, :, None, :]
+    cos_BTK = cos_BTK[:, :, None, :]
+    return jnp.concatenate([x1 * cos_BTK - x2 * sin_BTK, x2 * cos_BTK + x1 * sin_BTK], axis=-1).astype(x_BTHK.dtype)
 
 
 def compute_mrope_pos_embeddings(
-    position_ids: jax.Array, head_dim: int, rope_theta: float, mrope_section: tuple[int, ...]
+    position_ids_ZBT: jax.Array, head_dim: int, rope_theta: float, mrope_section: tuple[int, ...]
 ) -> tuple[jax.Array, jax.Array]:
     """Compute M-RoPE positional embeddings with interleaved frequency layout.
 
     Args:
-        position_ids: (3, batch, seq_len)
-        head_dim: int
-        rope_theta: float
-        mrope_section: tuple of 3 ints summing to head_dim // 2
+        position_ids_ZBT: (3, batch, seq_len)
 
     Returns:
-        sin, cos: (batch, seq_len, head_dim // 2)
+        sin_BTK, cos_BTK: (batch, seq_len, head_dim // 2)
     """
     dim = head_dim
-    inv_freq = 1.0 / (rope_theta ** (jnp.arange(0, dim, 2, dtype=jnp.float32) / dim))
-    freqs = jnp.einsum("dbs,h->dbsh", position_ids.astype(jnp.float32), inv_freq)
+    inv_freq_K = 1.0 / (rope_theta ** (jnp.arange(0, dim, 2, dtype=jnp.float32) / dim))
+    freqs_ZBTK = jnp.einsum("ZBT,K->ZBTK", position_ids_ZBT.astype(jnp.float32), inv_freq_K)
 
-    freqs_t = freqs[0]
+    freqs_BTK = freqs_ZBTK[0]
     h_indices = np.arange(1, mrope_section[1] * 3, 3)
     w_indices = np.arange(2, mrope_section[2] * 3, 3)
-    freqs_t = freqs_t.at[:, :, h_indices].set(freqs[1][:, :, h_indices])
-    freqs_t = freqs_t.at[:, :, w_indices].set(freqs[2][:, :, w_indices])
+    freqs_BTK = freqs_BTK.at[:, :, h_indices].set(freqs_ZBTK[1][:, :, h_indices])
+    freqs_BTK = freqs_BTK.at[:, :, w_indices].set(freqs_ZBTK[2][:, :, w_indices])
 
-    return jnp.sin(freqs_t), jnp.cos(freqs_t)
+    return jnp.sin(freqs_BTK), jnp.cos(freqs_BTK)
 
 
 def get_rope_index(
@@ -166,13 +162,17 @@ def get_rope_index(
 
 class TextMLP(nnx.Module):
     def __init__(self, cfg: Qwen3VLConfig, *, rngs: nnx.Rngs):
-        linear = partial(nnx.Linear, use_bias=False, rngs=rngs, dtype=jnp.float32)
+        self.shd_cfg = cfg.shd_cfg
+        linear = partial(nnx.Linear, use_bias=False, rngs=rngs, dtype=cfg.dtype)
         self.gate_proj = linear(cfg.emb_dim, cfg.mlp_dim)
         self.up_proj = linear(cfg.emb_dim, cfg.mlp_dim)
         self.down_proj = linear(cfg.mlp_dim, cfg.emb_dim)
 
-    def __call__(self, x: jax.Array) -> jax.Array:
-        return self.down_proj(nnx.silu(self.gate_proj(x)) * self.up_proj(x))
+    def __call__(self, hidden_BTD: jax.Array) -> jax.Array:
+        gate_BTF = self.gate_proj(hidden_BTD, out_sharding=self.shd_cfg.act_btf)
+        up_BTF = self.up_proj(hidden_BTD, out_sharding=self.shd_cfg.act_btf)
+        activated_BTF = reshard(nnx.silu(gate_BTF) * up_BTF, self.shd_cfg.act_btf)
+        return self.down_proj(activated_BTF, out_sharding=self.shd_cfg.act_btd)
 
 
 class TextMoEFeedForward(nnx.Module):
@@ -180,48 +180,68 @@ class TextMoEFeedForward(nnx.Module):
 
     def __init__(self, cfg: Qwen3VLConfig, *, rngs: nnx.Rngs):
         self.cfg = cfg
+        self.shd_cfg = cfg.shd_cfg
         E, D, F = cfg.num_experts, cfg.emb_dim, cfg.moe_intermediate_size
         init = nnx.initializers.lecun_normal()
         self.gate_proj = nnx.Param(init(rngs.params(), (E, D, F)))
         self.up_proj = nnx.Param(init(rngs.params(), (E, D, F)))
         self.down_proj = nnx.Param(init(rngs.params(), (E, F, D)))
-        self.router = nnx.Linear(D, E, use_bias=False, rngs=rngs, dtype=jnp.float32)
+        self.router = nnx.Linear(D, E, use_bias=False, rngs=rngs, dtype=cfg.dtype)
 
-    def __call__(self, x: jax.Array) -> tuple[jax.Array, jax.Array]:
+    def __call__(self, hidden_BTD: jax.Array) -> tuple[jax.Array, jax.Array]:
         cfg = self.cfg
-        router_logits = self.router(x)
-        probs = jax.nn.softmax(router_logits.astype(jnp.float32), axis=-1)
-        topk_weights, topk_idx = jax.lax.top_k(probs, cfg.num_experts_per_tok)
+        batch_axis = self.shd_cfg.act_btd[0]
+        hidden_axis = self.shd_cfg.act_btd[2]
+        ff_axis = self.shd_cfg.act_btf[2]
+
+        router_logits_BTE = self.router(hidden_BTD, out_sharding=P(batch_axis, None, None))
+        probs_BTE = jax.nn.softmax(router_logits_BTE.astype(jnp.float32), axis=-1)
+        topk_weights_BTk, topk_idx_BTk = jax.lax.top_k(probs_BTE, cfg.num_experts_per_tok)
         if cfg.norm_topk_prob:
-            topk_weights = topk_weights / jnp.clip(
-                jnp.sum(topk_weights, axis=-1, keepdims=True), min=1e-9
+            topk_weights_BTk = topk_weights_BTk / jnp.clip(
+                jnp.sum(topk_weights_BTk, axis=-1, keepdims=True), min=1e-9
             )
-        topk_weights = topk_weights.astype(probs.dtype)
+        topk_weights_BTk = topk_weights_BTk.astype(probs_BTE.dtype)
 
-        gate = jnp.einsum("btd,edf->btef", x, self.gate_proj[...])
-        up = jnp.einsum("btd,edf->btef", x, self.up_proj[...])
-        expert_hidden = nnx.silu(gate) * up
-        expert_out = jnp.einsum("btef,efd->bted", expert_hidden, self.down_proj[...])
+        dense_hidden_BTD = reshard(hidden_BTD, P(batch_axis, None, None))
+        gate_BTEF = jnp.einsum(
+            "BTD,EDF->BTEF",
+            dense_hidden_BTD,
+            self.gate_proj[...],
+            out_sharding=P(batch_axis, None, None, ff_axis),
+        )
+        up_BTEF = jnp.einsum(
+            "BTD,EDF->BTEF",
+            dense_hidden_BTD,
+            self.up_proj[...],
+            out_sharding=P(batch_axis, None, None, ff_axis),
+        )
+        expert_hidden_BTEF = nnx.silu(gate_BTEF) * up_BTEF
+        expert_out_BTED = jnp.einsum(
+            "BTEF,EFD->BTED",
+            expert_hidden_BTEF,
+            self.down_proj[...],
+            out_sharding=P(batch_axis, None, None, hidden_axis),
+        )
 
-        b, t = x.shape[:2]
-        flat_out = expert_out.reshape(b * t, cfg.num_experts, cfg.emb_dim)
-        flat_idx = topk_idx.reshape(b * t, cfg.num_experts_per_tok)
+        B, T = hidden_BTD.shape[:2]
+        flat_out = expert_out_BTED.reshape(B * T, cfg.num_experts, cfg.emb_dim)
+        flat_idx = topk_idx_BTk.reshape(B * T, cfg.num_experts_per_tok)
         gathered = jnp.take_along_axis(flat_out, flat_idx[..., None], axis=1)
-        gathered = gathered.reshape(b, t, cfg.num_experts_per_tok, cfg.emb_dim)
-        merged = jnp.sum(gathered * topk_weights[..., None], axis=-2)
+        gathered = gathered.reshape(B, T, cfg.num_experts_per_tok, cfg.emb_dim)
+        merged_BTD = reshard(jnp.sum(gathered * topk_weights_BTk[..., None], axis=-2), self.shd_cfg.act_btd)
 
-        # Load-balancing aux loss (Switch Transformer style)
-        expert_mask = jax.nn.one_hot(topk_idx, cfg.num_experts, dtype=probs.dtype)
-        tokens_per_expert = jnp.mean(expert_mask, axis=(0, 1))
-        router_prob_per_expert = jnp.mean(probs, axis=(0, 1))
-        aux_loss_raw = jnp.sum(tokens_per_expert * router_prob_per_expert) * cfg.num_experts
-        aux_loss = aux_loss_raw.astype(x.dtype)
-        return merged, aux_loss
+        expert_mask_BTkE = jax.nn.one_hot(topk_idx_BTk, cfg.num_experts, dtype=probs_BTE.dtype)
+        tokens_per_expert = jnp.mean(expert_mask_BTkE, axis=(0, 1))
+        router_prob_per_expert_E = jnp.mean(probs_BTE, axis=(0, 1))
+        aux_loss = jnp.sum(tokens_per_expert * router_prob_per_expert_E) * cfg.num_experts
+        return merged_BTD, aux_loss
 
 
 class TextAttention(nnx.Module):
     def __init__(self, cfg: Qwen3VLConfig, *, rngs: nnx.Rngs):
-        linear = partial(nnx.Linear, use_bias=False, rngs=rngs, dtype=jnp.float32)
+        self.shd_cfg = cfg.shd_cfg
+        linear = partial(nnx.Linear, use_bias=False, rngs=rngs, dtype=cfg.dtype)
         self.q_proj = linear(cfg.emb_dim, cfg.num_heads * cfg.head_dim)
         self.k_proj = linear(cfg.emb_dim, cfg.num_kv_heads * cfg.head_dim)
         self.v_proj = linear(cfg.emb_dim, cfg.num_kv_heads * cfg.head_dim)
@@ -233,27 +253,34 @@ class TextAttention(nnx.Module):
         self.head_dim = cfg.head_dim
         self.num_heads = cfg.num_heads
         self.num_kv_heads = cfg.num_kv_heads
+        self.logits_shd = P(cfg.shd_cfg.act_btd[0], None, None, cfg.shd_cfg.act_btnh[2], None)
 
-    def __call__(self, x: jax.Array, sin: jax.Array, cos: jax.Array, mask: jax.Array | None) -> jax.Array:
-        b, t, _ = x.shape
-        q = self.q_norm(self.q_proj(x).reshape(b, t, self.num_heads, self.head_dim))
-        k = self.k_norm(self.k_proj(x).reshape(b, t, self.num_kv_heads, self.head_dim))
-        v = self.v_proj(x).reshape(b, t, self.num_kv_heads, self.head_dim)
+    def __call__(self, hidden_BTD: jax.Array, sin_BTK: jax.Array, cos_BTK: jax.Array, mask: jax.Array | None) -> jax.Array:
+        B, T, _ = hidden_BTD.shape
+        q_proj_BTF = self.q_proj(hidden_BTD, out_sharding=self.shd_cfg.act_btf)
+        k_proj_BTF = self.k_proj(hidden_BTD, out_sharding=self.shd_cfg.act_btf)
+        v_proj_BTF = self.v_proj(hidden_BTD, out_sharding=self.shd_cfg.act_btf)
 
-        q = apply_rope(q, sin, cos)
-        k = apply_rope(k, sin, cos)
+        q_BTHK = reshard(self.q_norm(q_proj_BTF.reshape(B, T, self.num_heads, self.head_dim)), self.shd_cfg.act_btnh)
+        k_BTGK = reshard(self.k_norm(k_proj_BTF.reshape(B, T, self.num_kv_heads, self.head_dim)), self.shd_cfg.act_btnh)
+        v_BTGK = reshard(v_proj_BTF.reshape(B, T, self.num_kv_heads, self.head_dim), self.shd_cfg.act_btnh)
 
-        q_gqa = q.reshape(b, t, self.num_kv_heads, self.n_rep, self.head_dim)
-        attn = jnp.einsum("BTKGH,BSKH->BTSKG", q_gqa, k, precision=jax.lax.Precision.HIGHEST) * self.scale
+        q_BTHK = apply_rope(q_BTHK, sin_BTK, cos_BTK)
+        k_BTGK = apply_rope(k_BTGK, sin_BTK, cos_BTK)
+
+        q_BTGRK = q_BTHK.reshape(B, T, self.num_kv_heads, self.n_rep, self.head_dim)
+        logits_BTSGR = jnp.einsum("BTGRK,BSGK->BTSGR", q_BTGRK, k_BTGK) * self.scale
 
         if mask is not None:
             attn_mask = mask[:, :, :, None, None]
-            attn = jnp.where(attn_mask, attn, jnp.full_like(attn, _K_MASK))
+            logits_BTSGR = jnp.where(attn_mask, logits_BTSGR, _mask_value(logits_BTSGR.dtype))
 
-        attn = jax.nn.softmax(attn.astype(jnp.float32), axis=2).astype(attn.dtype)
-        out = jnp.einsum("BTSKG,BSKH->BTKGH", attn, v, precision=jax.lax.Precision.HIGHEST)
-        out = out.reshape(b, t, self.num_heads, self.head_dim)
-        return self.o_proj(out.reshape(b, t, self.num_heads * self.head_dim))
+        logits_BTSGR = reshard(logits_BTSGR, self.logits_shd)
+        weights_BTSGR = jax.nn.softmax(logits_BTSGR.astype(jnp.float32), axis=2).astype(logits_BTSGR.dtype)
+        attn_BTGRK = jnp.einsum("BTSGR,BSGK->BTGRK", weights_BTSGR, v_BTGK)
+        attn_BTHK = attn_BTGRK.reshape(B, T, self.num_heads, self.head_dim)
+        out_BTD = self.o_proj(attn_BTHK.reshape(B, T, self.num_heads * self.head_dim), out_sharding=self.shd_cfg.act_btd)
+        return reshard(out_BTD, self.shd_cfg.act_btd)
 
 
 class TextDecoderLayer(nnx.Module):
@@ -265,22 +292,23 @@ class TextDecoderLayer(nnx.Module):
         self.is_moe = cfg.is_moe_layer(layer_idx)
         self.mlp = TextMoEFeedForward(cfg, rngs=rngs) if self.is_moe else TextMLP(cfg, rngs=rngs)
 
-    def __call__(self, x: jax.Array, sin: jax.Array, cos: jax.Array, mask: jax.Array | None) -> tuple[jax.Array, jax.Array]:
-        x = x + self.attn(self.input_layernorm(x), sin, cos, mask)
+    def __call__(self, hidden_BTD: jax.Array, sin_BTK: jax.Array, cos_BTK: jax.Array, mask: jax.Array | None) -> tuple[jax.Array, jax.Array]:
+        hidden_BTD = hidden_BTD + self.attn(self.input_layernorm(hidden_BTD), sin_BTK, cos_BTK, mask)
         if self.is_moe:
-            ff_out, aux_loss = self.mlp(self.post_attention_layernorm(x))
+            ff_out_BTD, aux_loss = self.mlp(self.post_attention_layernorm(hidden_BTD))
         else:
-            ff_out = self.mlp(self.post_attention_layernorm(x))
-            aux_loss = jnp.array(0.0, dtype=x.dtype)
-        x = x + ff_out
-        return x, aux_loss
+            ff_out_BTD = self.mlp(self.post_attention_layernorm(hidden_BTD))
+            aux_loss = jnp.array(0.0, dtype=jnp.float32)
+        hidden_BTD = hidden_BTD + ff_out_BTD
+        return hidden_BTD, aux_loss
 
 
 class TextModel(nnx.Module):
     def __init__(self, cfg: Qwen3VLConfig, *, rngs: nnx.Rngs):
         self.embedder = nnx.Embed(
-            num_embeddings=cfg.vocab_size, features=cfg.emb_dim, dtype=jnp.float32, rngs=rngs
+            num_embeddings=cfg.vocab_size, features=cfg.emb_dim, dtype=cfg.dtype, rngs=rngs
         )
+        self.out_emb_shd = cfg.shd_cfg.act_btd
         self.layers = nnx.List([TextDecoderLayer(cfg, layer_idx=i, rngs=rngs) for i in range(cfg.num_layers)])
         self.final_norm = RMSNorm(cfg.emb_dim, cfg.norm_eps, rngs=rngs)
 
@@ -288,91 +316,84 @@ class TextModel(nnx.Module):
 class Qwen3VL(nnx.Module):
     def __init__(self, cfg: Qwen3VLConfig, *, rngs: nnx.Rngs):
         self.cfg = cfg
-        self.vision = VisionModel(cfg.vision, rngs=rngs)
+        self.logits_shd = P(cfg.shd_cfg.act_btd[0], None, None)
+        self.vision = VisionModel(cfg.vision, shd_cfg=cfg.shd_cfg, rngs=rngs)
         self.text = TextModel(cfg, rngs=rngs)
-        self.lm_head = nnx.Linear(cfg.emb_dim, cfg.vocab_size, use_bias=False, rngs=rngs, dtype=jnp.float32)
+        self.lm_head = nnx.Linear(cfg.emb_dim, cfg.vocab_size, use_bias=False, rngs=rngs, dtype=cfg.dtype)
 
     def __call__(
         self,
-        input_ids: jax.Array,
-        attention_mask: jax.Array,
-        position_ids: jax.Array | np.ndarray | None = None,
+        token_ids_BT: jax.Array,
+        attention_mask_BT: jax.Array,
+        position_ids_ZBT: jax.Array | np.ndarray | None = None,
         pixel_values: jax.Array | None = None,
         image_grid_thw: jax.Array | None = None,
     ) -> jax.Array:
         cfg = self.cfg
 
-        # 1. Vision encoding
-        image_features = None
+        image_features_ND = None
         deepstack_features = None
-        visual_pos_mask = None
+        visual_pos_mask_BT = None
         if pixel_values is not None and image_grid_thw is not None:
-            image_features, deepstack_features = self.vision(pixel_values, image_grid_thw)
+            image_features_ND, deepstack_features = self.vision(pixel_values, image_grid_thw)
 
-        # 2. Text embedding
-        inputs_embeds = self.text.embedder(input_ids)
+        inputs_embeds_BTD = self.text.embedder.embedding[...].at[(token_ids_BT,)].get(out_sharding=self.text.out_emb_shd)
 
-        # 3. Scatter image features into embeddings
-        if image_features is not None:
-            image_mask = input_ids == cfg.image_token_id
-            visual_pos_mask = image_mask
-            batch_idx, seq_idx = jnp.where(image_mask)
-            inputs_embeds = inputs_embeds.at[batch_idx, seq_idx].set(
-                image_features.astype(inputs_embeds.dtype)
+        if image_features_ND is not None:
+            image_mask_BT = token_ids_BT == cfg.image_token_id
+            visual_pos_mask_BT = image_mask_BT
+            batch_idx, seq_idx = jnp.where(image_mask_BT)
+            inputs_embeds_BTD = inputs_embeds_BTD.at[batch_idx, seq_idx].set(
+                image_features_ND.astype(inputs_embeds_BTD.dtype)
             )
 
-        # 4. Compute position IDs if not provided
-        if position_ids is None:
+        if position_ids_ZBT is None:
             if image_grid_thw is not None:
-                position_ids, _ = get_rope_index(
-                    input_ids,
+                position_ids_ZBT, _ = get_rope_index(
+                    token_ids_BT,
                     image_grid_thw=image_grid_thw,
-                    attention_mask=attention_mask,
+                    attention_mask=attention_mask_BT,
                     spatial_merge_size=cfg.vision.spatial_merge_size,
                     image_token_id=cfg.image_token_id,
                     video_token_id=cfg.video_token_id,
                     vision_start_token_id=cfg.vision_start_token_id,
                 )
             else:
-                positions = jnp.cumsum(attention_mask, axis=-1) - 1
-                positions = jnp.where(attention_mask, positions, 0)
-                position_ids = jnp.stack([positions, positions, positions], axis=0)
+                positions_BT = jnp.cumsum(attention_mask_BT, axis=-1) - 1
+                positions_BT = jnp.where(attention_mask_BT, positions_BT, 0)
+                position_ids_ZBT = jnp.stack([positions_BT, positions_BT, positions_BT], axis=0)
 
-        position_ids = jnp.asarray(position_ids)
-        text_position_ids = position_ids[0]
+        position_ids_ZBT = jnp.asarray(position_ids_ZBT)
+        text_position_ids_BT = position_ids_ZBT[0]
 
-        # 5. M-RoPE
-        sin, cos = compute_mrope_pos_embeddings(position_ids, cfg.head_dim, cfg.rope_theta, cfg.mrope_section)
+        sin_BTK, cos_BTK = compute_mrope_pos_embeddings(position_ids_ZBT, cfg.head_dim, cfg.rope_theta, cfg.mrope_section)
+        sin_BTK = sin_BTK.astype(cfg.dtype)
+        cos_BTK = cos_BTK.astype(cfg.dtype)
 
-        # 6. Standard causal mask based on sequential position (not M-RoPE position IDs)
-        seq_len = inputs_embeds.shape[1]
-        seq_pos = jnp.arange(seq_len)
-        causal_mask = seq_pos[:, None] >= seq_pos[None, :]
-        padding_mask = attention_mask[:, None, :].astype(jnp.bool_)
-        final_mask = causal_mask[None, :, :] & padding_mask
+        causal_mask_BTS = text_position_ids_BT[:, :, None] >= text_position_ids_BT[:, None, :]
+        padding_mask_B1T = attention_mask_BT[:, None, :].astype(jnp.bool_)
+        final_mask_BTS = causal_mask_BTS & padding_mask_B1T
 
-        # 7. Text decoder with deepstack
-        hidden_states = inputs_embeds
+        hidden_BTD = inputs_embeds_BTD
         aux_losses = []
         for layer_idx, layer in enumerate(self.text.layers):
-            hidden_states, aux_loss = layer(hidden_states, sin, cos, final_mask)
+            hidden_BTD, aux_loss = layer(hidden_BTD, sin_BTK, cos_BTK, final_mask_BTS)
             aux_losses.append(aux_loss)
             if deepstack_features is not None and layer_idx < len(deepstack_features):
-                hidden_states = _deepstack_process(hidden_states, visual_pos_mask, deepstack_features[layer_idx])
+                hidden_BTD = _deepstack_process(hidden_BTD, visual_pos_mask_BT, deepstack_features[layer_idx])
 
-        # 8. Final norm + LM head
-        logits = self.lm_head(self.text.final_norm(hidden_states))
+        logits_BTV = self.lm_head(self.text.final_norm(hidden_BTD), out_sharding=self.logits_shd)
         if self.cfg.num_experts > 0:
-            total_aux = jnp.sum(jnp.stack(aux_losses)) if aux_losses else jnp.array(0.0, dtype=logits.dtype)
-            return logits, total_aux
-        return logits
+            total_aux = jnp.sum(jnp.stack(aux_losses)) if aux_losses else jnp.array(0.0, dtype=jnp.float32)
+            return logits_BTV, total_aux
+        return logits_BTV
 
 
 def _deepstack_process(
-    hidden_states: jax.Array, visual_pos_mask: jax.Array, visual_embeds: jax.Array
+    hidden_BTD: jax.Array, visual_pos_mask_BT: jax.Array, visual_embeds_ND: jax.Array
 ) -> jax.Array:
     """Add visual embeddings to hidden states at visual token positions."""
-    batch_idx, seq_idx = jnp.where(visual_pos_mask)
-    current_vals = hidden_states[batch_idx, seq_idx]
-    new_vals = current_vals + visual_embeds.astype(current_vals.dtype)
-    return hidden_states.at[batch_idx, seq_idx].set(new_vals)
+    batch_idx, seq_idx = jnp.where(visual_pos_mask_BT)
+    current_vals = hidden_BTD[batch_idx, seq_idx]
+    new_vals = current_vals + visual_embeds_ND.astype(current_vals.dtype)
+    return hidden_BTD.at[batch_idx, seq_idx].set(new_vals)

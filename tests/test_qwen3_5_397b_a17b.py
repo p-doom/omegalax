@@ -38,7 +38,12 @@ class Qwen3_5RealTest(absltest.TestCase):
         cls.pad_id = cls.tokenizer.pad_token_id or 0
 
         cls.jax_cfg = make_config(MODEL_ID)
-        cls.jax_model, _ = create_qwen3_5_from_safetensors(cls.model_path, MODEL_ID)
+        cls.jax_model, _ = create_qwen3_5_from_safetensors(
+            cls.model_path,
+            MODEL_ID,
+            tp_size=1,
+            fsdp_size=1,
+        )
 
         cls.hf_model = HFModel.from_pretrained(
             cls.model_path, torch_dtype=torch.float32,
@@ -56,29 +61,29 @@ class Qwen3_5RealTest(absltest.TestCase):
         return self.tokenizer(chat_texts, return_tensors="pt", padding=True, padding_side="left")
 
     def _jax_prefill_logits(self, tokens_np: np.ndarray) -> np.ndarray:
-        tokens = jnp.asarray(tokens_np)
-        segment_ids = (tokens != self.pad_id).astype(jnp.int32)
-        logits, _ = self.jax_model(
-            tokens, segment_ids, None, jnp.array(0, dtype=jnp.int32),
+        token_ids_BT = jnp.asarray(tokens_np)
+        segment_ids_BT = (token_ids_BT != self.pad_id).astype(jnp.int32)
+        logits_BTV, _ = self.jax_model(
+            token_ids_BT, segment_ids_BT, None, jnp.array(0, dtype=jnp.int32),
         )
-        return np.asarray(logits, dtype=np.float32)
+        return np.asarray(logits_BTV, dtype=np.float32)
 
     def test_prefill_logits_match_hf(self):
         inputs = self._tokenize([PROMPT])
         with torch.no_grad():
-            hf_logits = self.hf_model(
+            hf_logits_BTV = self.hf_model(
                 input_ids=inputs["input_ids"],
                 attention_mask=inputs["attention_mask"],
                 use_cache=False,
             ).logits.cpu().numpy()
 
-        jax_logits = self._jax_prefill_logits(
+        jax_logits_BTV = self._jax_prefill_logits(
             np.array(inputs["input_ids"].cpu(), dtype=np.int32),
         )
 
         mask = inputs["attention_mask"].numpy().astype(bool)
-        jax_masked = jax_logits[mask]
-        hf_masked = hf_logits[mask]
+        jax_masked = jax_logits_BTV[mask]
+        hf_masked = hf_logits_BTV[mask]
         max_abs_diff = np.max(np.abs(jax_masked - hf_masked))
         max_rel_diff = np.max(np.abs(jax_masked - hf_masked) / np.clip(np.abs(hf_masked), 1e-8, None))
         print(f"\n  max_abs_diff = {max_abs_diff:.6e}")

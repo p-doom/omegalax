@@ -28,11 +28,11 @@ def _get_value(model: nnx.Module, dotted: str):
 class ExportDenseTest(absltest.TestCase):
     def test_round_trip_export_import(self):
         rng = jax.random.key(0)
-        model, cfg = text_api.init_model("qwen3-smoke", rng)
+        model, cfg = text_api.init_model("qwen3-smoke", rng, tp_size=1, fsdp_size=1)
 
         with tempfile.TemporaryDirectory() as tmpdir:
             export_qwen3_dense_to_safetensors(model, cfg, tmpdir)
-            reloaded = create_qwen3_from_safetensors(tmpdir, "qwen3-smoke")
+            reloaded = create_qwen3_from_safetensors(tmpdir, "qwen3-smoke", tp_size=1, fsdp_size=1)
 
             embed_orig = np.asarray(jax.device_get(_get_value(model, "embedder.embedding")))
             embed_new = np.asarray(jax.device_get(_get_value(reloaded, "embedder.embedding")))

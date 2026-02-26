@@ -68,7 +68,12 @@ class Qwen3VLMappingTest(absltest.TestCase):
 
         hf_cfg_dict = load_hf_config(cls.model_path)
         cls.cfg = make_vl_config_from_hf(hf_cfg_dict)
-        cls.jax_model, _ = create_qwen3_vl_from_safetensors(cls.model_path, MODEL_ID)
+        cls.jax_model, _ = create_qwen3_vl_from_safetensors(
+            cls.model_path,
+            MODEL_ID,
+            tp_size=1,
+            fsdp_size=1,
+        )
 
     def test_parameter_mapping_is_complete(self):
         """All HF keys should be mapped; all JAX leaves should be populated."""
@@ -105,17 +110,17 @@ class Qwen3VLMappingTest(absltest.TestCase):
         inputs = self.processor.tokenizer(text, return_tensors="pt", padding=True)
 
         with torch.no_grad():
-            hf_logits = self.hf_model(
+            hf_logits_BTV = self.hf_model(
                 input_ids=inputs["input_ids"],
                 attention_mask=inputs["attention_mask"],
             ).logits.cpu().numpy()
 
-        input_ids_jax = jnp.asarray(np.array(inputs["input_ids"].cpu(), dtype=np.int32))
-        attention_mask_jax = jnp.asarray(np.array(inputs["attention_mask"].cpu(), dtype=np.int32))
-        jax_logits = np.asarray(self.jax_model(input_ids_jax, attention_mask_jax), dtype=np.float32)
+        token_ids_BT = jnp.asarray(np.array(inputs["input_ids"].cpu(), dtype=np.int32))
+        attention_mask_BT = jnp.asarray(np.array(inputs["attention_mask"].cpu(), dtype=np.int32))
+        jax_logits_BTV = np.asarray(self.jax_model(token_ids_BT, attention_mask_BT), dtype=np.float32)
 
         mask = inputs["attention_mask"].numpy().astype(bool)
-        np.testing.assert_allclose(jax_logits[mask], hf_logits[mask], rtol=TEXT_RTOL, atol=TEXT_ATOL)
+        np.testing.assert_allclose(jax_logits_BTV[mask], hf_logits_BTV[mask], rtol=TEXT_RTOL, atol=TEXT_ATOL)
 
     def test_text_only_prefill_logits_batched(self):
         """Batched text-only forward should match HF model."""
@@ -131,17 +136,17 @@ class Qwen3VLMappingTest(absltest.TestCase):
         inputs = self.processor.tokenizer(texts, return_tensors="pt", padding=True, padding_side="left")
 
         with torch.no_grad():
-            hf_logits = self.hf_model(
+            hf_logits_BTV = self.hf_model(
                 input_ids=inputs["input_ids"],
                 attention_mask=inputs["attention_mask"],
             ).logits.cpu().numpy()
 
-        input_ids_jax = jnp.asarray(np.array(inputs["input_ids"].cpu(), dtype=np.int32))
-        attention_mask_jax = jnp.asarray(np.array(inputs["attention_mask"].cpu(), dtype=np.int32))
-        jax_logits = np.asarray(self.jax_model(input_ids_jax, attention_mask_jax), dtype=np.float32)
+        token_ids_BT = jnp.asarray(np.array(inputs["input_ids"].cpu(), dtype=np.int32))
+        attention_mask_BT = jnp.asarray(np.array(inputs["attention_mask"].cpu(), dtype=np.int32))
+        jax_logits_BTV = np.asarray(self.jax_model(token_ids_BT, attention_mask_BT), dtype=np.float32)
 
         mask = inputs["attention_mask"].numpy().astype(bool)
-        np.testing.assert_allclose(jax_logits[mask], hf_logits[mask], rtol=TEXT_RTOL, atol=TEXT_ATOL)
+        np.testing.assert_allclose(jax_logits_BTV[mask], hf_logits_BTV[mask], rtol=TEXT_RTOL, atol=TEXT_ATOL)
 
     def test_image_prefill_logits_match_hf(self):
         """Image+text forward should match HF model."""
@@ -161,17 +166,17 @@ class Qwen3VLMappingTest(absltest.TestCase):
         inputs = self.processor(text=[text], images=[img], return_tensors="pt", padding=True)
 
         with torch.no_grad():
-            hf_logits = self.hf_model(**inputs).logits.cpu().numpy()
+            hf_logits_BTV = self.hf_model(**inputs).logits.cpu().numpy()
 
-        input_ids_jax = jnp.asarray(np.array(inputs["input_ids"].cpu(), dtype=np.int32))
-        attention_mask_jax = jnp.asarray(np.array(inputs["attention_mask"].cpu(), dtype=np.int32))
+        token_ids_BT = jnp.asarray(np.array(inputs["input_ids"].cpu(), dtype=np.int32))
+        attention_mask_BT = jnp.asarray(np.array(inputs["attention_mask"].cpu(), dtype=np.int32))
         pixel_values_jax = jnp.asarray(inputs["pixel_values"].cpu().numpy())
         image_grid_thw_jax = jnp.asarray(inputs["image_grid_thw"].cpu().numpy())
 
-        jax_logits = np.asarray(
+        jax_logits_BTV = np.asarray(
             self.jax_model(
-                input_ids_jax,
-                attention_mask_jax,
+                token_ids_BT,
+                attention_mask_BT,
                 pixel_values=pixel_values_jax,
                 image_grid_thw=image_grid_thw_jax,
             ),
@@ -179,7 +184,7 @@ class Qwen3VLMappingTest(absltest.TestCase):
         )
 
         mask = inputs["attention_mask"].numpy().astype(bool)
-        np.testing.assert_allclose(jax_logits[mask], hf_logits[mask], rtol=IMAGE_RTOL, atol=IMAGE_ATOL)
+        np.testing.assert_allclose(jax_logits_BTV[mask], hf_logits_BTV[mask], rtol=IMAGE_RTOL, atol=IMAGE_ATOL)
 
 
 if __name__ == "__main__":

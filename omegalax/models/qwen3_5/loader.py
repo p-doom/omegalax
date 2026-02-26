@@ -12,6 +12,7 @@ import safetensors
 from etils import epath
 from flax import nnx
 
+from omegalax.distributed.mesh import ensure_mesh
 from omegalax.models.params_utils import (
     Transform,
     assign_to_state_dict,
@@ -22,8 +23,10 @@ from omegalax.models.params_utils import (
     map_to_bonsai_key,
     stoi,
 )
+from omegalax.models.sharding_runtime import apply_sharding_to_model_state as apply_sharding_to_model_state_runtime
 from .config import Qwen3_5Config, make_config, make_config_from_hf
 from .model import Qwen3_5ForConditionalGeneration
+from .sharding import model_state_sharding
 
 
 def _assert_config(cfg: Qwen3_5Config, hf_cfg: dict):
@@ -49,8 +52,7 @@ def _assert_config(cfg: Qwen3_5Config, hf_cfg: dict):
     _require("moe_intermediate_size", cfg.text_config.moe_intermediate_size, txt["moe_intermediate_size"])
     _require("rope_theta", cfg.text_config.rope_theta, rope_params["rope_theta"])
     _require("mrope_section", tuple(cfg.text_config.mrope_section), tuple(rope_params["mrope_section"]))
-    if "mrope_interleaved" in rope_params:
-        _require("mrope_interleaved", cfg.text_config.mrope_interleaved, rope_params["mrope_interleaved"])
+    _require("mrope_interleaved", cfg.text_config.mrope_interleaved, rope_params["mrope_interleaved"])
 
     _require("vision.hidden_size", cfg.vision_config.hidden_size, vis["hidden_size"])
     _require("vision.depth", cfg.vision_config.depth, vis["depth"])
@@ -236,8 +238,16 @@ _CONV3D_RE = re.compile(
 )
 
 
-def create_qwen3_5_from_safetensors(file_dir: str, model_id: str = "", use_sharding: bool = False) -> tuple[Qwen3_5ForConditionalGeneration, Qwen3_5Config]:
+def create_qwen3_5_from_safetensors(
+    file_dir: str,
+    model_id: str = "",
+    *,
+    tp_size: int | None = None,
+    fsdp_size: int | None = None,
+) -> tuple[Qwen3_5ForConditionalGeneration, Qwen3_5Config]:
     """Load HuggingFace Qwen3.5 safetensors into a JAX Qwen3.5 model."""
+    mesh = ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size)
+
     path = epath.Path(file_dir).expanduser()
     files = find_safetensors(file_dir)
 
@@ -382,7 +392,14 @@ def create_qwen3_5_from_safetensors(file_dir: str, model_id: str = "", use_shard
         state_dict["lm_head"]["kernel"] = state_dict["text"]["embedder"]["embedding"].T
 
     gc.collect()
-    return nnx.merge(graph_def, state_dict), cfg
+    model = nnx.merge(graph_def, state_dict)
+    model = apply_sharding_to_model_state_runtime(
+        model,
+        cfg.text_config.shd_cfg,
+        mesh,
+        model_state_sharding,
+    )
+    return model, cfg
 
 
 def get_all_key_mappings():

@@ -2,7 +2,7 @@ import dataclasses
 
 import jax.numpy as jnp
 
-from ..config import Qwen3Config, ShardConfig
+from ..config import Qwen3Config
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -91,10 +91,9 @@ def is_supported_moe_model_id(model_id: str) -> bool:
     return model_id in _MODEL_ID_TO_SPEC
 
 
-def make_moe_config(model_id: str, use_sharding: bool = False) -> Qwen3MoeConfig:
+def make_moe_config(model_id: str) -> Qwen3MoeConfig:
     spec = get_moe_spec(model_id)
     return Qwen3MoeConfig.with_sharding(
-        use_sharding,
         variant="moe",
         num_layers=int(spec["num_layers"]),
         vocab_size=int(spec["vocab_size"]),

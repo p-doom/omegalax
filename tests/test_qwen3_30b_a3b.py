@@ -35,7 +35,12 @@ class Qwen3_30B_A3B_Test(absltest.TestCase):
         cls.pad_id = cls.tokenizer.pad_token_id or 0
 
         cls.cfg = api.registry.build_config(MODEL_ID)
-        cls.jax_model = create_qwen3_moe_from_safetensors(cls.model_path, MODEL_ID)
+        cls.jax_model = create_qwen3_moe_from_safetensors(
+            cls.model_path,
+            MODEL_ID,
+            tp_size=1,
+            fsdp_size=1,
+        )
 
         cls.hf_model = Qwen3MoeForCausalLM.from_pretrained(
             cls.model_path, torch_dtype=torch.float32,
@@ -54,19 +59,19 @@ class Qwen3_30B_A3B_Test(absltest.TestCase):
         return self.tokenizer(chat_texts, return_tensors="pt", padding=True, padding_side="left")
 
     def _jax_prefill_logits(self, input_ids: torch.Tensor) -> np.ndarray:
-        tokens = jnp.asarray(np.array(input_ids.cpu(), dtype=np.int32))
-        logits, _ = api.forward(self.jax_model, tokens, self.pad_id, self.cfg)
-        return np.asarray(logits, dtype=np.float32)
+        token_ids_BT = jnp.asarray(np.array(input_ids.cpu(), dtype=np.int32))
+        logits_BTV, _ = api.forward(self.jax_model, token_ids_BT, self.pad_id, self.cfg)
+        return np.asarray(logits_BTV, dtype=np.float32)
 
     def test_prefill_logits_match_hf(self):
         inputs = self._tokenize([PROMPT])
         with torch.no_grad():
-            hf_logits = self.hf_model(**inputs).logits.cpu().numpy()
-        jax_logits = self._jax_prefill_logits(inputs["input_ids"])
+            hf_logits_BTV = self.hf_model(**inputs).logits.cpu().numpy()
+        jax_logits_BTV = self._jax_prefill_logits(inputs["input_ids"])
         mask = inputs["attention_mask"].numpy().astype(bool)
 
-        jax_masked = jax_logits[mask]
-        hf_masked = hf_logits[mask]
+        jax_masked = jax_logits_BTV[mask]
+        hf_masked = hf_logits_BTV[mask]
         max_abs_diff = np.max(np.abs(jax_masked - hf_masked))
         max_rel_diff = np.max(np.abs(jax_masked - hf_masked) / np.clip(np.abs(hf_masked), 1e-8, None))
         print(f"\n  max_abs_diff = {max_abs_diff:.6e}")

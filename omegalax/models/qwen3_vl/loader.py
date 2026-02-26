@@ -11,6 +11,7 @@ import safetensors
 from etils import epath
 from flax import nnx
 
+from omegalax.distributed.mesh import ensure_mesh
 from omegalax.models.params_utils import (
     Transform,
     assign_weights_from_eval_shape,
@@ -23,14 +24,16 @@ from omegalax.models.params_utils import (
     map_to_bonsai_key,
     stoi,
 )
+from omegalax.models.sharding_runtime import apply_sharding_to_model_state as apply_sharding_to_model_state_runtime
 from .config import Qwen3VLConfig, make_vl_config, make_vl_config_from_hf
 from .model import Qwen3VL
+from .sharding import model_state_sharding
 
 
 def _assert_vl_config(cfg: Qwen3VLConfig, hf_cfg: dict):
     txt = hf_cfg["text_config"]
     vis = hf_cfg["vision_config"]
-    rope_params = txt["rope_parameters"]
+    rope_params = txt.get("rope_parameters") or txt.get("rope_scaling") or {}
 
     def _require(name, lhs, rhs):
         if lhs != rhs:
@@ -43,11 +46,11 @@ def _assert_vl_config(cfg: Qwen3VLConfig, hf_cfg: dict):
     _require("num_kv_heads", cfg.num_kv_heads, txt["num_key_value_heads"])
     _require("head_dim", cfg.head_dim, txt["head_dim"])
     _require("mlp_dim", cfg.mlp_dim, txt["intermediate_size"])
-    _require("rope_theta", cfg.rope_theta, rope_params["rope_theta"])
+    _require("rope_theta", cfg.rope_theta, rope_params.get("rope_theta") or txt["rope_theta"])
     _require("mrope_section", tuple(cfg.mrope_section), tuple(rope_params["mrope_section"]))
 
     # MoE fields are absent in dense HF configs.
-    _require("num_experts", cfg.num_experts, txt.get("num_experts", 0))
+    _require("num_experts", cfg.num_experts, txt.get("num_experts") or txt.get("num_local_experts", 0))
     _require("num_experts_per_tok", cfg.num_experts_per_tok, txt.get("num_experts_per_tok", 0))
     _require("moe_intermediate_size", cfg.moe_intermediate_size, txt.get("moe_intermediate_size", 0))
 
@@ -131,8 +134,16 @@ def _get_non_expert_mapping():
     return mapping
 
 
-def create_qwen3_vl_from_safetensors(file_dir: str, model_id: str = "", use_sharding: bool = False) -> tuple[Qwen3VL, Qwen3VLConfig]:
+def create_qwen3_vl_from_safetensors(
+    file_dir: str,
+    model_id: str = "",
+    *,
+    tp_size: int | None = None,
+    fsdp_size: int | None = None,
+) -> tuple[Qwen3VL, Qwen3VLConfig]:
     """Load HuggingFace Qwen3-VL safetensors into a JAX Qwen3-VL model."""
+    mesh = ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size)
+
     path = epath.Path(file_dir).expanduser()
     files = find_safetensors(file_dir)
 
@@ -208,4 +219,6 @@ def create_qwen3_vl_from_safetensors(file_dir: str, model_id: str = "", use_shar
         state_dict["lm_head"]["kernel"] = state_dict["text"]["embedder"]["embedding"].T
 
     gc.collect()
-    return nnx.merge(graph_def, state_dict), cfg
+    model = nnx.merge(graph_def, state_dict)
+    model = apply_sharding_to_model_state_runtime(model, cfg.shd_cfg, mesh, model_state_sharding)
+    return model, cfg

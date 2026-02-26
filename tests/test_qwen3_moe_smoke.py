@@ -27,8 +27,13 @@ jax.config.update("jax_default_matmul_precision", "highest")
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
 
-RTOL = 1e-6
-ATOL = 1e-6
+_JNP_TO_TORCH = {jnp.float32: torch.float32, jnp.bfloat16: torch.bfloat16, jnp.float16: torch.float16}
+
+
+def _tolerances(jnp_dtype):
+    if jnp_dtype == jnp.float32:
+        return 1e-5, 1e-5
+    return 1e-2, 1e-2
 
 SMOKE_MOE_ID = "qwen3-smoke-moe"
 
@@ -55,9 +60,9 @@ HF_SMOKE_CFG = HFQwen3MoeConfig(
 
 def _random_input(batch_size: int = 1, seq_len: int = 16, vocab_size: int = 512, pad_id: int = 0):
     rng = np.random.RandomState(42)
-    tokens = rng.randint(1, vocab_size, size=(batch_size, seq_len)).astype(np.int32)
-    tokens[:, 0] = pad_id
-    return tokens
+    token_ids_BT = rng.randint(1, vocab_size, size=(batch_size, seq_len)).astype(np.int32)
+    token_ids_BT[:, 0] = pad_id
+    return token_ids_BT
 
 
 class Qwen3MoeWeightsTest(absltest.TestCase):
@@ -65,17 +70,28 @@ class Qwen3MoeWeightsTest(absltest.TestCase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        cls.hf_model = Qwen3MoeForCausalLM(HF_SMOKE_CFG).eval()
         cls.tmpdir = tempfile.mkdtemp()
-        cls.hf_model.save_pretrained(cls.tmpdir, safe_serialization=True)
+        torch.manual_seed(0)
+        np.random.seed(0)
 
-        # Write config.json so our loader can validate it
+        hf_model = Qwen3MoeForCausalLM(HF_SMOKE_CFG).eval()
+        hf_model.save_pretrained(cls.tmpdir, safe_serialization=True)
+
         cfg_path = os.path.join(cls.tmpdir, "config.json")
         with open(cfg_path, "w") as f:
             json.dump(HF_SMOKE_CFG.to_dict(), f)
 
         cls.jax_cfg = make_moe_config(SMOKE_MOE_ID)
-        cls.jax_model = create_qwen3_moe_from_safetensors(cls.tmpdir, SMOKE_MOE_ID)
+        cls.jax_model = create_qwen3_moe_from_safetensors(
+            cls.tmpdir,
+            SMOKE_MOE_ID,
+            tp_size=1,
+            fsdp_size=1,
+        )
+
+        torch_dtype = _JNP_TO_TORCH[cls.jax_cfg.dtype]
+        cls.hf_model = hf_model.to(torch_dtype)
+        cls.RTOL, cls.ATOL = _tolerances(cls.jax_cfg.dtype)
         cls.pad_id = 0
 
     def test_weight_loading_succeeds(self):
@@ -84,69 +100,69 @@ class Qwen3MoeWeightsTest(absltest.TestCase):
 
     def test_prefill_logits_match_hf(self):
         """JAX MoE forward pass logits must match HF within tolerance."""
-        tokens = _random_input(batch_size=1, seq_len=16, vocab_size=HF_SMOKE_CFG.vocab_size)
-        attention_mask = (tokens != self.pad_id).astype(np.int64)
+        token_ids_BT = _random_input(batch_size=1, seq_len=16, vocab_size=HF_SMOKE_CFG.vocab_size)
+        attention_mask_BT = (token_ids_BT != self.pad_id).astype(np.int64)
 
         with torch.no_grad():
             hf_out = self.hf_model(
-                input_ids=torch.tensor(tokens, dtype=torch.long),
-                attention_mask=torch.tensor(attention_mask, dtype=torch.long),
+                input_ids=torch.tensor(token_ids_BT, dtype=torch.long),
+                attention_mask=torch.tensor(attention_mask_BT, dtype=torch.long),
             )
-            hf_logits = hf_out.logits.cpu().numpy()
+            hf_logits_BTV = hf_out.logits.cpu().float().numpy()
 
-        jax_tokens = jnp.asarray(tokens)
-        jax_logits, _ = api.forward(self.jax_model, jax_tokens, self.pad_id, self.jax_cfg)
-        jax_logits = np.asarray(jax_logits, dtype=np.float32)
+        jax_token_ids_BT = jnp.asarray(token_ids_BT)
+        jax_logits_BTV, _ = api.forward(self.jax_model, jax_token_ids_BT, self.pad_id, self.jax_cfg)
+        jax_logits_BTV = np.asarray(jax_logits_BTV, dtype=np.float32)
 
-        mask = attention_mask.astype(bool)
-        max_abs_diff = np.max(np.abs(jax_logits[mask] - hf_logits[mask]))
+        mask = attention_mask_BT.astype(bool)
+        max_abs_diff = np.max(np.abs(jax_logits_BTV[mask] - hf_logits_BTV[mask]))
         print(f"\n  max_abs_diff = {max_abs_diff:.6e}")
-        np.testing.assert_allclose(jax_logits[mask], hf_logits[mask], rtol=RTOL, atol=ATOL)
+        np.testing.assert_allclose(jax_logits_BTV[mask], hf_logits_BTV[mask], rtol=self.RTOL, atol=self.ATOL)
 
     def test_prefill_logits_match_hf_batched(self):
         """Batched forward pass with padding should match HF."""
-        tokens_a = _random_input(batch_size=1, seq_len=16, vocab_size=HF_SMOKE_CFG.vocab_size)
-        tokens_b = _random_input(batch_size=1, seq_len=10, vocab_size=HF_SMOKE_CFG.vocab_size)
+        token_ids_a_BT = _random_input(batch_size=1, seq_len=16, vocab_size=HF_SMOKE_CFG.vocab_size)
+        token_ids_b_BT = _random_input(batch_size=1, seq_len=10, vocab_size=HF_SMOKE_CFG.vocab_size)
 
         # Pad shorter sequence on the left to match longer
         padded_b = np.zeros((1, 16), dtype=np.int32)
-        padded_b[:, 6:] = tokens_b
-        tokens = np.concatenate([tokens_a, padded_b], axis=0)
-        attention_mask = (tokens != self.pad_id).astype(np.int64)
+        padded_b[:, 6:] = token_ids_b_BT
+        token_ids_BT = np.concatenate([token_ids_a_BT, padded_b], axis=0)
+        attention_mask_BT = (token_ids_BT != self.pad_id).astype(np.int64)
 
         with torch.no_grad():
             hf_out = self.hf_model(
-                input_ids=torch.tensor(tokens, dtype=torch.long),
-                attention_mask=torch.tensor(attention_mask, dtype=torch.long),
+                input_ids=torch.tensor(token_ids_BT, dtype=torch.long),
+                attention_mask=torch.tensor(attention_mask_BT, dtype=torch.long),
             )
-            hf_logits = hf_out.logits.cpu().numpy()
+            hf_logits_BTV = hf_out.logits.cpu().float().numpy()
 
-        jax_tokens = jnp.asarray(tokens)
-        jax_logits, _ = api.forward(self.jax_model, jax_tokens, self.pad_id, self.jax_cfg)
-        jax_logits = np.asarray(jax_logits, dtype=np.float32)
+        jax_token_ids_BT = jnp.asarray(token_ids_BT)
+        jax_logits_BTV, _ = api.forward(self.jax_model, jax_token_ids_BT, self.pad_id, self.jax_cfg)
+        jax_logits_BTV = np.asarray(jax_logits_BTV, dtype=np.float32)
 
-        mask = attention_mask.astype(bool)
-        max_abs_diff = np.max(np.abs(jax_logits[mask] - hf_logits[mask]))
+        mask = attention_mask_BT.astype(bool)
+        max_abs_diff = np.max(np.abs(jax_logits_BTV[mask] - hf_logits_BTV[mask]))
         print(f"\n  max_abs_diff = {max_abs_diff:.6e}")
-        np.testing.assert_allclose(jax_logits[mask], hf_logits[mask], rtol=RTOL, atol=ATOL)
+        np.testing.assert_allclose(jax_logits_BTV[mask], hf_logits_BTV[mask], rtol=self.RTOL, atol=self.ATOL)
 
     def test_round_trip_preserves_logits(self):
         """Split → merge round-trip should preserve forward pass output."""
         from flax import nnx
 
-        tokens = _random_input(batch_size=1, seq_len=16, vocab_size=HF_SMOKE_CFG.vocab_size)
-        jax_tokens = jnp.asarray(tokens)
+        token_ids_BT = _random_input(batch_size=1, seq_len=16, vocab_size=HF_SMOKE_CFG.vocab_size)
+        jax_token_ids_BT = jnp.asarray(token_ids_BT)
 
-        baseline, _ = api.forward(self.jax_model, jax_tokens, self.pad_id, self.jax_cfg)
-        baseline = np.asarray(baseline)
+        baseline_BTV, _ = api.forward(self.jax_model, jax_token_ids_BT, self.pad_id, self.jax_cfg)
+        baseline_BTV = np.asarray(baseline_BTV)
 
         graph_def, state = nnx.split(self.jax_model)
         pure_state = nnx.to_pure_dict(state)
         restored = nnx.merge(graph_def, pure_state)
-        restored_logits, _ = api.forward(restored, jax_tokens, self.pad_id, self.jax_cfg)
-        restored_logits = np.asarray(restored_logits)
+        restored_logits_BTV, _ = api.forward(restored, jax_token_ids_BT, self.pad_id, self.jax_cfg)
+        restored_logits_BTV = np.asarray(restored_logits_BTV)
 
-        np.testing.assert_array_equal(restored_logits, baseline)
+        np.testing.assert_array_equal(restored_logits_BTV, baseline_BTV)
 
 
 if __name__ == "__main__":
