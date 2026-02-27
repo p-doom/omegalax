@@ -50,7 +50,8 @@ def _assert_vl_config(cfg: Qwen3VLConfig, hf_cfg: dict):
     _require("mrope_section", tuple(cfg.mrope_section), tuple(rope_params["mrope_section"]))
 
     # MoE fields are absent in dense HF configs.
-    _require("num_experts", cfg.num_experts, txt.get("num_experts") or txt.get("num_local_experts", 0))
+    num_experts = txt["num_experts"] if "num_experts" in txt else txt.get("num_local_experts", 0)
+    _require("num_experts", cfg.num_experts, num_experts)
     _require("num_experts_per_tok", cfg.num_experts_per_tok, txt.get("num_experts_per_tok", 0))
     _require("moe_intermediate_size", cfg.moe_intermediate_size, txt.get("moe_intermediate_size", 0))
 

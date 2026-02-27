@@ -43,7 +43,7 @@ def _load_text_model(args):
 
     rng = jax.random.key(train_cfg.seed)
     rng, init_rng = jax.random.split(rng)
-    model = text_trainer.init_model(
+    model, model_cfg = text_trainer.init_model(
         model_cfg,
         init_rng,
         tp_size=args.tp_size,
