@@ -46,9 +46,8 @@ def init_model(
     *,
     tp_size: int | None = None,
     fsdp_size: int | None = None,
-) -> nnx.Module:
-    model, _ = text_api.init_model(cfg_or_model_id, rng, tp_size=tp_size, fsdp_size=fsdp_size)
-    return model
+) -> tuple[nnx.Module, text_api.TextConfig]:
+    return text_api.init_model(cfg_or_model_id, rng, tp_size=tp_size, fsdp_size=fsdp_size)
 
 
 def build_optimizer(model: nnx.Module, train_cfg: TrainConfig) -> nnx.ModelAndOptimizer:
@@ -235,7 +234,7 @@ def run_training(
 
     is_primary_process = jax.process_index() == 0
 
-    model = init_model(model_cfg, init_rng, tp_size=tp_size, fsdp_size=fsdp_size)
+    model, model_cfg = init_model(model_cfg, init_rng, tp_size=tp_size, fsdp_size=fsdp_size)
     optimizer = build_optimizer(model, train_cfg)
     optimizer_graphdef = nnx.graphdef(optimizer)
     optimizer_state = nnx.state(optimizer)

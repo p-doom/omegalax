@@ -289,7 +289,7 @@ def make_vl_config_from_hf(hf_cfg: dict[str, Any]) -> Qwen3VLConfig:
         mrope_section=tuple(rope_params["mrope_section"]),
         # MoE fields are absent in dense configs.
         moe_intermediate_size=txt.get("moe_intermediate_size", 0),
-        num_experts=txt.get("num_experts") or txt.get("num_local_experts", 0),
+        num_experts=txt["num_experts"] if "num_experts" in txt else txt.get("num_local_experts", 0),
         num_experts_per_tok=txt.get("num_experts_per_tok", 0),
         mlp_only_layers=tuple(txt.get("mlp_only_layers", ())),
         decoder_sparse_step=txt.get("decoder_sparse_step", 1),

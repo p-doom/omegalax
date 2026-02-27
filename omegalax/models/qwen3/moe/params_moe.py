@@ -48,7 +48,8 @@ def _assert_moe_config(cfg: Qwen3MoeConfig, hf_cfg: dict[str, Any]):
     _require("emb_dim", cfg.emb_dim, hf_cfg["hidden_size"])
     _require("num_heads", cfg.num_heads, hf_cfg["num_attention_heads"])
     _require("num_kv_heads", cfg.num_kv_heads, hf_cfg["num_key_value_heads"])
-    _require("num_experts", cfg.num_experts, hf_cfg["num_experts"])
+    num_experts = hf_cfg["num_experts"] if "num_experts" in hf_cfg else hf_cfg["num_local_experts"]
+    _require("num_experts", cfg.num_experts, num_experts)
     _require("num_experts_per_tok", cfg.num_experts_per_tok, hf_cfg["num_experts_per_tok"])
     _require("moe_intermediate_size", cfg.moe_intermediate_size, hf_cfg["moe_intermediate_size"])
 

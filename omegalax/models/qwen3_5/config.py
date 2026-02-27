@@ -214,7 +214,7 @@ def make_config_from_hf(hf_cfg: dict[str, Any]) -> Qwen3_5Config:
             linear_value_head_dim=txt["linear_value_head_dim"],
             moe_intermediate_size=txt["moe_intermediate_size"],
             shared_expert_intermediate_size=txt["shared_expert_intermediate_size"],
-            num_experts=txt.get("num_experts") or txt.get("num_local_experts"),
+            num_experts=txt["num_experts"] if "num_experts" in txt else txt["num_local_experts"],
             num_experts_per_tok=txt["num_experts_per_tok"],
             router_aux_loss_coef=txt["router_aux_loss_coef"],
             dtype=text_dtype,

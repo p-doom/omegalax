@@ -47,7 +47,8 @@ def _assert_config(cfg: Qwen3_5Config, hf_cfg: dict):
     _require("num_attention_heads", cfg.text_config.num_attention_heads, txt["num_attention_heads"])
     _require("num_key_value_heads", cfg.text_config.num_key_value_heads, txt["num_key_value_heads"])
     _require("head_dim", cfg.text_config.head_dim, txt["head_dim"])
-    _require("num_experts", cfg.text_config.num_experts, txt["num_experts"])
+    num_experts = txt["num_experts"] if "num_experts" in txt else txt["num_local_experts"]
+    _require("num_experts", cfg.text_config.num_experts, num_experts)
     _require("num_experts_per_tok", cfg.text_config.num_experts_per_tok, txt["num_experts_per_tok"])
     _require("moe_intermediate_size", cfg.text_config.moe_intermediate_size, txt["moe_intermediate_size"])
     _require("rope_theta", cfg.text_config.rope_theta, rope_params["rope_theta"])
