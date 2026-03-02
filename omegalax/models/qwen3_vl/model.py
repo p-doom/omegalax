@@ -14,6 +14,7 @@ from .config import Qwen3VLConfig
 from .vision import VisionModel
 
 P = PartitionSpec
+wp = nnx.with_partitioning
 
 
 def _mask_value(dtype: jnp.dtype) -> float:
@@ -21,8 +22,15 @@ def _mask_value(dtype: jnp.dtype) -> float:
 
 
 class RMSNorm(nnx.Module):
-    def __init__(self, dim: int, eps: float, *, rngs: nnx.Rngs):
-        self.scale = nnx.Param(jnp.ones(dim))
+    def __init__(
+        self,
+        dim: int,
+        eps: float,
+        *,
+        rngs: nnx.Rngs,
+        sharding: tuple[str | None, ...] = ("hidden",),
+    ):
+        self.scale = nnx.Param(jnp.ones(dim), sharding=sharding)
         self.eps = eps
 
     def __call__(self, x: jax.Array) -> jax.Array:
@@ -163,10 +171,24 @@ def get_rope_index(
 class TextMLP(nnx.Module):
     def __init__(self, cfg: Qwen3VLConfig, *, rngs: nnx.Rngs):
         self.shd_cfg = cfg.shd_cfg
-        linear = partial(nnx.Linear, use_bias=False, rngs=rngs, dtype=cfg.dtype)
-        self.gate_proj = linear(cfg.emb_dim, cfg.mlp_dim)
-        self.up_proj = linear(cfg.emb_dim, cfg.mlp_dim)
-        self.down_proj = linear(cfg.mlp_dim, cfg.emb_dim)
+        init_fn = nnx.initializers.lecun_normal()
+        col_parallel = partial(
+            nnx.Linear,
+            use_bias=False,
+            rngs=rngs,
+            dtype=cfg.dtype,
+            kernel_init=wp(init_fn, ("embed", "mlp")),
+        )
+        row_parallel = partial(
+            nnx.Linear,
+            use_bias=False,
+            rngs=rngs,
+            dtype=cfg.dtype,
+            kernel_init=wp(init_fn, ("mlp", "embed")),
+        )
+        self.gate_proj = col_parallel(cfg.emb_dim, cfg.mlp_dim)
+        self.up_proj = col_parallel(cfg.emb_dim, cfg.mlp_dim)
+        self.down_proj = row_parallel(cfg.mlp_dim, cfg.emb_dim)
 
     def __call__(self, hidden_BTD: jax.Array) -> jax.Array:
         gate_BTF = self.gate_proj(hidden_BTD, out_sharding=self.shd_cfg.act_btf)
@@ -183,10 +205,26 @@ class TextMoEFeedForward(nnx.Module):
         self.shd_cfg = cfg.shd_cfg
         E, D, F = cfg.num_experts, cfg.emb_dim, cfg.moe_intermediate_size
         init = nnx.initializers.lecun_normal()
-        self.gate_proj = nnx.Param(init(rngs.params(), (E, D, F)))
-        self.up_proj = nnx.Param(init(rngs.params(), (E, D, F)))
-        self.down_proj = nnx.Param(init(rngs.params(), (E, F, D)))
-        self.router = nnx.Linear(D, E, use_bias=False, rngs=rngs, dtype=cfg.dtype)
+        self.gate_proj = nnx.Param(
+            init(rngs.params(), (E, D, F)),
+            sharding=(None, "embed", "mlp"),
+        )
+        self.up_proj = nnx.Param(
+            init(rngs.params(), (E, D, F)),
+            sharding=(None, "embed", "mlp"),
+        )
+        self.down_proj = nnx.Param(
+            init(rngs.params(), (E, F, D)),
+            sharding=(None, "mlp", "embed"),
+        )
+        self.router = nnx.Linear(
+            D,
+            E,
+            use_bias=False,
+            rngs=rngs,
+            dtype=cfg.dtype,
+            kernel_init=wp(init, ("embed", None)),
+        )
 
     def __call__(self, hidden_BTD: jax.Array) -> tuple[jax.Array, jax.Array]:
         cfg = self.cfg
@@ -241,13 +279,43 @@ class TextMoEFeedForward(nnx.Module):
 class TextAttention(nnx.Module):
     def __init__(self, cfg: Qwen3VLConfig, *, rngs: nnx.Rngs):
         self.shd_cfg = cfg.shd_cfg
-        linear = partial(nnx.Linear, use_bias=False, rngs=rngs, dtype=cfg.dtype)
-        self.q_proj = linear(cfg.emb_dim, cfg.num_heads * cfg.head_dim)
-        self.k_proj = linear(cfg.emb_dim, cfg.num_kv_heads * cfg.head_dim)
-        self.v_proj = linear(cfg.emb_dim, cfg.num_kv_heads * cfg.head_dim)
-        self.o_proj = linear(cfg.num_heads * cfg.head_dim, cfg.emb_dim)
-        self.q_norm = RMSNorm(cfg.head_dim, cfg.norm_eps, rngs=rngs)
-        self.k_norm = RMSNorm(cfg.head_dim, cfg.norm_eps, rngs=rngs)
+        init_fn = nnx.initializers.lecun_normal()
+        qkv_init = wp(init_fn, ("embed", "heads"))
+        o_init = wp(init_fn, ("heads", "embed"))
+        self.q_proj = nnx.Linear(
+            cfg.emb_dim,
+            cfg.num_heads * cfg.head_dim,
+            use_bias=False,
+            rngs=rngs,
+            dtype=cfg.dtype,
+            kernel_init=qkv_init,
+        )
+        self.k_proj = nnx.Linear(
+            cfg.emb_dim,
+            cfg.num_kv_heads * cfg.head_dim,
+            use_bias=False,
+            rngs=rngs,
+            dtype=cfg.dtype,
+            kernel_init=qkv_init,
+        )
+        self.v_proj = nnx.Linear(
+            cfg.emb_dim,
+            cfg.num_kv_heads * cfg.head_dim,
+            use_bias=False,
+            rngs=rngs,
+            dtype=cfg.dtype,
+            kernel_init=qkv_init,
+        )
+        self.o_proj = nnx.Linear(
+            cfg.num_heads * cfg.head_dim,
+            cfg.emb_dim,
+            use_bias=False,
+            rngs=rngs,
+            dtype=cfg.dtype,
+            kernel_init=o_init,
+        )
+        self.q_norm = RMSNorm(cfg.head_dim, cfg.norm_eps, rngs=rngs, sharding=(None,))
+        self.k_norm = RMSNorm(cfg.head_dim, cfg.norm_eps, rngs=rngs, sharding=(None,))
         self.n_rep = cfg.num_heads // cfg.num_kv_heads
         self.scale = cfg.head_dim**-0.5
         self.head_dim = cfg.head_dim
@@ -305,8 +373,13 @@ class TextDecoderLayer(nnx.Module):
 
 class TextModel(nnx.Module):
     def __init__(self, cfg: Qwen3VLConfig, *, rngs: nnx.Rngs):
+        embed_init = nnx.initializers.normal(stddev=0.02)
         self.embedder = nnx.Embed(
-            num_embeddings=cfg.vocab_size, features=cfg.emb_dim, dtype=cfg.dtype, rngs=rngs
+            num_embeddings=cfg.vocab_size,
+            features=cfg.emb_dim,
+            dtype=cfg.dtype,
+            rngs=rngs,
+            embedding_init=wp(embed_init, ("vocab", "embed")),
         )
         self.out_emb_shd = cfg.shd_cfg.act_btd
         self.layers = nnx.List([TextDecoderLayer(cfg, layer_idx=i, rngs=rngs) for i in range(cfg.num_layers)])
@@ -319,7 +392,15 @@ class Qwen3VL(nnx.Module):
         self.logits_shd = P(cfg.shd_cfg.act_btd[0], None, None)
         self.vision = VisionModel(cfg.vision, shd_cfg=cfg.shd_cfg, rngs=rngs)
         self.text = TextModel(cfg, rngs=rngs)
-        self.lm_head = nnx.Linear(cfg.emb_dim, cfg.vocab_size, use_bias=False, rngs=rngs, dtype=cfg.dtype)
+        lm_head_init = nnx.initializers.lecun_normal()
+        self.lm_head = nnx.Linear(
+            cfg.emb_dim,
+            cfg.vocab_size,
+            use_bias=False,
+            rngs=rngs,
+            dtype=cfg.dtype,
+            kernel_init=wp(lm_head_init, ("embed", "vocab")),
+        )
 
     def __call__(
         self,

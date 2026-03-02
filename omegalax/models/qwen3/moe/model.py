@@ -8,6 +8,8 @@ from ..dense.model import MLP as DenseMLP
 from ..norms import RMSNorm
 from .config import Qwen3MoeConfig
 
+wp = nnx.with_partitioning
+
 
 class MoEFeedForward(nnx.Module):
     """Sparse MoE block matching the HuggingFace Qwen3MoeSparseMoeBlock architecture.
@@ -24,10 +26,26 @@ class MoEFeedForward(nnx.Module):
         E, D, F = cfg.num_experts, cfg.emb_dim, cfg.moe_intermediate_size
 
         init = nnx.initializers.lecun_normal()
-        self.gate_proj = nnx.Param(init(rngs.params(), (E, D, F)))
-        self.up_proj = nnx.Param(init(rngs.params(), (E, D, F)))
-        self.down_proj = nnx.Param(init(rngs.params(), (E, F, D)))
-        self.router = nnx.Linear(D, E, use_bias=False, rngs=rngs, dtype=cfg.dtype)
+        self.gate_proj = nnx.Param(
+            init(rngs.params(), (E, D, F)),
+            sharding=(None, "embed", "mlp"),
+        )
+        self.up_proj = nnx.Param(
+            init(rngs.params(), (E, D, F)),
+            sharding=(None, "embed", "mlp"),
+        )
+        self.down_proj = nnx.Param(
+            init(rngs.params(), (E, F, D)),
+            sharding=(None, "mlp", "embed"),
+        )
+        self.router = nnx.Linear(
+            D,
+            E,
+            use_bias=False,
+            rngs=rngs,
+            dtype=cfg.dtype,
+            kernel_init=wp(init, ("embed", None)),
+        )
 
     @jax.named_scope("moe_feed_forward")
     def __call__(self, hidden_BTD: jax.Array) -> tuple[jax.Array, jax.Array]:
@@ -89,9 +107,9 @@ class MoEFeedForward(nnx.Module):
 
 class DecoderLayer(nnx.Module):
     def __init__(self, cfg: Qwen3MoeConfig, layer_idx: int, *, rngs: nnx.Rngs):
-        self.input_layernorm = RMSNorm(cfg.emb_dim, cfg.norm_eps, cfg.shd_cfg.rms_norm, rngs=rngs)
+        self.input_layernorm = RMSNorm(cfg.emb_dim, cfg.norm_eps, rngs=rngs)
         self.attn = Attention(cfg=cfg, rngs=rngs)
-        self.post_attention_layernorm = RMSNorm(cfg.emb_dim, cfg.norm_eps, cfg.shd_cfg.rms_norm, rngs=rngs)
+        self.post_attention_layernorm = RMSNorm(cfg.emb_dim, cfg.norm_eps, rngs=rngs)
 
         self.is_moe = cfg.is_moe_layer(layer_idx)
         if self.is_moe:
@@ -113,12 +131,27 @@ class DecoderLayer(nnx.Module):
 
 class Qwen3Moe(nnx.Module):
     def __init__(self, cfg: Qwen3MoeConfig, *, rngs: nnx.Rngs):
-        self.embedder = nnx.Embed(num_embeddings=cfg.vocab_size, features=cfg.emb_dim, dtype=cfg.dtype, rngs=rngs)
+        embed_init = nnx.initializers.normal(stddev=0.02)
+        self.embedder = nnx.Embed(
+            num_embeddings=cfg.vocab_size,
+            features=cfg.emb_dim,
+            dtype=cfg.dtype,
+            rngs=rngs,
+            embedding_init=wp(embed_init, ("vocab", "embed")),
+        )
         self.out_emb_shd = cfg.shd_cfg.act_btd
         self.logits_shd = P(cfg.shd_cfg.act_btd[0], None, None)
         self.layers = nnx.List([DecoderLayer(cfg=cfg, layer_idx=i, rngs=rngs) for i in range(cfg.num_layers)])
-        self.final_norm = RMSNorm(cfg.emb_dim, cfg.norm_eps, cfg.shd_cfg.rms_norm, rngs=rngs)
-        self.lm_head = nnx.Linear(cfg.emb_dim, cfg.vocab_size, use_bias=False, rngs=rngs, dtype=cfg.dtype)
+        self.final_norm = RMSNorm(cfg.emb_dim, cfg.norm_eps, rngs=rngs)
+        lm_head_init = nnx.initializers.lecun_normal()
+        self.lm_head = nnx.Linear(
+            cfg.emb_dim,
+            cfg.vocab_size,
+            use_bias=False,
+            rngs=rngs,
+            dtype=cfg.dtype,
+            kernel_init=wp(lm_head_init, ("embed", "vocab")),
+        )
 
     def __call__(self, token_ids_BT, segment_ids_BT, cache, num_right_pads):
         del num_right_pads

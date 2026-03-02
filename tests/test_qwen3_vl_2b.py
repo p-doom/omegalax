@@ -16,6 +16,7 @@ from flax import nnx
 from huggingface_hub import snapshot_download
 from transformers import AutoConfig, AutoProcessor, Qwen3VLForConditionalGeneration
 
+from omegalax.distributed.mesh import mesh_rules_for
 from omegalax.models.params_utils import map_to_bonsai_key
 from omegalax.models.qwen3_vl import create_qwen3_vl_from_safetensors
 from omegalax.models.qwen3_vl.loader import _get_non_expert_mapping
@@ -89,7 +90,8 @@ class Qwen3VLMappingTest(absltest.TestCase):
             self.fail(f"Unmapped HF parameter keys ({len(unmapped)}):\n" + "\n".join(sorted(unmapped)))
 
         from omegalax.models.qwen3_vl.model import Qwen3VL
-        _, abs_state = nnx.split(nnx.eval_shape(lambda: Qwen3VL(self.cfg, rngs=nnx.Rngs(params=0))))
+        with mesh_rules_for(tp_size=1, fsdp_size=1):
+            _, abs_state = nnx.split(nnx.eval_shape(lambda: Qwen3VL(self.cfg, rngs=nnx.Rngs(params=0))))
         abs_dict = nnx.to_pure_dict(abs_state)
         _, loaded_state = nnx.split(self.jax_model)
         loaded_dict = nnx.to_pure_dict(loaded_state)

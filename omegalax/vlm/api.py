@@ -11,28 +11,22 @@ from flax import nnx
 from jax.sharding import Mesh, PartitionSpec
 
 from omegalax.distributed.mesh import ensure_mesh, required_batch_multiple as mesh_required_batch_multiple
-from omegalax.models.shard_config import shard_config_for_mesh
-from omegalax.models.sharding_runtime import init_sharded_model as init_sharded_model_runtime
+from omegalax.models.shard_config import axis_rules_for_mesh, shard_config_for_mesh
+from omegalax.models.sharding_runtime import (
+    batch_partition_spec as runtime_batch_partition_spec,
+    init_model_sharded,
+    shard_batch as runtime_shard_batch,
+)
 from omegalax.models.qwen3_vl import Qwen3VL, make_vl_config
 from omegalax.models.qwen3_vl.config import (
     Qwen3VLConfig,
     is_supported_qwen3_vl_model_id,
     list_supported_qwen3_vl_model_ids,
 )
-from omegalax.models.qwen3_vl.sharding import (
-    batch_partition_spec as qwen3_vl_batch_partition_spec,
-    model_state_sharding as qwen3_vl_model_state_sharding,
-    shard_batch as qwen3_vl_shard_batch,
-)
 from omegalax.models.qwen3_5 import Qwen3_5Config
 from omegalax.models.qwen3_5 import make_config as make_qwen3_5_config
 from omegalax.models.qwen3_5.config import is_supported_qwen3_5_model_id, list_supported_qwen3_5_model_ids
 from omegalax.models.qwen3_5.model import Qwen3_5ForConditionalGeneration
-from omegalax.models.qwen3_5.sharding import (
-    batch_partition_spec as qwen3_5_batch_partition_spec,
-    model_state_sharding as qwen3_5_model_state_sharding,
-    shard_batch as qwen3_5_shard_batch,
-)
 
 VLMConfig = Union[Qwen3_5Config, Qwen3VLConfig]
 P = PartitionSpec
@@ -81,9 +75,9 @@ def align_config_to_mesh(cfg: VLMConfig, mesh: Mesh) -> VLMConfig:
 
 def batch_partition_spec(cfg: VLMConfig) -> PartitionSpec:
     if isinstance(cfg, Qwen3_5Config):
-        return qwen3_5_batch_partition_spec(cfg.text_config.shd_cfg)
+        return runtime_batch_partition_spec(cfg.text_config.shd_cfg)
     if isinstance(cfg, Qwen3VLConfig):
-        return qwen3_vl_batch_partition_spec(cfg.shd_cfg)
+        return runtime_batch_partition_spec(cfg.shd_cfg)
     raise TypeError(f"Unsupported VLM config type: {type(cfg)}")
 
 
@@ -93,9 +87,9 @@ def required_batch_multiple(cfg: VLMConfig, mesh: Mesh) -> int:
 
 def shard_batch(token_ids_BT: jax.Array, cfg: VLMConfig, mesh: Mesh) -> jax.Array:
     if isinstance(cfg, Qwen3_5Config):
-        return qwen3_5_shard_batch(token_ids_BT, cfg.text_config.shd_cfg, mesh)
+        return runtime_shard_batch(token_ids_BT, cfg.text_config.shd_cfg, mesh)
     if isinstance(cfg, Qwen3VLConfig):
-        return qwen3_vl_shard_batch(token_ids_BT, cfg.shd_cfg, mesh)
+        return runtime_shard_batch(token_ids_BT, cfg.shd_cfg, mesh)
     raise TypeError(f"Unsupported VLM config type: {type(cfg)}")
 
 
@@ -119,25 +113,12 @@ def init_model(
     mesh = ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size)
     cfg = align_config_to_mesh(cfg, mesh)
 
+    axis_rules = axis_rules_for_mesh(mesh)
     if isinstance(cfg, Qwen3_5Config):
-        model = init_sharded_model_runtime(
-            Qwen3_5ForConditionalGeneration,
-            cfg,
-            rng,
-            mesh,
-            qwen3_5_model_state_sharding,
-            lambda x: x.text_config.shd_cfg,
-        )
+        model = init_model_sharded(Qwen3_5ForConditionalGeneration, cfg, rng, mesh, axis_rules)
         return model, cfg
     if isinstance(cfg, Qwen3VLConfig):
-        model = init_sharded_model_runtime(
-            Qwen3VL,
-            cfg,
-            rng,
-            mesh,
-            qwen3_vl_model_state_sharding,
-            lambda x: x.shd_cfg,
-        )
+        model = init_model_sharded(Qwen3VL, cfg, rng, mesh, axis_rules)
         return model, cfg
     raise ValueError(f"Unsupported VLM config type: {type(cfg)}")
 

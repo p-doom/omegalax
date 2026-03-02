@@ -15,6 +15,7 @@ from flax import nnx
 from huggingface_hub import snapshot_download
 from transformers import AutoConfig, AutoTokenizer, Qwen3ForCausalLM
 
+from omegalax.distributed.mesh import mesh_rules_for
 from omegalax.text import api
 from omegalax.models.params_utils import map_to_bonsai_key
 from omegalax.models.qwen3.dense import params_dense
@@ -103,7 +104,8 @@ class Qwen3MappingTest(absltest.TestCase):
 
         # All JAX leaves should be populated and match abstract shapes.
         model_cls = api.registry.get_model_cls(self.cfg.variant)
-        _, abs_state = nnx.split(nnx.eval_shape(lambda: model_cls(self.cfg, rngs=nnx.Rngs(params=0))))
+        with mesh_rules_for(tp_size=1, fsdp_size=1):
+            _, abs_state = nnx.split(nnx.eval_shape(lambda: model_cls(self.cfg, rngs=nnx.Rngs(params=0))))
         abs_dict = nnx.to_pure_dict(abs_state)
         _, loaded_state = nnx.split(self.jax_model)
         loaded_dict = nnx.to_pure_dict(loaded_state)

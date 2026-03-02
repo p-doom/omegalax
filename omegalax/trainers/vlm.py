@@ -173,10 +173,10 @@ def _restore_checkpoint(
     optimizer: nnx.ModelAndOptimizer,
     rng: jax.Array,
 ) -> tuple[nnx.ModelAndOptimizer, int, jax.Array]:
-    """Restore optimizer/model state and RNG key if a checkpoint exists."""
+    """Restore optimizer/model state and RNG key from latest checkpoint."""
     latest_step = checkpoint_manager.latest_step()
     if latest_step is None:
-        return optimizer, 0, rng
+        raise ValueError("No checkpoint found to restore.")
 
     abstract_state = _abstract_train_state(optimizer, rng)
     restore_args = ocp.args.Composite(train_state=ocp.args.PyTreeRestore(abstract_state))
@@ -246,6 +246,8 @@ def run_training(
     checkpoint_manager = None
     if save_dir is not None:
         save_dir = Path(save_dir).expanduser().resolve()
+        if resume and not save_dir.exists():
+            raise ValueError(f"resume=True requires an existing checkpoint directory: {save_dir}")
         save_dir.mkdir(parents=True, exist_ok=True)
         checkpoint_manager = _make_checkpoint_manager(save_dir, save_interval=save_every or None)
 
@@ -254,7 +256,11 @@ def run_training(
         log_path.parent.mkdir(parents=True, exist_ok=True)
 
     start_step = 0
-    if resume and checkpoint_manager is not None:
+    if resume:
+        if checkpoint_manager is None:
+            raise ValueError("resume=True requires save_dir to be provided.")
+        if checkpoint_manager.latest_step() is None:
+            raise ValueError(f"resume=True but no checkpoints found under: {save_dir}")
         optimizer, start_step, rng = _restore_checkpoint(checkpoint_manager, optimizer, rng)
         rng = jax.device_put(rng, replicated_rng_sharding)
 
@@ -274,6 +280,10 @@ def run_training(
             return
 
         host_metrics = {k: float(v) for k, v in metrics_to_log.items()}
+        required_metric_keys = ("loss", "grad_norm")
+        missing = [k for k in required_metric_keys if k not in host_metrics]
+        if missing:
+            raise KeyError(f"Missing required metrics for logging: {missing}")
         host_metrics["step"] = step_to_log
         perf = step_metrics(
             per_device_flops, step_delta, tokens_per_step, peak_tflops

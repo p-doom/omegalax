@@ -10,13 +10,22 @@ from flax import nnx
 from omegalax.models.shard_config import ShardConfig
 from .config import Qwen3VLVisionConfig
 
+wp = nnx.with_partitioning
+
 
 class LayerNorm(nnx.Module):
     """Standard LayerNorm (weight + bias)."""
 
-    def __init__(self, dim: int, eps: float = 1e-6, *, rngs: nnx.Rngs):
-        self.scale = nnx.Param(jnp.ones(dim))
-        self.bias = nnx.Param(jnp.zeros(dim))
+    def __init__(
+        self,
+        dim: int,
+        eps: float = 1e-6,
+        *,
+        rngs: nnx.Rngs,
+        sharding: tuple[str | None, ...] = ("hidden",),
+    ):
+        self.scale = nnx.Param(jnp.ones(dim), sharding=sharding)
+        self.bias = nnx.Param(jnp.zeros(dim), sharding=sharding)
         self.eps = eps
 
     def __call__(self, x: jax.Array) -> jax.Array:
@@ -31,7 +40,15 @@ class VisionPatchEmbed(nnx.Module):
 
     def __init__(self, config: Qwen3VLVisionConfig, *, rngs: nnx.Rngs):
         in_features = config.in_channels * config.temporal_patch_size * config.patch_size**2
-        self.proj = nnx.Linear(in_features, config.hidden_size, use_bias=True, rngs=rngs, dtype=config.dtype)
+        init = nnx.initializers.lecun_normal()
+        self.proj = nnx.Linear(
+            in_features,
+            config.hidden_size,
+            use_bias=True,
+            rngs=rngs,
+            dtype=config.dtype,
+            kernel_init=wp(init, (None, "hidden")),
+        )
         self.in_features = in_features
 
     def __call__(self, pixels: jax.Array) -> jax.Array:
@@ -41,8 +58,23 @@ class VisionPatchEmbed(nnx.Module):
 
 class VisionMLP(nnx.Module):
     def __init__(self, config: Qwen3VLVisionConfig, *, rngs: nnx.Rngs):
-        self.fc1 = nnx.Linear(config.hidden_size, config.intermediate_size, use_bias=True, rngs=rngs, dtype=config.dtype)
-        self.fc2 = nnx.Linear(config.intermediate_size, config.hidden_size, use_bias=True, rngs=rngs, dtype=config.dtype)
+        init = nnx.initializers.lecun_normal()
+        self.fc1 = nnx.Linear(
+            config.hidden_size,
+            config.intermediate_size,
+            use_bias=True,
+            rngs=rngs,
+            dtype=config.dtype,
+            kernel_init=wp(init, (None, "hidden")),
+        )
+        self.fc2 = nnx.Linear(
+            config.intermediate_size,
+            config.hidden_size,
+            use_bias=True,
+            rngs=rngs,
+            dtype=config.dtype,
+            kernel_init=wp(init, ("hidden", None)),
+        )
         self.act_fn = lambda x: jax.nn.gelu(x, approximate=True)
 
     def __call__(self, hidden_ND: jax.Array) -> jax.Array:
@@ -79,8 +111,24 @@ class VisionAttention(nnx.Module):
         self.num_heads = config.num_heads
         self.head_dim = config.hidden_size // config.num_heads
         self.scale = self.head_dim**-0.5
-        self.qkv = nnx.Linear(config.hidden_size, config.hidden_size * 3, use_bias=True, rngs=rngs, dtype=config.dtype)
-        self.proj = nnx.Linear(config.hidden_size, config.hidden_size, use_bias=True, rngs=rngs, dtype=config.dtype)
+        init = nnx.initializers.lecun_normal()
+        qkv_init = wp(init, (None, "hidden"))
+        self.qkv = nnx.Linear(
+            config.hidden_size,
+            config.hidden_size * 3,
+            use_bias=True,
+            rngs=rngs,
+            dtype=config.dtype,
+            kernel_init=qkv_init,
+        )
+        self.proj = nnx.Linear(
+            config.hidden_size,
+            config.hidden_size,
+            use_bias=True,
+            rngs=rngs,
+            dtype=config.dtype,
+            kernel_init=qkv_init,
+        )
 
     def __call__(self, hidden_ND: jax.Array, cu_seqlens: list[int], cos_NK: jax.Array, sin_NK: jax.Array) -> jax.Array:
         N = hidden_ND.shape[0]
@@ -128,8 +176,23 @@ class VisionPatchMerger(nnx.Module):
         self.use_postshuffle_norm = use_postshuffle_norm
         norm_dim = hidden_size if use_postshuffle_norm else config.hidden_size
         self.norm = LayerNorm(norm_dim, eps=1e-6, rngs=rngs)
-        self.fc1 = nnx.Linear(hidden_size, hidden_size, use_bias=True, rngs=rngs, dtype=config.dtype)
-        self.fc2 = nnx.Linear(hidden_size, config.out_hidden_size, use_bias=True, rngs=rngs, dtype=config.dtype)
+        init = nnx.initializers.lecun_normal()
+        self.fc1 = nnx.Linear(
+            hidden_size,
+            hidden_size,
+            use_bias=True,
+            rngs=rngs,
+            dtype=config.dtype,
+            kernel_init=wp(init, (None, None)),
+        )
+        self.fc2 = nnx.Linear(
+            hidden_size,
+            config.out_hidden_size,
+            use_bias=True,
+            rngs=rngs,
+            dtype=config.dtype,
+            kernel_init=wp(init, (None, "hidden")),
+        )
 
     def __call__(self, hidden_ND: jax.Array) -> jax.Array:
         if self.use_postshuffle_norm:
@@ -146,8 +209,13 @@ class VisionModel(nnx.Module):
         self.config = config
         self.spatial_merge_size = config.spatial_merge_size
         self.patch_embed = VisionPatchEmbed(config, rngs=rngs)
+        pos_init = nnx.initializers.normal(stddev=0.02)
         self.pos_embed = nnx.Embed(
-            num_embeddings=config.num_position_embeddings, features=config.hidden_size, dtype=config.dtype, rngs=rngs
+            num_embeddings=config.num_position_embeddings,
+            features=config.hidden_size,
+            dtype=config.dtype,
+            rngs=rngs,
+            embedding_init=wp(pos_init, (None, "hidden")),
         )
         self.num_grid_per_side = int(config.num_position_embeddings**0.5)
         head_dim = config.hidden_size // config.num_heads

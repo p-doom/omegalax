@@ -12,7 +12,7 @@ import safetensors
 from etils import epath
 from flax import nnx
 
-from omegalax.distributed.mesh import ensure_mesh
+from omegalax.distributed.mesh import ensure_mesh, mesh_rules
 from omegalax.models.params_utils import (
     Transform,
     assign_to_state_dict,
@@ -23,10 +23,8 @@ from omegalax.models.params_utils import (
     map_to_bonsai_key,
     stoi,
 )
-from omegalax.models.sharding_runtime import apply_sharding_to_model_state as apply_sharding_to_model_state_runtime
 from .config import Qwen3_5Config, make_config, make_config_from_hf
 from .model import Qwen3_5ForConditionalGeneration
-from .sharding import model_state_sharding
 
 
 def _assert_config(cfg: Qwen3_5Config, hf_cfg: dict):
@@ -47,7 +45,7 @@ def _assert_config(cfg: Qwen3_5Config, hf_cfg: dict):
     _require("num_attention_heads", cfg.text_config.num_attention_heads, txt["num_attention_heads"])
     _require("num_key_value_heads", cfg.text_config.num_key_value_heads, txt["num_key_value_heads"])
     _require("head_dim", cfg.text_config.head_dim, txt["head_dim"])
-    num_experts = txt["num_experts"] if "num_experts" in txt else txt["num_local_experts"]
+    num_experts = txt["num_experts"]
     _require("num_experts", cfg.text_config.num_experts, num_experts)
     _require("num_experts_per_tok", cfg.text_config.num_experts_per_tok, txt["num_experts_per_tok"])
     _require("moe_intermediate_size", cfg.text_config.moe_intermediate_size, txt["moe_intermediate_size"])
@@ -259,9 +257,10 @@ def create_qwen3_5_from_safetensors(
     else:
         cfg = make_config_from_hf(hf_cfg)
 
-    model = nnx.eval_shape(
-        lambda: Qwen3_5ForConditionalGeneration(cfg, rngs=nnx.Rngs(params=0))
-    )
+    with mesh_rules(mesh):
+        model = nnx.eval_shape(
+            lambda: Qwen3_5ForConditionalGeneration(cfg, rngs=nnx.Rngs(params=0))
+        )
     graph_def, abs_state = nnx.split(model)
     state_dict = nnx.to_pure_dict(abs_state)
 
@@ -394,12 +393,6 @@ def create_qwen3_5_from_safetensors(
 
     gc.collect()
     model = nnx.merge(graph_def, state_dict)
-    model = apply_sharding_to_model_state_runtime(
-        model,
-        cfg.text_config.shd_cfg,
-        mesh,
-        model_state_sharding,
-    )
     return model, cfg
 
 

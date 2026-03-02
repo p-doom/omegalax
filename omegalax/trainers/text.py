@@ -180,10 +180,10 @@ def _restore_checkpoint(
     optimizer_state: nnx.State,
     rng: jax.Array,
 ) -> tuple[nnx.State, int, jax.Array]:
-    """Restore optimizer/model state and RNG key if a checkpoint exists."""
+    """Restore optimizer/model state and RNG key from latest checkpoint."""
     latest_step = checkpoint_manager.latest_step()
     if latest_step is None:
-        return optimizer_state, 0, rng
+        raise ValueError("No checkpoint found to restore.")
 
     abstract_state = _abstract_train_state(optimizer_state, rng)
     restore_args = ocp.args.Composite(train_state=ocp.args.PyTreeRestore(abstract_state))
@@ -260,6 +260,8 @@ def run_training(
     checkpoint_manager = None
     if save_dir is not None:
         save_dir = Path(save_dir).expanduser().resolve()
+        if resume and not save_dir.exists():
+            raise ValueError(f"resume=True requires an existing checkpoint directory: {save_dir}")
         save_dir.mkdir(parents=True, exist_ok=True)
         checkpoint_manager = _make_checkpoint_manager(save_dir, save_interval=save_every or None)
 
@@ -268,7 +270,11 @@ def run_training(
         log_path.parent.mkdir(parents=True, exist_ok=True)
 
     start_step = 0
-    if resume and checkpoint_manager is not None:
+    if resume:
+        if checkpoint_manager is None:
+            raise ValueError("resume=True requires save_dir to be provided.")
+        if checkpoint_manager.latest_step() is None:
+            raise ValueError(f"resume=True but no checkpoints found under: {save_dir}")
         optimizer_state, start_step, rng = _restore_checkpoint(checkpoint_manager, optimizer_state, rng)
         rng = jax.device_put(rng, replicated_rng_sharding)
 
@@ -288,6 +294,10 @@ def run_training(
             return
 
         host_metrics = {k: float(v) for k, v in metrics_to_log.items()}
+        required_metric_keys = ("loss", "grad_norm")
+        missing = [k for k in required_metric_keys if k not in host_metrics]
+        if missing:
+            raise KeyError(f"Missing required metrics for logging: {missing}")
         host_metrics["step"] = step_to_log
         perf = step_metrics(
             per_device_flops, step_delta, tokens_per_step, peak_tflops
@@ -296,10 +306,12 @@ def run_training(
         last_metrics = host_metrics
 
         if should_print:
-            acc = host_metrics.get("token_accuracy", 0.0)
+            acc_fragment = ""
+            if "token_accuracy" in host_metrics:
+                acc_fragment = f"acc={host_metrics['token_accuracy']:.4f} "
             print(
                 f"step={host_metrics['step']} loss={host_metrics['loss']:.4f} "
-                f"acc={acc:.4f} grad_norm={host_metrics['grad_norm']:.4f} "
+                f"{acc_fragment}grad_norm={host_metrics['grad_norm']:.4f} "
                 f"step_s={host_metrics['step_time_s']:.3f} tok/s/dev={host_metrics['tokens_per_sec_per_device']:.0f} "
                 f"TFLOP/s/dev={host_metrics['tflops_per_device']:.2f} mfu={host_metrics['mfu']:.4f}"
             )

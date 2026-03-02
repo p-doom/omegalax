@@ -13,7 +13,7 @@ from safetensors import numpy as stnp
 from etils import epath
 from flax import nnx
 
-from omegalax.distributed.mesh import ensure_mesh
+from omegalax.distributed.mesh import ensure_mesh, mesh_rules
 from omegalax.models.params_utils import (
     Transform,
     assign_weights_from_eval_shape,
@@ -27,11 +27,9 @@ from omegalax.models.params_utils import (
     save_hf_config,
     stoi,
 )
-from omegalax.models.sharding_runtime import apply_sharding_to_model_state as apply_sharding_to_model_state_runtime
 
 from .config import Qwen3Config, make_dense_config
 from .model import Qwen3Dense
-from ..sharding import model_state_sharding
 
 
 def assert_dense_config(cfg: Qwen3Config, hf_cfg: dict[str, Any]):
@@ -43,8 +41,8 @@ def assert_dense_config(cfg: Qwen3Config, hf_cfg: dict[str, Any]):
     _require("num_kv_heads", cfg.num_kv_heads, hf_cfg["num_key_value_heads"])
     _require("head_dim", cfg.head_dim, hf_cfg["head_dim"])
     _require("mlp_dim", cfg.mlp_dim, hf_cfg["intermediate_size"])
-    rope_params = hf_cfg.get("rope_parameters") or hf_cfg.get("rope_scaling") or {}
-    _require("rope_theta", cfg.rope_theta, rope_params.get("rope_theta") or hf_cfg.get("rope_theta"))
+    rope_params = hf_cfg["rope_parameters"]
+    _require("rope_theta", cfg.rope_theta, rope_params["rope_theta"])
 
 
 def _get_key_and_transform_mapping(cfg):
@@ -82,12 +80,14 @@ def create_qwen3_dense_from_safetensors(
     fsdp_size: int | None = None,
 ) -> Qwen3Dense:
     cfg = make_dense_config(model_id)
+    mesh = ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size)
     files = find_safetensors(file_dir)
 
     hf_cfg = load_hf_config(epath.Path(file_dir))
     assert_dense_config(cfg, hf_cfg)
 
-    qwen3 = nnx.eval_shape(lambda: Qwen3Dense(cfg, rngs=nnx.Rngs(params=0)))
+    with mesh_rules(mesh):
+        qwen3 = nnx.eval_shape(lambda: Qwen3Dense(cfg, rngs=nnx.Rngs(params=0)))
     graph_def, abs_state = nnx.split(qwen3)
     state_dict = nnx.to_pure_dict(abs_state)
 
@@ -113,12 +113,7 @@ def create_qwen3_dense_from_safetensors(
 
     gc.collect()
     model = nnx.merge(graph_def, state_dict)
-    return apply_sharding_to_model_state_runtime(
-        model,
-        cfg.shd_cfg,
-        ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size),
-        model_state_sharding,
-    )
+    return model
 
 
 def _make_hf_config_dict(cfg: Qwen3Config) -> dict[str, Any]:

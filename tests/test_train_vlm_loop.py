@@ -14,6 +14,32 @@ from omegalax.trainers import vlm as vlm_trainer  # noqa: E402
 
 
 class TrainVLMTest(absltest.TestCase):
+    def test_resume_requires_save_dir(self):
+        train_cfg = vlm_trainer.TrainConfig.smoke()
+        with self.assertRaisesRegex(ValueError, "resume=True requires save_dir"):
+            vlm_trainer.run_training(
+                "qwen3-vl-smoke",
+                train_cfg,
+                resume=True,
+                log_every=0,
+                tp_size=1,
+                fsdp_size=1,
+            )
+
+    def test_resume_requires_existing_checkpoint(self):
+        train_cfg = vlm_trainer.TrainConfig.smoke()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with self.assertRaisesRegex(ValueError, "no checkpoints found"):
+                vlm_trainer.run_training(
+                    "qwen3-vl-smoke",
+                    train_cfg,
+                    save_dir=Path(tmpdir),
+                    resume=True,
+                    log_every=0,
+                    tp_size=1,
+                    fsdp_size=1,
+                )
+
     def test_train_qwen3_vl_smoke(self):
         train_cfg = vlm_trainer.TrainConfig(
             seed=0,

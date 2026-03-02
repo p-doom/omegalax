@@ -16,6 +16,7 @@ from .rope import generate_text_rope
 from .vision import VisionModel
 
 P = PartitionSpec
+wp = nnx.with_partitioning
 
 
 # Feed-forward blocks
@@ -32,10 +33,24 @@ class MLP(nnx.Module):
         rngs: nnx.Rngs,
     ):
         self.shd_cfg = shd_cfg
-        linear = partial(nnx.Linear, use_bias=False, rngs=rngs, dtype=dtype)
-        self.gate_proj = linear(hidden_size, intermediate_size)
-        self.up_proj = linear(hidden_size, intermediate_size)
-        self.down_proj = linear(intermediate_size, hidden_size)
+        init_fn = nnx.initializers.lecun_normal()
+        col_parallel = partial(
+            nnx.Linear,
+            use_bias=False,
+            rngs=rngs,
+            dtype=dtype,
+            kernel_init=wp(init_fn, ("embed", "mlp")),
+        )
+        row_parallel = partial(
+            nnx.Linear,
+            use_bias=False,
+            rngs=rngs,
+            dtype=dtype,
+            kernel_init=wp(init_fn, ("mlp", "embed")),
+        )
+        self.gate_proj = col_parallel(hidden_size, intermediate_size)
+        self.up_proj = col_parallel(hidden_size, intermediate_size)
+        self.down_proj = row_parallel(intermediate_size, hidden_size)
 
     @jax.named_scope("mlp")
     def __call__(self, hidden_BTD: jax.Array) -> jax.Array:
@@ -56,9 +71,22 @@ class MoEFeedForward(nnx.Module):
         F_moe = cfg.moe_intermediate_size
 
         init = nnx.initializers.lecun_normal()
-        self.gate_up_proj = nnx.Param(init(rngs.params(), (E, 2 * F_moe, D)))
-        self.down_proj = nnx.Param(init(rngs.params(), (E, D, F_moe)))
-        self.router = nnx.Linear(D, E, use_bias=False, rngs=rngs, dtype=cfg.dtype)
+        self.gate_up_proj = nnx.Param(
+            init(rngs.params(), (E, 2 * F_moe, D)),
+            sharding=(None, "mlp", "embed"),
+        )
+        self.down_proj = nnx.Param(
+            init(rngs.params(), (E, D, F_moe)),
+            sharding=(None, "embed", "mlp"),
+        )
+        self.router = nnx.Linear(
+            D,
+            E,
+            use_bias=False,
+            rngs=rngs,
+            dtype=cfg.dtype,
+            kernel_init=wp(init, ("embed", None)),
+        )
 
         self.shared_expert = MLP(
             D,
@@ -67,7 +95,14 @@ class MoEFeedForward(nnx.Module):
             dtype=cfg.dtype,
             rngs=rngs,
         )
-        self.shared_expert_gate = nnx.Linear(D, 1, use_bias=False, rngs=rngs, dtype=cfg.dtype)
+        self.shared_expert_gate = nnx.Linear(
+            D,
+            1,
+            use_bias=False,
+            rngs=rngs,
+            dtype=cfg.dtype,
+            kernel_init=wp(init, ("embed", None)),
+        )
 
     @jax.named_scope("moe_ffn")
     def __call__(self, hidden_BTD: jax.Array) -> tuple[jax.Array, jax.Array]:
@@ -168,7 +203,14 @@ class TextModel(nnx.Module):
 
     def __init__(self, cfg: Qwen3_5TextConfig, *, rngs: nnx.Rngs):
         self.cfg = cfg
-        self.embedder = nnx.Embed(cfg.vocab_size, cfg.hidden_size, rngs=rngs, dtype=cfg.dtype)
+        embed_init = nnx.initializers.normal(stddev=0.02)
+        self.embedder = nnx.Embed(
+            cfg.vocab_size,
+            cfg.hidden_size,
+            rngs=rngs,
+            dtype=cfg.dtype,
+            embedding_init=wp(embed_init, ("vocab", "embed")),
+        )
         self.out_emb_shd = cfg.shd_cfg.act_btd
         self.layers = nnx.List([
             DecoderLayer(cfg, i, rngs=rngs) for i in range(cfg.num_hidden_layers)
@@ -232,7 +274,15 @@ class Qwen3_5ForCausalLM(nnx.Module):
     def __init__(self, cfg: Qwen3_5TextConfig, *, rngs: nnx.Rngs):
         self.text = TextModel(cfg, rngs=rngs)
         self.logits_shd = P(cfg.shd_cfg.act_btd[0], None, None)
-        self.lm_head = nnx.Linear(cfg.hidden_size, cfg.vocab_size, use_bias=False, rngs=rngs, dtype=cfg.dtype)
+        lm_head_init = nnx.initializers.lecun_normal()
+        self.lm_head = nnx.Linear(
+            cfg.hidden_size,
+            cfg.vocab_size,
+            use_bias=False,
+            rngs=rngs,
+            dtype=cfg.dtype,
+            kernel_init=wp(lm_head_init, ("embed", "vocab")),
+        )
 
     def __call__(self, token_ids_BT, segment_ids_BT, cache, num_right_pads):
         del cache, num_right_pads
@@ -249,8 +299,14 @@ class Qwen3_5ForConditionalGeneration(nnx.Module):
         self.vision = VisionModel(cfg.vision_config, shd_cfg=cfg.text_config.shd_cfg, rngs=rngs)
         self.text = TextModel(cfg.text_config, rngs=rngs)
         self.logits_shd = P(cfg.text_config.shd_cfg.act_btd[0], None, None)
+        lm_head_init = nnx.initializers.lecun_normal()
         self.lm_head = nnx.Linear(
-            cfg.text_config.hidden_size, cfg.text_config.vocab_size, use_bias=False, rngs=rngs, dtype=cfg.text_config.dtype,
+            cfg.text_config.hidden_size,
+            cfg.text_config.vocab_size,
+            use_bias=False,
+            rngs=rngs,
+            dtype=cfg.text_config.dtype,
+            kernel_init=wp(lm_head_init, ("embed", "vocab")),
         )
 
     def __call__(
