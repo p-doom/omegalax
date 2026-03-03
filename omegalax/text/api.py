@@ -3,25 +3,23 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import Union
 
 import jax
 import jax.numpy as jnp
 from flax import nnx
 from jax.sharding import Mesh, PartitionSpec
 
-from omegalax.distributed.mesh import ensure_mesh, required_batch_multiple as mesh_required_batch_multiple
-from omegalax.models.shard_config import shard_config_for_mesh
-from omegalax.models.sharding_runtime import init_sharded_model as init_sharded_model_runtime
+from omegalax.distributed.mesh import ensure_mesh
+from omegalax.models.shard_config import axis_rules_for_mesh, shard_config_for_mesh
+from omegalax.models.sharding_runtime import (
+    batch_partition_spec as runtime_batch_partition_spec,
+    init_model_sharded,
+    shard_batch as runtime_shard_batch,
+)
 from omegalax.models.qwen3 import registry as qwen3_registry
 from omegalax.models.qwen3.cache import Cache, init_cache
 from omegalax.models.qwen3.dense.model import Qwen3Dense
 from omegalax.models.qwen3.moe.model import Qwen3Moe
-from omegalax.models.qwen3.sharding import (
-    batch_partition_spec as qwen3_batch_partition_spec,
-    model_state_sharding as qwen3_model_state_sharding,
-    shard_batch as qwen3_shard_batch,
-)
 from omegalax.models.qwen3.utils import count_right_pads
 from omegalax.models.qwen3_5 import Qwen3_5TextConfig
 from omegalax.models.qwen3_5.config import (
@@ -30,16 +28,9 @@ from omegalax.models.qwen3_5.config import (
     make_config as make_qwen3_5_config,
 )
 from omegalax.models.qwen3_5.model import Qwen3_5ForCausalLM
-from omegalax.models.qwen3_5.sharding import (
-    batch_partition_spec as qwen3_5_batch_partition_spec,
-    model_state_sharding as qwen3_5_model_state_sharding,
-    shard_batch as qwen3_5_shard_batch,
-)
-
-P = PartitionSpec
 
 ModelConfig = qwen3_registry.Qwen3Config
-TextConfig = Union[ModelConfig, Qwen3_5TextConfig]
+TextConfig = ModelConfig | Qwen3_5TextConfig
 registry = qwen3_registry
 
 list_qwen3_dense_model_ids = qwen3_registry.list_qwen3_dense_model_ids
@@ -66,31 +57,22 @@ def resolve_config(model_or_id: str | TextConfig) -> TextConfig:
 
 def align_config_to_mesh(cfg: TextConfig, mesh: Mesh) -> TextConfig:
     """Drop singleton mesh axes from sharding specs to avoid degenerate constraints."""
-    if isinstance(cfg, qwen3_registry.Qwen3Config) or isinstance(cfg, Qwen3_5TextConfig):
+    if isinstance(cfg, (qwen3_registry.Qwen3Config, Qwen3_5TextConfig)):
         return dataclasses.replace(cfg, shd_cfg=shard_config_for_mesh(cfg.shd_cfg, mesh))
     raise TypeError(f"Unsupported text config type: {type(cfg)}")
 
 
 def batch_partition_spec(cfg: TextConfig) -> PartitionSpec:
     """Return the token batch partition spec for a text config."""
-    if isinstance(cfg, qwen3_registry.Qwen3Config):
-        return qwen3_batch_partition_spec(cfg.shd_cfg)
-    if isinstance(cfg, Qwen3_5TextConfig):
-        return qwen3_5_batch_partition_spec(cfg.shd_cfg)
+    if isinstance(cfg, (qwen3_registry.Qwen3Config, Qwen3_5TextConfig)):
+        return runtime_batch_partition_spec(cfg.shd_cfg)
     raise TypeError(f"Unsupported text config type: {type(cfg)}")
-
-
-def required_batch_multiple(cfg: TextConfig, mesh: Mesh) -> int:
-    """Global batch size must be divisible by this multiple for input sharding."""
-    return mesh_required_batch_multiple(batch_partition_spec(cfg), mesh)
 
 
 def shard_batch(token_ids_BT: jax.Array, cfg: TextConfig, mesh: Mesh) -> jax.Array:
     """Shard a token batch for model families that implement input sharding."""
-    if isinstance(cfg, qwen3_registry.Qwen3Config):
-        return qwen3_shard_batch(token_ids_BT, cfg.shd_cfg, mesh)
-    if isinstance(cfg, Qwen3_5TextConfig):
-        return qwen3_5_shard_batch(token_ids_BT, cfg.shd_cfg, mesh)
+    if isinstance(cfg, (qwen3_registry.Qwen3Config, Qwen3_5TextConfig)):
+        return runtime_shard_batch(token_ids_BT, cfg.shd_cfg, mesh)
     raise TypeError(f"Unsupported text config type: {type(cfg)}")
 
 
@@ -106,26 +88,13 @@ def init_model(
     mesh = ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size)
     cfg = align_config_to_mesh(cfg, mesh)
 
+    axis_rules = axis_rules_for_mesh(mesh)
     if isinstance(cfg, qwen3_registry.Qwen3Config):
         model_cls = qwen3_registry.get_model_cls(cfg.variant)
-        model = init_sharded_model_runtime(
-            model_cls,
-            cfg,
-            rng,
-            mesh,
-            qwen3_model_state_sharding,
-            lambda x: x.shd_cfg,
-        )
+        model = init_model_sharded(model_cls, cfg, rng, mesh, axis_rules)
         return model, cfg
     if isinstance(cfg, Qwen3_5TextConfig):
-        model = init_sharded_model_runtime(
-            Qwen3_5ForCausalLM,
-            cfg,
-            rng,
-            mesh,
-            qwen3_5_model_state_sharding,
-            lambda x: x.shd_cfg,
-        )
+        model = init_model_sharded(Qwen3_5ForCausalLM, cfg, rng, mesh, axis_rules)
         return model, cfg
 
     raise ValueError(f"Unsupported text config type: {type(cfg)}")

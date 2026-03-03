@@ -11,7 +11,7 @@ import safetensors
 from etils import epath
 from flax import nnx
 
-from omegalax.distributed.mesh import ensure_mesh
+from omegalax.distributed.mesh import ensure_mesh, mesh_rules
 from omegalax.models.params_utils import (
     Transform,
     assign_weights_from_eval_shape,
@@ -24,16 +24,14 @@ from omegalax.models.params_utils import (
     map_to_bonsai_key,
     stoi,
 )
-from omegalax.models.sharding_runtime import apply_sharding_to_model_state as apply_sharding_to_model_state_runtime
 from .config import Qwen3VLConfig, make_vl_config, make_vl_config_from_hf
 from .model import Qwen3VL
-from .sharding import model_state_sharding
 
 
 def _assert_vl_config(cfg: Qwen3VLConfig, hf_cfg: dict):
     txt = hf_cfg["text_config"]
     vis = hf_cfg["vision_config"]
-    rope_params = txt.get("rope_parameters") or txt.get("rope_scaling") or {}
+    rope_scaling = txt["rope_scaling"]
 
     def _require(name, lhs, rhs):
         if lhs != rhs:
@@ -46,13 +44,16 @@ def _assert_vl_config(cfg: Qwen3VLConfig, hf_cfg: dict):
     _require("num_kv_heads", cfg.num_kv_heads, txt["num_key_value_heads"])
     _require("head_dim", cfg.head_dim, txt["head_dim"])
     _require("mlp_dim", cfg.mlp_dim, txt["intermediate_size"])
-    _require("rope_theta", cfg.rope_theta, rope_params.get("rope_theta") or txt["rope_theta"])
-    _require("mrope_section", tuple(cfg.mrope_section), tuple(rope_params["mrope_section"]))
+    _require("rope_theta", cfg.rope_theta, txt["rope_theta"])
+    _require("mrope_section", tuple(cfg.mrope_section), tuple(rope_scaling["mrope_section"]))
 
-    # MoE fields are absent in dense HF configs.
-    _require("num_experts", cfg.num_experts, txt.get("num_experts") or txt.get("num_local_experts", 0))
-    _require("num_experts_per_tok", cfg.num_experts_per_tok, txt.get("num_experts_per_tok", 0))
-    _require("moe_intermediate_size", cfg.moe_intermediate_size, txt.get("moe_intermediate_size", 0))
+    if cfg.num_experts > 0:
+        _require("num_experts", cfg.num_experts, txt["num_experts"])
+        _require("num_experts_per_tok", cfg.num_experts_per_tok, txt["num_experts_per_tok"])
+        _require("moe_intermediate_size", cfg.moe_intermediate_size, txt["moe_intermediate_size"])
+        _require("mlp_only_layers", tuple(cfg.mlp_only_layers), tuple(txt["mlp_only_layers"]))
+        _require("decoder_sparse_step", cfg.decoder_sparse_step, txt["decoder_sparse_step"])
+        _require("norm_topk_prob", cfg.norm_topk_prob, txt["norm_topk_prob"])
 
     _require("vision.hidden_size", cfg.vision.hidden_size, vis["hidden_size"])
     _require("vision.intermediate_size", cfg.vision.intermediate_size, vis["intermediate_size"])
@@ -154,7 +155,8 @@ def create_qwen3_vl_from_safetensors(
     else:
         cfg = make_vl_config_from_hf(hf_cfg)
 
-    model = nnx.eval_shape(lambda: Qwen3VL(cfg, rngs=nnx.Rngs(params=0)))
+    with mesh_rules(mesh):
+        model = nnx.eval_shape(lambda: Qwen3VL(cfg, rngs=nnx.Rngs(params=0)))
     graph_def, abs_state = nnx.split(model)
     state_dict = nnx.to_pure_dict(abs_state)
 
@@ -220,5 +222,4 @@ def create_qwen3_vl_from_safetensors(
 
     gc.collect()
     model = nnx.merge(graph_def, state_dict)
-    model = apply_sharding_to_model_state_runtime(model, cfg.shd_cfg, mesh, model_state_sharding)
     return model, cfg

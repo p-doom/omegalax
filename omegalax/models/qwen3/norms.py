@@ -2,13 +2,20 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 
-from omegalax.models.shard_config import ShardingSpec
-
 
 class RMSNorm(nnx.Module):
-    def __init__(self, dim: int, norm_eps: float, shd: ShardingSpec, *, rngs: nnx.Rngs):
-        self.scale = nnx.Param(nnx.initializers.ones_init()(rngs.params(), (dim,)))
-        self.shd = shd
+    def __init__(
+        self,
+        dim: int,
+        norm_eps: float,
+        *,
+        rngs: nnx.Rngs,
+        sharding: tuple[str | None, ...] = ("hidden",),
+    ):
+        self.scale = nnx.Param(
+            nnx.initializers.ones_init()(rngs.params(), (dim,)),
+            sharding=sharding,
+        )
         self.norm_eps = norm_eps
 
     @jax.named_scope("rms_norm")

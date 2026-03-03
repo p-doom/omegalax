@@ -2,8 +2,14 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
+
 import jax
+from flax import nnx
 from jax.sharding import Mesh, PartitionSpec, get_abstract_mesh, get_mesh
+
+from omegalax.models.shard_config import axis_rules_for_mesh
 
 _AXES = ("tp", "fsdp")
 
@@ -78,3 +84,18 @@ def ensure_mesh(tp_size: int | None = None, fsdp_size: int | None = None) -> Mes
         )
 
     return set_default_mesh(tp_size=tp_size, fsdp_size=fsdp_size)
+
+
+@contextmanager
+def mesh_rules(mesh: Mesh) -> Iterator[Mesh]:
+    """Activate mesh + logical axis rules for a scoped block."""
+    with jax.set_mesh(mesh), nnx.logical_axis_rules(axis_rules_for_mesh(mesh)):
+        yield mesh
+
+
+@contextmanager
+def mesh_rules_for(tp_size: int | None = None, fsdp_size: int | None = None) -> Iterator[Mesh]:
+    """Resolve a mesh and activate mesh + logical axis rules for a scoped block."""
+    mesh = ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size)
+    with mesh_rules(mesh):
+        yield mesh

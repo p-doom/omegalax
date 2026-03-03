@@ -55,6 +55,7 @@ HF_VISION_CFG = HFVisionConfig(
 )
 
 HF_TEXT_CFG = HFTextConfig(
+    dtype="bfloat16",
     vocab_size=1024,
     hidden_size=128,
     num_hidden_layers=4,

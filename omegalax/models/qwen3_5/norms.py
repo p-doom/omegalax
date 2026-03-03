@@ -10,8 +10,15 @@ class RMSNorm(nnx.Module):
     Weight is initialized to zeros so the initial behaviour is identity normalization.
     """
 
-    def __init__(self, dim: int, eps: float = 1e-6, *, rngs: nnx.Rngs):
-        self.weight = nnx.Param(jnp.zeros(dim))
+    def __init__(
+        self,
+        dim: int,
+        eps: float = 1e-6,
+        *,
+        rngs: nnx.Rngs,
+        sharding: tuple[str | None, ...] = ("hidden",),
+    ):
+        self.weight = nnx.Param(jnp.zeros(dim), sharding=sharding)
         self.eps = eps
 
     @jax.named_scope("rms_norm")
@@ -26,8 +33,15 @@ class RMSNorm(nnx.Module):
 class RMSNormGated(nnx.Module):
     """Gated RMSNorm: weight * norm(x) * silu(gate)."""
 
-    def __init__(self, dim: int, eps: float = 1e-6, *, rngs: nnx.Rngs):
-        self.weight = nnx.Param(jnp.ones(dim))
+    def __init__(
+        self,
+        dim: int,
+        eps: float = 1e-6,
+        *,
+        rngs: nnx.Rngs,
+        sharding: tuple[str | None, ...] = ("hidden",),
+    ):
+        self.weight = nnx.Param(jnp.ones(dim), sharding=sharding)
         self.eps = eps
 
     @jax.named_scope("rms_norm_gated")
@@ -44,9 +58,16 @@ class RMSNormGated(nnx.Module):
 class LayerNorm(nnx.Module):
     """Standard LayerNorm used in the vision encoder."""
 
-    def __init__(self, dim: int, eps: float = 1e-6, *, rngs: nnx.Rngs):
-        self.weight = nnx.Param(jnp.ones(dim))
-        self.bias = nnx.Param(jnp.zeros(dim))
+    def __init__(
+        self,
+        dim: int,
+        eps: float = 1e-6,
+        *,
+        rngs: nnx.Rngs,
+        sharding: tuple[str | None, ...] = ("hidden",),
+    ):
+        self.weight = nnx.Param(jnp.ones(dim), sharding=sharding)
+        self.bias = nnx.Param(jnp.zeros(dim), sharding=sharding)
         self.eps = eps
 
     @jax.named_scope("layer_norm")

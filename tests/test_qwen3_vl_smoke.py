@@ -54,6 +54,7 @@ HF_VISION_CFG = HFVisionConfig(
 )
 
 HF_TEXT_CFG = HFTextConfig(
+    dtype="bfloat16",
     vocab_size=1024,
     hidden_size=128,
     intermediate_size=512,
@@ -92,9 +93,20 @@ class Qwen3VLSmokeTest(absltest.TestCase):
         hf_model = Qwen3VLForConditionalGeneration(HF_CFG).eval()
         hf_model.save_pretrained(cls.tmpdir, safe_serialization=True)
 
+        hf_cfg_dict = HF_CFG.to_dict()
+        text_cfg = hf_cfg_dict["text_config"]
+        rope_parameters = text_cfg.pop("rope_parameters")
+        text_cfg["dtype"] = text_cfg["dtype"] or "bfloat16"
+        text_cfg["rope_theta"] = rope_parameters["rope_theta"]
+        text_cfg["rope_scaling"] = {
+            "rope_type": rope_parameters.get("rope_type", "default"),
+            "mrope_interleaved": rope_parameters.get("mrope_interleaved", True),
+            "mrope_section": rope_parameters["mrope_section"],
+        }
+
         cfg_path = os.path.join(cls.tmpdir, "config.json")
         with open(cfg_path, "w") as f:
-            json.dump(HF_CFG.to_dict(), f)
+            json.dump(hf_cfg_dict, f)
 
         cls.jax_model, cls.jax_cfg = create_qwen3_vl_from_safetensors(
             cls.tmpdir,

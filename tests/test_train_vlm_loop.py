@@ -10,10 +10,37 @@ os.environ.setdefault("JAX_PLATFORMS", "cpu")
 from absl.testing import absltest  # noqa: E402
 import jax  # noqa: E402
 
+from omegalax.distributed.mesh import ensure_mesh, mesh_rules  # noqa: E402
 from omegalax.trainers import vlm as vlm_trainer  # noqa: E402
 
 
 class TrainVLMTest(absltest.TestCase):
+    def test_resume_requires_save_dir(self):
+        train_cfg = vlm_trainer.TrainConfig.smoke()
+        with self.assertRaisesRegex(ValueError, "resume=True requires save_dir"):
+            vlm_trainer.run_training(
+                "qwen3-vl-smoke",
+                train_cfg,
+                resume=True,
+                log_every=0,
+                tp_size=1,
+                fsdp_size=1,
+            )
+
+    def test_resume_requires_existing_checkpoint(self):
+        train_cfg = vlm_trainer.TrainConfig.smoke()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with self.assertRaisesRegex(ValueError, "no checkpoints found"):
+                vlm_trainer.run_training(
+                    "qwen3-vl-smoke",
+                    train_cfg,
+                    save_dir=Path(tmpdir),
+                    resume=True,
+                    log_every=0,
+                    tp_size=1,
+                    fsdp_size=1,
+                )
+
     def test_train_qwen3_vl_smoke(self):
         train_cfg = vlm_trainer.TrainConfig(
             seed=0,
@@ -146,7 +173,9 @@ class TrainVLMTest(absltest.TestCase):
     def test_abstract_train_state_preserves_sharding_metadata(self):
         rng = jax.random.key(0)
         model = vlm_trainer.init_model("qwen3-vl-smoke", rng, tp_size=1, fsdp_size=1)
-        optimizer = vlm_trainer.build_optimizer(model, vlm_trainer.TrainConfig.smoke())
+        mesh = ensure_mesh(tp_size=1, fsdp_size=1)
+        with mesh_rules(mesh):
+            optimizer = vlm_trainer.build_optimizer(model, vlm_trainer.TrainConfig.smoke())
 
         abstract_state = vlm_trainer._abstract_train_state(optimizer, rng)  # type: ignore
         self.assertIsNotNone(getattr(abstract_state["rng"], "sharding", None))

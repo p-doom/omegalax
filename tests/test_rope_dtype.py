@@ -16,7 +16,17 @@ import jax
 import jax.numpy as jnp
 from absl.testing import absltest
 
+from omegalax.distributed.mesh import mesh_rules_for
+
 MODEL_DTYPE = jnp.bfloat16
+
+
+class _RopeDtypeTestBase(absltest.TestCase):
+    """Base for rope-dtype tests; scopes mesh + logical axis rules to each test."""
+
+    def setUp(self):
+        super().setUp()
+        self.enterContext(mesh_rules_for(tp_size=1, fsdp_size=1))
 
 
 def _make_spy(original_fn, captured: list):
@@ -37,7 +47,7 @@ def _make_spy(original_fn, captured: list):
     return spy
 
 
-class Qwen3RopeDtypeTest(absltest.TestCase):
+class Qwen3RopeDtypeTest(_RopeDtypeTestBase):
     """Qwen3 dense Attention: generate in fp32, apply_rope receives model-dtype sin/cos."""
 
     def test_rope_dtype_through_attention_forward(self):
@@ -79,7 +89,7 @@ class Qwen3RopeDtypeTest(absltest.TestCase):
                              f"apply_rope call {i}: x_BTHK should be {MODEL_DTYPE}")
 
 
-class Qwen3_5TextRopeDtypeTest(absltest.TestCase):
+class Qwen3_5TextRopeDtypeTest(_RopeDtypeTestBase):
     """Qwen3.5 TextModel: generate_text_rope in fp32, cos/sin cast to model dtype before layers."""
 
     def test_rope_dtype_through_text_forward(self):
@@ -131,7 +141,7 @@ class Qwen3_5TextRopeDtypeTest(absltest.TestCase):
                              f"Layer {i}: sin_BTK should be {MODEL_DTYPE} after cast")
 
 
-class Qwen3_5VisionRopeDtypeTest(absltest.TestCase):
+class Qwen3_5VisionRopeDtypeTest(_RopeDtypeTestBase):
     """Qwen3.5 VisionModel: vision RoPE generated in fp32, cos/sin cast to vision dtype before blocks."""
 
     def test_rope_dtype_through_vision_forward(self):
@@ -170,7 +180,7 @@ class Qwen3_5VisionRopeDtypeTest(absltest.TestCase):
                              f"Vision block {i}: sin_NK should be {vis_cfg.dtype}")
 
 
-class Qwen3VLRopeDtypeTest(absltest.TestCase):
+class Qwen3VLRopeDtypeTest(_RopeDtypeTestBase):
     """Qwen3-VL: compute_mrope_pos_embeddings in fp32, sin/cos cast to model dtype before layers."""
 
     def test_rope_dtype_through_text_forward(self):
@@ -219,7 +229,7 @@ class Qwen3VLRopeDtypeTest(absltest.TestCase):
                              f"Layer {i}: cos_BTK should be {MODEL_DTYPE} after cast")
 
 
-class Qwen3VLVisionRopeDtypeTest(absltest.TestCase):
+class Qwen3VLVisionRopeDtypeTest(_RopeDtypeTestBase):
     """Qwen3-VL VisionModel: vision RoPE generated in fp32, cos/sin cast to vision dtype before blocks."""
 
     def test_rope_dtype_through_vision_forward(self):

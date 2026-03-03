@@ -246,34 +246,36 @@ def make_vl_config(model_id: str) -> Qwen3VLConfig:
     )
 
 
-def _hf_torch_dtype_to_jnp(torch_dtype: str | None) -> Any:
-    # FIXME (f.srambical): find the ground-truth hf dtype strings and raise an error on others
-    """Map HuggingFace torch_dtype string to jnp.dtype. Defaults to bfloat16 for text."""
-    if torch_dtype is None:
-        return jnp.bfloat16
-    kind = (torch_dtype if isinstance(torch_dtype, str) else str(torch_dtype)).lower()
+def _required(mapping: dict[str, Any], key: str, where: str) -> Any:
+    if key not in mapping:
+        raise ValueError(f"Missing required key '{key}' in {where}.")
+    return mapping[key]
+
+
+def _hf_dtype_to_jnp(hf_dtype: str) -> Any:
+    """Map HuggingFace dtype string to jnp.dtype."""
+    kind = (hf_dtype if isinstance(hf_dtype, str) else str(hf_dtype)).lower()
     if "bfloat16" in kind or "bf16" in kind:
         return jnp.bfloat16
     if "float32" in kind or "fp32" in kind:
         return jnp.float32
     if "float16" in kind or "fp16" in kind:
         return jnp.float16
-    return jnp.bfloat16
+    raise ValueError(f"Unsupported dtype '{hf_dtype}'.")
 
 
 def make_vl_config_from_hf(hf_cfg: dict[str, Any]) -> Qwen3VLConfig:
     """Build a Qwen3VLConfig from a HuggingFace config.json dict."""
-    vis = hf_cfg["vision_config"]
-    txt = hf_cfg["text_config"]
-
-    rope_params = txt.get("rope_parameters") or txt.get("rope_scaling") or {}
-    torch_dtype = hf_cfg.get("torch_dtype")
-    text_dtype = _hf_torch_dtype_to_jnp(torch_dtype)
-    vision_dtype = (
-        _hf_torch_dtype_to_jnp(vis.get("torch_dtype"))
-        if vis.get("torch_dtype") is not None
-        else (text_dtype if torch_dtype is not None else jnp.float32)
-    )
+    vis = _required(hf_cfg, "vision_config", "hf_cfg")
+    txt = _required(hf_cfg, "text_config", "hf_cfg")
+    rope_theta = _required(txt, "rope_theta", "hf_cfg['text_config']")
+    rope_scaling = _required(txt, "rope_scaling", "hf_cfg['text_config']")
+    if not isinstance(rope_scaling, dict):
+        raise ValueError("Expected rope_scaling to be a dict in hf_cfg['text_config'].")
+    mrope_section = _required(rope_scaling, "mrope_section", "hf_cfg['text_config'].rope_scaling")
+    text_dtype = _hf_dtype_to_jnp(_required(txt, "dtype", "hf_cfg['text_config']"))
+    vision_dtype = _hf_dtype_to_jnp(vis["dtype"]) if vis.get("dtype") is not None else jnp.float32
+    is_moe = str(hf_cfg.get("model_type", "")).endswith("_moe")
 
     return Qwen3VLConfig(
         num_layers=txt["num_hidden_layers"],
@@ -283,17 +285,16 @@ def make_vl_config_from_hf(hf_cfg: dict[str, Any]) -> Qwen3VLConfig:
         num_heads=txt["num_attention_heads"],
         head_dim=txt["head_dim"],
         num_kv_heads=txt["num_key_value_heads"],
-        rope_theta=rope_params.get("rope_theta") or txt["rope_theta"],
+        rope_theta=rope_theta,
         norm_eps=txt["rms_norm_eps"],
-        tie_word_embeddings=hf_cfg["tie_word_embeddings"],
-        mrope_section=tuple(rope_params["mrope_section"]),
-        # MoE fields are absent in dense configs.
-        moe_intermediate_size=txt.get("moe_intermediate_size", 0),
-        num_experts=txt.get("num_experts") or txt.get("num_local_experts", 0),
-        num_experts_per_tok=txt.get("num_experts_per_tok", 0),
-        mlp_only_layers=tuple(txt.get("mlp_only_layers", ())),
-        decoder_sparse_step=txt.get("decoder_sparse_step", 1),
-        norm_topk_prob=txt.get("norm_topk_prob", True),
+        tie_word_embeddings=_required(hf_cfg, "tie_word_embeddings", "hf_cfg"),
+        mrope_section=tuple(mrope_section),
+        moe_intermediate_size=txt["moe_intermediate_size"] if is_moe else 0,
+        num_experts=txt["num_experts"] if is_moe else 0,
+        num_experts_per_tok=txt["num_experts_per_tok"] if is_moe else 0,
+        mlp_only_layers=tuple(txt["mlp_only_layers"]) if is_moe else (),
+        decoder_sparse_step=txt["decoder_sparse_step"] if is_moe else 1,
+        norm_topk_prob=txt["norm_topk_prob"] if is_moe else True,
         image_token_id=hf_cfg["image_token_id"],
         video_token_id=hf_cfg["video_token_id"],
         vision_start_token_id=hf_cfg["vision_start_token_id"],

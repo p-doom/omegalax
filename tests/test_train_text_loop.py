@@ -14,6 +14,32 @@ from omegalax.trainers import text as text_trainer  # noqa: E402
 
 
 class TrainLoopTest(absltest.TestCase):
+    def test_resume_requires_save_dir(self):
+        train_cfg = text_trainer.TrainConfig.smoke()
+        with self.assertRaisesRegex(ValueError, "resume=True requires save_dir"):
+            text_trainer.run_training(
+                "qwen3-smoke",
+                train_cfg,
+                resume=True,
+                log_every=0,
+                tp_size=1,
+                fsdp_size=1,
+            )
+
+    def test_resume_requires_existing_checkpoint(self):
+        train_cfg = text_trainer.TrainConfig.smoke()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with self.assertRaisesRegex(ValueError, "no checkpoints found"):
+                text_trainer.run_training(
+                    "qwen3-smoke",
+                    train_cfg,
+                    save_dir=Path(tmpdir),
+                    resume=True,
+                    log_every=0,
+                    tp_size=1,
+                    fsdp_size=1,
+                )
+
     def test_train_and_resume(self):
         train_cfg = text_trainer.TrainConfig(
             seed=0,

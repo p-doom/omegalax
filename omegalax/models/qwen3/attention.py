@@ -7,6 +7,8 @@ from .norms import RMSNorm
 from .rope import apply_rope, generate_pos_embeddings
 from .utils import compute_positions_from_segment_ids, count_left_pads
 
+wp = nnx.with_partitioning
+
 def _mask_value(dtype: jnp.dtype) -> float:
     return float(jnp.finfo(dtype).min)
 
@@ -15,21 +17,44 @@ class Attention(nnx.Module):
     def __init__(self, cfg, *, rngs: nnx.Rngs):
         self.shd_cfg = cfg.shd_cfg
         self.dtype = cfg.dtype
+        init_fn = nnx.initializers.lecun_normal()
+        qkv_init = wp(init_fn, ("embed", "heads"))
+        o_init = wp(init_fn, ("heads", "embed"))
         self.q_proj = nnx.Linear(
-            cfg.emb_dim, cfg.num_heads * cfg.head_dim, use_bias=False, rngs=rngs, dtype=cfg.dtype
+            cfg.emb_dim,
+            cfg.num_heads * cfg.head_dim,
+            use_bias=False,
+            rngs=rngs,
+            dtype=cfg.dtype,
+            kernel_init=qkv_init,
         )
         self.k_proj = nnx.Linear(
-            cfg.emb_dim, cfg.num_kv_heads * cfg.head_dim, use_bias=False, rngs=rngs, dtype=cfg.dtype
+            cfg.emb_dim,
+            cfg.num_kv_heads * cfg.head_dim,
+            use_bias=False,
+            rngs=rngs,
+            dtype=cfg.dtype,
+            kernel_init=qkv_init,
         )
         self.v_proj = nnx.Linear(
-            cfg.emb_dim, cfg.num_kv_heads * cfg.head_dim, use_bias=False, rngs=rngs, dtype=cfg.dtype
+            cfg.emb_dim,
+            cfg.num_kv_heads * cfg.head_dim,
+            use_bias=False,
+            rngs=rngs,
+            dtype=cfg.dtype,
+            kernel_init=qkv_init,
         )
         self.o_proj = nnx.Linear(
-            cfg.num_heads * cfg.head_dim, cfg.emb_dim, use_bias=False, rngs=rngs, dtype=cfg.dtype
+            cfg.num_heads * cfg.head_dim,
+            cfg.emb_dim,
+            use_bias=False,
+            rngs=rngs,
+            dtype=cfg.dtype,
+            kernel_init=o_init,
         )
 
-        self.q_norm = RMSNorm(cfg.head_dim, cfg.norm_eps, self.shd_cfg.rms_norm, rngs=rngs)
-        self.k_norm = RMSNorm(cfg.head_dim, cfg.norm_eps, self.shd_cfg.rms_norm, rngs=rngs)
+        self.q_norm = RMSNorm(cfg.head_dim, cfg.norm_eps, rngs=rngs, sharding=(None,))
+        self.k_norm = RMSNorm(cfg.head_dim, cfg.norm_eps, rngs=rngs, sharding=(None,))
         self.n_rep = cfg.num_heads // cfg.num_kv_heads
         self.scale = cfg.head_dim**-0.5
         self.head_dim = cfg.head_dim

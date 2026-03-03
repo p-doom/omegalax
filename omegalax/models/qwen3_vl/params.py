@@ -26,9 +26,50 @@ from .model import Qwen3VL
 __all__ = ["create_qwen3_vl_from_safetensors", "export_qwen3_vl_to_safetensors"]
 
 
+def _jnp_dtype_to_hf(dtype: Any) -> str:
+    kind = str(dtype).lower()
+    if "bfloat16" in kind:
+        return "bfloat16"
+    if "float16" in kind:
+        return "float16"
+    if "float32" in kind:
+        return "float32"
+    raise ValueError(f"Unsupported dtype for HF config export: {dtype!r}")
+
+
 def _make_hf_config_dict(cfg: Qwen3VLConfig) -> dict[str, Any]:
     model_type = "qwen3_vl_moe" if cfg.num_experts > 0 else "qwen3_vl"
     text_model_type = "qwen3_vl_moe_text" if cfg.num_experts > 0 else "qwen3_vl_text"
+    text_cfg = {
+        "dtype": _jnp_dtype_to_hf(cfg.dtype),
+        "vocab_size": cfg.vocab_size,
+        "hidden_size": cfg.emb_dim,
+        "intermediate_size": cfg.mlp_dim,
+        "num_hidden_layers": cfg.num_layers,
+        "num_attention_heads": cfg.num_heads,
+        "num_key_value_heads": cfg.num_kv_heads,
+        "head_dim": cfg.head_dim,
+        "rms_norm_eps": cfg.norm_eps,
+        "tie_word_embeddings": cfg.tie_word_embeddings,
+        "rope_theta": cfg.rope_theta,
+        "rope_scaling": {
+            "rope_type": "default",
+            "mrope_interleaved": True,
+            "mrope_section": list(cfg.mrope_section),
+        },
+        "model_type": text_model_type,
+    }
+    if cfg.num_experts > 0:
+        text_cfg.update(
+            {
+                "moe_intermediate_size": cfg.moe_intermediate_size,
+                "num_experts": cfg.num_experts,
+                "num_experts_per_tok": cfg.num_experts_per_tok,
+                "mlp_only_layers": list(cfg.mlp_only_layers),
+                "decoder_sparse_step": cfg.decoder_sparse_step,
+                "norm_topk_prob": cfg.norm_topk_prob,
+            }
+        )
     return {
         "model_type": model_type,
         "tie_word_embeddings": cfg.tie_word_embeddings,
@@ -50,28 +91,7 @@ def _make_hf_config_dict(cfg: Qwen3VLConfig) -> dict[str, Any]:
             "deepstack_visual_indexes": list(cfg.vision.deepstack_visual_indexes),
             "model_type": "qwen3_vl",
         },
-        "text_config": {
-            "vocab_size": cfg.vocab_size,
-            "hidden_size": cfg.emb_dim,
-            "intermediate_size": cfg.mlp_dim,
-            "num_hidden_layers": cfg.num_layers,
-            "num_attention_heads": cfg.num_heads,
-            "num_key_value_heads": cfg.num_kv_heads,
-            "head_dim": cfg.head_dim,
-            "rms_norm_eps": cfg.norm_eps,
-            "tie_word_embeddings": cfg.tie_word_embeddings,
-            "rope_parameters": {
-                "rope_theta": cfg.rope_theta,
-                "mrope_section": list(cfg.mrope_section),
-            },
-            "moe_intermediate_size": cfg.moe_intermediate_size,
-            "num_experts": cfg.num_experts,
-            "num_experts_per_tok": cfg.num_experts_per_tok,
-            "mlp_only_layers": list(cfg.mlp_only_layers),
-            "decoder_sparse_step": cfg.decoder_sparse_step,
-            "norm_topk_prob": cfg.norm_topk_prob,
-            "model_type": text_model_type,
-        },
+        "text_config": text_cfg,
     }
 
 

@@ -24,6 +24,17 @@ from .model import Qwen3_5ForConditionalGeneration
 __all__ = ["create_qwen3_5_from_safetensors", "export_qwen3_5_to_safetensors"]
 
 
+def _jnp_dtype_to_hf(dtype: Any) -> str:
+    kind = str(dtype).lower()
+    if "bfloat16" in kind:
+        return "bfloat16"
+    if "float16" in kind:
+        return "float16"
+    if "float32" in kind:
+        return "float32"
+    raise ValueError(f"Unsupported dtype for HF config export: {dtype!r}")
+
+
 def _make_hf_config_dict(cfg: Qwen3_5Config) -> dict[str, Any]:
     txt = cfg.text_config
     vis = cfg.vision_config
@@ -49,6 +60,7 @@ def _make_hf_config_dict(cfg: Qwen3_5Config) -> dict[str, Any]:
             "model_type": "qwen3_5_moe",
         },
         "text_config": {
+            "dtype": _jnp_dtype_to_hf(txt.dtype),
             "vocab_size": txt.vocab_size,
             "hidden_size": txt.hidden_size,
             "num_hidden_layers": txt.num_hidden_layers,

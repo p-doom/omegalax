@@ -55,6 +55,7 @@ class Qwen3VLMoeSmokeTest(absltest.TestCase):
             "model_type": "qwen3_vl_moe",
         }
         text_cfg = {
+            "dtype": "bfloat16",
             "vocab_size": 1024,
             "hidden_size": 128,
             "intermediate_size": 512,
@@ -94,8 +95,19 @@ class Qwen3VLMoeSmokeTest(absltest.TestCase):
         hf_model = Qwen3VLMoeForConditionalGeneration(hf_cfg).eval()
         hf_model.save_pretrained(cls.tmpdir, safe_serialization=True)
 
+        hf_cfg_dict = hf_cfg.to_dict()
+        text_cfg = hf_cfg_dict["text_config"]
+        rope_parameters = text_cfg.pop("rope_parameters")
+        text_cfg["dtype"] = text_cfg["dtype"] or "bfloat16"
+        text_cfg["rope_theta"] = rope_parameters["rope_theta"]
+        text_cfg["rope_scaling"] = {
+            "rope_type": rope_parameters.get("rope_type", "default"),
+            "mrope_interleaved": rope_parameters.get("mrope_interleaved", True),
+            "mrope_section": rope_parameters["mrope_section"],
+        }
+
         with open(cfg_path, "w") as f:
-            json.dump(hf_cfg.to_dict(), f)
+            json.dump(hf_cfg_dict, f)
 
         cls.jax_model, cls.jax_cfg = create_qwen3_vl_from_safetensors(
             cls.tmpdir,

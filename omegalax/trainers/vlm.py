@@ -14,7 +14,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec
 import optax
 import orbax.checkpoint as ocp
 
-from omegalax.distributed.mesh import ensure_mesh
+from omegalax.distributed.mesh import ensure_mesh, mesh_rules, required_batch_multiple
 from omegalax.trainers.perf import (
     per_device_flops_per_step,
     step_metrics,
@@ -173,10 +173,10 @@ def _restore_checkpoint(
     optimizer: nnx.ModelAndOptimizer,
     rng: jax.Array,
 ) -> tuple[nnx.ModelAndOptimizer, int, jax.Array]:
-    """Restore optimizer/model state and RNG key if a checkpoint exists."""
+    """Restore optimizer/model state and RNG key from latest checkpoint."""
     latest_step = checkpoint_manager.latest_step()
     if latest_step is None:
-        return optimizer, 0, rng
+        raise ValueError("No checkpoint found to restore.")
 
     abstract_state = _abstract_train_state(optimizer, rng)
     restore_args = ocp.args.Composite(train_state=ocp.args.PyTreeRestore(abstract_state))
@@ -205,7 +205,7 @@ def run_training(
     mesh = ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size)
     model_cfg = vlm_api.align_config_to_mesh(model_cfg, mesh)
     batch_spec = vlm_api.batch_partition_spec(model_cfg)
-    required_multiple = vlm_api.required_batch_multiple(model_cfg, mesh)
+    required_multiple = required_batch_multiple(batch_spec, mesh)
     if train_cfg.batch_size % max(1, required_multiple) != 0:
         raise ValueError(
             f"Global batch_size={train_cfg.batch_size} must be divisible by {required_multiple} "
@@ -234,7 +234,8 @@ def run_training(
         tp_size=tp_size,
         fsdp_size=fsdp_size,
     )
-    optimizer = build_optimizer(model, train_cfg)
+    with mesh_rules(mesh):
+        optimizer = build_optimizer(model, train_cfg)
     train_step = make_train_step(model_cfg, pad_id=pad_id)
 
     per_device_flops = per_device_flops_per_step(
@@ -246,6 +247,8 @@ def run_training(
     checkpoint_manager = None
     if save_dir is not None:
         save_dir = Path(save_dir).expanduser().resolve()
+        if resume and not save_dir.exists():
+            raise ValueError(f"resume=True requires an existing checkpoint directory: {save_dir}")
         save_dir.mkdir(parents=True, exist_ok=True)
         checkpoint_manager = _make_checkpoint_manager(save_dir, save_interval=save_every or None)
 
@@ -254,7 +257,11 @@ def run_training(
         log_path.parent.mkdir(parents=True, exist_ok=True)
 
     start_step = 0
-    if resume and checkpoint_manager is not None:
+    if resume:
+        if checkpoint_manager is None:
+            raise ValueError("resume=True requires save_dir to be provided.")
+        if checkpoint_manager.latest_step() is None:
+            raise ValueError(f"resume=True but no checkpoints found under: {save_dir}")
         optimizer, start_step, rng = _restore_checkpoint(checkpoint_manager, optimizer, rng)
         rng = jax.device_put(rng, replicated_rng_sharding)
 
@@ -274,6 +281,10 @@ def run_training(
             return
 
         host_metrics = {k: float(v) for k, v in metrics_to_log.items()}
+        required_metric_keys = ("loss", "grad_norm")
+        missing = [k for k in required_metric_keys if k not in host_metrics]
+        if missing:
+            raise KeyError(f"Missing required metrics for logging: {missing}")
         host_metrics["step"] = step_to_log
         perf = step_metrics(
             per_device_flops, step_delta, tokens_per_step, peak_tflops

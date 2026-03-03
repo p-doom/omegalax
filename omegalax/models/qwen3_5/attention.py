@@ -17,6 +17,7 @@ from .norms import RMSNorm
 from .rope import apply_text_rope
 
 P = PartitionSpec
+wp = nnx.with_partitioning
 
 
 def _mask_value(dtype: jnp.dtype) -> float:
@@ -30,13 +31,44 @@ class Attention(nnx.Module):
         nkv = cfg.num_key_value_heads
 
         self.shd_cfg = cfg.shd_cfg
-        self.q_proj = nnx.Linear(cfg.hidden_size, nh * hd * 2, use_bias=cfg.attention_bias, rngs=rngs, dtype=cfg.dtype)
-        self.k_proj = nnx.Linear(cfg.hidden_size, nkv * hd, use_bias=cfg.attention_bias, rngs=rngs, dtype=cfg.dtype)
-        self.v_proj = nnx.Linear(cfg.hidden_size, nkv * hd, use_bias=cfg.attention_bias, rngs=rngs, dtype=cfg.dtype)
-        self.o_proj = nnx.Linear(nh * hd, cfg.hidden_size, use_bias=cfg.attention_bias, rngs=rngs, dtype=cfg.dtype)
+        init_fn = nnx.initializers.lecun_normal()
+        qkv_init = wp(init_fn, ("embed", "heads"))
+        o_init = wp(init_fn, ("heads", "embed"))
+        self.q_proj = nnx.Linear(
+            cfg.hidden_size,
+            nh * hd * 2,
+            use_bias=cfg.attention_bias,
+            rngs=rngs,
+            dtype=cfg.dtype,
+            kernel_init=qkv_init,
+        )
+        self.k_proj = nnx.Linear(
+            cfg.hidden_size,
+            nkv * hd,
+            use_bias=cfg.attention_bias,
+            rngs=rngs,
+            dtype=cfg.dtype,
+            kernel_init=qkv_init,
+        )
+        self.v_proj = nnx.Linear(
+            cfg.hidden_size,
+            nkv * hd,
+            use_bias=cfg.attention_bias,
+            rngs=rngs,
+            dtype=cfg.dtype,
+            kernel_init=qkv_init,
+        )
+        self.o_proj = nnx.Linear(
+            nh * hd,
+            cfg.hidden_size,
+            use_bias=cfg.attention_bias,
+            rngs=rngs,
+            dtype=cfg.dtype,
+            kernel_init=o_init,
+        )
 
-        self.q_norm = RMSNorm(hd, cfg.rms_norm_eps, rngs=rngs)
-        self.k_norm = RMSNorm(hd, cfg.rms_norm_eps, rngs=rngs)
+        self.q_norm = RMSNorm(hd, cfg.rms_norm_eps, rngs=rngs, sharding=(None,))
+        self.k_norm = RMSNorm(hd, cfg.rms_norm_eps, rngs=rngs, sharding=(None,))
 
         self.num_heads = nh
         self.num_kv_heads = nkv

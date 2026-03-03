@@ -15,7 +15,9 @@ class SmokeTest(absltest.TestCase):
         self.train_cfg = text_trainer.TrainConfig.smoke()
         self.rng = jax.random.key(0)
         self.rng, init_rng = jax.random.split(self.rng)
-        self.model = text_trainer.init_model(self.model_cfg, init_rng, tp_size=1, fsdp_size=1)
+        self.model, self.model_cfg = text_trainer.init_model(
+            self.model_cfg, init_rng, tp_size=1, fsdp_size=1
+        )
 
     def _tokens(self, batch_size: int, seq_len: int) -> jax.Array:
         self.rng, rng = jax.random.split(self.rng)
@@ -45,7 +47,7 @@ class SmokeTest(absltest.TestCase):
 
     def test_moe_forward_smoke(self):
         moe_cfg = api.registry.build_config("qwen3-smoke-moe")
-        moe_model = text_trainer.init_model(moe_cfg, self.rng, tp_size=1, fsdp_size=1)
+        moe_model, moe_cfg = text_trainer.init_model(moe_cfg, self.rng, tp_size=1, fsdp_size=1)
         token_ids_BT = self._tokens(batch_size=2, seq_len=8)
         logits_BTV, aux_loss = api.forward(moe_model, token_ids_BT, pad_id=0, cfg=moe_cfg)
         self.assertEqual(logits_BTV.shape[:2], (2, 8))

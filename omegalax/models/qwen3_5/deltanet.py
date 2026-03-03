@@ -24,6 +24,7 @@ from .config import Qwen3_5TextConfig
 from .norms import RMSNormGated
 
 P = PartitionSpec
+wp = nnx.with_partitioning
 
 
 def _l2norm(x: jax.Array, axis: int = -1, eps: float = 1e-6) -> jax.Array:
@@ -175,18 +176,32 @@ class GatedDeltaNet(nnx.Module):
         self.gqa_factor = self.num_v_heads // self.num_k_heads
 
         conv_dim = self.key_dim * 2 + self.value_dim
+        init = nnx.initializers.lecun_normal()
 
-        self.in_proj_qkv = nnx.Linear(D, conv_dim, use_bias=False, rngs=rngs, dtype=cfg.dtype)
-        self.in_proj_z = nnx.Linear(D, self.value_dim, use_bias=False, rngs=rngs, dtype=cfg.dtype)
-        self.in_proj_b = nnx.Linear(D, self.num_v_heads, use_bias=False, rngs=rngs, dtype=cfg.dtype)
-        self.in_proj_a = nnx.Linear(D, self.num_v_heads, use_bias=False, rngs=rngs, dtype=cfg.dtype)
-
-        self.conv_weight = nnx.Param(
-            nnx.initializers.lecun_normal()(rngs.params(), (conv_dim, self.conv_kernel_size))
+        in_proj_init = wp(init, ("embed", "mlp"))
+        self.in_proj_qkv = nnx.Linear(
+            D, conv_dim, use_bias=False, rngs=rngs, dtype=cfg.dtype, kernel_init=in_proj_init
+        )
+        self.in_proj_z = nnx.Linear(
+            D, self.value_dim, use_bias=False, rngs=rngs, dtype=cfg.dtype, kernel_init=in_proj_init
+        )
+        self.in_proj_b = nnx.Linear(
+            D, self.num_v_heads, use_bias=False, rngs=rngs, dtype=cfg.dtype, kernel_init=in_proj_init
+        )
+        self.in_proj_a = nnx.Linear(
+            D, self.num_v_heads, use_bias=False, rngs=rngs, dtype=cfg.dtype, kernel_init=in_proj_init
         )
 
-        self.dt_bias = nnx.Param(jnp.ones(self.num_v_heads))
-        self.A_log = nnx.Param(jnp.log(jax.random.uniform(rngs.params(), (self.num_v_heads,)) * 16))
+        self.conv_weight = nnx.Param(
+            init(rngs.params(), (conv_dim, self.conv_kernel_size)),
+            sharding=(None, None),
+        )
+
+        self.dt_bias = nnx.Param(jnp.ones(self.num_v_heads), sharding=(None,))
+        self.A_log = nnx.Param(
+            jnp.log(jax.random.uniform(rngs.params(), (self.num_v_heads,)) * 16),
+            sharding=(None,),
+        )
 
         batch_axis = cfg.shd_cfg.act_btd[0]
         head_axis = cfg.shd_cfg.act_btnh[2]
@@ -199,8 +214,17 @@ class GatedDeltaNet(nnx.Module):
         self.hidden_shd = cfg.shd_cfg.act_btd
         self.scan_state_shd = P(batch_axis, head_axis, None, None)
         self.flat_norm_shd = P(flat_axis, None)
-        self.norm = RMSNormGated(self.head_v_dim, cfg.rms_norm_eps, rngs=rngs)
-        self.out_proj = nnx.Linear(self.value_dim, D, use_bias=False, rngs=rngs, dtype=cfg.dtype)
+        self.norm = RMSNormGated(
+            self.head_v_dim, cfg.rms_norm_eps, rngs=rngs, sharding=(None,)
+        )
+        self.out_proj = nnx.Linear(
+            self.value_dim,
+            D,
+            use_bias=False,
+            rngs=rngs,
+            dtype=cfg.dtype,
+            kernel_init=wp(init, ("mlp", "embed")),
+        )
 
     @jax.named_scope("gated_delta_net")
     def __call__(self, hidden_BTD: jax.Array, attention_mask_BT: jax.Array | None = None) -> jax.Array:

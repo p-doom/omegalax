@@ -8,14 +8,30 @@ from ..attention import Attention
 from ..config import Qwen3Config
 from ..norms import RMSNorm
 
+wp = nnx.with_partitioning
+
 
 class MLP(nnx.Module):
     def __init__(self, cfg: Qwen3Config, *, rngs: nnx.Rngs):
         self.shd_cfg = cfg.shd_cfg
-        linear = partial(nnx.Linear, use_bias=False, rngs=rngs, dtype=cfg.dtype)
-        self.gate_proj = linear(cfg.emb_dim, cfg.mlp_dim)
-        self.up_proj = linear(cfg.emb_dim, cfg.mlp_dim)
-        self.down_proj = linear(cfg.mlp_dim, cfg.emb_dim)
+        init_fn = nnx.initializers.lecun_normal()
+        col_parallel = partial(
+            nnx.Linear,
+            use_bias=False,
+            rngs=rngs,
+            dtype=cfg.dtype,
+            kernel_init=wp(init_fn, ("embed", "mlp")),
+        )
+        row_parallel = partial(
+            nnx.Linear,
+            use_bias=False,
+            rngs=rngs,
+            dtype=cfg.dtype,
+            kernel_init=wp(init_fn, ("mlp", "embed")),
+        )
+        self.gate_proj = col_parallel(cfg.emb_dim, cfg.mlp_dim)
+        self.up_proj = col_parallel(cfg.emb_dim, cfg.mlp_dim)
+        self.down_proj = row_parallel(cfg.mlp_dim, cfg.emb_dim)
 
     @jax.named_scope("feed_forward")
     def __call__(self, hidden_BTD: jax.Array) -> jax.Array:
@@ -28,9 +44,9 @@ class MLP(nnx.Module):
 
 class DecoderLayer(nnx.Module):
     def __init__(self, cfg: Qwen3Config, *, rngs: nnx.Rngs):
-        self.input_layernorm = RMSNorm(cfg.emb_dim, cfg.norm_eps, cfg.shd_cfg.rms_norm, rngs=rngs)
+        self.input_layernorm = RMSNorm(cfg.emb_dim, cfg.norm_eps, rngs=rngs)
         self.attn = Attention(cfg=cfg, rngs=rngs)
-        self.post_attention_layernorm = RMSNorm(cfg.emb_dim, cfg.norm_eps, cfg.shd_cfg.rms_norm, rngs=rngs)
+        self.post_attention_layernorm = RMSNorm(cfg.emb_dim, cfg.norm_eps, rngs=rngs)
         self.mlp = MLP(cfg=cfg, rngs=rngs)
 
     def __call__(self, hidden_BTD: jax.Array, cache, segment_ids_BT: jax.Array) -> jax.Array:
@@ -41,12 +57,27 @@ class DecoderLayer(nnx.Module):
 
 class Qwen3Dense(nnx.Module):
     def __init__(self, cfg: Qwen3Config, *, rngs: nnx.Rngs):
-        self.embedder = nnx.Embed(num_embeddings=cfg.vocab_size, features=cfg.emb_dim, dtype=cfg.dtype, rngs=rngs)
+        embed_init = nnx.initializers.normal(stddev=0.02)
+        self.embedder = nnx.Embed(
+            num_embeddings=cfg.vocab_size,
+            features=cfg.emb_dim,
+            dtype=cfg.dtype,
+            rngs=rngs,
+            embedding_init=wp(embed_init, ("vocab", "embed")),
+        )
         self.out_emb_shd = cfg.shd_cfg.act_btd
         self.logits_shd = P(cfg.shd_cfg.act_btd[0], None, None)
         self.layers = nnx.List([DecoderLayer(cfg=cfg, rngs=rngs) for _ in range(cfg.num_layers)])
-        self.final_norm = RMSNorm(cfg.emb_dim, cfg.norm_eps, cfg.shd_cfg.rms_norm, rngs=rngs)
-        self.lm_head = nnx.Linear(cfg.emb_dim, cfg.vocab_size, use_bias=False, rngs=rngs, dtype=cfg.dtype)
+        self.final_norm = RMSNorm(cfg.emb_dim, cfg.norm_eps, rngs=rngs)
+        lm_head_init = nnx.initializers.lecun_normal()
+        self.lm_head = nnx.Linear(
+            cfg.emb_dim,
+            cfg.vocab_size,
+            use_bias=False,
+            rngs=rngs,
+            dtype=cfg.dtype,
+            kernel_init=wp(lm_head_init, ("embed", "vocab")),
+        )
 
     def __call__(self, token_ids_BT, segment_ids_BT, cache, num_right_pads):
         del num_right_pads

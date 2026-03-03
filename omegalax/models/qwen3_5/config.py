@@ -154,29 +154,33 @@ def make_config(model_id: str) -> Qwen3_5Config:
     )
 
 
-def _hf_torch_dtype_to_jnp(torch_dtype: str | None) -> Any:
-    # FIXME (f.srambical): find the ground-truth hf dtype strings and raise an error on others
-    """Map HuggingFace torch_dtype string to jnp.dtype. Defaults to bfloat16 for text."""
-    if torch_dtype is None:
-        return jnp.bfloat16
-    kind = (torch_dtype if isinstance(torch_dtype, str) else str(torch_dtype)).lower()
+def _required(mapping: dict[str, Any], key: str, where: str) -> Any:
+    if key not in mapping:
+        raise ValueError(f"Missing required key '{key}' in {where}.")
+    return mapping[key]
+
+
+def _hf_dtype_to_jnp(hf_dtype: str) -> Any:
+    """Map HuggingFace dtype string to jnp.dtype."""
+    kind = (hf_dtype if isinstance(hf_dtype, str) else str(hf_dtype)).lower()
     if "bfloat16" in kind or "bf16" in kind:
         return jnp.bfloat16
     if "float32" in kind or "fp32" in kind:
         return jnp.float32
     if "float16" in kind or "fp16" in kind:
         return jnp.float16
-    return jnp.bfloat16
+    raise ValueError(f"Unsupported dtype '{hf_dtype}'.")
 
 
 def make_config_from_hf(hf_cfg: dict[str, Any]) -> Qwen3_5Config:
     """Build a Qwen3_5Config from a HuggingFace config.json dict."""
-    vis = hf_cfg["vision_config"]
-    txt = hf_cfg["text_config"]
-    rope_params = txt.get("rope_parameters") or txt.get("rope_scaling") or {}
-    torch_dtype = hf_cfg.get("torch_dtype")
-    text_dtype = _hf_torch_dtype_to_jnp(torch_dtype)
-    vision_dtype = _hf_torch_dtype_to_jnp(vis.get("torch_dtype")) if vis.get("torch_dtype") is not None else (text_dtype if torch_dtype is not None else jnp.float32)
+    vis = _required(hf_cfg, "vision_config", "hf_cfg")
+    txt = _required(hf_cfg, "text_config", "hf_cfg")
+    rope_params = _required(txt, "rope_parameters", "hf_cfg['text_config']")
+    if not isinstance(rope_params, dict):
+        raise ValueError("Expected rope_parameters to be a dict in hf_cfg['text_config'].")
+    text_dtype = _hf_dtype_to_jnp(_required(txt, "dtype", "hf_cfg['text_config']"))
+    vision_dtype = _hf_dtype_to_jnp(vis["dtype"]) if vis.get("dtype") is not None else jnp.float32
 
     return Qwen3_5Config(
         vision_config=Qwen3_5VisionConfig(
@@ -201,7 +205,7 @@ def make_config_from_hf(hf_cfg: dict[str, Any]) -> Qwen3_5Config:
             head_dim=txt["head_dim"],
             rms_norm_eps=txt["rms_norm_eps"],
             layer_types=tuple(txt["layer_types"]),
-            rope_theta=rope_params.get("rope_theta") or txt["rope_theta"],
+            rope_theta=_required(rope_params, "rope_theta", "hf_cfg['text_config'].rope_parameters"),
             partial_rotary_factor=rope_params["partial_rotary_factor"],
             mrope_section=tuple(rope_params["mrope_section"]),
             mrope_interleaved=rope_params["mrope_interleaved"],
@@ -214,7 +218,7 @@ def make_config_from_hf(hf_cfg: dict[str, Any]) -> Qwen3_5Config:
             linear_value_head_dim=txt["linear_value_head_dim"],
             moe_intermediate_size=txt["moe_intermediate_size"],
             shared_expert_intermediate_size=txt["shared_expert_intermediate_size"],
-            num_experts=txt.get("num_experts") or txt.get("num_local_experts"),
+            num_experts=txt["num_experts"],
             num_experts_per_tok=txt["num_experts_per_tok"],
             router_aux_loss_coef=txt["router_aux_loss_coef"],
             dtype=text_dtype,
