@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import Union
 
 import jax
 import jax.numpy as jnp
 from flax import nnx
 from jax.sharding import Mesh, PartitionSpec
 
-from omegalax.distributed.mesh import ensure_mesh, required_batch_multiple as mesh_required_batch_multiple
+from omegalax.distributed.mesh import ensure_mesh
 from omegalax.models.shard_config import axis_rules_for_mesh, shard_config_for_mesh
 from omegalax.models.sharding_runtime import (
     batch_partition_spec as runtime_batch_partition_spec,
@@ -30,10 +29,8 @@ from omegalax.models.qwen3_5.config import (
 )
 from omegalax.models.qwen3_5.model import Qwen3_5ForCausalLM
 
-P = PartitionSpec
-
 ModelConfig = qwen3_registry.Qwen3Config
-TextConfig = Union[ModelConfig, Qwen3_5TextConfig]
+TextConfig = ModelConfig | Qwen3_5TextConfig
 registry = qwen3_registry
 
 list_qwen3_dense_model_ids = qwen3_registry.list_qwen3_dense_model_ids
@@ -60,26 +57,21 @@ def resolve_config(model_or_id: str | TextConfig) -> TextConfig:
 
 def align_config_to_mesh(cfg: TextConfig, mesh: Mesh) -> TextConfig:
     """Drop singleton mesh axes from sharding specs to avoid degenerate constraints."""
-    if isinstance(cfg, qwen3_registry.Qwen3Config) or isinstance(cfg, Qwen3_5TextConfig):
+    if isinstance(cfg, (qwen3_registry.Qwen3Config, Qwen3_5TextConfig)):
         return dataclasses.replace(cfg, shd_cfg=shard_config_for_mesh(cfg.shd_cfg, mesh))
     raise TypeError(f"Unsupported text config type: {type(cfg)}")
 
 
 def batch_partition_spec(cfg: TextConfig) -> PartitionSpec:
     """Return the token batch partition spec for a text config."""
-    if isinstance(cfg, qwen3_registry.Qwen3Config) or isinstance(cfg, Qwen3_5TextConfig):
+    if isinstance(cfg, (qwen3_registry.Qwen3Config, Qwen3_5TextConfig)):
         return runtime_batch_partition_spec(cfg.shd_cfg)
     raise TypeError(f"Unsupported text config type: {type(cfg)}")
 
 
-def required_batch_multiple(cfg: TextConfig, mesh: Mesh) -> int:
-    """Global batch size must be divisible by this multiple for input sharding."""
-    return mesh_required_batch_multiple(batch_partition_spec(cfg), mesh)
-
-
 def shard_batch(token_ids_BT: jax.Array, cfg: TextConfig, mesh: Mesh) -> jax.Array:
     """Shard a token batch for model families that implement input sharding."""
-    if isinstance(cfg, qwen3_registry.Qwen3Config) or isinstance(cfg, Qwen3_5TextConfig):
+    if isinstance(cfg, (qwen3_registry.Qwen3Config, Qwen3_5TextConfig)):
         return runtime_shard_batch(token_ids_BT, cfg.shd_cfg, mesh)
     raise TypeError(f"Unsupported text config type: {type(cfg)}")
 

@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import Union
 
 import jax
 import jax.numpy as jnp
 from flax import nnx
 from jax.sharding import Mesh, PartitionSpec
 
-from omegalax.distributed.mesh import ensure_mesh, required_batch_multiple as mesh_required_batch_multiple
+from omegalax.distributed.mesh import ensure_mesh
 from omegalax.models.shard_config import axis_rules_for_mesh, shard_config_for_mesh
 from omegalax.models.sharding_runtime import (
     batch_partition_spec as runtime_batch_partition_spec,
@@ -28,16 +27,7 @@ from omegalax.models.qwen3_5 import make_config as make_qwen3_5_config
 from omegalax.models.qwen3_5.config import is_supported_qwen3_5_model_id, list_supported_qwen3_5_model_ids
 from omegalax.models.qwen3_5.model import Qwen3_5ForConditionalGeneration
 
-VLMConfig = Union[Qwen3_5Config, Qwen3VLConfig]
-P = PartitionSpec
-
-
-def _is_qwen3_vl(model: nnx.Module) -> bool:
-    return isinstance(model, Qwen3VL)
-
-
-def _is_qwen3_5_vlm(model: nnx.Module) -> bool:
-    return isinstance(model, Qwen3_5ForConditionalGeneration)
+VLMConfig = Qwen3_5Config | Qwen3VLConfig
 
 
 def resolve_config(model_or_id: str | VLMConfig) -> VLMConfig:
@@ -79,10 +69,6 @@ def batch_partition_spec(cfg: VLMConfig) -> PartitionSpec:
     if isinstance(cfg, Qwen3VLConfig):
         return runtime_batch_partition_spec(cfg.shd_cfg)
     raise TypeError(f"Unsupported VLM config type: {type(cfg)}")
-
-
-def required_batch_multiple(cfg: VLMConfig, mesh: Mesh) -> int:
-    return mesh_required_batch_multiple(batch_partition_spec(cfg), mesh)
 
 
 def shard_batch(token_ids_BT: jax.Array, cfg: VLMConfig, mesh: Mesh) -> jax.Array:
@@ -138,7 +124,7 @@ def forward(
     if attention_mask_BT is None:
         attention_mask_BT = (token_ids_BT != pad_id).astype(jnp.int32)
 
-    if _is_qwen3_5_vlm(model):
+    if isinstance(model, Qwen3_5ForConditionalGeneration):
         segment_ids_BT = attention_mask_BT.astype(jnp.int32)
         logits_BTV, aux_loss = model(
             token_ids_BT,
@@ -151,7 +137,7 @@ def forward(
         )
         return logits_BTV, aux_loss
 
-    if _is_qwen3_vl(model):
+    if isinstance(model, Qwen3VL):
         outputs = model(
             token_ids_BT,
             attention_mask_BT,

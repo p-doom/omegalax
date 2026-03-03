@@ -9,7 +9,7 @@ from functools import partial
 
 import jax
 import jax.numpy as jnp
-from jax.sharding import PartitionSpec as P
+from jax.sharding import PartitionSpec as P, reshard
 from flax import nnx
 
 from omegalax.models.shard_config import ShardConfig
@@ -23,7 +23,7 @@ wp = nnx.with_partitioning
 class VisionPatchEmbed(nnx.Module):
     """3-D Conv patch embedding (temporal, H, W)."""
 
-    def __init__(self, cfg: Qwen3_5VisionConfig, *, rngs: nnx.Rngs):
+    def __init__(self, cfg: Qwen3_5VisionConfig, hidden_shd: P, *, rngs: nnx.Rngs):
         k = (cfg.temporal_patch_size, cfg.patch_size, cfg.patch_size)
         conv_init = nnx.initializers.lecun_normal()
         self.proj = nnx.Conv(
@@ -39,6 +39,7 @@ class VisionPatchEmbed(nnx.Module):
         self.temporal_patch_size = cfg.temporal_patch_size
         self.patch_size = cfg.patch_size
         self.embed_dim = cfg.hidden_size
+        self.hidden_shd = hidden_shd
 
     @jax.named_scope("vision_patch_embed")
     def __call__(self, pixels: jax.Array) -> jax.Array:
@@ -48,11 +49,11 @@ class VisionPatchEmbed(nnx.Module):
         """
         patches = pixels.reshape(-1, self.temporal_patch_size, self.patch_size, self.patch_size, self.in_channels)
         embedded = self.proj(patches)
-        return embedded.reshape(-1, self.embed_dim)
+        return reshard(embedded.reshape(-1, self.embed_dim), self.hidden_shd)
 
 
 class VisionMLP(nnx.Module):
-    def __init__(self, cfg: Qwen3_5VisionConfig, *, rngs: nnx.Rngs):
+    def __init__(self, cfg: Qwen3_5VisionConfig, hidden_shd: P, ff_shd: P, *, rngs: nnx.Rngs):
         init = nnx.initializers.lecun_normal()
         self.fc1 = nnx.Linear(
             cfg.hidden_size,
@@ -70,14 +71,19 @@ class VisionMLP(nnx.Module):
             dtype=cfg.dtype,
             kernel_init=wp(init, ("hidden", None)),
         )
+        self.hidden_shd = hidden_shd
+        self.ff_shd = ff_shd
 
     @jax.named_scope("vision_mlp")
     def __call__(self, hidden_ND: jax.Array) -> jax.Array:
-        return self.fc2(nnx.gelu(self.fc1(hidden_ND), approximate=True))
+        ff_NF = self.fc1(hidden_ND, out_sharding=self.ff_shd)
+        ff_NF = reshard(nnx.gelu(ff_NF, approximate=True), self.ff_shd)
+        out_ND = self.fc2(ff_NF, out_sharding=self.hidden_shd)
+        return reshard(out_ND, self.hidden_shd)
 
 
 class VisionAttention(nnx.Module):
-    def __init__(self, cfg: Qwen3_5VisionConfig, *, rngs: nnx.Rngs):
+    def __init__(self, cfg: Qwen3_5VisionConfig, hidden_shd: P, heads_shd: P, *, rngs: nnx.Rngs):
         self.num_heads = cfg.num_heads
         self.head_dim = cfg.hidden_size // cfg.num_heads
         self.scale = self.head_dim ** -0.5
@@ -91,6 +97,8 @@ class VisionAttention(nnx.Module):
             dtype=cfg.dtype,
             kernel_init=qkv_init,
         )
+        self.hidden_shd = hidden_shd
+        self.heads_shd = heads_shd
         self.proj = nnx.Linear(
             cfg.hidden_size,
             cfg.hidden_size,
@@ -108,14 +116,17 @@ class VisionAttention(nnx.Module):
         cos_NK: jax.Array,
         sin_NK: jax.Array,
     ) -> jax.Array:
+        hidden_ND = reshard(hidden_ND, self.hidden_shd)
         N = hidden_ND.shape[0]
-        qkv = self.qkv(hidden_ND).reshape(N, 3, self.num_heads, self.head_dim)
-        q_NHK, k_NHK, v_NHK = qkv[:, 0], qkv[:, 1], qkv[:, 2]
+        qkv = self.qkv(hidden_ND, out_sharding=self.hidden_shd).reshape(N, 3, self.num_heads, self.head_dim)
+        q_NHK = reshard(qkv[:, 0], self.heads_shd)
+        k_NHK = reshard(qkv[:, 1], self.heads_shd)
+        v_NHK = reshard(qkv[:, 2], self.heads_shd)
 
         q_NHK, k_NHK = apply_vision_rope(q_NHK, k_NHK, cos_NK, sin_NK)
 
         num_seqs = cu_seqlens.shape[0] - 1
-        outputs_ND = jnp.zeros_like(q_NHK.reshape(N, -1))
+        outputs_ND = reshard(jnp.zeros_like(q_NHK.reshape(N, -1)), self.hidden_shd)
 
         def _attn_chunk(start, end):
             q_i = q_NHK[start:end]
@@ -136,24 +147,27 @@ class VisionAttention(nnx.Module):
             return jax.lax.dynamic_update_slice(out, chunk_out, (start, 0))
 
         outputs_ND = jax.lax.fori_loop(0, num_seqs, body_fn, outputs_ND)
-        return self.proj(outputs_ND)
+        out_ND = self.proj(outputs_ND, out_sharding=self.hidden_shd)
+        return reshard(out_ND, self.hidden_shd)
 
 
 class VisionBlock(nnx.Module):
-    def __init__(self, cfg: Qwen3_5VisionConfig, *, rngs: nnx.Rngs):
+    def __init__(self, cfg: Qwen3_5VisionConfig, hidden_shd: P, ff_shd: P, heads_shd: P, *, rngs: nnx.Rngs):
         self.norm1 = LayerNorm(cfg.hidden_size, 1e-6, rngs=rngs)
         self.norm2 = LayerNorm(cfg.hidden_size, 1e-6, rngs=rngs)
-        self.attn = VisionAttention(cfg, rngs=rngs)
-        self.mlp = VisionMLP(cfg, rngs=rngs)
+        self.attn = VisionAttention(cfg, hidden_shd=hidden_shd, heads_shd=heads_shd, rngs=rngs)
+        self.mlp = VisionMLP(cfg, hidden_shd=hidden_shd, ff_shd=ff_shd, rngs=rngs)
+        self.hidden_shd = hidden_shd
 
     def __call__(self, hidden_ND, cu_seqlens, cos_NK, sin_NK):
-        hidden_ND = hidden_ND + self.attn(self.norm1(hidden_ND), cu_seqlens, cos_NK, sin_NK)
-        hidden_ND = hidden_ND + self.mlp(self.norm2(hidden_ND))
+        hidden_ND = reshard(hidden_ND, self.hidden_shd)
+        hidden_ND = reshard(hidden_ND + self.attn(self.norm1(hidden_ND), cu_seqlens, cos_NK, sin_NK), self.hidden_shd)
+        hidden_ND = reshard(hidden_ND + self.mlp(self.norm2(hidden_ND)), self.hidden_shd)
         return hidden_ND
 
 
 class VisionPatchMerger(nnx.Module):
-    def __init__(self, cfg: Qwen3_5VisionConfig, *, rngs: nnx.Rngs):
+    def __init__(self, cfg: Qwen3_5VisionConfig, hidden_shd: P, ff_shd: P, *, rngs: nnx.Rngs):
         merged_dim = cfg.hidden_size * (cfg.spatial_merge_size ** 2)
         self.norm = LayerNorm(cfg.hidden_size, 1e-6, rngs=rngs)
         init = nnx.initializers.lecun_normal()
@@ -173,13 +187,19 @@ class VisionPatchMerger(nnx.Module):
             dtype=cfg.dtype,
             kernel_init=wp(init, (None, "hidden")),
         )
+        self.hidden_shd = hidden_shd
+        self.ff_shd = ff_shd
 
     @jax.named_scope("vision_merger")
     def __call__(self, hidden_ND: jax.Array, merge_size: int) -> jax.Array:
+        hidden_ND = reshard(hidden_ND, self.hidden_shd)
         merged_dim = hidden_ND.shape[-1] * merge_size * merge_size
         normed = self.norm(hidden_ND)
         normed = normed.reshape(-1, merged_dim)
-        return self.fc2(nnx.gelu(self.fc1(normed), approximate=True))
+        ff_NF = self.fc1(normed, out_sharding=self.ff_shd)
+        ff_NF = reshard(nnx.gelu(ff_NF, approximate=True), self.ff_shd)
+        out_ND = self.fc2(ff_NF, out_sharding=self.hidden_shd)
+        return reshard(out_ND, self.hidden_shd)
 
 
 class VisionModel(nnx.Module):
@@ -187,7 +207,10 @@ class VisionModel(nnx.Module):
 
     def __init__(self, cfg: Qwen3_5VisionConfig, shd_cfg: ShardConfig, *, rngs: nnx.Rngs):
         self.cfg = cfg
-        self.patch_embed = VisionPatchEmbed(cfg, rngs=rngs)
+        self.hidden_shd = P(shd_cfg.act_btd[0], shd_cfg.act_btd[2])
+        self.ff_shd = P(shd_cfg.act_btd[0], shd_cfg.act_btf[2])
+        self.heads_shd = P(shd_cfg.act_btd[0], shd_cfg.act_btnh[2], None)
+        self.patch_embed = VisionPatchEmbed(cfg, hidden_shd=self.hidden_shd, rngs=rngs)
         pos_init = nnx.initializers.normal(stddev=0.02)
         self.pos_embed = nnx.Embed(
             num_embeddings=cfg.num_position_embeddings,
@@ -199,8 +222,10 @@ class VisionModel(nnx.Module):
         self.num_grid_per_side = int(cfg.num_position_embeddings ** 0.5)
         head_dim = cfg.hidden_size // cfg.num_heads
         self.rotary_half_dim = head_dim // 2
-        self.blocks = nnx.List([VisionBlock(cfg, rngs=rngs) for _ in range(cfg.depth)])
-        self.merger = VisionPatchMerger(cfg, rngs=rngs)
+        self.blocks = nnx.List(
+            [VisionBlock(cfg, hidden_shd=self.hidden_shd, ff_shd=self.ff_shd, heads_shd=self.heads_shd, rngs=rngs) for _ in range(cfg.depth)]
+        )
+        self.merger = VisionPatchMerger(cfg, hidden_shd=self.hidden_shd, ff_shd=self.ff_shd, rngs=rngs)
 
     def _rot_pos_emb(self, grid_thw: jax.Array) -> jax.Array:
         """Build per-token 2-D rotary embeddings from grid info."""
@@ -280,7 +305,7 @@ class VisionModel(nnx.Module):
     def __call__(self, pixel_values: jax.Array, grid_thw: jax.Array) -> jax.Array:
         hidden_ND = self.patch_embed(pixel_values)
         pos_embeds_ND = self._fast_pos_embed_interpolate(grid_thw)
-        hidden_ND = hidden_ND + pos_embeds_ND
+        hidden_ND = reshard(hidden_ND + pos_embeds_ND, self.hidden_shd)
 
         rotary_emb_NK = self._rot_pos_emb(grid_thw)
         emb_NK = jnp.concatenate([rotary_emb_NK, rotary_emb_NK], axis=-1)

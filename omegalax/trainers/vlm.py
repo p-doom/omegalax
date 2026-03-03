@@ -14,7 +14,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec
 import optax
 import orbax.checkpoint as ocp
 
-from omegalax.distributed.mesh import ensure_mesh
+from omegalax.distributed.mesh import ensure_mesh, mesh_rules, required_batch_multiple
 from omegalax.trainers.perf import (
     per_device_flops_per_step,
     step_metrics,
@@ -205,7 +205,7 @@ def run_training(
     mesh = ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size)
     model_cfg = vlm_api.align_config_to_mesh(model_cfg, mesh)
     batch_spec = vlm_api.batch_partition_spec(model_cfg)
-    required_multiple = vlm_api.required_batch_multiple(model_cfg, mesh)
+    required_multiple = required_batch_multiple(batch_spec, mesh)
     if train_cfg.batch_size % max(1, required_multiple) != 0:
         raise ValueError(
             f"Global batch_size={train_cfg.batch_size} must be divisible by {required_multiple} "
@@ -234,7 +234,8 @@ def run_training(
         tp_size=tp_size,
         fsdp_size=fsdp_size,
     )
-    optimizer = build_optimizer(model, train_cfg)
+    with mesh_rules(mesh):
+        optimizer = build_optimizer(model, train_cfg)
     train_step = make_train_step(model_cfg, pad_id=pad_id)
 
     per_device_flops = per_device_flops_per_step(

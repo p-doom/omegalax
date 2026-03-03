@@ -46,7 +46,9 @@ def _assert_moe_config(cfg: Qwen3MoeConfig, hf_cfg: dict[str, Any]):
     _require("emb_dim", cfg.emb_dim, hf_cfg["hidden_size"])
     _require("num_heads", cfg.num_heads, hf_cfg["num_attention_heads"])
     _require("num_kv_heads", cfg.num_kv_heads, hf_cfg["num_key_value_heads"])
-    num_experts = hf_cfg["num_experts"]
+    num_experts = hf_cfg.get("num_experts", hf_cfg.get("num_local_experts"))
+    if num_experts is None:
+        raise ValueError("Missing 'num_experts' (or alias 'num_local_experts') in HF config")
     _require("num_experts", cfg.num_experts, num_experts)
     _require("num_experts_per_tok", cfg.num_experts_per_tok, hf_cfg["num_experts_per_tok"])
     _require("moe_intermediate_size", cfg.moe_intermediate_size, hf_cfg["moe_intermediate_size"])
@@ -157,9 +159,14 @@ def _make_hf_config_dict(cfg: Qwen3MoeConfig) -> dict[str, Any]:
         "num_key_value_heads": cfg.num_kv_heads,
         "head_dim": cfg.head_dim,
         "intermediate_size": cfg.mlp_dim,
+        "rope_parameters": {
+            "rope_theta": cfg.rope_theta,
+            "rope_type": "default",
+        },
         "rope_theta": cfg.rope_theta,
         "tie_word_embeddings": cfg.tie_word_embeddings,
         "num_experts": cfg.num_experts,
+        "num_local_experts": cfg.num_experts,
         "num_experts_per_tok": cfg.num_experts_per_tok,
         "moe_intermediate_size": cfg.moe_intermediate_size,
         "norm_topk_prob": cfg.norm_topk_prob,

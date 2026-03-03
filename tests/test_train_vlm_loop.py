@@ -10,6 +10,7 @@ os.environ.setdefault("JAX_PLATFORMS", "cpu")
 from absl.testing import absltest  # noqa: E402
 import jax  # noqa: E402
 
+from omegalax.distributed.mesh import ensure_mesh, mesh_rules  # noqa: E402
 from omegalax.trainers import vlm as vlm_trainer  # noqa: E402
 
 
@@ -172,7 +173,9 @@ class TrainVLMTest(absltest.TestCase):
     def test_abstract_train_state_preserves_sharding_metadata(self):
         rng = jax.random.key(0)
         model = vlm_trainer.init_model("qwen3-vl-smoke", rng, tp_size=1, fsdp_size=1)
-        optimizer = vlm_trainer.build_optimizer(model, vlm_trainer.TrainConfig.smoke())
+        mesh = ensure_mesh(tp_size=1, fsdp_size=1)
+        with mesh_rules(mesh):
+            optimizer = vlm_trainer.build_optimizer(model, vlm_trainer.TrainConfig.smoke())
 
         abstract_state = vlm_trainer._abstract_train_state(optimizer, rng)  # type: ignore
         self.assertIsNotNone(getattr(abstract_state["rng"], "sharding", None))

@@ -160,16 +160,16 @@ def _required(mapping: dict[str, Any], key: str, where: str) -> Any:
     return mapping[key]
 
 
-def _hf_torch_dtype_to_jnp(torch_dtype: str) -> Any:
-    """Map HuggingFace torch_dtype string to jnp.dtype."""
-    kind = (torch_dtype if isinstance(torch_dtype, str) else str(torch_dtype)).lower()
+def _hf_dtype_to_jnp(hf_dtype: str) -> Any:
+    """Map HuggingFace dtype string to jnp.dtype."""
+    kind = (hf_dtype if isinstance(hf_dtype, str) else str(hf_dtype)).lower()
     if "bfloat16" in kind or "bf16" in kind:
         return jnp.bfloat16
     if "float32" in kind or "fp32" in kind:
         return jnp.float32
     if "float16" in kind or "fp16" in kind:
         return jnp.float16
-    raise ValueError(f"Unsupported torch_dtype '{torch_dtype}'.")
+    raise ValueError(f"Unsupported dtype '{hf_dtype}'.")
 
 
 def make_config_from_hf(hf_cfg: dict[str, Any]) -> Qwen3_5Config:
@@ -179,9 +179,8 @@ def make_config_from_hf(hf_cfg: dict[str, Any]) -> Qwen3_5Config:
     rope_params = _required(txt, "rope_parameters", "hf_cfg['text_config']")
     if not isinstance(rope_params, dict):
         raise ValueError("Expected rope_parameters to be a dict in hf_cfg['text_config'].")
-    torch_dtype = _required(hf_cfg, "torch_dtype", "hf_cfg")
-    text_dtype = _hf_torch_dtype_to_jnp(torch_dtype)
-    vision_dtype = _hf_torch_dtype_to_jnp(_required(vis, "torch_dtype", "hf_cfg['vision_config']"))
+    text_dtype = _hf_dtype_to_jnp(_required(txt, "dtype", "hf_cfg['text_config']"))
+    vision_dtype = _hf_dtype_to_jnp(vis["dtype"]) if vis.get("dtype") is not None else jnp.float32
 
     return Qwen3_5Config(
         vision_config=Qwen3_5VisionConfig(

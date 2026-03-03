@@ -31,7 +31,7 @@ from .model import Qwen3VL
 def _assert_vl_config(cfg: Qwen3VLConfig, hf_cfg: dict):
     txt = hf_cfg["text_config"]
     vis = hf_cfg["vision_config"]
-    rope_params = txt["rope_parameters"]
+    rope_scaling = txt["rope_scaling"]
 
     def _require(name, lhs, rhs):
         if lhs != rhs:
@@ -44,16 +44,16 @@ def _assert_vl_config(cfg: Qwen3VLConfig, hf_cfg: dict):
     _require("num_kv_heads", cfg.num_kv_heads, txt["num_key_value_heads"])
     _require("head_dim", cfg.head_dim, txt["head_dim"])
     _require("mlp_dim", cfg.mlp_dim, txt["intermediate_size"])
-    _require("rope_theta", cfg.rope_theta, rope_params["rope_theta"])
-    _require("mrope_section", tuple(cfg.mrope_section), tuple(rope_params["mrope_section"]))
+    _require("rope_theta", cfg.rope_theta, txt["rope_theta"])
+    _require("mrope_section", tuple(cfg.mrope_section), tuple(rope_scaling["mrope_section"]))
 
-    num_experts = txt["num_experts"]
-    _require("num_experts", cfg.num_experts, num_experts)
-    _require("num_experts_per_tok", cfg.num_experts_per_tok, txt["num_experts_per_tok"])
-    _require("moe_intermediate_size", cfg.moe_intermediate_size, txt["moe_intermediate_size"])
-    _require("mlp_only_layers", tuple(cfg.mlp_only_layers), tuple(txt["mlp_only_layers"]))
-    _require("decoder_sparse_step", cfg.decoder_sparse_step, txt["decoder_sparse_step"])
-    _require("norm_topk_prob", cfg.norm_topk_prob, txt["norm_topk_prob"])
+    if cfg.num_experts > 0:
+        _require("num_experts", cfg.num_experts, txt["num_experts"])
+        _require("num_experts_per_tok", cfg.num_experts_per_tok, txt["num_experts_per_tok"])
+        _require("moe_intermediate_size", cfg.moe_intermediate_size, txt["moe_intermediate_size"])
+        _require("mlp_only_layers", tuple(cfg.mlp_only_layers), tuple(txt["mlp_only_layers"]))
+        _require("decoder_sparse_step", cfg.decoder_sparse_step, txt["decoder_sparse_step"])
+        _require("norm_topk_prob", cfg.norm_topk_prob, txt["norm_topk_prob"])
 
     _require("vision.hidden_size", cfg.vision.hidden_size, vis["hidden_size"])
     _require("vision.intermediate_size", cfg.vision.intermediate_size, vis["intermediate_size"])
