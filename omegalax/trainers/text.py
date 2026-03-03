@@ -11,6 +11,7 @@ from flax import nnx
 import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
+import numpy as np
 import optax
 import orbax.checkpoint as ocp
 
@@ -130,9 +131,16 @@ def make_train_step(
 
 def make_synthetic_batch(
     rng: jax.Array, batch_size: int, seq_len: int, vocab_size: int, pad_id: int = 0
-) -> jax.Array:
-    """Random token batch generator used for smoke training."""
-    return jax.random.randint(rng, (batch_size, seq_len), minval=pad_id, maxval=vocab_size, dtype=jnp.int32)
+) -> np.ndarray:
+    """Random token batch generator used for smoke training.
+
+    Returns a numpy array so the result is always process-local, which
+    is required by ``jax.make_array_from_process_local_data`` in
+    multi-process setups.
+    """
+    return np.asarray(
+        jax.random.randint(rng, (batch_size, seq_len), minval=pad_id, maxval=vocab_size, dtype=jnp.int32)
+    )
 
 
 def _train_state(optimizer_state: nnx.State, rng: jax.Array) -> dict[str, object]:
