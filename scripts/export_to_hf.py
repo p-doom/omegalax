@@ -75,7 +75,7 @@ def _load_vlm_model(args):
 
 
 def load_model(args):
-    arch = registry.resolve(args.model_id).arch
+    arch = registry.resolve(args.model_id)
     if arch == registry.Arch.TEXT:
         return _load_text_model(args)
     if arch == registry.Arch.VLM:

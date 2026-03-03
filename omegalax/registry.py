@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from enum import Enum
 
 
@@ -41,11 +40,6 @@ def infer_arch(model_id: str) -> Arch:
     raise ValueError(f"Cannot infer architecture for model id '{model_id}'")
 
 
-@dataclass(frozen=True)
-class ModelArch:
-    arch: Arch
-
-
-def resolve(model_id: str) -> ModelArch:
+def resolve(model_id: str) -> Arch:
     """Return the architecture classification for a given model id."""
-    return ModelArch(arch=infer_arch(model_id))
+    return infer_arch(model_id)
