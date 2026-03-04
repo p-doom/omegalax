@@ -51,16 +51,27 @@ import jax.numpy as jnp
 from omegalax.text import api
 
 rng = jax.random.key(0)
-model, cfg = api.init_model("Qwen/Qwen3-0.6B", rng)
+model, cfg = api.init_model("Qwen/Qwen3-0.6B", rng, tp_size=1, fsdp_size=1)
 tokens = jax.random.randint(rng, (2, 32), 0, cfg.vocab_size, jnp.int32)
 logits, aux_loss = api.forward(model, tokens, pad_id=0, cfg=cfg)
 cache = api.make_cache(cfg, batch_size=2, token_len=32, generate_steps=8)
 next_logits, cache, aux_loss = api.decode(model, cache, tokens, pad_id=0, cfg=cfg)
 ```
 
-Run the synthetic training loop:
+## Training with synthetic data
+Run a longer synthetic training loop with orbax checkpointing and JSONL logging:
 ```bash
-uv run scripts/train_smoke.py --model-id Qwen/Qwen3-0.6B --num-steps 5
+uv run scripts/train_text_pretrain.py --model-id qwen3-smoke --num-steps 50 --save-dir runs/text-qwen3-smoke --tp-size 1 --fsdp-size 1
+```
+Run the VLM synthetic training loop:
+```bash
+uv run scripts/train_vlm.py --model-id qwen3-vl-smoke --num-steps 50 --save-dir runs/vlm-qwen3-vl-smoke --tp-size 1 --fsdp-size 1
+```
+Resume from the latest checkpoint with `--resume`.
+
+Export any supported model (Qwen3 dense/MoE, Qwen3.5, Qwen3-VL) to HuggingFace safetensors:
+```bash
+uv run scripts/export_to_hf.py --model-id qwen3-smoke --out-dir /tmp/qwen3-smoke-export --tp-size 1 --fsdp-size 1
 ```
 
 ## Quickstart (vision-language)
@@ -71,7 +82,7 @@ import jax.numpy as jnp
 from omegalax import vlm
 
 rng = jax.random.key(0)
-model, cfg = vlm.api.init_model("qwen3.5-smoke", rng)
+model, cfg = vlm.api.init_model("qwen3.5-smoke", rng, tp_size=1, fsdp_size=1)
 tokens = jnp.ones((1, 16), dtype=jnp.int32)
 pixel_values = jnp.zeros((1, 3, 2, 14, 14), dtype=jnp.float32)  # B, C, T, H, W
 image_grid_thw = jnp.array([[1, 1, 1]], dtype=jnp.int32)
@@ -87,9 +98,9 @@ from huggingface_hub import snapshot_download
 from omegalax.models.qwen3.params import create_qwen3_from_safetensors
 
 ckpt_dir = snapshot_download("Qwen/Qwen3-8B")
-model = create_qwen3_from_safetensors(ckpt_dir, "Qwen/Qwen3-8B")
+model = create_qwen3_from_safetensors(ckpt_dir, "Qwen/Qwen3-8B", tp_size=1, fsdp_size=1)
 ```
-For Qwen3.5 and Qwen3-VL, use `create_qwen3_5_from_safetensors` or `create_qwen3_vl_from_safetensors` respectively. When starting from a raw HF config, `omegalax.models.qwen3_vl.make_vl_config_from_hf()` will build a matching JAX config.
+For Qwen3.5 and Qwen3-VL, use `create_qwen3_5_from_safetensors(..., tp_size=1, fsdp_size=1)` or `create_qwen3_vl_from_safetensors(..., tp_size=1, fsdp_size=1)` respectively. When starting from a raw HF config, `omegalax.models.qwen3_vl.make_vl_config_from_hf()` will build a matching JAX config.
 
 ## Tests
 Tests use `absltest`:
