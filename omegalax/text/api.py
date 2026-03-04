@@ -15,6 +15,7 @@ from omegalax.models.sharding_runtime import (
     batch_partition_spec as runtime_batch_partition_spec,
     init_model_sharded,
     shard_batch as runtime_shard_batch,
+    shard_batch_dict as runtime_shard_batch_dict,
 )
 from omegalax.models.qwen3 import registry as qwen3_registry
 from omegalax.models.qwen3.cache import Cache, init_cache
@@ -73,6 +74,13 @@ def shard_batch(token_ids_BT: jax.Array, cfg: TextConfig, mesh: Mesh) -> jax.Arr
     """Shard a token batch for model families that implement input sharding."""
     if isinstance(cfg, (qwen3_registry.Qwen3Config, Qwen3_5TextConfig)):
         return runtime_shard_batch(token_ids_BT, cfg.shd_cfg, mesh)
+    raise TypeError(f"Unsupported text config type: {type(cfg)}")
+
+
+def shard_batch_dict(batch: dict, cfg: TextConfig, mesh: Mesh) -> dict[str, jax.Array]:
+    """Shard every array in a batch dict (batch dim sharded, rest replicated)."""
+    if isinstance(cfg, (qwen3_registry.Qwen3Config, Qwen3_5TextConfig)):
+        return runtime_shard_batch_dict(batch, cfg.shd_cfg, mesh)
     raise TypeError(f"Unsupported text config type: {type(cfg)}")
 
 
