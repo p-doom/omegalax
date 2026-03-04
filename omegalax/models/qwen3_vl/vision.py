@@ -215,10 +215,11 @@ class VisionPatchMerger(nnx.Module):
 
     def __call__(self, hidden_ND: jax.Array) -> jax.Array:
         hidden_ND = reshard(hidden_ND, self.hidden_shd)
+        new_sizes = (hidden_ND.shape[0] * hidden_ND.shape[1] // self.hidden_size, self.hidden_size)
         if self.use_postshuffle_norm:
-            normed = self.norm(hidden_ND.reshape(-1, self.hidden_size))
+            normed = self.norm(jax.lax.reshape(hidden_ND, new_sizes, out_sharding=self.hidden_shd))
         else:
-            normed = self.norm(hidden_ND).reshape(-1, self.hidden_size)
+            normed = jax.lax.reshape(self.norm(hidden_ND), new_sizes, out_sharding=self.hidden_shd)
         # FIXME (f.srambical):  we should probably approximate the gelu for increased throughput,
         # even if that deviates from huggingface numerics
         ff_NF = self.fc1(normed, out_sharding=self.ff_shd)

@@ -195,7 +195,11 @@ class VisionPatchMerger(nnx.Module):
         hidden_ND = reshard(hidden_ND, self.hidden_shd)
         merged_dim = hidden_ND.shape[-1] * merge_size * merge_size
         normed = self.norm(hidden_ND)
-        normed = normed.reshape(-1, merged_dim)
+        normed = jax.lax.reshape(
+            normed,
+            (normed.shape[0] // (merge_size * merge_size), merged_dim),
+            out_sharding=self.hidden_shd,
+        )
         ff_NF = self.fc1(normed, out_sharding=self.ff_shd)
         ff_NF = reshard(nnx.gelu(ff_NF, approximate=True), self.ff_shd)
         out_ND = self.fc2(ff_NF, out_sharding=self.hidden_shd)
