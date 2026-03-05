@@ -70,12 +70,12 @@ class Qwen3_5RealTest(absltest.TestCase):
 
     def test_prefill_logits_match_hf(self):
         inputs = self._tokenize([PROMPT])
-        with torch.no_grad():
+        with torch.no_grad(), torch.autocast("cpu", dtype=torch.bfloat16):
             hf_logits_BTV = self.hf_model(
                 input_ids=inputs["input_ids"],
                 attention_mask=inputs["attention_mask"],
                 use_cache=False,
-            ).logits.cpu().numpy()
+            ).logits.float().cpu().numpy()
 
         jax_logits_BTV = self._jax_prefill_logits(
             np.array(inputs["input_ids"].cpu(), dtype=np.int32),

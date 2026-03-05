@@ -242,7 +242,7 @@ class GatedDeltaNet(nnx.Module):
         b_BTH = self.in_proj_b(hidden_BTD, out_sharding=P(batch_axis, None, head_axis))
         a_BTH = self.in_proj_a(hidden_BTD, out_sharding=P(batch_axis, None, head_axis))
 
-        mixed_qkv_BCT = nnx.silu(_causal_depthwise_conv1d(mixed_qkv_BCT, self.conv_weight[...]))
+        mixed_qkv_BCT = nnx.silu(_causal_depthwise_conv1d(mixed_qkv_BCT, self.conv_weight[...].astype(mixed_qkv_BCT.dtype)))
         mixed_qkv_BTC = mixed_qkv_BCT.transpose(0, 2, 1)
 
         q_BTHA, k_BTHA, v_BTHU = jnp.split(

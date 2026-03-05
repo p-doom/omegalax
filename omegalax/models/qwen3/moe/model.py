@@ -60,9 +60,9 @@ class MoEFeedForward(nnx.Module):
             )
         topk_weights_BTk = topk_weights_BTk.astype(probs_BTE.dtype)
 
-        gate_proj_EDF = self.gate_proj[...]
-        up_proj_EDF = self.up_proj[...]
-        down_proj_EFD = self.down_proj[...]
+        gate_proj_EDF = jnp.astype(self.gate_proj[...], hidden_BTD.dtype)
+        up_proj_EDF = jnp.astype(self.up_proj[...], hidden_BTD.dtype)
+        down_proj_EFD = jnp.astype(self.down_proj[...], hidden_BTD.dtype)
         batch_axis = self.shd_cfg.act_btd[0]
         hidden_axis = self.shd_cfg.act_btd[2]
         ff_axis = self.shd_cfg.act_btf[2]
@@ -156,7 +156,10 @@ class Qwen3Moe(nnx.Module):
     def __call__(self, token_ids_BT, segment_ids_BT, cache, num_right_pads):
         del num_right_pads
         aux_losses = []
-        hidden_BTD = self.embedder.embedding[...].at[(token_ids_BT,)].get(out_sharding=self.out_emb_shd)
+        hidden_BTD = jnp.astype(
+            self.embedder.embedding[...].at[(token_ids_BT,)].get(out_sharding=self.out_emb_shd),
+            self.embedder.dtype,
+        )
         for i, layer in enumerate(self.layers):
             layer_cache = None if cache is None else cache[i]
             hidden_BTD, aux = layer(hidden_BTD, layer_cache, segment_ids_BT)

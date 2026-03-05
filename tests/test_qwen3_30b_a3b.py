@@ -65,8 +65,8 @@ class Qwen3_30B_A3B_Test(absltest.TestCase):
 
     def test_prefill_logits_match_hf(self):
         inputs = self._tokenize([PROMPT])
-        with torch.no_grad():
-            hf_logits_BTV = self.hf_model(**inputs).logits.cpu().numpy()
+        with torch.no_grad(), torch.autocast("cpu", dtype=torch.bfloat16):
+            hf_logits_BTV = self.hf_model(**inputs).logits.float().cpu().numpy()
         jax_logits_BTV = self._jax_prefill_logits(inputs["input_ids"])
         mask = inputs["attention_mask"].numpy().astype(bool)
 

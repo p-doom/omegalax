@@ -111,11 +111,11 @@ class Qwen3VLMappingTest(absltest.TestCase):
         text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         inputs = self.processor.tokenizer(text, return_tensors="pt", padding=True)
 
-        with torch.no_grad():
+        with torch.no_grad(), torch.autocast("cpu", dtype=torch.bfloat16):
             hf_logits_BTV = self.hf_model(
                 input_ids=inputs["input_ids"],
                 attention_mask=inputs["attention_mask"],
-            ).logits.cpu().numpy()
+            ).logits.float().cpu().numpy()
 
         token_ids_BT = jnp.asarray(np.array(inputs["input_ids"].cpu(), dtype=np.int32))
         attention_mask_BT = jnp.asarray(np.array(inputs["attention_mask"].cpu(), dtype=np.int32))
@@ -137,11 +137,11 @@ class Qwen3VLMappingTest(absltest.TestCase):
         ]
         inputs = self.processor.tokenizer(texts, return_tensors="pt", padding=True, padding_side="left")
 
-        with torch.no_grad():
+        with torch.no_grad(), torch.autocast("cpu", dtype=torch.bfloat16):
             hf_logits_BTV = self.hf_model(
                 input_ids=inputs["input_ids"],
                 attention_mask=inputs["attention_mask"],
-            ).logits.cpu().numpy()
+            ).logits.float().cpu().numpy()
 
         token_ids_BT = jnp.asarray(np.array(inputs["input_ids"].cpu(), dtype=np.int32))
         attention_mask_BT = jnp.asarray(np.array(inputs["attention_mask"].cpu(), dtype=np.int32))
@@ -167,8 +167,8 @@ class Qwen3VLMappingTest(absltest.TestCase):
         text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         inputs = self.processor(text=[text], images=[img], return_tensors="pt", padding=True)
 
-        with torch.no_grad():
-            hf_logits_BTV = self.hf_model(**inputs).logits.cpu().numpy()
+        with torch.no_grad(), torch.autocast("cpu", dtype=torch.bfloat16):
+            hf_logits_BTV = self.hf_model(**inputs).logits.float().cpu().numpy()
 
         token_ids_BT = jnp.asarray(np.array(inputs["input_ids"].cpu(), dtype=np.int32))
         attention_mask_BT = jnp.asarray(np.array(inputs["attention_mask"].cpu(), dtype=np.int32))

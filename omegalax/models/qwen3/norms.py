@@ -21,6 +21,7 @@ class RMSNorm(nnx.Module):
     @jax.named_scope("rms_norm")
     def __call__(self, x: jax.Array) -> jax.Array:
         dtype = x.dtype
-        variance = jnp.mean(jnp.astype(x, jnp.float32) ** 2, axis=-1, keepdims=True)
-        normed = x * jax.lax.rsqrt(variance + self.norm_eps)
+        x_f32 = jnp.astype(x, jnp.float32)
+        variance = jnp.mean(x_f32 ** 2, axis=-1, keepdims=True)
+        normed = x_f32 * jax.lax.rsqrt(variance + self.norm_eps)
         return jnp.astype(self.scale[...] * normed, dtype)

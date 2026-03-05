@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -24,9 +26,10 @@ class LayerNorm(nnx.Module):
         *,
         rngs: nnx.Rngs,
         sharding: tuple[str | None, ...] = ("hidden",),
+        param_dtype: Any = jnp.float32,
     ):
-        self.scale = nnx.Param(jnp.ones(dim), sharding=sharding)
-        self.bias = nnx.Param(jnp.zeros(dim), sharding=sharding)
+        self.scale = nnx.Param(jnp.ones(dim, dtype=param_dtype), sharding=sharding)
+        self.bias = nnx.Param(jnp.zeros(dim, dtype=param_dtype), sharding=sharding)
         self.eps = eps
 
     def __call__(self, x: jax.Array) -> jax.Array:

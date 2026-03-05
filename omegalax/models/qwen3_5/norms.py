@@ -1,5 +1,7 @@
 """Normalization layers for Qwen3.5."""
 
+from typing import Any
+
 import jax
 import jax.numpy as jnp
 from flax import nnx
@@ -16,9 +18,10 @@ class RMSNorm(nnx.Module):
         eps: float = 1e-6,
         *,
         rngs: nnx.Rngs,
+        param_dtype: Any = jnp.float32,
         sharding: tuple[str | None, ...] = ("hidden",),
     ):
-        self.weight = nnx.Param(jnp.zeros(dim), sharding=sharding)
+        self.weight = nnx.Param(jnp.zeros(dim, dtype=param_dtype), sharding=sharding)
         self.eps = eps
 
     @jax.named_scope("rms_norm")
@@ -39,9 +42,10 @@ class RMSNormGated(nnx.Module):
         eps: float = 1e-6,
         *,
         rngs: nnx.Rngs,
+        param_dtype: Any = jnp.float32,
         sharding: tuple[str | None, ...] = ("hidden",),
     ):
-        self.weight = nnx.Param(jnp.ones(dim), sharding=sharding)
+        self.weight = nnx.Param(jnp.ones(dim, dtype=param_dtype), sharding=sharding)
         self.eps = eps
 
     @jax.named_scope("rms_norm_gated")
@@ -64,10 +68,11 @@ class LayerNorm(nnx.Module):
         eps: float = 1e-6,
         *,
         rngs: nnx.Rngs,
+        param_dtype: Any = jnp.float32,
         sharding: tuple[str | None, ...] = ("hidden",),
     ):
-        self.weight = nnx.Param(jnp.ones(dim), sharding=sharding)
-        self.bias = nnx.Param(jnp.zeros(dim), sharding=sharding)
+        self.weight = nnx.Param(jnp.ones(dim, dtype=param_dtype), sharding=sharding)
+        self.bias = nnx.Param(jnp.zeros(dim, dtype=param_dtype), sharding=sharding)
         self.eps = eps
 
     @jax.named_scope("layer_norm")

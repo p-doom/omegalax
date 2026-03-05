@@ -81,7 +81,10 @@ class Qwen3Dense(nnx.Module):
 
     def __call__(self, token_ids_BT, segment_ids_BT, cache, num_right_pads):
         del num_right_pads
-        hidden_BTD = self.embedder.embedding[...].at[(token_ids_BT,)].get(out_sharding=self.out_emb_shd)
+        hidden_BTD = jnp.astype(
+            self.embedder.embedding[...].at[(token_ids_BT,)].get(out_sharding=self.out_emb_shd),
+            self.embedder.dtype,
+        )
         for i, layer in enumerate(self.layers):
             layer_cache = None if cache is None else cache[i]
             hidden_BTD = layer(hidden_BTD, layer_cache, segment_ids_BT)

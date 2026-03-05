@@ -120,11 +120,15 @@ class MoEFeedForward(nnx.Module):
         )
         topk_weights_BTk = topk_weights_BTk.astype(probs_BTE.dtype)
 
+        compute_dtype = hidden_BTD.dtype
+        gate_up_proj = jnp.astype(self.gate_up_proj[...], compute_dtype)
+        down_proj = jnp.astype(self.down_proj[...], compute_dtype)
+
         dense_hidden_BTD = reshard(hidden_BTD, P(batch_axis, None, None))
         gate_up_BTEF = jnp.einsum(
             "BTD,EFD->BTEF",
             dense_hidden_BTD,
-            self.gate_up_proj[...],
+            gate_up_proj,
             out_sharding=P(batch_axis, None, None, ff_axis),
         )
         gate_BTEF, up_BTEF = jnp.split(gate_up_BTEF, 2, axis=-1)
@@ -132,7 +136,7 @@ class MoEFeedForward(nnx.Module):
         expert_out_BTED = jnp.einsum(
             "BTEF,EDF->BTED",
             expert_hidden_BTEF,
-            self.down_proj[...],
+            down_proj,
             out_sharding=P(batch_axis, None, None, hidden_axis),
         )
 
@@ -228,7 +232,10 @@ class TextModel(nnx.Module):
         cfg = self.cfg
 
         if inputs_embeds_BTD is None:
-            hidden_BTD = self.embedder.embedding[...].at[(token_ids_BT,)].get(out_sharding=self.out_emb_shd)
+            hidden_BTD = jnp.astype(
+                self.embedder.embedding[...].at[(token_ids_BT,)].get(out_sharding=self.out_emb_shd),
+                self.embedder.dtype,
+            )
         else:
             hidden_BTD = inputs_embeds_BTD
 
@@ -321,7 +328,10 @@ class Qwen3_5ForConditionalGeneration(nnx.Module):
     ):
         del cache, num_right_pads
 
-        inputs_embeds_BTD = self.text.embedder.embedding[...].at[(token_ids_BT,)].get(out_sharding=self.text.out_emb_shd)
+        inputs_embeds_BTD = jnp.astype(
+            self.text.embedder.embedding[...].at[(token_ids_BT,)].get(out_sharding=self.text.out_emb_shd),
+            self.text.embedder.dtype,
+        )
 
         if pixel_values is not None and image_grid_thw is not None:
             image_embeds_ND = self.vision(pixel_values, image_grid_thw)
