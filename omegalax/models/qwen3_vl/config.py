@@ -187,9 +187,9 @@ _QWEN3_VL_SPECS: dict[str, dict[str, Any]] = {
         "norm_eps": 1e-6,
         "tie_word_embeddings": False,
         "mrope_section": (24, 20, 20),
-        "image_token_id": 151657,
-        "video_token_id": 151658,
-        "vision_start_token_id": 151653,
+        "image_token_id": 151655,
+        "video_token_id": 151656,
+        "vision_start_token_id": 151652,
         "vision": {
             "hidden_size": 1_152,
             "intermediate_size": 4_304,

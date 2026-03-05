@@ -195,7 +195,7 @@ _QWEN3_MOE_SPECS: dict[str, dict] = {
         "mlp_only_layers": (),
         "decoder_sparse_step": 1,
         "norm_topk_prob": True,
-        "rope_theta": 1_000_000,
+        "rope_theta": 10_000_000,
         "rope_scaling_factor": None,
         "local_rope_theta": None,
         "tie_word_embeddings": False,

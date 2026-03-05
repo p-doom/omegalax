@@ -297,10 +297,23 @@ def list_supported_qwen3_5_model_ids() -> list[str]:
     return sorted(_MODEL_ID_TO_SPEC.keys())
 
 
+_FULL_ATTENTION_INTERVAL = 4
+
+
+def _generate_layer_types(num_layers: int) -> tuple[str, ...]:
+    """Generate layer_types with full_attention every 4th layer (1-indexed)."""
+    return tuple(
+        "full_attention" if (i + 1) % _FULL_ATTENTION_INTERVAL == 0 else "linear_attention"
+        for i in range(num_layers)
+    )
+
+
 def make_config(model_id: str) -> Qwen3_5Config:
     spec = get_qwen3_5_spec(model_id)
     vis_kw = spec["vision_config"]
-    txt_kw = spec["text_config"]
+    txt_kw = dict(spec["text_config"])
+    if not txt_kw.get("layer_types"):
+        txt_kw["layer_types"] = _generate_layer_types(txt_kw["num_hidden_layers"])
     return Qwen3_5Config(
         vision_config=Qwen3_5VisionConfig(**vis_kw),
         text_config=Qwen3_5TextConfig(**txt_kw),
