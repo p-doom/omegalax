@@ -53,8 +53,9 @@ class RMSNormGated(nnx.Module):
         dtype = x.dtype
         x_f32 = x.astype(jnp.float32)
         variance = jnp.mean(x_f32 ** 2, axis=-1, keepdims=True)
-        normed = x_f32 * jax.lax.rsqrt(variance + self.eps)
-        out = self.weight[...] * normed.astype(dtype)
+        normed = jnp.astype(x_f32 * jax.lax.rsqrt(variance + self.eps), dtype)
+        weight = jnp.astype(self.weight[...], dtype)
+        out = weight * normed
         out = out * nnx.silu(gate.astype(jnp.float32))
         return out.astype(dtype)
 

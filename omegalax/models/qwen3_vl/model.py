@@ -40,8 +40,9 @@ class RMSNorm(nnx.Module):
         dtype = x.dtype
         x_f32 = x.astype(jnp.float32)
         variance = jnp.mean(x_f32 ** 2, axis=-1, keepdims=True)
-        normed = x_f32 * jax.lax.rsqrt(variance + self.eps)
-        return (self.scale[...] * normed).astype(dtype)
+        normed = jnp.astype(x_f32 * jax.lax.rsqrt(variance + self.eps), dtype)
+        scale = jnp.astype(self.scale[...], dtype)
+        return scale * normed
 
 
 def apply_rope(x_BTHK: jax.Array, sin_BTK: jax.Array, cos_BTK: jax.Array) -> jax.Array:

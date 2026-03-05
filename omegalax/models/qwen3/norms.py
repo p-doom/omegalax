@@ -24,4 +24,4 @@ class RMSNorm(nnx.Module):
         x_f32 = jnp.astype(x, jnp.float32)
         variance = jnp.mean(x_f32 ** 2, axis=-1, keepdims=True)
         normed = jnp.astype(x_f32 * jax.lax.rsqrt(variance + self.norm_eps), dtype)
-        return self.scale[...] * normed
+        return jnp.astype(self.scale[...], dtype) * normed
