@@ -346,7 +346,7 @@ def make_config_from_hf(hf_cfg: dict[str, Any]) -> Qwen3_5Config:
     if not isinstance(rope_params, dict):
         raise ValueError("Expected rope_parameters to be a dict in hf_cfg['text_config'].")
     text_dtype = _hf_dtype_to_jnp(_required(txt, "dtype", "hf_cfg['text_config']"))
-    vision_dtype = _hf_dtype_to_jnp(vis["dtype"]) if vis.get("dtype") is not None else jnp.float32
+    vision_dtype = _hf_dtype_to_jnp(vis["dtype"]) if vis.get("dtype") is not None else text_dtype
 
     has_moe = "num_experts" in txt and txt["num_experts"] > 0
 

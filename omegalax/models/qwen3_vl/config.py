@@ -311,7 +311,7 @@ def make_vl_config_from_hf(hf_cfg: dict[str, Any]) -> Qwen3VLConfig:
         raise ValueError("Expected rope_scaling to be a dict in hf_cfg['text_config'].")
     mrope_section = _required(rope_scaling, "mrope_section", "hf_cfg['text_config'].rope_scaling")
     text_dtype = _hf_dtype_to_jnp(_required(txt, "dtype", "hf_cfg['text_config']"))
-    vision_dtype = _hf_dtype_to_jnp(vis["dtype"]) if vis.get("dtype") is not None else jnp.float32
+    vision_dtype = _hf_dtype_to_jnp(vis["dtype"]) if vis.get("dtype") is not None else text_dtype
     is_moe = str(hf_cfg.get("model_type", "")).endswith("_moe")
 
     return Qwen3VLConfig(
