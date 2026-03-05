@@ -36,8 +36,9 @@ from huggingface_hub import snapshot_download
 from transformers import AutoConfig, AutoTokenizer, Qwen3ForCausalLM
 from transformers.models.qwen3.modeling_qwen3 import apply_rotary_pos_emb
 
+from tests.real_weights import requires_real_weights
 from omegalax.text import api
-from omegalax.models.qwen3.dense import params_dense
+from omegalax.models.qwen3 import loader as qwen3_loader
 from omegalax.models.qwen3.rope import apply_rope, generate_pos_embeddings
 
 jax.config.update("jax_default_matmul_precision", "highest")
@@ -68,6 +69,7 @@ def _to_np(x) -> np.ndarray:
     return np.asarray(x, dtype=np.float32)
 
 
+@requires_real_weights
 class Qwen3ModuleTest(absltest.TestCase):
     """Feed identical HF-produced inputs into each module pair and compare."""
 
@@ -82,7 +84,7 @@ class Qwen3ModuleTest(absltest.TestCase):
         cls.hf_model = Qwen3ForCausalLM.from_pretrained(
             cls.model_path, config=hf_cfg, torch_dtype=torch.float32
         ).eval()
-        cls.jax_model = params_dense.create_qwen3_dense_from_safetensors(
+        cls.jax_model = qwen3_loader.create_qwen3_from_safetensors(
             cls.model_path,
             MODEL_ID,
             tp_size=1,

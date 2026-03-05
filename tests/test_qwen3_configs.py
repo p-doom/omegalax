@@ -1,6 +1,6 @@
 from absl.testing import absltest
 
-from omegalax.models.qwen3.dense.params_dense import assert_dense_config
+from omegalax.models.qwen3.loader import _assert_config
 from omegalax.text import api
 
 
@@ -94,7 +94,7 @@ class Qwen3RegistryTest(absltest.TestCase):
         }
 
         with self.assertRaisesRegex(ValueError, "tie_word_embeddings"):
-            assert_dense_config(cfg, hf_cfg)
+            _assert_config(cfg, hf_cfg)
 
 
 if __name__ == "__main__":

@@ -28,17 +28,12 @@ from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
 
 from omegalax.models.qwen3_5.params import create_qwen3_5_from_safetensors
 
-jax.config.update("jax_default_matmul_precision", "highest")
+from tests.logits_assert import assert_logits_close
+
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
 
 _JNP_TO_TORCH = {jnp.float32: torch.float32, jnp.bfloat16: torch.bfloat16, jnp.float16: torch.float16}
-
-
-def _tolerances(jnp_dtype):
-    if jnp_dtype == jnp.float32:
-        return 1e-5, 1e-5
-    return 1e-2, 1e-2
 
 
 HF_VISION_CFG = HFVisionConfig(
@@ -122,7 +117,6 @@ class Qwen3_5WeightsTest(absltest.TestCase):
 
         torch_dtype = _JNP_TO_TORCH[cls.jax_cfg.text_config.dtype]
         cls.hf_model = hf_model.to(torch_dtype)
-        cls.RTOL, cls.ATOL = _tolerances(cls.jax_cfg.text_config.dtype)
         cls.pad_id = 0
 
     def _jax_prefill_logits(self, tokens_np: np.ndarray) -> np.ndarray:
@@ -151,9 +145,8 @@ class Qwen3_5WeightsTest(absltest.TestCase):
 
         jax_logits_BTV = self._jax_prefill_logits(token_ids_BT)
 
-        max_abs_diff = np.max(np.abs(jax_logits_BTV - hf_logits_BTV))
-        print(f"\n  max_abs_diff = {max_abs_diff:.6e}")
-        np.testing.assert_allclose(jax_logits_BTV, hf_logits_BTV, rtol=self.RTOL, atol=self.ATOL)
+        mask = np.ones_like(token_ids_BT, dtype=bool)
+        assert_logits_close(self, jax_logits_BTV, hf_logits_BTV, mask)
 
     def test_prefill_logits_match_hf_batched(self):
         """Batched forward pass with left-padding should match HuggingFace.
@@ -180,9 +173,7 @@ class Qwen3_5WeightsTest(absltest.TestCase):
         jax_logits_BTV = self._jax_prefill_logits(token_ids_BT)
 
         mask = attention_mask_BT.astype(bool)
-        max_abs_diff = np.max(np.abs(jax_logits_BTV[mask] - hf_logits_BTV[mask]))
-        print(f"\n  max_abs_diff = {max_abs_diff:.6e}")
-        np.testing.assert_allclose(jax_logits_BTV[mask], hf_logits_BTV[mask], rtol=self.RTOL, atol=self.ATOL)
+        assert_logits_close(self, jax_logits_BTV, hf_logits_BTV, mask)
 
     def test_round_trip_preserves_logits(self):
         """Split → merge round-trip should produce identical logits."""

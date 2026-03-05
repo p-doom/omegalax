@@ -12,6 +12,7 @@ from transformers import AutoTokenizer
 
 from omegalax.data.collators import TextSFTCollator
 from omegalax.data.jsonl import JSONLDataset
+from omegalax.registry import resolve_hf_repo_id
 from omegalax.trainers import text as text_trainer
 from omegalax.trainers.perf import resolve_peak_tflops
 
@@ -65,7 +66,7 @@ def main() -> None:
     args = parse_args()
     jax.distributed.initialize()
 
-    tokenizer_name = args.tokenizer or args.model_id
+    tokenizer_name = args.tokenizer or resolve_hf_repo_id(args.model_id)
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
     collator = TextSFTCollator(tokenizer, max_length=args.max_length)
     dataset = JSONLDataset(args.data_path)

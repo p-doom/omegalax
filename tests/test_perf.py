@@ -2,8 +2,7 @@
 
 from absl.testing import absltest
 
-from omegalax.models.qwen3.dense.config import make_dense_config
-from omegalax.models.qwen3.moe.config import make_moe_config
+from omegalax.models.qwen3.config import make_config as make_qwen3_config
 from omegalax.models.qwen3_5.config import make_config as make_qwen3_5_config
 from omegalax.trainers.perf import (
     PEAK_TFLOPS,
@@ -18,7 +17,7 @@ class TrainingFlopsPerTokenTest(absltest.TestCase):
     """Smoke tests for training_flops_per_token with small configs."""
 
     def test_qwen3_smoke_dense_positive(self):
-        cfg = make_dense_config("qwen3-smoke")
+        cfg = make_qwen3_config("qwen3-smoke")
         seq_len = 8
         flops = training_flops_per_token(cfg, seq_len)
         self.assertGreater(flops, 0)
@@ -30,7 +29,7 @@ class TrainingFlopsPerTokenTest(absltest.TestCase):
         self.assertLessEqual(flops, 5_000_000)
 
     def test_qwen3_smoke_moe_positive(self):
-        cfg = make_moe_config("qwen3-smoke-moe")
+        cfg = make_qwen3_config("qwen3-smoke-moe")
         seq_len = 8
         flops = training_flops_per_token(cfg, seq_len)
         self.assertGreater(flops, 0)
@@ -58,7 +57,7 @@ class TrainingFlopsPerTokenTest(absltest.TestCase):
 
 class PerDeviceFlopsStepTest(absltest.TestCase):
     def test_per_device_flops_per_step_positive(self):
-        cfg = make_dense_config("qwen3-smoke")
+        cfg = make_qwen3_config("qwen3-smoke")
         flops = per_device_flops_per_step(cfg, seq_len=8, batch_size=2)
         self.assertGreater(flops, 0)
 

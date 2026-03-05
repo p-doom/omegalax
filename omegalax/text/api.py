@@ -19,8 +19,7 @@ from omegalax.models.sharding_runtime import (
 )
 from omegalax.models.qwen3 import registry as qwen3_registry
 from omegalax.models.qwen3.cache import Cache, init_cache
-from omegalax.models.qwen3.dense.model import Qwen3Dense
-from omegalax.models.qwen3.moe.model import Qwen3Moe
+from omegalax.models.qwen3.model import Qwen3
 from omegalax.models.qwen3.utils import count_right_pads
 from omegalax.models.qwen3_5 import Qwen3_5TextConfig
 from omegalax.models.qwen3_5.config import (
@@ -98,8 +97,7 @@ def init_model(
 
     axis_rules = axis_rules_for_mesh(mesh)
     if isinstance(cfg, qwen3_registry.Qwen3Config):
-        model_cls = qwen3_registry.get_model_cls(cfg.variant)
-        model = init_model_sharded(model_cls, cfg, rng, mesh, axis_rules)
+        model = init_model_sharded(Qwen3, cfg, rng, mesh, axis_rules)
         return model, cfg
     if isinstance(cfg, Qwen3_5TextConfig):
         model = init_model_sharded(Qwen3_5ForCausalLM, cfg, rng, mesh, axis_rules)
@@ -112,14 +110,7 @@ def forward(model: nnx.Module, token_ids_BT: jax.Array, pad_id: int, cfg: TextCo
     """Forward pass for text-only models; returns logits and aux loss."""
     segment_ids_BT = 1 * (token_ids_BT != pad_id)
 
-    if isinstance(model, (Qwen3Dense, Qwen3Moe)):
-        if cfg.variant == "moe":
-            logits_BTV, aux_loss = model(token_ids_BT, segment_ids_BT, None, jnp.array(0, dtype=jnp.int32))
-            return logits_BTV, aux_loss
-        logits_BTV = model(token_ids_BT, segment_ids_BT, None, jnp.array(0, dtype=jnp.int32))
-        return logits_BTV, jnp.array(0.0, dtype=jnp.float32)
-
-    if isinstance(model, Qwen3_5ForCausalLM):
+    if isinstance(model, (Qwen3, Qwen3_5ForCausalLM)):
         logits_BTV, aux_loss = model(token_ids_BT, segment_ids_BT, None, jnp.array(0, dtype=jnp.int32))
         return logits_BTV, aux_loss
 
@@ -128,17 +119,12 @@ def forward(model: nnx.Module, token_ids_BT: jax.Array, pad_id: int, cfg: TextCo
 
 def decode(model: nnx.Module, cache: Cache, token_ids_BT: jax.Array, pad_id: int, cfg: TextConfig):
     """Decode step for autoregressive generation (Qwen3 only)."""
-    if not isinstance(model, (Qwen3Dense, Qwen3Moe)):
+    if not isinstance(model, Qwen3):
         raise NotImplementedError("decode is only implemented for Qwen3 text models.")
 
     segment_ids_BT = 1 * (token_ids_BT != pad_id)
     num_right_pads = count_right_pads(token_ids_BT, pad_id)
-    outputs = model(token_ids_BT, segment_ids_BT, cache, jnp.array(num_right_pads, dtype=jnp.int32))
-
-    if cfg.variant == "moe":
-        logits_BTV, aux_loss = outputs
-    else:
-        logits_BTV, aux_loss = outputs, jnp.array(0.0, dtype=jnp.float32)
+    logits_BTV, aux_loss = model(token_ids_BT, segment_ids_BT, cache, jnp.array(num_right_pads, dtype=jnp.int32))
 
     target_ind = token_ids_BT.shape[-1] - num_right_pads - 1
     return logits_BTV[:, target_ind], cache, aux_loss

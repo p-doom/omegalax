@@ -16,6 +16,8 @@ from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
     Qwen3_5MoeForConditionalGeneration as HFModel,
 )
 
+from tests.logits_assert import assert_logits_close
+from tests.real_weights import requires_real_weights
 from omegalax.models.qwen3_5.config import make_config
 from omegalax.models.qwen3_5.params import create_qwen3_5_from_safetensors
 
@@ -24,25 +26,10 @@ torch.backends.cudnn.allow_tf32 = False
 
 MODEL_ID = "Qwen/Qwen3.5-397B-A17B"
 PROMPT = "Why is the sky blue instead of another color like purple?"
-LOGIT_ATOL = 2.0
-LOGIT_MEDIAN_ATOL = 0.2
 
 
+@requires_real_weights
 class Qwen3_5RealTest(absltest.TestCase):
-
-    def _assert_logits_close(self, jax_masked, hf_masked):
-        abs_diff = np.abs(jax_masked - hf_masked)
-        max_abs = np.max(abs_diff)
-        median_abs = np.median(abs_diff)
-        self.assertLess(max_abs, LOGIT_ATOL,
-            f"max abs diff {max_abs:.4f} >= {LOGIT_ATOL} (median={median_abs:.4f})")
-        self.assertLess(median_abs, LOGIT_MEDIAN_ATOL,
-            f"median abs diff {median_abs:.4f} >= {LOGIT_MEDIAN_ATOL} (max={max_abs:.4f})")
-        jax_top1 = np.argmax(jax_masked, axis=-1)
-        hf_top1 = np.argmax(hf_masked, axis=-1)
-        match_rate = np.mean(jax_top1 == hf_top1)
-        self.assertGreater(match_rate, 0.8,
-            f"top-1 prediction match rate {match_rate:.2%} <= 80%")
 
     @classmethod
     def setUpClass(cls):
@@ -100,7 +87,7 @@ class Qwen3_5RealTest(absltest.TestCase):
         mask = inputs["attention_mask"].cpu().numpy().astype(bool)
         jax_masked = jax_logits_BTV[mask]
         hf_masked = hf_logits_BTV[mask]
-        self._assert_logits_close(jax_masked, hf_masked)
+        assert_logits_close(self, jax_masked, hf_masked, top1_min_match=0.8)
 
 
 if __name__ == "__main__":

@@ -160,17 +160,24 @@ class MoEFeedForward(nnx.Module):
 
 # Decoder Layer
 class DecoderLayer(nnx.Module):
-    """Hybrid decoder layer: full_attention or linear_attention + MoE MLP."""
+    """Hybrid decoder layer: full_attention or linear_attention + dense MLP or MoE."""
 
     def __init__(self, cfg: Qwen3_5TextConfig, layer_idx: int, *, rngs: nnx.Rngs):
         self.layer_type = cfg.layer_types[layer_idx]
+        self.is_moe = cfg.is_moe
 
         if self.layer_type == "full_attention":
             self.attn = Attention(cfg, rngs=rngs)
         else:
             self.linear_attn = GatedDeltaNet(cfg, rngs=rngs)
 
-        self.mlp = MoEFeedForward(cfg, rngs=rngs)
+        if cfg.is_moe:
+            self.mlp = MoEFeedForward(cfg, rngs=rngs)
+        else:
+            self.mlp = MLP(
+                cfg.hidden_size, cfg.intermediate_size, cfg.shd_cfg,
+                dtype=cfg.dtype, rngs=rngs,
+            )
         self.input_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, rngs=rngs)
         self.post_attention_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, rngs=rngs)
 
@@ -195,7 +202,11 @@ class DecoderLayer(nnx.Module):
 
         residual_BTD = hidden_BTD
         normed_BTD = self.post_attention_layernorm(hidden_BTD)
-        ff_out_BTD, aux_loss = self.mlp(normed_BTD)
+        if self.is_moe:
+            ff_out_BTD, aux_loss = self.mlp(normed_BTD)
+        else:
+            ff_out_BTD = self.mlp(normed_BTD)
+            aux_loss = jnp.array(0.0, dtype=jnp.float32)
         hidden_BTD = residual_BTD + ff_out_BTD
 
         return hidden_BTD, aux_loss

@@ -13,6 +13,7 @@ from transformers import AutoProcessor
 from omegalax.data.collators import VLMSFTCollator
 from omegalax.data.jsonl import JSONLDataset
 from omegalax.trainers import vlm as vlm_trainer
+from omegalax.registry import resolve_hf_repo_id
 from omegalax.trainers.perf import resolve_peak_tflops
 
 
@@ -65,7 +66,7 @@ def main() -> None:
     args = parse_args()
     jax.distributed.initialize()
 
-    processor_name = args.processor or args.model_id
+    processor_name = args.processor or resolve_hf_repo_id(args.model_id)
     processor = AutoProcessor.from_pretrained(processor_name)
     collator = VLMSFTCollator(processor, max_length=args.max_length)
 

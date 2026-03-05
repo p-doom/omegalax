@@ -16,7 +16,6 @@ from typing import Any, Union
 import jax
 
 from omegalax.models.qwen3.config import Qwen3Config
-from omegalax.models.qwen3.moe.config import Qwen3MoeConfig
 from omegalax.models.qwen3_5.config import Qwen3_5Config, Qwen3_5TextConfig
 from omegalax.models.qwen3_vl.config import Qwen3VLConfig
 
@@ -67,9 +66,9 @@ def training_flops_per_token(cfg: RunPerfConfig, seq_len: int) -> int:
         return _training_flops_per_token_qwen3_5(cfg.text_config, seq_len)
     if isinstance(cfg, Qwen3VLConfig):
         return _training_flops_per_token_qwen3_vl(cfg, seq_len)
-    if isinstance(cfg, Qwen3MoeConfig):
-        return _training_flops_per_token_qwen3_moe(cfg, seq_len)
     if isinstance(cfg, Qwen3Config):
+        if cfg.is_moe:
+            return _training_flops_per_token_qwen3_moe(cfg, seq_len)
         return _training_flops_per_token_qwen3_dense(cfg, seq_len)
     if isinstance(cfg, Qwen3_5TextConfig):
         return _training_flops_per_token_qwen3_5(cfg, seq_len)
@@ -132,7 +131,7 @@ def _training_flops_per_token_qwen3_vl(cfg: Qwen3VLConfig, seq_len: int) -> int:
     return forward_per_token * TRAINING_FLOP_MULTIPLIER
 
 
-def _training_flops_per_token_qwen3_moe(cfg: Qwen3MoeConfig, seq_len: int) -> int:
+def _training_flops_per_token_qwen3_moe(cfg: Qwen3Config, seq_len: int) -> int:
     D = cfg.emb_dim
     H = cfg.num_heads
     G = cfg.num_kv_heads
@@ -173,12 +172,7 @@ def _training_flops_per_token_qwen3_5(cfg: Qwen3_5TextConfig, seq_len: int) -> i
     V = cfg.vocab_size
     L = cfg.num_hidden_layers
     T = seq_len
-    E = cfg.num_experts
-    k = cfg.num_experts_per_tok
-    F_moe = cfg.moe_intermediate_size
-    F_shared = cfg.shared_expert_intermediate_size
 
-    # Linear attention / GatedDeltaNet dims
     key_dim = cfg.linear_key_head_dim * cfg.linear_num_key_heads
     value_dim = cfg.linear_value_head_dim * cfg.linear_num_value_heads
     nv = cfg.linear_num_value_heads
@@ -189,14 +183,12 @@ def _training_flops_per_token_qwen3_5(cfg: Qwen3_5TextConfig, seq_len: int) -> i
     layer_flops = 0
     for layer_idx, layer_type in enumerate(cfg.layer_types):
         if layer_type == "full_attention":
-            # Q has 2x width for output gate
             q_flops = 2 * D * (H * K * 2)
             kv_flops = 2 * D * (2 * G * K)
             attn_dot = 4 * T * H * K
             o_flops = 2 * H * K * D
             layer_flops += q_flops + kv_flops + attn_dot + o_flops
         else:
-            # linear_attention (GatedDeltaNet)
             conv_dim = key_dim * 2 + value_dim
             in_proj_qkv = 2 * D * conv_dim
             in_proj_z = 2 * D * value_dim
@@ -206,14 +198,21 @@ def _training_flops_per_token_qwen3_5(cfg: Qwen3_5TextConfig, seq_len: int) -> i
             delta_rule_per_token = 2 * nv * (ak * av)
             layer_flops += in_proj_qkv + in_proj_z + in_proj_b + in_proj_a + out_proj + delta_rule_per_token
 
-        # MoE MLP (all layers in Qwen3.5)
-        router_flops = 2 * D * E
-        gate_up_per_expert = 2 * (2 * F_moe) * D
-        down_per_expert = 2 * F_moe * D
-        routed_flops = k * (gate_up_per_expert + down_per_expert)
-        shared_flops = 2 * 3 * D * F_shared
-        shared_gate_flops = 2 * D * 1
-        layer_flops += router_flops + routed_flops + shared_flops + shared_gate_flops
+        if cfg.is_moe:
+            E = cfg.num_experts
+            k = cfg.num_experts_per_tok
+            F_moe = cfg.moe_intermediate_size
+            F_shared = cfg.shared_expert_intermediate_size
+            router_flops = 2 * D * E
+            gate_up_per_expert = 2 * (2 * F_moe) * D
+            down_per_expert = 2 * F_moe * D
+            routed_flops = k * (gate_up_per_expert + down_per_expert)
+            shared_flops = 2 * 3 * D * F_shared
+            shared_gate_flops = 2 * D * 1
+            layer_flops += router_flops + routed_flops + shared_flops + shared_gate_flops
+        else:
+            F_dense = cfg.intermediate_size
+            layer_flops += 2 * 3 * D * F_dense
 
     embedding_flops = 2 * D * V
     forward_per_token = layer_flops + embedding_flops

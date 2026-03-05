@@ -17,10 +17,12 @@ from flax import nnx
 from huggingface_hub import snapshot_download
 from transformers import AutoConfig, AutoTokenizer, Qwen3ForCausalLM
 
+from tests.logits_assert import assert_logits_close
+from tests.real_weights import requires_real_weights
 from omegalax.distributed.mesh import mesh_rules_for
 from omegalax.text import api
 from omegalax.models.params_utils import map_to_bonsai_key
-from omegalax.models.qwen3.dense import params_dense
+from omegalax.models.qwen3 import loader as qwen3_loader
 
 
 torch.backends.cuda.matmul.allow_tf32 = False
@@ -28,9 +30,6 @@ torch.backends.cudnn.allow_tf32 = False
 
 MODEL_ID = "Qwen/Qwen3-0.6B"
 PROMPT = "Why is the sky blue instead of another color like purple?"
-
-LOGIT_ATOL = 2.0
-LOGIT_MEDIAN_ATOL = 0.2
 
 
 def _flatten_leaf_keys(tree: dict, prefix: str = "") -> list[str]:
@@ -52,6 +51,7 @@ def _get_value(tree: dict, dotted_key: str):
     return node
 
 
+@requires_real_weights
 class Qwen3MappingTest(absltest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -67,7 +67,7 @@ class Qwen3MappingTest(absltest.TestCase):
         ).to(cls.device).eval()
         cls.pad_id = cls.tokenizer.pad_token_id or 0
 
-        cls.jax_model = params_dense.create_qwen3_dense_from_safetensors(
+        cls.jax_model = qwen3_loader.create_qwen3_from_safetensors(
             cls.model_path,
             MODEL_ID,
             tp_size=1,
@@ -94,7 +94,7 @@ class Qwen3MappingTest(absltest.TestCase):
 
     def test_parameter_mapping_is_complete(self):
         # HF -> JAX mapping should cover every HF tensor key.
-        mapping = params_dense._get_key_and_transform_mapping(self.cfg)
+        mapping = qwen3_loader._get_key_mapping()
         unmapped: list[str] = []
         for f in Path(self.model_path).glob("*.safetensors"):
             with safetensors.safe_open(f, framework="numpy") as sf:
@@ -123,37 +123,13 @@ class Qwen3MappingTest(absltest.TestCase):
             self.assertEqual(abs_val.shape, loaded_val.shape, f"Shape mismatch at {key}")
             self.assertIsInstance(loaded_val, (jax.Array, np.ndarray))
 
-    def _assert_logits_close(self, jax_logits_BTV, hf_logits_BTV, mask):
-        jax_masked = jax_logits_BTV[mask]
-        hf_masked = hf_logits_BTV[mask]
-        abs_diff = np.abs(jax_masked - hf_masked)
-        max_abs = np.max(abs_diff)
-        median_abs = np.median(abs_diff)
-
-        self.assertLess(
-            max_abs, LOGIT_ATOL,
-            f"max abs diff {max_abs:.4f} >= {LOGIT_ATOL} (median={median_abs:.4f})"
-        )
-        self.assertLess(
-            median_abs, LOGIT_MEDIAN_ATOL,
-            f"median abs diff {median_abs:.4f} >= {LOGIT_MEDIAN_ATOL} (max={max_abs:.4f})"
-        )
-
-        jax_top1 = np.argmax(jax_masked, axis=-1)
-        hf_top1 = np.argmax(hf_masked, axis=-1)
-        match_rate = np.mean(jax_top1 == hf_top1)
-        self.assertGreater(
-            match_rate, 0.8,
-            f"top-1 prediction match rate {match_rate:.2%} <= 80%"
-        )
-
     def test_prefill_logits_match_hf(self):
         inputs = self._tokenize([PROMPT])
         with torch.no_grad():
             hf_logits_BTV = self.hf_model(**inputs).logits.float().cpu().numpy()
         jax_logits_BTV = self._jax_prefill_logits(inputs["input_ids"])
         mask = inputs["attention_mask"].cpu().numpy().astype(bool)
-        self._assert_logits_close(jax_logits_BTV, hf_logits_BTV, mask)
+        assert_logits_close(self, jax_logits_BTV, hf_logits_BTV, mask, top1_min_match=0.8)
 
     def test_prefill_logits_match_hf_batched(self):
         inputs = self._tokenize([PROMPT, "Who am I?"])
@@ -161,7 +137,7 @@ class Qwen3MappingTest(absltest.TestCase):
             hf_logits_BTV = self.hf_model(**inputs).logits.float().cpu().numpy()
         jax_logits_BTV = self._jax_prefill_logits(inputs["input_ids"])
         mask = inputs["attention_mask"].cpu().numpy().astype(bool)
-        self._assert_logits_close(jax_logits_BTV, hf_logits_BTV, mask)
+        assert_logits_close(self, jax_logits_BTV, hf_logits_BTV, mask, top1_min_match=0.8)
 
     def test_round_trip_preserves_prefill_logits(self):
         inputs = self._tokenize([PROMPT])

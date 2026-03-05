@@ -20,20 +20,15 @@ from transformers import Qwen3Config as HFQwen3Config
 from transformers import Qwen3ForCausalLM
 
 from omegalax.text import api
-from omegalax.models.qwen3.dense.config import make_dense_config
-from omegalax.models.qwen3.dense.params_dense import create_qwen3_dense_from_safetensors
+from omegalax.models.qwen3.config import make_config
+from omegalax.models.qwen3.loader import create_qwen3_from_safetensors
 
-jax.config.update("jax_default_matmul_precision", "highest")
+from tests.logits_assert import assert_logits_close
+
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
 
 _JNP_TO_TORCH = {jnp.float32: torch.float32, jnp.bfloat16: torch.bfloat16, jnp.float16: torch.float16}
-
-
-def _tolerances(jnp_dtype):
-    if jnp_dtype == jnp.float32:
-        return 1e-5, 1e-5
-    return 1e-2, 1e-2
 
 SMOKE_ID = "qwen3-smoke"
 
@@ -75,8 +70,8 @@ class Qwen3DenseSmokeTest(absltest.TestCase):
         with open(cfg_path, "w") as f:
             json.dump(HF_SMOKE_CFG.to_dict(), f)
 
-        cls.jax_cfg = make_dense_config(SMOKE_ID)
-        cls.jax_model = create_qwen3_dense_from_safetensors(
+        cls.jax_cfg = make_config(SMOKE_ID)
+        cls.jax_model = create_qwen3_from_safetensors(
             cls.tmpdir,
             SMOKE_ID,
             tp_size=1,
@@ -85,7 +80,6 @@ class Qwen3DenseSmokeTest(absltest.TestCase):
 
         torch_dtype = _JNP_TO_TORCH[cls.jax_cfg.dtype]
         cls.hf_model = hf_model.to(torch_dtype)
-        cls.RTOL, cls.ATOL = _tolerances(cls.jax_cfg.dtype)
         cls.pad_id = 0
 
     def _jax_prefill_logits(self, tokens_np: np.ndarray) -> np.ndarray:
@@ -110,9 +104,7 @@ class Qwen3DenseSmokeTest(absltest.TestCase):
         jax_logits_BTV = self._jax_prefill_logits(token_ids_BT)
 
         mask = attention_mask_BT.astype(bool)
-        max_abs_diff = np.max(np.abs(jax_logits_BTV[mask] - hf_logits_BTV[mask]))
-        print(f"\n  max_abs_diff = {max_abs_diff:.6e}")
-        np.testing.assert_allclose(jax_logits_BTV[mask], hf_logits_BTV[mask], rtol=self.RTOL, atol=self.ATOL)
+        assert_logits_close(self, jax_logits_BTV, hf_logits_BTV, mask)
 
     def test_prefill_logits_match_hf_batched(self):
         token_ids_a_BT = _random_input(batch_size=1, seq_len=16, vocab_size=HF_SMOKE_CFG.vocab_size)
@@ -133,9 +125,7 @@ class Qwen3DenseSmokeTest(absltest.TestCase):
         jax_logits_BTV = self._jax_prefill_logits(token_ids_BT)
 
         mask = attention_mask_BT.astype(bool)
-        max_abs_diff = np.max(np.abs(jax_logits_BTV[mask] - hf_logits_BTV[mask]))
-        print(f"\n  max_abs_diff = {max_abs_diff:.6e}")
-        np.testing.assert_allclose(jax_logits_BTV[mask], hf_logits_BTV[mask], rtol=self.RTOL, atol=self.ATOL)
+        assert_logits_close(self, jax_logits_BTV, hf_logits_BTV, mask)
 
     def test_round_trip_preserves_logits(self):
         from flax import nnx

@@ -16,6 +16,8 @@ from flax import nnx
 from huggingface_hub import snapshot_download
 from transformers import AutoConfig, AutoProcessor, Qwen3VLForConditionalGeneration
 
+from tests.logits_assert import assert_logits_close
+from tests.real_weights import requires_real_weights
 from omegalax.distributed.mesh import mesh_rules_for
 from omegalax.models.params_utils import map_to_bonsai_key
 from omegalax.models.qwen3_vl import create_qwen3_vl_from_safetensors
@@ -28,8 +30,6 @@ torch.backends.cudnn.allow_tf32 = False
 
 MODEL_ID = "Qwen/Qwen3-VL-2B-Instruct"
 PROMPT = "Why is the sky blue?"
-LOGIT_ATOL = 2.0
-LOGIT_MEDIAN_ATOL = 0.2
 
 
 def _flatten_leaf_keys(tree: dict, prefix: str = "") -> list[str]:
@@ -51,6 +51,7 @@ def _get_value(tree: dict, dotted_key: str):
     return node
 
 
+@requires_real_weights
 class Qwen3VLMappingTest(absltest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -102,26 +103,6 @@ class Qwen3VLMappingTest(absltest.TestCase):
             loaded_val = _get_value(loaded_dict, key)
             self.assertEqual(abs_val.shape, loaded_val.shape, f"Shape mismatch at {key}")
 
-    def _assert_logits_close(self, jax_masked, hf_masked):
-        abs_diff = np.abs(jax_masked - hf_masked)
-        max_abs = np.max(abs_diff)
-        median_abs = np.median(abs_diff)
-        self.assertLess(
-            max_abs, LOGIT_ATOL,
-            f"max abs diff {max_abs:.4f} >= {LOGIT_ATOL} (median={median_abs:.4f})"
-        )
-        self.assertLess(
-            median_abs, LOGIT_MEDIAN_ATOL,
-            f"median abs diff {median_abs:.4f} >= {LOGIT_MEDIAN_ATOL} (max={max_abs:.4f})"
-        )
-        jax_top1 = np.argmax(jax_masked, axis=-1)
-        hf_top1 = np.argmax(hf_masked, axis=-1)
-        match_rate = np.mean(jax_top1 == hf_top1)
-        self.assertGreater(
-            match_rate, 0.8,
-            f"top-1 prediction match rate {match_rate:.2%} <= 80%"
-        )
-
     def test_text_only_prefill_logits_match_hf(self):
         """Text-only forward (no images) should match HF model."""
         messages = [{"role": "user", "content": [{"type": "text", "text": PROMPT}]}]
@@ -140,7 +121,7 @@ class Qwen3VLMappingTest(absltest.TestCase):
         jax_logits_BTV = np.asarray(self.jax_model(token_ids_BT, attention_mask_BT), dtype=np.float32)
 
         mask = inputs["attention_mask"].cpu().numpy().astype(bool)
-        self._assert_logits_close(jax_logits_BTV[mask], hf_logits_BTV[mask])
+        assert_logits_close(self, jax_logits_BTV, hf_logits_BTV, mask, top1_min_match=0.8)
 
     def test_text_only_prefill_logits_batched(self):
         """Batched text-only forward should match HF model."""
@@ -167,7 +148,7 @@ class Qwen3VLMappingTest(absltest.TestCase):
         jax_logits_BTV = np.asarray(self.jax_model(token_ids_BT, attention_mask_BT), dtype=np.float32)
 
         mask = inputs["attention_mask"].cpu().numpy().astype(bool)
-        self._assert_logits_close(jax_logits_BTV[mask], hf_logits_BTV[mask])
+        assert_logits_close(self, jax_logits_BTV, hf_logits_BTV, mask, top1_min_match=0.8)
 
     def test_image_prefill_logits_match_hf(self):
         """Image+text forward should match HF model."""
@@ -206,7 +187,7 @@ class Qwen3VLMappingTest(absltest.TestCase):
         )
 
         mask = inputs["attention_mask"].cpu().numpy().astype(bool)
-        self._assert_logits_close(jax_logits_BTV[mask], hf_logits_BTV[mask])
+        assert_logits_close(self, jax_logits_BTV, hf_logits_BTV, mask, top1_min_match=0.8)
 
 
 if __name__ == "__main__":

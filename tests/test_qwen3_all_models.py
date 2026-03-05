@@ -25,6 +25,7 @@ from absl.testing import absltest, parameterized
 from huggingface_hub import snapshot_download
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
+from tests.real_weights import requires_real_weights
 from omegalax.text import api
 from omegalax.models.qwen3.params import create_qwen3_from_safetensors
 
@@ -52,6 +53,7 @@ def _make_params():
     ]
 
 
+@requires_real_weights
 class Qwen3AllModelsTest(parameterized.TestCase):
 
     @parameterized.named_parameters(_make_params())
