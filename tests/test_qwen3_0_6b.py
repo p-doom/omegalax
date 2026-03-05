@@ -1,9 +1,7 @@
 """End-to-end correctness test for Qwen3-0.6B against HuggingFace."""
 
-import os
 from pathlib import Path
 
-os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
 import jax
 import jax.numpy as jnp
@@ -21,7 +19,6 @@ from omegalax.models.params_utils import map_to_bonsai_key
 from omegalax.models.qwen3.dense import params_dense
 
 
-jax.config.update("jax_default_matmul_precision", "highest")
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
 
@@ -53,16 +50,16 @@ def _get_value(tree: dict, dotted_key: str):
 class Qwen3MappingTest(absltest.TestCase):
     @classmethod
     def setUpClass(cls):
-        os.environ.setdefault("JAX_PLATFORMS", "cpu")
         super().setUpClass()
+        cls.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         cls.cfg = api.registry.build_config(MODEL_ID)
         cls.model_path = snapshot_download(MODEL_ID)
         cls.tokenizer = AutoTokenizer.from_pretrained(cls.model_path)
         hf_cfg = AutoConfig.from_pretrained(cls.model_path)
         hf_cfg.tie_word_embeddings = cls.cfg.tie_word_embeddings
         cls.hf_model = Qwen3ForCausalLM.from_pretrained(
-            cls.model_path, config=hf_cfg, torch_dtype=torch.float32
-        ).eval()
+            cls.model_path, config=hf_cfg, torch_dtype=torch.bfloat16, attn_implementation="eager"
+        ).to(cls.device).eval()
         cls.pad_id = cls.tokenizer.pad_token_id or 0
 
         cls.jax_model = params_dense.create_qwen3_dense_from_safetensors(
@@ -82,7 +79,8 @@ class Qwen3MappingTest(absltest.TestCase):
             )
             for t in texts
         ]
-        return self.tokenizer(chat_texts, return_tensors="pt", padding=True, padding_side="left")
+        toks = self.tokenizer(chat_texts, return_tensors="pt", padding=True, padding_side="left")
+        return {k: v.to(self.device) for k, v in toks.items()}
 
     def _jax_prefill_logits(self, input_ids: torch.Tensor) -> np.ndarray:
         token_ids_BT = jnp.asarray(np.array(input_ids.cpu(), dtype=np.int32))
@@ -122,18 +120,18 @@ class Qwen3MappingTest(absltest.TestCase):
 
     def test_prefill_logits_match_hf(self):
         inputs = self._tokenize([PROMPT])
-        with torch.no_grad(), torch.autocast("cpu", dtype=torch.bfloat16):
+        with torch.no_grad():
             hf_logits_BTV = self.hf_model(**inputs).logits.float().cpu().numpy()
         jax_logits_BTV = self._jax_prefill_logits(inputs["input_ids"])
-        mask = inputs["attention_mask"].numpy().astype(bool)
+        mask = inputs["attention_mask"].cpu().numpy().astype(bool)
         np.testing.assert_allclose(jax_logits_BTV[mask], hf_logits_BTV[mask], rtol=RTOL, atol=ATOL)
 
     def test_prefill_logits_match_hf_batched(self):
         inputs = self._tokenize([PROMPT, "Who am I?"])
-        with torch.no_grad(), torch.autocast("cpu", dtype=torch.bfloat16):
+        with torch.no_grad():
             hf_logits_BTV = self.hf_model(**inputs).logits.float().cpu().numpy()
         jax_logits_BTV = self._jax_prefill_logits(inputs["input_ids"])
-        mask = inputs["attention_mask"].numpy().astype(bool)
+        mask = inputs["attention_mask"].cpu().numpy().astype(bool)
         np.testing.assert_allclose(jax_logits_BTV[mask], hf_logits_BTV[mask], rtol=RTOL, atol=ATOL)
 
     def test_round_trip_preserves_prefill_logits(self):
@@ -143,7 +141,7 @@ class Qwen3MappingTest(absltest.TestCase):
         graph_def, state = nnx.split(self.jax_model)
         pure_state = nnx.to_pure_dict(state)
         restored = nnx.merge(graph_def, pure_state)
-        restored_token_ids_BT = jnp.asarray(np.array(inputs["input_ids"]), dtype=jnp.int32)
+        restored_token_ids_BT = jnp.asarray(np.array(inputs["input_ids"].cpu()), dtype=jnp.int32)
         restored_logits_BTV, _ = api.forward(restored, restored_token_ids_BT, self.pad_id, self.cfg)
         restored_logits_BTV = np.asarray(restored_logits_BTV)
 

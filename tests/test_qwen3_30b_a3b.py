@@ -1,9 +1,5 @@
 """End-to-end correctness test for Qwen3-30B-A3B against HuggingFace."""
 
-import os
-
-os.environ.setdefault("JAX_PLATFORMS", "cpu")
-
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -15,7 +11,6 @@ from transformers import AutoTokenizer, Qwen3MoeForCausalLM
 from omegalax.text import api
 from omegalax.models.qwen3.moe.params_moe import create_qwen3_moe_from_safetensors
 
-jax.config.update("jax_default_matmul_precision", "highest")
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
 
@@ -30,6 +25,7 @@ class Qwen3_30B_A3B_Test(absltest.TestCase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
+        cls.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         cls.model_path = snapshot_download(MODEL_ID)
         cls.tokenizer = AutoTokenizer.from_pretrained(cls.model_path)
         cls.pad_id = cls.tokenizer.pad_token_id or 0
@@ -43,8 +39,8 @@ class Qwen3_30B_A3B_Test(absltest.TestCase):
         )
 
         cls.hf_model = Qwen3MoeForCausalLM.from_pretrained(
-            cls.model_path, torch_dtype=torch.float32,
-        ).eval()
+            cls.model_path, torch_dtype=torch.bfloat16, attn_implementation="eager",
+        ).to(cls.device).eval()
 
     def _tokenize(self, texts: list[str]):
         chat_texts = [
@@ -56,7 +52,8 @@ class Qwen3_30B_A3B_Test(absltest.TestCase):
             )
             for t in texts
         ]
-        return self.tokenizer(chat_texts, return_tensors="pt", padding=True, padding_side="left")
+        toks = self.tokenizer(chat_texts, return_tensors="pt", padding=True, padding_side="left")
+        return {k: v.to(self.device) for k, v in toks.items()}
 
     def _jax_prefill_logits(self, input_ids: torch.Tensor) -> np.ndarray:
         token_ids_BT = jnp.asarray(np.array(input_ids.cpu(), dtype=np.int32))
@@ -65,10 +62,10 @@ class Qwen3_30B_A3B_Test(absltest.TestCase):
 
     def test_prefill_logits_match_hf(self):
         inputs = self._tokenize([PROMPT])
-        with torch.no_grad(), torch.autocast("cpu", dtype=torch.bfloat16):
+        with torch.no_grad():
             hf_logits_BTV = self.hf_model(**inputs).logits.float().cpu().numpy()
         jax_logits_BTV = self._jax_prefill_logits(inputs["input_ids"])
-        mask = inputs["attention_mask"].numpy().astype(bool)
+        mask = inputs["attention_mask"].cpu().numpy().astype(bool)
 
         jax_masked = jax_logits_BTV[mask]
         hf_masked = hf_logits_BTV[mask]
