@@ -237,6 +237,7 @@ def run_training(
     replicated_rng_sharding = NamedSharding(mesh, P())
     root_rng = jax.device_put(jax.random.key(train_cfg.seed), replicated_rng_sharding)
     init_rng, rng = jax.random.split(root_rng)
+    init_rng = jax.device_put(init_rng, replicated_rng_sharding)
     if is_batch_partitioned_across_processes:
         rng = jax.random.fold_in(rng, jax.process_index())
     rng = jax.device_put(rng, replicated_rng_sharding)
@@ -314,6 +315,7 @@ def run_training(
 
     for step in range(start_step, train_cfg.num_steps):
         rng, batch_rng = jax.random.split(rng)
+        rng = jax.device_put(rng, replicated_rng_sharding)
         batch = make_synthetic_batch(batch_rng, local_batch_size, train_cfg.seq_len, model_cfg.vocab_size, pad_id)
         batch = text_api.shard_batch(batch, model_cfg, mesh)
         optimizer_state, metrics = train_step(optimizer_state, batch)
@@ -413,6 +415,8 @@ def run_sft(
     replicated_rng_sharding = NamedSharding(mesh, P())
     root_rng = jax.device_put(jax.random.key(train_cfg.seed), replicated_rng_sharding)
     init_rng, rng = jax.random.split(root_rng)
+    init_rng = jax.device_put(init_rng, replicated_rng_sharding)
+    rng = jax.device_put(rng, replicated_rng_sharding)
 
     is_primary_process = jax.process_index() == 0
 
