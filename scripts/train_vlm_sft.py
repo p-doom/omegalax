@@ -8,7 +8,11 @@ from pathlib import Path
 
 import jax
 import numpy as np
-from transformers import AutoProcessor
+
+# from transformers import AutoProcessor
+from transformers import AutoTokenizer, AutoImageProcessor, Qwen3VLProcessor
+from transformers.video_processing_utils import BaseVideoProcessor
+from transformers.processing_utils import ProcessorMixin
 
 from omegalax.data.collators import VLMSFTCollator
 from omegalax.data.jsonl import JSONLDataset
@@ -42,8 +46,15 @@ def _batched_iter(
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="SFT a VLM from a JSONL dataset.")
     p.add_argument("--model-id", type=str, required=True)
-    p.add_argument("--data-path", type=str, required=True, help="Path to JSONL training data.")
-    p.add_argument("--processor", type=str, default=None, help="HF processor name/path (defaults to --model-id).")
+    p.add_argument(
+        "--data-path", type=str, required=True, help="Path to JSONL training data."
+    )
+    p.add_argument(
+        "--processor",
+        type=str,
+        default=None,
+        help="HF processor name/path (defaults to --model-id).",
+    )
     p.add_argument("--max-length", type=int, default=512)
     p.add_argument("--num-steps", type=int, default=100)
     p.add_argument("--batch-size", type=int, default=4)
@@ -66,12 +77,36 @@ def main() -> None:
     args = parse_args()
     jax.distributed.initialize()
 
-    processor_name = args.processor or resolve_hf_repo_id(args.model_id)
-    processor = AutoProcessor.from_pretrained(processor_name)
+    # processor_name = args.processor or resolve_hf_repo_id(args.model_id)
+    # processor = AutoProcessor.from_pretrained(processor_name)
+    # collator = VLMSFTCollator(processor, max_length=args.max_length)
+
+    # dataset = JSONLDataset(args.data_path)
+    # data_iter = _batched_iter(dataset, collator, args.batch_size, shuffle=True, seed=args.seed)
+
+    processor_name = args.processor or args.model_id
+    tokenizer = AutoTokenizer.from_pretrained(processor_name)
+    image_processor = AutoImageProcessor.from_pretrained(processor_name)
+    video_processor = BaseVideoProcessor()
+
+    # Workaround: the lazy module creates a Placeholder for BaseVideoProcessor
+    # when torchvision is absent, making isinstance fail against the real class.
+    _orig_check = ProcessorMixin.check_argument_for_proper_class
+    ProcessorMixin.check_argument_for_proper_class = lambda self, *a, **kw: None
+    processor = Qwen3VLProcessor(
+        tokenizer=tokenizer,
+        image_processor=image_processor,
+        video_processor=video_processor,
+        chat_template=tokenizer.chat_template,
+    )
+    ProcessorMixin.check_argument_for_proper_class = _orig_check
+
     collator = VLMSFTCollator(processor, max_length=args.max_length)
 
     dataset = JSONLDataset(args.data_path)
-    data_iter = _batched_iter(dataset, collator, args.batch_size, shuffle=True, seed=args.seed)
+    data_iter = _batched_iter(
+        dataset, collator, args.batch_size, shuffle=True, seed=args.seed
+    )
 
     train_cfg = vlm_trainer.TrainConfig(
         seed=args.seed,
@@ -82,7 +117,9 @@ def main() -> None:
         weight_decay=args.weight_decay,
         print_every=args.log_every,
     )
-    save_dir = Path(args.save_dir) if args.save_dir else _default_save_dir(args.model_id)
+    save_dir = (
+        Path(args.save_dir) if args.save_dir else _default_save_dir(args.model_id)
+    )
     peak_tflops = resolve_peak_tflops(args.peak_tflops)
 
     _, last_metrics = vlm_trainer.run_sft(
@@ -100,7 +137,9 @@ def main() -> None:
         fsdp_size=args.fsdp_size,
     )
     if last_metrics:
-        print(f"finished step={int(last_metrics['step'])} loss={last_metrics['loss']:.4f}")
+        print(
+            f"finished step={int(last_metrics['step'])} loss={last_metrics['loss']:.4f}"
+        )
 
 
 if __name__ == "__main__":
