@@ -16,6 +16,7 @@ dependencies = [
   "jaxtyping",
   "optax",
   "orbax-checkpoint",
+  "Pillow",
   "safetensors",
   "transformers",
   "huggingface-hub",

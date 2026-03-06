@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import datetime
-import json
+from collections.abc import Iterator
 from pathlib import Path
 
 from flax import nnx
@@ -18,8 +18,8 @@ import orbax.checkpoint as ocp
 from omegalax.distributed.mesh import ensure_mesh, mesh_rules, required_batch_multiple
 from omegalax.text import api as text_api
 from omegalax.trainers.perf import (
+    maybe_log_step_metrics,
     per_device_flops_per_step,
-    step_metrics,
     StepTimer,
 )
 
@@ -74,6 +74,22 @@ def _local_batch_size(global_batch_size: int, seq_len: int, batch_spec: Partitio
     return sum((stop - start + step - 1) // step for start, stop, step in unique_batch_slices)
 
 
+def _masked_next_token_loss(
+    logits_BTV: jax.Array,
+    targets_BT: jax.Array,
+    mask_BT: jax.Array,
+) -> jax.Array:
+    logits_BTV = logits_BTV.astype(jnp.float32)
+    target_logits_BT = jnp.take_along_axis(logits_BTV, targets_BT[..., None], axis=-1)[..., 0]
+    max_logits_BT = jnp.max(logits_BTV, axis=-1)
+    stable_logits_BTV = logits_BTV - max_logits_BT[..., None]
+    logsumexp_BT = max_logits_BT + jnp.log(jnp.sum(jnp.exp(stable_logits_BTV), axis=-1))
+    nll_BT = logsumexp_BT - target_logits_BT
+    mask_BT = mask_BT.astype(jnp.float32)
+    denom = jnp.maximum(jnp.sum(mask_BT), 1.0)
+    return jnp.sum(nll_BT * mask_BT) / denom
+
+
 def make_train_step(
     cfg: text_api.TextConfig,
     optimizer_graphdef,
@@ -82,21 +98,6 @@ def make_train_step(
     *,
     pad_id: int = 0,
 ):
-    def _masked_next_token_loss(
-        logits_BTV: jax.Array,
-        targets_BT: jax.Array,
-        mask_BT: jax.Array,
-    ) -> jax.Array:
-        logits_BTV = logits_BTV.astype(jnp.float32)
-        target_logits_BT = jnp.take_along_axis(logits_BTV, targets_BT[..., None], axis=-1)[..., 0]
-        max_logits_BT = jnp.max(logits_BTV, axis=-1)
-        stable_logits_BTV = logits_BTV - max_logits_BT[..., None]
-        logsumexp_BT = max_logits_BT + jnp.log(jnp.sum(jnp.exp(stable_logits_BTV), axis=-1))
-        nll_BT = logsumexp_BT - target_logits_BT
-        mask_BT = mask_BT.astype(jnp.float32)
-        denom = jnp.maximum(jnp.sum(mask_BT), 1.0)
-        return jnp.sum(nll_BT * mask_BT) / denom
-
     def _train_step(optimizer_state, token_ids_BT: jax.Array):
         optimizer = nnx.merge(optimizer_graphdef, optimizer_state)
 
@@ -236,6 +237,7 @@ def run_training(
     replicated_rng_sharding = NamedSharding(mesh, P())
     root_rng = jax.device_put(jax.random.key(train_cfg.seed), replicated_rng_sharding)
     init_rng, rng = jax.random.split(root_rng)
+    init_rng = jax.device_put(init_rng, replicated_rng_sharding)
     if is_batch_partitioned_across_processes:
         rng = jax.random.fold_in(rng, jax.process_index())
     rng = jax.device_put(rng, replicated_rng_sharding)
@@ -291,46 +293,29 @@ def run_training(
     prev_metrics: tuple[int, dict[str, jax.Array], datetime.timedelta] | None = None
 
     def _log_prev_metrics(force: bool = False) -> None:
-        """Log metrics for the previous step to avoid per-step device syncs."""
-        nonlocal prev_metrics, last_metrics
+        nonlocal last_metrics
         if prev_metrics is None:
             return
-
         step_to_log, metrics_to_log, step_delta = prev_metrics
-        should_print = is_primary_process and log_every and step_to_log % log_every == 0
-        should_write = is_primary_process and log_path is not None
-        if not (should_print or should_write or force):
-            return
-
-        host_metrics = {k: float(v) for k, v in metrics_to_log.items()}
-        required_metric_keys = ("loss", "grad_norm")
-        missing = [k for k in required_metric_keys if k not in host_metrics]
-        if missing:
-            raise KeyError(f"Missing required metrics for logging: {missing}")
-        host_metrics["step"] = step_to_log
-        perf = step_metrics(
-            per_device_flops, step_delta, tokens_per_step, peak_tflops
+        result = maybe_log_step_metrics(
+            step_to_log,
+            metrics_to_log,
+            step_delta,
+            is_primary_process=is_primary_process,
+            log_every=log_every,
+            log_path=log_path,
+            force=force,
+            per_device_flops=per_device_flops,
+            tokens_per_step=tokens_per_step,
+            peak_tflops=peak_tflops,
+            extra_print_keys=[("token_accuracy", "acc={:.4f} ")],
         )
-        host_metrics.update(perf)
-        last_metrics = host_metrics
-
-        if should_print:
-            acc_fragment = ""
-            if "token_accuracy" in host_metrics:
-                acc_fragment = f"acc={host_metrics['token_accuracy']:.4f} "
-            print(
-                f"step={host_metrics['step']} loss={host_metrics['loss']:.4f} "
-                f"{acc_fragment}grad_norm={host_metrics['grad_norm']:.4f} "
-                f"step_s={host_metrics['step_time_s']:.3f} tok/s/dev={host_metrics['tokens_per_sec_per_device']:.0f} "
-                f"TFLOP/s/dev={host_metrics['tflops_per_device']:.2f} mfu={host_metrics['mfu']:.4f}"
-            )
-
-        if should_write:
-            with log_path.open("a") as f:
-                f.write(json.dumps(host_metrics) + "\n")
+        if result is not None:
+            last_metrics = result
 
     for step in range(start_step, train_cfg.num_steps):
         rng, batch_rng = jax.random.split(rng)
+        rng = jax.device_put(rng, replicated_rng_sharding)
         batch = make_synthetic_batch(batch_rng, local_batch_size, train_cfg.seq_len, model_cfg.vocab_size, pad_id)
         batch = text_api.shard_batch(batch, model_cfg, mesh)
         optimizer_state, metrics = train_step(optimizer_state, batch)
@@ -344,6 +329,178 @@ def run_training(
             _save_checkpoint(checkpoint_manager, optimizer_state, rng, step + 1)
 
     # Flush the final step's metrics.
+    _log_prev_metrics(force=True)
+
+    if checkpoint_manager is not None:
+        if last_metrics and (not save_every or last_metrics["step"] % save_every != 0):
+            _save_checkpoint(checkpoint_manager, optimizer_state, rng, int(last_metrics["step"]))
+        checkpoint_manager.wait_until_finished()
+        checkpoint_manager.close()
+
+    optimizer = nnx.merge(optimizer_graphdef, optimizer_state)
+    return optimizer, last_metrics
+
+
+def make_sft_train_step(
+    cfg: text_api.TextConfig,
+    optimizer_graphdef,
+    optimizer_state_sharding,
+    mesh: Mesh,
+    *,
+    pad_id: int = 0,
+):
+    """Build a JIT-compiled SFT train step that consumes a batch dict.
+
+    The batch dict must contain ``token_ids_BT``, ``attention_mask_BT``, and
+    ``loss_mask_BT`` (all ``(B, T)`` int32).
+    """
+    replicated = _replicated_sharding(mesh)
+
+    def _sft_step(optimizer_state, batch):
+        optimizer = nnx.merge(optimizer_graphdef, optimizer_state)
+        token_ids_BT = batch["token_ids_BT"]
+        loss_mask_BT = batch["loss_mask_BT"]
+
+        def loss_fn(model):
+            logits_BTV, aux_loss = text_api.forward(model, token_ids_BT, pad_id, cfg)
+            targets = token_ids_BT[:, 1:]
+            mask = loss_mask_BT[:, 1:].astype(jnp.float32)
+            loss = _masked_next_token_loss(logits_BTV[:, :-1, :], targets, mask) + aux_loss
+            supervised_tokens = jnp.sum(mask)
+            return loss, supervised_tokens
+
+        (loss, supervised_tokens), grads = nnx.value_and_grad(loss_fn, has_aux=True)(optimizer.model)
+        optimizer.update(grads)
+        metrics = {
+            "loss": loss,
+            "grad_norm": optax.tree.norm(grads),
+            "supervised_tokens": supervised_tokens,
+        }
+        return nnx.state(optimizer), metrics
+
+    @jax.jit(
+        out_shardings=(optimizer_state_sharding, replicated),
+        donate_argnums=(0,),
+    )
+    def sft_train_step(optimizer_state, batch):
+        return _sft_step(optimizer_state, batch)
+
+    return sft_train_step
+
+
+def run_sft(
+    model_id_or_cfg,
+    train_cfg: TrainConfig,
+    data_iter: Iterator[dict[str, np.ndarray]],
+    *,
+    save_dir: str | Path | None = None,
+    save_every: int = 0,
+    log_every: int = 1,
+    log_jsonl: str | Path | None = None,
+    resume: bool = False,
+    pad_id: int = 0,
+    peak_tflops: float | None = None,
+    tp_size: int | None = None,
+    fsdp_size: int | None = None,
+) -> tuple[nnx.ModelAndOptimizer, dict[str, float]]:
+    """SFT a text model from an external data iterator; returns final optimizer + last metrics.
+
+    ``data_iter`` must yield dicts with keys ``token_ids_BT``,
+    ``attention_mask_BT``, and ``loss_mask_BT`` (all numpy ``(B, T)``).
+    """
+    model_cfg = text_api.resolve_config(model_id_or_cfg)
+    mesh = ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size)
+    model_cfg = text_api.align_config_to_mesh(model_cfg, mesh)
+
+    replicated_rng_sharding = NamedSharding(mesh, P())
+    root_rng = jax.device_put(jax.random.key(train_cfg.seed), replicated_rng_sharding)
+    init_rng, rng = jax.random.split(root_rng)
+    init_rng = jax.device_put(init_rng, replicated_rng_sharding)
+    rng = jax.device_put(rng, replicated_rng_sharding)
+
+    is_primary_process = jax.process_index() == 0
+
+    model, model_cfg = init_model(model_cfg, init_rng, tp_size=tp_size, fsdp_size=fsdp_size)
+    with mesh_rules(mesh):
+        optimizer = build_optimizer(model, train_cfg)
+    optimizer_graphdef = nnx.graphdef(optimizer)
+    optimizer_state = nnx.state(optimizer)
+    replicated = NamedSharding(mesh, P())
+    optimizer_state_sharding = jax.tree.map(
+        lambda leaf: leaf.sharding if isinstance(leaf, jax.Array) else replicated,
+        optimizer_state,
+    )
+    sft_step = make_sft_train_step(
+        model_cfg,
+        optimizer_graphdef,
+        optimizer_state_sharding,
+        mesh,
+        pad_id=pad_id,
+    )
+
+    per_device_flops = per_device_flops_per_step(
+        model_cfg, train_cfg.seq_len, train_cfg.batch_size
+    )
+    timer = StepTimer(warmup=2)
+    tokens_per_step = train_cfg.seq_len * train_cfg.batch_size
+
+    checkpoint_manager = None
+    if save_dir is not None:
+        save_dir = Path(save_dir).expanduser().resolve()
+        if resume and not save_dir.exists():
+            raise ValueError(f"resume=True requires an existing checkpoint directory: {save_dir}")
+        save_dir.mkdir(parents=True, exist_ok=True)
+        checkpoint_manager = _make_checkpoint_manager(save_dir, save_interval=save_every or None)
+
+    log_path = Path(log_jsonl).expanduser() if log_jsonl else None
+    if log_path is not None:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    start_step = 0
+    if resume:
+        if checkpoint_manager is None:
+            raise ValueError("resume=True requires save_dir to be provided.")
+        if checkpoint_manager.latest_step() is None:
+            raise ValueError(f"resume=True but no checkpoints found under: {save_dir}")
+        optimizer_state, start_step, rng = _restore_checkpoint(checkpoint_manager, optimizer_state, rng)
+        rng = jax.device_put(rng, replicated_rng_sharding)
+
+    last_metrics: dict[str, float] = {}
+    prev_metrics: tuple[int, dict[str, jax.Array], datetime.timedelta] | None = None
+
+    def _log_prev_metrics(force: bool = False) -> None:
+        nonlocal last_metrics
+        if prev_metrics is None:
+            return
+        step_to_log, metrics_to_log, step_delta = prev_metrics
+        result = maybe_log_step_metrics(
+            step_to_log,
+            metrics_to_log,
+            step_delta,
+            is_primary_process=is_primary_process,
+            log_every=log_every,
+            log_path=log_path,
+            force=force,
+            per_device_flops=per_device_flops,
+            tokens_per_step=tokens_per_step,
+            peak_tflops=peak_tflops,
+            extra_print_keys=[("supervised_tokens", "sup_tok={:.0f} ")],
+        )
+        if result is not None:
+            last_metrics = result
+
+    for step in range(start_step, train_cfg.num_steps):
+        batch = next(data_iter)
+        batch = text_api.shard_batch_dict(batch, model_cfg, mesh)
+        optimizer_state, metrics = sft_step(optimizer_state, batch)
+        step_delta = timer.step()
+
+        _log_prev_metrics()
+        prev_metrics = (step + 1, metrics, step_delta)
+
+        if checkpoint_manager is not None and save_every and (step + 1) % save_every == 0:
+            _save_checkpoint(checkpoint_manager, optimizer_state, rng, step + 1)
+
     _log_prev_metrics(force=True)
 
     if checkpoint_manager is not None:

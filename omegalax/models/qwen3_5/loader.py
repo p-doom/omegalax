@@ -45,10 +45,14 @@ def _assert_config(cfg: Qwen3_5Config, hf_cfg: dict):
     _require("num_attention_heads", cfg.text_config.num_attention_heads, txt["num_attention_heads"])
     _require("num_key_value_heads", cfg.text_config.num_key_value_heads, txt["num_key_value_heads"])
     _require("head_dim", cfg.text_config.head_dim, txt["head_dim"])
-    num_experts = txt["num_experts"]
-    _require("num_experts", cfg.text_config.num_experts, num_experts)
-    _require("num_experts_per_tok", cfg.text_config.num_experts_per_tok, txt["num_experts_per_tok"])
-    _require("moe_intermediate_size", cfg.text_config.moe_intermediate_size, txt["moe_intermediate_size"])
+
+    if cfg.text_config.is_moe:
+        _require("num_experts", cfg.text_config.num_experts, txt["num_experts"])
+        _require("num_experts_per_tok", cfg.text_config.num_experts_per_tok, txt["num_experts_per_tok"])
+        _require("moe_intermediate_size", cfg.text_config.moe_intermediate_size, txt["moe_intermediate_size"])
+    else:
+        _require("intermediate_size", cfg.text_config.intermediate_size, txt["intermediate_size"])
+
     _require("rope_theta", cfg.text_config.rope_theta, rope_params["rope_theta"])
     _require("mrope_section", tuple(cfg.text_config.mrope_section), tuple(rope_params["mrope_section"]))
     _require("mrope_interleaved", cfg.text_config.mrope_interleaved, rope_params["mrope_interleaved"])
@@ -184,6 +188,7 @@ def _get_text_key_mapping():
         p + r"layers\." + L + r"\.linear_attn\.out_proj\.weight": (
             r"text.layers.\1.linear_attn.out_proj.kernel", Transform.LINEAR
         ),
+        # MoE shared expert
         p + r"layers\." + L + r"\.mlp\.shared_expert\.gate_proj\.weight": (
             r"text.layers.\1.mlp.shared_expert.gate_proj.kernel", Transform.LINEAR
         ),
@@ -192,6 +197,16 @@ def _get_text_key_mapping():
         ),
         p + r"layers\." + L + r"\.mlp\.shared_expert\.down_proj\.weight": (
             r"text.layers.\1.mlp.shared_expert.down_proj.kernel", Transform.LINEAR
+        ),
+        # Dense MLP (used when num_experts == 0)
+        p + r"layers\." + L + r"\.mlp\.gate_proj\.weight": (
+            r"text.layers.\1.mlp.gate_proj.kernel", Transform.LINEAR
+        ),
+        p + r"layers\." + L + r"\.mlp\.up_proj\.weight": (
+            r"text.layers.\1.mlp.up_proj.kernel", Transform.LINEAR
+        ),
+        p + r"layers\." + L + r"\.mlp\.down_proj\.weight": (
+            r"text.layers.\1.mlp.down_proj.kernel", Transform.LINEAR
         ),
         r"lm_head\.weight": (
             "lm_head.kernel", Transform.LINEAR
@@ -365,26 +380,27 @@ def create_qwen3_5_from_safetensors(
         gc.collect()
 
     # Assemble per-expert weights into batched format (per-expert HF format)
-    num_experts = cfg.text_config.num_experts
-    layer_projs: dict[int, dict[str, dict[int, np.ndarray]]] = defaultdict(lambda: defaultdict(dict))
-    for (layer_idx, proj_name), expert_tensors in expert_buf.items():
-        layer_projs[layer_idx][proj_name] = expert_tensors
+    if cfg.text_config.is_moe and expert_buf:
+        num_experts = cfg.text_config.num_experts
+        layer_projs: dict[int, dict[str, dict[int, np.ndarray]]] = defaultdict(lambda: defaultdict(dict))
+        for (layer_idx, proj_name), expert_tensors in expert_buf.items():
+            layer_projs[layer_idx][proj_name] = expert_tensors
 
-    for layer_idx, projs in layer_projs.items():
-        if "gate_proj" in projs and "up_proj" in projs:
-            gates = [projs["gate_proj"][i] for i in range(num_experts)]
-            ups = [projs["up_proj"][i] for i in range(num_experts)]
-            fused = np.stack(
-                [np.concatenate([g, u], axis=0) for g, u in zip(gates, ups)], axis=0
-            )
-            target = f"text.layers.{layer_idx}.mlp.gate_up_proj"
-            assign_to_state_dict(state_dict, target, jnp.asarray(fused), "experts.*.gate/up_proj")
+        for layer_idx, projs in layer_projs.items():
+            if "gate_proj" in projs and "up_proj" in projs:
+                gates = [projs["gate_proj"][i] for i in range(num_experts)]
+                ups = [projs["up_proj"][i] for i in range(num_experts)]
+                fused = np.stack(
+                    [np.concatenate([g, u], axis=0) for g, u in zip(gates, ups)], axis=0
+                )
+                target = f"text.layers.{layer_idx}.mlp.gate_up_proj"
+                assign_to_state_dict(state_dict, target, jnp.asarray(fused), "experts.*.gate/up_proj")
 
-        if "down_proj" in projs:
-            downs = [projs["down_proj"][i] for i in range(num_experts)]
-            stacked = np.stack(downs, axis=0)
-            target = f"text.layers.{layer_idx}.mlp.down_proj"
-            assign_to_state_dict(state_dict, target, jnp.asarray(stacked), "experts.*.down_proj")
+            if "down_proj" in projs:
+                downs = [projs["down_proj"][i] for i in range(num_experts)]
+                stacked = np.stack(downs, axis=0)
+                target = f"text.layers.{layer_idx}.mlp.down_proj"
+                assign_to_state_dict(state_dict, target, jnp.asarray(stacked), "experts.*.down_proj")
 
     check_conversion_errors(unmatched_hf_keys)
 

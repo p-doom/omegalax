@@ -52,11 +52,11 @@ class Qwen3RopeDtypeTest(_RopeDtypeTestBase):
 
     def test_rope_dtype_through_attention_forward(self):
         from flax import nnx
-        from omegalax.models.qwen3.dense.config import make_dense_config
+        from omegalax.models.qwen3.config import make_config
         from omegalax.models.qwen3 import attention as attn_mod
         from omegalax.models.qwen3 import rope as rope_mod
 
-        cfg = dataclasses.replace(make_dense_config("qwen3-smoke"), dtype=MODEL_DTYPE)
+        cfg = dataclasses.replace(make_config("qwen3-smoke"), dtype=MODEL_DTYPE)
         attn = attn_mod.Attention(cfg, rngs=nnx.Rngs(0))
 
         gen_calls, apply_calls = [], []

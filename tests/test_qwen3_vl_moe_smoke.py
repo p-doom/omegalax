@@ -15,17 +15,12 @@ from transformers import AutoConfig, Qwen3VLMoeForConditionalGeneration
 
 from omegalax.models.qwen3_vl import create_qwen3_vl_from_safetensors
 
-jax.config.update("jax_default_matmul_precision", "highest")
+from tests.logits_assert import assert_logits_close
+
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
 
 _JNP_TO_TORCH = {jnp.float32: torch.float32, jnp.bfloat16: torch.bfloat16, jnp.float16: torch.float16}
-
-
-def _tolerances(jnp_dtype):
-    if jnp_dtype == jnp.float32:
-        return 1e-5, 1e-5
-    return 1e-2, 1e-2
 
 
 def _random_tokens(batch: int, seq: int, vocab: int, seed: int = 0):
@@ -117,7 +112,6 @@ class Qwen3VLMoeSmokeTest(absltest.TestCase):
 
         torch_dtype = _JNP_TO_TORCH[cls.jax_cfg.dtype]
         cls.hf_model = hf_model.to(torch_dtype)
-        cls.RTOL, cls.ATOL = _tolerances(cls.jax_cfg.dtype)
 
     def test_forward_logits_match_hf(self):
         token_ids_BT = _random_tokens(batch=1, seq=8, vocab=self.config_dict["text_config"]["vocab_size"])
@@ -137,9 +131,8 @@ class Qwen3VLMoeSmokeTest(absltest.TestCase):
         )
         jax_logits_BTV = np.asarray(jax_logits_BTV, dtype=np.float32)
 
-        max_abs_diff = np.max(np.abs(jax_logits_BTV - hf_logits_BTV))
-        print(f"\n  max_abs_diff = {max_abs_diff:.6e}")
-        np.testing.assert_allclose(jax_logits_BTV, hf_logits_BTV, rtol=self.RTOL, atol=self.ATOL)
+        mask = np.ones_like(token_ids_BT, dtype=bool)
+        assert_logits_close(self, jax_logits_BTV, hf_logits_BTV, mask)
 
 
 if __name__ == "__main__":

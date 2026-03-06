@@ -1,23 +1,22 @@
-"""Qwen3 model family shared utilities and registry."""
+"""Qwen3 model family (dense + MoE)."""
 
 from . import registry
-from .registry import (
+from .config import (
     Qwen3Config,
-    Qwen3Dense,
-    Qwen3Moe,
-    build_config,
-    get_model_cls,
     list_qwen3_dense_model_ids,
     list_qwen3_moe_model_ids,
+    make_config,
 )
+from .model import Qwen3
+from .registry import build_config, get_model_cls
 
 __all__ = [
+    "Qwen3",
     "Qwen3Config",
-    "Qwen3Dense",
-    "Qwen3Moe",
     "build_config",
     "get_model_cls",
     "list_qwen3_dense_model_ids",
     "list_qwen3_moe_model_ids",
+    "make_config",
     "registry",
 ]

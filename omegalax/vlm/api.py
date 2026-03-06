@@ -15,6 +15,7 @@ from omegalax.models.sharding_runtime import (
     batch_partition_spec as runtime_batch_partition_spec,
     init_model_sharded,
     shard_batch as runtime_shard_batch,
+    shard_batch_dict as runtime_shard_batch_dict,
 )
 from omegalax.models.qwen3_vl import Qwen3VL, make_vl_config
 from omegalax.models.qwen3_vl.config import (
@@ -76,6 +77,15 @@ def shard_batch(token_ids_BT: jax.Array, cfg: VLMConfig, mesh: Mesh) -> jax.Arra
         return runtime_shard_batch(token_ids_BT, cfg.text_config.shd_cfg, mesh)
     if isinstance(cfg, Qwen3VLConfig):
         return runtime_shard_batch(token_ids_BT, cfg.shd_cfg, mesh)
+    raise TypeError(f"Unsupported VLM config type: {type(cfg)}")
+
+
+def shard_batch_dict(batch: dict, cfg: VLMConfig, mesh: Mesh) -> dict[str, jax.Array]:
+    """Shard every array in a batch dict (batch dim sharded, rest replicated)."""
+    if isinstance(cfg, Qwen3_5Config):
+        return runtime_shard_batch_dict(batch, cfg.text_config.shd_cfg, mesh)
+    if isinstance(cfg, Qwen3VLConfig):
+        return runtime_shard_batch_dict(batch, cfg.shd_cfg, mesh)
     raise TypeError(f"Unsupported VLM config type: {type(cfg)}")
 
 

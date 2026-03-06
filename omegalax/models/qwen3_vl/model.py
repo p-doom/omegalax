@@ -30,14 +30,19 @@ class RMSNorm(nnx.Module):
         rngs: nnx.Rngs,
         sharding: tuple[str | None, ...] = ("hidden",),
     ):
-        self.scale = nnx.Param(jnp.ones(dim), sharding=sharding)
+        self.scale = nnx.Param(
+            nnx.initializers.ones_init()(rngs.params(), (dim,)),
+            sharding=sharding,
+        )
         self.eps = eps
 
     def __call__(self, x: jax.Array) -> jax.Array:
         dtype = x.dtype
-        variance = jnp.mean(x.astype(jnp.float32) ** 2, axis=-1, keepdims=True)
-        normed = x * jax.lax.rsqrt(variance + self.eps)
-        return (self.scale[...] * normed).astype(dtype)
+        x_f32 = x.astype(jnp.float32)
+        variance = jnp.mean(x_f32 ** 2, axis=-1, keepdims=True)
+        normed = jnp.astype(x_f32 * jax.lax.rsqrt(variance + self.eps), dtype)
+        scale = jnp.astype(self.scale[...], dtype)
+        return scale * normed
 
 
 def apply_rope(x_BTHK: jax.Array, sin_BTK: jax.Array, cos_BTK: jax.Array) -> jax.Array:
@@ -241,24 +246,29 @@ class TextMoEFeedForward(nnx.Module):
             )
         topk_weights_BTk = topk_weights_BTk.astype(probs_BTE.dtype)
 
+        compute_dtype = hidden_BTD.dtype
+        gate_proj_EDF = jnp.astype(self.gate_proj[...], compute_dtype)
+        up_proj_EDF = jnp.astype(self.up_proj[...], compute_dtype)
+        down_proj_EFD = jnp.astype(self.down_proj[...], compute_dtype)
+
         dense_hidden_BTD = reshard(hidden_BTD, P(batch_axis, None, None))
         gate_BTEF = jnp.einsum(
             "BTD,EDF->BTEF",
             dense_hidden_BTD,
-            self.gate_proj[...],
+            gate_proj_EDF,
             out_sharding=P(batch_axis, None, None, ff_axis),
         )
         up_BTEF = jnp.einsum(
             "BTD,EDF->BTEF",
             dense_hidden_BTD,
-            self.up_proj[...],
+            up_proj_EDF,
             out_sharding=P(batch_axis, None, None, ff_axis),
         )
         expert_hidden_BTEF = nnx.silu(gate_BTEF) * up_BTEF
         expert_out_BTED = jnp.einsum(
             "BTEF,EFD->BTED",
             expert_hidden_BTEF,
-            self.down_proj[...],
+            down_proj_EFD,
             out_sharding=P(batch_axis, None, None, hidden_axis),
         )
 
@@ -418,7 +428,10 @@ class Qwen3VL(nnx.Module):
         if pixel_values is not None and image_grid_thw is not None:
             image_features_ND, deepstack_features = self.vision(pixel_values, image_grid_thw)
 
-        inputs_embeds_BTD = self.text.embedder.embedding[...].at[(token_ids_BT,)].get(out_sharding=self.text.out_emb_shd)
+        inputs_embeds_BTD = jnp.astype(
+            self.text.embedder.embedding[...].at[(token_ids_BT,)].get(out_sharding=self.text.out_emb_shd),
+            self.text.embedder.dtype,
+        )
 
         if image_features_ND is not None:
             image_mask_BT = token_ids_BT == cfg.image_token_id

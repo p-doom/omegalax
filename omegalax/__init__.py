@@ -4,7 +4,7 @@ from .trainers import text as text_trainer, vlm as vlm_trainer
 from .vlm import api as vlm_api
 from .models.qwen3.cache import Cache, LayerCache
 from .models.shard_config import ShardConfig
-from .models.qwen3.registry import list_qwen3_dense_model_ids, list_qwen3_moe_model_ids
+from .models.qwen3.config import list_qwen3_dense_model_ids, list_qwen3_moe_model_ids
 from .models.qwen3_5 import (
     Qwen3_5Config,
     Qwen3_5ForCausalLM,

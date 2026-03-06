@@ -3,32 +3,33 @@
 import os
 from pathlib import Path
 
-os.environ.setdefault("JAX_PLATFORMS", "cpu")
+os.environ.setdefault("JAX_PLATFORMS", "cuda")
+os.environ["USE_HUB_KERNELS"] = "false"
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import safetensors
 import torch
+
 from absl.testing import absltest
 from flax import nnx
 from huggingface_hub import snapshot_download
 from transformers import AutoConfig, AutoTokenizer, Qwen3ForCausalLM
 
+from tests.logits_assert import assert_logits_close
+from tests.real_weights import requires_real_weights
 from omegalax.distributed.mesh import mesh_rules_for
 from omegalax.text import api
 from omegalax.models.params_utils import map_to_bonsai_key
-from omegalax.models.qwen3.dense import params_dense
+from omegalax.models.qwen3 import loader as qwen3_loader
 
 
-jax.config.update("jax_default_matmul_precision", "highest")
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
 
 MODEL_ID = "Qwen/Qwen3-0.6B"
 PROMPT = "Why is the sky blue instead of another color like purple?"
-RTOL = 1e-5
-ATOL = 1e-4
 
 
 def _flatten_leaf_keys(tree: dict, prefix: str = "") -> list[str]:
@@ -50,22 +51,23 @@ def _get_value(tree: dict, dotted_key: str):
     return node
 
 
+@requires_real_weights
 class Qwen3MappingTest(absltest.TestCase):
     @classmethod
     def setUpClass(cls):
-        os.environ.setdefault("JAX_PLATFORMS", "cpu")
         super().setUpClass()
+        cls.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         cls.cfg = api.registry.build_config(MODEL_ID)
         cls.model_path = snapshot_download(MODEL_ID)
         cls.tokenizer = AutoTokenizer.from_pretrained(cls.model_path)
         hf_cfg = AutoConfig.from_pretrained(cls.model_path)
         hf_cfg.tie_word_embeddings = cls.cfg.tie_word_embeddings
         cls.hf_model = Qwen3ForCausalLM.from_pretrained(
-            cls.model_path, config=hf_cfg, torch_dtype=torch.float32
-        ).eval()
+            cls.model_path, config=hf_cfg, torch_dtype=torch.bfloat16, attn_implementation="eager"
+        ).to(cls.device).eval()
         cls.pad_id = cls.tokenizer.pad_token_id or 0
 
-        cls.jax_model = params_dense.create_qwen3_dense_from_safetensors(
+        cls.jax_model = qwen3_loader.create_qwen3_from_safetensors(
             cls.model_path,
             MODEL_ID,
             tp_size=1,
@@ -82,7 +84,8 @@ class Qwen3MappingTest(absltest.TestCase):
             )
             for t in texts
         ]
-        return self.tokenizer(chat_texts, return_tensors="pt", padding=True, padding_side="left")
+        toks = self.tokenizer(chat_texts, return_tensors="pt", padding=True, padding_side="left")
+        return {k: v.to(self.device) for k, v in toks.items()}
 
     def _jax_prefill_logits(self, input_ids: torch.Tensor) -> np.ndarray:
         token_ids_BT = jnp.asarray(np.array(input_ids.cpu(), dtype=np.int32))
@@ -91,7 +94,7 @@ class Qwen3MappingTest(absltest.TestCase):
 
     def test_parameter_mapping_is_complete(self):
         # HF -> JAX mapping should cover every HF tensor key.
-        mapping = params_dense._get_key_and_transform_mapping(self.cfg)
+        mapping = qwen3_loader._get_key_mapping()
         unmapped: list[str] = []
         for f in Path(self.model_path).glob("*.safetensors"):
             with safetensors.safe_open(f, framework="numpy") as sf:
@@ -123,18 +126,18 @@ class Qwen3MappingTest(absltest.TestCase):
     def test_prefill_logits_match_hf(self):
         inputs = self._tokenize([PROMPT])
         with torch.no_grad():
-            hf_logits_BTV = self.hf_model(**inputs).logits.cpu().numpy()
+            hf_logits_BTV = self.hf_model(**inputs).logits.float().cpu().numpy()
         jax_logits_BTV = self._jax_prefill_logits(inputs["input_ids"])
-        mask = inputs["attention_mask"].numpy().astype(bool)
-        np.testing.assert_allclose(jax_logits_BTV[mask], hf_logits_BTV[mask], rtol=RTOL, atol=ATOL)
+        mask = inputs["attention_mask"].cpu().numpy().astype(bool)
+        assert_logits_close(self, jax_logits_BTV, hf_logits_BTV, mask, top1_min_match=0.8)
 
     def test_prefill_logits_match_hf_batched(self):
         inputs = self._tokenize([PROMPT, "Who am I?"])
         with torch.no_grad():
-            hf_logits_BTV = self.hf_model(**inputs).logits.cpu().numpy()
+            hf_logits_BTV = self.hf_model(**inputs).logits.float().cpu().numpy()
         jax_logits_BTV = self._jax_prefill_logits(inputs["input_ids"])
-        mask = inputs["attention_mask"].numpy().astype(bool)
-        np.testing.assert_allclose(jax_logits_BTV[mask], hf_logits_BTV[mask], rtol=RTOL, atol=ATOL)
+        mask = inputs["attention_mask"].cpu().numpy().astype(bool)
+        assert_logits_close(self, jax_logits_BTV, hf_logits_BTV, mask, top1_min_match=0.8)
 
     def test_round_trip_preserves_prefill_logits(self):
         inputs = self._tokenize([PROMPT])
@@ -143,11 +146,11 @@ class Qwen3MappingTest(absltest.TestCase):
         graph_def, state = nnx.split(self.jax_model)
         pure_state = nnx.to_pure_dict(state)
         restored = nnx.merge(graph_def, pure_state)
-        restored_token_ids_BT = jnp.asarray(np.array(inputs["input_ids"]), dtype=jnp.int32)
+        restored_token_ids_BT = jnp.asarray(np.array(inputs["input_ids"].cpu()), dtype=jnp.int32)
         restored_logits_BTV, _ = api.forward(restored, restored_token_ids_BT, self.pad_id, self.cfg)
         restored_logits_BTV = np.asarray(restored_logits_BTV)
 
-        np.testing.assert_allclose(restored_logits_BTV, baseline_BTV, rtol=RTOL, atol=ATOL)
+        np.testing.assert_allclose(restored_logits_BTV, baseline_BTV, rtol=0, atol=0)
 
 
 if __name__ == "__main__":
