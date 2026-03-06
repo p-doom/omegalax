@@ -10,7 +10,7 @@ import jax
 import numpy as np
 from transformers import AutoTokenizer
 
-from omegalax.data.collators import TextSFTCollator
+from omegalax.data.collator_qwen3 import TextSFTCollator
 from omegalax.data.jsonl import JSONLDataset
 from omegalax.registry import resolve_hf_repo_id
 from omegalax.trainers import text as text_trainer

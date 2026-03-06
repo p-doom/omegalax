@@ -11,7 +11,9 @@ from absl.testing import absltest
 import numpy as np
 from transformers import AutoTokenizer
 
-from omegalax.data.collators import TextSFTCollator, _build_assistant_loss_mask
+from transformers import AutoImageProcessor
+
+from omegalax.data.collator_qwen3 import TextSFTCollator, VLMSFTCollator, _build_assistant_loss_mask, _build_chatml_text
 from omegalax.data.jsonl import JSONLDataset
 
 
@@ -213,6 +215,186 @@ class JSONLDatasetTest(absltest.TestCase):
         examples = list(ds.iter_examples(shuffle=False, seed=0, process_split=False, num_epochs=2))
         self.assertEqual(len(examples), 6)
         os.unlink(f.name)
+
+
+class BuildChatMLTextTest(absltest.TestCase):
+    """Tests for _build_chatml_text ChatML output format."""
+
+    def setUp(self):
+        super().setUp()
+        self.tokenizer = _make_tokenizer()
+
+    def test_text_only_single_turn(self):
+        messages = [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi!"},
+        ]
+        result = _build_chatml_text(messages, image_grids=[], merge_size=2)
+        expected = (
+            "<|im_start|>user\nHello<|im_end|>\n"
+            "<|im_start|>assistant\nHi!<|im_end|>\n"
+        )
+        self.assertEqual(result, expected)
+
+    def test_text_only_multi_turn(self):
+        messages = [
+            {"role": "user", "content": "A"},
+            {"role": "assistant", "content": "B"},
+            {"role": "user", "content": "C"},
+            {"role": "assistant", "content": "D"},
+        ]
+        result = _build_chatml_text(messages, image_grids=[], merge_size=2)
+        expected = (
+            "<|im_start|>user\nA<|im_end|>\n"
+            "<|im_start|>assistant\nB<|im_end|>\n"
+            "<|im_start|>user\nC<|im_end|>\n"
+            "<|im_start|>assistant\nD<|im_end|>\n"
+        )
+        self.assertEqual(result, expected)
+
+    def test_with_system_prompt(self):
+        messages = [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi!"},
+        ]
+        result = _build_chatml_text(messages, image_grids=[], merge_size=2)
+        expected = (
+            "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
+            "<|im_start|>user\nHello<|im_end|>\n"
+            "<|im_start|>assistant\nHi!<|im_end|>\n"
+        )
+        self.assertEqual(result, expected)
+
+    def test_image_tokens_inserted(self):
+        messages = [
+            {"role": "user", "content": [
+                {"type": "image"},
+                {"type": "text", "text": "Describe."},
+            ]},
+            {"role": "assistant", "content": "A cat."},
+        ]
+        grid = (1, 8, 8)
+        merge_size = 2
+        n_tokens = 1 * (8 // 2) * (8 // 2)  # = 16
+
+        result = _build_chatml_text(messages, image_grids=[grid], merge_size=merge_size)
+        self.assertIn("<|vision_start|>", result)
+        self.assertIn("<|vision_end|>", result)
+        self.assertEqual(result.count("<|image_pad|>"), n_tokens)
+
+    def test_multi_image(self):
+        messages = [
+            {"role": "user", "content": [
+                {"type": "image"},
+                {"type": "image"},
+                {"type": "text", "text": "Compare."},
+            ]},
+        ]
+        grids = [(1, 4, 4), (1, 8, 8)]
+        merge_size = 2
+        n1 = 1 * (4 // 2) * (4 // 2)  # = 4
+        n2 = 1 * (8 // 2) * (8 // 2)  # = 16
+
+        result = _build_chatml_text(messages, image_grids=grids, merge_size=merge_size)
+        self.assertEqual(result.count("<|image_pad|>"), n1 + n2)
+        self.assertEqual(result.count("<|vision_start|>"), 2)
+        self.assertEqual(result.count("<|vision_end|>"), 2)
+
+    def test_encodes_correctly(self):
+        """Verify that tokenizer.encode on our ChatML text produces valid token IDs."""
+        messages = [
+            {"role": "user", "content": [
+                {"type": "image"},
+                {"type": "text", "text": "What is this?"},
+            ]},
+            {"role": "assistant", "content": "A photo."},
+        ]
+        grid = (1, 4, 4)
+        text = _build_chatml_text(messages, image_grids=[grid], merge_size=2)
+        ids = self.tokenizer.encode(text, add_special_tokens=False)
+
+        im_start_id = self.tokenizer.convert_tokens_to_ids("<|im_start|>")
+        im_end_id = self.tokenizer.convert_tokens_to_ids("<|im_end|>")
+        image_pad_id = self.tokenizer.convert_tokens_to_ids("<|image_pad|>")
+
+        self.assertEqual(ids.count(im_start_id), 2)
+        self.assertEqual(ids.count(im_end_id), 2)
+        n_expected = 1 * (4 // 2) * (4 // 2)  # = 4
+        self.assertEqual(ids.count(image_pad_id), n_expected)
+
+
+class VLMSFTCollatorTest(absltest.TestCase):
+    """Tests for the VLM SFT collator with real images."""
+
+    def setUp(self):
+        super().setUp()
+        self.tokenizer = _make_tokenizer()
+        self.image_processor = AutoImageProcessor.from_pretrained(
+            "Qwen/Qwen3-VL-2B-Instruct", use_fast=False, # force the numpy codepath
+        )
+        self.max_length = 256
+        self.collator = VLMSFTCollator(
+            self.tokenizer, max_length=self.max_length,
+            image_processor=self.image_processor,
+        )
+
+    def test_text_only_example(self):
+        examples = [
+            {"messages": [
+                {"role": "user", "content": "Hello"},
+                {"role": "assistant", "content": "Hi!"},
+            ]},
+        ]
+        batch = self.collator(examples)
+        self.assertIn("token_ids_BT", batch)
+        self.assertEqual(batch["token_ids_BT"].shape, (1, self.max_length))
+        self.assertNotIn("pixel_values", batch)
+        self.assertNotIn("image_grid_thw", batch)
+
+    def test_multimodal_example(self):
+        from PIL import Image
+        img = Image.new("RGB", (200, 200), color=(100, 150, 200))
+        examples = [
+            {"messages": [
+                {"role": "user", "content": [
+                    {"type": "image", "image": img},
+                    {"type": "text", "text": "Describe."},
+                ]},
+                {"role": "assistant", "content": "A solid color image."},
+            ]},
+        ]
+        batch = self.collator(examples)
+        self.assertIn("token_ids_BT", batch)
+        self.assertIn("pixel_values", batch)
+        self.assertIn("image_grid_thw", batch)
+        self.assertEqual(batch["token_ids_BT"].shape, (1, self.max_length))
+        self.assertEqual(batch["image_grid_thw"].shape[1], 3)
+
+        image_pad_id = self.tokenizer.convert_tokens_to_ids("<|image_pad|>")
+        token_ids = batch["token_ids_BT"][0]
+        n_pad = int(np.sum(token_ids == image_pad_id))
+        grid = batch["image_grid_thw"][0]
+        expected_pads = int(grid[0]) * (int(grid[1]) // 2) * (int(grid[2]) // 2)
+        self.assertEqual(n_pad, expected_pads)
+
+    def test_loss_mask_on_assistant_only(self):
+        from PIL import Image
+        img = Image.new("RGB", (100, 100), color=(50, 50, 50))
+        examples = [
+            {"messages": [
+                {"role": "user", "content": [
+                    {"type": "image", "image": img},
+                    {"type": "text", "text": "What?"},
+                ]},
+                {"role": "assistant", "content": "Nothing special."},
+            ]},
+        ]
+        batch = self.collator(examples)
+        mask = batch["loss_mask_BT"][0]
+        self.assertGreater(np.sum(mask), 0)
+        attn = batch["attention_mask_BT"][0]
+        self.assertLess(np.sum(mask), np.sum(attn))
 
 
 if __name__ == "__main__":

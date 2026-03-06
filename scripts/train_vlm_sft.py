@@ -8,9 +8,9 @@ from pathlib import Path
 
 import jax
 import numpy as np
-from transformers import AutoProcessor
+from transformers import AutoImageProcessor, AutoTokenizer
 
-from omegalax.data.collators import VLMSFTCollator
+from omegalax.data.collator_qwen3 import VLMSFTCollator
 from omegalax.data.jsonl import JSONLDataset
 from omegalax.trainers import vlm as vlm_trainer
 from omegalax.registry import resolve_hf_repo_id
@@ -43,7 +43,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="SFT a VLM from a JSONL dataset.")
     p.add_argument("--model-id", type=str, required=True)
     p.add_argument("--data-path", type=str, required=True, help="Path to JSONL training data.")
-    p.add_argument("--processor", type=str, default=None, help="HF processor name/path (defaults to --model-id).")
+    p.add_argument("--processor", type=str, default=None, help="HF repo to read tokenizer and image config from (defaults to --model-id).")
     p.add_argument("--max-length", type=int, default=512)
     p.add_argument("--num-steps", type=int, default=100)
     p.add_argument("--batch-size", type=int, default=4)
@@ -66,9 +66,10 @@ def main() -> None:
     args = parse_args()
     jax.distributed.initialize()
 
-    processor_name = args.processor or resolve_hf_repo_id(args.model_id)
-    processor = AutoProcessor.from_pretrained(processor_name)
-    collator = VLMSFTCollator(processor, max_length=args.max_length)
+    repo_id = args.processor or resolve_hf_repo_id(args.model_id)
+    tokenizer = AutoTokenizer.from_pretrained(repo_id)
+    image_processor = AutoImageProcessor.from_pretrained(repo_id, use_fast=False)
+    collator = VLMSFTCollator(tokenizer, max_length=args.max_length, image_processor=image_processor)
 
     dataset = JSONLDataset(args.data_path)
     data_iter = _batched_iter(dataset, collator, args.batch_size, shuffle=True, seed=args.seed)
