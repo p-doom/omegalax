@@ -346,6 +346,7 @@ def make_sft_train_step(cfg, pad_id: int = 0):
         loss_mask_BT = batch["loss_mask_BT"]
         pixel_values = batch.get("pixel_values")
         image_grid_thw = batch.get("image_grid_thw")
+        position_ids_ZBT = batch.get("position_ids_ZBT")
 
         def loss_fn(model):
             logits_BTV, aux_loss = vlm_api.forward(
@@ -356,6 +357,7 @@ def make_sft_train_step(cfg, pad_id: int = 0):
                 attention_mask_BT=attention_mask_BT,
                 pixel_values=pixel_values,
                 image_grid_thw=image_grid_thw,
+                position_ids_ZBT=position_ids_ZBT,
             )
             targets = token_ids_BT[:, 1:]
             mask = loss_mask_BT[:, 1:].astype(jnp.float32)

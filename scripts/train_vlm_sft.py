@@ -68,6 +68,7 @@ def main() -> None:
 
     repo_id = args.processor or resolve_hf_repo_id(args.model_id)
     tokenizer = AutoTokenizer.from_pretrained(repo_id)
+    assert args.max_length <= tokenizer.model_max_length, f"--max-length={args.max_length} exceeds tokenizer.model_max_length={tokenizer.model_max_length}"
     image_processor = AutoImageProcessor.from_pretrained(repo_id, use_fast=False)
     collator = VLMSFTCollator(tokenizer, max_length=args.max_length, image_processor=image_processor)
 

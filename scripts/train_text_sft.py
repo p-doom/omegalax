@@ -68,6 +68,7 @@ def main() -> None:
 
     tokenizer_name = args.tokenizer or resolve_hf_repo_id(args.model_id)
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+    assert args.max_length <= tokenizer.model_max_length, f"--max-length={args.max_length} exceeds tokenizer.model_max_length={tokenizer.model_max_length}"
     collator = TextSFTCollator(tokenizer, max_length=args.max_length)
     dataset = JSONLDataset(args.data_path)
     data_iter = _batched_iter(dataset, collator, args.batch_size, shuffle=True, seed=args.seed)

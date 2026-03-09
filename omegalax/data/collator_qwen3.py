@@ -180,7 +180,11 @@ class VLMSFTCollator:
     HF image processor (slow path, NumPy backend).
 
     Outputs ``{"token_ids_BT", "attention_mask_BT", "loss_mask_BT"}`` plus
-    ``"pixel_values"`` and ``"image_grid_thw"`` when images are present.
+    ``"pixel_values"``, ``"image_grid_thw"``, and ``"position_ids_ZBT"``
+    when images are present.
+
+    ``position_ids_ZBT`` is precomputed here (on CPU, via numpy) so the
+    model's ``get_rope_index`` never needs to run inside ``jax.jit``.
     """
 
     def __init__(
@@ -198,7 +202,13 @@ class VLMSFTCollator:
         self._im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
         self._assistant_token_id = tokenizer.encode("assistant", add_special_tokens=False)[0]
 
+        self._image_token_id = tokenizer.convert_tokens_to_ids("<|image_pad|>")
+        self._video_token_id = tokenizer.convert_tokens_to_ids("<|video_pad|>")
+        self._vision_start_token_id = tokenizer.convert_tokens_to_ids("<|vision_start|>")
+
     def __call__(self, examples: Sequence[dict[str, Any]]) -> dict[str, np.ndarray]:
+        from omegalax.models.qwen3_vl.model import get_rope_index
+
         batch_ids: list[np.ndarray] = []
         batch_attn: list[np.ndarray] = []
         batch_mask: list[np.ndarray] = []
@@ -254,6 +264,18 @@ class VLMSFTCollator:
         if has_images and all_pixel_values:
             result["pixel_values"] = np.concatenate(all_pixel_values, axis=0)
         if has_images and all_grid_thw:
-            result["image_grid_thw"] = np.concatenate(all_grid_thw, axis=0)
+            image_grid_thw = np.concatenate(all_grid_thw, axis=0)
+            result["image_grid_thw"] = image_grid_thw
+
+            position_ids, _ = get_rope_index(
+                result["token_ids_BT"],
+                image_grid_thw=image_grid_thw,
+                attention_mask=result["attention_mask_BT"],
+                spatial_merge_size=self.image_processor.merge_size,
+                image_token_id=self._image_token_id,
+                video_token_id=self._video_token_id,
+                vision_start_token_id=self._vision_start_token_id,
+            )
+            result["position_ids_ZBT"] = position_ids.astype(np.int32)
 
         return result
