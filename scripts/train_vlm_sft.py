@@ -57,6 +57,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--save-dir", type=str, default=None)
     p.add_argument("--save-every", type=int, default=50)
     p.add_argument("--log-every", type=int, default=10)
+    p.add_argument("--tensorboard-dir", type=str, default=None)
+    p.add_argument("--profile-start", type=int, default=3, help="Step to start profiling (after JIT warmup).")
+    p.add_argument("--profile-end", type=int, default=8, help="Step to stop profiling.")
     p.add_argument("--log-jsonl", type=str, default=None)
     p.add_argument("--resume", action="store_true")
     p.add_argument("--pad-id", type=int, default=0)
@@ -107,10 +110,11 @@ def main() -> None:
         peak_tflops=peak_tflops,
         tp_size=args.tp_size,
         fsdp_size=args.fsdp_size,
+        profile_dir=args.tensorboard_dir,
+        profile_steps=(args.profile_start, args.profile_end),
     )
     if last_metrics:
         print(f"finished step={int(last_metrics['step'])} loss={last_metrics['loss']:.4f}")
-
 
 if __name__ == "__main__":
     main()

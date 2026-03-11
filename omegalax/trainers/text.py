@@ -402,6 +402,8 @@ def run_sft(
     peak_tflops: float | None = None,
     tp_size: int | None = None,
     fsdp_size: int | None = None,
+    profile_dir: str | Path | None = None,
+    profile_steps: tuple[int, int] = (3, 8),
 ) -> tuple[nnx.ModelAndOptimizer, dict[str, float]]:
     """SFT a text model from an external data iterator; returns final optimizer + last metrics.
 
@@ -489,17 +491,39 @@ def run_sft(
         if result is not None:
             last_metrics = result
 
+    prof_start, prof_end = profile_steps
+    profiling_active = False
+
     for step in range(start_step, train_cfg.num_steps):
+        if profile_dir is not None and step == prof_start and not profiling_active:
+            if is_primary_process:
+                print(f"[profiler] starting trace at step {step} -> {profile_dir}")
+            jax.profiler.start_trace(str(profile_dir))
+            profiling_active = True
+
         batch = next(data_iter)
         batch = text_api.shard_batch_dict(batch, model_cfg, mesh)
         optimizer_state, metrics = sft_step(optimizer_state, batch)
         step_delta = timer.step()
+
+        if profiling_active and step + 1 >= prof_end:
+            jax.tree.map(lambda x: x.block_until_ready(), (optimizer_state, metrics))
+            jax.profiler.stop_trace()
+            profiling_active = False
+            if is_primary_process:
+                print(f"[profiler] stopped trace at step {step + 1}")
 
         _log_prev_metrics()
         prev_metrics = (step + 1, metrics, step_delta)
 
         if checkpoint_manager is not None and save_every and (step + 1) % save_every == 0:
             _save_checkpoint(checkpoint_manager, optimizer_state, rng, step + 1)
+
+    if profiling_active:
+        jax.tree.map(lambda x: x.block_until_ready(), (optimizer_state, metrics))
+        jax.profiler.stop_trace()
+        if is_primary_process:
+            print("[profiler] stopped trace at end of training")
 
     _log_prev_metrics(force=True)
 
