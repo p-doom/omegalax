@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -44,8 +45,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--model-id", type=str, required=True)
     p.add_argument("--data-path", type=str, required=True, help="Path to JSONL training data.")
     p.add_argument("--processor", type=str, default=None, help="HF repo to read tokenizer and image config from (defaults to --model-id).")
-    p.add_argument("--min-pixels", type=int, default=None, help="Override image processor min_pixels before preprocessing.")
-    p.add_argument("--max-pixels", type=int, default=None, help="Override image processor max_pixels before preprocessing.")
+    p.add_argument("--preprocessor-config", type=str, default=None, help="Path to a JSON file whose keys override the default image processor config.")
     p.add_argument("--max-length", type=int, default=512)
     p.add_argument("--num-steps", type=int, default=100)
     p.add_argument("--batch-size", type=int, default=4)
@@ -71,15 +71,12 @@ def main() -> None:
     repo_id = args.processor or resolve_hf_repo_id(args.model_id)
     tokenizer = AutoTokenizer.from_pretrained(repo_id)
     assert args.max_length <= tokenizer.model_max_length, f"--max-length={args.max_length} exceeds tokenizer.model_max_length={tokenizer.model_max_length}"
-    image_processor = AutoImageProcessor.from_pretrained(repo_id, use_fast=False)
-    if args.min_pixels is not None:
-        image_processor.min_pixels = args.min_pixels
-        if hasattr(image_processor, "size") and isinstance(image_processor.size, dict):
-            image_processor.size["shortest_edge"] = args.min_pixels
-    if args.max_pixels is not None:
-        image_processor.max_pixels = args.max_pixels
-        if hasattr(image_processor, "size") and isinstance(image_processor.size, dict):
-            image_processor.size["longest_edge"] = args.max_pixels
+
+    ip_kwargs: dict = {}
+    if args.preprocessor_config:
+        with open(args.preprocessor_config) as f:
+            ip_kwargs = json.load(f)
+    image_processor = AutoImageProcessor.from_pretrained(repo_id, use_fast=False, **ip_kwargs)
     collator = VLMSFTCollator(tokenizer, max_length=args.max_length, image_processor=image_processor)
 
     dataset = JSONLDataset(args.data_path)
