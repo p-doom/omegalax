@@ -436,7 +436,7 @@ class Qwen3VL(nnx.Module):
         if image_features_ND is not None:
             image_mask_BT = token_ids_BT == cfg.image_token_id
             visual_pos_mask_BT = image_mask_BT
-            batch_idx, seq_idx = jnp.where(image_mask_BT)
+            batch_idx, seq_idx = jnp.where(image_mask_BT, size=image_features_ND.shape[0])
             inputs_embeds_BTD = inputs_embeds_BTD.at[batch_idx, seq_idx].set(
                 image_features_ND.astype(inputs_embeds_BTD.dtype)
             )
@@ -487,7 +487,7 @@ def _deepstack_process(
     hidden_BTD: jax.Array, visual_pos_mask_BT: jax.Array, visual_embeds_ND: jax.Array
 ) -> jax.Array:
     """Add visual embeddings to hidden states at visual token positions."""
-    batch_idx, seq_idx = jnp.where(visual_pos_mask_BT)
+    batch_idx, seq_idx = jnp.where(visual_pos_mask_BT, size=visual_embeds_ND.shape[0])
     current_vals = hidden_BTD[batch_idx, seq_idx]
     new_vals = current_vals + visual_embeds_ND.astype(current_vals.dtype)
     return hidden_BTD.at[batch_idx, seq_idx].set(new_vals)

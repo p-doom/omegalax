@@ -199,25 +199,14 @@ class VisionAttention(nnx.Module):
 
         q_NHK, k_NHK = apply_rotary_pos_emb_vision(q_NHK, k_NHK, cos_NK, sin_NK)
 
-        num_seqs = cu_seqlens.shape[0] - 1
-        outputs_ND = reshard(jnp.zeros_like(q_NHK.reshape(N, -1)), self.hidden_shd)
+        seg_ids = jnp.searchsorted(cu_seqlens[1:], jnp.arange(N), side="right")
+        attn_mask_NM = seg_ids[:, None] == seg_ids[None, :]
 
-        def _attn_chunk(start, end):
-            q_c = q_NHK[start:end]
-            k_c = k_NHK[start:end]
-            v_c = v_NHK[start:end]
-            logits_HNN = jnp.einsum("NHK,MHK->HNM", q_c, k_c) * self.scale
-            weights_HNN = jax.nn.softmax(logits_HNN.astype(jnp.float32), axis=-1).astype(q_c.dtype)
-            out_NHK = jnp.einsum("HNM,MHK->NHK", weights_HNN, v_c)
-            return out_NHK.reshape(-1, self.num_heads * self.head_dim)
+        logits_HNM = jnp.einsum("NHK,MHK->HNM", q_NHK, k_NHK) * self.scale
+        logits_HNM = jnp.where(attn_mask_NM[None, :, :], logits_HNM, -1e9)
+        weights_HNM = jax.nn.softmax(logits_HNM.astype(jnp.float32), axis=-1).astype(q_NHK.dtype)
+        outputs_ND = jnp.einsum("HNM,MHK->NHK", weights_HNM, v_NHK).reshape(N, -1)
 
-        def body_fn(i, out):
-            start = cu_seqlens[i]
-            end = cu_seqlens[i + 1]
-            chunk_out = _attn_chunk(start, end)
-            return jax.lax.dynamic_update_slice(out, chunk_out, (start, 0))
-
-        outputs_ND = jax.lax.fori_loop(0, num_seqs, body_fn, outputs_ND)
         out_ND = self.proj(outputs_ND, out_sharding=self.hidden_shd)
         return reshard(out_ND, self.hidden_shd)
 
@@ -391,11 +380,10 @@ class VisionModel(nnx.Module):
         cos_NK = cos_NK.astype(self.config.dtype)
         sin_NK = sin_NK.astype(self.config.dtype)
 
+        tokens_per_image = grid_thw[:, 0] * grid_thw[:, 1] * grid_thw[:, 2]
         cu_seqlens = jnp.concatenate([
             jnp.zeros(1, dtype=jnp.int32),
-            jnp.cumsum(
-                jnp.repeat(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0], out_sharding=P())
-            ).astype(jnp.int32),
+            jnp.cumsum(tokens_per_image).astype(jnp.int32),
         ])
 
         deepstack_features: list[jax.Array] = []
