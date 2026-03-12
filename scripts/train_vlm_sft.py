@@ -57,13 +57,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--save-dir", type=str, default=None)
     p.add_argument("--save-every", type=int, default=50)
     p.add_argument("--log-every", type=int, default=10)
-    p.add_argument("--tensorboard-dir", type=str, default=None)
+    p.add_argument("--profile-dir", type=str, default=None)
     p.add_argument("--profile-start", type=int, default=3, help="Step to start profiling (after JIT warmup).")
     p.add_argument("--profile-end", type=int, default=8, help="Step to stop profiling.")
     p.add_argument("--log-jsonl", type=str, default=None)
     p.add_argument("--resume", action="store_true")
     p.add_argument("--pad-id", type=int, default=0)
     p.add_argument("--peak-tflops", type=str, default=None)
+    p.add_argument("--log-image-sizes", action="store_true", help="Print original and resized image dimensions for the first batch.")
     return p.parse_args()
 
 
@@ -110,7 +111,7 @@ def main() -> None:
         peak_tflops=peak_tflops,
         tp_size=args.tp_size,
         fsdp_size=args.fsdp_size,
-        profile_dir=args.tensorboard_dir,
+        profile_dir=args.profile_dir,
         profile_steps=(args.profile_start, args.profile_end),
     )
     if last_metrics:

@@ -508,6 +508,7 @@ def run_sft(
 
         if profiling_active and step + 1 >= prof_end:
             jax.tree.map(lambda x: x.block_until_ready(), (optimizer_state, metrics))
+            jax.profiler.save_device_memory_profile(f"{profile_dir}/memory.prof")
             jax.profiler.stop_trace()
             profiling_active = False
             if is_primary_process:
@@ -521,6 +522,7 @@ def run_sft(
 
     if profiling_active:
         jax.tree.map(lambda x: x.block_until_ready(), (optimizer_state, metrics))
+        jax.profiler.save_device_memory_profile(f"{profile_dir}/memory.prof")
         jax.profiler.stop_trace()
         if is_primary_process:
             print("[profiler] stopped trace at end of training")
