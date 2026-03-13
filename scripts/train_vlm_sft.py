@@ -67,6 +67,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--peak-tflops", type=str, default=None)
     p.add_argument("--log-image-sizes", action="store_true", help="Print original and resized image dimensions for the first batch.")
     p.add_argument("--tensorboard-dir", type=str, default=None, help="Directory for TensorBoard event files.")
+    p.add_argument("--max-turns", type=int, default=None, help="Max messages per conversation; longer chats are split into chunks.")
     return p.parse_args()
 
 
@@ -85,7 +86,7 @@ def main() -> None:
     image_processor = AutoImageProcessor.from_pretrained(repo_id, use_fast=False, **ip_kwargs)
     collator = VLMSFTCollator(tokenizer, max_length=args.max_length, image_processor=image_processor)
 
-    dataset = JSONLDataset(args.data_path)
+    dataset = JSONLDataset(args.data_path, max_turns=args.max_turns)
     data_iter = _batched_iter(dataset, collator, args.batch_size, shuffle=True, seed=args.seed)
 
     train_cfg = vlm_trainer.TrainConfig(
