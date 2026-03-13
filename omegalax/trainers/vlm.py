@@ -6,7 +6,6 @@ import dataclasses
 import datetime
 from collections.abc import Iterator
 from pathlib import Path
-
 from flax import nnx
 import jax
 import jax.numpy as jnp
@@ -208,6 +207,7 @@ def run_training(
     peak_tflops: float | None = None,
     tp_size: int | None = None,
     fsdp_size: int | None = None,
+    tb_writer=None,
 ) -> tuple[nnx.ModelAndOptimizer, dict[str, float]]:
     """Train a VLM with synthetic data; returns final optimizer + last metrics."""
     model_cfg = vlm_api.resolve_config(model_id_or_cfg)
@@ -294,6 +294,7 @@ def run_training(
             per_device_flops=per_device_flops,
             tokens_per_step=tokens_per_step,
             peak_tflops=peak_tflops,
+            tb_writer=tb_writer,
         )
         if result is not None:
             last_metrics = result
@@ -393,6 +394,7 @@ def run_sft(
     fsdp_size: int | None = None,
     profile_dir: str | Path | None = None,
     profile_steps: tuple[int, int] = (3, 8),
+    tb_writer=None,
 ) -> tuple[nnx.ModelAndOptimizer, dict[str, float]]:
     """SFT a VLM from an external data iterator; returns final optimizer + last metrics.
 
@@ -469,6 +471,7 @@ def run_sft(
             tokens_per_step=tokens_per_step,
             peak_tflops=peak_tflops,
             extra_print_keys=[("supervised_tokens", "sup_tok={:.0f} ")],
+            tb_writer=tb_writer,
         )
         if result is not None:
             last_metrics = result

@@ -291,6 +291,7 @@ def maybe_log_step_metrics(
     tokens_per_step: int,
     peak_tflops: float | None,
     extra_print_keys: Sequence[tuple[str, str]] | None = None,
+    tb_writer: Any = None,
 ) -> dict[str, float] | None:
     """Optionally log and print step metrics. Returns host_metrics if logged, else None.
 
@@ -328,5 +329,12 @@ def maybe_log_step_metrics(
     if should_write and log_path is not None:
         with log_path.open("a") as f:
             f.write(json.dumps(host_metrics) + "\n")
+
+    if tb_writer is not None and is_primary_process:
+        _TB_SKIP = {"step"}
+        for key, val in host_metrics.items():
+            if key not in _TB_SKIP:
+                tb_writer.add_scalar(f"train/{key}", val, step_to_log)
+        tb_writer.flush()
 
     return host_metrics

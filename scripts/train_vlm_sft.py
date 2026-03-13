@@ -9,6 +9,7 @@ from pathlib import Path
 
 import jax
 import numpy as np
+from tensorboardX import SummaryWriter
 from transformers import AutoImageProcessor, AutoTokenizer
 
 from omegalax.data.collator_qwen3 import VLMSFTCollator
@@ -65,6 +66,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--pad-id", type=int, default=0)
     p.add_argument("--peak-tflops", type=str, default=None)
     p.add_argument("--log-image-sizes", action="store_true", help="Print original and resized image dimensions for the first batch.")
+    p.add_argument("--tensorboard-dir", type=str, default=None, help="Directory for TensorBoard event files.")
     return p.parse_args()
 
 
@@ -98,22 +100,34 @@ def main() -> None:
     save_dir = Path(args.save_dir) if args.save_dir else _default_save_dir(args.model_id)
     peak_tflops = resolve_peak_tflops(args.peak_tflops)
 
-    _, last_metrics = vlm_trainer.run_sft(
-        args.model_id,
-        train_cfg,
-        data_iter,
-        save_dir=save_dir,
-        save_every=args.save_every,
-        log_every=args.log_every,
-        log_jsonl=args.log_jsonl,
-        resume=args.resume,
-        pad_id=args.pad_id,
-        peak_tflops=peak_tflops,
-        tp_size=args.tp_size,
-        fsdp_size=args.fsdp_size,
-        profile_dir=args.profile_dir,
-        profile_steps=(args.profile_start, args.profile_end),
-    )
+    tb_writer = None
+    if args.tensorboard_dir and jax.process_index() == 0:
+        tb_dir = Path(args.tensorboard_dir)
+        tb_dir.mkdir(parents=True, exist_ok=True)
+        tb_writer = SummaryWriter(str(tb_dir))
+
+    try:
+        _, last_metrics = vlm_trainer.run_sft(
+            args.model_id,
+            train_cfg,
+            data_iter,
+            save_dir=save_dir,
+            save_every=args.save_every,
+            log_every=args.log_every,
+            log_jsonl=args.log_jsonl,
+            resume=args.resume,
+            pad_id=args.pad_id,
+            peak_tflops=peak_tflops,
+            tp_size=args.tp_size,
+            fsdp_size=args.fsdp_size,
+            profile_dir=args.profile_dir,
+            profile_steps=(args.profile_start, args.profile_end),
+            tb_writer=tb_writer,
+        )
+    finally:
+        if tb_writer is not None:
+            tb_writer.close()
+
     if last_metrics:
         print(f"finished step={int(last_metrics['step'])} loss={last_metrics['loss']:.4f}")
 
