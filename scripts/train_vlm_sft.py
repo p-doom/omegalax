@@ -68,6 +68,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--log-image-sizes", action="store_true", help="Print original and resized image dimensions for the first batch.")
     p.add_argument("--tensorboard-dir", type=str, default=None, help="Directory for TensorBoard event files.")
     p.add_argument("--max-turns", type=int, default=None, help="Max messages per conversation; longer chats are split into chunks.")
+    p.add_argument("--val-data-path", type=str, default=None, help="Path to JSONL validation data.")
+    p.add_argument("--val-every", type=int, default=None, help="Run validation every N training steps.")
+    p.add_argument("--val-steps", type=int, default=10, help="Number of batches per validation run.")
     return p.parse_args()
 
 
@@ -88,6 +91,11 @@ def main() -> None:
 
     dataset = JSONLDataset(args.data_path, max_turns=args.max_turns)
     data_iter = _batched_iter(dataset, collator, args.batch_size, shuffle=True, seed=args.seed)
+
+    val_data_iter = None
+    if args.val_data_path:
+        val_dataset = JSONLDataset(args.val_data_path, max_turns=args.max_turns)
+        val_data_iter = _batched_iter(val_dataset, collator, args.batch_size, shuffle=False, seed=args.seed)
 
     train_cfg = vlm_trainer.TrainConfig(
         seed=args.seed,
@@ -124,6 +132,9 @@ def main() -> None:
             profile_dir=args.profile_dir,
             profile_steps=(args.profile_start, args.profile_end),
             tb_writer=tb_writer,
+            val_data_iter=val_data_iter,
+            val_every=args.val_every,
+            val_steps=args.val_steps,
         )
     finally:
         if tb_writer is not None:
