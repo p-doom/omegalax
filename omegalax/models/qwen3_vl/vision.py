@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from functools import partial
 from typing import Any
 
 import jax
@@ -219,10 +220,8 @@ class VisionBlock(nnx.Module):
         self.mlp = VisionMLP(config, hidden_shd=hidden_shd, ff_shd=ff_shd, rngs=rngs)
         self.hidden_shd = hidden_shd
 
+    @partial(jax.checkpoint, static_argnums=0)
     def __call__(self, hidden_ND: jax.Array, cu_seqlens: jax.Array, cos_NK: jax.Array, sin_NK: jax.Array) -> jax.Array:
-        return jax.checkpoint(self._forward)(hidden_ND, cu_seqlens, cos_NK, sin_NK)
-
-    def _forward(self, hidden_ND: jax.Array, cu_seqlens: jax.Array, cos_NK: jax.Array, sin_NK: jax.Array) -> jax.Array:
         hidden_ND = reshard(hidden_ND, self.hidden_shd)
         hidden_ND = reshard(hidden_ND + self.attn(self.norm1(hidden_ND), cu_seqlens, cos_NK, sin_NK), self.hidden_shd)
         hidden_ND = reshard(hidden_ND + self.mlp(self.norm2(hidden_ND)), self.hidden_shd)
