@@ -278,7 +278,7 @@ class VisionModel(nnx.Module):
         return jnp.concatenate([row_emb, col_emb], axis=-1)
 
     def _fast_pos_embed_interpolate(self, grid_thw: jax.Array, total_tokens: int) -> jax.Array:
-        """Bilinear position embedding interpolation (JIT-safe)."""
+        """Bilinear position embedding interpolation."""
         row, col, img_id = _token_spatial_coords(grid_thw, self.cfg.spatial_merge_size, total_tokens)
         pos_weight_VD = self.pos_embed.embedding[...]
         n = self.num_grid_per_side
