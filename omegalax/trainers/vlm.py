@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import dataclasses
 import datetime
+import json
 from collections.abc import Iterator
 from pathlib import Path
-
 from flax import nnx
 import jax
 import jax.numpy as jnp
@@ -208,6 +208,7 @@ def run_training(
     peak_tflops: float | None = None,
     tp_size: int | None = None,
     fsdp_size: int | None = None,
+    tb_writer=None,
 ) -> tuple[nnx.ModelAndOptimizer, dict[str, float]]:
     """Train a VLM with synthetic data; returns final optimizer + last metrics."""
     model_cfg = vlm_api.resolve_config(model_id_or_cfg)
@@ -294,6 +295,7 @@ def run_training(
             per_device_flops=per_device_flops,
             tokens_per_step=tokens_per_step,
             peak_tflops=peak_tflops,
+            tb_writer=tb_writer,
         )
         if result is not None:
             last_metrics = result
@@ -377,6 +379,37 @@ def make_sft_train_step(cfg, pad_id: int = 0):
     return sft_train_step
 
 
+def make_sft_eval_step(cfg, pad_id: int = 0):
+    """Build a JIT-compiled VLM SFT eval step (forward only, no gradients)."""
+
+    @nnx.jit
+    def sft_eval_step(model: nnx.Module, batch: dict[str, jax.Array]):
+        token_ids_BT = batch["token_ids_BT"]
+        attention_mask_BT = batch["attention_mask_BT"]
+        loss_mask_BT = batch["loss_mask_BT"]
+        pixel_values = batch.get("pixel_values")
+        image_grid_thw = batch.get("image_grid_thw")
+        position_ids_ZBT = batch.get("position_ids_ZBT")
+
+        logits_BTV, aux_loss = vlm_api.forward(
+            model,
+            token_ids_BT,
+            pad_id,
+            cfg,
+            attention_mask_BT=attention_mask_BT,
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+            position_ids_ZBT=position_ids_ZBT,
+        )
+        targets = token_ids_BT[:, 1:]
+        mask = loss_mask_BT[:, 1:].astype(jnp.float32)
+        loss = _masked_next_token_loss(logits_BTV[:, :-1, :], targets, mask) + aux_loss
+        supervised_tokens = jnp.sum(mask)
+        return loss, supervised_tokens
+
+    return sft_eval_step
+
+
 def run_sft(
     model_id_or_cfg,
     train_cfg: TrainConfig,
@@ -393,12 +426,19 @@ def run_sft(
     fsdp_size: int | None = None,
     profile_dir: str | Path | None = None,
     profile_steps: tuple[int, int] = (3, 8),
+    tb_writer=None,
+    val_data_iter: Iterator[dict[str, np.ndarray]] | None = None,
+    val_every: int | None = None,
+    val_steps: int = 10,
 ) -> tuple[nnx.ModelAndOptimizer, dict[str, float]]:
     """SFT a VLM from an external data iterator; returns final optimizer + last metrics.
 
     ``data_iter`` must yield dicts with keys ``token_ids_BT``,
     ``attention_mask_BT``, and ``loss_mask_BT`` (all numpy ``(B, T)``).
     Optionally ``pixel_values`` and ``image_grid_thw`` for multimodal batches.
+
+    If ``val_data_iter`` is provided, runs ``val_steps`` forward-only batches
+    every ``val_every`` training steps and logs the average validation loss.
     """
     model_cfg = vlm_api.resolve_config(model_id_or_cfg)
     mesh = ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size)
@@ -421,6 +461,7 @@ def run_sft(
     with mesh_rules(mesh):
         optimizer = build_optimizer(model, train_cfg)
     sft_step = make_sft_train_step(model_cfg, pad_id=pad_id)
+    eval_step = make_sft_eval_step(model_cfg, pad_id=pad_id) if val_data_iter is not None else None
 
     per_device_flops = per_device_flops_per_step(
         model_cfg, train_cfg.seq_len, train_cfg.batch_size
@@ -469,6 +510,7 @@ def run_sft(
             tokens_per_step=tokens_per_step,
             peak_tflops=peak_tflops,
             extra_print_keys=[("supervised_tokens", "sup_tok={:.0f} ")],
+            tb_writer=tb_writer,
         )
         if result is not None:
             last_metrics = result
@@ -501,6 +543,33 @@ def run_sft(
 
         if checkpoint_manager is not None and save_every and (step + 1) % save_every == 0:
             _save_checkpoint(checkpoint_manager, optimizer, rng, step + 1)
+
+        if eval_step is not None and val_every and (step + 1) % val_every == 0:
+            total_val_loss = 0.0
+            total_val_sup_tokens = 0.0
+            for _ in range(val_steps):
+                val_batch = next(val_data_iter)
+                val_batch = vlm_api.shard_batch_dict(val_batch, model_cfg, mesh)
+                val_loss, val_sup_tokens = eval_step(optimizer.model, val_batch)
+                total_val_loss += float(val_loss)
+                total_val_sup_tokens += float(val_sup_tokens)
+            avg_val_loss = total_val_loss / val_steps
+            if is_primary_process:
+                print(
+                    f"[val] step={step + 1} val_loss={avg_val_loss:.4f} "
+                    f"val_sup_tok={total_val_sup_tokens:.0f}"
+                )
+            if log_path is not None and is_primary_process:
+                val_record = {
+                    "step": step + 1,
+                    "val_loss": avg_val_loss,
+                    "val_supervised_tokens": total_val_sup_tokens,
+                }
+                with log_path.open("a") as f:
+                    f.write(json.dumps(val_record) + "\n")
+            if tb_writer is not None and is_primary_process:
+                tb_writer.add_scalar("val/loss", avg_val_loss, step + 1)
+                tb_writer.flush()
 
     if is_profiling_active:
         jax.tree.map(lambda x: x.block_until_ready(), metrics)
