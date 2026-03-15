@@ -10,6 +10,19 @@ from pathlib import Path
 import numpy as np
 
 
+def _split_messages(messages: list[dict], max_turns: int) -> list[list[dict]]:
+    """Split a conversation into chunks of at most *max_turns* messages.
+
+    Splits on 2-message (assistant/user pair) boundaries so each chunk
+    is a self-contained conversation.  The last chunk may be shorter.
+    """
+    if len(messages) <= max_turns:
+        return [messages]
+
+    step = max_turns - (max_turns % 2) if max_turns >= 2 else 1
+    return [messages[i : i + step] for i in range(0, len(messages), step)]
+
+
 class JSONLDataset:
     """Reads a JSONL file where each line is a JSON object with at least a
     ``"messages"`` key.
@@ -21,10 +34,17 @@ class JSONLDataset:
     Or text-only::
 
         {"messages": [{"role": "user", "content": "Hello"}, ...]}
+
+    Args:
+        path: Path to the JSONL file.
+        max_turns: If set, conversations with more messages than this are
+            split into multiple examples of at most *max_turns* messages
+            each (splitting on pair boundaries).
     """
 
-    def __init__(self, path: str | Path) -> None:
+    def __init__(self, path: str | Path, *, max_turns: int | None = None) -> None:
         self.path = Path(path)
+        self.max_turns = max_turns
         self.examples = self._load()
 
     def _load(self) -> list[dict]:
@@ -34,7 +54,14 @@ class JSONLDataset:
                 line = line.strip()
                 if not line:
                     continue
-                examples.append(json.loads(line))
+                raw = json.loads(line)
+                if self.max_turns is not None and len(raw["messages"]) > self.max_turns:
+                    for chunk in _split_messages(raw["messages"], self.max_turns):
+                        ex = dict(raw)
+                        ex["messages"] = chunk
+                        examples.append(ex)
+                else:
+                    examples.append(raw)
         return examples
 
     def __len__(self) -> int:
