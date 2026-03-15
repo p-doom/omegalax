@@ -4,59 +4,60 @@ from __future__ import annotations
 
 from enum import Enum
 
+from omegalax.models.params_utils import load_hf_config_from_source
+from omegalax.models.qwen3.config import is_supported_model_id as is_supported_qwen3_model_id
+from omegalax.models.qwen3.config import resolve_qwen3_repo_id
+from omegalax.models.qwen3_5.config import is_supported_qwen3_5_model_id, resolve_qwen3_5_repo_id
+from omegalax.models.qwen3_vl.config import is_supported_qwen3_vl_model_id, resolve_qwen3_vl_repo_id
+
 
 class Arch(str, Enum):
     TEXT = "text"
     VLM = "vlm"
 
 
-from omegalax.models.qwen3.config import get_spec as _get_qwen3_spec
-from omegalax.models.qwen3_vl.config import get_vl_spec as _get_vl_spec
-from omegalax.models.qwen3_5.config import get_qwen3_5_spec as _get_qwen3_5_spec
+_TEXT_MODEL_TYPES = {"qwen3", "qwen3_moe"}
+_VLM_MODEL_TYPES = {"qwen3_5", "qwen3_5_moe", "qwen3_vl", "qwen3_vl_moe"}
 
 
-_ARCH_RESOLVERS: tuple[tuple[Arch, tuple], ...] = (
-    (Arch.TEXT, (_get_qwen3_spec,)),
-    (Arch.VLM, (_get_vl_spec, _get_qwen3_5_spec)),
-)
-
-
-def _matches_any(resolvers, model_id: str) -> bool:
-    for resolver in resolvers:
-        try:
-            resolver(model_id)
-            return True
-        except ValueError:
-            continue
-    return False
+def _load_resolved_hf_config(model_id: str) -> dict:
+    if is_supported_qwen3_model_id(model_id):
+        source = resolve_qwen3_repo_id(model_id)
+    elif is_supported_qwen3_5_model_id(model_id):
+        source = resolve_qwen3_5_repo_id(model_id)
+    elif is_supported_qwen3_vl_model_id(model_id):
+        source = resolve_qwen3_vl_repo_id(model_id)
+    else:
+        raise ValueError(f"Unsupported model id '{model_id}'")
+    return load_hf_config_from_source(source)
 
 
 def infer_arch(model_id: str) -> Arch:
-    """Determine the architecture via exact resolution against known registries."""
-    for arch, resolvers in _ARCH_RESOLVERS:
-        if _matches_any(resolvers, model_id):
-            return arch
-    raise ValueError(f"Cannot infer architecture for model id '{model_id}'")
+    """Determine the architecture from a smoke alias or HF-format config source."""
+    if model_id.startswith("qwen3-smoke"):
+        return Arch.TEXT
+    if model_id.startswith("qwen3.5-smoke") or model_id.startswith("qwen3-vl-smoke"):
+        return Arch.VLM
+
+    hf_cfg = _load_resolved_hf_config(model_id)
+    model_type = hf_cfg.get("model_type")
+    if model_type in _TEXT_MODEL_TYPES:
+        return Arch.TEXT
+    if model_type in _VLM_MODEL_TYPES:
+        return Arch.VLM
+    raise ValueError(f"Cannot infer architecture for model/config source '{model_id}'")
 
 
 def resolve_hf_repo_id(model_id: str) -> str:
-    """Map a short spec key or HF repo id to the canonical HuggingFace repo id.
-
-    Returns the input unchanged when it already contains '/' (i.e. is already
-    a full HF repo id).  For short keys like ``qwen3-vl-2b`` or ``qwen3-0-6b``
-    this looks up the ``hf_repo_id`` in the corresponding spec registry.
-    """
+    """Map a short alias to the canonical HuggingFace repo id when applicable."""
     if "/" in model_id:
         return model_id
-    for _arch, resolvers in _ARCH_RESOLVERS:
-        for resolver in resolvers:
-            try:
-                spec = resolver(model_id)
-                hf_id = spec.get("hf_repo_id") if isinstance(spec, dict) else None
-                if hf_id:
-                    return hf_id
-            except ValueError:
-                continue
+    if is_supported_qwen3_model_id(model_id):
+        return resolve_qwen3_repo_id(model_id)
+    if is_supported_qwen3_5_model_id(model_id):
+        return resolve_qwen3_5_repo_id(model_id)
+    if is_supported_qwen3_vl_model_id(model_id):
+        return resolve_qwen3_vl_repo_id(model_id)
     return model_id
 
 

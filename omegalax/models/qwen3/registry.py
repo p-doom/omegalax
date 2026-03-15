@@ -7,6 +7,7 @@ from .config import (
     list_qwen3_dense_model_ids,
     list_qwen3_moe_model_ids,
     make_config,
+    make_config_from_hf,
 )
 from .model import Qwen3
 
@@ -33,4 +34,5 @@ __all__ = [
     "is_supported_model_id",
     "list_qwen3_dense_model_ids",
     "list_qwen3_moe_model_ids",
+    "make_config_from_hf",
 ]

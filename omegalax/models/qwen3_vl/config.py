@@ -6,7 +6,9 @@ import dataclasses
 from typing import Any
 
 import jax.numpy as jnp
+from etils import epath
 
+from omegalax.models.params_utils import load_hf_config_from_source
 from omegalax.models.shard_config import ShardConfig
 
 
@@ -62,9 +64,8 @@ class Qwen3VLConfig:
         )
 
 
-_QWEN3_VL_SPECS: dict[str, dict[str, Any]] = {
+_QWEN3_VL_SMOKE_SPECS: dict[str, dict[str, Any]] = {
     "qwen3-vl-smoke": {
-        "hf_repo_id": None,
         "vocab_size": 1024,
         "emb_dim": 128,
         "mlp_dim": 512,
@@ -101,7 +102,6 @@ _QWEN3_VL_SPECS: dict[str, dict[str, Any]] = {
         "norm_topk_prob": True,
     },
     "qwen3-vl-smoke-moe": {
-        "hf_repo_id": None,
         "vocab_size": 1024,
         "emb_dim": 128,
         "mlp_dim": 512,
@@ -137,150 +137,15 @@ _QWEN3_VL_SPECS: dict[str, dict[str, Any]] = {
         "decoder_sparse_step": 1,
         "norm_topk_prob": True,
     },
-    "qwen3-vl-2b": {
-        "hf_repo_id": "Qwen/Qwen3-VL-2B-Instruct",
-        "vocab_size": 151_936,
-        "emb_dim": 2_048,
-        "mlp_dim": 6_144,
-        "num_layers": 28,
-        "num_heads": 16,
-        "head_dim": 128,
-        "num_kv_heads": 8,
-        "rope_theta": 5_000_000,
-        "norm_eps": 1e-6,
-        "tie_word_embeddings": True,
-        "mrope_section": (24, 20, 20),
-        "image_token_id": 151655,
-        "video_token_id": 151656,
-        "vision_start_token_id": 151652,
-        "vision": {
-            "hidden_size": 1_024,
-            "intermediate_size": 4_096,
-            "num_heads": 16,
-            "patch_size": 16,
-            "temporal_patch_size": 2,
-            "in_channels": 3,
-            "spatial_merge_size": 2,
-            "out_hidden_size": 2_048,
-            "depth": 24,
-            "hidden_act": "gelu_pytorch_tanh",
-            "num_position_embeddings": 2_304,
-            "deepstack_visual_indexes": (5, 11, 17),
-        },
-        "moe_intermediate_size": 0,
-        "num_experts": 0,
-        "num_experts_per_tok": 0,
-        "mlp_only_layers": (),
-        "decoder_sparse_step": 1,
-        "norm_topk_prob": True,
-    },
-    "qwen3-vl-30b-a3b": {
-        "hf_repo_id": "Qwen/Qwen3-VL-30B-A3B-Instruct",
-        "vocab_size": 151_936,
-        "emb_dim": 2_048,
-        "mlp_dim": 6_144,
-        "num_layers": 48,
-        "num_heads": 32,
-        "head_dim": 128,
-        "num_kv_heads": 4,
-        "rope_theta": 5_000_000,
-        "norm_eps": 1e-6,
-        "tie_word_embeddings": False,
-        "mrope_section": (24, 20, 20),
-        "image_token_id": 151655,
-        "video_token_id": 151656,
-        "vision_start_token_id": 151652,
-        "vision": {
-            "hidden_size": 1_152,
-            "intermediate_size": 4_304,
-            "num_heads": 16,
-            "patch_size": 16,
-            "temporal_patch_size": 2,
-            "in_channels": 3,
-            "spatial_merge_size": 2,
-            "out_hidden_size": 2_048,
-            "depth": 27,
-            "hidden_act": "gelu_pytorch_tanh",
-            "num_position_embeddings": 2_304,
-            "deepstack_visual_indexes": (8, 16, 24),
-        },
-        "moe_intermediate_size": 768,
-        "num_experts": 128,
-        "num_experts_per_tok": 8,
-        "mlp_only_layers": (),
-        "decoder_sparse_step": 1,
-        "norm_topk_prob": True,
-    },
 }
 
+_QWEN3_VL_REPOS = (
+    "Qwen/Qwen3-VL-2B-Instruct",
+    "Qwen/Qwen3-VL-30B-A3B-Instruct",
+)
 
-_MODEL_ID_TO_SPEC: dict[str, str] = {}
-for _spec_key, _spec in _QWEN3_VL_SPECS.items():
-    _MODEL_ID_TO_SPEC[_spec_key] = _spec_key
-    _hf_id = _spec.get("hf_repo_id")
-    if _hf_id:
-        _MODEL_ID_TO_SPEC[_hf_id] = _spec_key
-
-
-def list_qwen3_vl_model_ids() -> list[str]:
-    return [spec["hf_repo_id"] for spec in _QWEN3_VL_SPECS.values() if spec.get("hf_repo_id")]
-
-
-def get_vl_spec(model_id: str) -> dict[str, Any]:
-    spec_key = _MODEL_ID_TO_SPEC.get(model_id)
-    if spec_key:
-        return dict(_QWEN3_VL_SPECS[spec_key])
-    supported = sorted(_MODEL_ID_TO_SPEC.keys())
-    raise ValueError(f"Unsupported Qwen3-VL model_id '{model_id}'. Supported ids: {supported}")
-
-
-def is_supported_qwen3_vl_model_id(model_id: str) -> bool:
-    return model_id in _MODEL_ID_TO_SPEC
-
-
-def list_supported_qwen3_vl_model_ids() -> list[str]:
-    return sorted(_MODEL_ID_TO_SPEC.keys())
-
-
-def make_vl_config(model_id: str) -> Qwen3VLConfig:
-    spec = get_vl_spec(model_id)
-    vis = spec["vision"]
-    return Qwen3VLConfig(
-        num_layers=spec["num_layers"],
-        vocab_size=spec["vocab_size"],
-        emb_dim=spec["emb_dim"],
-        mlp_dim=spec["mlp_dim"],
-        num_heads=spec["num_heads"],
-        head_dim=spec["head_dim"],
-        num_kv_heads=spec["num_kv_heads"],
-        rope_theta=spec["rope_theta"],
-        norm_eps=spec["norm_eps"],
-        tie_word_embeddings=spec["tie_word_embeddings"],
-        mrope_section=tuple(spec["mrope_section"]),
-        moe_intermediate_size=spec["moe_intermediate_size"],
-        num_experts=spec["num_experts"],
-        num_experts_per_tok=spec["num_experts_per_tok"],
-        mlp_only_layers=tuple(spec["mlp_only_layers"]),
-        decoder_sparse_step=spec["decoder_sparse_step"],
-        norm_topk_prob=spec["norm_topk_prob"],
-        image_token_id=spec["image_token_id"],
-        video_token_id=spec["video_token_id"],
-        vision_start_token_id=spec["vision_start_token_id"],
-        vision=Qwen3VLVisionConfig(
-            hidden_size=vis["hidden_size"],
-            intermediate_size=vis["intermediate_size"],
-            num_heads=vis["num_heads"],
-            patch_size=vis["patch_size"],
-            temporal_patch_size=vis["temporal_patch_size"],
-            in_channels=vis["in_channels"],
-            spatial_merge_size=vis["spatial_merge_size"],
-            out_hidden_size=vis["out_hidden_size"],
-            depth=vis["depth"],
-            hidden_act=vis["hidden_act"],
-            num_position_embeddings=vis["num_position_embeddings"],
-            deepstack_visual_indexes=tuple(vis["deepstack_visual_indexes"]),
-        ),
-    )
+_SUPPORTED_MODEL_TYPES = {"qwen3_vl", "qwen3_vl_moe"}
+_SUPPORTED_MODEL_IDS = sorted((*_QWEN3_VL_SMOKE_SPECS.keys(), *_QWEN3_VL_REPOS))
 
 
 def _required(mapping: dict[str, Any], key: str, where: str) -> Any:
@@ -301,54 +166,141 @@ def _hf_dtype_to_jnp(hf_dtype: str) -> Any:
     raise ValueError(f"Unsupported dtype '{hf_dtype}'.")
 
 
+def list_qwen3_vl_model_ids() -> list[str]:
+    return list(_QWEN3_VL_REPOS)
+
+
+def get_vl_spec(model_id: str) -> dict[str, Any]:
+    if model_id in _QWEN3_VL_SMOKE_SPECS:
+        return dict(_QWEN3_VL_SMOKE_SPECS[model_id])
+    if model_id in _QWEN3_VL_REPOS:
+        return {"hf_repo_id": model_id}
+    raise ValueError(f"Unsupported Qwen3-VL model_id '{model_id}'. Supported ids: {_SUPPORTED_MODEL_IDS}")
+
+
+def resolve_qwen3_vl_repo_id(model_id: str) -> str:
+    return model_id
+
+
+def is_supported_qwen3_vl_model_id(model_id: str) -> bool:
+    return model_id in _QWEN3_VL_SMOKE_SPECS or model_id in _QWEN3_VL_REPOS
+
+
+def list_supported_qwen3_vl_model_ids() -> list[str]:
+    return list(_SUPPORTED_MODEL_IDS)
+
+
+def make_vl_config(model_id: str) -> Qwen3VLConfig:
+    if model_id in _QWEN3_VL_SMOKE_SPECS:
+        spec = _QWEN3_VL_SMOKE_SPECS[model_id]
+        vis = spec["vision"]
+        return Qwen3VLConfig(
+            num_layers=spec["num_layers"],
+            vocab_size=spec["vocab_size"],
+            emb_dim=spec["emb_dim"],
+            mlp_dim=spec["mlp_dim"],
+            num_heads=spec["num_heads"],
+            head_dim=spec["head_dim"],
+            num_kv_heads=spec["num_kv_heads"],
+            rope_theta=spec["rope_theta"],
+            norm_eps=spec["norm_eps"],
+            tie_word_embeddings=spec["tie_word_embeddings"],
+            mrope_section=tuple(spec["mrope_section"]),
+            moe_intermediate_size=spec["moe_intermediate_size"],
+            num_experts=spec["num_experts"],
+            num_experts_per_tok=spec["num_experts_per_tok"],
+            mlp_only_layers=tuple(spec["mlp_only_layers"]),
+            decoder_sparse_step=spec["decoder_sparse_step"],
+            norm_topk_prob=spec["norm_topk_prob"],
+            image_token_id=spec["image_token_id"],
+            video_token_id=spec["video_token_id"],
+            vision_start_token_id=spec["vision_start_token_id"],
+            vision=Qwen3VLVisionConfig(
+                hidden_size=vis["hidden_size"],
+                intermediate_size=vis["intermediate_size"],
+                num_heads=vis["num_heads"],
+                patch_size=vis["patch_size"],
+                temporal_patch_size=vis["temporal_patch_size"],
+                in_channels=vis["in_channels"],
+                spatial_merge_size=vis["spatial_merge_size"],
+                out_hidden_size=vis["out_hidden_size"],
+                depth=vis["depth"],
+                hidden_act=vis["hidden_act"],
+                num_position_embeddings=vis["num_position_embeddings"],
+                deepstack_visual_indexes=tuple(vis["deepstack_visual_indexes"]),
+            ),
+        )
+
+    if "/" not in model_id and not epath.Path(model_id).expanduser().exists():
+        raise ValueError(f"Unsupported Qwen3-VL model_id '{model_id}'. Supported ids: {_SUPPORTED_MODEL_IDS}")
+
+    hf_cfg = load_hf_config_from_source(resolve_qwen3_vl_repo_id(model_id))
+    return make_vl_config_from_hf(hf_cfg)
+
+
 def make_vl_config_from_hf(hf_cfg: dict[str, Any]) -> Qwen3VLConfig:
     """Build a Qwen3VLConfig from a HuggingFace config.json dict."""
+    model_type = _required(hf_cfg, "model_type", "hf_cfg")
+    if model_type not in _SUPPORTED_MODEL_TYPES:
+        raise ValueError(
+            f"Unsupported Qwen3-VL model_type '{model_type}'. Expected one of {sorted(_SUPPORTED_MODEL_TYPES)}."
+        )
+
     vis = _required(hf_cfg, "vision_config", "hf_cfg")
     txt = _required(hf_cfg, "text_config", "hf_cfg")
+    if not isinstance(vis, dict):
+        raise ValueError("Expected vision_config to be a dict in hf_cfg.")
+    if not isinstance(txt, dict):
+        raise ValueError("Expected text_config to be a dict in hf_cfg.")
+
     rope_theta = _required(txt, "rope_theta", "hf_cfg['text_config']")
     rope_scaling = _required(txt, "rope_scaling", "hf_cfg['text_config']")
     if not isinstance(rope_scaling, dict):
         raise ValueError("Expected rope_scaling to be a dict in hf_cfg['text_config'].")
+    rope_type = rope_scaling.get("rope_type", "default")
+    if rope_type != "default":
+        raise ValueError(f"Unsupported rope_scaling.rope_type '{rope_type}' for Qwen3-VL.")
+
     mrope_section = _required(rope_scaling, "mrope_section", "hf_cfg['text_config'].rope_scaling")
     text_dtype = _hf_dtype_to_jnp(_required(txt, "dtype", "hf_cfg['text_config']"))
     vision_dtype = _hf_dtype_to_jnp(vis["dtype"]) if vis.get("dtype") is not None else text_dtype
-    is_moe = str(hf_cfg.get("model_type", "")).endswith("_moe")
+    is_moe = model_type == "qwen3_vl_moe"
 
     return Qwen3VLConfig(
-        num_layers=txt["num_hidden_layers"],
-        vocab_size=txt["vocab_size"],
-        emb_dim=txt["hidden_size"],
-        mlp_dim=txt["intermediate_size"],
-        num_heads=txt["num_attention_heads"],
-        head_dim=txt["head_dim"],
-        num_kv_heads=txt["num_key_value_heads"],
+        num_layers=_required(txt, "num_hidden_layers", "hf_cfg['text_config']"),
+        vocab_size=_required(txt, "vocab_size", "hf_cfg['text_config']"),
+        emb_dim=_required(txt, "hidden_size", "hf_cfg['text_config']"),
+        mlp_dim=_required(txt, "intermediate_size", "hf_cfg['text_config']"),
+        num_heads=_required(txt, "num_attention_heads", "hf_cfg['text_config']"),
+        head_dim=_required(txt, "head_dim", "hf_cfg['text_config']"),
+        num_kv_heads=_required(txt, "num_key_value_heads", "hf_cfg['text_config']"),
         rope_theta=rope_theta,
-        norm_eps=txt["rms_norm_eps"],
+        norm_eps=_required(txt, "rms_norm_eps", "hf_cfg['text_config']"),
         tie_word_embeddings=_required(hf_cfg, "tie_word_embeddings", "hf_cfg"),
         mrope_section=tuple(mrope_section),
-        moe_intermediate_size=txt["moe_intermediate_size"] if is_moe else 0,
-        num_experts=txt["num_experts"] if is_moe else 0,
-        num_experts_per_tok=txt["num_experts_per_tok"] if is_moe else 0,
-        mlp_only_layers=tuple(txt["mlp_only_layers"]) if is_moe else (),
-        decoder_sparse_step=txt["decoder_sparse_step"] if is_moe else 1,
-        norm_topk_prob=txt["norm_topk_prob"] if is_moe else True,
-        image_token_id=hf_cfg["image_token_id"],
-        video_token_id=hf_cfg["video_token_id"],
-        vision_start_token_id=hf_cfg["vision_start_token_id"],
+        moe_intermediate_size=_required(txt, "moe_intermediate_size", "hf_cfg['text_config']") if is_moe else 0,
+        num_experts=_required(txt, "num_experts", "hf_cfg['text_config']") if is_moe else 0,
+        num_experts_per_tok=_required(txt, "num_experts_per_tok", "hf_cfg['text_config']") if is_moe else 0,
+        mlp_only_layers=tuple(_required(txt, "mlp_only_layers", "hf_cfg['text_config']")) if is_moe else (),
+        decoder_sparse_step=_required(txt, "decoder_sparse_step", "hf_cfg['text_config']") if is_moe else 1,
+        norm_topk_prob=_required(txt, "norm_topk_prob", "hf_cfg['text_config']") if is_moe else True,
+        image_token_id=_required(hf_cfg, "image_token_id", "hf_cfg"),
+        video_token_id=_required(hf_cfg, "video_token_id", "hf_cfg"),
+        vision_start_token_id=_required(hf_cfg, "vision_start_token_id", "hf_cfg"),
         dtype=text_dtype,
         vision=Qwen3VLVisionConfig(
-            hidden_size=vis["hidden_size"],
-            intermediate_size=vis["intermediate_size"],
-            num_heads=vis["num_heads"],
-            patch_size=vis["patch_size"],
-            temporal_patch_size=vis["temporal_patch_size"],
-            in_channels=vis["in_channels"],
-            spatial_merge_size=vis["spatial_merge_size"],
-            out_hidden_size=vis["out_hidden_size"],
-            depth=vis["depth"],
-            hidden_act=vis["hidden_act"],
-            num_position_embeddings=vis["num_position_embeddings"],
-            deepstack_visual_indexes=tuple(vis["deepstack_visual_indexes"]),
+            hidden_size=_required(vis, "hidden_size", "hf_cfg['vision_config']"),
+            intermediate_size=_required(vis, "intermediate_size", "hf_cfg['vision_config']"),
+            num_heads=_required(vis, "num_heads", "hf_cfg['vision_config']"),
+            patch_size=_required(vis, "patch_size", "hf_cfg['vision_config']"),
+            temporal_patch_size=_required(vis, "temporal_patch_size", "hf_cfg['vision_config']"),
+            in_channels=_required(vis, "in_channels", "hf_cfg['vision_config']"),
+            spatial_merge_size=_required(vis, "spatial_merge_size", "hf_cfg['vision_config']"),
+            out_hidden_size=_required(vis, "out_hidden_size", "hf_cfg['vision_config']"),
+            depth=_required(vis, "depth", "hf_cfg['vision_config']"),
+            hidden_act=_required(vis, "hidden_act", "hf_cfg['vision_config']"),
+            num_position_embeddings=_required(vis, "num_position_embeddings", "hf_cfg['vision_config']"),
+            deepstack_visual_indexes=tuple(_required(vis, "deepstack_visual_indexes", "hf_cfg['vision_config']")),
             dtype=vision_dtype,
         ),
     )

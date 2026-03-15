@@ -24,7 +24,7 @@ from omegalax.models.params_utils import (
     map_to_bonsai_key,
     stoi,
 )
-from .config import Qwen3VLConfig, make_vl_config, make_vl_config_from_hf
+from .config import Qwen3VLConfig, make_vl_config_from_hf
 from .model import Qwen3VL
 
 
@@ -149,11 +149,8 @@ def create_qwen3_vl_from_safetensors(
     files = find_safetensors(file_dir)
 
     hf_cfg = load_hf_config(path)
-    if model_id:
-        cfg = make_vl_config(model_id)
-        _assert_vl_config(cfg, hf_cfg)
-    else:
-        cfg = make_vl_config_from_hf(hf_cfg)
+    cfg = make_vl_config_from_hf(hf_cfg)
+    _assert_vl_config(cfg, hf_cfg)
 
     with mesh_rules(mesh):
         model = nnx.eval_shape(lambda: Qwen3VL(cfg, rngs=nnx.Rngs(params=0)))

@@ -26,8 +26,10 @@ from omegalax.models.qwen3_5.config import (
     is_supported_qwen3_5_model_id,
     list_supported_qwen3_5_model_ids,
     make_config as make_qwen3_5_config,
+    make_config_from_hf as make_qwen3_5_config_from_hf,
 )
 from omegalax.models.qwen3_5.model import Qwen3_5ForCausalLM
+from omegalax.models.params_utils import load_hf_config_from_source
 
 ModelConfig = qwen3_registry.Qwen3Config
 TextConfig = ModelConfig | Qwen3_5TextConfig
@@ -47,11 +49,17 @@ def resolve_config(model_or_id: str | TextConfig) -> TextConfig:
     if is_supported_qwen3_5_model_id(model_or_id):
         return make_qwen3_5_config(model_or_id).text_config
 
-    supported_qwen3 = sorted(set(qwen3_registry.list_qwen3_dense_model_ids() + qwen3_registry.list_qwen3_moe_model_ids()))
-    supported_qwen3_5 = list_supported_qwen3_5_model_ids()
+    hf_cfg = load_hf_config_from_source(model_or_id)
+    model_type = hf_cfg.get("model_type")
+    if model_type in {"qwen3", "qwen3_moe"}:
+        return qwen3_registry.make_config_from_hf(hf_cfg)
+    if model_type in {"qwen3_5", "qwen3_5_moe"}:
+        return make_qwen3_5_config_from_hf(hf_cfg).text_config
+
     raise ValueError(
-        f"Unsupported text model_id '{model_or_id}'. "
-        f"Supported Qwen3 ids: {supported_qwen3}; supported Qwen3.5 ids: {supported_qwen3_5}."
+        f"Unsupported text model/config source '{model_or_id}'. "
+        f"Supported Qwen3 ids: {sorted(set(qwen3_registry.list_qwen3_dense_model_ids() + qwen3_registry.list_qwen3_moe_model_ids()))}; "
+        f"supported Qwen3.5 ids: {list_supported_qwen3_5_model_ids()}."
     )
 
 

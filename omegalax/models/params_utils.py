@@ -10,6 +10,7 @@ from typing import Any, Callable
 import jax.numpy as jnp
 import numpy as np
 from etils import epath
+from huggingface_hub import hf_hub_download
 
 TransformRule = tuple[tuple[int, ...] | None, tuple[int, ...] | None, bool] | None
 
@@ -267,6 +268,22 @@ def load_hf_config(path: str | epath.Path) -> dict[str, Any]:
     if not cfg_path.exists():
         raise ValueError(f"Expected HuggingFace config.json under {path}")
     with cfg_path.open() as f:
+        return json.load(f)
+
+
+def load_hf_config_from_source(source: str | epath.Path) -> dict[str, Any]:
+    """Load a HuggingFace config from a local directory/file or remote repo id."""
+    source_path = epath.Path(source).expanduser()
+    if source_path.exists():
+        if source_path.is_dir():
+            return load_hf_config(source_path)
+        if source_path.name == "config.json":
+            with source_path.open() as f:
+                return json.load(f)
+        raise ValueError(f"Expected a directory or config.json path, got {source_path}")
+
+    cfg_file = hf_hub_download(repo_id=str(source), filename="config.json")
+    with epath.Path(cfg_file).open() as f:
         return json.load(f)
 
 
