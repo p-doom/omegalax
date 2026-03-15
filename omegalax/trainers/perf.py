@@ -8,12 +8,14 @@ materializes the full attention matrix.
 from __future__ import annotations
 
 import datetime
+import json
+from collections.abc import Sequence
+from pathlib import Path
 from typing import Any, Union
 
 import jax
 
 from omegalax.models.qwen3.config import Qwen3Config
-from omegalax.models.qwen3.moe.config import Qwen3MoeConfig
 from omegalax.models.qwen3_5.config import Qwen3_5Config, Qwen3_5TextConfig
 from omegalax.models.qwen3_vl.config import Qwen3VLConfig
 
@@ -64,9 +66,9 @@ def training_flops_per_token(cfg: RunPerfConfig, seq_len: int) -> int:
         return _training_flops_per_token_qwen3_5(cfg.text_config, seq_len)
     if isinstance(cfg, Qwen3VLConfig):
         return _training_flops_per_token_qwen3_vl(cfg, seq_len)
-    if isinstance(cfg, Qwen3MoeConfig):
-        return _training_flops_per_token_qwen3_moe(cfg, seq_len)
     if isinstance(cfg, Qwen3Config):
+        if cfg.is_moe:
+            return _training_flops_per_token_qwen3_moe(cfg, seq_len)
         return _training_flops_per_token_qwen3_dense(cfg, seq_len)
     if isinstance(cfg, Qwen3_5TextConfig):
         return _training_flops_per_token_qwen3_5(cfg, seq_len)
@@ -129,7 +131,7 @@ def _training_flops_per_token_qwen3_vl(cfg: Qwen3VLConfig, seq_len: int) -> int:
     return forward_per_token * TRAINING_FLOP_MULTIPLIER
 
 
-def _training_flops_per_token_qwen3_moe(cfg: Qwen3MoeConfig, seq_len: int) -> int:
+def _training_flops_per_token_qwen3_moe(cfg: Qwen3Config, seq_len: int) -> int:
     D = cfg.emb_dim
     H = cfg.num_heads
     G = cfg.num_kv_heads
@@ -170,12 +172,7 @@ def _training_flops_per_token_qwen3_5(cfg: Qwen3_5TextConfig, seq_len: int) -> i
     V = cfg.vocab_size
     L = cfg.num_hidden_layers
     T = seq_len
-    E = cfg.num_experts
-    k = cfg.num_experts_per_tok
-    F_moe = cfg.moe_intermediate_size
-    F_shared = cfg.shared_expert_intermediate_size
 
-    # Linear attention / GatedDeltaNet dims
     key_dim = cfg.linear_key_head_dim * cfg.linear_num_key_heads
     value_dim = cfg.linear_value_head_dim * cfg.linear_num_value_heads
     nv = cfg.linear_num_value_heads
@@ -186,14 +183,12 @@ def _training_flops_per_token_qwen3_5(cfg: Qwen3_5TextConfig, seq_len: int) -> i
     layer_flops = 0
     for layer_idx, layer_type in enumerate(cfg.layer_types):
         if layer_type == "full_attention":
-            # Q has 2x width for output gate
             q_flops = 2 * D * (H * K * 2)
             kv_flops = 2 * D * (2 * G * K)
             attn_dot = 4 * T * H * K
             o_flops = 2 * H * K * D
             layer_flops += q_flops + kv_flops + attn_dot + o_flops
         else:
-            # linear_attention (GatedDeltaNet)
             conv_dim = key_dim * 2 + value_dim
             in_proj_qkv = 2 * D * conv_dim
             in_proj_z = 2 * D * value_dim
@@ -203,14 +198,21 @@ def _training_flops_per_token_qwen3_5(cfg: Qwen3_5TextConfig, seq_len: int) -> i
             delta_rule_per_token = 2 * nv * (ak * av)
             layer_flops += in_proj_qkv + in_proj_z + in_proj_b + in_proj_a + out_proj + delta_rule_per_token
 
-        # MoE MLP (all layers in Qwen3.5)
-        router_flops = 2 * D * E
-        gate_up_per_expert = 2 * (2 * F_moe) * D
-        down_per_expert = 2 * F_moe * D
-        routed_flops = k * (gate_up_per_expert + down_per_expert)
-        shared_flops = 2 * 3 * D * F_shared
-        shared_gate_flops = 2 * D * 1
-        layer_flops += router_flops + routed_flops + shared_flops + shared_gate_flops
+        if cfg.is_moe:
+            E = cfg.num_experts
+            k = cfg.num_experts_per_tok
+            F_moe = cfg.moe_intermediate_size
+            F_shared = cfg.shared_expert_intermediate_size
+            router_flops = 2 * D * E
+            gate_up_per_expert = 2 * (2 * F_moe) * D
+            down_per_expert = 2 * F_moe * D
+            routed_flops = k * (gate_up_per_expert + down_per_expert)
+            shared_flops = 2 * 3 * D * F_shared
+            shared_gate_flops = 2 * D * 1
+            layer_flops += router_flops + routed_flops + shared_flops + shared_gate_flops
+        else:
+            F_dense = cfg.intermediate_size
+            layer_flops += 2 * 3 * D * F_dense
 
     embedding_flops = 2 * D * V
     forward_per_token = layer_flops + embedding_flops
@@ -274,3 +276,65 @@ def step_metrics(
         "tflops_per_device": tflops_per_device,
         "mfu": mfu,
     }
+
+
+def maybe_log_step_metrics(
+    step_to_log: int,
+    metrics_to_log: dict[str, Any],
+    step_delta: datetime.timedelta,
+    *,
+    is_primary_process: bool,
+    log_every: int,
+    log_path: Path | None,
+    force: bool = False,
+    per_device_flops: float,
+    tokens_per_step: int,
+    peak_tflops: float | None,
+    extra_print_keys: Sequence[tuple[str, str]] | None = None,
+    tb_writer: Any = None,
+) -> dict[str, float] | None:
+    """Optionally log and print step metrics. Returns host_metrics if logged, else None.
+
+    extra_print_keys: optional list of (metric_key, format_fragment) for the print
+    line, e.g. [("token_accuracy", "acc={:.4f} "), ("supervised_tokens", "sup_tok={:.0f} ")].
+    """
+    should_print = is_primary_process and log_every and step_to_log % log_every == 0
+    should_write = is_primary_process and log_path is not None
+    if not (should_print or should_write or force):
+        return None
+
+    host_metrics = {k: float(v) for k, v in metrics_to_log.items()}
+    required = ("loss", "grad_norm")
+    missing = [k for k in required if k not in host_metrics]
+    if missing:
+        raise KeyError(f"Missing required metrics for logging: {missing}")
+    host_metrics["step"] = step_to_log
+    host_metrics.update(
+        step_metrics(per_device_flops, step_delta, tokens_per_step, peak_tflops)
+    )
+
+    if should_print:
+        extra_frag = ""
+        if extra_print_keys:
+            for key, fmt in extra_print_keys:
+                if key in host_metrics:
+                    extra_frag += fmt.format(host_metrics[key])
+        print(
+            f"step={host_metrics['step']} loss={host_metrics['loss']:.4f} "
+            f"{extra_frag}grad_norm={host_metrics['grad_norm']:.4f} "
+            f"step_s={host_metrics['step_time_s']:.3f} tok/s/dev={host_metrics['tokens_per_sec_per_device']:.0f} "
+            f"TFLOP/s/dev={host_metrics['tflops_per_device']:.2f} mfu={host_metrics['mfu']:.4f}"
+        )
+
+    if should_write and log_path is not None:
+        with log_path.open("a") as f:
+            f.write(json.dumps(host_metrics) + "\n")
+
+    if tb_writer is not None and is_primary_process:
+        _TB_SKIP = {"step"}
+        for key, val in host_metrics.items():
+            if key not in _TB_SKIP:
+                tb_writer.add_scalar(f"train/{key}", val, step_to_log)
+        tb_writer.flush()
+
+    return host_metrics

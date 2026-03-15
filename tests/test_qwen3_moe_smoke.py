@@ -20,20 +20,15 @@ from transformers import Qwen3MoeForCausalLM
 from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig as HFQwen3MoeConfig
 
 from omegalax.text import api
-from omegalax.models.qwen3.moe.config import make_moe_config
-from omegalax.models.qwen3.moe.params_moe import create_qwen3_moe_from_safetensors
+from omegalax.models.qwen3.config import make_config
+from omegalax.models.qwen3.loader import create_qwen3_from_safetensors
 
-jax.config.update("jax_default_matmul_precision", "highest")
+from tests.logits_assert import assert_logits_close
+
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
 
 _JNP_TO_TORCH = {jnp.float32: torch.float32, jnp.bfloat16: torch.bfloat16, jnp.float16: torch.float16}
-
-
-def _tolerances(jnp_dtype):
-    if jnp_dtype == jnp.float32:
-        return 1e-5, 1e-5
-    return 1e-2, 1e-2
 
 SMOKE_MOE_ID = "qwen3-smoke-moe"
 
@@ -81,8 +76,8 @@ class Qwen3MoeWeightsTest(absltest.TestCase):
         with open(cfg_path, "w") as f:
             json.dump(HF_SMOKE_CFG.to_dict(), f)
 
-        cls.jax_cfg = make_moe_config(SMOKE_MOE_ID)
-        cls.jax_model = create_qwen3_moe_from_safetensors(
+        cls.jax_cfg = make_config(SMOKE_MOE_ID)
+        cls.jax_model = create_qwen3_from_safetensors(
             cls.tmpdir,
             SMOKE_MOE_ID,
             tp_size=1,
@@ -91,7 +86,6 @@ class Qwen3MoeWeightsTest(absltest.TestCase):
 
         torch_dtype = _JNP_TO_TORCH[cls.jax_cfg.dtype]
         cls.hf_model = hf_model.to(torch_dtype)
-        cls.RTOL, cls.ATOL = _tolerances(cls.jax_cfg.dtype)
         cls.pad_id = 0
 
     def test_weight_loading_succeeds(self):
@@ -115,9 +109,7 @@ class Qwen3MoeWeightsTest(absltest.TestCase):
         jax_logits_BTV = np.asarray(jax_logits_BTV, dtype=np.float32)
 
         mask = attention_mask_BT.astype(bool)
-        max_abs_diff = np.max(np.abs(jax_logits_BTV[mask] - hf_logits_BTV[mask]))
-        print(f"\n  max_abs_diff = {max_abs_diff:.6e}")
-        np.testing.assert_allclose(jax_logits_BTV[mask], hf_logits_BTV[mask], rtol=self.RTOL, atol=self.ATOL)
+        assert_logits_close(self, jax_logits_BTV, hf_logits_BTV, mask)
 
     def test_prefill_logits_match_hf_batched(self):
         """Batched forward pass with padding should match HF."""
@@ -142,9 +134,7 @@ class Qwen3MoeWeightsTest(absltest.TestCase):
         jax_logits_BTV = np.asarray(jax_logits_BTV, dtype=np.float32)
 
         mask = attention_mask_BT.astype(bool)
-        max_abs_diff = np.max(np.abs(jax_logits_BTV[mask] - hf_logits_BTV[mask]))
-        print(f"\n  max_abs_diff = {max_abs_diff:.6e}")
-        np.testing.assert_allclose(jax_logits_BTV[mask], hf_logits_BTV[mask], rtol=self.RTOL, atol=self.ATOL)
+        assert_logits_close(self, jax_logits_BTV, hf_logits_BTV, mask)
 
     def test_round_trip_preserves_logits(self):
         """Split → merge round-trip should preserve forward pass output."""

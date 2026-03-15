@@ -120,11 +120,15 @@ class MoEFeedForward(nnx.Module):
         )
         topk_weights_BTk = topk_weights_BTk.astype(probs_BTE.dtype)
 
+        compute_dtype = hidden_BTD.dtype
+        gate_up_proj = jnp.astype(self.gate_up_proj[...], compute_dtype)
+        down_proj = jnp.astype(self.down_proj[...], compute_dtype)
+
         dense_hidden_BTD = reshard(hidden_BTD, P(batch_axis, None, None))
         gate_up_BTEF = jnp.einsum(
             "BTD,EFD->BTEF",
             dense_hidden_BTD,
-            self.gate_up_proj[...],
+            gate_up_proj,
             out_sharding=P(batch_axis, None, None, ff_axis),
         )
         gate_BTEF, up_BTEF = jnp.split(gate_up_BTEF, 2, axis=-1)
@@ -132,7 +136,7 @@ class MoEFeedForward(nnx.Module):
         expert_out_BTED = jnp.einsum(
             "BTEF,EDF->BTED",
             expert_hidden_BTEF,
-            self.down_proj[...],
+            down_proj,
             out_sharding=P(batch_axis, None, None, hidden_axis),
         )
 
@@ -156,20 +160,28 @@ class MoEFeedForward(nnx.Module):
 
 # Decoder Layer
 class DecoderLayer(nnx.Module):
-    """Hybrid decoder layer: full_attention or linear_attention + MoE MLP."""
+    """Hybrid decoder layer: full_attention or linear_attention + dense MLP or MoE."""
 
     def __init__(self, cfg: Qwen3_5TextConfig, layer_idx: int, *, rngs: nnx.Rngs):
         self.layer_type = cfg.layer_types[layer_idx]
+        self.is_moe = cfg.is_moe
 
         if self.layer_type == "full_attention":
             self.attn = Attention(cfg, rngs=rngs)
         else:
             self.linear_attn = GatedDeltaNet(cfg, rngs=rngs)
 
-        self.mlp = MoEFeedForward(cfg, rngs=rngs)
+        if cfg.is_moe:
+            self.mlp = MoEFeedForward(cfg, rngs=rngs)
+        else:
+            self.mlp = MLP(
+                cfg.hidden_size, cfg.intermediate_size, cfg.shd_cfg,
+                dtype=cfg.dtype, rngs=rngs,
+            )
         self.input_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, rngs=rngs)
         self.post_attention_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, rngs=rngs)
 
+    @partial(jax.remat, static_argnums=0)
     def __call__(
         self,
         hidden_BTD: jax.Array,
@@ -191,7 +203,11 @@ class DecoderLayer(nnx.Module):
 
         residual_BTD = hidden_BTD
         normed_BTD = self.post_attention_layernorm(hidden_BTD)
-        ff_out_BTD, aux_loss = self.mlp(normed_BTD)
+        if self.is_moe:
+            ff_out_BTD, aux_loss = self.mlp(normed_BTD)
+        else:
+            ff_out_BTD = self.mlp(normed_BTD)
+            aux_loss = jnp.array(0.0, dtype=jnp.float32)
         hidden_BTD = residual_BTD + ff_out_BTD
 
         return hidden_BTD, aux_loss
@@ -228,7 +244,10 @@ class TextModel(nnx.Module):
         cfg = self.cfg
 
         if inputs_embeds_BTD is None:
-            hidden_BTD = self.embedder.embedding[...].at[(token_ids_BT,)].get(out_sharding=self.out_emb_shd)
+            hidden_BTD = jnp.astype(
+                self.embedder.embedding[...].at[(token_ids_BT,)].get(out_sharding=self.out_emb_shd),
+                self.embedder.dtype,
+            )
         else:
             hidden_BTD = inputs_embeds_BTD
 
@@ -321,7 +340,10 @@ class Qwen3_5ForConditionalGeneration(nnx.Module):
     ):
         del cache, num_right_pads
 
-        inputs_embeds_BTD = self.text.embedder.embedding[...].at[(token_ids_BT,)].get(out_sharding=self.text.out_emb_shd)
+        inputs_embeds_BTD = jnp.astype(
+            self.text.embedder.embedding[...].at[(token_ids_BT,)].get(out_sharding=self.text.out_emb_shd),
+            self.text.embedder.dtype,
+        )
 
         if pixel_values is not None and image_grid_thw is not None:
             image_embeds_ND = self.vision(pixel_values, image_grid_thw)

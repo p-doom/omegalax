@@ -11,7 +11,7 @@ from absl.testing import absltest
 from flax import nnx
 
 from omegalax.models.qwen3.params import create_qwen3_from_safetensors
-from omegalax.models.qwen3.dense.params_dense import export_qwen3_dense_to_safetensors
+from omegalax.models.qwen3.params import export_qwen3_to_safetensors
 from omegalax.text import api as text_api
 
 
@@ -31,7 +31,7 @@ class ExportDenseTest(absltest.TestCase):
         model, cfg = text_api.init_model("qwen3-smoke", rng, tp_size=1, fsdp_size=1)
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            export_qwen3_dense_to_safetensors(model, cfg, tmpdir)
+            export_qwen3_to_safetensors(model, cfg, tmpdir)
             reloaded = create_qwen3_from_safetensors(tmpdir, "qwen3-smoke", tp_size=1, fsdp_size=1)
 
             embed_orig = np.asarray(jax.device_get(_get_value(model, "embedder.embedding")))

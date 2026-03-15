@@ -15,7 +15,44 @@ from flax import nnx
 from omegalax.models.shard_config import ShardConfig
 from .config import Qwen3_5VisionConfig
 from .norms import LayerNorm
-from .rope import apply_vision_rope, generate_vision_rope
+from .rope import apply_vision_rope
+
+
+def _token_spatial_coords(
+    grid_thw: jax.Array, merge_size: int, total_tokens: int
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Map each vision token to its (row, col) in the original spatial grid.
+
+    Returns:
+        row_coord, col_coord, image_id: each int32 of shape
+        ``(total_tokens,)``.
+    """
+    tokens_per_image = grid_thw[:, 0] * grid_thw[:, 1] * grid_thw[:, 2]
+    cu_tokens = jnp.concatenate(
+        [jnp.zeros(1, dtype=jnp.int32), jnp.cumsum(tokens_per_image).astype(jnp.int32)]
+    )
+
+    tok_idx = jnp.arange(total_tokens, dtype=jnp.int32)
+    image_id = jnp.searchsorted(cu_tokens[1:], tok_idx, side="right")
+    local_idx = tok_idx - cu_tokens[image_id]
+
+    h = grid_thw[image_id, 1]
+    w = grid_thw[image_id, 2]
+    spatial_idx = local_idx % (h * w)
+
+    merge_sq = merge_size * merge_size
+    merged_w = w // merge_size
+    group_idx = spatial_idx // merge_sq
+    intra_idx = spatial_idx % merge_sq
+
+    block_r = group_idx // merged_w
+    block_c = group_idx % merged_w
+    intra_r = intra_idx // merge_size
+    intra_c = intra_idx % merge_size
+
+    row_coord = block_r * merge_size + intra_r
+    col_coord = block_c * merge_size + intra_c
+    return row_coord, col_coord, image_id
 
 wp = nnx.with_partitioning
 
@@ -124,29 +161,13 @@ class VisionAttention(nnx.Module):
         v_NHK = reshard(qkv[:, 2], self.heads_shd)
 
         q_NHK, k_NHK = apply_vision_rope(q_NHK, k_NHK, cos_NK, sin_NK)
+        seg_ids = jnp.searchsorted(cu_seqlens[1:], jnp.arange(N), side="right")
+        attn_mask_NM = seg_ids[:, None] == seg_ids[None, :]
+        logits_HNM = jnp.einsum("NHK,MHK->HNM", q_NHK, k_NHK) * self.scale
+        logits_HNM = jnp.where(attn_mask_NM[None, :, :], logits_HNM, -1e9)
+        weights_HNM = jax.nn.softmax(logits_HNM.astype(jnp.float32), axis=-1).astype(q_NHK.dtype)
+        outputs_ND = jnp.einsum("HNM,MHK->NHK", weights_HNM, v_NHK).reshape(N, -1)
 
-        num_seqs = cu_seqlens.shape[0] - 1
-        outputs_ND = reshard(jnp.zeros_like(q_NHK.reshape(N, -1)), self.hidden_shd)
-
-        def _attn_chunk(start, end):
-            q_i = q_NHK[start:end]
-            k_i = k_NHK[start:end]
-            v_i = v_NHK[start:end]
-            q_HLK = q_i.transpose(1, 0, 2)
-            k_HLK = k_i.transpose(1, 0, 2)
-            v_HLK = v_i.transpose(1, 0, 2)
-            logits_HLL = jnp.matmul(q_HLK, k_HLK.transpose(0, 2, 1)) * self.scale
-            weights_HLL = jax.nn.softmax(logits_HLL.astype(jnp.float32), axis=-1).astype(logits_HLL.dtype)
-            out_HLK = jnp.matmul(weights_HLL, v_HLK)
-            return out_HLK.transpose(1, 0, 2).reshape(-1, self.num_heads * self.head_dim)
-
-        def body_fn(i, out):
-            start = cu_seqlens[i]
-            end = cu_seqlens[i + 1]
-            chunk_out = _attn_chunk(start, end)
-            return jax.lax.dynamic_update_slice(out, chunk_out, (start, 0))
-
-        outputs_ND = jax.lax.fori_loop(0, num_seqs, body_fn, outputs_ND)
         out_ND = self.proj(outputs_ND, out_sharding=self.hidden_shd)
         return reshard(out_ND, self.hidden_shd)
 
@@ -159,6 +180,7 @@ class VisionBlock(nnx.Module):
         self.mlp = VisionMLP(cfg, hidden_shd=hidden_shd, ff_shd=ff_shd, rngs=rngs)
         self.hidden_shd = hidden_shd
 
+    @partial(jax.remat, static_argnums=0)
     def __call__(self, hidden_ND, cu_seqlens, cos_NK, sin_NK):
         hidden_ND = reshard(hidden_ND, self.hidden_shd)
         hidden_ND = reshard(hidden_ND + self.attn(self.norm1(hidden_ND), cu_seqlens, cos_NK, sin_NK), self.hidden_shd)
@@ -195,7 +217,11 @@ class VisionPatchMerger(nnx.Module):
         hidden_ND = reshard(hidden_ND, self.hidden_shd)
         merged_dim = hidden_ND.shape[-1] * merge_size * merge_size
         normed = self.norm(hidden_ND)
-        normed = normed.reshape(-1, merged_dim)
+        normed = jax.lax.reshape(
+            normed,
+            (normed.shape[0] // (merge_size * merge_size), merged_dim),
+            out_sharding=self.hidden_shd,
+        )
         ff_NF = self.fc1(normed, out_sharding=self.ff_shd)
         ff_NF = reshard(nnx.gelu(ff_NF, approximate=True), self.ff_shd)
         out_ND = self.fc2(ff_NF, out_sharding=self.hidden_shd)
@@ -227,87 +253,62 @@ class VisionModel(nnx.Module):
         )
         self.merger = VisionPatchMerger(cfg, hidden_shd=self.hidden_shd, ff_shd=self.ff_shd, rngs=rngs)
 
-    def _rot_pos_emb(self, grid_thw: jax.Array) -> jax.Array:
+    def _rot_pos_emb(self, grid_thw: jax.Array, total_tokens: int) -> jax.Array:
         """Build per-token 2-D rotary embeddings from grid info."""
-        merge_size = self.cfg.spatial_merge_size
-        max_hw = int(jnp.max(grid_thw[:, 1:]))
-        freq_table = generate_vision_rope(max_hw, self.rotary_half_dim)
+        row, col, _ = _token_spatial_coords(grid_thw, self.cfg.spatial_merge_size, total_tokens)
+        inv_freq = 1.0 / (
+            10000.0
+            ** (jnp.arange(0, self.rotary_half_dim, 2, dtype=jnp.float32) / self.rotary_half_dim)
+        )
+        row_emb = row[:, None].astype(jnp.float32) * inv_freq[None, :]
+        col_emb = col[:, None].astype(jnp.float32) * inv_freq[None, :]
+        return jnp.concatenate([row_emb, col_emb], axis=-1)
 
-        all_pos_ids = []
-        for idx in range(grid_thw.shape[0]):
-            t, h, w = int(grid_thw[idx, 0]), int(grid_thw[idx, 1]), int(grid_thw[idx, 2])
-            merged_h, merged_w = h // merge_size, w // merge_size
-
-            block_rows = jnp.arange(merged_h)
-            block_cols = jnp.arange(merged_w)
-            intra_row = jnp.arange(merge_size)
-            intra_col = jnp.arange(merge_size)
-
-            row_idx = (block_rows[:, None, None, None] * merge_size + intra_row[None, None, :, None])
-            col_idx = (block_cols[None, :, None, None] * merge_size + intra_col[None, None, None, :])
-
-            row_idx = jnp.broadcast_to(row_idx, (merged_h, merged_w, merge_size, merge_size)).reshape(-1)
-            col_idx = jnp.broadcast_to(col_idx, (merged_h, merged_w, merge_size, merge_size)).reshape(-1)
-
-            coords = jnp.stack([row_idx, col_idx], axis=-1)
-            if t > 1:
-                coords = jnp.tile(coords, (t, 1))
-            all_pos_ids.append(coords)
-
-        pos_ids = jnp.concatenate(all_pos_ids, axis=0)
-        embeddings = freq_table[pos_ids]
-        return embeddings.reshape(embeddings.shape[0], -1)
-
-    def _fast_pos_embed_interpolate(self, grid_thw: jax.Array) -> jax.Array:
+    def _fast_pos_embed_interpolate(self, grid_thw: jax.Array, total_tokens: int) -> jax.Array:
         """Bilinear position embedding interpolation."""
-        merge_size = self.cfg.spatial_merge_size
+        row, col, img_id = _token_spatial_coords(grid_thw, self.cfg.spatial_merge_size, total_tokens)
         pos_weight_VD = self.pos_embed.embedding[...]
         n = self.num_grid_per_side
 
-        all_embeds = []
-        for idx in range(grid_thw.shape[0]):
-            t, h, w = int(grid_thw[idx, 0]), int(grid_thw[idx, 1]), int(grid_thw[idx, 2])
-            h_idxs = jnp.linspace(0, n - 1, h)
-            w_idxs = jnp.linspace(0, n - 1, w)
+        h = grid_thw[img_id, 1].astype(jnp.float32)
+        w = grid_thw[img_id, 2].astype(jnp.float32)
 
-            h_floor = jnp.floor(h_idxs).astype(jnp.int32)
-            w_floor = jnp.floor(w_idxs).astype(jnp.int32)
-            h_ceil = jnp.clip(h_floor + 1, min=0, max=n - 1)
-            w_ceil = jnp.clip(w_floor + 1, min=0, max=n - 1)
+        h_idx = row.astype(jnp.float32) * (n - 1) / jnp.maximum(h - 1.0, 1.0)
+        w_idx = col.astype(jnp.float32) * (n - 1) / jnp.maximum(w - 1.0, 1.0)
 
-            dh = h_idxs - h_floor
-            dw = w_idxs - w_floor
+        h_floor = jnp.floor(h_idx).astype(jnp.int32)
+        w_floor = jnp.floor(w_idx).astype(jnp.int32)
+        h_ceil = jnp.minimum(h_floor + 1, n - 1)
+        w_ceil = jnp.minimum(w_floor + 1, n - 1)
+        dh = h_idx - h_floor.astype(jnp.float32)
+        dw = w_idx - w_floor.astype(jnp.float32)
 
-            idx00 = (h_floor[:, None] * n + w_floor[None, :]).reshape(-1)
-            idx01 = (h_floor[:, None] * n + w_ceil[None, :]).reshape(-1)
-            idx10 = (h_ceil[:, None] * n + w_floor[None, :]).reshape(-1)
-            idx11 = (h_ceil[:, None] * n + w_ceil[None, :]).reshape(-1)
+        idx_ff = h_floor * n + w_floor
+        idx_fc = h_floor * n + w_ceil
+        idx_cf = h_ceil * n + w_floor
+        idx_cc = h_ceil * n + w_ceil
 
-            w00 = ((1 - dh)[:, None] * (1 - dw)[None, :]).reshape(-1)
-            w01 = ((1 - dh)[:, None] * dw[None, :]).reshape(-1)
-            w10 = (dh[:, None] * (1 - dw)[None, :]).reshape(-1)
-            w11 = (dh[:, None] * dw[None, :]).reshape(-1)
+        w_ff = (1.0 - dh) * (1.0 - dw)
+        w_fc = (1.0 - dh) * dw
+        w_cf = dh * (1.0 - dw)
+        w_cc = dh * dw
 
-            embed_ND = (
-                pos_weight_VD[idx00] * w00[:, None]
-                + pos_weight_VD[idx01] * w01[:, None]
-                + pos_weight_VD[idx10] * w10[:, None]
-                + pos_weight_VD[idx11] * w11[:, None]
-            )
-            embed_ND = jnp.tile(embed_ND, (t, 1))
-            embed_ND = embed_ND.reshape(t, h // merge_size, merge_size, w // merge_size, merge_size, -1)
-            embed_ND = embed_ND.transpose(0, 1, 3, 2, 4, 5).reshape(-1, embed_ND.shape[-1])
-            all_embeds.append(embed_ND)
-
-        return jnp.concatenate(all_embeds, axis=0)
+        return (
+            pos_weight_VD[idx_ff] * w_ff[:, None]
+            + pos_weight_VD[idx_fc] * w_fc[:, None]
+            + pos_weight_VD[idx_cf] * w_cf[:, None]
+            + pos_weight_VD[idx_cc] * w_cc[:, None]
+        )
 
     @jax.named_scope("vision_model")
     def __call__(self, pixel_values: jax.Array, grid_thw: jax.Array) -> jax.Array:
         hidden_ND = self.patch_embed(pixel_values)
-        pos_embeds_ND = self._fast_pos_embed_interpolate(grid_thw)
+        total_tokens: int = hidden_ND.shape[0]
+
+        pos_embeds_ND = self._fast_pos_embed_interpolate(grid_thw, total_tokens)
         hidden_ND = reshard(hidden_ND + pos_embeds_ND, self.hidden_shd)
 
-        rotary_emb_NK = self._rot_pos_emb(grid_thw)
+        rotary_emb_NK = self._rot_pos_emb(grid_thw, total_tokens)
         emb_NK = jnp.concatenate([rotary_emb_NK, rotary_emb_NK], axis=-1)
         cos_NK, sin_NK = jnp.cos(emb_NK), jnp.sin(emb_NK)
         cos_NK = cos_NK.astype(self.cfg.dtype)

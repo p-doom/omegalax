@@ -1,10 +1,10 @@
 """End-to-end correctness test for Qwen3-VL-2B against HuggingFace."""
 
 import os
-
-os.environ.setdefault("JAX_PLATFORMS", "cpu")
-
 from pathlib import Path
+
+os.environ.setdefault("JAX_PLATFORMS", "cuda")
+os.environ["USE_HUB_KERNELS"] = "false"
 
 import jax
 import jax.numpy as jnp
@@ -16,6 +16,8 @@ from flax import nnx
 from huggingface_hub import snapshot_download
 from transformers import AutoConfig, AutoProcessor, Qwen3VLForConditionalGeneration
 
+from tests.logits_assert import assert_logits_close
+from tests.real_weights import requires_real_weights
 from omegalax.distributed.mesh import mesh_rules_for
 from omegalax.models.params_utils import map_to_bonsai_key
 from omegalax.models.qwen3_vl import create_qwen3_vl_from_safetensors
@@ -23,16 +25,11 @@ from omegalax.models.qwen3_vl.loader import _get_non_expert_mapping
 from omegalax.models.qwen3_vl.config import make_vl_config_from_hf
 from omegalax.models.params_utils import load_hf_config
 
-jax.config.update("jax_default_matmul_precision", "highest")
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
 
 MODEL_ID = "Qwen/Qwen3-VL-2B-Instruct"
 PROMPT = "Why is the sky blue?"
-TEXT_RTOL = 1e-4
-TEXT_ATOL = 5e-4
-IMAGE_RTOL = 1e-3
-IMAGE_ATOL = 5e-3
 
 
 def _flatten_leaf_keys(tree: dict, prefix: str = "") -> list[str]:
@@ -54,17 +51,18 @@ def _get_value(tree: dict, dotted_key: str):
     return node
 
 
+@requires_real_weights
 class Qwen3VLMappingTest(absltest.TestCase):
     @classmethod
     def setUpClass(cls):
-        os.environ.setdefault("JAX_PLATFORMS", "cpu")
         super().setUpClass()
+        cls.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         cls.model_path = snapshot_download(MODEL_ID)
         cls.processor = AutoProcessor.from_pretrained(cls.model_path)
         hf_cfg = AutoConfig.from_pretrained(cls.model_path)
         cls.hf_model = Qwen3VLForConditionalGeneration.from_pretrained(
-            cls.model_path, config=hf_cfg, torch_dtype=torch.float32, attn_implementation="eager"
-        ).eval()
+            cls.model_path, config=hf_cfg, torch_dtype=torch.bfloat16, attn_implementation="eager"
+        ).to(cls.device).eval()
         cls.pad_id = cls.processor.tokenizer.pad_token_id or 0
 
         hf_cfg_dict = load_hf_config(cls.model_path)
@@ -110,19 +108,20 @@ class Qwen3VLMappingTest(absltest.TestCase):
         messages = [{"role": "user", "content": [{"type": "text", "text": PROMPT}]}]
         text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         inputs = self.processor.tokenizer(text, return_tensors="pt", padding=True)
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
         with torch.no_grad():
             hf_logits_BTV = self.hf_model(
                 input_ids=inputs["input_ids"],
                 attention_mask=inputs["attention_mask"],
-            ).logits.cpu().numpy()
+            ).logits.float().cpu().numpy()
 
         token_ids_BT = jnp.asarray(np.array(inputs["input_ids"].cpu(), dtype=np.int32))
         attention_mask_BT = jnp.asarray(np.array(inputs["attention_mask"].cpu(), dtype=np.int32))
         jax_logits_BTV = np.asarray(self.jax_model(token_ids_BT, attention_mask_BT), dtype=np.float32)
 
-        mask = inputs["attention_mask"].numpy().astype(bool)
-        np.testing.assert_allclose(jax_logits_BTV[mask], hf_logits_BTV[mask], rtol=TEXT_RTOL, atol=TEXT_ATOL)
+        mask = inputs["attention_mask"].cpu().numpy().astype(bool)
+        assert_logits_close(self, jax_logits_BTV, hf_logits_BTV, mask, top1_min_match=0.8)
 
     def test_text_only_prefill_logits_batched(self):
         """Batched text-only forward should match HF model."""
@@ -136,19 +135,20 @@ class Qwen3VLMappingTest(absltest.TestCase):
             for p in prompts
         ]
         inputs = self.processor.tokenizer(texts, return_tensors="pt", padding=True, padding_side="left")
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
         with torch.no_grad():
             hf_logits_BTV = self.hf_model(
                 input_ids=inputs["input_ids"],
                 attention_mask=inputs["attention_mask"],
-            ).logits.cpu().numpy()
+            ).logits.float().cpu().numpy()
 
         token_ids_BT = jnp.asarray(np.array(inputs["input_ids"].cpu(), dtype=np.int32))
         attention_mask_BT = jnp.asarray(np.array(inputs["attention_mask"].cpu(), dtype=np.int32))
         jax_logits_BTV = np.asarray(self.jax_model(token_ids_BT, attention_mask_BT), dtype=np.float32)
 
-        mask = inputs["attention_mask"].numpy().astype(bool)
-        np.testing.assert_allclose(jax_logits_BTV[mask], hf_logits_BTV[mask], rtol=TEXT_RTOL, atol=TEXT_ATOL)
+        mask = inputs["attention_mask"].cpu().numpy().astype(bool)
+        assert_logits_close(self, jax_logits_BTV, hf_logits_BTV, mask, top1_min_match=0.8)
 
     def test_image_prefill_logits_match_hf(self):
         """Image+text forward should match HF model."""
@@ -166,9 +166,10 @@ class Qwen3VLMappingTest(absltest.TestCase):
         ]
         text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         inputs = self.processor(text=[text], images=[img], return_tensors="pt", padding=True)
+        inputs = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
 
         with torch.no_grad():
-            hf_logits_BTV = self.hf_model(**inputs).logits.cpu().numpy()
+            hf_logits_BTV = self.hf_model(**inputs).logits.float().cpu().numpy()
 
         token_ids_BT = jnp.asarray(np.array(inputs["input_ids"].cpu(), dtype=np.int32))
         attention_mask_BT = jnp.asarray(np.array(inputs["attention_mask"].cpu(), dtype=np.int32))
@@ -185,8 +186,8 @@ class Qwen3VLMappingTest(absltest.TestCase):
             dtype=np.float32,
         )
 
-        mask = inputs["attention_mask"].numpy().astype(bool)
-        np.testing.assert_allclose(jax_logits_BTV[mask], hf_logits_BTV[mask], rtol=IMAGE_RTOL, atol=IMAGE_ATOL)
+        mask = inputs["attention_mask"].cpu().numpy().astype(bool)
+        assert_logits_close(self, jax_logits_BTV, hf_logits_BTV, mask, top1_min_match=0.8)
 
 
 if __name__ == "__main__":

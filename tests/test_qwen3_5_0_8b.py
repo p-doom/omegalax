@@ -1,4 +1,4 @@
-"""End-to-end correctness test for Qwen3-30B-A3B against HuggingFace."""
+"""End-to-end correctness test for Qwen3.5-0.8B (dense) against HuggingFace."""
 
 import os
 
@@ -11,22 +11,25 @@ import numpy as np
 import torch
 from absl.testing import absltest
 from huggingface_hub import snapshot_download
-from transformers import AutoTokenizer, Qwen3MoeForCausalLM
+from transformers import AutoTokenizer
+from transformers.models.qwen3_5.modeling_qwen3_5 import (
+    Qwen3_5ForConditionalGeneration as HFModel,
+)
 
 from tests.logits_assert import assert_logits_close
 from tests.real_weights import requires_real_weights
-from omegalax.text import api
-from omegalax.models.qwen3.loader import create_qwen3_from_safetensors
+from omegalax.models.qwen3_5.config import make_config
+from omegalax.models.qwen3_5.params import create_qwen3_5_from_safetensors
 
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
 
-MODEL_ID = "Qwen/Qwen3-30B-A3B-Instruct-2507"
+MODEL_ID = "Qwen/Qwen3.5-0.8B"
 PROMPT = "Why is the sky blue instead of another color like purple?"
 
 
 @requires_real_weights
-class Qwen3_30B_A3B_Test(absltest.TestCase):
+class Qwen3_5_0_8B_Test(absltest.TestCase):
 
     @classmethod
     def setUpClass(cls):
@@ -36,15 +39,15 @@ class Qwen3_30B_A3B_Test(absltest.TestCase):
         cls.tokenizer = AutoTokenizer.from_pretrained(cls.model_path)
         cls.pad_id = cls.tokenizer.pad_token_id or 0
 
-        cls.cfg = api.registry.build_config(MODEL_ID)
-        cls.jax_model = create_qwen3_from_safetensors(
+        cls.jax_cfg = make_config(MODEL_ID)
+        cls.jax_model, _ = create_qwen3_5_from_safetensors(
             cls.model_path,
             MODEL_ID,
             tp_size=1,
             fsdp_size=1,
         )
 
-        cls.hf_model = Qwen3MoeForCausalLM.from_pretrained(
+        cls.hf_model = HFModel.from_pretrained(
             cls.model_path, torch_dtype=torch.bfloat16, attn_implementation="eager",
         ).to(cls.device).eval()
 
@@ -54,25 +57,34 @@ class Qwen3_30B_A3B_Test(absltest.TestCase):
                 [{"role": "user", "content": t}],
                 tokenize=False,
                 add_generation_prompt=True,
-                enable_thinking=True,
             )
             for t in texts
         ]
         toks = self.tokenizer(chat_texts, return_tensors="pt", padding=True, padding_side="left")
         return {k: v.to(self.device) for k, v in toks.items()}
 
-    def _jax_prefill_logits(self, input_ids: torch.Tensor) -> np.ndarray:
-        token_ids_BT = jnp.asarray(np.array(input_ids.cpu(), dtype=np.int32))
-        logits_BTV, _ = api.forward(self.jax_model, token_ids_BT, self.pad_id, self.cfg)
+    def _jax_prefill_logits(self, tokens_np: np.ndarray) -> np.ndarray:
+        token_ids_BT = jnp.asarray(tokens_np)
+        segment_ids_BT = (token_ids_BT != self.pad_id).astype(jnp.int32)
+        logits_BTV, _ = self.jax_model(
+            token_ids_BT, segment_ids_BT, None, jnp.array(0, dtype=jnp.int32),
+        )
         return np.asarray(logits_BTV, dtype=np.float32)
 
     def test_prefill_logits_match_hf(self):
         inputs = self._tokenize([PROMPT])
         with torch.no_grad():
-            hf_logits_BTV = self.hf_model(**inputs).logits.float().cpu().numpy()
-        jax_logits_BTV = self._jax_prefill_logits(inputs["input_ids"])
-        mask = inputs["attention_mask"].cpu().numpy().astype(bool)
+            hf_logits_BTV = self.hf_model(
+                input_ids=inputs["input_ids"],
+                attention_mask=inputs["attention_mask"],
+                use_cache=False,
+            ).logits.float().cpu().numpy()
 
+        jax_logits_BTV = self._jax_prefill_logits(
+            np.array(inputs["input_ids"].cpu(), dtype=np.int32),
+        )
+
+        mask = inputs["attention_mask"].cpu().numpy().astype(bool)
         jax_masked = jax_logits_BTV[mask]
         hf_masked = hf_logits_BTV[mask]
         assert_logits_close(self, jax_masked, hf_masked, top1_min_match=0.8)

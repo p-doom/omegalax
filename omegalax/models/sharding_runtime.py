@@ -31,3 +31,18 @@ def batch_partition_spec(shd_cfg: ShardConfig) -> PartitionSpec:
 def shard_batch(token_ids_BT: jax.Array, shd_cfg: ShardConfig, mesh: Mesh) -> jax.Array:
     sharding = NamedSharding(mesh, batch_partition_spec(shd_cfg))
     return jax.make_array_from_process_local_data(sharding, token_ids_BT)
+
+
+def shard_batch_dict(
+    batch: dict[str, Any],
+    shd_cfg: ShardConfig,
+    mesh: Mesh,
+) -> dict[str, jax.Array]:
+    """Shard every array in a batch dict: batch dim sharded, rest replicated."""
+    batch_axis = shd_cfg.act_btd[0]
+    result = {}
+    for key, arr in batch.items():
+        spec = P(batch_axis, *((None,) * (arr.ndim - 1)))
+        sharding = NamedSharding(mesh, spec)
+        result[key] = jax.make_array_from_process_local_data(sharding, arr)
+    return result

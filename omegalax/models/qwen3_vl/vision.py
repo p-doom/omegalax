@@ -2,14 +2,61 @@
 
 from __future__ import annotations
 
+from functools import partial
+from typing import Any
+
 import jax
 import jax.numpy as jnp
-import numpy as np
 from flax import nnx
 from jax.sharding import PartitionSpec as P, reshard
 
 from omegalax.models.shard_config import ShardConfig
 from .config import Qwen3VLVisionConfig
+
+
+def _token_spatial_coords(
+    image_grid: jax.Array, merge_size: int, total_tokens: int
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Map each vision token to its (row, col) in the original spatial grid.
+
+    Args:
+        image_grid: int32 array of shape ``(num_images, 3)`` with ``(t, h, w)``
+            per image.
+        merge_size: spatial merge factor (typically 2).
+        total_tokens: total number of vision tokens across all images
+            (``sum(t*h*w)``).  Must be a **static** Python int (known from
+            array shapes at trace time).
+
+    Returns:
+        row_coord, col_coord, image_id — each int32 of shape
+        ``(total_tokens,)``.
+    """
+    tokens_per_image = image_grid[:, 0] * image_grid[:, 1] * image_grid[:, 2]
+    cu_tokens = jnp.concatenate(
+        [jnp.zeros(1, dtype=jnp.int32), jnp.cumsum(tokens_per_image).astype(jnp.int32)]
+    )
+
+    tok_idx = jnp.arange(total_tokens, dtype=jnp.int32)
+    image_id = jnp.searchsorted(cu_tokens[1:], tok_idx, side="right")
+    local_idx = tok_idx - cu_tokens[image_id]
+
+    h = image_grid[image_id, 1]
+    w = image_grid[image_id, 2]
+    spatial_idx = local_idx % (h * w)
+
+    merge_sq = merge_size * merge_size
+    merged_w = w // merge_size
+    group_idx = spatial_idx // merge_sq
+    intra_idx = spatial_idx % merge_sq
+
+    block_r = group_idx // merged_w
+    block_c = group_idx % merged_w
+    intra_r = intra_idx // merge_size
+    intra_c = intra_idx % merge_size
+
+    row_coord = block_r * merge_size + intra_r
+    col_coord = block_c * merge_size + intra_c
+    return row_coord, col_coord, image_id
 
 wp = nnx.with_partitioning
 
@@ -24,9 +71,10 @@ class LayerNorm(nnx.Module):
         *,
         rngs: nnx.Rngs,
         sharding: tuple[str | None, ...] = ("hidden",),
+        param_dtype: Any = jnp.float32,
     ):
-        self.scale = nnx.Param(jnp.ones(dim), sharding=sharding)
-        self.bias = nnx.Param(jnp.zeros(dim), sharding=sharding)
+        self.scale = nnx.Param(jnp.ones(dim, dtype=param_dtype), sharding=sharding)
+        self.bias = nnx.Param(jnp.zeros(dim, dtype=param_dtype), sharding=sharding)
         self.eps = eps
 
     def __call__(self, x: jax.Array) -> jax.Array:
@@ -139,7 +187,7 @@ class VisionAttention(nnx.Module):
         self.hidden_shd = hidden_shd
         self.heads_shd = heads_shd
 
-    def __call__(self, hidden_ND: jax.Array, cu_seqlens: list[int], cos_NK: jax.Array, sin_NK: jax.Array) -> jax.Array:
+    def __call__(self, hidden_ND: jax.Array, cu_seqlens: jax.Array, cos_NK: jax.Array, sin_NK: jax.Array) -> jax.Array:
         hidden_ND = reshard(hidden_ND, self.hidden_shd)
         N = hidden_ND.shape[0]
         qkv = self.qkv(hidden_ND, out_sharding=self.hidden_shd).reshape(N, 3, self.num_heads, self.head_dim)
@@ -149,17 +197,15 @@ class VisionAttention(nnx.Module):
 
         q_NHK, k_NHK = apply_rotary_pos_emb_vision(q_NHK, k_NHK, cos_NK, sin_NK)
 
-        outputs = []
-        for i in range(len(cu_seqlens) - 1):
-            start, end = cu_seqlens[i], cu_seqlens[i + 1]
-            q_c, k_c, v_c = q_NHK[start:end], k_NHK[start:end], v_NHK[start:end]
-            logits_HNN = jnp.einsum("NHK,MHK->HNM", q_c, k_c) * self.scale
-            weights_HNN = jax.nn.softmax(logits_HNN.astype(jnp.float32), axis=-1).astype(q_c.dtype)
-            out_NHK = jnp.einsum("HNM,MHK->NHK", weights_HNN, v_c)
-            outputs.append(out_NHK)
+        seg_ids = jnp.searchsorted(cu_seqlens[1:], jnp.arange(N), side="right")
+        attn_mask_NM = seg_ids[:, None] == seg_ids[None, :]
 
-        result_ND = jnp.concatenate(outputs, axis=0).reshape(N, -1)
-        out_ND = self.proj(result_ND, out_sharding=self.hidden_shd)
+        logits_HNM = jnp.einsum("NHK,MHK->HNM", q_NHK, k_NHK) * self.scale
+        logits_HNM = jnp.where(attn_mask_NM[None, :, :], logits_HNM, -1e9)
+        weights_HNM = jax.nn.softmax(logits_HNM.astype(jnp.float32), axis=-1).astype(q_NHK.dtype)
+        outputs_ND = jnp.einsum("HNM,MHK->NHK", weights_HNM, v_NHK).reshape(N, -1)
+
+        out_ND = self.proj(outputs_ND, out_sharding=self.hidden_shd)
         return reshard(out_ND, self.hidden_shd)
 
 
@@ -171,7 +217,8 @@ class VisionBlock(nnx.Module):
         self.mlp = VisionMLP(config, hidden_shd=hidden_shd, ff_shd=ff_shd, rngs=rngs)
         self.hidden_shd = hidden_shd
 
-    def __call__(self, hidden_ND: jax.Array, cu_seqlens: list[int], cos_NK: jax.Array, sin_NK: jax.Array) -> jax.Array:
+    @partial(jax.remat, static_argnums=0)
+    def __call__(self, hidden_ND: jax.Array, cu_seqlens: jax.Array, cos_NK: jax.Array, sin_NK: jax.Array) -> jax.Array:
         hidden_ND = reshard(hidden_ND, self.hidden_shd)
         hidden_ND = reshard(hidden_ND + self.attn(self.norm1(hidden_ND), cu_seqlens, cos_NK, sin_NK), self.hidden_shd)
         hidden_ND = reshard(hidden_ND + self.mlp(self.norm2(hidden_ND)), self.hidden_shd)
@@ -215,10 +262,11 @@ class VisionPatchMerger(nnx.Module):
 
     def __call__(self, hidden_ND: jax.Array) -> jax.Array:
         hidden_ND = reshard(hidden_ND, self.hidden_shd)
+        new_sizes = (hidden_ND.shape[0] * hidden_ND.shape[1] // self.hidden_size, self.hidden_size)
         if self.use_postshuffle_norm:
-            normed = self.norm(hidden_ND.reshape(-1, self.hidden_size))
+            normed = self.norm(jax.lax.reshape(hidden_ND, new_sizes, out_sharding=self.hidden_shd))
         else:
-            normed = self.norm(hidden_ND).reshape(-1, self.hidden_size)
+            normed = jax.lax.reshape(self.norm(hidden_ND), new_sizes, out_sharding=self.hidden_shd)
         # FIXME (f.srambical):  we should probably approximate the gelu for increased throughput,
         # even if that deviates from huggingface numerics
         ff_NF = self.fc1(normed, out_sharding=self.ff_shd)
@@ -271,96 +319,75 @@ class VisionModel(nnx.Module):
         )
         self.deepstack_visual_indexes = config.deepstack_visual_indexes
 
-    def _compute_rotary_pos_emb(self, grid_thw_list: list[list[int]]) -> jax.Array:
-        merge_size = self.spatial_merge_size
-        max_hw = max(max(int(h), int(w)) for _, h, w in grid_thw_list)
+    def _compute_rotary_pos_emb(self, image_grid: jax.Array, total_tokens: int) -> jax.Array:
+        row, col, _ = _token_spatial_coords(image_grid, self.spatial_merge_size, total_tokens)
+        inv_freq = 1.0 / (
+            self.rotary_theta
+            ** (jnp.arange(0, self.rotary_dim, 2, dtype=jnp.float32) / self.rotary_dim)
+        )
+        row_emb = row[:, None].astype(jnp.float32) * inv_freq[None, :]
+        col_emb = col[:, None].astype(jnp.float32) * inv_freq[None, :]
+        return jnp.concatenate([row_emb, col_emb], axis=-1)
 
-        inv_freq = 1.0 / (self.rotary_theta ** (jnp.arange(0, self.rotary_dim, 2, dtype=jnp.float32) / self.rotary_dim))
-        seq = jnp.arange(max_hw, dtype=jnp.float32)
-        freq_table = jnp.outer(seq, inv_freq)
-
-        all_pos_ids = []
-        for num_frames, height, width in grid_thw_list:
-            num_frames, height, width = int(num_frames), int(height), int(width)
-            merged_h, merged_w = height // merge_size, width // merge_size
-            block_rows = np.arange(merged_h)
-            block_cols = np.arange(merged_w)
-            intra_row = np.arange(merge_size)
-            intra_col = np.arange(merge_size)
-            row_idx = (block_rows[:, None, None, None] * merge_size + intra_row[None, None, :, None])
-            col_idx = (block_cols[None, :, None, None] * merge_size + intra_col[None, None, None, :])
-            row_idx = np.broadcast_to(row_idx, (merged_h, merged_w, merge_size, merge_size)).reshape(-1)
-            col_idx = np.broadcast_to(col_idx, (merged_h, merged_w, merge_size, merge_size)).reshape(-1)
-            coords = np.stack([row_idx, col_idx], axis=-1)
-            if num_frames > 1:
-                coords = np.tile(coords, (num_frames, 1))
-            all_pos_ids.append(coords)
-
-        pos_ids = jnp.array(np.concatenate(all_pos_ids, axis=0))
-        embeddings = freq_table[pos_ids]
-        return embeddings.reshape(pos_ids.shape[0], -1)
-
-    def _interpolate_pos_embed(self, grid_thw_list: list[list[int]]) -> jax.Array:
-        merge_size = self.spatial_merge_size
+    def _interpolate_pos_embed(self, image_grid: jax.Array, total_tokens: int) -> jax.Array:
+        row, col, img_id = _token_spatial_coords(image_grid, self.spatial_merge_size, total_tokens)
         pos_weight_VD = self.pos_embed.embedding[...]
         n = self.num_grid_per_side
 
-        all_pos = []
-        for t, h, w in grid_thw_list:
-            t, h, w = int(t), int(h), int(w)
-            h_idxs = jnp.linspace(0, n - 1, h)
-            w_idxs = jnp.linspace(0, n - 1, w)
+        h = image_grid[img_id, 1].astype(jnp.float32)
+        w = image_grid[img_id, 2].astype(jnp.float32)
 
-            h_floor = jnp.floor(h_idxs).astype(jnp.int32)
-            w_floor = jnp.floor(w_idxs).astype(jnp.int32)
-            h_ceil = jnp.minimum(h_floor + 1, n - 1)
-            w_ceil = jnp.minimum(w_floor + 1, n - 1)
-            dh = h_idxs - h_floor
-            dw = w_idxs - w_floor
+        h_idx = row.astype(jnp.float32) * (n - 1) / jnp.maximum(h - 1.0, 1.0)
+        w_idx = col.astype(jnp.float32) * (n - 1) / jnp.maximum(w - 1.0, 1.0)
 
-            idx_ff = (h_floor[:, None] * n + w_floor[None, :]).reshape(-1)
-            idx_fc = (h_floor[:, None] * n + w_ceil[None, :]).reshape(-1)
-            idx_cf = (h_ceil[:, None] * n + w_floor[None, :]).reshape(-1)
-            idx_cc = (h_ceil[:, None] * n + w_ceil[None, :]).reshape(-1)
+        h_floor = jnp.floor(h_idx).astype(jnp.int32)
+        w_floor = jnp.floor(w_idx).astype(jnp.int32)
+        h_ceil = jnp.minimum(h_floor + 1, n - 1)
+        w_ceil = jnp.minimum(w_floor + 1, n - 1)
+        dh = h_idx - h_floor.astype(jnp.float32)
+        dw = w_idx - w_floor.astype(jnp.float32)
 
-            w_ff = ((1 - dh)[:, None] * (1 - dw)[None, :]).reshape(-1)
-            w_fc = ((1 - dh)[:, None] * dw[None, :]).reshape(-1)
-            w_cf = (dh[:, None] * (1 - dw)[None, :]).reshape(-1)
-            w_cc = (dh[:, None] * dw[None, :]).reshape(-1)
+        idx_ff = h_floor * n + w_floor
+        idx_fc = h_floor * n + w_ceil
+        idx_cf = h_ceil * n + w_floor
+        idx_cc = h_ceil * n + w_ceil
 
-            pos_ND = (
-                pos_weight_VD[idx_ff] * w_ff[:, None]
-                + pos_weight_VD[idx_fc] * w_fc[:, None]
-                + pos_weight_VD[idx_cf] * w_cf[:, None]
-                + pos_weight_VD[idx_cc] * w_cc[:, None]
-            )
-            pos_ND = jnp.tile(pos_ND, (t, 1))
-            pos_ND = pos_ND.reshape(t, h // merge_size, merge_size, w // merge_size, merge_size, -1)
-            pos_ND = pos_ND.transpose(0, 1, 3, 2, 4, 5).reshape(-1, pos_ND.shape[-1])
-            all_pos.append(pos_ND)
+        w_ff = (1.0 - dh) * (1.0 - dw)
+        w_fc = (1.0 - dh) * dw
+        w_cf = dh * (1.0 - dw)
+        w_cc = dh * dw
 
-        return jnp.concatenate(all_pos, axis=0)
+        return (
+            pos_weight_VD[idx_ff] * w_ff[:, None]
+            + pos_weight_VD[idx_fc] * w_fc[:, None]
+            + pos_weight_VD[idx_cf] * w_cf[:, None]
+            + pos_weight_VD[idx_cc] * w_cc[:, None]
+        )
 
     def __call__(
-        self, pixel_values: jax.Array, grid_thw: jax.Array
+        self, pixel_values: jax.Array, image_grid: jax.Array
     ) -> tuple[jax.Array, list[jax.Array]]:
-        grid_thw_list = grid_thw.tolist() if hasattr(grid_thw, "tolist") else [[int(v) for v in row] for row in grid_thw]
-
         hidden_ND = self.patch_embed(pixel_values)
-        pos_embeds_ND = self._interpolate_pos_embed(grid_thw_list)
+        total_tokens: int = hidden_ND.shape[0]
+
+        pos_embeds_ND = self._interpolate_pos_embed(image_grid, total_tokens)
         hidden_ND = reshard(hidden_ND + pos_embeds_ND, self.hidden_shd)
 
-        rotary_emb_NK = self._compute_rotary_pos_emb(grid_thw_list)
+        rotary_emb_NK = self._compute_rotary_pos_emb(image_grid, total_tokens)
         emb_NK = jnp.concatenate([rotary_emb_NK, rotary_emb_NK], axis=-1)
         cos_NK, sin_NK = jnp.cos(emb_NK), jnp.sin(emb_NK)
         cos_NK = cos_NK.astype(self.config.dtype)
         sin_NK = sin_NK.astype(self.config.dtype)
 
-        cu_seqlens = [0]
-        for t_val, h_val, w_val in grid_thw_list:
-            t_val, h_val, w_val = int(t_val), int(h_val), int(w_val)
-            for _ in range(t_val):
-                cu_seqlens.append(cu_seqlens[-1] + h_val * w_val)
+        tokens_per_frame = jnp.repeat(
+            image_grid[:, 1] * image_grid[:, 2],
+            image_grid[:, 0],
+            out_sharding=P(),
+        )
+        cu_seqlens = jnp.concatenate([
+            jnp.zeros(1, dtype=jnp.int32),
+            jnp.cumsum(tokens_per_frame).astype(jnp.int32),
+        ])
 
         deepstack_features: list[jax.Array] = []
         for layer_num, blk in enumerate(self.blocks):
