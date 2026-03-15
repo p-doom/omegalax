@@ -55,7 +55,7 @@ class JSONLDataset:
                 if not line:
                     continue
                 raw = json.loads(line)
-                if self.max_turns is not None and len(raw.get("messages", [])) > self.max_turns:
+                if self.max_turns is not None and len(raw["messages"]) > self.max_turns:
                     for chunk in _split_messages(raw["messages"], self.max_turns):
                         ex = dict(raw)
                         ex["messages"] = chunk
