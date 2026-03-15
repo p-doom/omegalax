@@ -24,7 +24,7 @@ class Qwen3VLVisionConfig:
     hidden_act: str
     num_position_embeddings: int
     deepstack_visual_indexes: tuple[int, ...]
-    dtype: Any = jnp.float32
+    dtype: Any = jnp.bfloat16
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
