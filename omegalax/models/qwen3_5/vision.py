@@ -5,6 +5,8 @@ rotary position embeddings, spatial merge, and bilinear position
 embedding interpolation.
 """
 
+from functools import partial
+
 import jax
 import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P, reshard
@@ -159,29 +161,13 @@ class VisionAttention(nnx.Module):
         v_NHK = reshard(qkv[:, 2], self.heads_shd)
 
         q_NHK, k_NHK = apply_vision_rope(q_NHK, k_NHK, cos_NK, sin_NK)
+        seg_ids = jnp.searchsorted(cu_seqlens[1:], jnp.arange(N), side="right")
+        attn_mask_NM = seg_ids[:, None] == seg_ids[None, :]
+        logits_HNM = jnp.einsum("NHK,MHK->HNM", q_NHK, k_NHK) * self.scale
+        logits_HNM = jnp.where(attn_mask_NM[None, :, :], logits_HNM, -1e9)
+        weights_HNM = jax.nn.softmax(logits_HNM.astype(jnp.float32), axis=-1).astype(q_NHK.dtype)
+        outputs_ND = jnp.einsum("HNM,MHK->NHK", weights_HNM, v_NHK).reshape(N, -1)
 
-        num_seqs = cu_seqlens.shape[0] - 1
-        outputs_ND = reshard(jnp.zeros_like(q_NHK.reshape(N, -1)), self.hidden_shd)
-
-        def _attn_chunk(start, end):
-            q_i = q_NHK[start:end]
-            k_i = k_NHK[start:end]
-            v_i = v_NHK[start:end]
-            q_HLK = q_i.transpose(1, 0, 2)
-            k_HLK = k_i.transpose(1, 0, 2)
-            v_HLK = v_i.transpose(1, 0, 2)
-            logits_HLL = jnp.matmul(q_HLK, k_HLK.transpose(0, 2, 1)) * self.scale
-            weights_HLL = jax.nn.softmax(logits_HLL.astype(jnp.float32), axis=-1).astype(logits_HLL.dtype)
-            out_HLK = jnp.matmul(weights_HLL, v_HLK)
-            return out_HLK.transpose(1, 0, 2).reshape(-1, self.num_heads * self.head_dim)
-
-        def body_fn(i, out):
-            start = cu_seqlens[i]
-            end = cu_seqlens[i + 1]
-            chunk_out = _attn_chunk(start, end)
-            return jax.lax.dynamic_update_slice(out, chunk_out, (start, 0))
-
-        outputs_ND = jax.lax.fori_loop(0, num_seqs, body_fn, outputs_ND)
         out_ND = self.proj(outputs_ND, out_sharding=self.hidden_shd)
         return reshard(out_ND, self.hidden_shd)
 
@@ -194,6 +180,7 @@ class VisionBlock(nnx.Module):
         self.mlp = VisionMLP(cfg, hidden_shd=hidden_shd, ff_shd=ff_shd, rngs=rngs)
         self.hidden_shd = hidden_shd
 
+    @partial(jax.remat, static_argnums=0)
     def __call__(self, hidden_ND, cu_seqlens, cos_NK, sin_NK):
         hidden_ND = reshard(hidden_ND, self.hidden_shd)
         hidden_ND = reshard(hidden_ND + self.attn(self.norm1(hidden_ND), cu_seqlens, cos_NK, sin_NK), self.hidden_shd)
