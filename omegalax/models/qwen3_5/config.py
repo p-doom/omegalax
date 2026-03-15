@@ -22,7 +22,7 @@ class Qwen3_5VisionConfig:
     in_channels: int = 3
     out_hidden_size: int = 4096
     num_position_embeddings: int = 2304
-    dtype: Any = jnp.float32
+    dtype: Any = jnp.bfloat16
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
