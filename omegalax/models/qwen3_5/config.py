@@ -6,7 +6,9 @@ import dataclasses
 from typing import Any
 
 import jax.numpy as jnp
+from etils import epath
 
+from omegalax.models.params_utils import load_hf_config_from_source
 from omegalax.models.shard_config import ShardConfig
 
 
@@ -98,10 +100,8 @@ _SMOKE_LINEAR_ATTN = {
     "linear_value_head_dim": 32,
 }
 
-# Model specs registry
-_QWEN3_5_SPECS: dict[str, dict] = {
+_QWEN3_5_SMOKE_SPECS: dict[str, dict[str, Any]] = {
     "qwen3.5-smoke": {
-        "hf_repo_id": None,
         "vision_config": _SMOKE_VISION,
         "text_config": {
             "vocab_size": 1024,
@@ -123,7 +123,6 @@ _QWEN3_5_SPECS: dict[str, dict] = {
         },
     },
     "qwen3.5-smoke-dense": {
-        "hf_repo_id": None,
         "vision_config": _SMOKE_VISION,
         "text_config": {
             "vocab_size": 1024,
@@ -141,183 +140,22 @@ _QWEN3_5_SPECS: dict[str, dict] = {
             "intermediate_size": 256,
         },
     },
-    "qwen3.5-0.8b": {
-        "hf_repo_id": "Qwen/Qwen3.5-0.8B",
-        "vision_config": {
-            "depth": 12,
-            "hidden_size": 768,
-            "intermediate_size": 3072,
-            "num_heads": 12,
-            "out_hidden_size": 1024,
-        },
-        "text_config": {
-            "hidden_size": 1024,
-            "num_hidden_layers": 24,
-            "num_attention_heads": 8,
-            "num_key_value_heads": 2,
-            "intermediate_size": 3584,
-            "linear_num_value_heads": 16,
-            "tie_word_embeddings": True,
-        },
-    },
-    "qwen3.5-2b": {
-        "hf_repo_id": "Qwen/Qwen3.5-2B",
-        "vision_config": {
-            "depth": 24,
-            "hidden_size": 1024,
-            "intermediate_size": 4096,
-            "num_heads": 16,
-            "out_hidden_size": 2048,
-        },
-        "text_config": {
-            "hidden_size": 2048,
-            "num_hidden_layers": 24,
-            "num_attention_heads": 8,
-            "num_key_value_heads": 2,
-            "intermediate_size": 6144,
-            "linear_num_value_heads": 16,
-            "tie_word_embeddings": True,
-        },
-    },
-    "qwen3.5-4b": {
-        "hf_repo_id": "Qwen/Qwen3.5-4B",
-        "vision_config": {
-            "depth": 24,
-            "hidden_size": 1024,
-            "intermediate_size": 4096,
-            "num_heads": 16,
-            "out_hidden_size": 2560,
-        },
-        "text_config": {
-            "hidden_size": 2560,
-            "num_hidden_layers": 32,
-            "num_attention_heads": 16,
-            "num_key_value_heads": 4,
-            "intermediate_size": 9216,
-            "linear_num_value_heads": 32,
-            "tie_word_embeddings": True,
-        },
-    },
-    "qwen3.5-9b": {
-        "hf_repo_id": "Qwen/Qwen3.5-9B",
-        "vision_config": {},
-        "text_config": {
-            "num_hidden_layers": 32,
-            "num_attention_heads": 16,
-            "num_key_value_heads": 4,
-            "intermediate_size": 12288,
-            "linear_num_value_heads": 32,
-        },
-    },
-    "qwen3.5-27b": {
-        "hf_repo_id": "Qwen/Qwen3.5-27B",
-        "vision_config": {
-            "out_hidden_size": 5120,
-        },
-        "text_config": {
-            "hidden_size": 5120,
-            "num_hidden_layers": 64,
-            "num_attention_heads": 24,
-            "num_key_value_heads": 4,
-            "intermediate_size": 17408,
-            "linear_num_value_heads": 48,
-        },
-    },
-    "qwen3.5-35b-a3b": {
-        "hf_repo_id": "Qwen/Qwen3.5-35B-A3B",
-        "vision_config": {
-            "out_hidden_size": 2048,
-        },
-        "text_config": {
-            "hidden_size": 2048,
-            "num_hidden_layers": 40,
-            "num_attention_heads": 16,
-            "num_key_value_heads": 2,
-            "linear_num_value_heads": 32,
-            "moe_intermediate_size": 512,
-            "shared_expert_intermediate_size": 512,
-            "num_experts": 256,
-            "num_experts_per_tok": 8,
-        },
-    },
-    "qwen3.5-122b-a10b": {
-        "hf_repo_id": "Qwen/Qwen3.5-122B-A10B",
-        "vision_config": {
-            "out_hidden_size": 3072,
-        },
-        "text_config": {
-            "hidden_size": 3072,
-            "num_hidden_layers": 48,
-            "num_attention_heads": 32,
-            "num_key_value_heads": 2,
-            "moe_intermediate_size": 1024,
-            "shared_expert_intermediate_size": 1024,
-            "num_experts": 256,
-            "num_experts_per_tok": 8,
-        },
-    },
-    "qwen3.5-397b-a17b": {
-        "hf_repo_id": "Qwen/Qwen3.5-397B-A17B",
-        "vision_config": {},
-        "text_config": {
-            "num_hidden_layers": 60,
-            "moe_intermediate_size": 1024,
-            "shared_expert_intermediate_size": 1024,
-            "num_experts": 512,
-            "num_experts_per_tok": 10,
-        },
-    },
 }
 
-_MODEL_ID_TO_SPEC: dict[str, str] = {}
-for _spec_key, _spec in _QWEN3_5_SPECS.items():
-    _MODEL_ID_TO_SPEC[_spec_key] = _spec_key
-    _hf_id = _spec.get("hf_repo_id")
-    if _hf_id:
-        _MODEL_ID_TO_SPEC[_hf_id] = _spec_key
+_QWEN3_5_REPOS = (
+    "Qwen/Qwen3.5-0.8B",
+    "Qwen/Qwen3.5-2B",
+    "Qwen/Qwen3.5-4B",
+    "Qwen/Qwen3.5-9B",
+    "Qwen/Qwen3.5-27B",
+    "Qwen/Qwen3.5-35B-A3B",
+    "Qwen/Qwen3.5-122B-A10B",
+    "Qwen/Qwen3.5-397B-A17B",
+)
 
-
-def list_qwen3_5_model_ids() -> list[str]:
-    return [s["hf_repo_id"] for s in _QWEN3_5_SPECS.values() if s.get("hf_repo_id")]
-
-
-def get_qwen3_5_spec(model_id: str) -> dict:
-    spec_key = _MODEL_ID_TO_SPEC.get(model_id)
-    if spec_key:
-        return dict(_QWEN3_5_SPECS[spec_key])
-    supported = sorted(_MODEL_ID_TO_SPEC.keys())
-    raise ValueError(f"Unsupported Qwen3.5 model_id '{model_id}'. Supported ids: {supported}")
-
-
-def is_supported_qwen3_5_model_id(model_id: str) -> bool:
-    return model_id in _MODEL_ID_TO_SPEC
-
-
-def list_supported_qwen3_5_model_ids() -> list[str]:
-    return sorted(_MODEL_ID_TO_SPEC.keys())
-
-
+_SUPPORTED_MODEL_TYPES = {"qwen3_5", "qwen3_5_moe"}
+_SUPPORTED_MODEL_IDS = sorted((*_QWEN3_5_SMOKE_SPECS.keys(), *_QWEN3_5_REPOS))
 _FULL_ATTENTION_INTERVAL = 4
-
-
-def _generate_layer_types(num_layers: int) -> tuple[str, ...]:
-    """Generate layer_types with full_attention every 4th layer (1-indexed)."""
-    return tuple(
-        "full_attention" if (i + 1) % _FULL_ATTENTION_INTERVAL == 0 else "linear_attention"
-        for i in range(num_layers)
-    )
-
-
-def make_config(model_id: str) -> Qwen3_5Config:
-    spec = get_qwen3_5_spec(model_id)
-    vis_kw = spec["vision_config"]
-    txt_kw = dict(spec["text_config"])
-    if not txt_kw.get("layer_types"):
-        txt_kw["layer_types"] = _generate_layer_types(txt_kw["num_hidden_layers"])
-    return Qwen3_5Config(
-        vision_config=Qwen3_5VisionConfig(**vis_kw),
-        text_config=Qwen3_5TextConfig(**txt_kw),
-    )
 
 
 def _required(mapping: dict[str, Any], key: str, where: str) -> Any:
@@ -338,69 +176,137 @@ def _hf_dtype_to_jnp(hf_dtype: str) -> Any:
     raise ValueError(f"Unsupported dtype '{hf_dtype}'.")
 
 
+def list_qwen3_5_model_ids() -> list[str]:
+    return list(_QWEN3_5_REPOS)
+
+
+def resolve_qwen3_5_repo_id(model_id: str) -> str:
+    return model_id
+
+
+def get_qwen3_5_spec(model_id: str) -> dict[str, Any]:
+    if model_id in _QWEN3_5_SMOKE_SPECS:
+        return dict(_QWEN3_5_SMOKE_SPECS[model_id])
+    if model_id in _QWEN3_5_REPOS:
+        return {"hf_repo_id": model_id}
+    raise ValueError(f"Unsupported Qwen3.5 model_id '{model_id}'. Supported ids: {_SUPPORTED_MODEL_IDS}")
+
+
+def is_supported_qwen3_5_model_id(model_id: str) -> bool:
+    return model_id in _QWEN3_5_SMOKE_SPECS or model_id in _QWEN3_5_REPOS
+
+
+def list_supported_qwen3_5_model_ids() -> list[str]:
+    return list(_SUPPORTED_MODEL_IDS)
+
+
+def _generate_layer_types(num_layers: int) -> tuple[str, ...]:
+    """Generate layer_types with full_attention every 4th layer (1-indexed)."""
+    return tuple(
+        "full_attention" if (i + 1) % _FULL_ATTENTION_INTERVAL == 0 else "linear_attention"
+        for i in range(num_layers)
+    )
+
+
+def make_config(model_id: str) -> Qwen3_5Config:
+    if model_id in _QWEN3_5_SMOKE_SPECS:
+        spec = _QWEN3_5_SMOKE_SPECS[model_id]
+        return Qwen3_5Config(
+            vision_config=Qwen3_5VisionConfig(**spec["vision_config"]),
+            text_config=Qwen3_5TextConfig(**spec["text_config"]),
+        )
+
+    if "/" not in model_id and not epath.Path(model_id).expanduser().exists():
+        raise ValueError(f"Unsupported Qwen3.5 model_id '{model_id}'. Supported ids: {_SUPPORTED_MODEL_IDS}")
+
+    hf_cfg = load_hf_config_from_source(resolve_qwen3_5_repo_id(model_id))
+    return make_config_from_hf(hf_cfg)
+
+
 def make_config_from_hf(hf_cfg: dict[str, Any]) -> Qwen3_5Config:
     """Build a Qwen3_5Config from a HuggingFace config.json dict."""
+    model_type = _required(hf_cfg, "model_type", "hf_cfg")
+    if model_type not in _SUPPORTED_MODEL_TYPES:
+        raise ValueError(
+            f"Unsupported Qwen3.5 model_type '{model_type}'. Expected one of {sorted(_SUPPORTED_MODEL_TYPES)}."
+        )
+
     vis = _required(hf_cfg, "vision_config", "hf_cfg")
     txt = _required(hf_cfg, "text_config", "hf_cfg")
+    if not isinstance(vis, dict):
+        raise ValueError("Expected vision_config to be a dict in hf_cfg.")
+    if not isinstance(txt, dict):
+        raise ValueError("Expected text_config to be a dict in hf_cfg.")
+
     rope_params = _required(txt, "rope_parameters", "hf_cfg['text_config']")
     if not isinstance(rope_params, dict):
         raise ValueError("Expected rope_parameters to be a dict in hf_cfg['text_config'].")
+    rope_type = rope_params.get("rope_type", "default")
+    if rope_type != "default":
+        raise ValueError(f"Unsupported rope_parameters.rope_type '{rope_type}' for Qwen3.5.")
+
     text_dtype = _hf_dtype_to_jnp(_required(txt, "dtype", "hf_cfg['text_config']"))
     vision_dtype = _hf_dtype_to_jnp(vis["dtype"]) if vis.get("dtype") is not None else text_dtype
 
-    has_moe = "num_experts" in txt and txt["num_experts"] > 0
+    has_moe = model_type == "qwen3_5_moe"
+    if has_moe == ("intermediate_size" in txt):
+        raise ValueError(
+            "Qwen3.5 config must map cleanly to exactly one of dense or MoE text settings."
+        )
 
     text_kw: dict[str, Any] = {
-        "vocab_size": txt["vocab_size"],
-        "hidden_size": txt["hidden_size"],
-        "num_hidden_layers": txt["num_hidden_layers"],
-        "num_attention_heads": txt["num_attention_heads"],
-        "num_key_value_heads": txt["num_key_value_heads"],
-        "head_dim": txt["head_dim"],
-        "rms_norm_eps": txt["rms_norm_eps"],
-        "layer_types": tuple(txt["layer_types"]),
+        "vocab_size": _required(txt, "vocab_size", "hf_cfg['text_config']"),
+        "hidden_size": _required(txt, "hidden_size", "hf_cfg['text_config']"),
+        "num_hidden_layers": _required(txt, "num_hidden_layers", "hf_cfg['text_config']"),
+        "num_attention_heads": _required(txt, "num_attention_heads", "hf_cfg['text_config']"),
+        "num_key_value_heads": _required(txt, "num_key_value_heads", "hf_cfg['text_config']"),
+        "head_dim": _required(txt, "head_dim", "hf_cfg['text_config']"),
+        "rms_norm_eps": _required(txt, "rms_norm_eps", "hf_cfg['text_config']"),
+        "layer_types": tuple(_required(txt, "layer_types", "hf_cfg['text_config']")),
         "rope_theta": _required(rope_params, "rope_theta", "rope_parameters"),
-        "partial_rotary_factor": rope_params["partial_rotary_factor"],
-        "mrope_section": tuple(rope_params["mrope_section"]),
-        "mrope_interleaved": rope_params["mrope_interleaved"],
-        "attention_bias": txt["attention_bias"],
-        "tie_word_embeddings": hf_cfg["tie_word_embeddings"],
-        "linear_conv_kernel_dim": txt["linear_conv_kernel_dim"],
-        "linear_key_head_dim": txt["linear_key_head_dim"],
-        "linear_num_key_heads": txt["linear_num_key_heads"],
-        "linear_num_value_heads": txt["linear_num_value_heads"],
-        "linear_value_head_dim": txt["linear_value_head_dim"],
+        "partial_rotary_factor": _required(rope_params, "partial_rotary_factor", "rope_parameters"),
+        "mrope_section": tuple(_required(rope_params, "mrope_section", "rope_parameters")),
+        "mrope_interleaved": _required(rope_params, "mrope_interleaved", "rope_parameters"),
+        "attention_bias": _required(txt, "attention_bias", "hf_cfg['text_config']"),
+        "tie_word_embeddings": _required(hf_cfg, "tie_word_embeddings", "hf_cfg"),
+        "linear_conv_kernel_dim": _required(txt, "linear_conv_kernel_dim", "hf_cfg['text_config']"),
+        "linear_key_head_dim": _required(txt, "linear_key_head_dim", "hf_cfg['text_config']"),
+        "linear_num_key_heads": _required(txt, "linear_num_key_heads", "hf_cfg['text_config']"),
+        "linear_num_value_heads": _required(txt, "linear_num_value_heads", "hf_cfg['text_config']"),
+        "linear_value_head_dim": _required(txt, "linear_value_head_dim", "hf_cfg['text_config']"),
         "dtype": text_dtype,
     }
 
     if has_moe:
         text_kw.update(
-            moe_intermediate_size=txt["moe_intermediate_size"],
-            shared_expert_intermediate_size=txt["shared_expert_intermediate_size"],
-            num_experts=txt["num_experts"],
-            num_experts_per_tok=txt["num_experts_per_tok"],
-            router_aux_loss_coef=txt["router_aux_loss_coef"],
+            moe_intermediate_size=_required(txt, "moe_intermediate_size", "hf_cfg['text_config']"),
+            shared_expert_intermediate_size=_required(
+                txt, "shared_expert_intermediate_size", "hf_cfg['text_config']"
+            ),
+            num_experts=_required(txt, "num_experts", "hf_cfg['text_config']"),
+            num_experts_per_tok=_required(txt, "num_experts_per_tok", "hf_cfg['text_config']"),
+            router_aux_loss_coef=_required(txt, "router_aux_loss_coef", "hf_cfg['text_config']"),
         )
     else:
-        text_kw["intermediate_size"] = txt["intermediate_size"]
+        text_kw["intermediate_size"] = _required(txt, "intermediate_size", "hf_cfg['text_config']")
 
     return Qwen3_5Config(
         vision_config=Qwen3_5VisionConfig(
-            depth=vis["depth"],
-            hidden_size=vis["hidden_size"],
-            intermediate_size=vis["intermediate_size"],
-            num_heads=vis["num_heads"],
-            patch_size=vis["patch_size"],
-            temporal_patch_size=vis["temporal_patch_size"],
-            spatial_merge_size=vis["spatial_merge_size"],
-            in_channels=vis["in_channels"],
-            out_hidden_size=vis["out_hidden_size"],
-            num_position_embeddings=vis["num_position_embeddings"],
+            depth=_required(vis, "depth", "hf_cfg['vision_config']"),
+            hidden_size=_required(vis, "hidden_size", "hf_cfg['vision_config']"),
+            intermediate_size=_required(vis, "intermediate_size", "hf_cfg['vision_config']"),
+            num_heads=_required(vis, "num_heads", "hf_cfg['vision_config']"),
+            patch_size=_required(vis, "patch_size", "hf_cfg['vision_config']"),
+            temporal_patch_size=_required(vis, "temporal_patch_size", "hf_cfg['vision_config']"),
+            spatial_merge_size=_required(vis, "spatial_merge_size", "hf_cfg['vision_config']"),
+            in_channels=_required(vis, "in_channels", "hf_cfg['vision_config']"),
+            out_hidden_size=_required(vis, "out_hidden_size", "hf_cfg['vision_config']"),
+            num_position_embeddings=_required(vis, "num_position_embeddings", "hf_cfg['vision_config']"),
             dtype=vision_dtype,
         ),
         text_config=Qwen3_5TextConfig(**text_kw),
-        image_token_id=hf_cfg["image_token_id"],
-        video_token_id=hf_cfg["video_token_id"],
-        vision_start_token_id=hf_cfg["vision_start_token_id"],
-        vision_end_token_id=hf_cfg["vision_end_token_id"],
+        image_token_id=_required(hf_cfg, "image_token_id", "hf_cfg"),
+        video_token_id=_required(hf_cfg, "video_token_id", "hf_cfg"),
+        vision_start_token_id=_required(hf_cfg, "vision_start_token_id", "hf_cfg"),
+        vision_end_token_id=_required(hf_cfg, "vision_end_token_id", "hf_cfg"),
     )

@@ -29,11 +29,25 @@ from .model import Qwen3
 __all__ = [
     "create_qwen3_from_safetensors",
     "export_qwen3_to_safetensors",
+    "qwen3_to_hf_config_dict",
 ]
 
 
-def _make_hf_config_dict(cfg: Qwen3Config) -> dict[str, Any]:
+def _jnp_dtype_to_hf(dtype: Any) -> str:
+    kind = str(dtype).lower()
+    if "bfloat16" in kind:
+        return "bfloat16"
+    if "float16" in kind:
+        return "float16"
+    if "float32" in kind:
+        return "float32"
+    raise ValueError(f"Unsupported dtype for HF config export: {dtype!r}")
+
+
+def qwen3_to_hf_config_dict(cfg: Qwen3Config) -> dict[str, Any]:
     result: dict[str, Any] = {
+        "dtype": _jnp_dtype_to_hf(cfg.dtype),
+        "model_type": "qwen3_moe" if cfg.is_moe else "qwen3",
         "vocab_size": cfg.vocab_size,
         "num_hidden_layers": cfg.num_layers,
         "hidden_size": cfg.emb_dim,
@@ -41,6 +55,7 @@ def _make_hf_config_dict(cfg: Qwen3Config) -> dict[str, Any]:
         "num_key_value_heads": cfg.num_kv_heads,
         "head_dim": cfg.head_dim,
         "intermediate_size": cfg.mlp_dim,
+        "rms_norm_eps": cfg.norm_eps,
         "rope_parameters": {
             "rope_theta": cfg.rope_theta,
             "rope_type": "default",
@@ -48,17 +63,21 @@ def _make_hf_config_dict(cfg: Qwen3Config) -> dict[str, Any]:
         "rope_theta": cfg.rope_theta,
         "tie_word_embeddings": cfg.tie_word_embeddings,
     }
+    if cfg.rope_scaling_factor is not None:
+        result["rope_parameters"]["factor"] = cfg.rope_scaling_factor
+    if cfg.local_rope_theta is not None:
+        result["rope_parameters"]["local_rope_theta"] = cfg.local_rope_theta
     if cfg.is_moe:
         result.update(
             num_experts=cfg.num_experts,
             num_local_experts=cfg.num_experts,
             num_experts_per_tok=cfg.num_experts_per_tok,
             moe_intermediate_size=cfg.moe_intermediate_size,
+            mlp_only_layers=list(cfg.mlp_only_layers),
+            decoder_sparse_step=cfg.decoder_sparse_step,
             norm_topk_prob=cfg.norm_topk_prob,
-            model_type="qwen3_moe",
+            router_aux_loss_coef=cfg.aux_loss_coef,
         )
-    else:
-        result["model_type"] = "qwen3"
     return result
 
 
@@ -138,6 +157,6 @@ def export_qwen3_to_safetensors(
         raise RuntimeError(f"Unmapped JAX parameters during export:\n{missing}")
 
     stnp.save_file(hf_tensors, str(tensor_path))
-    save_hf_config(_make_hf_config_dict(cfg), out_dir)
+    save_hf_config(qwen3_to_hf_config_dict(cfg), out_dir)
 
     return tensor_path
