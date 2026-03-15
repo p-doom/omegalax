@@ -181,7 +181,6 @@ class DecoderLayer(nnx.Module):
         self.input_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, rngs=rngs)
         self.post_attention_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, rngs=rngs)
 
-    @partial(jax.remat, static_argnums=0)
     def __call__(
         self,
         hidden_BTD: jax.Array,

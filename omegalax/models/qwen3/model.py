@@ -133,7 +133,6 @@ class DecoderLayer(nnx.Module):
         else:
             self.mlp = MLP(cfg=cfg, rngs=rngs)
 
-    @partial(jax.remat, static_argnums=0)
     def __call__(self, hidden_BTD: jax.Array, cache, segment_ids_BT: jax.Array):
         normed_BTD = self.input_layernorm(hidden_BTD)
         attn_out_BTD = hidden_BTD + self.attn(normed_BTD, cache, segment_ids_BT)
