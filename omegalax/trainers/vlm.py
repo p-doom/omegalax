@@ -516,25 +516,25 @@ def run_sft(
             last_metrics = result
 
     prof_start, prof_end = profile_steps
-    profiling_active = False
+    is_profiling_active = False
 
     for step in range(start_step, train_cfg.num_steps):
-        if profile_dir is not None and step == prof_start and not profiling_active:
+        if profile_dir is not None and step == prof_start and not is_profiling_active:
             if is_primary_process:
                 print(f"[profiler] starting trace at step {step} -> {profile_dir}")
             jax.profiler.start_trace(str(profile_dir))
-            profiling_active = True
+            is_profiling_active = True
 
         batch = next(data_iter)
         batch = vlm_api.shard_batch_dict(batch, model_cfg, mesh)
         _, metrics = sft_step(optimizer, batch)
         step_delta = timer.step()
 
-        if profiling_active and step + 1 >= prof_end:
+        if is_profiling_active and step + 1 >= prof_end:
             jax.tree.map(lambda x: x.block_until_ready(), metrics)
             jax.profiler.save_device_memory_profile(f"{profile_dir}/memory.prof")
             jax.profiler.stop_trace()
-            profiling_active = False
+            is_profiling_active = False
             if is_primary_process:
                 print(f"[profiler] stopped trace at step {step + 1}")
 
@@ -571,7 +571,7 @@ def run_sft(
                 tb_writer.add_scalar("val/loss", avg_val_loss, step + 1)
                 tb_writer.flush()
 
-    if profiling_active:
+    if is_profiling_active:
         jax.tree.map(lambda x: x.block_until_ready(), metrics)
         jax.profiler.save_device_memory_profile(f"{profile_dir}/memory.prof")
         jax.profiler.stop_trace()

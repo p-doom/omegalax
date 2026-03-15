@@ -370,10 +370,8 @@ class TextDecoderLayer(nnx.Module):
         self.is_moe = cfg.is_moe_layer(layer_idx)
         self.mlp = TextMoEFeedForward(cfg, rngs=rngs) if self.is_moe else TextMLP(cfg, rngs=rngs)
 
+    @partial(jax.remat, static_argnums=0)
     def __call__(self, hidden_BTD: jax.Array, sin_BTK: jax.Array, cos_BTK: jax.Array, mask: jax.Array | None) -> tuple[jax.Array, jax.Array]:
-        return jax.checkpoint(self._forward)(hidden_BTD, sin_BTK, cos_BTK, mask)
-
-    def _forward(self, hidden_BTD: jax.Array, sin_BTK: jax.Array, cos_BTK: jax.Array, mask: jax.Array | None) -> tuple[jax.Array, jax.Array]:
         hidden_BTD = hidden_BTD + self.attn(self.input_layernorm(hidden_BTD), sin_BTK, cos_BTK, mask)
         if self.is_moe:
             ff_out_BTD, aux_loss = self.mlp(self.post_attention_layernorm(hidden_BTD))

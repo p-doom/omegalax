@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from functools import partial
 from typing import Any
 
 import jax
@@ -14,15 +15,12 @@ from .config import Qwen3VLVisionConfig
 
 
 def _token_spatial_coords(
-    grid_thw: jax.Array, merge_size: int, total_tokens: int
+    image_grid: jax.Array, merge_size: int, total_tokens: int
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Map each vision token to its (row, col) in the original spatial grid.
 
-    All ops are element-wise on statically-shaped arrays, so this is safe
-    inside ``jax.jit``.
-
     Args:
-        grid_thw: int32 array of shape ``(num_images, 3)`` with ``(t, h, w)``
+        image_grid: int32 array of shape ``(num_images, 3)`` with ``(t, h, w)``
             per image.
         merge_size: spatial merge factor (typically 2).
         total_tokens: total number of vision tokens across all images
@@ -33,7 +31,7 @@ def _token_spatial_coords(
         row_coord, col_coord, image_id — each int32 of shape
         ``(total_tokens,)``.
     """
-    tokens_per_image = grid_thw[:, 0] * grid_thw[:, 1] * grid_thw[:, 2]
+    tokens_per_image = image_grid[:, 0] * image_grid[:, 1] * image_grid[:, 2]
     cu_tokens = jnp.concatenate(
         [jnp.zeros(1, dtype=jnp.int32), jnp.cumsum(tokens_per_image).astype(jnp.int32)]
     )
@@ -42,8 +40,8 @@ def _token_spatial_coords(
     image_id = jnp.searchsorted(cu_tokens[1:], tok_idx, side="right")
     local_idx = tok_idx - cu_tokens[image_id]
 
-    h = grid_thw[image_id, 1]
-    w = grid_thw[image_id, 2]
+    h = image_grid[image_id, 1]
+    w = image_grid[image_id, 2]
     spatial_idx = local_idx % (h * w)
 
     merge_sq = merge_size * merge_size
@@ -219,10 +217,8 @@ class VisionBlock(nnx.Module):
         self.mlp = VisionMLP(config, hidden_shd=hidden_shd, ff_shd=ff_shd, rngs=rngs)
         self.hidden_shd = hidden_shd
 
+    @partial(jax.remat, static_argnums=0)
     def __call__(self, hidden_ND: jax.Array, cu_seqlens: jax.Array, cos_NK: jax.Array, sin_NK: jax.Array) -> jax.Array:
-        return jax.checkpoint(self._forward)(hidden_ND, cu_seqlens, cos_NK, sin_NK)
-
-    def _forward(self, hidden_ND: jax.Array, cu_seqlens: jax.Array, cos_NK: jax.Array, sin_NK: jax.Array) -> jax.Array:
         hidden_ND = reshard(hidden_ND, self.hidden_shd)
         hidden_ND = reshard(hidden_ND + self.attn(self.norm1(hidden_ND), cu_seqlens, cos_NK, sin_NK), self.hidden_shd)
         hidden_ND = reshard(hidden_ND + self.mlp(self.norm2(hidden_ND)), self.hidden_shd)
@@ -323,8 +319,8 @@ class VisionModel(nnx.Module):
         )
         self.deepstack_visual_indexes = config.deepstack_visual_indexes
 
-    def _compute_rotary_pos_emb(self, grid_thw: jax.Array, total_tokens: int) -> jax.Array:
-        row, col, _ = _token_spatial_coords(grid_thw, self.spatial_merge_size, total_tokens)
+    def _compute_rotary_pos_emb(self, image_grid: jax.Array, total_tokens: int) -> jax.Array:
+        row, col, _ = _token_spatial_coords(image_grid, self.spatial_merge_size, total_tokens)
         inv_freq = 1.0 / (
             self.rotary_theta
             ** (jnp.arange(0, self.rotary_dim, 2, dtype=jnp.float32) / self.rotary_dim)
@@ -333,13 +329,13 @@ class VisionModel(nnx.Module):
         col_emb = col[:, None].astype(jnp.float32) * inv_freq[None, :]
         return jnp.concatenate([row_emb, col_emb], axis=-1)
 
-    def _interpolate_pos_embed(self, grid_thw: jax.Array, total_tokens: int) -> jax.Array:
-        row, col, img_id = _token_spatial_coords(grid_thw, self.spatial_merge_size, total_tokens)
+    def _interpolate_pos_embed(self, image_grid: jax.Array, total_tokens: int) -> jax.Array:
+        row, col, img_id = _token_spatial_coords(image_grid, self.spatial_merge_size, total_tokens)
         pos_weight_VD = self.pos_embed.embedding[...]
         n = self.num_grid_per_side
 
-        h = grid_thw[img_id, 1].astype(jnp.float32)
-        w = grid_thw[img_id, 2].astype(jnp.float32)
+        h = image_grid[img_id, 1].astype(jnp.float32)
+        w = image_grid[img_id, 2].astype(jnp.float32)
 
         h_idx = row.astype(jnp.float32) * (n - 1) / jnp.maximum(h - 1.0, 1.0)
         w_idx = col.astype(jnp.float32) * (n - 1) / jnp.maximum(w - 1.0, 1.0)
@@ -369,24 +365,28 @@ class VisionModel(nnx.Module):
         )
 
     def __call__(
-        self, pixel_values: jax.Array, grid_thw: jax.Array
+        self, pixel_values: jax.Array, image_grid: jax.Array
     ) -> tuple[jax.Array, list[jax.Array]]:
         hidden_ND = self.patch_embed(pixel_values)
         total_tokens: int = hidden_ND.shape[0]
 
-        pos_embeds_ND = self._interpolate_pos_embed(grid_thw, total_tokens)
+        pos_embeds_ND = self._interpolate_pos_embed(image_grid, total_tokens)
         hidden_ND = reshard(hidden_ND + pos_embeds_ND, self.hidden_shd)
 
-        rotary_emb_NK = self._compute_rotary_pos_emb(grid_thw, total_tokens)
+        rotary_emb_NK = self._compute_rotary_pos_emb(image_grid, total_tokens)
         emb_NK = jnp.concatenate([rotary_emb_NK, rotary_emb_NK], axis=-1)
         cos_NK, sin_NK = jnp.cos(emb_NK), jnp.sin(emb_NK)
         cos_NK = cos_NK.astype(self.config.dtype)
         sin_NK = sin_NK.astype(self.config.dtype)
 
-        tokens_per_image = grid_thw[:, 0] * grid_thw[:, 1] * grid_thw[:, 2]
+        tokens_per_frame = jnp.repeat(
+            image_grid[:, 1] * image_grid[:, 2],
+            image_grid[:, 0],
+            out_sharding=P(),
+        )
         cu_seqlens = jnp.concatenate([
             jnp.zeros(1, dtype=jnp.int32),
-            jnp.cumsum(tokens_per_image).astype(jnp.int32),
+            jnp.cumsum(tokens_per_frame).astype(jnp.int32),
         ])
 
         deepstack_features: list[jax.Array] = []
