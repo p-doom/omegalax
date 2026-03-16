@@ -22,11 +22,17 @@ from omegalax.models.qwen3_vl.config import (
     Qwen3VLConfig,
     is_supported_qwen3_vl_model_id,
     list_supported_qwen3_vl_model_ids,
+    make_vl_config_from_hf,
 )
 from omegalax.models.qwen3_5 import Qwen3_5Config
 from omegalax.models.qwen3_5 import make_config as make_qwen3_5_config
-from omegalax.models.qwen3_5.config import is_supported_qwen3_5_model_id, list_supported_qwen3_5_model_ids
+from omegalax.models.qwen3_5.config import (
+    is_supported_qwen3_5_model_id,
+    list_supported_qwen3_5_model_ids,
+    make_config_from_hf as make_qwen3_5_config_from_hf,
+)
 from omegalax.models.qwen3_5.model import Qwen3_5ForConditionalGeneration
+from omegalax.models.params_utils import load_hf_config_from_source
 
 VLMConfig = Qwen3_5Config | Qwen3VLConfig
 
@@ -41,11 +47,17 @@ def resolve_config(model_or_id: str | VLMConfig) -> VLMConfig:
     if is_supported_qwen3_vl_model_id(model_or_id):
         return make_vl_config(model_or_id)
 
-    supported_qwen3_5 = list_supported_qwen3_5_model_ids()
-    supported_qwen3_vl = list_supported_qwen3_vl_model_ids()
+    hf_cfg = load_hf_config_from_source(model_or_id)
+    model_type = hf_cfg.get("model_type")
+    if model_type in {"qwen3_5", "qwen3_5_moe"}:
+        return make_qwen3_5_config_from_hf(hf_cfg)
+    if model_type in {"qwen3_vl", "qwen3_vl_moe"}:
+        return make_vl_config_from_hf(hf_cfg)
+
     raise ValueError(
-        f"Unsupported VLM model id '{model_or_id}'. "
-        f"Supported Qwen3.5 ids: {supported_qwen3_5}; supported Qwen3-VL ids: {supported_qwen3_vl}."
+        f"Unsupported VLM model/config source '{model_or_id}'. "
+        f"Supported Qwen3.5 ids: {list_supported_qwen3_5_model_ids()}; "
+        f"supported Qwen3-VL ids: {list_supported_qwen3_vl_model_ids()}."
     )
 
 
@@ -128,6 +140,7 @@ def forward(
     attention_mask_BT: jax.Array | None = None,
     pixel_values: jax.Array | None = None,
     image_grid_thw: jax.Array | None = None,
+    vision_cu_seqlens: jax.Array | None = None,
     position_ids_ZBT: jax.Array | None = None,
 ):
     """Forward pass for VLMs; supports text-only or multimodal batches."""
@@ -154,6 +167,7 @@ def forward(
             position_ids_ZBT=position_ids_ZBT,
             pixel_values=pixel_values,
             image_grid_thw=image_grid_thw,
+            vision_cu_seqlens=vision_cu_seqlens,
         )
         if isinstance(outputs, tuple):
             logits_BTV, aux_loss = outputs

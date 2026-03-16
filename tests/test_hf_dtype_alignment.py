@@ -48,6 +48,7 @@ def _qwen3_vl_hf_cfg() -> dict:
 
 def _qwen3_5_hf_cfg() -> dict:
     return {
+        "model_type": "qwen3_5",
         "tie_word_embeddings": False,
         "image_token_id": 11,
         "video_token_id": 12,

@@ -174,7 +174,23 @@ class Qwen3VLMappingTest(absltest.TestCase):
         token_ids_BT = jnp.asarray(np.array(inputs["input_ids"].cpu(), dtype=np.int32))
         attention_mask_BT = jnp.asarray(np.array(inputs["attention_mask"].cpu(), dtype=np.int32))
         pixel_values_jax = jnp.asarray(inputs["pixel_values"].cpu().numpy())
-        image_grid_thw_jax = jnp.asarray(inputs["image_grid_thw"].cpu().numpy())
+        image_grid_thw_np = np.array(inputs["image_grid_thw"].cpu().numpy(), dtype=np.int32)
+        image_grid_thw_jax = jnp.asarray(image_grid_thw_np)
+        vision_cu_seqlens_jax = jnp.asarray(
+            np.concatenate(
+                [
+                    np.zeros(1, dtype=np.int32),
+                    np.cumsum(
+                        np.asarray([
+                            int(h) * int(w)
+                            for t, h, w in image_grid_thw_np.tolist()
+                            for _ in range(int(t))
+                        ], dtype=np.int32),
+                        dtype=np.int32,
+                    ),
+                ]
+            )
+        )
 
         jax_logits_BTV = np.asarray(
             self.jax_model(
@@ -182,6 +198,7 @@ class Qwen3VLMappingTest(absltest.TestCase):
                 attention_mask_BT,
                 pixel_values=pixel_values_jax,
                 image_grid_thw=image_grid_thw_jax,
+                vision_cu_seqlens=vision_cu_seqlens_jax,
             ),
             dtype=np.float32,
         )

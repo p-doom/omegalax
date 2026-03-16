@@ -24,7 +24,7 @@ from omegalax.models.params_utils import (
     map_to_bonsai_key,
     stoi,
 )
-from .config import Qwen3Config, make_config
+from .config import Qwen3Config, make_config_from_hf
 from .model import Qwen3
 
 
@@ -41,6 +41,7 @@ def _assert_config(cfg: Qwen3Config, hf_cfg: dict[str, Any]):
     _require("num_kv_heads", cfg.num_kv_heads, hf_cfg["num_key_value_heads"])
     _require("head_dim", cfg.head_dim, hf_cfg["head_dim"])
     _require("mlp_dim", cfg.mlp_dim, hf_cfg["intermediate_size"])
+    _require("norm_eps", cfg.norm_eps, hf_cfg["rms_norm_eps"])
 
     rope_params = hf_cfg.get("rope_parameters")
     if isinstance(rope_params, dict) and "rope_theta" in rope_params:
@@ -84,17 +85,17 @@ def _get_key_mapping():
 
 def create_qwen3_from_safetensors(
     file_dir: str,
-    model_id: str,
+    model_id: str = "",
     *,
     tp_size: int | None = None,
     fsdp_size: int | None = None,
 ) -> Qwen3:
     """Load HuggingFace Qwen3 safetensors (dense or MoE) into a JAX model."""
-    cfg = make_config(model_id)
     mesh = ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size)
     files = find_safetensors(file_dir)
 
     hf_cfg = load_hf_config(epath.Path(file_dir))
+    cfg = make_config_from_hf(hf_cfg)
     _assert_config(cfg, hf_cfg)
 
     with mesh_rules(mesh):

@@ -23,7 +23,7 @@ from .config import Qwen3VLConfig
 from .loader import _get_non_expert_mapping, create_qwen3_vl_from_safetensors
 from .model import Qwen3VL
 
-__all__ = ["create_qwen3_vl_from_safetensors", "export_qwen3_vl_to_safetensors"]
+__all__ = ["create_qwen3_vl_from_safetensors", "export_qwen3_vl_to_safetensors", "qwen3_vl_to_hf_config_dict"]
 
 
 def _jnp_dtype_to_hf(dtype: Any) -> str:
@@ -37,7 +37,7 @@ def _jnp_dtype_to_hf(dtype: Any) -> str:
     raise ValueError(f"Unsupported dtype for HF config export: {dtype!r}")
 
 
-def _make_hf_config_dict(cfg: Qwen3VLConfig) -> dict[str, Any]:
+def qwen3_vl_to_hf_config_dict(cfg: Qwen3VLConfig) -> dict[str, Any]:
     model_type = "qwen3_vl_moe" if cfg.num_experts > 0 else "qwen3_vl"
     text_model_type = "qwen3_vl_moe_text" if cfg.num_experts > 0 else "qwen3_vl_text"
     text_cfg = {
@@ -178,6 +178,6 @@ def export_qwen3_vl_to_safetensors(model: Qwen3VL, cfg: Qwen3VLConfig, out_dir: 
         raise RuntimeError(f"Unmapped JAX parameters during export:\n" + "\n".join(sorted(unmatched)))
 
     stnp.save_file(hf_tensors, tensor_path)
-    save_hf_config(_make_hf_config_dict(cfg), out_path)
+    save_hf_config(qwen3_vl_to_hf_config_dict(cfg), out_path)
 
     return tensor_path

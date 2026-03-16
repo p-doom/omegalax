@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import dataclasses
 import datetime
-import json
 from collections.abc import Iterator
 from pathlib import Path
 from flax import nnx
@@ -15,7 +14,9 @@ import numpy as np
 import optax
 import orbax.checkpoint as ocp
 
+from omegalax import export as export_lib
 from omegalax.distributed.mesh import ensure_mesh, mesh_rules, required_batch_multiple
+from omegalax.models.params_utils import save_hf_config
 from omegalax.trainers.perf import (
     maybe_log_step_metrics,
     per_device_flops_per_step,
@@ -169,6 +170,10 @@ def _make_checkpoint_manager(save_dir: Path, save_interval: int | None) -> ocp.C
     return ocp.CheckpointManager(save_dir, options=options, handler_registry=handler_registry)
 
 
+def _write_checkpoint_config(save_dir: Path, cfg) -> None:
+    save_hf_config(export_lib.model_config_to_hf_dict(cfg), save_dir)
+
+
 def _save_checkpoint(
     checkpoint_manager: ocp.CheckpointManager, optimizer: nnx.ModelAndOptimizer, rng: jax.Array, step: int
 ) -> None:
@@ -211,7 +216,20 @@ def run_training(
     tb_writer=None,
 ) -> tuple[nnx.ModelAndOptimizer, dict[str, float]]:
     """Train a VLM with synthetic data; returns final optimizer + last metrics."""
-    model_cfg = vlm_api.resolve_config(model_id_or_cfg)
+    save_path = Path(save_dir).expanduser().resolve() if save_dir is not None else None
+    if resume:
+        if save_path is None:
+            raise ValueError("resume=True requires save_dir to be provided.")
+        if not save_path.exists():
+            raise ValueError(f"resume=True requires an existing checkpoint directory: {save_path}")
+        checkpoint_probe = _make_checkpoint_manager(save_path, save_interval=None)
+        latest_step = checkpoint_probe.latest_step()
+        checkpoint_probe.close()
+        if latest_step is None:
+            raise ValueError(f"resume=True but no checkpoints found under: {save_path}")
+        model_cfg = vlm_api.resolve_config(str(save_path))
+    else:
+        model_cfg = vlm_api.resolve_config(model_id_or_cfg)
     mesh = ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size)
     model_cfg = vlm_api.align_config_to_mesh(model_cfg, mesh)
     batch_spec = vlm_api.batch_partition_spec(model_cfg)
@@ -256,12 +274,10 @@ def run_training(
     tokens_per_step = train_cfg.seq_len * train_cfg.batch_size
 
     checkpoint_manager = None
-    if save_dir is not None:
-        save_dir = Path(save_dir).expanduser().resolve()
-        if resume and not save_dir.exists():
-            raise ValueError(f"resume=True requires an existing checkpoint directory: {save_dir}")
-        save_dir.mkdir(parents=True, exist_ok=True)
-        checkpoint_manager = _make_checkpoint_manager(save_dir, save_interval=save_every or None)
+    if save_path is not None:
+        save_path.mkdir(parents=True, exist_ok=True)
+        _write_checkpoint_config(save_path, model_cfg)
+        checkpoint_manager = _make_checkpoint_manager(save_path, save_interval=save_every or None)
 
     log_path = Path(log_jsonl).expanduser() if log_jsonl else None
     if log_path is not None:
@@ -271,8 +287,6 @@ def run_training(
     if resume:
         if checkpoint_manager is None:
             raise ValueError("resume=True requires save_dir to be provided.")
-        if checkpoint_manager.latest_step() is None:
-            raise ValueError(f"resume=True but no checkpoints found under: {save_dir}")
         optimizer, start_step, rng = _restore_checkpoint(checkpoint_manager, optimizer, rng)
         rng = jax.device_put(rng, replicated_rng_sharding)
 
@@ -348,6 +362,7 @@ def make_sft_train_step(cfg, pad_id: int = 0):
         loss_mask_BT = batch["loss_mask_BT"]
         pixel_values = batch.get("pixel_values")
         image_grid_thw = batch.get("image_grid_thw")
+        vision_cu_seqlens = batch.get("vision_cu_seqlens")
         position_ids_ZBT = batch.get("position_ids_ZBT")
 
         def loss_fn(model):
@@ -359,6 +374,7 @@ def make_sft_train_step(cfg, pad_id: int = 0):
                 attention_mask_BT=attention_mask_BT,
                 pixel_values=pixel_values,
                 image_grid_thw=image_grid_thw,
+                vision_cu_seqlens=vision_cu_seqlens,
                 position_ids_ZBT=position_ids_ZBT,
             )
             targets = token_ids_BT[:, 1:]
@@ -389,6 +405,7 @@ def make_sft_eval_step(cfg, pad_id: int = 0):
         loss_mask_BT = batch["loss_mask_BT"]
         pixel_values = batch.get("pixel_values")
         image_grid_thw = batch.get("image_grid_thw")
+        vision_cu_seqlens = batch.get("vision_cu_seqlens")
         position_ids_ZBT = batch.get("position_ids_ZBT")
 
         logits_BTV, aux_loss = vlm_api.forward(
@@ -399,6 +416,7 @@ def make_sft_eval_step(cfg, pad_id: int = 0):
             attention_mask_BT=attention_mask_BT,
             pixel_values=pixel_values,
             image_grid_thw=image_grid_thw,
+            vision_cu_seqlens=vision_cu_seqlens,
             position_ids_ZBT=position_ids_ZBT,
         )
         targets = token_ids_BT[:, 1:]
@@ -440,7 +458,20 @@ def run_sft(
     If ``val_data_iter`` is provided, runs ``val_steps`` forward-only batches
     every ``val_every`` training steps and logs the average validation loss.
     """
-    model_cfg = vlm_api.resolve_config(model_id_or_cfg)
+    save_path = Path(save_dir).expanduser().resolve() if save_dir is not None else None
+    if resume:
+        if save_path is None:
+            raise ValueError("resume=True requires save_dir to be provided.")
+        if not save_path.exists():
+            raise ValueError(f"resume=True requires an existing checkpoint directory: {save_path}")
+        checkpoint_probe = _make_checkpoint_manager(save_path, save_interval=None)
+        latest_step = checkpoint_probe.latest_step()
+        checkpoint_probe.close()
+        if latest_step is None:
+            raise ValueError(f"resume=True but no checkpoints found under: {save_path}")
+        model_cfg = vlm_api.resolve_config(str(save_path))
+    else:
+        model_cfg = vlm_api.resolve_config(model_id_or_cfg)
     mesh = ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size)
     model_cfg = vlm_api.align_config_to_mesh(model_cfg, mesh)
 
@@ -470,12 +501,10 @@ def run_sft(
     tokens_per_step = train_cfg.seq_len * train_cfg.batch_size
 
     checkpoint_manager = None
-    if save_dir is not None:
-        save_dir = Path(save_dir).expanduser().resolve()
-        if resume and not save_dir.exists():
-            raise ValueError(f"resume=True requires an existing checkpoint directory: {save_dir}")
-        save_dir.mkdir(parents=True, exist_ok=True)
-        checkpoint_manager = _make_checkpoint_manager(save_dir, save_interval=save_every or None)
+    if save_path is not None:
+        save_path.mkdir(parents=True, exist_ok=True)
+        _write_checkpoint_config(save_path, model_cfg)
+        checkpoint_manager = _make_checkpoint_manager(save_path, save_interval=save_every or None)
 
     log_path = Path(log_jsonl).expanduser() if log_jsonl else None
     if log_path is not None:
@@ -485,8 +514,6 @@ def run_sft(
     if resume:
         if checkpoint_manager is None:
             raise ValueError("resume=True requires save_dir to be provided.")
-        if checkpoint_manager.latest_step() is None:
-            raise ValueError(f"resume=True but no checkpoints found under: {save_dir}")
         optimizer, start_step, rng = _restore_checkpoint(checkpoint_manager, optimizer, rng)
         rng = jax.device_put(rng, replicated_rng_sharding)
 

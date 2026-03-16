@@ -420,6 +420,7 @@ class Qwen3VL(nnx.Module):
         position_ids_ZBT: jax.Array | np.ndarray | None = None,
         pixel_values: jax.Array | None = None,
         image_grid_thw: jax.Array | None = None,
+        vision_cu_seqlens: jax.Array | None = None,
     ) -> jax.Array:
         cfg = self.cfg
 
@@ -427,7 +428,9 @@ class Qwen3VL(nnx.Module):
         deepstack_features = None
         visual_pos_mask_BT = None
         if pixel_values is not None and image_grid_thw is not None:
-            image_features_ND, deepstack_features = self.vision(pixel_values, image_grid_thw)
+            if vision_cu_seqlens is None:
+                raise ValueError("vision_cu_seqlens is required when passing image_grid_thw to Qwen3VL")
+            image_features_ND, deepstack_features = self.vision(pixel_values, image_grid_thw, vision_cu_seqlens)
 
         inputs_embeds_BTD = jnp.astype(
             self.text.embedder.embedding[...].at[(token_ids_BT,)].get(out_sharding=self.text.out_emb_shd),
