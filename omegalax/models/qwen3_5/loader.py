@@ -23,7 +23,7 @@ from omegalax.models.params_utils import (
     map_to_bonsai_key,
     stoi,
 )
-from .config import Qwen3_5Config, make_config, make_config_from_hf
+from .config import Qwen3_5Config, make_config_from_hf
 from .model import Qwen3_5ForConditionalGeneration
 
 
@@ -266,11 +266,8 @@ def create_qwen3_5_from_safetensors(
     files = find_safetensors(file_dir)
 
     hf_cfg = load_hf_config(path)
-    if model_id:
-        cfg = make_config(model_id)
-        _assert_config(cfg, hf_cfg)
-    else:
-        cfg = make_config_from_hf(hf_cfg)
+    cfg = make_config_from_hf(hf_cfg)
+    _assert_config(cfg, hf_cfg)
 
     with mesh_rules(mesh):
         model = nnx.eval_shape(

@@ -1,97 +1,83 @@
 from absl.testing import absltest
 
+from omegalax.models.qwen3.config import make_config, make_config_from_hf
 from omegalax.models.qwen3.loader import _assert_config
-from omegalax.text import api
 
 
-EXPECTED_QWEN3_SPECS = {
-    "Qwen/Qwen3-0.6B": {
+def _dense_hf_cfg() -> dict:
+    return {
+        "model_type": "qwen3",
+        "dtype": "bfloat16",
         "vocab_size": 151_936,
-        "emb_dim": 1_024,
-        "mlp_dim": 3_072,
-        "num_layers": 28,
-        "num_heads": 16,
+        "hidden_size": 4_096,
+        "intermediate_size": 12_288,
+        "num_hidden_layers": 36,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
         "head_dim": 128,
-        "num_kv_heads": 8,
-        "tie_word_embeddings": True,
-    },
-    "Qwen/Qwen3-1.7B": {
-        "vocab_size": 151_936,
-        "emb_dim": 2_048,
-        "mlp_dim": 6_144,
-        "num_layers": 28,
-        "num_heads": 16,
-        "head_dim": 128,
-        "num_kv_heads": 8,
-        "tie_word_embeddings": True,
-    },
-    "Qwen/Qwen3-4B": {
-        "vocab_size": 151_936,
-        "emb_dim": 2_560,
-        "mlp_dim": 9_728,
-        "num_layers": 36,
-        "num_heads": 32,
-        "head_dim": 128,
-        "num_kv_heads": 8,
-        "tie_word_embeddings": True,
-    },
-    "Qwen/Qwen3-8B": {
-        "vocab_size": 151_936,
-        "emb_dim": 4_096,
-        "mlp_dim": 12_288,
-        "num_layers": 36,
-        "num_heads": 32,
-        "head_dim": 128,
-        "num_kv_heads": 8,
+        "rms_norm_eps": 1e-6,
+        "rope_parameters": {"rope_theta": 1_000_000, "rope_type": "default"},
         "tie_word_embeddings": False,
-    },
-    "Qwen/Qwen3-14B": {
+    }
+
+
+def _moe_hf_cfg() -> dict:
+    return {
+        "model_type": "qwen3_moe",
+        "dtype": "bfloat16",
         "vocab_size": 151_936,
-        "emb_dim": 5_120,
-        "mlp_dim": 17_408,
-        "num_layers": 40,
-        "num_heads": 40,
+        "hidden_size": 2_048,
+        "intermediate_size": 6_144,
+        "num_hidden_layers": 48,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 4,
         "head_dim": 128,
-        "num_kv_heads": 8,
+        "rms_norm_eps": 1e-6,
+        "rope_parameters": {"rope_theta": 10_000_000, "rope_type": "default"},
         "tie_word_embeddings": False,
-    },
-    "Qwen/Qwen3-32B": {
-        "vocab_size": 151_936,
-        "emb_dim": 5_120,
-        "mlp_dim": 25_600,
-        "num_layers": 64,
-        "num_heads": 64,
-        "head_dim": 128,
-        "num_kv_heads": 8,
-        "tie_word_embeddings": False,
-    },
-}
+        "moe_intermediate_size": 768,
+        "num_experts": 128,
+        "num_experts_per_tok": 8,
+        "mlp_only_layers": [],
+        "decoder_sparse_step": 1,
+        "norm_topk_prob": True,
+    }
 
 
 class Qwen3RegistryTest(absltest.TestCase):
-    def test_registry_values_match(self):
-        for model_id, expected in EXPECTED_QWEN3_SPECS.items():
-            cfg = api.registry.build_config(model_id)
-            for field, value in expected.items():
-                self.assertEqual(getattr(cfg, field), value, msg=f"{model_id}: {field}")
+    def test_dense_hf_config_maps_cleanly(self):
+        cfg = make_config_from_hf(_dense_hf_cfg())
+        self.assertEqual(cfg.vocab_size, 151_936)
+        self.assertEqual(cfg.emb_dim, 4_096)
+        self.assertEqual(cfg.mlp_dim, 12_288)
+        self.assertEqual(cfg.num_layers, 36)
+        self.assertEqual(cfg.num_heads, 32)
+        self.assertEqual(cfg.head_dim, 128)
+        self.assertEqual(cfg.num_kv_heads, 8)
+        self.assertFalse(cfg.tie_word_embeddings)
+
+    def test_moe_hf_config_maps_cleanly(self):
+        cfg = make_config_from_hf(_moe_hf_cfg())
+        self.assertEqual(cfg.num_experts, 128)
+        self.assertEqual(cfg.num_experts_per_tok, 8)
+        self.assertEqual(cfg.moe_intermediate_size, 768)
+        self.assertTrue(cfg.is_moe)
+
+    def test_moe_hf_config_accepts_num_local_experts_alias(self):
+        hf_cfg = _moe_hf_cfg()
+        hf_cfg["num_local_experts"] = hf_cfg.pop("num_experts")
+        cfg = make_config_from_hf(hf_cfg)
+        self.assertEqual(cfg.num_experts, 128)
+        self.assertTrue(cfg.is_moe)
 
     def test_unknown_alias_raises(self):
         with self.assertRaisesRegex(ValueError, "Unsupported Qwen3 model_id"):
-            api.registry.build_config("qwen3-0.6b-base")
+            make_config("qwen3-0.6b-base")
 
     def test_tie_word_embeddings_mismatch_raises(self):
-        cfg = api.registry.build_config("Qwen/Qwen3-8B")
-        hf_cfg = {
-            "vocab_size": cfg.vocab_size,
-            "hidden_size": cfg.emb_dim,
-            "intermediate_size": cfg.mlp_dim,
-            "num_hidden_layers": cfg.num_layers,
-            "num_attention_heads": cfg.num_heads,
-            "num_key_value_heads": cfg.num_kv_heads,
-            "head_dim": cfg.head_dim,
-            "rope_theta": cfg.rope_theta,
-            "tie_word_embeddings": not cfg.tie_word_embeddings,
-        }
+        cfg = make_config_from_hf(_dense_hf_cfg())
+        hf_cfg = dict(_dense_hf_cfg())
+        hf_cfg["tie_word_embeddings"] = not cfg.tie_word_embeddings
 
         with self.assertRaisesRegex(ValueError, "tie_word_embeddings"):
             _assert_config(cfg, hf_cfg)

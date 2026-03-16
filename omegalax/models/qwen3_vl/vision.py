@@ -365,7 +365,7 @@ class VisionModel(nnx.Module):
         )
 
     def __call__(
-        self, pixel_values: jax.Array, image_grid: jax.Array
+        self, pixel_values: jax.Array, image_grid: jax.Array, vision_cu_seqlens: jax.Array
     ) -> tuple[jax.Array, list[jax.Array]]:
         hidden_ND = self.patch_embed(pixel_values)
         total_tokens: int = hidden_ND.shape[0]
@@ -379,15 +379,7 @@ class VisionModel(nnx.Module):
         cos_NK = cos_NK.astype(self.config.dtype)
         sin_NK = sin_NK.astype(self.config.dtype)
 
-        tokens_per_frame = jnp.repeat(
-            image_grid[:, 1] * image_grid[:, 2],
-            image_grid[:, 0],
-            out_sharding=P(),
-        )
-        cu_seqlens = jnp.concatenate([
-            jnp.zeros(1, dtype=jnp.int32),
-            jnp.cumsum(tokens_per_frame).astype(jnp.int32),
-        ])
+        cu_seqlens = vision_cu_seqlens.astype(jnp.int32)
 
         deepstack_features: list[jax.Array] = []
         for layer_num, blk in enumerate(self.blocks):
