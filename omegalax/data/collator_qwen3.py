@@ -170,6 +170,21 @@ class TextSFTCollator:
         }
 
 
+def _compute_vision_cu_seqlens(image_grid_thw: np.ndarray) -> np.ndarray:
+    """Return cumulative per-frame token counts for the vision tower.
+
+    For each ``(t, h, w)`` row, append ``h*w`` exactly ``t`` times, then prefix-sum
+    with a leading zero. This is derived execution metadata, analogous to
+    ``position_ids_ZBT``.
+    """
+    frame_token_counts: list[int] = []
+    for t, h, w in image_grid_thw.tolist():
+        frame_token_counts.extend([int(h) * int(w)] * int(t))
+    return np.concatenate(
+        [np.zeros(1, dtype=np.int32), np.cumsum(np.asarray(frame_token_counts, dtype=np.int32), dtype=np.int32)]
+    )
+
+
 class VLMSFTCollator:
     """Collate Qwen multimodal chat examples into padded numpy arrays with loss masks.
 
@@ -266,6 +281,7 @@ class VLMSFTCollator:
         if has_images and all_grid_thw:
             image_grid_thw = np.concatenate(all_grid_thw, axis=0)
             result["image_grid_thw"] = image_grid_thw
+            result["vision_cu_seqlens"] = _compute_vision_cu_seqlens(image_grid_thw)
 
             position_ids, _ = get_rope_index(
                 result["token_ids_BT"],

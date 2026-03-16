@@ -362,6 +362,7 @@ def make_sft_train_step(cfg, pad_id: int = 0):
         loss_mask_BT = batch["loss_mask_BT"]
         pixel_values = batch.get("pixel_values")
         image_grid_thw = batch.get("image_grid_thw")
+        vision_cu_seqlens = batch.get("vision_cu_seqlens")
         position_ids_ZBT = batch.get("position_ids_ZBT")
 
         def loss_fn(model):
@@ -373,6 +374,7 @@ def make_sft_train_step(cfg, pad_id: int = 0):
                 attention_mask_BT=attention_mask_BT,
                 pixel_values=pixel_values,
                 image_grid_thw=image_grid_thw,
+                vision_cu_seqlens=vision_cu_seqlens,
                 position_ids_ZBT=position_ids_ZBT,
             )
             targets = token_ids_BT[:, 1:]
@@ -403,6 +405,7 @@ def make_sft_eval_step(cfg, pad_id: int = 0):
         loss_mask_BT = batch["loss_mask_BT"]
         pixel_values = batch.get("pixel_values")
         image_grid_thw = batch.get("image_grid_thw")
+        vision_cu_seqlens = batch.get("vision_cu_seqlens")
         position_ids_ZBT = batch.get("position_ids_ZBT")
 
         logits_BTV, aux_loss = vlm_api.forward(
@@ -413,6 +416,7 @@ def make_sft_eval_step(cfg, pad_id: int = 0):
             attention_mask_BT=attention_mask_BT,
             pixel_values=pixel_values,
             image_grid_thw=image_grid_thw,
+            vision_cu_seqlens=vision_cu_seqlens,
             position_ids_ZBT=position_ids_ZBT,
         )
         targets = token_ids_BT[:, 1:]

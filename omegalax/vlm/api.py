@@ -140,6 +140,7 @@ def forward(
     attention_mask_BT: jax.Array | None = None,
     pixel_values: jax.Array | None = None,
     image_grid_thw: jax.Array | None = None,
+    vision_cu_seqlens: jax.Array | None = None,
     position_ids_ZBT: jax.Array | None = None,
 ):
     """Forward pass for VLMs; supports text-only or multimodal batches."""
@@ -166,6 +167,7 @@ def forward(
             position_ids_ZBT=position_ids_ZBT,
             pixel_values=pixel_values,
             image_grid_thw=image_grid_thw,
+            vision_cu_seqlens=vision_cu_seqlens,
         )
         if isinstance(outputs, tuple):
             logits_BTV, aux_loss = outputs
