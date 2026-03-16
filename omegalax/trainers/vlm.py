@@ -16,6 +16,7 @@ import optax
 import orbax.checkpoint as ocp
 
 from omegalax.distributed.mesh import ensure_mesh, mesh_rules, required_batch_multiple
+from omegalax.trainers.schedule import build_lr_schedule
 from omegalax.trainers.perf import (
     maybe_log_step_metrics,
     per_device_flops_per_step,
@@ -35,6 +36,10 @@ class TrainConfig:
     learning_rate: float = 3e-4
     weight_decay: float = 0.01
     print_every: int = 1
+    lr_schedule: str = "constant"
+    warmup_steps: int = 0
+    min_lr_ratio: float = 0.0
+    wsd_decay_fraction: float = 0.1
 
     @classmethod
     def smoke(cls):
@@ -58,7 +63,15 @@ def init_model(
 
 
 def build_optimizer(model: nnx.Module, train_cfg: TrainConfig) -> nnx.ModelAndOptimizer:
-    tx = optax.adamw(learning_rate=train_cfg.learning_rate, weight_decay=train_cfg.weight_decay)
+    lr = build_lr_schedule(
+        lr_schedule=train_cfg.lr_schedule,
+        learning_rate=train_cfg.learning_rate,
+        num_steps=train_cfg.num_steps,
+        warmup_steps=train_cfg.warmup_steps,
+        min_lr_ratio=train_cfg.min_lr_ratio,
+        wsd_decay_fraction=train_cfg.wsd_decay_fraction,
+    )
+    tx = optax.adamw(learning_rate=lr, weight_decay=train_cfg.weight_decay)
     return nnx.ModelAndOptimizer(model, tx)
 
 

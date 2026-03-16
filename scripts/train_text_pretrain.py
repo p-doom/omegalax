@@ -25,6 +25,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seq-len", type=int, default=64)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=0.01)
+    parser.add_argument("--lr-schedule", type=str, default="constant", choices=["constant", "cos", "wsd"], help="LR schedule type.")
+    parser.add_argument("--warmup-steps", type=int, default=0, help="Linear warmup steps.")
+    parser.add_argument("--min-lr-ratio", type=float, default=0.0, help="Min LR as a fraction of --learning-rate (used by cos and wsd).")
+    parser.add_argument("--wsd-decay-fraction", type=float, default=0.1, help="Fraction of total steps for the WSD linear decay phase.")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--tp-size", type=int, default=None)
     parser.add_argument("--fsdp-size", type=int, default=None)
@@ -54,6 +58,10 @@ def main() -> None:
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
         print_every=args.log_every,
+        lr_schedule=args.lr_schedule,
+        warmup_steps=args.warmup_steps,
+        min_lr_ratio=args.min_lr_ratio,
+        wsd_decay_fraction=args.wsd_decay_fraction,
     )
     save_dir = Path(args.save_dir) if args.save_dir else _default_save_dir(args.model_id)
 

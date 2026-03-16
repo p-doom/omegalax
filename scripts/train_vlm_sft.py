@@ -52,6 +52,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch-size", type=int, default=4)
     p.add_argument("--learning-rate", type=float, default=2e-5)
     p.add_argument("--weight-decay", type=float, default=0.01)
+    p.add_argument("--lr-schedule", type=str, default="constant", choices=["constant", "cos", "wsd"], help="LR schedule type.")
+    p.add_argument("--warmup-steps", type=int, default=0, help="Linear warmup steps.")
+    p.add_argument("--min-lr-ratio", type=float, default=0.0, help="Min LR as a fraction of --learning-rate (used by cos and wsd).")
+    p.add_argument("--wsd-decay-fraction", type=float, default=0.1, help="Fraction of total steps for the WSD linear decay phase.")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--tp-size", type=int, default=None)
     p.add_argument("--fsdp-size", type=int, default=None)
@@ -105,6 +109,10 @@ def main() -> None:
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
         print_every=args.log_every,
+        lr_schedule=args.lr_schedule,
+        warmup_steps=args.warmup_steps,
+        min_lr_ratio=args.min_lr_ratio,
+        wsd_decay_fraction=args.wsd_decay_fraction,
     )
     save_dir = Path(args.save_dir) if args.save_dir else _default_save_dir(args.model_id)
     peak_tflops = resolve_peak_tflops(args.peak_tflops)
