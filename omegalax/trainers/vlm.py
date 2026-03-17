@@ -41,6 +41,7 @@ class TrainConfig:
     warmup_steps: int = 0
     min_lr_ratio: float = 0.0
     wsd_decay_fraction: float = 0.1
+    max_grad_norm: float | None = 1.0
 
     @classmethod
     def smoke(cls):
@@ -72,7 +73,13 @@ def build_optimizer(model: nnx.Module, train_cfg: TrainConfig) -> nnx.ModelAndOp
         min_lr_ratio=train_cfg.min_lr_ratio,
         wsd_decay_fraction=train_cfg.wsd_decay_fraction,
     )
-    tx = optax.adamw(learning_rate=lr, weight_decay=train_cfg.weight_decay)
+    if train_cfg.max_grad_norm is not None:
+        tx = optax.chain(
+            optax.clip_by_global_norm(train_cfg.max_grad_norm),
+            optax.adamw(learning_rate=lr, weight_decay=train_cfg.weight_decay),
+        )
+    else:
+        tx = optax.adamw(learning_rate=lr, weight_decay=train_cfg.weight_decay)
     return nnx.ModelAndOptimizer(model, tx)
 
 
