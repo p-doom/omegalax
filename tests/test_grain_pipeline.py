@@ -4,6 +4,7 @@ import json
 import os
 import tempfile
 from pathlib import Path
+from unittest import mock
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
@@ -34,6 +35,9 @@ class GrainPipelineTest(absltest.TestCase):
             for row in rows:
                 f.write(json.dumps(row) + "\n")
 
+    def _expected_session_id(self, path: Path, line_num: int) -> str:
+        return f"{path.stem}-{line_num:09d}"
+
     def test_compile_jsonl_to_arrayrecord_blocks_messages(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             src = Path(tmpdir) / "train.jsonl"
@@ -41,7 +45,6 @@ class GrainPipelineTest(absltest.TestCase):
                 src,
                 [
                     {
-                        "session_id": 1,
                         "messages": [
                             {"role": "user", "content": "a"},
                             {"role": "assistant", "content": "b"},
@@ -69,7 +72,6 @@ class GrainPipelineTest(absltest.TestCase):
                 src,
                 [
                     {
-                        "session_id": 1,
                         "messages": [{"role": "user", "content": "a"}],
                     },
                 ],
@@ -94,7 +96,6 @@ class GrainPipelineTest(absltest.TestCase):
                 src,
                 [
                     {
-                        "session_id": 7,
                         "messages": [
                             {"role": "user", "content": "10"},
                             {"role": "assistant", "content": "11"},
@@ -132,7 +133,8 @@ class GrainPipelineTest(absltest.TestCase):
             records = [next(iterator) for _ in range(3)]
             self.assertEqual([len(record["messages"]) for record in records], [2, 2, 1])
             self.assertEqual([record["messages"][0]["content"] for record in records], ["10", "12", "14"])
-            self.assertEqual([record["_omegalax_session_id"] for record in records], ["7", "7", "7"])
+            expected_session_id = self._expected_session_id(src, 1)
+            self.assertEqual([record["_omegalax_session_id"] for record in records], [expected_session_id] * 3)
 
     def test_grain_iterator_checkpoint_restore_on_chunk_index(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -141,7 +143,6 @@ class GrainPipelineTest(absltest.TestCase):
                 src,
                 [
                     {
-                        "session_id": "session-0",
                         "messages": [
                             {"role": "user", "content": "10"},
                             {"role": "assistant", "content": "11"},
@@ -149,6 +150,8 @@ class GrainPipelineTest(absltest.TestCase):
                             {"role": "assistant", "content": "13"},
                             {"role": "user", "content": "14"},
                             {"role": "assistant", "content": "15"},
+                            {"role": "user", "content": "16"},
+                            {"role": "assistant", "content": "17"},
                         ],
                     },
                 ],
@@ -195,7 +198,7 @@ class GrainPipelineTest(absltest.TestCase):
             manager.wait_until_finished()
 
             expected_next = next(iterator)
-            self.assertEqual(expected_next["starts"].tolist(), [14])
+            self.assertEqual(expected_next["starts"].tolist(), [14, 16])
 
             restored_iterator = make_grain_iterator(
                 chunked,
@@ -212,13 +215,78 @@ class GrainPipelineTest(absltest.TestCase):
                 args=checkpoint_utils.make_grain_restore_args(abstract_state, restored_iterator),
             )
             next_after_restore = next(restored["input_iter"])
-            self.assertEqual(next_after_restore["starts"].tolist(), [14])
+            self.assertEqual(next_after_restore["starts"].tolist(), [14, 16])
             manager.close()
+
+    def test_make_grain_iterator_shards_by_jax_process(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src = Path(tmpdir) / "train.jsonl"
+            self._write_jsonl(
+                src,
+                [
+                    {
+                        "messages": [
+                            {"role": "user", "content": "10"},
+                            {"role": "assistant", "content": "11"},
+                            {"role": "user", "content": "12"},
+                            {"role": "assistant", "content": "13"},
+                            {"role": "user", "content": "14"},
+                            {"role": "assistant", "content": "15"},
+                            {"role": "user", "content": "16"},
+                            {"role": "assistant", "content": "17"},
+                        ],
+                    },
+                ],
+            )
+            payload = compile_jsonl_to_arrayrecord(
+                src,
+                Path(tmpdir) / "payload",
+                messages_per_record=2,
+                records_per_shard=8,
+            )
+            chunked = build_chunk_index(
+                payload,
+                Path(tmpdir) / "chunked",
+                max_length=2,
+                measure_messages=lambda messages: len(messages),
+                records_per_shard=8,
+            )
+
+            with mock.patch("jax.process_count", return_value=2):
+                with mock.patch("jax.process_index", return_value=0):
+                    iterator0 = make_grain_iterator(
+                        chunked,
+                        batch_size=1,
+                        batch_fn=lambda batch: batch[0],
+                        shuffle=False,
+                        seed=0,
+                        read_options=make_grain_read_options(num_threads=1, prefetch_buffer_size=1),
+                        multiprocessing_options=make_grain_multiprocessing_options(num_workers=0, per_worker_buffer_size=1),
+                    )
+                    records0 = [next(iterator0) for _ in range(2)]
+
+                with mock.patch("jax.process_index", return_value=1):
+                    iterator1 = make_grain_iterator(
+                        chunked,
+                        batch_size=1,
+                        batch_fn=lambda batch: batch[0],
+                        shuffle=False,
+                        seed=0,
+                        read_options=make_grain_read_options(num_threads=1, prefetch_buffer_size=1),
+                        multiprocessing_options=make_grain_multiprocessing_options(num_workers=0, per_worker_buffer_size=1),
+                    )
+                    records1 = [next(iterator1) for _ in range(2)]
+
+            starts0 = [record["messages"][0]["content"] for record in records0]
+            starts1 = [record["messages"][0]["content"] for record in records1]
+            self.assertEqual(starts0, ["10", "12"])
+            self.assertEqual(starts1, ["14", "16"])
+            self.assertEmpty(set(starts0).intersection(starts1))
 
     def test_resolve_arrayrecord_paths_rejects_raw_jsonl_files(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             src = Path(tmpdir) / "train.jsonl"
-            self._write_jsonl(src, [{"session_id": 1, "messages": [{"role": "user", "content": "a"}]}])
+            self._write_jsonl(src, [{"messages": [{"role": "user", "content": "a"}]}])
 
             with self.assertRaisesRegex(ValueError, "compiled Grain shard"):
                 resolve_arrayrecord_paths(src)

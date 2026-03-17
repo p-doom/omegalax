@@ -112,7 +112,6 @@ def _make_grain_batch_iter(batch: dict[str, np.ndarray]):
         src.write_text(
             json.dumps(
                 {
-                    "session_id": 1,
                     "messages": [{"role": "user", "content": "stub"}],
                     "batch": _to_jsonable(batch),
                 }

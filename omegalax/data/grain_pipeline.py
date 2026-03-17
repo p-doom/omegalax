@@ -10,7 +10,8 @@ from pathlib import Path
 from typing import Any
 
 from array_record.python.array_record_module import ArrayRecordWriter
-import grain.python as grain
+import grain
+import jax
 
 COMPILED_DATASET_VERSION = 1
 COMPILED_METADATA_FILENAME = "metadata.json"
@@ -104,6 +105,10 @@ def _make_payload_block_record(
     }
 
 
+def _build_session_id(path: Path, line_num: int) -> str:
+    return f"{path.stem}-{line_num:09d}"
+
+
 def _iter_jsonl_message_blocks(
     path: Path,
     *,
@@ -118,8 +123,8 @@ def _iter_jsonl_message_blocks(
             messages = raw["messages"]
             assert isinstance(messages, list), f"Expected 'messages' to be a list at {path}:{line_num}"
 
-            session_id = str(raw["session_id"])
-            session_meta = {k: v for k, v in raw.items() if k != "messages"}
+            session_id = _build_session_id(path, line_num)
+            session_meta = {k: v for k, v in raw.items() if k not in {"messages", "session_id"}}
 
             block_messages: list[dict[str, Any]] = []
             block_start = 0
@@ -161,7 +166,10 @@ def compile_jsonl_to_arrayrecord(
     records_per_shard: int = 10_000,
     overwrite: bool = False,
 ) -> Path:
-    """Compile raw JSONL sessions into canonical message-block ArrayRecord shards."""
+    """Compile raw JSONL sessions into canonical message-block ArrayRecord shards.
+
+    Session ids are always synthesized from the source filename and line number.
+    """
 
     if messages_per_record <= 0:
         raise ValueError("messages_per_record must be > 0")
@@ -228,13 +236,22 @@ def required_epochs_for_batches(
 ) -> int:
     if num_batches <= 0:
         return 1
+    if batch_size <= 0:
+        raise ValueError("batch_size must be > 0")
     metadata = load_compiled_metadata(path)
     num_records = int(metadata["num_records"])
-    batches_per_epoch = max(1, (num_records + batch_size - 1) // batch_size)
-    return max(1, (num_batches + batches_per_epoch - 1) // batches_per_epoch)
+    process_count = jax.process_count()
+    records_per_epoch = num_records // process_count
+    if records_per_epoch <= 0:
+        raise ValueError(
+            f"Compiled Grain dataset has {num_records} records, which is too small to shard "
+            f"across process_count={process_count} with drop_remainder=True."
+        )
+    required_records = batch_size * num_batches
+    return max(1, (required_records + records_per_epoch - 1) // records_per_epoch)
 
 def _iter_indexed_records(path: str | Path):
-    source = grain.ArrayRecordDataSource([str(p) for p in resolve_arrayrecord_paths(path)])
+    source = grain.sources.ArrayRecordDataSource([str(p) for p in resolve_arrayrecord_paths(path)])
     for record_idx in range(len(source)):
         yield record_idx, json.loads(source[record_idx])
 
@@ -344,14 +361,25 @@ def build_chunk_index(
         },
     )
 
-class _ChunkDescriptorResolver:
+class _JsonLoadsMap(grain.transforms.Map):
+    def map(self, element):
+        return json.loads(element)
+
+
+class _ChunkDescriptorResolver(grain.transforms.Map):
     def __init__(self, payload_path: str | Path) -> None:
         self._payload_shards = [str(path) for path in resolve_arrayrecord_paths(payload_path)]
-        self._payload_source = grain.ArrayRecordDataSource(self._payload_shards)
+        self._payload_source = None
 
-    def __call__(self, descriptor: dict[str, Any]) -> dict[str, Any]:
+    def _source(self):
+        if self._payload_source is None:
+            self._payload_source = grain.sources.ArrayRecordDataSource(self._payload_shards)
+        return self._payload_source
+
+    def map(self, descriptor: dict[str, Any]) -> dict[str, Any]:
         messages: list[dict[str, Any]] = []
         session_meta: dict[str, Any] = {}
+        payload_source = self._source()
 
         start_record_idx = int(descriptor["start_record_idx"])
         end_record_idx = int(descriptor["end_record_idx"])
@@ -359,7 +387,7 @@ class _ChunkDescriptorResolver:
         end_message_offset = int(descriptor["end_message_offset"])
 
         for record_idx in range(start_record_idx, end_record_idx + 1):
-            block = json.loads(self._payload_source[record_idx])
+            block = json.loads(payload_source[record_idx])
             if not session_meta:
                 session_meta = dict(block.get("session_meta", {}))
             lo = start_message_offset if record_idx == start_record_idx else 0
@@ -407,26 +435,43 @@ def make_grain_iterator(
     read_options: grain.ReadOptions | None = None,
     multiprocessing_options: grain.MultiprocessingOptions | None = None,
 ):
-    """Create a checkpointable Grain iterator over a compiled chunk-index dataset."""
+    """Create a checkpointable Grain dataloader iterator over a chunk-index dataset."""
 
     compiled_path = Path(compiled_path).expanduser().resolve()
     metadata = load_compiled_metadata(compiled_path)
     if "payload_path" not in metadata:
         raise ValueError(f"Expected compiled Grain chunk-index dataset, missing payload_path: {compiled_path}")
 
-    shard_paths = [str(path) for path in resolve_arrayrecord_paths(compiled_path)]
-    dataset = grain.MapDataset.source(grain.ArrayRecordDataSource(shard_paths))
-    dataset = dataset.map(json.loads)
-    if shuffle:
-        dataset = dataset.shuffle(seed=seed)
-    payload_path = str(metadata["payload_path"])
-    dataset = dataset.map(_ChunkDescriptorResolver(payload_path))
-    if num_epochs > 1:
-        dataset = dataset.repeat(num_epochs)
-    dataset = dataset.batch(batch_size, drop_remainder=False, batch_fn=batch_fn)
+    if batch_size <= 0:
+        raise ValueError("batch_size must be > 0")
 
-    iter_dataset = dataset.to_iter_dataset(read_options or make_grain_read_options())
+    shard_paths = [str(path) for path in resolve_arrayrecord_paths(compiled_path)]
+    payload_path = str(metadata["payload_path"])
     mp_options = multiprocessing_options or make_grain_multiprocessing_options()
-    if mp_options.num_workers > 0:
-        iter_dataset = iter_dataset.mp_prefetch(mp_options)
-    return iter(iter_dataset)
+    read_options = read_options or make_grain_read_options()
+
+    source = grain.sources.ArrayRecordDataSource(shard_paths)
+    shard_options = grain.sharding.ShardByJaxProcess(drop_remainder=True)
+    sampler = grain.samplers.IndexSampler(
+        num_records=len(source),
+        shard_options=shard_options,
+        shuffle=shuffle,
+        num_epochs=num_epochs,
+        seed=seed,
+    )
+    operations = [
+        _JsonLoadsMap(),
+        _ChunkDescriptorResolver(payload_path),
+        grain.transforms.Batch(batch_size=batch_size, drop_remainder=True, batch_fn=batch_fn),
+    ]
+    dataloader = grain.DataLoader(
+        data_source=source,
+        sampler=sampler,
+        operations=operations,
+        worker_count=mp_options.num_workers,
+        worker_buffer_size=mp_options.per_worker_buffer_size,
+        shard_options=shard_options,
+        read_options=read_options,
+        enable_profiling=mp_options.enable_profiling,
+    )
+    return iter(dataloader)
