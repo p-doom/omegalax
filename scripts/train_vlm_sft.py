@@ -120,7 +120,7 @@ def main() -> None:
         tb_dir = Path(args.tensorboard_dir)
         tb_dir.mkdir(parents=True, exist_ok=True)
         tb_writer = SummaryWriter(str(tb_dir))
-        tb_writer.add_hparams(args.__dict__, {})
+        tb_writer.add_hparams(args.__dict__, {}, name="hparams")
     try:
         _, last_metrics = vlm_trainer.run_sft(
             args.model_id,
