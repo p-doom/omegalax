@@ -23,27 +23,28 @@ def _build_assistant_loss_mask(
 ) -> np.ndarray:
     """Mask with 1 on assistant-content tokens, 0 elsewhere.
 
-    ChatML ``<|im_start|>``/``<|im_end|>`` pair 1:1 in sequence order.
-    We find which pairs are assistant turns, then fill the content spans
-    via cumsum — no Python loops.
+    Each ``<|im_start|>`` is paired with the nearest *following*
+    ``<|im_end|>`` (via searchsorted) so that orphan ``<|im_end|>``
+    tokens left over after left-truncation are safely ignored.
     """
     n = len(input_ids)
     starts = np.where(input_ids == im_start_id)[0]
     ends = np.where(input_ids == im_end_id)[0]
-    k = min(len(starts), len(ends))
-    if k == 0:
+    if len(starts) == 0 or len(ends) == 0:
         return np.zeros(n, dtype=np.int32)
-    starts, ends = starts[:k], ends[:k]
 
-    # Which <|im_start|> are followed by `assistant`?
+    # Pair each <|im_start|> with the nearest following <|im_end|>.
+    end_idx = np.searchsorted(ends, starts, side="left")
+    valid_pairs = end_idx < len(ends)
+    starts = starts[valid_pairs]
+    matched_ends = ends[end_idx[valid_pairs]]
+
     is_asst = (starts + 1 < n) & (input_ids[starts + 1] == assistant_token_id)
-    # Content starts after <|im_start|> assistant \n  (3 tokens).
     content_starts = starts[is_asst] + 3
-    content_ends = ends[is_asst]
+    content_ends = matched_ends[is_asst]
 
-    # +1 at content start, -1 at <|im_end|> → cumsum gives the mask.
     signal = np.zeros(n, dtype=np.int32)
-    valid = content_starts < n
+    valid = (content_starts < n) & (content_starts <= content_ends)
     np.add.at(signal, content_starts[valid], 1)
     np.add.at(signal, content_ends[valid], -1)
     return np.cumsum(signal).astype(np.int32)
