@@ -1,19 +1,23 @@
-"""VLM SFT training from a JSONL dataset (text-only or multimodal)."""
+"""VLM SFT training from a compiled Grain dataset (text-only or multimodal)."""
 
 from __future__ import annotations
 
 import argparse
 import json
-from collections.abc import Iterator
 from pathlib import Path
 
 import jax
-import numpy as np
 from tensorboardX import SummaryWriter
 from transformers import AutoImageProcessor, AutoTokenizer
 
 from omegalax.data.collator_qwen3 import VLMSFTCollator
-from omegalax.data.jsonl import JSONLDataset
+from omegalax.data.grain_pipeline import (
+    make_grain_iterator,
+    make_grain_multiprocessing_options,
+    make_grain_read_options,
+    required_epochs_for_batches,
+)
+from omegalax.distributed.mesh import process_local_batch_size
 from omegalax.trainers import vlm as vlm_trainer
 from omegalax.registry import resolve_hf_repo_id
 from omegalax.trainers.perf import resolve_peak_tflops
@@ -24,32 +28,53 @@ def _default_save_dir(model_id: str) -> Path:
     return Path("runs") / "vlm_sft" / safe_name
 
 
-def _batched_iter(
-    dataset: JSONLDataset,
+def _grain_iter(
+    data_path: str,
     collator: VLMSFTCollator,
-    batch_size: int,
+    per_process_batch_size: int,
     *,
-    shuffle: bool = True,
-    seed: int = 0,
-) -> Iterator[dict[str, np.ndarray]]:
-    """Yield collated batches from the dataset forever."""
-    buf: list[dict] = []
-    for ex in dataset.iter_examples(shuffle=shuffle, seed=seed, num_epochs=None):
-        buf.append(ex)
-        if len(buf) == batch_size:
-            yield collator(buf)
-            buf = []
+    shuffle: bool,
+    seed: int,
+    grain_read_threads: int,
+    grain_read_buffer_size: int,
+    grain_workers: int,
+    grain_worker_buffer_size: int,
+    num_batches: int,
+):
+    return make_grain_iterator(
+        data_path,
+        batch_size=per_process_batch_size,
+        batch_fn=collator,
+        shuffle=shuffle,
+        seed=seed,
+        num_epochs=required_epochs_for_batches(
+            data_path, batch_size=per_process_batch_size, num_batches=num_batches
+        ),
+        read_options=make_grain_read_options(
+            num_threads=grain_read_threads,
+            prefetch_buffer_size=grain_read_buffer_size,
+        ),
+        multiprocessing_options=make_grain_multiprocessing_options(
+            num_workers=grain_workers,
+            per_worker_buffer_size=grain_worker_buffer_size,
+        ),
+    )
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="SFT a VLM from a JSONL dataset.")
+    p = argparse.ArgumentParser(description="SFT a VLM from a compiled Grain chunk-index dataset.")
     p.add_argument("--model-id", type=str, required=True)
-    p.add_argument("--data-path", type=str, required=True, help="Path to JSONL training data.")
+    p.add_argument(
+        "--data-path",
+        type=str,
+        required=True,
+        help="Path to a compiled Grain chunk-index dataset directory. Build it from raw JSONL via scripts/compile_sft_dataset.py and scripts/build_sft_chunk_index.py.",
+    )
     p.add_argument("--processor", type=str, default=None, help="HF repo to read tokenizer and image config from (defaults to --model-id).")
     p.add_argument("--preprocessor-config", type=str, default=None, help="Path to a JSON file whose keys override the default image processor config.")
     p.add_argument("--max-length", type=int, default=512)
     p.add_argument("--num-steps", type=int, default=100)
-    p.add_argument("--batch-size", type=int, default=4)
+    p.add_argument("--batch-size", type=int, default=4, help="Global batch size across all JAX processes.")
     p.add_argument("--learning-rate", type=float, default=2e-5)
     p.add_argument("--weight-decay", type=float, default=0.01)
     p.add_argument("--seed", type=int, default=0)
@@ -67,10 +92,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--peak-tflops", type=str, default=None)
     p.add_argument("--log-image-sizes", action="store_true", help="Print original and resized image dimensions for the first batch.")
     p.add_argument("--tensorboard-dir", type=str, default=None, help="Directory for TensorBoard event files.")
-    p.add_argument("--max-turns", type=int, default=None, help="Max messages per conversation; longer chats are split into chunks.")
-    p.add_argument("--val-data-path", type=str, default=None, help="Path to JSONL validation data.")
+    p.add_argument("--val-data-path", type=str, default=None, help="Path to a compiled Grain validation chunk-index dataset.")
     p.add_argument("--val-every", type=int, default=None, help="Run validation every N training steps.")
     p.add_argument("--val-steps", type=int, default=10, help="Number of batches per validation run.")
+    p.add_argument("--grain-read-threads", type=int, default=16)
+    p.add_argument("--grain-read-buffer-size", type=int, default=500)
+    p.add_argument("--grain-workers", type=int, default=0)
+    p.add_argument("--grain-worker-buffer-size", type=int, default=1)
     return p.parse_args()
 
 
@@ -88,14 +116,40 @@ def main() -> None:
             ip_kwargs = json.load(f)
     image_processor = AutoImageProcessor.from_pretrained(repo_id, use_fast=False, **ip_kwargs)
     collator = VLMSFTCollator(tokenizer, max_length=args.max_length, image_processor=image_processor)
+    per_process_batch = process_local_batch_size(args.batch_size)
+    if jax.process_index() == 0:
+        print(
+            f"global_batch_size={args.batch_size} process_count={jax.process_count()} "
+            f"per_process_batch_size={per_process_batch}"
+        )
 
-    dataset = JSONLDataset(args.data_path, max_turns=args.max_turns)
-    data_iter = _batched_iter(dataset, collator, args.batch_size, shuffle=True, seed=args.seed)
+    data_iter = _grain_iter(
+        args.data_path,
+        collator,
+        per_process_batch,
+        shuffle=True,
+        seed=args.seed,
+        grain_read_threads=args.grain_read_threads,
+        grain_read_buffer_size=args.grain_read_buffer_size,
+        grain_workers=args.grain_workers,
+        grain_worker_buffer_size=args.grain_worker_buffer_size,
+        num_batches=args.num_steps,
+    )
 
     val_data_iter = None
     if args.val_data_path:
-        val_dataset = JSONLDataset(args.val_data_path, max_turns=args.max_turns)
-        val_data_iter = _batched_iter(val_dataset, collator, args.batch_size, shuffle=False, seed=args.seed)
+        val_data_iter = _grain_iter(
+            args.val_data_path,
+            collator,
+            per_process_batch,
+            shuffle=False,
+            seed=args.seed,
+            grain_read_threads=args.grain_read_threads,
+            grain_read_buffer_size=args.grain_read_buffer_size,
+            grain_workers=args.grain_workers,
+            grain_worker_buffer_size=args.grain_worker_buffer_size,
+            num_batches=max(1, (args.num_steps // max(args.val_every or args.num_steps, 1)) * args.val_steps),
+        )
 
     train_cfg = vlm_trainer.TrainConfig(
         seed=args.seed,
@@ -106,7 +160,9 @@ def main() -> None:
         weight_decay=args.weight_decay,
         print_every=args.log_every,
     )
-    save_dir = Path(args.save_dir) if args.save_dir else _default_save_dir(args.model_id)
+    save_dir = Path(args.save_dir) if args.save_dir else (
+        _default_save_dir(args.model_id) if args.save_every > 0 or args.resume else None
+    )
     peak_tflops = resolve_peak_tflops(args.peak_tflops)
 
     tb_writer = None

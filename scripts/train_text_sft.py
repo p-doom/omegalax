@@ -1,17 +1,21 @@
-"""Text-model SFT training from a JSONL dataset."""
+"""Text-model SFT training from a compiled Grain dataset."""
 
 from __future__ import annotations
 
 import argparse
-from collections.abc import Iterator
 from pathlib import Path
 
 import jax
-import numpy as np
 from transformers import AutoTokenizer
 
 from omegalax.data.collator_qwen3 import TextSFTCollator
-from omegalax.data.jsonl import JSONLDataset
+from omegalax.data.grain_pipeline import (
+    make_grain_iterator,
+    make_grain_multiprocessing_options,
+    make_grain_read_options,
+    required_epochs_for_batches,
+)
+from omegalax.distributed.mesh import process_local_batch_size
 from omegalax.registry import resolve_hf_repo_id
 from omegalax.trainers import text as text_trainer
 from omegalax.trainers.perf import resolve_peak_tflops
@@ -22,31 +26,52 @@ def _default_save_dir(model_id: str) -> Path:
     return Path("runs") / "text_sft" / safe_name
 
 
-def _batched_iter(
-    dataset: JSONLDataset,
+def _grain_iter(
+    data_path: str,
     collator: TextSFTCollator,
-    batch_size: int,
+    per_process_batch_size: int,
     *,
-    shuffle: bool = True,
-    seed: int = 0,
-) -> Iterator[dict[str, np.ndarray]]:
-    """Yield collated batches from the dataset forever."""
-    buf: list[dict] = []
-    for ex in dataset.iter_examples(shuffle=shuffle, seed=seed, num_epochs=None):
-        buf.append(ex)
-        if len(buf) == batch_size:
-            yield collator(buf)
-            buf = []
+    shuffle: bool,
+    seed: int,
+    grain_read_threads: int,
+    grain_read_buffer_size: int,
+    grain_workers: int,
+    grain_worker_buffer_size: int,
+    num_batches: int,
+):
+    return make_grain_iterator(
+        data_path,
+        batch_size=per_process_batch_size,
+        batch_fn=collator,
+        shuffle=shuffle,
+        seed=seed,
+        num_epochs=required_epochs_for_batches(
+            data_path, batch_size=per_process_batch_size, num_batches=num_batches
+        ),
+        read_options=make_grain_read_options(
+            num_threads=grain_read_threads,
+            prefetch_buffer_size=grain_read_buffer_size,
+        ),
+        multiprocessing_options=make_grain_multiprocessing_options(
+            num_workers=grain_workers,
+            per_worker_buffer_size=grain_worker_buffer_size,
+        ),
+    )
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="SFT a text model from a JSONL dataset.")
+    p = argparse.ArgumentParser(description="SFT a text model from a compiled Grain chunk-index dataset.")
     p.add_argument("--model-id", type=str, required=True)
-    p.add_argument("--data-path", type=str, required=True, help="Path to JSONL training data.")
+    p.add_argument(
+        "--data-path",
+        type=str,
+        required=True,
+        help="Path to a compiled Grain chunk-index dataset directory. Build it from raw JSONL via scripts/compile_sft_dataset.py and scripts/build_sft_chunk_index.py.",
+    )
     p.add_argument("--tokenizer", type=str, default=None, help="HF tokenizer name/path (defaults to --model-id).")
     p.add_argument("--max-length", type=int, default=512)
     p.add_argument("--num-steps", type=int, default=100)
-    p.add_argument("--batch-size", type=int, default=8)
+    p.add_argument("--batch-size", type=int, default=8, help="Global batch size across all JAX processes.")
     p.add_argument("--learning-rate", type=float, default=2e-5)
     p.add_argument("--weight-decay", type=float, default=0.01)
     p.add_argument("--seed", type=int, default=0)
@@ -62,6 +87,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--resume", action="store_true")
     p.add_argument("--pad-id", type=int, default=0)
     p.add_argument("--peak-tflops", type=str, default=None)
+    p.add_argument("--grain-read-threads", type=int, default=16)
+    p.add_argument("--grain-read-buffer-size", type=int, default=500)
+    p.add_argument("--grain-workers", type=int, default=0)
+    p.add_argument("--grain-worker-buffer-size", type=int, default=1)
     return p.parse_args()
 
 
@@ -73,8 +102,24 @@ def main() -> None:
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
     assert args.max_length <= tokenizer.model_max_length, f"--max-length={args.max_length} exceeds tokenizer.model_max_length={tokenizer.model_max_length}"
     collator = TextSFTCollator(tokenizer, max_length=args.max_length)
-    dataset = JSONLDataset(args.data_path)
-    data_iter = _batched_iter(dataset, collator, args.batch_size, shuffle=True, seed=args.seed)
+    per_process_batch = process_local_batch_size(args.batch_size)
+    if jax.process_index() == 0:
+        print(
+            f"global_batch_size={args.batch_size} process_count={jax.process_count()} "
+            f"per_process_batch_size={per_process_batch}"
+        )
+    data_iter = _grain_iter(
+        args.data_path,
+        collator,
+        per_process_batch,
+        shuffle=True,
+        seed=args.seed,
+        grain_read_threads=args.grain_read_threads,
+        grain_read_buffer_size=args.grain_read_buffer_size,
+        grain_workers=args.grain_workers,
+        grain_worker_buffer_size=args.grain_worker_buffer_size,
+        num_batches=args.num_steps,
+    )
 
     train_cfg = text_trainer.TrainConfig(
         seed=args.seed,
@@ -85,7 +130,9 @@ def main() -> None:
         weight_decay=args.weight_decay,
         print_every=args.log_every,
     )
-    save_dir = Path(args.save_dir) if args.save_dir else _default_save_dir(args.model_id)
+    save_dir = Path(args.save_dir) if args.save_dir else (
+        _default_save_dir(args.model_id) if args.save_every > 0 or args.resume else None
+    )
     peak_tflops = resolve_peak_tflops(args.peak_tflops)
 
     _, last_metrics = text_trainer.run_sft(

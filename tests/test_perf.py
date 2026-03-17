@@ -1,7 +1,10 @@
 """Tests for training FLOP counting and throughput metrics."""
 
+from unittest import mock
+
 from absl.testing import absltest
 
+from omegalax.distributed.mesh import process_local_batch_size
 from omegalax.models.qwen3.config import make_config as make_qwen3_config
 from omegalax.models.qwen3_5.config import make_config as make_qwen3_5_config
 from omegalax.trainers.perf import (
@@ -67,6 +70,7 @@ class StepMetricsTest(absltest.TestCase):
         import datetime
         out = step_metrics(1e12, datetime.timedelta(0), 64, 312.0)
         self.assertEqual(out["step_time_s"], 0.0)
+        self.assertEqual(out["global_tokens_per_sec"], 0.0)
         self.assertEqual(out["tokens_per_sec_per_device"], 0.0)
         self.assertEqual(out["tflops_per_device"], 0.0)
         self.assertEqual(out["mfu"], 0.0)
@@ -76,6 +80,7 @@ class StepMetricsTest(absltest.TestCase):
         # 1e12 FLOPs in 1 second -> 1 TFLOP/s; peak 312 -> mfu = 1/312
         out = step_metrics(1e12, datetime.timedelta(seconds=1), 64, 312.0)
         self.assertAlmostEqual(out["step_time_s"], 1.0)
+        self.assertAlmostEqual(out["global_tokens_per_sec"], 64.0)
         self.assertGreater(out["tokens_per_sec_per_device"], 0)
         self.assertAlmostEqual(out["tflops_per_device"], 1.0)
         self.assertAlmostEqual(out["mfu"], 1.0 / 312.0)
@@ -85,6 +90,17 @@ class StepMetricsTest(absltest.TestCase):
         out = step_metrics(1e12, datetime.timedelta(seconds=1), 64, None)
         self.assertEqual(out["mfu"], 0.0)
         self.assertGreater(out["tflops_per_device"], 0)
+
+
+class ProcessLocalBatchSizeTest(absltest.TestCase):
+    def test_returns_process_local_batch_size(self):
+        with mock.patch("jax.process_count", return_value=4):
+            self.assertEqual(process_local_batch_size(8), 2)
+
+    def test_rejects_non_divisible_global_batch_size(self):
+        with mock.patch("jax.process_count", return_value=3):
+            with self.assertRaisesRegex(ValueError, "divisible by process_count=3"):
+                process_local_batch_size(8)
 
 
 class StepTimerTest(absltest.TestCase):

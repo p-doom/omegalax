@@ -252,7 +252,7 @@ def per_device_flops_per_step(
 def step_metrics(
     per_device_flops: float,
     step_delta: datetime.timedelta,
-    tokens_per_step: int,
+    global_tokens_per_step: int,
     peak_tflops: float | None,
 ) -> dict[str, float]:
     """Compute tokens/s, TFLOPS/device, and MFU from step timing."""
@@ -260,18 +260,20 @@ def step_metrics(
     if sec <= 0:
         return {
             "step_time_s": 0.0,
+            "global_tokens_per_sec": 0.0,
             "tokens_per_sec_per_device": 0.0,
             "tflops_per_device": 0.0,
             "mfu": 0.0,
         }
     n_devices = jax.device_count()
-    tokens_per_sec_total = tokens_per_step / sec
-    tokens_per_sec_per_device = tokens_per_sec_total / n_devices
+    global_tokens_per_sec = global_tokens_per_step / sec
+    tokens_per_sec_per_device = global_tokens_per_sec / n_devices
     flops_per_sec_per_device = per_device_flops / sec
     tflops_per_device = flops_per_sec_per_device / 1e12
     mfu = (flops_per_sec_per_device / (peak_tflops * 1e12)) if peak_tflops else 0.0
     return {
         "step_time_s": sec,
+        "global_tokens_per_sec": global_tokens_per_sec,
         "tokens_per_sec_per_device": tokens_per_sec_per_device,
         "tflops_per_device": tflops_per_device,
         "mfu": mfu,
@@ -288,7 +290,7 @@ def maybe_log_step_metrics(
     log_path: Path | None,
     force: bool = False,
     per_device_flops: float,
-    tokens_per_step: int,
+    global_tokens_per_step: int,
     peak_tflops: float | None,
     extra_print_keys: Sequence[tuple[str, str]] | None = None,
     tb_writer: Any = None,
@@ -310,7 +312,7 @@ def maybe_log_step_metrics(
         raise KeyError(f"Missing required metrics for logging: {missing}")
     host_metrics["step"] = step_to_log
     host_metrics.update(
-        step_metrics(per_device_flops, step_delta, tokens_per_step, peak_tflops)
+        step_metrics(per_device_flops, step_delta, global_tokens_per_step, peak_tflops)
     )
 
     if should_print:

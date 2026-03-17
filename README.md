@@ -58,14 +58,14 @@ cache = api.make_cache(cfg, batch_size=2, token_len=32, generate_steps=8)
 next_logits, cache, aux_loss = api.decode(model, cache, tokens, pad_id=0, cfg=cfg)
 ```
 
-## Training with synthetic data
-Run a longer synthetic training loop with orbax checkpointing and JSONL logging:
+## Training
+Run text SFT from a compiled Grain dataset:
 ```bash
-uv run scripts/train_text_pretrain.py --model-id qwen3-smoke --num-steps 50 --save-dir runs/text-qwen3-smoke --tp-size 1 --fsdp-size 1
+uv run scripts/train_text_sft.py --model-id qwen3-smoke --data-path /path/to/compiled-dataset --tp-size 1 --fsdp-size 1
 ```
-Run the VLM synthetic training loop:
+Run VLM SFT from a compiled Grain dataset:
 ```bash
-uv run scripts/train_vlm.py --model-id qwen3-vl-smoke --num-steps 50 --save-dir runs/vlm-qwen3-vl-smoke --tp-size 1 --fsdp-size 1
+uv run scripts/train_vlm_sft.py --model-id qwen3-vl-smoke --data-path /path/to/compiled-dataset --tp-size 1 --fsdp-size 1
 ```
 Resume from the latest checkpoint with `--resume`.
 

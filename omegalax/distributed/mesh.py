@@ -32,6 +32,17 @@ def required_batch_multiple(batch_spec: PartitionSpec, mesh: Mesh) -> int:
     return int(mesh.shape[axis])
 
 
+def process_local_batch_size(global_batch_size: int) -> int:
+    process_count = jax.process_count()
+    if global_batch_size <= 0:
+        raise ValueError(f"Global batch size must be > 0, got {global_batch_size}.")
+    if global_batch_size % process_count != 0:
+        raise ValueError(
+            f"Global batch size {global_batch_size} must be divisible by process_count={process_count}."
+        )
+    return global_batch_size // process_count
+
+
 def make_mesh(tp_size: int, fsdp_size: int) -> Mesh:
     tp, fsdp = _resolve_mesh_shape(tp_size=tp_size, fsdp_size=fsdp_size)
     return jax.make_mesh((tp, fsdp), _AXES)

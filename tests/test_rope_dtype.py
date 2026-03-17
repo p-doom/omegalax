@@ -168,7 +168,6 @@ class Qwen3_5VisionRopeDtypeTest(_RopeDtypeTestBase):
         c = vis_cfg.in_channels
         pixels = jnp.ones((n_patches, c * tp * ps * ps), dtype=jnp.float32)
         grid_thw = jnp.array([[1, h, w]], dtype=jnp.int32)
-
         with mock.patch.object(vis_mod.VisionBlock, "__call__", block_spy):
             vision(pixels, grid_thw)
 
@@ -256,9 +255,10 @@ class Qwen3VLVisionRopeDtypeTest(_RopeDtypeTestBase):
         c = vis_cfg.in_channels
         pixels = jnp.ones((n_patches, c * tp * ps * ps), dtype=jnp.float32)
         grid_thw = jnp.array([[1, h, w]], dtype=jnp.int32)
+        vision_cu_seqlens = jnp.array([0, h * w], dtype=jnp.int32)
 
         with mock.patch.object(vis_mod.VisionBlock, "__call__", block_spy):
-            vision(pixels, grid_thw)
+            vision(pixels, grid_thw, vision_cu_seqlens)
 
         self.assertGreater(len(block_calls), 0)
         for i, call in enumerate(block_calls):

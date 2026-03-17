@@ -10,6 +10,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
   "absl-py",
+  "array-record",
   "etils",
   "flax>0.12.0",
   "jax[cuda12]",
@@ -20,6 +21,8 @@ dependencies = [
   "safetensors",
   "transformers",
   "huggingface-hub",
+  "tensorboardx>=2.6.4",
+  "grain>=0.2.16",
 ]
 
 [project.optional-dependencies]
@@ -29,3 +32,10 @@ torch-tests = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["omegalax"]
+
+[dependency-groups]
+dev = [
+    "setuptools<81",
+    "tensorboard>=2.20.0",
+    "xprof>=2.22.0",
+]

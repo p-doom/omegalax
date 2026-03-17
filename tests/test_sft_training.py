@@ -1,6 +1,9 @@
 """Smoke tests for SFT training loops and shard_batch_dict."""
 
+import json
 import os
+from pathlib import Path
+import tempfile
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
@@ -9,6 +12,13 @@ from absl.testing import absltest
 import jax
 import numpy as np
 
+from omegalax.data.grain_pipeline import (
+    build_chunk_index,
+    compile_jsonl_to_arrayrecord,
+    make_grain_iterator,
+    make_grain_multiprocessing_options,
+    make_grain_read_options,
+)
 from omegalax.distributed.mesh import ensure_mesh
 from omegalax.models.qwen3_vl.config import make_vl_config
 from omegalax.models.qwen3_vl.model import get_rope_index
@@ -74,6 +84,61 @@ def _make_multimodal_qwen3_vl_smoke_batch(seq_len: int = 8) -> dict[str, np.ndar
     }
 
 
+def _to_jsonable(value):
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, dict):
+        return {k: _to_jsonable(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_to_jsonable(v) for v in value]
+    return value
+
+
+def _restore_arrays(value):
+    if isinstance(value, list):
+        if not value:
+            return np.asarray(value)
+        if not any(isinstance(item, dict) for item in value):
+            return np.asarray(value)
+        return [_restore_arrays(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _restore_arrays(item) for key, item in value.items()}
+    return value
+
+
+def _make_grain_batch_iter(batch: dict[str, np.ndarray]):
+    with tempfile.TemporaryDirectory() as tmpdir:
+        src = Path(tmpdir) / "train.jsonl"
+        src.write_text(
+            json.dumps(
+                {
+                    "session_id": 1,
+                    "messages": [{"role": "user", "content": "stub"}],
+                    "batch": _to_jsonable(batch),
+                }
+            )
+            + "\n"
+        )
+        payload = compile_jsonl_to_arrayrecord(src, Path(tmpdir) / "payload", records_per_shard=1)
+        compiled = build_chunk_index(
+            payload,
+            Path(tmpdir) / "chunked",
+            max_length=1,
+            measure_messages=lambda messages: len(messages),
+            records_per_shard=1,
+        )
+        iterator = make_grain_iterator(
+            compiled,
+            batch_size=1,
+            batch_fn=lambda records: _restore_arrays(records[0]["batch"]),
+            shuffle=False,
+            seed=0,
+            read_options=make_grain_read_options(num_threads=1, prefetch_buffer_size=1),
+            multiprocessing_options=make_grain_multiprocessing_options(num_workers=0, per_worker_buffer_size=1),
+        )
+        yield from iterator
+
+
 class ShardBatchDictTest(absltest.TestCase):
     def test_rank2_arrays(self):
         mesh = ensure_mesh(tp_size=1, fsdp_size=1)
@@ -103,15 +168,15 @@ class TextSFTTrainingTest(absltest.TestCase):
     def test_one_step_sft(self):
         train_cfg = text_trainer.TrainConfig(
             seed=0,
-            batch_size=2,
+            batch_size=1,
             seq_len=8,
             num_steps=1,
             learning_rate=1e-3,
             weight_decay=0.0,
             print_every=0,
         )
-        batch = _make_synthetic_sft_batch(2, 8, 32000)
-        data_iter = iter([batch])
+        batch = _make_synthetic_sft_batch(1, 8, 32000)
+        data_iter = _make_grain_batch_iter(batch)
 
         _, metrics = text_trainer.run_sft(
             "qwen3-smoke",
@@ -139,7 +204,7 @@ class VLMSFTTrainingTest(absltest.TestCase):
             print_every=0,
         )
         batch = _make_synthetic_sft_batch(1, 4, 32000)
-        data_iter = iter([batch])
+        data_iter = _make_grain_batch_iter(batch)
 
         _, metrics = vlm_trainer.run_sft(
             "qwen3-vl-smoke",
@@ -165,7 +230,7 @@ class VLMSFTTrainingTest(absltest.TestCase):
             print_every=0,
         )
         batch = _make_multimodal_qwen3_vl_smoke_batch(seq_len=8)
-        data_iter = iter([batch])
+        data_iter = _make_grain_batch_iter(batch)
 
         _, metrics = vlm_trainer.run_sft(
             "qwen3-vl-smoke",
