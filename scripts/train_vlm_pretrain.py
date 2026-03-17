@@ -34,7 +34,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-dir", type=str, default=None, help="Directory to store checkpoints/logs.")
     parser.add_argument("--save-every", type=int, default=50)
     parser.add_argument("--log-every", type=int, default=10)
-    parser.add_argument("--log-jsonl", type=str, default=None, help="Optional JSONL metrics file.")
     parser.add_argument("--resume", action="store_true", help="Resume from latest checkpoint if present.")
     parser.add_argument("--pad-id", type=int, default=0)
     parser.add_argument(
@@ -71,7 +70,6 @@ def main() -> None:
         save_dir=save_dir,
         save_every=args.save_every,
         log_every=args.log_every,
-        log_jsonl=args.log_jsonl,
         resume=args.resume,
         pad_id=args.pad_id,
         peak_tflops=peak_tflops,
