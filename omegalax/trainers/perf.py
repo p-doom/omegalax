@@ -8,9 +8,6 @@ materializes the full attention matrix.
 from __future__ import annotations
 
 import datetime
-import json
-from collections.abc import Sequence
-from pathlib import Path
 from typing import Any, Union
 
 import jax
@@ -287,22 +284,15 @@ def maybe_log_step_metrics(
     *,
     is_primary_process: bool,
     log_every: int,
-    log_path: Path | None,
     force: bool = False,
     per_device_flops: float,
     global_tokens_per_step: int,
     peak_tflops: float | None,
-    extra_print_keys: Sequence[tuple[str, str]] | None = None,
     tb_writer: Any = None,
 ) -> dict[str, float] | None:
-    """Optionally log and print step metrics. Returns host_metrics if logged, else None.
-
-    extra_print_keys: optional list of (metric_key, format_fragment) for the print
-    line, e.g. [("token_accuracy", "acc={:.4f} "), ("supervised_tokens", "sup_tok={:.0f} ")].
-    """
-    should_print = is_primary_process and log_every and step_to_log % log_every == 0
-    should_write = is_primary_process and log_path is not None
-    if not (should_print or should_write or force):
+    """Optionally compute and log step metrics. Returns host_metrics if logged, else None."""
+    should_log = is_primary_process and log_every and step_to_log % log_every == 0
+    if not (should_log or force):
         return None
 
     host_metrics = {k: float(v) for k, v in metrics_to_log.items()}
@@ -314,23 +304,6 @@ def maybe_log_step_metrics(
     host_metrics.update(
         step_metrics(per_device_flops, step_delta, global_tokens_per_step, peak_tflops)
     )
-
-    if should_print:
-        extra_frag = ""
-        if extra_print_keys:
-            for key, fmt in extra_print_keys:
-                if key in host_metrics:
-                    extra_frag += fmt.format(host_metrics[key])
-        print(
-            f"step={host_metrics['step']} loss={host_metrics['loss']:.4f} "
-            f"{extra_frag}grad_norm={host_metrics['grad_norm']:.4f} "
-            f"step_s={host_metrics['step_time_s']:.3f} tok/s/dev={host_metrics['tokens_per_sec_per_device']:.0f} "
-            f"TFLOP/s/dev={host_metrics['tflops_per_device']:.2f} mfu={host_metrics['mfu']:.4f}"
-        )
-
-    if should_write and log_path is not None:
-        with log_path.open("a") as f:
-            f.write(json.dumps(host_metrics) + "\n")
 
     if tb_writer is not None and is_primary_process:
         _TB_SKIP = {"step"}
