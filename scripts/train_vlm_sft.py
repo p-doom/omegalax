@@ -61,11 +61,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--profile-dir", type=str, default=None)
     p.add_argument("--profile-start", type=int, default=3, help="Step to start profiling (after JIT warmup).")
     p.add_argument("--profile-end", type=int, default=8, help="Step to stop profiling.")
-    p.add_argument("--log-jsonl", type=str, default=None)
     p.add_argument("--resume", action="store_true")
     p.add_argument("--pad-id", type=int, default=0)
     p.add_argument("--peak-tflops", type=str, default=None)
-    p.add_argument("--log-image-sizes", action="store_true", help="Print original and resized image dimensions for the first batch.")
     p.add_argument("--tensorboard-dir", type=str, default=None, help="Directory for TensorBoard event files.")
     p.add_argument("--max-turns", type=int, default=None, help="Max messages per conversation; longer chats are split into chunks.")
     p.add_argument("--val-data-path", type=str, default=None, help="Path to JSONL validation data.")
@@ -114,7 +112,7 @@ def main() -> None:
         tb_dir = Path(args.tensorboard_dir)
         tb_dir.mkdir(parents=True, exist_ok=True)
         tb_writer = SummaryWriter(str(tb_dir))
-
+        tb_writer.add_hparams(args.__dict__, {})
     try:
         _, last_metrics = vlm_trainer.run_sft(
             args.model_id,
@@ -123,7 +121,6 @@ def main() -> None:
             save_dir=save_dir,
             save_every=args.save_every,
             log_every=args.log_every,
-            log_jsonl=args.log_jsonl,
             resume=args.resume,
             pad_id=args.pad_id,
             peak_tflops=peak_tflops,

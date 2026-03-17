@@ -147,30 +147,6 @@ class TrainVLMTest(absltest.TestCase):
         self.assertAlmostEqual(metrics_rank0["loss"], metrics_rank1["loss"], places=6)
         self.assertAlmostEqual(metrics_rank0["grad_norm"], metrics_rank1["grad_norm"], places=6)
 
-    def test_non_primary_process_does_not_write_jsonl_logs(self):
-        train_cfg = vlm_trainer.TrainConfig(
-            seed=0,
-            batch_size=1,
-            seq_len=4,
-            num_steps=1,
-            learning_rate=1e-3,
-            weight_decay=0.0,
-            print_every=1,
-        )
-        with tempfile.TemporaryDirectory() as tmpdir:
-            log_path = Path(tmpdir) / "metrics.jsonl"
-            with mock.patch("omegalax.trainers.vlm.jax.process_index", return_value=1):
-                _, metrics = vlm_trainer.run_training(
-                    "qwen3-vl-smoke",
-                    train_cfg,
-                    log_every=1,
-                    log_jsonl=log_path,
-                    tp_size=1,
-                    fsdp_size=1,
-                )
-            self.assertIn("loss", metrics)
-            self.assertFalse(log_path.exists())
-
     def test_abstract_train_state_preserves_sharding_metadata(self):
         mesh = ensure_mesh(tp_size=1, fsdp_size=1)
         rng = jax.device_put(jax.random.key(0), NamedSharding(mesh, PartitionSpec()))

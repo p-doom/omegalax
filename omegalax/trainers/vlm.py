@@ -207,7 +207,6 @@ def run_training(
     save_dir: str | Path | None = None,
     save_every: int = 0,
     log_every: int = 1,
-    log_jsonl: str | Path | None = None,
     resume: bool = False,
     pad_id: int = 0,
     peak_tflops: float | None = None,
@@ -279,10 +278,6 @@ def run_training(
         _write_checkpoint_config(save_path, model_cfg)
         checkpoint_manager = _make_checkpoint_manager(save_path, save_interval=save_every or None)
 
-    log_path = Path(log_jsonl).expanduser() if log_jsonl else None
-    if log_path is not None:
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-
     start_step = 0
     if resume:
         if checkpoint_manager is None:
@@ -304,7 +299,6 @@ def run_training(
             step_delta,
             is_primary_process=is_primary_process,
             log_every=log_every,
-            log_path=log_path,
             force=force,
             per_device_flops=per_device_flops,
             tokens_per_step=tokens_per_step,
@@ -436,7 +430,6 @@ def run_sft(
     save_dir: str | Path | None = None,
     save_every: int = 0,
     log_every: int = 1,
-    log_jsonl: str | Path | None = None,
     resume: bool = False,
     pad_id: int = 0,
     peak_tflops: float | None = None,
@@ -506,10 +499,6 @@ def run_sft(
         _write_checkpoint_config(save_path, model_cfg)
         checkpoint_manager = _make_checkpoint_manager(save_path, save_interval=save_every or None)
 
-    log_path = Path(log_jsonl).expanduser() if log_jsonl else None
-    if log_path is not None:
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-
     start_step = 0
     if resume:
         if checkpoint_manager is None:
@@ -531,12 +520,10 @@ def run_sft(
             step_delta,
             is_primary_process=is_primary_process,
             log_every=log_every,
-            log_path=log_path,
             force=force,
             per_device_flops=per_device_flops,
             tokens_per_step=tokens_per_step,
             peak_tflops=peak_tflops,
-            extra_print_keys=[("supervised_tokens", "sup_tok={:.0f} ")],
             tb_writer=tb_writer,
         )
         if result is not None:
@@ -581,21 +568,9 @@ def run_sft(
                 total_val_loss += float(val_loss)
                 total_val_sup_tokens += float(val_sup_tokens)
             avg_val_loss = total_val_loss / val_steps
-            if is_primary_process:
-                print(
-                    f"[val] step={step + 1} val_loss={avg_val_loss:.4f} "
-                    f"val_sup_tok={total_val_sup_tokens:.0f}"
-                )
-            if log_path is not None and is_primary_process:
-                val_record = {
-                    "step": step + 1,
-                    "val_loss": avg_val_loss,
-                    "val_supervised_tokens": total_val_sup_tokens,
-                }
-                with log_path.open("a") as f:
-                    f.write(json.dumps(val_record) + "\n")
             if tb_writer is not None and is_primary_process:
                 tb_writer.add_scalar("val/loss", avg_val_loss, step + 1)
+                tb_writer.add_scalar("val/sup_tokens", total_val_sup_tokens, step + 1)
                 tb_writer.flush()
 
     if is_profiling_active:

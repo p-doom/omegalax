@@ -214,7 +214,6 @@ def run_training(
     save_dir: str | Path | None = None,
     save_every: int = 0,
     log_every: int = 1,
-    log_jsonl: str | Path | None = None,
     resume: bool = False,
     pad_id: int = 0,
     peak_tflops: float | None = None,
@@ -293,10 +292,6 @@ def run_training(
         _write_checkpoint_config(save_path, model_cfg)
         checkpoint_manager = _make_checkpoint_manager(save_path, save_interval=save_every or None)
 
-    log_path = Path(log_jsonl).expanduser() if log_jsonl else None
-    if log_path is not None:
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-
     start_step = 0
     if resume:
         if checkpoint_manager is None:
@@ -318,12 +313,10 @@ def run_training(
             step_delta,
             is_primary_process=is_primary_process,
             log_every=log_every,
-            log_path=log_path,
             force=force,
             per_device_flops=per_device_flops,
             tokens_per_step=tokens_per_step,
             peak_tflops=peak_tflops,
-            extra_print_keys=[("token_accuracy", "acc={:.4f} ")],
         )
         if result is not None:
             last_metrics = result
@@ -411,7 +404,6 @@ def run_sft(
     save_dir: str | Path | None = None,
     save_every: int = 0,
     log_every: int = 1,
-    log_jsonl: str | Path | None = None,
     resume: bool = False,
     pad_id: int = 0,
     peak_tflops: float | None = None,
@@ -480,10 +472,6 @@ def run_sft(
         _write_checkpoint_config(save_path, model_cfg)
         checkpoint_manager = _make_checkpoint_manager(save_path, save_interval=save_every or None)
 
-    log_path = Path(log_jsonl).expanduser() if log_jsonl else None
-    if log_path is not None:
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-
     start_step = 0
     if resume:
         if checkpoint_manager is None:
@@ -505,12 +493,10 @@ def run_sft(
             step_delta,
             is_primary_process=is_primary_process,
             log_every=log_every,
-            log_path=log_path,
             force=force,
             per_device_flops=per_device_flops,
             tokens_per_step=tokens_per_step,
             peak_tflops=peak_tflops,
-            extra_print_keys=[("supervised_tokens", "sup_tok={:.0f} ")],
         )
         if result is not None:
             last_metrics = result

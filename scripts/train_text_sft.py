@@ -55,7 +55,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--save-dir", type=str, default=None)
     p.add_argument("--save-every", type=int, default=50)
     p.add_argument("--log-every", type=int, default=10)
-    p.add_argument("--log-jsonl", type=str, default=None)
     p.add_argument("--profile-dir", type=str, default=None)
     p.add_argument("--profile-start", type=int, default=3, help="Step to start profiling (after JIT warmup).")
     p.add_argument("--profile-end", type=int, default=8, help="Step to stop profiling.")
@@ -95,7 +94,6 @@ def main() -> None:
         save_dir=save_dir,
         save_every=args.save_every,
         log_every=args.log_every,
-        log_jsonl=args.log_jsonl,
         resume=args.resume,
         pad_id=args.pad_id,
         peak_tflops=peak_tflops,
