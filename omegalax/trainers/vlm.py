@@ -560,14 +560,17 @@ def run_sft(
 
         if eval_step is not None and val_every and (step + 1) % val_every == 0:
             total_val_loss = 0.0
+            total_val_sup_tokens = 0.0
             for _ in range(val_steps):
                 val_batch = next(val_data_iter)
                 val_batch = vlm_api.shard_batch_dict(val_batch, model_cfg, mesh)
                 val_loss, val_sup_tokens = eval_step(optimizer.model, val_batch)
                 total_val_loss += float(val_loss)
+                total_val_sup_tokens += float(val_sup_tokens)
             avg_val_loss = total_val_loss / val_steps
             if tb_writer is not None and is_primary_process:
                 tb_writer.add_scalar("val/loss", avg_val_loss, step + 1)
+                tb_writer.add_scalar("val/sup_tokens", total_val_sup_tokens, step + 1)
                 tb_writer.flush()
 
     if is_profiling_active:
