@@ -283,6 +283,64 @@ class GrainPipelineTest(absltest.TestCase):
             self.assertEqual(starts1, ["14", "16"])
             self.assertEmpty(set(starts0).intersection(starts1))
 
+    def test_make_grain_iterator_global_shuffle_is_deterministic_and_disjoint(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src = Path(tmpdir) / "train.jsonl"
+            rows = []
+            for value in range(8):
+                rows.append(
+                    {
+                        "messages": [
+                            {"role": "user", "content": str(value)},
+                        ],
+                    }
+                )
+            self._write_jsonl(src, rows)
+
+            payload = compile_jsonl_to_arrayrecord(
+                src,
+                Path(tmpdir) / "payload",
+                messages_per_record=1,
+                records_per_shard=8,
+            )
+            chunked = build_chunk_index(
+                payload,
+                Path(tmpdir) / "chunked",
+                max_length=1,
+                measure_messages=lambda messages: len(messages),
+                records_per_shard=8,
+            )
+
+            def collect_process_order(process_index: int, seed: int) -> list[str]:
+                with mock.patch("jax.process_count", return_value=2):
+                    with mock.patch("jax.process_index", return_value=process_index):
+                        iterator = make_grain_iterator(
+                            chunked,
+                            batch_size=1,
+                            batch_fn=lambda batch: batch[0],
+                            shuffle=True,
+                            seed=seed,
+                            read_options=make_grain_read_options(num_threads=1, prefetch_buffer_size=1),
+                            multiprocessing_options=make_grain_multiprocessing_options(
+                                num_workers=0, per_worker_buffer_size=1
+                            ),
+                        )
+                        return [next(iterator)["messages"][0]["content"] for _ in range(4)]
+
+            process0_seed0 = collect_process_order(0, seed=0)
+            process1_seed0 = collect_process_order(1, seed=0)
+            process0_seed0_repeat = collect_process_order(0, seed=0)
+            process1_seed0_repeat = collect_process_order(1, seed=0)
+            process0_seed1 = collect_process_order(0, seed=1)
+            process1_seed1 = collect_process_order(1, seed=1)
+
+            self.assertEqual(process0_seed0, process0_seed0_repeat)
+            self.assertEqual(process1_seed0, process1_seed0_repeat)
+            self.assertEmpty(set(process0_seed0).intersection(process1_seed0))
+            self.assertEqual(set(process0_seed0).union(process1_seed0), {str(i) for i in range(8)})
+            self.assertNotEqual(process0_seed0 + process1_seed0, [str(i) for i in range(8)])
+            self.assertNotEqual(process0_seed0 + process1_seed0, process0_seed1 + process1_seed1)
+
     def test_resolve_arrayrecord_paths_rejects_raw_jsonl_files(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             src = Path(tmpdir) / "train.jsonl"
