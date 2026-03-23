@@ -78,6 +78,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--tp-size", type=int, default=None)
     p.add_argument("--fsdp-size", type=int, default=None)
     p.add_argument("--save-dir", type=str, default=None)
+    p.add_argument("--jax-cache-dir", type=str, default="/tmp/jax_cache", help="Directory for JAX persistent compilation cache.")
     p.add_argument("--save-every", type=int, default=50)
     p.add_argument("--log-every", type=int, default=10)
     p.add_argument("--profile-dir", type=str, default=None)
@@ -95,6 +96,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    jax.config.update("jax_compilation_cache_dir", args.jax_cache_dir)
     jax.distributed.initialize()
 
     tokenizer_name = args.tokenizer or resolve_hf_repo_id(args.model_id)
