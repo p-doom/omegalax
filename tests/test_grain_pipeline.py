@@ -117,7 +117,7 @@ class GrainPipelineTest(absltest.TestCase):
                 payload,
                 Path(tmpdir) / "chunked",
                 max_length=2,
-                measure_messages=lambda messages: len(messages),
+                measure_message=lambda message: 1,
                 records_per_shard=8,
             )
 
@@ -166,7 +166,7 @@ class GrainPipelineTest(absltest.TestCase):
                 payload,
                 Path(tmpdir) / "chunked",
                 max_length=2,
-                measure_messages=lambda messages: len(messages),
+                measure_message=lambda message: 1,
                 records_per_shard=8,
             )
 
@@ -248,7 +248,7 @@ class GrainPipelineTest(absltest.TestCase):
                 payload,
                 Path(tmpdir) / "chunked",
                 max_length=2,
-                measure_messages=lambda messages: len(messages),
+                measure_message=lambda message: 1,
                 records_per_shard=8,
             )
 
@@ -307,7 +307,7 @@ class GrainPipelineTest(absltest.TestCase):
                 payload,
                 Path(tmpdir) / "chunked",
                 max_length=1,
-                measure_messages=lambda messages: len(messages),
+                measure_message=lambda message: 1,
                 records_per_shard=8,
             )
 

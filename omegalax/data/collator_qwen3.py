@@ -46,11 +46,14 @@ def _build_assistant_loss_mask(
     content_starts = starts[is_asst] + 3
     content_ends = ends[is_asst]
 
-    # +1 at content start, -1 at <|im_end|> → cumsum gives the mask.
+    # +1 at content start, -1 after <|im_end|> → cumsum gives the mask.
+    # content_ends points at <|im_end|> itself, which must be a supervised
+    # target so the model learns to terminate; the \n that follows is not.
     signal = np.zeros(n, dtype=np.int32)
     valid = content_starts < n
+    ends_plus_one = content_ends[valid] + 1
     np.add.at(signal, content_starts[valid], 1)
-    np.add.at(signal, content_ends[valid], -1)
+    np.add.at(signal, ends_plus_one[ends_plus_one < n], -1)
     return np.cumsum(signal).astype(np.int32)
 
 

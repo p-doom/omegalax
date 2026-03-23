@@ -7,12 +7,14 @@ from absl.testing import absltest
 from omegalax.distributed.mesh import process_local_batch_size
 from omegalax.models.qwen3.config import make_config as make_qwen3_config
 from omegalax.models.qwen3_5.config import make_config as make_qwen3_5_config
+from omegalax.models.qwen3_vl.config import make_vl_config as make_qwen3_vl_config
 from omegalax.trainers.perf import (
     PEAK_TFLOPS,
-    training_flops_per_token,
     per_device_flops_per_step,
+    qwen3_vl_vision_training_flops,
     step_metrics,
     StepTimer,
+    training_flops_per_token,
 )
 
 
@@ -57,12 +59,32 @@ class TrainingFlopsPerTokenTest(absltest.TestCase):
         self.assertGreater(flops, 0)
         self.assertEqual(flops, training_flops_per_token(full_cfg.text_config, seq_len))
 
+    def test_qwen3_vl_vision_training_flops_positive(self):
+        cfg = make_qwen3_vl_config("qwen3-vl-smoke")
+        flops = qwen3_vl_vision_training_flops(cfg, [[1, 4, 4]])
+        self.assertGreater(flops, 0)
+
+    def test_qwen3_vl_vision_training_flops_uses_full_batched_attention(self):
+        cfg = make_qwen3_vl_config("qwen3-vl-smoke")
+        single = qwen3_vl_vision_training_flops(cfg, [[1, 4, 4]])
+        doubled = qwen3_vl_vision_training_flops(cfg, [[1, 4, 4], [1, 4, 4]])
+        self.assertGreater(doubled, 2 * single)
+
 
 class PerDeviceFlopsStepTest(absltest.TestCase):
     def test_per_device_flops_per_step_positive(self):
         cfg = make_qwen3_config("qwen3-smoke")
         flops = per_device_flops_per_step(cfg, seq_len=8, batch_size=2)
         self.assertGreater(flops, 0)
+
+    def test_qwen3_vl_per_device_flops_adds_vision_cost(self):
+        cfg = make_qwen3_vl_config("qwen3-vl-smoke")
+        with mock.patch("jax.device_count", return_value=1):
+            base = per_device_flops_per_step(cfg, seq_len=8, batch_size=2)
+            with_images = per_device_flops_per_step(
+                cfg, seq_len=8, batch_size=2, image_grid_thw=[[1, 4, 4]]
+            )
+        self.assertGreater(with_images, base)
 
 
 class StepMetricsTest(absltest.TestCase):

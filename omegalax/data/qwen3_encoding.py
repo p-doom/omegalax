@@ -65,6 +65,44 @@ def extract_images(messages: list[dict[str, Any]]) -> list[Image.Image]:
     return images
 
 
+def _message_has_images(message: dict[str, Any]) -> bool:
+    content = message.get("content", "")
+    if isinstance(content, str):
+        return False
+    return any(block.get("type") == "image" for block in content)
+
+
+def make_message_length_fn(
+    tokenizer: PreTrainedTokenizer,
+    image_processor: BaseImageProcessor | None = None,
+):
+    """Return a ``message -> token_count`` callable for use with ``build_chunk_index``.
+
+    Suitable for ChatML-formatted models (Qwen3 / Qwen3.5).  Token lengths are
+    exactly additive at message boundaries: ``<|im_start|>``/``<|im_end|>`` act
+    as hard BPE split points and ``add_special_tokens=False`` suppresses any
+    per-sequence overhead, so ``sum(lengths)`` equals the full-sequence length
+    exactly.  For a different chat template, implement an analogous factory and
+    swap it in.
+    """
+
+    def _measure(message: dict[str, Any]) -> int:
+        if image_processor is None and _message_has_images(message):
+            raise ValueError(
+                "Encountered image content in message but no image_processor was provided. "
+                "Pass image_processor= to make_message_length_fn."
+            )
+        encoded = encode_qwen_messages(
+            [message],
+            tokenizer=tokenizer,
+            image_processor=image_processor,
+            include_pixels=False,
+        )
+        return int(len(encoded["input_ids"]))
+
+    return _measure
+
+
 def encode_qwen_messages(
     messages: list[dict[str, Any]],
     *,

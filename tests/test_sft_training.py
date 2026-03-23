@@ -123,7 +123,7 @@ def _make_grain_batch_iter(batch: dict[str, np.ndarray]):
             payload,
             Path(tmpdir) / "chunked",
             max_length=1,
-            measure_messages=lambda messages: len(messages),
+            measure_message=lambda message: 1,
             records_per_shard=1,
         )
         iterator = make_grain_iterator(

@@ -11,6 +11,7 @@ import datetime
 from typing import Any, Union
 
 import jax
+import numpy as np
 
 from omegalax.models.qwen3.config import Qwen3Config
 from omegalax.models.qwen3_5.config import Qwen3_5Config, Qwen3_5TextConfig
@@ -95,7 +96,11 @@ def _training_flops_per_token_qwen3_dense(cfg: Qwen3Config, seq_len: int) -> int
 
 
 def _training_flops_per_token_qwen3_vl(cfg: Qwen3VLConfig, seq_len: int) -> int:
-    """Qwen3-VL decoder FLOPs (same structure as Qwen3 MoE/dense)."""
+    """Qwen3-VL decoder FLOPs (same structure as Qwen3 MoE/dense).
+
+    This excludes the vision tower because its cost depends on the concrete
+    ``image_grid_thw`` values for each batch.
+    """
     D = cfg.emb_dim
     H = cfg.num_heads
     G = cfg.num_kv_heads
@@ -126,6 +131,62 @@ def _training_flops_per_token_qwen3_vl(cfg: Qwen3VLConfig, seq_len: int) -> int:
     embedding_flops = 2 * D * V
     forward_per_token = layer_flops + embedding_flops
     return forward_per_token * TRAINING_FLOP_MULTIPLIER
+
+
+def qwen3_vl_vision_training_flops(
+    cfg: Qwen3VLConfig, image_grid_thw: Any | None
+) -> int:
+    """Theoretical Qwen3-VL vision-tower FLOPs for one training step (x3).
+
+    Counts matmuls only and matches the current implementation in
+    ``omegalax.models.qwen3_vl.vision``:
+    - patch embed and patch mergers are linear layers;
+    - vision attention materializes the full ``(sum N_i)^2`` attention matrix
+      across all images in the batch before masking by ``vision_cu_seqlens``.
+    """
+    if image_grid_thw is None:
+        return 0
+
+    grid_N3 = np.asarray(image_grid_thw, dtype=np.int64)
+    if grid_N3.size == 0:
+        return 0
+    if grid_N3.ndim != 2 or grid_N3.shape[1] != 3:
+        raise ValueError(
+            f"Expected image_grid_thw with shape (num_images, 3), got {grid_N3.shape}."
+        )
+
+    vis = cfg.vision
+    merge = vis.spatial_merge_size
+
+    total_tokens = int(np.sum(grid_N3[:, 0] * grid_N3[:, 1] * grid_N3[:, 2]))
+    merged_tokens = int(
+        np.sum(grid_N3[:, 0] * (grid_N3[:, 1] // merge) * (grid_N3[:, 2] // merge))
+    )
+    if total_tokens <= 0 or merged_tokens <= 0:
+        return 0
+
+    D = vis.hidden_size
+    F = vis.intermediate_size
+    H = vis.num_heads
+    K = D // H
+    in_features = vis.in_channels * vis.temporal_patch_size * vis.patch_size**2
+
+    patch_embed_flops = 2 * total_tokens * in_features * D
+
+    qkv_flops = 2 * total_tokens * D * (3 * D)
+    attn_dot_flops = 4 * total_tokens * total_tokens * H * K
+    o_proj_flops = 2 * total_tokens * D * D
+    mlp_flops = 2 * total_tokens * D * F + 2 * total_tokens * F * D
+    block_flops = vis.depth * (qkv_flops + attn_dot_flops + o_proj_flops + mlp_flops)
+
+    merger_dim = D * (merge**2)
+    merger_fc1_flops = 2 * merged_tokens * merger_dim * merger_dim
+    merger_fc2_flops = 2 * merged_tokens * merger_dim * vis.out_hidden_size
+    num_mergers = 1 + len(vis.deepstack_visual_indexes)
+    merger_flops = num_mergers * (merger_fc1_flops + merger_fc2_flops)
+
+    forward = patch_embed_flops + block_flops + merger_flops
+    return forward * TRAINING_FLOP_MULTIPLIER
 
 
 def _training_flops_per_token_qwen3_moe(cfg: Qwen3Config, seq_len: int) -> int:
@@ -239,10 +300,20 @@ class StepTimer:
 
 
 def per_device_flops_per_step(
-    cfg: RunPerfConfig, seq_len: int, batch_size: int
+    cfg: RunPerfConfig,
+    seq_len: int,
+    batch_size: int,
+    image_grid_thw: Any | None = None,
 ) -> float:
-    """Total training FLOPs per step, divided by device count."""
+    """Total training FLOPs per step, divided by device count.
+
+    For Qwen3-VL, ``image_grid_thw`` adds the vision-tower FLOPs for the
+    concrete batch. Text-decoder FLOPs are still computed from the padded
+    ``seq_len`` and ``batch_size``.
+    """
     total = training_flops_per_token(cfg, seq_len) * seq_len * batch_size
+    if isinstance(cfg, Qwen3VLConfig):
+        total += qwen3_vl_vision_training_flops(cfg, image_grid_thw)
     return total / max(1, jax.device_count())
 
 

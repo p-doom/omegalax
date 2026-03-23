@@ -260,12 +260,20 @@ def build_chunk_index(
     out_dir: str | Path,
     *,
     max_length: int,
-    measure_messages,
+    measure_message,
     records_per_shard: int = 100_000,
     overwrite: bool = False,
     profile_metadata: dict[str, Any] | None = None,
 ) -> Path:
-    """Build an offline chunk index over a canonical payload-block dataset."""
+    """Build an offline chunk index over a canonical payload-block dataset.
+
+    ``measure_message`` is called exactly once per message and must return the
+    number of tokens that message contributes to a sequence.  For chat templates
+    where tokenization is exactly additive at message boundaries (e.g. ChatML
+    with ``add_special_tokens=False``), the accumulated per-message sum equals
+    the full-sequence length exactly.  Swap in a different ``measure_message``
+    implementation for other chat templates.
+    """
 
     if max_length <= 0:
         raise ValueError("max_length must be > 0")
@@ -311,36 +319,28 @@ def build_chunk_index(
                 current_length = 0
 
             for msg_offset, message in enumerate(block["messages"]):
+                msg_length = int(measure_message(message))
+                if msg_length > max_length:
+                    raise ValueError(
+                        f"Single message at session={block_session_id} record={record_idx} "
+                        f"offset={msg_offset} exceeds max_length={max_length}"
+                    )
+
                 if not current_messages:
                     start_record_idx = record_idx
                     start_message_offset = msg_offset
-
-                current_messages.append(message)
-                measured_length = int(measure_messages(current_messages))
-                if measured_length > max_length:
-                    current_messages.pop()
-                    if not current_messages:
-                        raise ValueError(
-                            f"Single message at session={block_session_id} record={record_idx} "
-                            f"offset={msg_offset} exceeds max_length={max_length}"
-                        )
-
+                elif current_length + msg_length > max_length:
                     descriptor = emit_current()
                     if descriptor is None:
                         raise AssertionError("Expected a chunk descriptor before overflow split")
                     yield descriptor
-
-                    current_messages = [message]
+                    current_messages = []
+                    current_length = 0
                     start_record_idx = record_idx
                     start_message_offset = msg_offset
-                    measured_length = int(measure_messages(current_messages))
-                    if measured_length > max_length:
-                        raise ValueError(
-                            f"Single message at session={block_session_id} record={record_idx} "
-                            f"offset={msg_offset} exceeds max_length={max_length}"
-                        )
 
-                current_length = measured_length
+                current_messages.append(message)
+                current_length += msg_length
                 end_record_idx = record_idx
                 end_message_offset = msg_offset + 1
 

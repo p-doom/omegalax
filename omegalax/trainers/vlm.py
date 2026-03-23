@@ -291,9 +291,6 @@ def run_sft(
     sft_step = make_sft_train_step(model_cfg, pad_id=pad_id)
     eval_step = make_sft_eval_step(model_cfg, pad_id=pad_id) if val_data_iter is not None else None
 
-    per_device_flops = per_device_flops_per_step(
-        model_cfg, train_cfg.seq_len, train_cfg.batch_size
-    )
     timer = StepTimer(warmup=2)
     global_tokens_per_step = train_cfg.seq_len * train_cfg.batch_size
 
@@ -311,13 +308,13 @@ def run_sft(
         rng = jax.device_put(rng, replicated_rng_sharding)
 
     last_metrics: dict[str, float] = {}
-    prev_metrics: tuple[int, dict[str, jax.Array], datetime.timedelta] | None = None
+    prev_metrics: tuple[int, dict[str, jax.Array], datetime.timedelta, float] | None = None
 
     def _log_prev_metrics(force: bool = False) -> None:
         nonlocal last_metrics
         if prev_metrics is None:
             return
-        step_to_log, metrics_to_log, step_delta = prev_metrics
+        step_to_log, metrics_to_log, step_delta, step_per_device_flops = prev_metrics
         result = maybe_log_step_metrics(
             step_to_log,
             metrics_to_log,
@@ -325,7 +322,7 @@ def run_sft(
             is_primary_process=is_primary_process,
             log_every=log_every,
             force=force,
-            per_device_flops=per_device_flops,
+            per_device_flops=step_per_device_flops,
             global_tokens_per_step=global_tokens_per_step,
             peak_tflops=peak_tflops,
             tb_writer=tb_writer,
@@ -344,6 +341,12 @@ def run_sft(
             is_profiling_active = True
 
         batch = next(data_iter)
+        step_per_device_flops = per_device_flops_per_step(
+            model_cfg,
+            train_cfg.seq_len,
+            train_cfg.batch_size,
+            image_grid_thw=batch.get("image_grid_thw"),
+        )
         batch = vlm_api.shard_batch_dict(batch, model_cfg, mesh)
         _, metrics = sft_step(optimizer, batch)
         step_delta = timer.step()
@@ -357,7 +360,7 @@ def run_sft(
                 print(f"[profiler] stopped trace at step {step + 1}")
 
         _log_prev_metrics()
-        prev_metrics = (step + 1, metrics, step_delta)
+        prev_metrics = (step + 1, metrics, step_delta, step_per_device_flops)
 
         if checkpoint_manager is not None and save_every and (step + 1) % save_every == 0:
             _save_sft_checkpoint(checkpoint_manager, optimizer, rng, step + 1, data_iter)

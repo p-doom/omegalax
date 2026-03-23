@@ -8,19 +8,8 @@ import json
 from transformers import AutoImageProcessor, AutoTokenizer
 
 from omegalax.data.grain_pipeline import build_chunk_index
-from omegalax.data.qwen3_encoding import encode_qwen_messages
+from omegalax.data.qwen3_encoding import make_message_length_fn
 from omegalax.registry import resolve_hf_repo_id
-
-
-def _messages_have_images(messages) -> bool:
-    for msg in messages:
-        content = msg["content"]
-        if isinstance(content, str):
-            continue
-        for block in content:
-            if block.get("type") == "image":
-                return True
-    return False
 
 
 def parse_args() -> argparse.Namespace:
@@ -53,22 +42,11 @@ def main() -> None:
                 ip_kwargs = json.load(f)
         image_processor = AutoImageProcessor.from_pretrained(processor_name, use_fast=False, **ip_kwargs)
 
-    def measure_messages(messages) -> int:
-        if image_processor is None and _messages_have_images(messages):
-            raise ValueError("Chunk indexing encountered image content but no --processor was provided.")
-        encoded = encode_qwen_messages(
-            messages,
-            tokenizer=tokenizer,
-            image_processor=image_processor,
-            include_pixels=False,
-        )
-        return int(len(encoded["input_ids"]))
-
     out_dir = build_chunk_index(
         args.data_path,
         args.out_dir,
         max_length=args.max_length,
-        measure_messages=measure_messages,
+        measure_message=make_message_length_fn(tokenizer, image_processor),
         records_per_shard=args.records_per_shard,
         overwrite=args.overwrite,
         profile_metadata={
