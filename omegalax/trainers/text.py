@@ -19,7 +19,7 @@ from omegalax import export as export_lib
 from omegalax.models.params_utils import save_hf_config
 from omegalax.text import api as text_api
 from omegalax.trainers import checkpoint_utils
-from omegalax.trainers.optim import fp32_wrap
+from omegalax.trainers.optim import MixedPrecisionOptimizer
 from omegalax.trainers.perf import (
     maybe_log_step_metrics,
     per_device_flops_per_step,
@@ -50,11 +50,9 @@ def init_model(
     return text_api.init_model(cfg_or_model_id, rng, tp_size=tp_size, fsdp_size=fsdp_size)
 
 
-def build_optimizer(model: nnx.Module, train_cfg: TrainConfig) -> nnx.ModelAndOptimizer:
-    tx = fp32_wrap(
-        optax.adamw(learning_rate=train_cfg.learning_rate, weight_decay=train_cfg.weight_decay)
-    )
-    return nnx.ModelAndOptimizer(model, tx)
+def build_optimizer(model: nnx.Module, train_cfg: TrainConfig) -> MixedPrecisionOptimizer:
+    tx = optax.adamw(learning_rate=train_cfg.learning_rate, weight_decay=train_cfg.weight_decay, mu_dtype=jnp.float32)
+    return MixedPrecisionOptimizer(model, tx)
 
 
 def _masked_next_token_loss(
@@ -198,7 +196,7 @@ def run_sft(
     fsdp_size: int | None = None,
     profile_dir: str | Path | None = None,
     profile_steps: tuple[int, int] = (3, 8),
-) -> tuple[nnx.ModelAndOptimizer, dict[str, float]]:
+) -> tuple[MixedPrecisionOptimizer, dict[str, float]]:
     """SFT a text model from a Grain iterator; returns final optimizer + last metrics.
 
     ``data_iter`` must be a checkpointable Grain iterator yielding dicts with keys ``token_ids_BT``,

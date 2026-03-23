@@ -22,7 +22,7 @@ from omegalax.trainers.perf import (
     per_device_flops_per_step,
     StepTimer,
 )
-from omegalax.trainers.optim import fp32_wrap
+from omegalax.trainers.optim import MixedPrecisionOptimizer
 from omegalax.vlm import api as vlm_api
 
 P = PartitionSpec
@@ -55,11 +55,9 @@ def init_model(
     return model
 
 
-def build_optimizer(model: nnx.Module, train_cfg: TrainConfig) -> nnx.ModelAndOptimizer:
-    tx = fp32_wrap(
-        optax.adamw(learning_rate=train_cfg.learning_rate, weight_decay=train_cfg.weight_decay)
-    )
-    return nnx.ModelAndOptimizer(model, tx)
+def build_optimizer(model: nnx.Module, train_cfg: TrainConfig) -> MixedPrecisionOptimizer:
+    tx = optax.adamw(learning_rate=train_cfg.learning_rate, weight_decay=train_cfg.weight_decay, mu_dtype=jnp.float32)
+    return MixedPrecisionOptimizer(model, tx)
 
 
 def _masked_next_token_loss(
@@ -78,11 +76,11 @@ def _masked_next_token_loss(
     return jnp.sum(nll_BT * mask_BT) / denom
 
 
-def _train_state(optimizer: nnx.ModelAndOptimizer, rng: jax.Array) -> dict[str, object]:
+def _train_state(optimizer: MixedPrecisionOptimizer, rng: jax.Array) -> dict[str, object]:
     return {"optimizer": nnx.state(optimizer), "rng": rng}
 
 
-def _abstract_train_state(optimizer: nnx.ModelAndOptimizer, rng: jax.Array) -> dict[str, object]:
+def _abstract_train_state(optimizer: MixedPrecisionOptimizer, rng: jax.Array) -> dict[str, object]:
     return {
         "optimizer": jax.tree.map(
             lambda value: jax.ShapeDtypeStruct(value.shape, value.dtype, sharding=value.sharding),
@@ -114,7 +112,7 @@ def _write_checkpoint_config(save_dir: Path, cfg) -> None:
 
 def _save_sft_checkpoint(
     checkpoint_manager: ocp.CheckpointManager,
-    optimizer: nnx.ModelAndOptimizer,
+    optimizer: MixedPrecisionOptimizer,
     rng: jax.Array,
     step: int,
     input_iter: checkpoint_utils.GrainIterator,
@@ -126,10 +124,10 @@ def _save_sft_checkpoint(
 
 def _restore_sft_checkpoint(
     checkpoint_manager: ocp.CheckpointManager,
-    optimizer: nnx.ModelAndOptimizer,
+    optimizer: MixedPrecisionOptimizer,
     rng: jax.Array,
     input_iter: checkpoint_utils.GrainIterator,
-) -> tuple[nnx.ModelAndOptimizer, int, jax.Array, checkpoint_utils.GrainIterator]:
+) -> tuple[MixedPrecisionOptimizer, int, jax.Array, checkpoint_utils.GrainIterator]:
     latest_step = checkpoint_manager.latest_step()
     if latest_step is None:
         raise ValueError("No checkpoint found to restore.")
@@ -151,7 +149,7 @@ def make_sft_train_step(cfg, pad_id: int = 0):
     """
 
     @nnx.jit(donate_argnums=0)
-    def sft_train_step(optimizer: nnx.ModelAndOptimizer, batch: dict[str, jax.Array]):
+    def sft_train_step(optimizer: MixedPrecisionOptimizer, batch: dict[str, jax.Array]):
         token_ids_BT = batch["token_ids_BT"]
         attention_mask_BT = batch["attention_mask_BT"]
         loss_mask_BT = batch["loss_mask_BT"]
@@ -242,7 +240,7 @@ def run_sft(
     val_data_iter: checkpoint_utils.GrainIterator | None = None,
     val_every: int | None = None,
     val_steps: int = 10,
-) -> tuple[nnx.ModelAndOptimizer, dict[str, float]]:
+) -> tuple[MixedPrecisionOptimizer, dict[str, float]]:
     """SFT a VLM from a Grain iterator; returns final optimizer + last metrics.
 
     ``data_iter`` must be a checkpointable Grain iterator yielding dicts with keys ``token_ids_BT``,

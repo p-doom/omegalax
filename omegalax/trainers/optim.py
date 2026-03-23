@@ -1,32 +1,43 @@
-"""Mixed-precision optax helpers."""
+"""Mixed-precision optimizer (T5X-style: bf16 params, fp32 state & accumulation)."""
 
 from __future__ import annotations
 
+from flax import nnx
 import jax
 import jax.numpy as jnp
 import optax
 
 
-def fp32_wrap(tx: optax.GradientTransformation) -> optax.GradientTransformation:
-    """Wrap an optax optimizer so internal state and accumulation use fp32.
+class MixedPrecisionOptimizer(nnx.ModelAndOptimizer):
+    """AdamW-style optimizer with T5X mixed-precision semantics.
 
-    Mirrors the T5X recipe: bf16 params, fp32 optimizer states, fp32 gradient
-    accumulation, cast updates back to param dtype after the step.
-
-    Gradients are explicitly cast to fp32 before the inner optimizer. This is
-    necessary for the second-moment estimate (``grad²`` in bf16 flushes small
-    values to zero).
+    * Optimizer state (momentum, second-moment) is stored in fp32.
+    * Gradients are upcast to fp32 before the optimizer step.
+    * The parameter update (``param + delta``) is computed in fp32, then
+      cast back to the original param dtype (e.g. bf16).
+    * Weight-decay is applied to fp32 params.
     """
 
-    def init_fn(params):
-        fp32_params = jax.tree.map(lambda p: jnp.zeros(p.shape, dtype=jnp.float32), params)
-        return tx.init(fp32_params)
+    def update(self, grads, **kwargs):  # type: ignore[override]
+        """Compute and apply one optimizer step with fp32 accumulation."""
+        param_arrays = nnx.pure(nnx.state(self.model, self.wrt))
+        grad_arrays = nnx.pure(nnx.state(grads, self.wrt))
+        opt_state_arrays = nnx.pure(self.opt_state)
 
-    def update_fn(updates, state, params=None):
-        fp32_updates = jax.tree.map(lambda u: u.astype(jnp.float32), updates)
-        new_updates, new_state = tx.update(fp32_updates, state, params)
-        # Cast deltas back so apply_updates keeps params in their original dtype.
-        new_updates = jax.tree.map(lambda u, p: u.astype(p.dtype), new_updates, params)
-        return new_updates, new_state
+        fp32_grads = jax.tree.map(lambda g: g.astype(jnp.float32), grad_arrays)
+        fp32_params = jax.tree.map(lambda p: p.astype(jnp.float32), param_arrays)
 
-    return optax.GradientTransformation(init_fn, update_fn)
+        updates, new_opt_state = self.tx.update(
+            fp32_grads, opt_state_arrays, fp32_params, **nnx.pure(kwargs)
+        )
+
+        new_params = jax.tree.map(
+            lambda fp, u, p: (fp + u).astype(p.dtype),
+            fp32_params,
+            updates,
+            param_arrays,
+        )
+
+        nnx.update(self.model, new_params)
+        nnx.update(self.opt_state, nnx.state(new_opt_state))
+        self.step[...] += 1
