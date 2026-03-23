@@ -22,6 +22,7 @@ from omegalax.trainers.perf import (
     per_device_flops_per_step,
     StepTimer,
 )
+from omegalax.trainers.optim import fp32_wrap
 from omegalax.vlm import api as vlm_api
 
 P = PartitionSpec
@@ -55,7 +56,9 @@ def init_model(
 
 
 def build_optimizer(model: nnx.Module, train_cfg: TrainConfig) -> nnx.ModelAndOptimizer:
-    tx = optax.adamw(learning_rate=train_cfg.learning_rate, weight_decay=train_cfg.weight_decay)
+    tx = fp32_wrap(
+        optax.adamw(learning_rate=train_cfg.learning_rate, weight_decay=train_cfg.weight_decay)
+    )
     return nnx.ModelAndOptimizer(model, tx)
 
 

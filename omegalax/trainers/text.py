@@ -19,6 +19,7 @@ from omegalax import export as export_lib
 from omegalax.models.params_utils import save_hf_config
 from omegalax.text import api as text_api
 from omegalax.trainers import checkpoint_utils
+from omegalax.trainers.optim import fp32_wrap
 from omegalax.trainers.perf import (
     maybe_log_step_metrics,
     per_device_flops_per_step,
@@ -50,7 +51,9 @@ def init_model(
 
 
 def build_optimizer(model: nnx.Module, train_cfg: TrainConfig) -> nnx.ModelAndOptimizer:
-    tx = optax.adamw(learning_rate=train_cfg.learning_rate, weight_decay=train_cfg.weight_decay)
+    tx = fp32_wrap(
+        optax.adamw(learning_rate=train_cfg.learning_rate, weight_decay=train_cfg.weight_decay)
+    )
     return nnx.ModelAndOptimizer(model, tx)
 
 
