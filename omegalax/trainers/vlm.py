@@ -23,6 +23,7 @@ from omegalax.trainers.perf import (
     StepTimer,
 )
 from omegalax.trainers.optim import MixedPrecisionOptimizer
+from omegalax.trainers.text import startup_log
 from omegalax.vlm import api as vlm_api
 
 P = PartitionSpec
@@ -262,10 +263,13 @@ def run_sft(
         if latest_step is None:
             raise ValueError(f"resume=True but no checkpoints found under: {save_path}")
         model_cfg = vlm_api.resolve_config(str(save_path))
+        startup_log(f"resolved model config from checkpoint {save_path!r}")
     else:
         model_cfg = vlm_api.resolve_config(model_id_or_cfg)
+        startup_log("resolved model config")
     mesh = ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size)
     model_cfg = vlm_api.align_config_to_mesh(model_cfg, mesh)
+    startup_log("mesh ready (tp/fsdp)")
     batch_multiple = required_batch_multiple(vlm_api.batch_partition_spec(model_cfg), mesh)
     if train_cfg.batch_size % batch_multiple != 0:
         raise ValueError(
@@ -278,6 +282,7 @@ def run_sft(
     init_rng, rng = jax.random.split(root_rng)
     init_rng = jax.device_put(init_rng, replicated_rng_sharding)
     rng = jax.device_put(rng, replicated_rng_sharding)
+    startup_log("placed training rng on device mesh")
 
     is_primary_process = jax.process_index() == 0
 
@@ -287,10 +292,13 @@ def run_sft(
         tp_size=tp_size,
         fsdp_size=fsdp_size,
     )
+    startup_log("initialized model")
     with mesh_rules(mesh):
         optimizer = build_optimizer(model, train_cfg)
+    startup_log("built optimizer")
     sft_step = make_sft_train_step(model_cfg, pad_id=pad_id)
     eval_step = make_sft_eval_step(model_cfg, pad_id=pad_id) if val_data_iter is not None else None
+    startup_log("built train step (jit)" + (" and eval step (jit)" if eval_step is not None else ""))
 
     timer = StepTimer(warmup=2)
     global_tokens_per_step = train_cfg.seq_len * train_cfg.batch_size
@@ -300,6 +308,7 @@ def run_sft(
         save_path.mkdir(parents=True, exist_ok=True)
         _write_checkpoint_config(save_path, model_cfg)
         checkpoint_manager = _make_checkpoint_manager(save_path, save_interval=save_every or None)
+        startup_log(f"checkpoint manager ready at {save_path!r}")
 
     start_step = 0
     if resume:
@@ -307,6 +316,7 @@ def run_sft(
             raise ValueError("resume=True requires save_dir to be provided.")
         optimizer, start_step, rng, data_iter = _restore_sft_checkpoint(checkpoint_manager, optimizer, rng, data_iter)
         rng = jax.device_put(rng, replicated_rng_sharding)
+        startup_log(f"restored checkpoint at step {start_step}")
 
     last_metrics: dict[str, float] = {}
     prev_metrics: tuple[int, dict[str, jax.Array], datetime.timedelta, float] | None = None
@@ -334,6 +344,7 @@ def run_sft(
     prof_start, prof_end = profile_steps
     is_profiling_active = False
 
+    startup_log("entering training loop")
     for step in range(start_step, train_cfg.num_steps):
         if profile_dir is not None and step == prof_start and not is_profiling_active:
             if is_primary_process:

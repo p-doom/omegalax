@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-import argparse
 from pathlib import Path
+
+from absl import app, flags
 import jax
 
 from omegalax import export as export_lib
@@ -12,59 +13,56 @@ from omegalax.text import api as text_api
 from omegalax.trainers import text as text_trainer
 from omegalax.vlm import api as vlm_api
 
+FLAGS = flags.FLAGS
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Export a model to HF safetensors.")
-    parser.add_argument("--model-id", type=str, required=True, help="Model id to export.")
-    parser.add_argument("--out-dir", type=str, required=True, help="Destination directory for safetensors+config.")
-    parser.add_argument("--seed", type=int, default=0, help="RNG seed used when initializing the model.")
-    parser.add_argument("--tp-size", type=int, default=None)
-    parser.add_argument("--fsdp-size", type=int, default=None)
-    parser.add_argument("--pad-id", type=int, default=0, help="Padding token id (for cache creation).")
-    return parser.parse_args()
+flags.DEFINE_string("model_id", None, "Model id to export.", required=True)
+flags.DEFINE_string("out_dir", None, "Destination directory for safetensors+config.", required=True)
+flags.DEFINE_integer("seed", 0, "RNG seed used when initializing the model.")
+flags.DEFINE_integer("tp_size", None, "Tensor parallelism size.")
+flags.DEFINE_integer("fsdp_size", None, "FSDP parallelism size.")
+flags.DEFINE_integer("pad_id", 0, "Padding token id (for cache creation).")
 
 
-def _load_text_model(args):
-    model_cfg = text_api.registry.build_config(args.model_id)
-    rng = jax.random.key(args.seed)
+def _load_text_model():
+    model_cfg = text_api.registry.build_config(FLAGS.model_id)
+    rng = jax.random.key(FLAGS.seed)
     rng, init_rng = jax.random.split(rng)
     model, model_cfg = text_trainer.init_model(
         model_cfg,
         init_rng,
-        tp_size=args.tp_size,
-        fsdp_size=args.fsdp_size,
+        tp_size=FLAGS.tp_size,
+        fsdp_size=FLAGS.fsdp_size,
     )
     return model, model_cfg
 
 
-def _load_vlm_model(args):
-    rng = jax.random.key(args.seed)
+def _load_vlm_model():
+    rng = jax.random.key(FLAGS.seed)
     model, cfg = vlm_api.init_model(
-        args.model_id,
+        FLAGS.model_id,
         rng,
-        tp_size=args.tp_size,
-        fsdp_size=args.fsdp_size,
+        tp_size=FLAGS.tp_size,
+        fsdp_size=FLAGS.fsdp_size,
     )
     return model, cfg
 
 
-def load_model(args):
-    arch = registry.resolve(args.model_id)
+def load_model():
+    arch = registry.resolve(FLAGS.model_id)
     if arch == registry.Arch.TEXT:
-        return _load_text_model(args)
+        return _load_text_model()
     if arch == registry.Arch.VLM:
-        return _load_vlm_model(args)
-    raise ValueError(f"Unsupported architecture for model id '{args.model_id}'")
+        return _load_vlm_model()
+    raise ValueError(f"Unsupported architecture for model id '{FLAGS.model_id}'")
 
 
-def main() -> None:
-    args = parse_args()
+def main(_) -> None:
     jax.distributed.initialize()
-    model, cfg = load_model(args)
-    out_dir = Path(args.out_dir)
+    model, cfg = load_model()
+    out_dir = Path(FLAGS.out_dir)
     path = export_lib.export_model_to_hf(model, cfg, out_dir)
     print(f"Exported safetensors to {path}")
 
 
 if __name__ == "__main__":
-    main()
+    app.run(main)
