@@ -20,6 +20,8 @@ dependencies = [
   "safetensors",
   "transformers",
   "huggingface-hub",
+  "mlflow",
+  "wandb",
 ]
 
 [project.optional-dependencies]

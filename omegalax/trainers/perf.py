@@ -11,6 +11,7 @@ import datetime
 from typing import Any, Union
 
 import jax
+import wandb
 
 from omegalax.models.qwen3.config import Qwen3Config
 from omegalax.models.qwen3_5.config import Qwen3_5Config, Qwen3_5TextConfig
@@ -286,7 +287,6 @@ def maybe_log_step_metrics(
     per_device_flops: float,
     tokens_per_step: int,
     peak_tflops: float | None,
-    tb_writer: Any = None,
 ) -> dict[str, float] | None:
     """Optionally compute and log step metrics. Returns host_metrics if logged, else None."""
     should_log = is_primary_process and log_every and step_to_log % log_every == 0
@@ -303,11 +303,7 @@ def maybe_log_step_metrics(
         step_metrics(per_device_flops, step_delta, tokens_per_step, peak_tflops)
     )
 
-    if tb_writer is not None and is_primary_process:
-        _TB_SKIP = {"step"}
-        for key, val in host_metrics.items():
-            if key not in _TB_SKIP:
-                tb_writer.add_scalar(f"train/{key}", val, step_to_log)
-        tb_writer.flush()
+    if wandb.run is not None and is_primary_process:
+        wandb.log({f"train/{k}": v for k, v in host_metrics.items() if k != "step"}, step=step_to_log)
 
     return host_metrics

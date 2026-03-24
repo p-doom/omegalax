@@ -13,6 +13,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec
 import numpy as np
 import optax
 import orbax.checkpoint as ocp
+import wandb
 
 from omegalax import export as export_lib
 from omegalax.distributed.mesh import ensure_mesh, mesh_rules, required_batch_multiple
@@ -232,7 +233,6 @@ def run_training(
     peak_tflops: float | None = None,
     tp_size: int | None = None,
     fsdp_size: int | None = None,
-    tb_writer=None,
 ) -> tuple[nnx.ModelAndOptimizer, dict[str, float]]:
     """Train a VLM with synthetic data; returns final optimizer + last metrics."""
     save_path = Path(save_dir).expanduser().resolve() if save_dir is not None else None
@@ -323,7 +323,6 @@ def run_training(
             per_device_flops=per_device_flops,
             tokens_per_step=tokens_per_step,
             peak_tflops=peak_tflops,
-            tb_writer=tb_writer,
         )
         if result is not None:
             last_metrics = result
@@ -457,7 +456,6 @@ def run_sft(
     fsdp_size: int | None = None,
     profile_dir: str | Path | None = None,
     profile_steps: tuple[int, int] = (3, 8),
-    tb_writer=None,
     val_data_iter: Iterator[dict[str, np.ndarray]] | None = None,
     val_every: int | None = None,
     val_steps: int = 10,
@@ -544,7 +542,6 @@ def run_sft(
             per_device_flops=per_device_flops,
             tokens_per_step=tokens_per_step,
             peak_tflops=peak_tflops,
-            tb_writer=tb_writer,
         )
         if result is not None:
             last_metrics = result
@@ -588,10 +585,8 @@ def run_sft(
                 total_val_loss += float(val_loss)
                 total_val_sup_tokens += float(val_sup_tokens)
             avg_val_loss = total_val_loss / val_steps
-            if tb_writer is not None and is_primary_process:
-                tb_writer.add_scalar("val/loss", avg_val_loss, step + 1)
-                tb_writer.add_scalar("val/sup_tokens", total_val_sup_tokens, step + 1)
-                tb_writer.flush()
+            if wandb.run is not None and is_primary_process:
+                wandb.log({"val/loss": avg_val_loss, "val/sup_tokens": total_val_sup_tokens}, step=step + 1)
 
     if is_profiling_active:
         jax.tree.map(lambda x: x.block_until_ready(), metrics)

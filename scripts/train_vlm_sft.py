@@ -9,7 +9,7 @@ from pathlib import Path
 
 import jax
 import numpy as np
-from tensorboardX import SummaryWriter
+import wandb
 from transformers import AutoImageProcessor, AutoTokenizer
 
 from omegalax.data.collator_qwen3 import VLMSFTCollator
@@ -69,7 +69,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--resume", action="store_true")
     p.add_argument("--pad-id", type=int, default=0)
     p.add_argument("--peak-tflops", type=str, default=None)
-    p.add_argument("--tensorboard-dir", type=str, default=None, help="Directory for TensorBoard event files.")
+    p.add_argument("--wandb-project", type=str, default=None, help="W&B project name. Enables wandb logging when set.")
+    p.add_argument("--wandb-entity", type=str, default=None, help="W&B entity (team or user).")
+    p.add_argument("--wandb-name", type=str, default=None, help="W&B run display name.")
+    p.add_argument("--wandb-group", type=str, default=None, help="W&B run group.")
     p.add_argument("--max-turns", type=int, default=None, help="Max messages per conversation; longer chats are split into chunks.")
     p.add_argument("--val-data-path", type=str, default=None, help="Path to JSONL validation data.")
     p.add_argument("--val-every", type=int, default=None, help="Run validation every N training steps.")
@@ -117,12 +120,14 @@ def main() -> None:
     save_dir = Path(args.save_dir) if args.save_dir else _default_save_dir(args.model_id)
     peak_tflops = resolve_peak_tflops(args.peak_tflops)
 
-    tb_writer = None
-    if args.tensorboard_dir and jax.process_index() == 0:
-        tb_dir = Path(args.tensorboard_dir)
-        tb_dir.mkdir(parents=True, exist_ok=True)
-        tb_writer = SummaryWriter(str(tb_dir))
-        tb_writer.add_hparams(args.__dict__, {}, name="hparams")
+    if args.wandb_project and jax.process_index() == 0:
+        wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            name=args.wandb_name,
+            group=args.wandb_group,
+            config=args.__dict__,
+        )
     try:
         _, last_metrics = vlm_trainer.run_sft(
             args.model_id,
@@ -138,14 +143,13 @@ def main() -> None:
             fsdp_size=args.fsdp_size,
             profile_dir=args.profile_dir,
             profile_steps=(args.profile_start, args.profile_end),
-            tb_writer=tb_writer,
             val_data_iter=val_data_iter,
             val_every=args.val_every,
             val_steps=args.val_steps,
         )
     finally:
-        if tb_writer is not None:
-            tb_writer.close()
+        if wandb.run is not None:
+            wandb.finish()
 
     if last_metrics:
         print(f"finished step={int(last_metrics['step'])} loss={last_metrics['loss']:.4f}")
