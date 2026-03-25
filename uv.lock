@@ -2895,7 +2895,7 @@ wheels = [
 [[package]]
 name = "tokamax"
 version = "0.0.12"
-source = { git = "https://github.com/p-doom/tokamax.git?rev=nested-mask#8b7e67ffa8f9351f20014a7ed3031b1cf1599e58" }
+source = { git = "https://github.com/p-doom/tokamax.git?rev=nested-mask#d81bc23bc80f01728984bcda5161ff2569cd7cc5" }
 dependencies = [
     { name = "absl-py" },
     { name = "einshape" },
