@@ -2,6 +2,7 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 from jax.sharding import PartitionSpec as P, reshard
+from tokamax import dot_product_attention
 
 from .norms import RMSNorm
 from .rope import apply_rope, generate_pos_embeddings
@@ -80,27 +81,10 @@ class Attention(nnx.Module):
             k_BTGK = apply_rope(k_BTGK, sin_BTK, cos_BTK)
 
             B, T, H, K = q_BTHK.shape
-            q_BTGRK = q_BTHK.reshape((B, T, self.num_kv_heads, self.n_rep, K))
-            logits_BTSGR: jax.Array = jnp.asarray(
-                jnp.einsum("BTGRK,BSGK->BTSGR", q_BTGRK, k_BTGK)
-                * self.scale
+            attn_BTHK = dot_product_attention(
+                q_BTHK, k_BTGK, v_BTGK,
+                is_causal=True, scale=self.scale, implementation="mosaic",
             )
-
-            q_pos_BT = positions_BT
-            k_pos_BT = positions_BT
-            causal_mask_BTS = k_pos_BT[:, None, :] <= q_pos_BT[:, :, None]
-            segment_mask_BTS = segment_ids_BT[:, None, :] == segment_ids_BT[:, :, None]
-            final_mask_BTS = causal_mask_BTS & segment_mask_BTS
-            attn_mask = final_mask_BTS[:, :, :, None, None]
-            logits_BTSGR = jnp.where(
-                attn_mask, logits_BTSGR, _mask_value(logits_BTSGR.dtype)
-            )
-
-            weights_BTSGR = jax.nn.softmax(logits_BTSGR.astype(jnp.float32), axis=2).astype(
-                logits_BTSGR.dtype
-            )
-            attn_BTGRK = jnp.einsum("BTSGR,BSGK->BTGRK", weights_BTSGR, v_BTGK)
-            attn_BTHK = attn_BTGRK.reshape((B, T, self.num_heads, K))
             out_BTD = self.o_proj(attn_BTHK.reshape(B, T, self.num_heads * K), out_sharding=self.shd_cfg.act_btd)
             return reshard(out_BTD, self.shd_cfg.act_btd)
 

@@ -305,8 +305,7 @@ class Qwen3_5ForCausalLM(nnx.Module):
 
     def __call__(self, token_ids_BT, segment_ids_BT, cache, num_right_pads):
         del cache, num_right_pads
-        hidden_BTD, aux = self.text(token_ids_BT=token_ids_BT, segment_ids_BT=segment_ids_BT)
-        return self.lm_head(hidden_BTD, out_sharding=self.logits_shd), aux
+        return self.text(token_ids_BT=token_ids_BT, segment_ids_BT=segment_ids_BT)
 
 
 # VLM
@@ -339,7 +338,6 @@ class Qwen3_5ForConditionalGeneration(nnx.Module):
         position_ids_ZBT: jax.Array | None = None,
     ):
         del cache, num_right_pads
-
         inputs_embeds_BTD = jnp.astype(
             self.text.embedder.embedding[...].at[(token_ids_BT,)].get(out_sharding=self.text.out_emb_shd),
             self.text.embedder.dtype,
@@ -355,9 +353,8 @@ class Qwen3_5ForConditionalGeneration(nnx.Module):
             batch_indices, seq_indices = jnp.where(image_mask_BT)
             inputs_embeds_BTD = inputs_embeds_BTD.at[batch_indices, seq_indices].set(image_embeds_ND)
 
-        hidden_BTD, aux = self.text(
+        return self.text(
             inputs_embeds_BTD=inputs_embeds_BTD,
             segment_ids_BT=segment_ids_BT,
             position_ids_ZBT=position_ids_ZBT,
         )
-        return self.lm_head(hidden_BTD, out_sharding=self.logits_shd), aux

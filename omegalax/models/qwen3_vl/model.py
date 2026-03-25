@@ -9,16 +9,13 @@ import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 from jax.sharding import PartitionSpec, reshard
+from tokamax import dot_product_attention
 
 from .config import Qwen3VLConfig
 from .vision import VisionModel
 
 P = PartitionSpec
 wp = nnx.with_partitioning
-
-
-def _mask_value(dtype: jnp.dtype) -> float:
-    return float(jnp.finfo(dtype).min)
 
 
 class RMSNorm(nnx.Module):
@@ -331,9 +328,7 @@ class TextAttention(nnx.Module):
         self.head_dim = cfg.head_dim
         self.num_heads = cfg.num_heads
         self.num_kv_heads = cfg.num_kv_heads
-        self.logits_shd = P(cfg.shd_cfg.act_btd[0], None, None, cfg.shd_cfg.act_btnh[2], None)
-
-    def __call__(self, hidden_BTD: jax.Array, sin_BTK: jax.Array, cos_BTK: jax.Array, mask: jax.Array | None) -> jax.Array:
+    def __call__(self, hidden_BTD: jax.Array, sin_BTK: jax.Array, cos_BTK: jax.Array) -> jax.Array:
         B, T, _ = hidden_BTD.shape
         q_proj_BTF = self.q_proj(hidden_BTD, out_sharding=self.shd_cfg.act_btf)
         k_proj_BTF = self.k_proj(hidden_BTD, out_sharding=self.shd_cfg.act_btf)
@@ -346,17 +341,10 @@ class TextAttention(nnx.Module):
         q_BTHK = apply_rope(q_BTHK, sin_BTK, cos_BTK)
         k_BTGK = apply_rope(k_BTGK, sin_BTK, cos_BTK)
 
-        q_BTGRK = q_BTHK.reshape(B, T, self.num_kv_heads, self.n_rep, self.head_dim)
-        logits_BTSGR = jnp.einsum("BTGRK,BSGK->BTSGR", q_BTGRK, k_BTGK) * self.scale
-
-        if mask is not None:
-            attn_mask = mask[:, :, :, None, None]
-            logits_BTSGR = jnp.where(attn_mask, logits_BTSGR, _mask_value(logits_BTSGR.dtype))
-
-        logits_BTSGR = reshard(logits_BTSGR, self.logits_shd)
-        weights_BTSGR = jax.nn.softmax(logits_BTSGR.astype(jnp.float32), axis=2).astype(logits_BTSGR.dtype)
-        attn_BTGRK = jnp.einsum("BTSGR,BSGK->BTGRK", weights_BTSGR, v_BTGK)
-        attn_BTHK = attn_BTGRK.reshape(B, T, self.num_heads, self.head_dim)
+        attn_BTHK = dot_product_attention(
+            q_BTHK, k_BTGK, v_BTGK,
+            is_causal=True, scale=self.scale, implementation="mosaic",
+        )
         out_BTD = self.o_proj(attn_BTHK.reshape(B, T, self.num_heads * self.head_dim), out_sharding=self.shd_cfg.act_btd)
         return reshard(out_BTD, self.shd_cfg.act_btd)
 
@@ -371,8 +359,8 @@ class TextDecoderLayer(nnx.Module):
         self.mlp = TextMoEFeedForward(cfg, rngs=rngs) if self.is_moe else TextMLP(cfg, rngs=rngs)
 
     @partial(jax.remat, static_argnums=0)
-    def __call__(self, hidden_BTD: jax.Array, sin_BTK: jax.Array, cos_BTK: jax.Array, mask: jax.Array | None) -> tuple[jax.Array, jax.Array]:
-        hidden_BTD = hidden_BTD + self.attn(self.input_layernorm(hidden_BTD), sin_BTK, cos_BTK, mask)
+    def __call__(self, hidden_BTD: jax.Array, sin_BTK: jax.Array, cos_BTK: jax.Array) -> tuple[jax.Array, jax.Array]:
+        hidden_BTD = hidden_BTD + self.attn(self.input_layernorm(hidden_BTD), sin_BTK, cos_BTK)
         if self.is_moe:
             ff_out_BTD, aux_loss = self.mlp(self.post_attention_layernorm(hidden_BTD))
         else:
@@ -421,7 +409,7 @@ class Qwen3VL(nnx.Module):
         pixel_values: jax.Array | None = None,
         image_grid_thw: jax.Array | None = None,
         vision_cu_seqlens: jax.Array | None = None,
-    ) -> jax.Array:
+    ) -> tuple[jax.Array, jax.Array]:
         cfg = self.cfg
 
         image_features_ND = None
@@ -462,29 +450,22 @@ class Qwen3VL(nnx.Module):
                 position_ids_ZBT = jnp.stack([positions_BT, positions_BT, positions_BT], axis=0)
 
         position_ids_ZBT = jnp.asarray(position_ids_ZBT)
-        text_position_ids_BT = position_ids_ZBT[0]
 
         sin_BTK, cos_BTK = compute_mrope_pos_embeddings(position_ids_ZBT, cfg.head_dim, cfg.rope_theta, cfg.mrope_section)
         sin_BTK = sin_BTK.astype(cfg.dtype)
         cos_BTK = cos_BTK.astype(cfg.dtype)
 
-        causal_mask_BTS = text_position_ids_BT[:, :, None] >= text_position_ids_BT[:, None, :]
-        padding_mask_B1T = attention_mask_BT[:, None, :].astype(jnp.bool_)
-        final_mask_BTS = causal_mask_BTS & padding_mask_B1T
-
         hidden_BTD = inputs_embeds_BTD
         aux_losses = []
         for layer_idx, layer in enumerate(self.text.layers):
-            hidden_BTD, aux_loss = layer(hidden_BTD, sin_BTK, cos_BTK, final_mask_BTS)
+            hidden_BTD, aux_loss = layer(hidden_BTD, sin_BTK, cos_BTK)
             aux_losses.append(aux_loss)
             if deepstack_features is not None and layer_idx < len(deepstack_features):
                 hidden_BTD = _deepstack_process(hidden_BTD, visual_pos_mask_BT, deepstack_features[layer_idx])
 
-        logits_BTV = self.lm_head(self.text.final_norm(hidden_BTD), out_sharding=self.logits_shd)
-        if self.cfg.num_experts > 0:
-            total_aux = jnp.sum(jnp.stack(aux_losses)) if aux_losses else jnp.array(0.0, dtype=jnp.float32)
-            return logits_BTV, total_aux
-        return logits_BTV
+        hidden_BTD = self.text.final_norm(hidden_BTD)
+        total_aux = jnp.sum(jnp.stack(aux_losses)) if aux_losses else jnp.array(0.0, dtype=jnp.float32)
+        return hidden_BTD, total_aux
 
 
 def _deepstack_process(

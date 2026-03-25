@@ -66,9 +66,10 @@ class Qwen3_5_0_8B_Test(absltest.TestCase):
     def _jax_prefill_logits(self, tokens_np: np.ndarray) -> np.ndarray:
         token_ids_BT = jnp.asarray(tokens_np)
         segment_ids_BT = (token_ids_BT != self.pad_id).astype(jnp.int32)
-        logits_BTV, _ = self.jax_model(
+        hidden_BTD, _ = self.jax_model(
             token_ids_BT, segment_ids_BT, None, jnp.array(0, dtype=jnp.int32),
         )
+        logits_BTV = self.jax_model.lm_head(hidden_BTD)
         return np.asarray(logits_BTV, dtype=np.float32)
 
     def test_prefill_logits_match_hf(self):

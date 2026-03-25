@@ -128,7 +128,8 @@ class Qwen3VLSmokeTest(absltest.TestCase):
 
         token_ids_jax_BT = jnp.asarray(token_ids_BT)
         attention_mask_jax_BT = jnp.asarray(attention_mask_BT.astype(np.int32))
-        jax_logits_BTV = np.asarray(self.jax_model(token_ids_jax_BT, attention_mask_jax_BT), dtype=np.float32)
+        hidden_BTD, _ = self.jax_model(token_ids_jax_BT, attention_mask_jax_BT)
+        jax_logits_BTV = np.asarray(self.jax_model.lm_head(hidden_BTD), dtype=np.float32)
 
         mask = np.ones_like(token_ids_BT, dtype=bool)
         assert_logits_close(self, jax_logits_BTV, hf_logits_BTV, mask)
@@ -151,7 +152,8 @@ class Qwen3VLSmokeTest(absltest.TestCase):
 
         token_ids_jax_BT = jnp.asarray(token_ids_BT)
         attention_mask_jax_BT = jnp.asarray(attention_mask_BT.astype(np.int32))
-        jax_logits_BTV = np.asarray(self.jax_model(token_ids_jax_BT, attention_mask_jax_BT), dtype=np.float32)
+        hidden_BTD, _ = self.jax_model(token_ids_jax_BT, attention_mask_jax_BT)
+        jax_logits_BTV = np.asarray(self.jax_model.lm_head(hidden_BTD), dtype=np.float32)
 
         mask = attention_mask_BT.astype(bool)
         assert_logits_close(self, jax_logits_BTV, hf_logits_BTV, mask)
@@ -163,12 +165,14 @@ class Qwen3VLSmokeTest(absltest.TestCase):
         token_ids_jax_BT = jnp.asarray(token_ids_BT)
         attention_mask_jax_BT = jnp.ones_like(token_ids_jax_BT, dtype=jnp.int32)
 
-        baseline_BTV = np.asarray(self.jax_model(token_ids_jax_BT, attention_mask_jax_BT), dtype=np.float32)
+        baseline_hidden, _ = self.jax_model(token_ids_jax_BT, attention_mask_jax_BT)
+        baseline_BTV = np.asarray(self.jax_model.lm_head(baseline_hidden), dtype=np.float32)
 
         graph_def, state = nnx.split(self.jax_model)
         pure_state = nnx.to_pure_dict(state)
         restored = nnx.merge(graph_def, pure_state)
-        restored_logits_BTV = np.asarray(restored(token_ids_jax_BT, attention_mask_jax_BT), dtype=np.float32)
+        restored_hidden, _ = restored(token_ids_jax_BT, attention_mask_jax_BT)
+        restored_logits_BTV = np.asarray(restored.lm_head(restored_hidden), dtype=np.float32)
 
         np.testing.assert_array_equal(restored_logits_BTV, baseline_BTV)
 

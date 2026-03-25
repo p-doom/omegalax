@@ -87,22 +87,22 @@ def _apply_interleaved_mrope(
 
 
 def apply_text_rope(
-    q_BHTK: jax.Array, k_BHTK: jax.Array, cos_BTK: jax.Array, sin_BTK: jax.Array
+    q_BTHK: jax.Array, k_BTHK: jax.Array, cos_BTK: jax.Array, sin_BTK: jax.Array
 ) -> tuple[jax.Array, jax.Array]:
     """Apply partial RoPE to query and key.
 
     Args:
-        q_BHTK, k_BHTK: (B, num_heads, T, head_dim)
+        q_BTHK, k_BTHK: (B, T, num_heads, head_dim)
         cos_BTK, sin_BTK: (B, T, rotary_dim)
     Returns:
         q, k with RoPE applied to the first rotary_dim dimensions.
     """
     rotary_dim = cos_BTK.shape[-1]
-    cos_BTK = cos_BTK[:, None, :, :]
-    sin_BTK = sin_BTK[:, None, :, :]
+    cos_BTK = cos_BTK[:, :, None, :]
+    sin_BTK = sin_BTK[:, :, None, :]
 
-    q_rot, q_pass = q_BHTK[..., :rotary_dim], q_BHTK[..., rotary_dim:]
-    k_rot, k_pass = k_BHTK[..., :rotary_dim], k_BHTK[..., rotary_dim:]
+    q_rot, q_pass = q_BTHK[..., :rotary_dim], q_BTHK[..., rotary_dim:]
+    k_rot, k_pass = k_BTHK[..., :rotary_dim], k_BTHK[..., rotary_dim:]
 
     q_embed = q_rot * cos_BTK + _rotate_half(q_rot) * sin_BTK
     k_embed = k_rot * cos_BTK + _rotate_half(k_rot) * sin_BTK

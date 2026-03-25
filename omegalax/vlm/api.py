@@ -143,39 +143,30 @@ def forward(
     vision_cu_seqlens: jax.Array | None = None,
     position_ids_ZBT: jax.Array | None = None,
 ):
-    """Forward pass for VLMs; supports text-only or multimodal batches."""
+    """Forward pass returning hidden states before lm_head, plus aux loss."""
     if attention_mask_BT is None:
         attention_mask_BT = (token_ids_BT != pad_id).astype(jnp.int32)
 
     if isinstance(model, Qwen3_5ForConditionalGeneration):
         segment_ids_BT = attention_mask_BT.astype(jnp.int32)
-        logits_BTV, aux_loss = model(
-            token_ids_BT,
-            segment_ids_BT,
-            None,
-            jnp.array(0, dtype=jnp.int32),
+        return model(
+            token_ids_BT, segment_ids_BT, None, jnp.array(0, dtype=jnp.int32),
             pixel_values=pixel_values,
             image_grid_thw=image_grid_thw,
             position_ids_ZBT=position_ids_ZBT,
         )
-        return logits_BTV, aux_loss
 
     if isinstance(model, Qwen3VL):
-        outputs = model(
-            token_ids_BT,
-            attention_mask_BT,
+        return model(
+            token_ids_BT, attention_mask_BT,
             position_ids_ZBT=position_ids_ZBT,
             pixel_values=pixel_values,
             image_grid_thw=image_grid_thw,
             vision_cu_seqlens=vision_cu_seqlens,
         )
-        if isinstance(outputs, tuple):
-            logits_BTV, aux_loss = outputs
-            return logits_BTV, aux_loss
-        else:
-            return outputs, jnp.array(0.0, dtype=jnp.float32)
 
     raise ValueError(f"Unsupported VLM model type: {type(model)}")
+
 
 
 def make_cache(*_args, **_kwargs):

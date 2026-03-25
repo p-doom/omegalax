@@ -1,8 +1,8 @@
 """Throughput metrics for training: FLOP counting, step timing, and MFU.
 
-Uses the MaxText-style approach: theoretical model FLOPs
-We do NOT halve attention FLOPs for causal masking; the current implementation
-materializes the full attention matrix.
+Uses the MaxText-style approach: attention FLOPs for causal masking are
+halved (2*T*H*K per token instead of 4*T*H*K) since flash attention kernels
+skip masked blocks. Vision encoder attention (bidirectional) uses full FLOPs.
 """
 
 from __future__ import annotations
@@ -85,7 +85,7 @@ def _training_flops_per_token_qwen3_dense(cfg: Qwen3Config, seq_len: int) -> int
 
     # Per layer, per token (matmul FLOPs: 2 * M * N * K for [M,K] @ [K,N])
     qkv_flops = 2 * D * (H + 2 * G) * K
-    attn_dot_flops = 4 * T * H * K  # full attention, no causal halving
+    attn_dot_flops = 2 * T * H * K  # causal attention: halved
     o_proj_flops = 2 * H * K * D
     attn_per_layer = qkv_flops + attn_dot_flops + o_proj_flops
     mlp_per_layer = 2 * 3 * D * F  # SwiGLU: gate, up, down
@@ -114,7 +114,7 @@ def _training_flops_per_token_qwen3_vl(cfg: Qwen3VLConfig, seq_len: int) -> int:
     T = seq_len
 
     qkv_flops = 2 * D * (H + 2 * G) * K
-    attn_dot_flops = 4 * T * H * K
+    attn_dot_flops = 2 * T * H * K  # causal attention: halved
     o_proj_flops = 2 * H * K * D
     attn_per_layer = qkv_flops + attn_dot_flops + o_proj_flops
 
@@ -203,7 +203,7 @@ def _training_flops_per_token_qwen3_moe(cfg: Qwen3Config, seq_len: int) -> int:
     T = seq_len
 
     qkv_flops = 2 * D * (H + 2 * G) * K
-    attn_dot_flops = 4 * T * H * K
+    attn_dot_flops = 2 * T * H * K  # causal attention: halved
     o_proj_flops = 2 * H * K * D
     attn_per_layer = qkv_flops + attn_dot_flops + o_proj_flops
 
@@ -243,7 +243,7 @@ def _training_flops_per_token_qwen3_5(cfg: Qwen3_5TextConfig, seq_len: int) -> i
         if layer_type == "full_attention":
             q_flops = 2 * D * (H * K * 2)
             kv_flops = 2 * D * (2 * G * K)
-            attn_dot = 4 * T * H * K
+            attn_dot = 2 * T * H * K  # causal attention: halved
             o_flops = 2 * H * K * D
             layer_flops += q_flops + kv_flops + attn_dot + o_flops
         else:

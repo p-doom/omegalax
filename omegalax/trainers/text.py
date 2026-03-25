@@ -20,6 +20,7 @@ from omegalax import export as export_lib
 from omegalax.models.params_utils import save_hf_config
 from omegalax.text import api as text_api
 from omegalax.trainers import checkpoint_utils
+from omegalax.trainers.loss import chunked_cross_entropy_loss
 from omegalax.trainers.optim import MixedPrecisionOptimizer
 from omegalax.trainers.perf import (
     maybe_log_step_metrics,
@@ -64,20 +65,7 @@ def build_optimizer(model: nnx.Module, train_cfg: TrainConfig) -> MixedPrecision
     return MixedPrecisionOptimizer(model, tx)
 
 
-def _masked_next_token_loss(
-    logits_BTV: jax.Array,
-    targets_BT: jax.Array,
-    mask_BT: jax.Array,
-) -> jax.Array:
-    logits_BTV = logits_BTV.astype(jnp.float32)
-    target_logits_BT = jnp.take_along_axis(logits_BTV, targets_BT[..., None], axis=-1)[..., 0]
-    max_logits_BT = jnp.max(logits_BTV, axis=-1)
-    stable_logits_BTV = logits_BTV - max_logits_BT[..., None]
-    logsumexp_BT = max_logits_BT + jnp.log(jnp.sum(jnp.exp(stable_logits_BTV), axis=-1))
-    nll_BT = logsumexp_BT - target_logits_BT
-    mask_BT = mask_BT.astype(jnp.float32)
-    denom = jnp.maximum(jnp.sum(mask_BT), 1.0)
-    return jnp.sum(nll_BT * mask_BT) / denom
+_NUM_LOSS_TILES = 4
 
 
 def _train_state(optimizer_state: nnx.State, rng: jax.Array) -> dict[str, object]:
@@ -164,11 +152,13 @@ def make_sft_train_step(
         loss_mask_BT = batch["loss_mask_BT"]
 
         def loss_fn(model):
-            logits_BTV, aux_loss = text_api.forward(model, token_ids_BT, pad_id, cfg)
-            targets = token_ids_BT[:, 1:]
-            mask = loss_mask_BT[:, 1:].astype(jnp.float32)
-            loss = _masked_next_token_loss(logits_BTV[:, :-1, :], targets, mask) + aux_loss
-            supervised_tokens = jnp.sum(mask)
+            hidden_BTD, aux_loss = text_api.forward(model, token_ids_BT, pad_id, cfg)
+            lm_weight = model.lm_head.kernel[...]
+            loss = chunked_cross_entropy_loss(
+                hidden_BTD, lm_weight, token_ids_BT, loss_mask_BT,
+                num_tiles=_NUM_LOSS_TILES,
+            ) + aux_loss
+            supervised_tokens = jnp.sum(loss_mask_BT[:, 1:].astype(jnp.float32))
             return loss, supervised_tokens
 
         (loss, supervised_tokens), grads = nnx.value_and_grad(loss_fn, has_aux=True)(optimizer.model)

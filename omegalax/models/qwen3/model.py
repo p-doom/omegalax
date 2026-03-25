@@ -6,7 +6,6 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 from jax.sharding import PartitionSpec as P, reshard
-
 from .attention import Attention
 from .config import Qwen3Config
 from .norms import RMSNorm
@@ -179,6 +178,6 @@ class Qwen3(nnx.Module):
             layer_cache = None if cache is None else cache[i]
             hidden_BTD, aux = layer(hidden_BTD, layer_cache, segment_ids_BT)
             aux_losses.append(aux)
-        logits_BTV = self.lm_head(self.final_norm(hidden_BTD), out_sharding=self.logits_shd)
+        hidden_BTD = self.final_norm(hidden_BTD)
         total_aux = jnp.sum(jnp.stack(aux_losses)) if aux_losses else jnp.array(0.0, dtype=jnp.float32)
-        return logits_BTV, total_aux
+        return hidden_BTD, total_aux

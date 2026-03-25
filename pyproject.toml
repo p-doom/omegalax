@@ -19,6 +19,7 @@ dependencies = [
   "orbax-checkpoint",
   "Pillow",
   "safetensors",
+  "tokamax @ git+https://github.com/p-doom/tokamax.git@nested-mask", # change after fix has been upstreamed
   "transformers",
   "huggingface-hub",
   "tensorboardx>=2.6.4",
@@ -29,6 +30,9 @@ dependencies = [
 torch-tests = [
   "torch==2.10.* ; platform_system == \"Linux\"",
 ]
+
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["omegalax"]

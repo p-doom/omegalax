@@ -11,6 +11,8 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P, reshard
 from flax import nnx
+from tokamax import dot_product_attention
+from tokamax._src.ops.attention.base import Mask
 
 from omegalax.models.shard_config import ShardConfig
 from .config import Qwen3_5VisionConfig
@@ -161,12 +163,29 @@ class VisionAttention(nnx.Module):
         v_NHK = reshard(qkv[:, 2], self.heads_shd)
 
         q_NHK, k_NHK = apply_vision_rope(q_NHK, k_NHK, cos_NK, sin_NK)
-        seg_ids = jnp.searchsorted(cu_seqlens[1:], jnp.arange(N), side="right")
-        attn_mask_NM = seg_ids[:, None] == seg_ids[None, :]
-        logits_HNM = jnp.einsum("NHK,MHK->HNM", q_NHK, k_NHK) * self.scale
-        logits_HNM = jnp.where(attn_mask_NM[None, :, :], logits_HNM, -1e9)
-        weights_HNM = jax.nn.softmax(logits_HNM.astype(jnp.float32), axis=-1).astype(q_NHK.dtype)
-        outputs_ND = jnp.einsum("HNM,MHK->NHK", weights_HNM, v_NHK).reshape(N, -1)
+
+        _BLOCK = 128
+        N_padded = (N + _BLOCK - 1) // _BLOCK * _BLOCK
+        pad_n = N_padded - N
+
+        if pad_n > 0:
+            q_NHK = jnp.pad(q_NHK, ((0, pad_n), (0, 0), (0, 0)))
+            k_NHK = jnp.pad(k_NHK, ((0, pad_n), (0, 0), (0, 0)))
+            v_NHK = jnp.pad(v_NHK, ((0, pad_n), (0, 0), (0, 0)))
+
+        seg_ids = jnp.searchsorted(cu_seqlens[1:], jnp.arange(N_padded), side="right")
+        k_start = cu_seqlens[jnp.minimum(seg_ids, cu_seqlens.shape[0] - 2)]
+        k_end = cu_seqlens[jnp.minimum(seg_ids + 1, cu_seqlens.shape[0] - 1)]
+        is_pad = jnp.arange(N_padded) >= N
+        k_start = jnp.where(is_pad, N_padded, k_start)
+        k_end = jnp.where(is_pad, N_padded, k_end)
+
+        attn_NHK = dot_product_attention(
+            q_NHK[None], k_NHK[None], v_NHK[None],
+            mask=Mask(k_start=k_start, k_end=k_end),
+            scale=self.scale, is_causal=False, implementation="mosaic",
+        )
+        outputs_ND = attn_NHK[0, :N].reshape(N, -1)
 
         out_ND = self.proj(outputs_ND, out_sharding=self.hidden_shd)
         return reshard(out_ND, self.hidden_shd)

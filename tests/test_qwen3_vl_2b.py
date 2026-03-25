@@ -118,7 +118,8 @@ class Qwen3VLMappingTest(absltest.TestCase):
 
         token_ids_BT = jnp.asarray(np.array(inputs["input_ids"].cpu(), dtype=np.int32))
         attention_mask_BT = jnp.asarray(np.array(inputs["attention_mask"].cpu(), dtype=np.int32))
-        jax_logits_BTV = np.asarray(self.jax_model(token_ids_BT, attention_mask_BT), dtype=np.float32)
+        hidden_BTD, _ = self.jax_model(token_ids_BT, attention_mask_BT)
+        jax_logits_BTV = np.asarray(self.jax_model.lm_head(hidden_BTD), dtype=np.float32)
 
         mask = inputs["attention_mask"].cpu().numpy().astype(bool)
         assert_logits_close(self, jax_logits_BTV, hf_logits_BTV, mask, top1_min_match=0.8)
@@ -145,7 +146,8 @@ class Qwen3VLMappingTest(absltest.TestCase):
 
         token_ids_BT = jnp.asarray(np.array(inputs["input_ids"].cpu(), dtype=np.int32))
         attention_mask_BT = jnp.asarray(np.array(inputs["attention_mask"].cpu(), dtype=np.int32))
-        jax_logits_BTV = np.asarray(self.jax_model(token_ids_BT, attention_mask_BT), dtype=np.float32)
+        hidden_BTD, _ = self.jax_model(token_ids_BT, attention_mask_BT)
+        jax_logits_BTV = np.asarray(self.jax_model.lm_head(hidden_BTD), dtype=np.float32)
 
         mask = inputs["attention_mask"].cpu().numpy().astype(bool)
         assert_logits_close(self, jax_logits_BTV, hf_logits_BTV, mask, top1_min_match=0.8)
@@ -192,16 +194,14 @@ class Qwen3VLMappingTest(absltest.TestCase):
             )
         )
 
-        jax_logits_BTV = np.asarray(
-            self.jax_model(
-                token_ids_BT,
-                attention_mask_BT,
-                pixel_values=pixel_values_jax,
-                image_grid_thw=image_grid_thw_jax,
-                vision_cu_seqlens=vision_cu_seqlens_jax,
-            ),
-            dtype=np.float32,
+        hidden_BTD, _ = self.jax_model(
+            token_ids_BT,
+            attention_mask_BT,
+            pixel_values=pixel_values_jax,
+            image_grid_thw=image_grid_thw_jax,
+            vision_cu_seqlens=vision_cu_seqlens_jax,
         )
+        jax_logits_BTV = np.asarray(self.jax_model.lm_head(hidden_BTD), dtype=np.float32)
 
         mask = inputs["attention_mask"].cpu().numpy().astype(bool)
         assert_logits_close(self, jax_logits_BTV, hf_logits_BTV, mask, top1_min_match=0.8)
