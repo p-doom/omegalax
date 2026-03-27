@@ -38,6 +38,9 @@ class TrainConfig:
     num_steps: int = 20
     learning_rate: float = 3e-4
     weight_decay: float = 0.01
+    warmup_steps: int = 0
+    max_grad_norm: float = 0.0
+    grad_accum_steps: int = 1
     print_every: int = 1
 
 
@@ -58,8 +61,22 @@ def init_model(
 
 
 def build_optimizer(model: nnx.Module, train_cfg: TrainConfig) -> MixedPrecisionOptimizer:
-    tx = optax.adamw(learning_rate=train_cfg.learning_rate, weight_decay=train_cfg.weight_decay, mu_dtype=jnp.float32)
-    return MixedPrecisionOptimizer(model, tx)
+    lr = train_cfg.learning_rate
+    if train_cfg.warmup_steps > 0:
+        lr = optax.linear_schedule(
+            init_value=0.0,
+            end_value=train_cfg.learning_rate,
+            transition_steps=train_cfg.warmup_steps,
+        )
+    chain = []
+    if train_cfg.max_grad_norm > 0:
+        chain.append(optax.clip_by_global_norm(train_cfg.max_grad_norm))
+    chain.append(optax.adamw(lr, weight_decay=train_cfg.weight_decay))
+    tx = optax.chain(*chain)
+    if train_cfg.grad_accum_steps > 1:
+        tx = optax.MultiSteps(tx, every_k_schedule=train_cfg.grad_accum_steps)
+    opt = MixedPrecisionOptimizer(model, tx)
+    return opt
 
 
 _NUM_LOSS_TILES = 4
@@ -229,7 +246,7 @@ def run_sft(
     fsdp_size: int | None = None,
     profile_dir: str | Path | None = None,
     profile_steps: tuple[int, int] = (3, 8),
-    tb_writer=None,
+    wandb_run=None,
     val_data_iter: checkpoint_utils.GrainIterator | None = None,
     val_every: int | None = None,
     val_steps: int = 10,
@@ -259,6 +276,8 @@ def run_sft(
     else:
         model_cfg = vlm_api.resolve_config(model_id_or_cfg)
         startup_log("resolved model config")
+    startup_log(f"model_cfg={model_cfg}")
+    startup_log(f"tie_word_embeddings={model_cfg.tie_word_embeddings}")
     mesh = ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size)
     model_cfg = vlm_api.align_config_to_mesh(model_cfg, mesh)
     startup_log("mesh ready (tp/fsdp)")
@@ -278,13 +297,22 @@ def run_sft(
 
     is_primary_process = jax.process_index() == 0
 
-    model, model_cfg = vlm_api.init_model(
-        model_cfg,
-        init_rng,
-        tp_size=tp_size,
-        fsdp_size=fsdp_size,
-    )
-    startup_log("initialized model")
+    if not resume and isinstance(model_id_or_cfg, str):
+        model, model_cfg = vlm_api.load_pretrained(
+            model_id_or_cfg,
+            tp_size=tp_size,
+            fsdp_size=fsdp_size,
+        )
+        model_cfg = vlm_api.align_config_to_mesh(model_cfg, mesh)
+        startup_log("loaded pretrained model")
+    else:
+        model, model_cfg = vlm_api.init_model(
+            model_cfg,
+            init_rng,
+            tp_size=tp_size,
+            fsdp_size=fsdp_size,
+        )
+        startup_log("initialized model (random init)")
     with mesh_rules(mesh):
         optimizer = build_optimizer(model, train_cfg)
     startup_log("built optimizer")
@@ -328,7 +356,7 @@ def run_sft(
             per_device_flops=step_per_device_flops,
             global_tokens_per_step=global_tokens_per_step,
             peak_tflops=peak_tflops,
-            tb_writer=tb_writer,
+            wandb_run=wandb_run,
         )
         if result is not None:
             last_metrics = result
@@ -379,10 +407,11 @@ def run_sft(
                 total_val_loss += float(val_loss)
                 total_val_sup_tokens += float(val_sup_tokens)
             avg_val_loss = total_val_loss / val_steps
-            if tb_writer is not None and is_primary_process:
-                tb_writer.add_scalar("val/loss", avg_val_loss, step + 1)
-                tb_writer.add_scalar("val/sup_tokens", total_val_sup_tokens, step + 1)
-                tb_writer.flush()
+            if wandb_run is not None and is_primary_process:
+                wandb_run.log(
+                    {"val/loss": avg_val_loss, "val/sup_tokens": total_val_sup_tokens},
+                    step=step + 1,
+                )
 
     if is_profiling_active:
         jax.tree.map(lambda x: x.block_until_ready(), metrics)

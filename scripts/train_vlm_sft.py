@@ -7,7 +7,7 @@ from pathlib import Path
 
 from absl import app, flags
 import jax
-from tensorboardX import SummaryWriter
+import wandb
 from transformers import AutoImageProcessor, AutoTokenizer
 
 from omegalax.data.collator_qwen3 import VLMSFTCollator
@@ -34,6 +34,9 @@ flags.DEFINE_integer("num_steps", 100, "Number of training steps.")
 flags.DEFINE_integer("batch_size", 4, "Global batch size across all JAX processes.")
 flags.DEFINE_float("learning_rate", 2e-5, "Learning rate.")
 flags.DEFINE_float("weight_decay", 0.01, "Weight decay.")
+flags.DEFINE_integer("warmup_steps", 0, "Linear LR warmup steps.")
+flags.DEFINE_float("max_grad_norm", 1.0, "Max gradient norm for clipping (0 = no clipping).")
+flags.DEFINE_integer("grad_accum_steps", 1, "Gradient accumulation steps (1 = no accumulation).")
 flags.DEFINE_integer("seed", 0, "RNG seed.")
 flags.DEFINE_integer("tp_size", None, "Tensor parallelism size.")
 flags.DEFINE_integer("fsdp_size", None, "FSDP parallelism size.")
@@ -47,7 +50,11 @@ flags.DEFINE_integer("profile_end", 8, "Step to stop profiling.")
 flags.DEFINE_bool("resume", False, "Resume from latest checkpoint.")
 flags.DEFINE_integer("pad_id", 0, "Padding token id.")
 flags.DEFINE_string("peak_tflops", None, "Peak TFLOPS for MFU calculation.")
-flags.DEFINE_string("tensorboard_dir", None, "Directory for TensorBoard event files.")
+flags.DEFINE_string("wandb_entity", None, "Weights & Biases entity (team/user).")
+flags.DEFINE_string("wandb_project", None, "Weights & Biases project name.")
+flags.DEFINE_string("wandb_group", None, "Weights & Biases run group.")
+flags.DEFINE_string("wandb_name", None, "Weights & Biases run name.")
+flags.DEFINE_list("wandb_tags", [], "Comma-separated Weights & Biases tags.")
 flags.DEFINE_string("val_data_path", None, "Path to compiled Grain validation chunk-index dataset.")
 flags.DEFINE_integer("val_every", None, "Run validation every N training steps.")
 flags.DEFINE_integer("val_steps", 10, "Number of batches per validation run.")
@@ -151,6 +158,9 @@ def main(_) -> None:
         num_steps=FLAGS.num_steps,
         learning_rate=FLAGS.learning_rate,
         weight_decay=FLAGS.weight_decay,
+        warmup_steps=FLAGS.warmup_steps,
+        max_grad_norm=FLAGS.max_grad_norm,
+        grad_accum_steps=FLAGS.grad_accum_steps,
         print_every=FLAGS.log_every,
     )
     save_dir = Path(FLAGS.save_dir) if FLAGS.save_dir else (
@@ -158,12 +168,16 @@ def main(_) -> None:
     )
     peak_tflops = resolve_peak_tflops(FLAGS.peak_tflops)
 
-    tb_writer = None
-    if FLAGS.tensorboard_dir and jax.process_index() == 0:
-        tb_dir = Path(FLAGS.tensorboard_dir)
-        tb_dir.mkdir(parents=True, exist_ok=True)
-        tb_writer = SummaryWriter(str(tb_dir))
-        tb_writer.add_hparams(flags.FLAGS.flag_values_dict(), {})
+    wandb_run = None
+    if FLAGS.wandb_project and jax.process_index() == 0:
+        wandb_run = wandb.init(
+            entity=FLAGS.wandb_entity,
+            project=FLAGS.wandb_project,
+            group=FLAGS.wandb_group,
+            name=FLAGS.wandb_name,
+            tags=FLAGS.wandb_tags or None,
+            config=flags.FLAGS.flag_values_dict(),
+        )
     try:
         _, last_metrics = vlm_trainer.run_sft(
             FLAGS.model_id,
@@ -179,14 +193,14 @@ def main(_) -> None:
             fsdp_size=FLAGS.fsdp_size,
             profile_dir=FLAGS.profile_dir,
             profile_steps=(FLAGS.profile_start, FLAGS.profile_end),
-            tb_writer=tb_writer,
+            wandb_run=wandb_run,
             val_data_iter=val_data_iter,
             val_every=FLAGS.val_every,
             val_steps=FLAGS.val_steps,
         )
     finally:
-        if tb_writer is not None:
-            tb_writer.close()
+        if wandb_run is not None:
+            wandb_run.finish()
 
     if last_metrics:
         print(f"finished step={int(last_metrics['step'])} loss={last_metrics['loss']:.4f}")
