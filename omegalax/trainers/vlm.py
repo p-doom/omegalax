@@ -282,7 +282,6 @@ def run_sft(
         model_cfg = vlm_api.resolve_config(model_id_or_cfg)
         startup_log("resolved model config")
     startup_log(f"model_cfg={model_cfg}")
-    startup_log(f"tie_word_embeddings={model_cfg.tie_word_embeddings}")
     mesh = ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size)
     model_cfg = vlm_api.align_config_to_mesh(model_cfg, mesh)
     startup_log("mesh ready (tp/fsdp)")
@@ -321,7 +320,7 @@ def run_sft(
     with mesh_rules(mesh):
         optimizer = build_optimizer(model, train_cfg)
     
-    # Init cpu learning rate schedule function for logging
+    # Init cpu learning rate scheduler function for logging
     lr_schedule_fn = build_lr_schedule(
         peak_lr=train_cfg.learning_rate,
         num_steps=train_cfg.num_steps,
