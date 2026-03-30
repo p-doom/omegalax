@@ -35,6 +35,10 @@ flags.DEFINE_integer("batch_size", 4, "Global batch size across all JAX processe
 flags.DEFINE_float("learning_rate", 2e-5, "Learning rate.")
 flags.DEFINE_float("weight_decay", 0.01, "Weight decay.")
 flags.DEFINE_integer("warmup_steps", 0, "Linear LR warmup steps.")
+flags.DEFINE_enum("lr_schedule", "linear", ["linear", "cosine", "wsd"],
+                  "LR schedule after warmup: 'linear' (constant), 'cosine', or 'wsd' (warmup-stable-decay).")
+flags.DEFINE_float("lr_end_factor", 0.0, "Final LR as fraction of peak LR (cosine/wsd decay end value).")
+flags.DEFINE_float("lr_stable_fraction", 0.8, "Fraction of post-warmup steps at peak LR (wsd only).")
 flags.DEFINE_float("max_grad_norm", 1.0, "Max gradient norm for clipping (0 = no clipping).")
 flags.DEFINE_integer("grad_accum_steps", 1, "Gradient accumulation steps (1 = no accumulation).")
 flags.DEFINE_integer("seed", 0, "RNG seed.")
@@ -129,13 +133,14 @@ def main(_) -> None:
             f"per_process_batch_size={per_process_batch}"
         )
 
+    total_micro_batches = FLAGS.num_steps * FLAGS.grad_accum_steps
     data_iter = _grain_iter(
         FLAGS.data_path,
         collator,
         per_process_batch,
         shuffle=True,
         seed=FLAGS.seed,
-        num_batches=FLAGS.num_steps,
+        num_batches=total_micro_batches,
     )
     startup_log("built train grain DataLoader iterator")
 
@@ -159,6 +164,9 @@ def main(_) -> None:
         learning_rate=FLAGS.learning_rate,
         weight_decay=FLAGS.weight_decay,
         warmup_steps=FLAGS.warmup_steps,
+        lr_schedule=FLAGS.lr_schedule,
+        lr_end_factor=FLAGS.lr_end_factor,
+        lr_stable_fraction=FLAGS.lr_stable_fraction,
         max_grad_norm=FLAGS.max_grad_norm,
         grad_accum_steps=FLAGS.grad_accum_steps,
         print_every=FLAGS.log_every,
