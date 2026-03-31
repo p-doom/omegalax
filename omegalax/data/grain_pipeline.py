@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import json
+import multiprocessing as mp
+import os
 import shutil
 from collections.abc import Iterable
 from itertools import chain
 from pathlib import Path
 from typing import Any
+
+from tqdm import tqdm
 
 from array_record.python.array_record_module import ArrayRecordWriter
 import grain
@@ -16,6 +20,8 @@ import jax
 COMPILED_DATASET_VERSION = 1
 COMPILED_METADATA_FILENAME = "metadata.json"
 ARRAY_RECORD_SUFFIX = ".array_record"
+
+_measure_fn = None
 
 
 def _prepare_output_dir(out_dir: Path, *, overwrite: bool) -> None:
@@ -255,6 +261,33 @@ def _iter_indexed_records(path: str | Path):
     for record_idx in range(len(source)):
         yield record_idx, json.loads(source[record_idx])
 
+
+def _measure_worker(keyed_message):
+    key, message = keyed_message
+    return key, _measure_fn(message)
+
+
+def _precompute_message_lengths(payload_path, measure_message, num_workers):
+    global _measure_fn
+    _measure_fn = measure_message
+
+    tasks: list[tuple[tuple[int, int], dict[str, Any]]] = []
+    for record_idx, block in _iter_indexed_records(payload_path):
+        for msg_offset, message in enumerate(block["messages"]):
+            tasks.append(((record_idx, msg_offset), message))
+
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+    ctx = mp.get_context("fork")
+    chunksize = max(1, min(32, len(tasks) // num_workers))
+    with ctx.Pool(num_workers) as pool:
+        results = dict(tqdm(
+            pool.imap_unordered(_measure_worker, tasks, chunksize=chunksize),
+            total=len(tasks),
+            desc=f"Measuring messages ({num_workers} workers)",
+        ))
+    return results
+
+
 def build_chunk_index(
     payload_path: str | Path,
     out_dir: str | Path,
@@ -264,6 +297,7 @@ def build_chunk_index(
     records_per_shard: int = 100_000,
     overwrite: bool = False,
     profile_metadata: dict[str, Any] | None = None,
+    num_workers: int = 1,
 ) -> Path:
     """Build an offline chunk index over a canonical payload-block dataset.
 
@@ -283,6 +317,12 @@ def build_chunk_index(
     payload_metadata = load_compiled_metadata(payload_path)
     if "payload_path" in payload_metadata:
         raise ValueError(f"Chunk indices can only be built from payload datasets, got chunk index: {payload_path}")
+
+    precomputed_lengths: dict[tuple[int, int], int] | None = None
+    if num_workers > 1:
+        precomputed_lengths = _precompute_message_lengths(
+            payload_path, measure_message, num_workers
+        )
 
     def _iter_chunk_descriptors():
         current_session_id: str | None = None
@@ -319,7 +359,10 @@ def build_chunk_index(
                 current_length = 0
 
             for msg_offset, message in enumerate(block["messages"]):
-                msg_length = int(measure_message(message))
+                if precomputed_lengths is not None:
+                    msg_length = precomputed_lengths[(record_idx, msg_offset)]
+                else:
+                    msg_length = int(measure_message(message))
                 if msg_length > max_length:
                     raise ValueError(
                         f"Single message at session={block_session_id} record={record_idx} "
