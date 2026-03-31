@@ -108,14 +108,13 @@ def chunk_gated_delta_rule(
     attn_BHJLM = -(jnp.einsum("BHJLA,BHJMA->BHJLM", kb_BHJLA, k_BHJLA) * decay_mask_LM)
     attn_BHJLM = jnp.where(upper_mask_LM, 0.0, attn_BHJLM)
 
-    def correction_step(i, attn):
-        row = attn[..., i, :]
-        contribution = jnp.einsum("...j,...jk->...k", row, attn)
-        new_row = row + contribution
-        return attn.at[..., i, :].set(new_row)
-
-    attn_BHJLM = jax.lax.fori_loop(1, chunk_size, correction_step, attn_BHJLM)
-    attn_BHJLM = attn_BHJLM + jnp.eye(chunk_size)
+    eye_LM = jnp.eye(chunk_size, dtype=attn_BHJLM.dtype)
+    triu_shd = P(scan_state_shd[0], scan_state_shd[1], None, None, None)
+    lhs_BHJLM = reshard(eye_LM - attn_BHJLM, triu_shd)
+    rhs_BHJLM = reshard(jnp.broadcast_to(eye_LM, lhs_BHJLM.shape), triu_shd)
+    attn_BHJLM = jax.scipy.linalg.solve_triangular(
+        lhs_BHJLM, rhs_BHJLM, lower=True,
+    )
 
     v_corrected_BHJLU = jnp.einsum("BHJLM,BHJMU->BHJLU", attn_BHJLM, vb_BHJLU)
     k_cumdecay_BHJLA = jnp.einsum("BHJLM,BHJMA->BHJLA", attn_BHJLM, kb_BHJLA * jnp.exp(g_BHJL)[..., None])
