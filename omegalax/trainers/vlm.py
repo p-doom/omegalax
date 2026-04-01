@@ -64,19 +64,11 @@ def init_model(
     return model
 
 
-def build_optimizer(model: nnx.Module, train_cfg: TrainConfig) -> MixedPrecisionOptimizer:
-    lr = build_lr_schedule(
-        peak_lr=train_cfg.learning_rate,
-        num_steps=train_cfg.num_steps,
-        warmup_steps=train_cfg.warmup_steps,
-        schedule=train_cfg.lr_schedule,
-        end_factor=train_cfg.lr_end_factor,
-        stable_fraction=train_cfg.lr_stable_fraction,
-    )
+def build_optimizer(model: nnx.Module, lr_schedule_fn: optax.Schedule | float, train_cfg: TrainConfig) -> MixedPrecisionOptimizer:
     chain = []
     if train_cfg.max_grad_norm > 0:
         chain.append(optax.clip_by_global_norm(train_cfg.max_grad_norm))
-    chain.append(optax.adamw(lr, weight_decay=train_cfg.weight_decay))
+    chain.append(optax.adamw(lr_schedule_fn, weight_decay=train_cfg.weight_decay))
     tx = optax.chain(*chain)
     if train_cfg.grad_accum_steps > 1:
         tx = optax.MultiSteps(tx, every_k_schedule=train_cfg.grad_accum_steps)
@@ -301,6 +293,15 @@ def run_sft(
 
     is_primary_process = jax.process_index() == 0
 
+    lr_schedule_fn = build_lr_schedule(
+        peak_lr=train_cfg.learning_rate,
+        num_steps=train_cfg.num_steps,
+        warmup_steps=train_cfg.warmup_steps,
+        schedule=train_cfg.lr_schedule,
+        end_factor=train_cfg.lr_end_factor,
+        stable_fraction=train_cfg.lr_stable_fraction,
+    )
+
     if not resume and isinstance(model_id_or_cfg, str):
         model, model_cfg = vlm_api.load_pretrained(
             model_id_or_cfg,
@@ -318,17 +319,8 @@ def run_sft(
         )
         startup_log("initialized model (random init)")
     with mesh_rules(mesh):
-        optimizer = build_optimizer(model, train_cfg)
-    
-    # Init cpu learning rate scheduler function for logging
-    lr_schedule_fn = build_lr_schedule(
-        peak_lr=train_cfg.learning_rate,
-        num_steps=train_cfg.num_steps,
-        warmup_steps=train_cfg.warmup_steps,
-        schedule=train_cfg.lr_schedule,
-        end_factor=train_cfg.lr_end_factor,
-        stable_fraction=train_cfg.lr_stable_fraction,
-    )
+        optimizer = build_optimizer(model, lr_schedule_fn, train_cfg)
+
     startup_log("built optimizer")
     sft_step = make_sft_train_step(model_cfg, pad_id=pad_id)
     eval_step = make_sft_eval_step(model_cfg, pad_id=pad_id) if val_data_iter is not None else None
@@ -421,13 +413,11 @@ def run_sft(
             if is_primary_process:
                 print(f"[profiler] stopped trace at step {step}")
 
-        with jax.default_device('cpu'):
-            current_lr = float(lr_schedule_fn(step_idx)) if callable(lr_schedule_fn) else float(lr_schedule_fn)
         window_metrics = {
             "loss": accum_loss / accum_steps,
             "grad_norm": accum_grad_norm / accum_steps,
             "supervised_tokens": accum_sup_tokens,
-            "lr": current_lr,
+            "lr": lr_schedule_fn(step_idx),
         }
         _log_prev_metrics()
         prev_metrics = (step, window_metrics, accum_time, accum_flops)
