@@ -413,14 +413,17 @@ def run_sft(
             if is_primary_process:
                 print(f"[profiler] stopped trace at step {step}")
 
-        window_metrics = {
-            "loss": accum_loss / accum_steps,
-            "grad_norm": accum_grad_norm / accum_steps,
-            "supervised_tokens": accum_sup_tokens,
-            "lr": lr_schedule_fn(step_idx),
-        }
-        _log_prev_metrics()
-        prev_metrics = (step, window_metrics, accum_time, accum_flops)
+        
+        with jax.default_device('cpu'):
+            window_metrics = {
+                "loss": accum_loss / accum_steps,
+                "grad_norm": accum_grad_norm / accum_steps,
+                "supervised_tokens": accum_sup_tokens,
+                "lr": lr_schedule_fn(step_idx),
+            }
+            _log_prev_metrics()
+
+            prev_metrics = (step, window_metrics, accum_time, accum_flops)
 
         if checkpoint_manager is not None and save_every and step % save_every == 0:
             _save_sft_checkpoint(checkpoint_manager, optimizer, rng, step, data_iter)
