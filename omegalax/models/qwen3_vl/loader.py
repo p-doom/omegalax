@@ -11,7 +11,10 @@ import safetensors
 from etils import epath
 from flax import nnx
 
+import dataclasses
+
 from omegalax.distributed.mesh import ensure_mesh, mesh_rules
+from omegalax.models.shard_config import shard_config_for_mesh
 from omegalax.models.params_utils import (
     Transform,
     assign_weights_from_eval_shape,
@@ -151,6 +154,7 @@ def create_qwen3_vl_from_safetensors(
     hf_cfg = load_hf_config(path)
     cfg = make_vl_config_from_hf(hf_cfg)
     _assert_vl_config(cfg, hf_cfg)
+    cfg = dataclasses.replace(cfg, shd_cfg=shard_config_for_mesh(cfg.shd_cfg, mesh))
 
     with mesh_rules(mesh):
         model = nnx.eval_shape(lambda: Qwen3VL(cfg, rngs=nnx.Rngs(params=0)))

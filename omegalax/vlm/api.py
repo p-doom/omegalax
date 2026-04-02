@@ -169,6 +169,27 @@ def forward(
 
 
 
+def load_pretrained(
+    model_id: str,
+    *,
+    tp_size: int | None = None,
+    fsdp_size: int | None = None,
+) -> tuple[nnx.Module, VLMConfig]:
+    """Load a pretrained VLM from HuggingFace safetensors."""
+    from huggingface_hub import snapshot_download
+
+    from omegalax.models.qwen3_5 import create_qwen3_5_from_safetensors
+    from omegalax.models.qwen3_vl import create_qwen3_vl_from_safetensors
+
+    local_dir = snapshot_download(model_id)
+    cfg = resolve_config(model_id)
+    if isinstance(cfg, Qwen3VLConfig):
+        return create_qwen3_vl_from_safetensors(local_dir, tp_size=tp_size, fsdp_size=fsdp_size)
+    if isinstance(cfg, Qwen3_5Config):
+        return create_qwen3_5_from_safetensors(local_dir, tp_size=tp_size, fsdp_size=fsdp_size)
+    raise ValueError(f"Unsupported VLM config type for pretrained loading: {type(cfg)}")
+
+
 def make_cache(*_args, **_kwargs):
     """Placeholder for cache creation to keep the interface symmetric."""
     return None

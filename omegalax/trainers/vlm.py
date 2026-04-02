@@ -18,6 +18,7 @@ from omegalax.distributed.mesh import ensure_mesh, mesh_rules, required_batch_mu
 from omegalax.models.params_utils import save_hf_config
 from omegalax.trainers import checkpoint_utils
 from omegalax.trainers.loss import chunked_cross_entropy_loss
+from omegalax.trainers.lr_schedule import build_lr_schedule
 from omegalax.trainers.perf import (
     maybe_log_step_metrics,
     per_device_flops_per_step,
@@ -38,6 +39,12 @@ class TrainConfig:
     num_steps: int = 20
     learning_rate: float = 3e-4
     weight_decay: float = 0.01
+    warmup_steps: int = 0
+    lr_schedule: str = "linear"
+    lr_end_factor: float = 0.0 
+    lr_stable_fraction: float = 0.8 
+    max_grad_norm: float = 0.0
+    grad_accum_steps: int = 1
     print_every: int = 1
 
 
@@ -57,9 +64,16 @@ def init_model(
     return model
 
 
-def build_optimizer(model: nnx.Module, train_cfg: TrainConfig) -> MixedPrecisionOptimizer:
-    tx = optax.adamw(learning_rate=train_cfg.learning_rate, weight_decay=train_cfg.weight_decay, mu_dtype=jnp.float32)
-    return MixedPrecisionOptimizer(model, tx)
+def build_optimizer(model: nnx.Module, lr_schedule_fn: optax.Schedule | float, train_cfg: TrainConfig) -> MixedPrecisionOptimizer:
+    chain = []
+    if train_cfg.max_grad_norm > 0:
+        chain.append(optax.clip_by_global_norm(train_cfg.max_grad_norm))
+    chain.append(optax.adamw(lr_schedule_fn, weight_decay=train_cfg.weight_decay))
+    tx = optax.chain(*chain)
+    if train_cfg.grad_accum_steps > 1:
+        tx = optax.MultiSteps(tx, every_k_schedule=train_cfg.grad_accum_steps)
+    opt = MixedPrecisionOptimizer(model, tx)
+    return opt
 
 
 _NUM_LOSS_TILES = 4
@@ -229,7 +243,7 @@ def run_sft(
     fsdp_size: int | None = None,
     profile_dir: str | Path | None = None,
     profile_steps: tuple[int, int] = (3, 8),
-    tb_writer=None,
+    wandb_run=None,
     val_data_iter: checkpoint_utils.GrainIterator | None = None,
     val_every: int | None = None,
     val_steps: int = 10,
@@ -259,6 +273,7 @@ def run_sft(
     else:
         model_cfg = vlm_api.resolve_config(model_id_or_cfg)
         startup_log("resolved model config")
+    startup_log(f"model_cfg={model_cfg}")
     mesh = ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size)
     model_cfg = vlm_api.align_config_to_mesh(model_cfg, mesh)
     startup_log("mesh ready (tp/fsdp)")
@@ -278,22 +293,42 @@ def run_sft(
 
     is_primary_process = jax.process_index() == 0
 
-    model, model_cfg = vlm_api.init_model(
-        model_cfg,
-        init_rng,
-        tp_size=tp_size,
-        fsdp_size=fsdp_size,
+    lr_schedule_fn = build_lr_schedule(
+        peak_lr=train_cfg.learning_rate,
+        num_steps=train_cfg.num_steps,
+        warmup_steps=train_cfg.warmup_steps,
+        schedule=train_cfg.lr_schedule,
+        end_factor=train_cfg.lr_end_factor,
+        stable_fraction=train_cfg.lr_stable_fraction,
     )
-    startup_log("initialized model")
+
+    if not resume and isinstance(model_id_or_cfg, str):
+        model, model_cfg = vlm_api.load_pretrained(
+            model_id_or_cfg,
+            tp_size=tp_size,
+            fsdp_size=fsdp_size,
+        )
+        model_cfg = vlm_api.align_config_to_mesh(model_cfg, mesh)
+        startup_log("loaded pretrained model")
+    else:
+        model, model_cfg = vlm_api.init_model(
+            model_cfg,
+            init_rng,
+            tp_size=tp_size,
+            fsdp_size=fsdp_size,
+        )
+        startup_log("initialized model (random init)")
     with mesh_rules(mesh):
-        optimizer = build_optimizer(model, train_cfg)
+        optimizer = build_optimizer(model, lr_schedule_fn, train_cfg)
+
     startup_log("built optimizer")
     sft_step = make_sft_train_step(model_cfg, pad_id=pad_id)
     eval_step = make_sft_eval_step(model_cfg, pad_id=pad_id) if val_data_iter is not None else None
     startup_log("built train step (jit)" + (" and eval step (jit)" if eval_step is not None else ""))
 
-    timer = StepTimer(warmup=2)
-    global_tokens_per_step = train_cfg.seq_len * train_cfg.batch_size
+    accum_steps = train_cfg.grad_accum_steps
+    timer = StepTimer(warmup=2 * accum_steps)
+    global_tokens_per_step = train_cfg.seq_len * train_cfg.batch_size * accum_steps
 
     checkpoint_manager = None
     if save_path is not None:
@@ -328,7 +363,7 @@ def run_sft(
             per_device_flops=step_per_device_flops,
             global_tokens_per_step=global_tokens_per_step,
             peak_tflops=peak_tflops,
-            tb_writer=tb_writer,
+            wandb_run=wandb_run,
         )
         if result is not None:
             last_metrics = result
@@ -337,39 +372,63 @@ def run_sft(
     is_profiling_active = False
 
     startup_log("entering training loop")
-    for step in range(start_step, train_cfg.num_steps):
-        if profile_dir is not None and step == prof_start and not is_profiling_active:
+    for step_idx in range(start_step, train_cfg.num_steps):
+        step = step_idx + 1
+
+        if profile_dir is not None and step_idx == prof_start and not is_profiling_active:
             if is_primary_process:
                 print(f"[profiler] starting trace at step {step} -> {profile_dir}")
             jax.profiler.start_trace(str(profile_dir))
             is_profiling_active = True
 
-        batch = next(data_iter)
-        step_per_device_flops = per_device_flops_per_step(
-            model_cfg,
-            train_cfg.seq_len,
-            train_cfg.batch_size,
-            image_grid_thw=batch.get("image_grid_thw"),
-        )
-        batch = vlm_api.shard_batch_dict(batch, model_cfg, mesh)
-        _, metrics = sft_step(optimizer, batch)
-        step_delta = timer.step()
+        accum_loss = 0.0
+        accum_sup_tokens = 0.0
+        accum_grad_norm = 0.0
+        accum_flops = 0.0
+        accum_time = datetime.timedelta(0)
 
-        if is_profiling_active and step + 1 >= prof_end:
+        for _micro in range(accum_steps):
+            batch = next(data_iter)
+            micro_flops = per_device_flops_per_step(
+                model_cfg,
+                train_cfg.seq_len,
+                train_cfg.batch_size,
+                image_grid_thw=batch.get("image_grid_thw"),
+            )
+            batch = vlm_api.shard_batch_dict(batch, model_cfg, mesh)
+            _, metrics = sft_step(optimizer, batch)
+            micro_delta = timer.step()
+
+            accum_loss = accum_loss + metrics["loss"]
+            accum_sup_tokens = accum_sup_tokens + metrics["supervised_tokens"]
+            accum_grad_norm = accum_grad_norm + metrics["grad_norm"]
+            accum_flops += micro_flops
+            accum_time += micro_delta
+
+        if is_profiling_active and step >= prof_end:
             jax.tree.map(lambda x: x.block_until_ready(), metrics)
             jax.profiler.save_device_memory_profile(f"{profile_dir}/memory.prof")
             jax.profiler.stop_trace()
             is_profiling_active = False
             if is_primary_process:
-                print(f"[profiler] stopped trace at step {step + 1}")
+                print(f"[profiler] stopped trace at step {step}")
 
-        _log_prev_metrics()
-        prev_metrics = (step + 1, metrics, step_delta, step_per_device_flops)
+        
+        with jax.default_device('cpu'):
+            window_metrics = {
+                "loss": accum_loss / accum_steps,
+                "grad_norm": accum_grad_norm / accum_steps,
+                "supervised_tokens": accum_sup_tokens,
+                "lr": lr_schedule_fn(step_idx),
+            }
+            _log_prev_metrics()
 
-        if checkpoint_manager is not None and save_every and (step + 1) % save_every == 0:
-            _save_sft_checkpoint(checkpoint_manager, optimizer, rng, step + 1, data_iter)
+            prev_metrics = (step, window_metrics, accum_time, accum_flops)
 
-        if eval_step is not None and val_every and (step + 1) % val_every == 0:
+        if checkpoint_manager is not None and save_every and step % save_every == 0:
+            _save_sft_checkpoint(checkpoint_manager, optimizer, rng, step, data_iter)
+
+        if eval_step is not None and val_every and step % val_every == 0:
             total_val_loss = 0.0
             total_val_sup_tokens = 0.0
             for _ in range(val_steps):
@@ -379,10 +438,11 @@ def run_sft(
                 total_val_loss += float(val_loss)
                 total_val_sup_tokens += float(val_sup_tokens)
             avg_val_loss = total_val_loss / val_steps
-            if tb_writer is not None and is_primary_process:
-                tb_writer.add_scalar("val/loss", avg_val_loss, step + 1)
-                tb_writer.add_scalar("val/sup_tokens", total_val_sup_tokens, step + 1)
-                tb_writer.flush()
+            if wandb_run is not None and is_primary_process:
+                wandb_run.log(
+                    {"val/loss": avg_val_loss, "val/sup_tokens": total_val_sup_tokens},
+                    step=step,
+                )
 
     if is_profiling_active:
         jax.tree.map(lambda x: x.block_until_ready(), metrics)

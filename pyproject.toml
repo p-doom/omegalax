@@ -22,7 +22,7 @@ dependencies = [
   "tokamax @ git+https://github.com/p-doom/tokamax.git@nested-mask", # change after fix has been upstreamed
   "transformers",
   "huggingface-hub",
-  "tensorboardx>=2.6.4",
+  "wandb",
   "grain>=0.2.16",
 ]
 
