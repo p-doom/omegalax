@@ -26,7 +26,7 @@ class _RopeDtypeTestBase(absltest.TestCase):
 
     def setUp(self):
         super().setUp()
-        self.enterContext(mesh_rules_for(tp_size=1, fsdp_size=1))
+        self.enterContext(mesh_rules_for(tp_size=1, fsdp_size=1, dp_size=1))
 
 
 def _make_spy(original_fn, captured: list):

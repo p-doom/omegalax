@@ -258,9 +258,10 @@ def create_qwen3_5_from_safetensors(
     *,
     tp_size: int | None = None,
     fsdp_size: int | None = None,
+    dp_size: int | None = None,
 ) -> tuple[Qwen3_5ForConditionalGeneration, Qwen3_5Config]:
     """Load HuggingFace Qwen3.5 safetensors into a JAX Qwen3.5 model."""
-    mesh = ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size)
+    mesh = ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size)
 
     path = epath.Path(file_dir).expanduser()
     files = find_safetensors(file_dir)
@@ -306,18 +307,25 @@ def create_qwen3_5_from_safetensors(
         return False
 
     def _handle_moe_specials(torch_key: str, tensor) -> bool:
+        # Fused gate_up_proj: (E, 2*F, D) → split into gate (E, D, F) + up (E, D, F)
         m = _EXPERT_GATE_UP_RE.match(torch_key)
         if m:
             layer_idx = int(m.group(1))
-            target = f"text.layers.{layer_idx}.mlp.gate_up_proj"
-            assign_to_state_dict(state_dict, target, jnp.asarray(tensor), torch_key)
+            fused_E2FD = np.asarray(tensor)
+            gate_EFD, up_EFD = np.split(fused_E2FD, 2, axis=1)
+            gate_EDF = np.swapaxes(gate_EFD, 1, 2)
+            up_EDF = np.swapaxes(up_EFD, 1, 2)
+            assign_to_state_dict(state_dict, f"text.layers.{layer_idx}.mlp.gate_proj", jnp.asarray(gate_EDF), torch_key)
+            assign_to_state_dict(state_dict, f"text.layers.{layer_idx}.mlp.up_proj", jnp.asarray(up_EDF), torch_key)
             return True
 
+        # Batched down_proj: HF (E, D, F) → JAX (E, F, D)
         m = _EXPERT_DOWN_BATCHED_RE.match(torch_key)
         if m:
             layer_idx = int(m.group(1))
-            target = f"text.layers.{layer_idx}.mlp.down_proj"
-            assign_to_state_dict(state_dict, target, jnp.asarray(tensor), torch_key)
+            down_EDF = np.asarray(tensor)
+            down_EFD = np.swapaxes(down_EDF, 1, 2)
+            assign_to_state_dict(state_dict, f"text.layers.{layer_idx}.mlp.down_proj", jnp.asarray(down_EFD), torch_key)
             return True
 
         m = _EXPERT_PER_RE.match(torch_key)
@@ -384,20 +392,28 @@ def create_qwen3_5_from_safetensors(
             layer_projs[layer_idx][proj_name] = expert_tensors
 
         for layer_idx, projs in layer_projs.items():
-            if "gate_proj" in projs and "up_proj" in projs:
+            # Per-expert HF weights are (F, D) each. Stack → (E, F, D), transpose → (E, D, F).
+            if "gate_proj" in projs:
                 gates = [projs["gate_proj"][i] for i in range(num_experts)]
+                gate_EFD = np.stack(gates, axis=0)
+                gate_EDF = np.swapaxes(gate_EFD, 1, 2)
+                assign_to_state_dict(state_dict, f"text.layers.{layer_idx}.mlp.gate_proj",
+                                     jnp.asarray(gate_EDF), "experts.*.gate_proj")
+
+            if "up_proj" in projs:
                 ups = [projs["up_proj"][i] for i in range(num_experts)]
-                fused = np.stack(
-                    [np.concatenate([g, u], axis=0) for g, u in zip(gates, ups)], axis=0
-                )
-                target = f"text.layers.{layer_idx}.mlp.gate_up_proj"
-                assign_to_state_dict(state_dict, target, jnp.asarray(fused), "experts.*.gate/up_proj")
+                up_EFD = np.stack(ups, axis=0)
+                up_EDF = np.swapaxes(up_EFD, 1, 2)
+                assign_to_state_dict(state_dict, f"text.layers.{layer_idx}.mlp.up_proj",
+                                     jnp.asarray(up_EDF), "experts.*.up_proj")
 
             if "down_proj" in projs:
+                # HF per-expert down_proj.weight is (D, F). Stack → (E, D, F). Swap → (E, F, D).
                 downs = [projs["down_proj"][i] for i in range(num_experts)]
-                stacked = np.stack(downs, axis=0)
-                target = f"text.layers.{layer_idx}.mlp.down_proj"
-                assign_to_state_dict(state_dict, target, jnp.asarray(stacked), "experts.*.down_proj")
+                down_EDF = np.stack(downs, axis=0)
+                down_EFD = np.swapaxes(down_EDF, 1, 2)
+                assign_to_state_dict(state_dict, f"text.layers.{layer_idx}.mlp.down_proj",
+                                     jnp.asarray(down_EFD), "experts.*.down_proj")
 
     check_conversion_errors(unmatched_hf_keys)
 
@@ -406,6 +422,8 @@ def create_qwen3_5_from_safetensors(
 
     gc.collect()
     model = nnx.merge(graph_def, state_dict)
+    from omegalax.models.sharding_runtime import _finalize_q_shardings
+    _finalize_q_shardings(model, mesh)
     return model, cfg
 
 

@@ -54,12 +54,14 @@ def init_model(
     *,
     tp_size: int | None = None,
     fsdp_size: int | None = None,
+    dp_size: int | None = None,
 ) -> nnx.Module:
     model, _ = vlm_api.init_model(
         cfg_or_model_id,
         rng,
         tp_size=tp_size,
         fsdp_size=fsdp_size,
+        dp_size=dp_size,
     )
     return model
 
@@ -177,6 +179,7 @@ def make_sft_train_step(cfg, pad_id: int = 0):
             loss = chunked_cross_entropy_loss(
                 hidden_BTD, lm_weight, token_ids_BT, loss_mask_BT,
                 num_tiles=_NUM_LOSS_TILES,
+                logits_out_sharding=cfg.shd_cfg.logits_btv,
             ) + aux_loss
             supervised_tokens = jnp.sum(loss_mask_BT[:, 1:].astype(jnp.float32))
             return loss, supervised_tokens
@@ -221,6 +224,7 @@ def make_sft_eval_step(cfg, pad_id: int = 0):
         loss = chunked_cross_entropy_loss(
             hidden_BTD, lm_weight, token_ids_BT, loss_mask_BT,
             num_tiles=_NUM_LOSS_TILES,
+            logits_out_sharding=cfg.shd_cfg.logits_btv,
         ) + aux_loss
         supervised_tokens = jnp.sum(loss_mask_BT[:, 1:].astype(jnp.float32))
         return loss, supervised_tokens
@@ -241,6 +245,7 @@ def run_sft(
     peak_tflops: float | None = None,
     tp_size: int | None = None,
     fsdp_size: int | None = None,
+    dp_size: int | None = None,
     profile_dir: str | Path | None = None,
     profile_steps: tuple[int, int] = (3, 8),
     wandb_run=None,
@@ -274,9 +279,9 @@ def run_sft(
         model_cfg = vlm_api.resolve_config(model_id_or_cfg)
         startup_log("resolved model config")
     startup_log(f"model_cfg={model_cfg}")
-    mesh = ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size)
+    mesh = ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size)
     model_cfg = vlm_api.align_config_to_mesh(model_cfg, mesh)
-    startup_log("mesh ready (tp/fsdp)")
+    startup_log("mesh ready (tp/fsdp/dp)")
     batch_multiple = required_batch_multiple(vlm_api.batch_partition_spec(model_cfg), mesh)
     if train_cfg.batch_size % batch_multiple != 0:
         raise ValueError(
@@ -307,6 +312,7 @@ def run_sft(
             model_id_or_cfg,
             tp_size=tp_size,
             fsdp_size=fsdp_size,
+            dp_size=dp_size,
         )
         model_cfg = vlm_api.align_config_to_mesh(model_cfg, mesh)
         startup_log("loaded pretrained model")
@@ -316,6 +322,7 @@ def run_sft(
             init_rng,
             tp_size=tp_size,
             fsdp_size=fsdp_size,
+            dp_size=dp_size,
         )
         startup_log("initialized model (random init)")
     with mesh_rules(mesh):
