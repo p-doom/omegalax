@@ -195,7 +195,7 @@ class TextMLP(nnx.Module):
     def __call__(self, hidden_BTD: jax.Array) -> jax.Array:
         gate_BTF = self.gate_proj(hidden_BTD, out_sharding=self.shd_cfg.act_btf)
         up_BTF = self.up_proj(hidden_BTD, out_sharding=self.shd_cfg.act_btf)
-        activated_BTF = reshard(nnx.silu(gate_BTF) * up_BTF, self.shd_cfg.act_btf)
+        activated_BTF = nnx.silu(gate_BTF) * up_BTF
         return self.down_proj(activated_BTF, out_sharding=self.shd_cfg.act_btd)
 
 
@@ -328,15 +328,18 @@ class TextAttention(nnx.Module):
         self.head_dim = cfg.head_dim
         self.num_heads = cfg.num_heads
         self.num_kv_heads = cfg.num_kv_heads
+        object.__setattr__(self, "_q_sharding", None)
+        object.__setattr__(self, "_q_sharding_spec", P(*cfg.shd_cfg.act_btnh))
+
     def __call__(self, hidden_BTD: jax.Array, sin_BTK: jax.Array, cos_BTK: jax.Array) -> jax.Array:
         B, T, _ = hidden_BTD.shape
         q_proj_BTF = self.q_proj(hidden_BTD, out_sharding=self.shd_cfg.act_btf)
         k_proj_BTF = self.k_proj(hidden_BTD, out_sharding=self.shd_cfg.act_btf)
         v_proj_BTF = self.v_proj(hidden_BTD, out_sharding=self.shd_cfg.act_btf)
 
-        q_BTHK = reshard(self.q_norm(q_proj_BTF.reshape(B, T, self.num_heads, self.head_dim)), self.shd_cfg.act_btnh)
-        k_BTGK = reshard(self.k_norm(k_proj_BTF.reshape(B, T, self.num_kv_heads, self.head_dim)), self.shd_cfg.act_btnh)
-        v_BTGK = reshard(v_proj_BTF.reshape(B, T, self.num_kv_heads, self.head_dim), self.shd_cfg.act_btnh)
+        q_BTHK = self.q_norm(jax.lax.reshape(q_proj_BTF, (B, T, self.num_heads, self.head_dim), out_sharding=self.shd_cfg.act_btnh))
+        k_BTGK = self.k_norm(jax.lax.reshape(k_proj_BTF, (B, T, self.num_kv_heads, self.head_dim), out_sharding=self.shd_cfg.act_btnh))
+        v_BTGK = jax.lax.reshape(v_proj_BTF, (B, T, self.num_kv_heads, self.head_dim), out_sharding=self.shd_cfg.act_btnh)
 
         q_BTHK = apply_rope(q_BTHK, sin_BTK, cos_BTK)
         k_BTGK = apply_rope(k_BTGK, sin_BTK, cos_BTK)
@@ -344,9 +347,10 @@ class TextAttention(nnx.Module):
         attn_BTHK = dot_product_attention(
             q_BTHK, k_BTGK, v_BTGK,
             is_causal=True, scale=self.scale, implementation="mosaic",
+            q_sharding=self._q_sharding,
         )
-        out_BTD = self.o_proj(attn_BTHK.reshape(B, T, self.num_heads * self.head_dim), out_sharding=self.shd_cfg.act_btd)
-        return reshard(out_BTD, self.shd_cfg.act_btd)
+        out_BTD = self.o_proj(jax.lax.reshape(attn_BTHK, (B, T, self.num_heads * self.head_dim), out_sharding=self.shd_cfg.act_btf), out_sharding=self.shd_cfg.act_btd)
+        return out_BTD
 
 
 class TextDecoderLayer(nnx.Module):
@@ -430,7 +434,8 @@ class Qwen3VL(nnx.Module):
             visual_pos_mask_BT = image_mask_BT
             batch_idx, seq_idx = jnp.where(image_mask_BT, size=image_features_ND.shape[0])
             inputs_embeds_BTD = inputs_embeds_BTD.at[batch_idx, seq_idx].set(
-                image_features_ND.astype(inputs_embeds_BTD.dtype)
+                image_features_ND.astype(inputs_embeds_BTD.dtype),
+                out_sharding=self.text.out_emb_shd,
             )
 
         if position_ids_ZBT is None:
@@ -461,7 +466,7 @@ class Qwen3VL(nnx.Module):
             hidden_BTD, aux_loss = layer(hidden_BTD, sin_BTK, cos_BTK)
             aux_losses.append(aux_loss)
             if deepstack_features is not None and layer_idx < len(deepstack_features):
-                hidden_BTD = _deepstack_process(hidden_BTD, visual_pos_mask_BT, deepstack_features[layer_idx])
+                hidden_BTD = _deepstack_process(hidden_BTD, visual_pos_mask_BT, deepstack_features[layer_idx], out_sharding=self.text.out_emb_shd)
 
         hidden_BTD = self.text.final_norm(hidden_BTD)
         total_aux = jnp.sum(jnp.stack(aux_losses)) if aux_losses else jnp.array(0.0, dtype=jnp.float32)
@@ -469,10 +474,11 @@ class Qwen3VL(nnx.Module):
 
 
 def _deepstack_process(
-    hidden_BTD: jax.Array, visual_pos_mask_BT: jax.Array, visual_embeds_ND: jax.Array
+    hidden_BTD: jax.Array, visual_pos_mask_BT: jax.Array, visual_embeds_ND: jax.Array,
+    out_sharding: P | None = None,
 ) -> jax.Array:
     """Add visual embeddings to hidden states at visual token positions."""
     batch_idx, seq_idx = jnp.where(visual_pos_mask_BT, size=visual_embeds_ND.shape[0])
     current_vals = hidden_BTD[batch_idx, seq_idx]
     new_vals = current_vals + visual_embeds_ND.astype(current_vals.dtype)
-    return hidden_BTD.at[batch_idx, seq_idx].set(new_vals)
+    return hidden_BTD.at[batch_idx, seq_idx].set(new_vals, out_sharding=out_sharding)

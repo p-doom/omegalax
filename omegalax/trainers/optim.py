@@ -25,17 +25,15 @@ class MixedPrecisionOptimizer(nnx.ModelAndOptimizer):
         opt_state_arrays = nnx.pure(self.opt_state)
 
         fp32_grads = jax.tree.map(lambda g: g.astype(jnp.float32), grad_arrays)
-        fp32_params = jax.tree.map(lambda p: p.astype(jnp.float32), param_arrays)
 
         updates, new_opt_state = self.tx.update(
-            fp32_grads, opt_state_arrays, fp32_params, **nnx.pure(kwargs)
+            fp32_grads, opt_state_arrays, param_arrays, **nnx.pure(kwargs)
         )
 
         new_params = jax.tree.map(
-            lambda fp, u, p: (fp + u).astype(p.dtype),
-            fp32_params,
-            updates,
+            lambda p, u: (p.astype(jnp.float32) + u).astype(p.dtype),
             param_arrays,
+            updates,
         )
 
         nnx.update(self.model, new_params)

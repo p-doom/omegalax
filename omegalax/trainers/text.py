@@ -21,6 +21,7 @@ from omegalax.models.params_utils import save_hf_config
 from omegalax.text import api as text_api
 from omegalax.trainers import checkpoint_utils
 from omegalax.trainers.loss import chunked_cross_entropy_loss
+from omegalax.trainers.lr_schedule import build_lr_schedule
 from omegalax.trainers.optim import MixedPrecisionOptimizer
 from omegalax.trainers.perf import (
     maybe_log_step_metrics,
@@ -47,6 +48,12 @@ class TrainConfig:
     num_steps: int = 20
     learning_rate: float = 3e-4
     weight_decay: float = 0.01
+    warmup_steps: int = 0
+    lr_schedule: str = "linear"
+    lr_end_factor: float = 0.0
+    lr_stable_fraction: float = 0.8
+    max_grad_norm: float = 0.0
+    grad_accum_steps: int = 1
     print_every: int = 1
 
 
@@ -56,27 +63,43 @@ def init_model(
     *,
     tp_size: int | None = None,
     fsdp_size: int | None = None,
+    dp_size: int | None = None,
 ) -> tuple[nnx.Module, text_api.TextConfig]:
-    return text_api.init_model(cfg_or_model_id, rng, tp_size=tp_size, fsdp_size=fsdp_size)
+    return text_api.init_model(cfg_or_model_id, rng, tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size)
 
 
 def build_optimizer(model: nnx.Module, train_cfg: TrainConfig) -> MixedPrecisionOptimizer:
-    tx = optax.adamw(learning_rate=train_cfg.learning_rate, weight_decay=train_cfg.weight_decay, mu_dtype=jnp.float32)
-    return MixedPrecisionOptimizer(model, tx)
+    lr = build_lr_schedule(
+        peak_lr=train_cfg.learning_rate,
+        num_steps=train_cfg.num_steps,
+        warmup_steps=train_cfg.warmup_steps,
+        schedule=train_cfg.lr_schedule,
+        end_factor=train_cfg.lr_end_factor,
+        stable_fraction=train_cfg.lr_stable_fraction,
+    )
+    chain = []
+    if train_cfg.max_grad_norm > 0:
+        chain.append(optax.clip_by_global_norm(train_cfg.max_grad_norm))
+    chain.append(optax.adamw(lr, weight_decay=train_cfg.weight_decay))
+    tx = optax.chain(*chain)
+    if train_cfg.grad_accum_steps > 1:
+        tx = optax.MultiSteps(tx, every_k_schedule=train_cfg.grad_accum_steps)
+    opt = MixedPrecisionOptimizer(model, tx)
+    return opt
 
 
 _NUM_LOSS_TILES = 4
 
 
-def _train_state(optimizer_state: nnx.State, rng: jax.Array) -> dict[str, object]:
-    return {"optimizer": optimizer_state, "rng": rng}
+def _train_state(optimizer: MixedPrecisionOptimizer, rng: jax.Array) -> dict[str, object]:
+    return {"optimizer": nnx.state(optimizer), "rng": rng}
 
 
-def _abstract_train_state(optimizer_state: nnx.State, rng: jax.Array) -> dict[str, object]:
+def _abstract_train_state(optimizer: MixedPrecisionOptimizer, rng: jax.Array) -> dict[str, object]:
     return {
         "optimizer": jax.tree.map(
             lambda value: jax.ShapeDtypeStruct(value.shape, value.dtype, sharding=value.sharding),
-            optimizer_state,
+            nnx.state(optimizer),
         ),
         "rng": jax.ShapeDtypeStruct(rng.shape, rng.dtype, sharding=rng.sharding),
     }
@@ -98,56 +121,49 @@ def _make_checkpoint_manager(save_dir: Path, save_interval: int | None) -> ocp.C
     return ocp.CheckpointManager(save_dir, options=options, handler_registry=handler_registry)
 
 
-def _write_checkpoint_config(save_dir: Path, cfg: text_api.TextConfig) -> None:
+def _write_checkpoint_config(save_dir: Path, cfg) -> None:
     save_hf_config(export_lib.model_config_to_hf_dict(cfg), save_dir)
 
 
 def _save_sft_checkpoint(
     checkpoint_manager: ocp.CheckpointManager,
-    optimizer_state: nnx.State,
+    optimizer: MixedPrecisionOptimizer,
     rng: jax.Array,
     step: int,
     input_iter: checkpoint_utils.GrainIterator,
 ) -> None:
-    train_state = _train_state(optimizer_state, rng)
+    train_state = _train_state(optimizer, rng)
     save_args = checkpoint_utils.make_grain_save_args(train_state, input_iter)
     checkpoint_manager.save(step, args=save_args)
 
 
 def _restore_sft_checkpoint(
     checkpoint_manager: ocp.CheckpointManager,
-    optimizer_state: nnx.State,
+    optimizer: MixedPrecisionOptimizer,
     rng: jax.Array,
     input_iter: checkpoint_utils.GrainIterator,
-) -> tuple[nnx.State, int, jax.Array, checkpoint_utils.GrainIterator]:
+) -> tuple[MixedPrecisionOptimizer, int, jax.Array, checkpoint_utils.GrainIterator]:
     latest_step = checkpoint_manager.latest_step()
     if latest_step is None:
         raise ValueError("No checkpoint found to restore.")
 
-    abstract_state = _abstract_train_state(optimizer_state, rng)
+    abstract_state = _abstract_train_state(optimizer, rng)
     restore_args = checkpoint_utils.make_grain_restore_args(abstract_state, input_iter)
     restored = checkpoint_manager.restore(latest_step, args=restore_args)
     train_state = restored["train_state"]
-    return train_state["optimizer"], int(latest_step), train_state["rng"], checkpoint_utils.restored_input_iter(restored)
+    nnx.update(optimizer, train_state["optimizer"])
+    return optimizer, int(latest_step), train_state["rng"], checkpoint_utils.restored_input_iter(restored)
 
 
-def make_sft_train_step(
-    cfg: text_api.TextConfig,
-    optimizer_graphdef,
-    optimizer_state_sharding,
-    mesh: Mesh,
-    *,
-    pad_id: int = 0,
-):
-    """Build a JIT-compiled SFT train step that consumes a batch dict.
+def make_sft_train_step(cfg, pad_id: int = 0):
+    """Build a JIT-compiled text SFT train step that consumes a batch dict.
 
     The batch dict must contain ``token_ids_BT``, ``attention_mask_BT``, and
     ``loss_mask_BT`` (all ``(B, T)`` int32).
     """
-    replicated = NamedSharding(mesh, P())
 
-    def _sft_step(optimizer_state, batch):
-        optimizer = nnx.merge(optimizer_graphdef, optimizer_state)
+    @nnx.jit(donate_argnums=0)
+    def sft_train_step(optimizer: MixedPrecisionOptimizer, batch: dict[str, jax.Array]):
         token_ids_BT = batch["token_ids_BT"]
         loss_mask_BT = batch["loss_mask_BT"]
 
@@ -157,6 +173,7 @@ def make_sft_train_step(
             loss = chunked_cross_entropy_loss(
                 hidden_BTD, lm_weight, token_ids_BT, loss_mask_BT,
                 num_tiles=_NUM_LOSS_TILES,
+                logits_out_sharding=cfg.shd_cfg.logits_btv,
             ) + aux_loss
             supervised_tokens = jnp.sum(loss_mask_BT[:, 1:].astype(jnp.float32))
             return loss, supervised_tokens
@@ -168,16 +185,30 @@ def make_sft_train_step(
             "grad_norm": optax.tree.norm(grads),
             "supervised_tokens": supervised_tokens,
         }
-        return nnx.state(optimizer), metrics
-
-    @jax.jit(
-        out_shardings=(optimizer_state_sharding, replicated),
-        donate_argnums=(0,),
-    )
-    def sft_train_step(optimizer_state, batch):
-        return _sft_step(optimizer_state, batch)
+        return loss, metrics
 
     return sft_train_step
+
+
+def make_sft_eval_step(cfg, pad_id: int = 0):
+    """Build a JIT-compiled text SFT eval step (forward only, no gradients)."""
+
+    @nnx.jit
+    def sft_eval_step(model: nnx.Module, batch: dict[str, jax.Array]):
+        token_ids_BT = batch["token_ids_BT"]
+        loss_mask_BT = batch["loss_mask_BT"]
+
+        hidden_BTD, aux_loss = text_api.forward(model, token_ids_BT, pad_id, cfg)
+        lm_weight = model.lm_head.kernel[...]
+        loss = chunked_cross_entropy_loss(
+            hidden_BTD, lm_weight, token_ids_BT, loss_mask_BT,
+            num_tiles=_NUM_LOSS_TILES,
+            logits_out_sharding=cfg.shd_cfg.logits_btv,
+        ) + aux_loss
+        supervised_tokens = jnp.sum(loss_mask_BT[:, 1:].astype(jnp.float32))
+        return loss, supervised_tokens
+
+    return sft_eval_step
 
 
 def run_sft(
@@ -193,13 +224,21 @@ def run_sft(
     peak_tflops: float | None = None,
     tp_size: int | None = None,
     fsdp_size: int | None = None,
+    dp_size: int | None = None,
     profile_dir: str | Path | None = None,
     profile_steps: tuple[int, int] = (3, 8),
+    wandb_run=None,
+    val_data_iter: checkpoint_utils.GrainIterator | None = None,
+    val_every: int | None = None,
+    val_steps: int = 10,
 ) -> tuple[MixedPrecisionOptimizer, dict[str, float]]:
     """SFT a text model from a Grain iterator; returns final optimizer + last metrics.
 
     ``data_iter`` must be a checkpointable Grain iterator yielding dicts with keys ``token_ids_BT``,
     ``attention_mask_BT``, and ``loss_mask_BT`` (all numpy ``(B, T)``).
+
+    If ``val_data_iter`` is provided, runs ``val_steps`` forward-only batches
+    every ``val_every`` training steps and logs the average validation loss.
     """
     save_path = Path(save_dir).expanduser().resolve() if save_dir is not None else None
     if resume:
@@ -217,9 +256,10 @@ def run_sft(
     else:
         model_cfg = text_api.resolve_config(model_id_or_cfg)
         startup_log("resolved model config")
-    mesh = ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size)
+    startup_log(f"model_cfg={model_cfg}")
+    mesh = ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size)
     model_cfg = text_api.align_config_to_mesh(model_cfg, mesh)
-    startup_log("mesh ready (tp/fsdp)")
+    startup_log("mesh ready (tp/fsdp/dp)")
     batch_multiple = required_batch_multiple(text_api.batch_partition_spec(model_cfg), mesh)
     if train_cfg.batch_size % batch_multiple != 0:
         raise ValueError(
@@ -236,32 +276,28 @@ def run_sft(
 
     is_primary_process = jax.process_index() == 0
 
-    model, model_cfg = init_model(model_cfg, init_rng, tp_size=tp_size, fsdp_size=fsdp_size)
+    model, model_cfg = init_model(model_cfg, init_rng, tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size)
     startup_log("initialized model")
     with mesh_rules(mesh):
         optimizer = build_optimizer(model, train_cfg)
-    startup_log("built optimizer")
-    optimizer_graphdef = nnx.graphdef(optimizer)
-    optimizer_state = nnx.state(optimizer)
-    replicated = NamedSharding(mesh, P())
-    optimizer_state_sharding = jax.tree.map(
-        lambda leaf: leaf.sharding if isinstance(leaf, jax.Array) else replicated,
-        optimizer_state,
-    )
-    sft_step = make_sft_train_step(
-        model_cfg,
-        optimizer_graphdef,
-        optimizer_state_sharding,
-        mesh,
-        pad_id=pad_id,
-    )
-    startup_log("built train step (jit)")
 
-    per_device_flops = per_device_flops_per_step(
-        model_cfg, train_cfg.seq_len, train_cfg.batch_size
+    # Init cpu learning rate scheduler function for logging
+    lr_schedule_fn = build_lr_schedule(
+        peak_lr=train_cfg.learning_rate,
+        num_steps=train_cfg.num_steps,
+        warmup_steps=train_cfg.warmup_steps,
+        schedule=train_cfg.lr_schedule,
+        end_factor=train_cfg.lr_end_factor,
+        stable_fraction=train_cfg.lr_stable_fraction,
     )
-    timer = StepTimer(warmup=2)
-    global_tokens_per_step = train_cfg.seq_len * train_cfg.batch_size
+    startup_log("built optimizer")
+    sft_step = make_sft_train_step(model_cfg, pad_id=pad_id)
+    eval_step = make_sft_eval_step(model_cfg, pad_id=pad_id) if val_data_iter is not None else None
+    startup_log("built train step (jit)" + (" and eval step (jit)" if eval_step is not None else ""))
+
+    accum_steps = train_cfg.grad_accum_steps
+    timer = StepTimer(warmup=2 * accum_steps)
+    global_tokens_per_step = train_cfg.seq_len * train_cfg.batch_size * accum_steps
 
     checkpoint_manager = None
     if save_path is not None:
@@ -274,20 +310,18 @@ def run_sft(
     if resume:
         if checkpoint_manager is None:
             raise ValueError("resume=True requires save_dir to be provided.")
-        optimizer_state, start_step, rng, data_iter = _restore_sft_checkpoint(
-            checkpoint_manager, optimizer_state, rng, data_iter
-        )
+        optimizer, start_step, rng, data_iter = _restore_sft_checkpoint(checkpoint_manager, optimizer, rng, data_iter)
         rng = jax.device_put(rng, replicated_rng_sharding)
         startup_log(f"restored checkpoint at step {start_step}")
 
     last_metrics: dict[str, float] = {}
-    prev_metrics: tuple[int, dict[str, jax.Array], datetime.timedelta] | None = None
+    prev_metrics: tuple[int, dict[str, jax.Array], datetime.timedelta, float] | None = None
 
     def _log_prev_metrics(force: bool = False) -> None:
         nonlocal last_metrics
         if prev_metrics is None:
             return
-        step_to_log, metrics_to_log, step_delta = prev_metrics
+        step_to_log, metrics_to_log, step_delta, step_per_device_flops = prev_metrics
         result = maybe_log_step_metrics(
             step_to_log,
             metrics_to_log,
@@ -295,9 +329,10 @@ def run_sft(
             is_primary_process=is_primary_process,
             log_every=log_every,
             force=force,
-            per_device_flops=per_device_flops,
+            per_device_flops=step_per_device_flops,
             global_tokens_per_step=global_tokens_per_step,
             peak_tflops=peak_tflops,
+            wandb_run=wandb_run,
         )
         if result is not None:
             last_metrics = result
@@ -306,34 +341,78 @@ def run_sft(
     is_profiling_active = False
 
     startup_log("entering training loop")
-    for step in range(start_step, train_cfg.num_steps):
-        if profile_dir is not None and step == prof_start and not is_profiling_active:
+    for step_idx in range(start_step, train_cfg.num_steps):
+        step = step_idx + 1
+
+        if profile_dir is not None and step_idx == prof_start and not is_profiling_active:
             if is_primary_process:
                 print(f"[profiler] starting trace at step {step} -> {profile_dir}")
             jax.profiler.start_trace(str(profile_dir))
             is_profiling_active = True
 
-        batch = next(data_iter)
-        batch = text_api.shard_batch_dict(batch, model_cfg, mesh)
-        optimizer_state, metrics = sft_step(optimizer_state, batch)
-        step_delta = timer.step()
+        accum_loss = 0.0
+        accum_sup_tokens = 0.0
+        accum_grad_norm = 0.0
+        accum_flops = 0.0
+        accum_time = datetime.timedelta(0)
 
-        if is_profiling_active and step + 1 >= prof_end:
-            jax.tree.map(lambda x: x.block_until_ready(), (optimizer_state, metrics))
+        for _micro in range(accum_steps):
+            batch = next(data_iter)
+            micro_flops = per_device_flops_per_step(
+                model_cfg,
+                train_cfg.seq_len,
+                train_cfg.batch_size,
+            )
+            batch = text_api.shard_batch_dict(batch, model_cfg, mesh)
+            _, metrics = sft_step(optimizer, batch)
+            micro_delta = timer.step()
+
+            accum_loss = accum_loss + metrics["loss"]
+            accum_sup_tokens = accum_sup_tokens + metrics["supervised_tokens"]
+            accum_grad_norm = accum_grad_norm + metrics["grad_norm"]
+            accum_flops += micro_flops
+            accum_time += micro_delta
+
+        if is_profiling_active and step >= prof_end:
+            jax.tree.map(lambda x: x.block_until_ready(), metrics)
             jax.profiler.save_device_memory_profile(f"{profile_dir}/memory.prof")
             jax.profiler.stop_trace()
             is_profiling_active = False
             if is_primary_process:
-                print(f"[profiler] stopped trace at step {step + 1}")
+                print(f"[profiler] stopped trace at step {step}")
 
+        with jax.default_device('cpu'):
+            current_lr = float(lr_schedule_fn(step_idx)) if callable(lr_schedule_fn) else float(lr_schedule_fn)
+        window_metrics = {
+            "loss": accum_loss / accum_steps,
+            "grad_norm": accum_grad_norm / accum_steps,
+            "supervised_tokens": accum_sup_tokens,
+            "lr": current_lr,
+        }
         _log_prev_metrics()
-        prev_metrics = (step + 1, metrics, step_delta)
+        prev_metrics = (step, window_metrics, accum_time, accum_flops)
 
-        if checkpoint_manager is not None and save_every and (step + 1) % save_every == 0:
-            _save_sft_checkpoint(checkpoint_manager, optimizer_state, rng, step + 1, data_iter)
+        if checkpoint_manager is not None and save_every and step % save_every == 0:
+            _save_sft_checkpoint(checkpoint_manager, optimizer, rng, step, data_iter)
+
+        if eval_step is not None and val_every and step % val_every == 0:
+            total_val_loss = 0.0
+            total_val_sup_tokens = 0.0
+            for _ in range(val_steps):
+                val_batch = next(val_data_iter)
+                val_batch = text_api.shard_batch_dict(val_batch, model_cfg, mesh)
+                val_loss, val_sup_tokens = eval_step(optimizer.model, val_batch)
+                total_val_loss += float(val_loss)
+                total_val_sup_tokens += float(val_sup_tokens)
+            avg_val_loss = total_val_loss / val_steps
+            if wandb_run is not None and is_primary_process:
+                wandb_run.log(
+                    {"val/loss": avg_val_loss, "val/sup_tokens": total_val_sup_tokens},
+                    step=step,
+                )
 
     if is_profiling_active:
-        jax.tree.map(lambda x: x.block_until_ready(), (optimizer_state, metrics))
+        jax.tree.map(lambda x: x.block_until_ready(), metrics)
         jax.profiler.save_device_memory_profile(f"{profile_dir}/memory.prof")
         jax.profiler.stop_trace()
         if is_primary_process:
@@ -343,9 +422,8 @@ def run_sft(
 
     if checkpoint_manager is not None:
         if last_metrics and (not save_every or last_metrics["step"] % save_every != 0):
-            _save_sft_checkpoint(checkpoint_manager, optimizer_state, rng, int(last_metrics["step"]), data_iter)
+            _save_sft_checkpoint(checkpoint_manager, optimizer, rng, int(last_metrics["step"]), data_iter)
         checkpoint_manager.wait_until_finished()
         checkpoint_manager.close()
 
-    optimizer = nnx.merge(optimizer_graphdef, optimizer_state)
     return optimizer, last_metrics

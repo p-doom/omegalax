@@ -44,6 +44,7 @@ flags.DEFINE_integer("grad_accum_steps", 1, "Gradient accumulation steps (1 = no
 flags.DEFINE_integer("seed", 0, "RNG seed.")
 flags.DEFINE_integer("tp_size", None, "Tensor parallelism size.")
 flags.DEFINE_integer("fsdp_size", None, "FSDP parallelism size.")
+flags.DEFINE_integer("dp_size", None, "Data parallelism size.")
 flags.DEFINE_string("save_dir", None, "Checkpoint save directory.")
 flags.DEFINE_string("jax_cache_dir", "/tmp/jax_cache", "Directory for JAX persistent compilation cache.")
 flags.DEFINE_integer("save_every", 50, "Save checkpoint every N steps.")
@@ -81,6 +82,7 @@ def _grain_iter(
     shuffle: bool,
     seed: int,
     num_batches: int,
+    dp_size: int | None = None,
 ):
     return make_grain_iterator(
         data_path,
@@ -89,7 +91,8 @@ def _grain_iter(
         shuffle=shuffle,
         seed=seed,
         num_epochs=required_epochs_for_batches(
-            data_path, batch_size=per_process_batch_size, num_batches=num_batches
+            data_path, batch_size=per_process_batch_size, num_batches=num_batches,
+            dp_size=dp_size,
         ),
         read_options=make_grain_read_options(
             num_threads=FLAGS.grain_read_threads,
@@ -99,6 +102,7 @@ def _grain_iter(
             num_workers=FLAGS.grain_workers,
             per_worker_buffer_size=FLAGS.grain_worker_buffer_size,
         ),
+        dp_size=dp_size,
     )
 
 
@@ -121,7 +125,7 @@ def main(_) -> None:
     startup_log(f"loaded image processor from {repo_id!r}")
     collator = VLMSFTCollator(tokenizer, max_length=FLAGS.max_length, image_processor=image_processor)
     startup_log("built VLMSFTCollator")
-    per_process_batch = process_local_batch_size(FLAGS.batch_size)
+    per_process_batch = process_local_batch_size(FLAGS.batch_size, dp_size=FLAGS.dp_size)
     startup_log(
         f"model_id={FLAGS.model_id!r} data_path={FLAGS.data_path!r} "
         f"jax_compilation_cache_dir={FLAGS.jax_cache_dir!r} "
@@ -141,6 +145,7 @@ def main(_) -> None:
         shuffle=True,
         seed=FLAGS.seed,
         num_batches=total_micro_batches,
+        dp_size=FLAGS.dp_size,
     )
     startup_log("built train grain DataLoader iterator")
 
@@ -153,6 +158,7 @@ def main(_) -> None:
             shuffle=False,
             seed=FLAGS.seed,
             num_batches=max(1, (FLAGS.num_steps // max(FLAGS.val_every or FLAGS.num_steps, 1)) * FLAGS.val_steps),
+            dp_size=FLAGS.dp_size,
         )
         startup_log(f"built val grain DataLoader iterator from {FLAGS.val_data_path!r}")
 
@@ -199,6 +205,7 @@ def main(_) -> None:
             peak_tflops=peak_tflops,
             tp_size=FLAGS.tp_size,
             fsdp_size=FLAGS.fsdp_size,
+            dp_size=FLAGS.dp_size,
             profile_dir=FLAGS.profile_dir,
             profile_steps=(FLAGS.profile_start, FLAGS.profile_end),
             wandb_run=wandb_run,

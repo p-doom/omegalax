@@ -42,6 +42,7 @@ class Qwen3_30B_A3B_Test(absltest.TestCase):
             MODEL_ID,
             tp_size=1,
             fsdp_size=1,
+            dp_size=1,
         )
 
         cls.hf_model = Qwen3MoeForCausalLM.from_pretrained(

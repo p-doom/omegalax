@@ -47,27 +47,27 @@ def _assert_params_equal(testcase: absltest.TestCase, model_a, model_b):
 
 class ExportRoundTripTest(absltest.TestCase):
     def test_qwen3_dense_round_trip(self):
-        with mesh_rules_for(tp_size=1, fsdp_size=1):
+        with mesh_rules_for(tp_size=1, fsdp_size=1, dp_size=1):
             cfg = make_qwen3_config("qwen3-smoke")
             rngs = nnx.Rngs(params=jax.random.key(0))
             model = Qwen3(cfg, rngs=rngs)
             with tempfile.TemporaryDirectory() as tmpdir:
                 export_qwen3_to_safetensors(model, cfg, tmpdir)
-                loaded = create_qwen3_from_safetensors(tmpdir, "qwen3-smoke", tp_size=1, fsdp_size=1)
+                loaded = create_qwen3_from_safetensors(tmpdir, "qwen3-smoke", tp_size=1, fsdp_size=1, dp_size=1)
         _assert_params_equal(self, model, loaded)
 
     def test_qwen3_moe_round_trip(self):
-        with mesh_rules_for(tp_size=1, fsdp_size=1):
+        with mesh_rules_for(tp_size=1, fsdp_size=1, dp_size=1):
             cfg = make_qwen3_config("qwen3-smoke-moe")
             rngs = nnx.Rngs(params=jax.random.key(0))
             model = Qwen3(cfg, rngs=rngs)
             with tempfile.TemporaryDirectory() as tmpdir:
                 export_qwen3_to_safetensors(model, cfg, tmpdir)
-                loaded = create_qwen3_from_safetensors(tmpdir, "qwen3-smoke-moe", tp_size=1, fsdp_size=1)
+                loaded = create_qwen3_from_safetensors(tmpdir, "qwen3-smoke-moe", tp_size=1, fsdp_size=1, dp_size=1)
         _assert_params_equal(self, model, loaded)
 
     def test_qwen3_vl_round_trip(self):
-        with mesh_rules_for(tp_size=1, fsdp_size=1):
+        with mesh_rules_for(tp_size=1, fsdp_size=1, dp_size=1):
             cfg = make_vl_config("qwen3-vl-smoke")
             rngs = nnx.Rngs(params=jax.random.key(0))
             model = Qwen3VL(cfg, rngs=rngs)
@@ -78,11 +78,12 @@ class ExportRoundTripTest(absltest.TestCase):
                     "qwen3-vl-smoke",
                     tp_size=1,
                     fsdp_size=1,
+                    dp_size=1,
                 )
         _assert_params_equal(self, model, loaded)
 
     def test_qwen3_vl_moe_round_trip(self):
-        with mesh_rules_for(tp_size=1, fsdp_size=1):
+        with mesh_rules_for(tp_size=1, fsdp_size=1, dp_size=1):
             cfg = make_vl_config("qwen3-vl-smoke-moe")
             rngs = nnx.Rngs(params=jax.random.key(0))
             model = Qwen3VL(cfg, rngs=rngs)
@@ -93,11 +94,12 @@ class ExportRoundTripTest(absltest.TestCase):
                     "qwen3-vl-smoke-moe",
                     tp_size=1,
                     fsdp_size=1,
+                    dp_size=1,
                 )
         _assert_params_equal(self, model, loaded)
 
     def test_qwen3_5_round_trip(self):
-        with mesh_rules_for(tp_size=1, fsdp_size=1):
+        with mesh_rules_for(tp_size=1, fsdp_size=1, dp_size=1):
             cfg: Qwen3_5Config = make_config("qwen3.5-smoke")
             rngs = nnx.Rngs(params=jax.random.key(0))
             model = Qwen3_5ForConditionalGeneration(cfg, rngs=rngs)
@@ -108,11 +110,12 @@ class ExportRoundTripTest(absltest.TestCase):
                     "qwen3.5-smoke",
                     tp_size=1,
                     fsdp_size=1,
+                    dp_size=1,
                 )
         _assert_params_equal(self, model, loaded)
 
     def test_qwen3_5_dense_round_trip(self):
-        with mesh_rules_for(tp_size=1, fsdp_size=1):
+        with mesh_rules_for(tp_size=1, fsdp_size=1, dp_size=1):
             cfg: Qwen3_5Config = make_config("qwen3.5-smoke-dense")
             rngs = nnx.Rngs(params=jax.random.key(0))
             model = Qwen3_5ForConditionalGeneration(cfg, rngs=rngs)
@@ -123,6 +126,7 @@ class ExportRoundTripTest(absltest.TestCase):
                     "qwen3.5-smoke-dense",
                     tp_size=1,
                     fsdp_size=1,
+                    dp_size=1,
                 )
         _assert_params_equal(self, model, loaded)
 

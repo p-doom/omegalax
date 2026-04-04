@@ -86,9 +86,10 @@ class VisionPatchEmbed(nnx.Module):
         Args:
             pixels: flattened pixel patches (num_patches, C * tp * p * p).
         """
-        patches = pixels.reshape(-1, self.temporal_patch_size, self.patch_size, self.patch_size, self.in_channels)
+        N = pixels.shape[0]
+        patches = pixels.reshape(N, self.temporal_patch_size, self.patch_size, self.patch_size, self.in_channels)
         embedded = self.proj(patches)
-        return reshard(embedded.reshape(-1, self.embed_dim), self.hidden_shd)
+        return jax.lax.reshape(embedded, (N, self.embed_dim), out_sharding=self.hidden_shd)
 
 
 class VisionMLP(nnx.Module):
@@ -116,9 +117,9 @@ class VisionMLP(nnx.Module):
     @jax.named_scope("vision_mlp")
     def __call__(self, hidden_ND: jax.Array) -> jax.Array:
         ff_NF = self.fc1(hidden_ND, out_sharding=self.ff_shd)
-        ff_NF = reshard(nnx.gelu(ff_NF, approximate=True), self.ff_shd)
+        ff_NF = nnx.gelu(ff_NF, approximate=True)
         out_ND = self.fc2(ff_NF, out_sharding=self.hidden_shd)
-        return reshard(out_ND, self.hidden_shd)
+        return out_ND
 
 
 class VisionAttention(nnx.Module):
@@ -138,6 +139,8 @@ class VisionAttention(nnx.Module):
         )
         self.hidden_shd = hidden_shd
         self.heads_shd = heads_shd
+        object.__setattr__(self, "_q_sharding", None)
+        object.__setattr__(self, "_q_sharding_spec", P(None, *heads_shd))
         self.proj = nnx.Linear(
             cfg.hidden_size,
             cfg.hidden_size,
@@ -155,7 +158,6 @@ class VisionAttention(nnx.Module):
         cos_NK: jax.Array,
         sin_NK: jax.Array,
     ) -> jax.Array:
-        hidden_ND = reshard(hidden_ND, self.hidden_shd)
         N = hidden_ND.shape[0]
         qkv = self.qkv(hidden_ND, out_sharding=self.hidden_shd).reshape(N, 3, self.num_heads, self.head_dim)
         q_NHK = reshard(qkv[:, 0], self.heads_shd)
@@ -184,11 +186,12 @@ class VisionAttention(nnx.Module):
             q_NHK[None], k_NHK[None], v_NHK[None],
             mask=Mask(k_start=k_start, k_end=k_end),
             scale=self.scale, is_causal=False, implementation="mosaic",
+            q_sharding=self._q_sharding,
         )
         outputs_ND = attn_NHK[0, :N].reshape(N, -1)
 
         out_ND = self.proj(outputs_ND, out_sharding=self.hidden_shd)
-        return reshard(out_ND, self.hidden_shd)
+        return out_ND
 
 
 class VisionBlock(nnx.Module):
@@ -201,9 +204,8 @@ class VisionBlock(nnx.Module):
 
     @partial(jax.remat, static_argnums=0)
     def __call__(self, hidden_ND, cu_seqlens, cos_NK, sin_NK):
-        hidden_ND = reshard(hidden_ND, self.hidden_shd)
-        hidden_ND = reshard(hidden_ND + self.attn(self.norm1(hidden_ND), cu_seqlens, cos_NK, sin_NK), self.hidden_shd)
-        hidden_ND = reshard(hidden_ND + self.mlp(self.norm2(hidden_ND)), self.hidden_shd)
+        hidden_ND = hidden_ND + self.attn(self.norm1(hidden_ND), cu_seqlens, cos_NK, sin_NK)
+        hidden_ND = hidden_ND + self.mlp(self.norm2(hidden_ND))
         return hidden_ND
 
 
@@ -233,7 +235,6 @@ class VisionPatchMerger(nnx.Module):
 
     @jax.named_scope("vision_merger")
     def __call__(self, hidden_ND: jax.Array, merge_size: int) -> jax.Array:
-        hidden_ND = reshard(hidden_ND, self.hidden_shd)
         merged_dim = hidden_ND.shape[-1] * merge_size * merge_size
         normed = self.norm(hidden_ND)
         normed = jax.lax.reshape(
@@ -242,9 +243,9 @@ class VisionPatchMerger(nnx.Module):
             out_sharding=self.hidden_shd,
         )
         ff_NF = self.fc1(normed, out_sharding=self.ff_shd)
-        ff_NF = reshard(nnx.gelu(ff_NF, approximate=True), self.ff_shd)
+        ff_NF = nnx.gelu(ff_NF, approximate=True)
         out_ND = self.fc2(ff_NF, out_sharding=self.hidden_shd)
-        return reshard(out_ND, self.hidden_shd)
+        return out_ND
 
 
 class VisionModel(nnx.Module):
@@ -325,7 +326,7 @@ class VisionModel(nnx.Module):
         total_tokens: int = hidden_ND.shape[0]
 
         pos_embeds_ND = self._fast_pos_embed_interpolate(grid_thw, total_tokens)
-        hidden_ND = reshard(hidden_ND + pos_embeds_ND, self.hidden_shd)
+        hidden_ND = hidden_ND + pos_embeds_ND
 
         rotary_emb_NK = self._rot_pos_emb(grid_thw, total_tokens)
         emb_NK = jnp.concatenate([rotary_emb_NK, rotary_emb_NK], axis=-1)

@@ -166,16 +166,19 @@ class BuildAssistantLossMaskTest(absltest.TestCase):
         _, mask = self._apply_and_mask(messages)
         self.assertEqual(np.sum(mask), 0)
 
-    def test_mask_excludes_im_end(self):
+    def test_mask_includes_assistant_im_end(self):
         messages = [
             {"role": "user", "content": "X"},
             {"role": "assistant", "content": "Y"},
         ]
         ids, mask = self._apply_and_mask(messages)
-        # <|im_end|> tokens should not be supervised
+        # Assistant <|im_end|> should be supervised so the model learns to terminate.
+        # User <|im_end|> should not be supervised.
         im_end_positions = np.where(ids == self._im_end_id)[0]
-        for pos in im_end_positions:
-            self.assertEqual(mask[pos], 0, f"<|im_end|> at position {pos} should not be masked")
+        # First <|im_end|> is from user turn (not supervised)
+        self.assertEqual(mask[im_end_positions[0]], 0, "User <|im_end|> should not be supervised")
+        # Second <|im_end|> is from assistant turn (supervised)
+        self.assertEqual(mask[im_end_positions[1]], 1, "Assistant <|im_end|> should be supervised")
 
 
 class BuildChatMLTextTest(absltest.TestCase):

@@ -40,7 +40,6 @@ class MLP(nnx.Module):
         gate_BTF = self.gate_proj(hidden_BTD, out_sharding=self.shd_cfg.act_btf)
         up_BTF = self.up_proj(hidden_BTD, out_sharding=self.shd_cfg.act_btf)
         activated_BTF = nnx.silu(gate_BTF) * up_BTF
-        activated_BTF = reshard(activated_BTF, self.shd_cfg.act_btf)
         return self.down_proj(activated_BTF, out_sharding=self.shd_cfg.act_btd)
 
 
@@ -105,10 +104,16 @@ class MoEFeedForward(nnx.Module):
         )
 
         B, T = hidden_BTD.shape[:2]
-        flat_out = expert_out_BTED.reshape(B * T, cfg.num_experts, cfg.emb_dim)
+        flat_out = jax.lax.reshape(
+            expert_out_BTED, (B * T, cfg.num_experts, cfg.emb_dim),
+            out_sharding=P(batch_axis, None, hidden_axis),
+        )
         flat_idx = topk_idx_BTk.reshape(B * T, cfg.num_experts_per_tok)
         gathered = jnp.take_along_axis(flat_out, flat_idx[..., None], axis=1)
-        gathered = gathered.reshape(B, T, cfg.num_experts_per_tok, cfg.emb_dim)
+        gathered = jax.lax.reshape(
+            gathered, (B, T, cfg.num_experts_per_tok, cfg.emb_dim),
+            out_sharding=P(batch_axis, None, None, hidden_axis),
+        )
         merged_BTD = jnp.sum(gathered * topk_weights_BTk[..., None], axis=-2)
         merged_BTD = reshard(merged_BTD, self.shd_cfg.act_btd)
 

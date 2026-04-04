@@ -72,6 +72,7 @@ class Qwen3MappingTest(absltest.TestCase):
             MODEL_ID,
             tp_size=1,
             fsdp_size=1,
+            dp_size=1,
         )
 
     def _tokenize(self, texts: list[str]):
@@ -109,7 +110,7 @@ class Qwen3MappingTest(absltest.TestCase):
 
         # All JAX leaves should be populated and match abstract shapes.
         model_cls = api.registry.get_model_cls(self.cfg.variant)
-        with mesh_rules_for(tp_size=1, fsdp_size=1):
+        with mesh_rules_for(tp_size=1, fsdp_size=1, dp_size=1):
             _, abs_state = nnx.split(nnx.eval_shape(lambda: model_cls(self.cfg, rngs=nnx.Rngs(params=0))))
         abs_dict = nnx.to_pure_dict(abs_state)
         _, loaded_state = nnx.split(self.jax_model)

@@ -89,6 +89,7 @@ class Qwen3ModuleTest(absltest.TestCase):
             MODEL_ID,
             tp_size=1,
             fsdp_size=1,
+            dp_size=1,
         )
 
         chat_text = cls.tokenizer.apply_chat_template(

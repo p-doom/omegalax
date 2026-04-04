@@ -10,7 +10,7 @@ Key differences from standard Qwen3 attention:
 import jax
 import jax.numpy as jnp
 from flax import nnx
-from jax.sharding import PartitionSpec, reshard
+from jax.sharding import PartitionSpec
 from tokamax import dot_product_attention
 
 from .config import Qwen3_5TextConfig
@@ -73,6 +73,8 @@ class Attention(nnx.Module):
         self.n_rep = nh // nkv
         self.scale = hd ** -0.5
         self.hidden_shd = cfg.shd_cfg.act_btd
+        object.__setattr__(self, "_q_sharding", None)
+        object.__setattr__(self, "_q_sharding_spec", P(*cfg.shd_cfg.act_btnh))
 
     @jax.named_scope("attention")
     def __call__(
@@ -83,25 +85,29 @@ class Attention(nnx.Module):
         segment_ids_BT: jax.Array,
         position_ids_BT: jax.Array,
     ) -> jax.Array:
-        hidden_BTD = reshard(hidden_BTD, self.hidden_shd)
         B, T, _ = hidden_BTD.shape
 
-        q_out_BTHK2 = self.q_proj(hidden_BTD, out_sharding=self.shd_cfg.act_btf).reshape(
-            B, T, self.num_heads, self.head_dim * 2
+        heads_shd = self.shd_cfg.act_btnh
+        q_out_BTHK2 = jax.lax.reshape(
+            self.q_proj(hidden_BTD, out_sharding=self.shd_cfg.act_btf),
+            (B, T, self.num_heads, self.head_dim * 2),
+            out_sharding=P(heads_shd[0], heads_shd[1], heads_shd[2], None),
         )
         q_BTHK, gate_BTHK = jnp.split(q_out_BTHK2, 2, axis=-1)
-        gate_BTD = gate_BTHK.reshape(B, T, -1)
+        gate_BTD = jax.lax.reshape(gate_BTHK, (B, T, self.num_heads * self.head_dim), out_sharding=self.shd_cfg.act_btf)
 
-        q_BTHK = reshard(self.q_norm(q_BTHK), self.shd_cfg.act_btnh)
-        k_BTGK = reshard(
-            self.k_norm(
-                self.k_proj(hidden_BTD, out_sharding=self.shd_cfg.act_btf).reshape(B, T, self.num_kv_heads, self.head_dim)
-            ),
-            self.shd_cfg.act_btnh,
+        q_BTHK = self.q_norm(q_BTHK)
+        k_BTGK = self.k_norm(
+            jax.lax.reshape(
+                self.k_proj(hidden_BTD, out_sharding=self.shd_cfg.act_btf),
+                (B, T, self.num_kv_heads, self.head_dim),
+                out_sharding=heads_shd,
+            )
         )
-        v_BTGK = reshard(
-            self.v_proj(hidden_BTD, out_sharding=self.shd_cfg.act_btf).reshape(B, T, self.num_kv_heads, self.head_dim),
-            self.shd_cfg.act_btnh,
+        v_BTGK = jax.lax.reshape(
+            self.v_proj(hidden_BTD, out_sharding=self.shd_cfg.act_btf),
+            (B, T, self.num_kv_heads, self.head_dim),
+            out_sharding=heads_shd,
         )
 
         q_BTHK, k_BTGK = apply_text_rope(q_BTHK, k_BTGK, cos_BTK, sin_BTK)
@@ -109,9 +115,10 @@ class Attention(nnx.Module):
         attn_BTHK = dot_product_attention(
             q_BTHK, k_BTGK, v_BTGK,
             is_causal=True, scale=self.scale, implementation="mosaic",
+            q_sharding=self._q_sharding,
         )
-        attn_out_BTD = attn_BTHK.reshape(B, T, -1)
+        attn_out_BTD = jax.lax.reshape(attn_BTHK, (B, T, self.num_heads * self.head_dim), out_sharding=self.shd_cfg.act_btf)
 
         attn_out_BTD = attn_out_BTD * jax.nn.sigmoid(gate_BTD)
         out_BTD = self.o_proj(attn_out_BTD, out_sharding=self.shd_cfg.act_btd)
-        return reshard(out_BTD, self.shd_cfg.act_btd)
+        return out_BTD

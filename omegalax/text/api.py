@@ -97,10 +97,11 @@ def init_model(
     *,
     tp_size: int | None = None,
     fsdp_size: int | None = None,
+    dp_size: int | None = None,
 ) -> tuple[nnx.Module, TextConfig]:
     """Initialize a text-only model (Qwen3 or Qwen3.5 text) and return (model, cfg)."""
     cfg = resolve_config(model_or_id)
-    mesh = ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size)
+    mesh = ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size)
     cfg = align_config_to_mesh(cfg, mesh)
 
     axis_rules = axis_rules_for_mesh(mesh)
