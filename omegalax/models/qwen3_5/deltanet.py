@@ -56,7 +56,6 @@ def chunk_gated_delta_rule(
     v_BTHU: jax.Array,
     g_BTH: jax.Array,
     beta_BTH: jax.Array,
-    scan_state_shd: PartitionSpec,
     chunk_size: int = 64,
 ) -> jax.Array:
     """Chunked gated delta rule.
@@ -108,20 +107,15 @@ def chunk_gated_delta_rule(
     attn_BHJLM = -(jnp.einsum("BHJLA,BHJMA->BHJLM", kb_BHJLA, k_BHJLA) * decay_mask_LM)
     attn_BHJLM = jnp.where(upper_mask_LM, 0.0, attn_BHJLM)
 
-    def correction_step(i, attn):
-        row = attn[..., i, :]
-        contribution = jnp.einsum("...j,...jk->...k", row, attn)
-        new_row = row + contribution
-        return attn.at[..., i, :].set(new_row)
-
-    attn_BHJLM = jax.lax.fori_loop(1, chunk_size, correction_step, attn_BHJLM)
-    attn_BHJLM = attn_BHJLM + jnp.eye(chunk_size)
+    eye_LM = jnp.eye(chunk_size, dtype=attn_BHJLM.dtype)
+    lhs_BHJLM = eye_LM - attn_BHJLM
+    rhs_BHJLM = jnp.broadcast_to(eye_LM, lhs_BHJLM.shape)
+    attn_BHJLM = jax.scipy.linalg.solve_triangular(lhs_BHJLM, rhs_BHJLM, lower=True)
 
     v_corrected_BHJLU = jnp.einsum("BHJLM,BHJMU->BHJLU", attn_BHJLM, vb_BHJLU)
     k_cumdecay_BHJLA = jnp.einsum("BHJLM,BHJMA->BHJLA", attn_BHJLM, kb_BHJLA * jnp.exp(g_BHJL)[..., None])
 
     state_BHAU = jnp.zeros((B, H, A, U), dtype=jnp.float32)
-    state_BHAU = reshard(state_BHAU, scan_state_shd)
     upper_mask_1_LM = jnp.triu(jnp.ones((chunk_size, chunk_size), dtype=jnp.bool_), k=1)
 
     def chunk_step(carry, chunk_idx):
@@ -146,7 +140,6 @@ def chunk_gated_delta_rule(
         g_decay_BHL = jnp.exp(g_j_BHL[:, :, -1:] - g_j_BHL)
         k_decayed_BHMA = k_j_BHMA * g_decay_BHL[..., None]
         new_st_BHAU = st_BHAU * jnp.exp(g_last) + jnp.einsum("BHMA,BHMU->BHAU", k_decayed_BHMA, v_new_BHLU)
-        new_st_BHAU = reshard(new_st_BHAU, scan_state_shd)
 
         return new_st_BHAU, chunk_out_BHLU
 
@@ -210,7 +203,10 @@ class GatedDeltaNet(nnx.Module):
         elif head_axis is None or head_axis == batch_axis:
             flat_axis = batch_axis
         else:
-            flat_axis = (batch_axis, head_axis)
+            # Flatten into a single tuple — PartitionSpec forbids nested tuples.
+            ba = batch_axis if isinstance(batch_axis, tuple) else (batch_axis,)
+            ha = head_axis if isinstance(head_axis, tuple) else (head_axis,)
+            flat_axis = (*ba, *ha)
         self.hidden_shd = cfg.shd_cfg.act_btd
         self.scan_state_shd = P(batch_axis, head_axis, None, None)
         self.flat_norm_shd = P(flat_axis, None)
@@ -228,8 +224,6 @@ class GatedDeltaNet(nnx.Module):
 
     @jax.named_scope("gated_delta_net")
     def __call__(self, hidden_BTD: jax.Array, attention_mask_BT: jax.Array | None = None) -> jax.Array:
-        hidden_BTD = reshard(hidden_BTD, self.hidden_shd)
-
         if attention_mask_BT is not None and attention_mask_BT.shape[1] > 1:
             hidden_BTD = hidden_BTD * attention_mask_BT[:, :, None]
 
@@ -238,47 +232,75 @@ class GatedDeltaNet(nnx.Module):
         batch_axis = self.shd_cfg.act_btd[0]
         head_axis = self.shd_cfg.act_btnh[2]
         mixed_qkv_BCT = self.in_proj_qkv(hidden_BTD, out_sharding=self.shd_cfg.act_btf).transpose(0, 2, 1)
-        z_BTHU = self.in_proj_z(hidden_BTD, out_sharding=self.shd_cfg.act_btf).reshape(B, T, self.num_v_heads, self.head_v_dim)
+        z_BTHU = jax.lax.reshape(
+            self.in_proj_z(hidden_BTD, out_sharding=self.shd_cfg.act_btf),
+            (B, T, self.num_v_heads, self.head_v_dim),
+            out_sharding=P(batch_axis, None, head_axis, None),
+        )
         b_BTH = self.in_proj_b(hidden_BTD, out_sharding=P(batch_axis, None, head_axis))
         a_BTH = self.in_proj_a(hidden_BTD, out_sharding=P(batch_axis, None, head_axis))
 
         mixed_qkv_BCT = nnx.silu(_causal_depthwise_conv1d(mixed_qkv_BCT, self.conv_weight[...].astype(mixed_qkv_BCT.dtype)))
         mixed_qkv_BTC = mixed_qkv_BCT.transpose(0, 2, 1)
 
-        q_BTHA, k_BTHA, v_BTHU = jnp.split(
-            mixed_qkv_BTC, [self.key_dim, self.key_dim * 2], axis=-1
-        )
-        q_BTHA = q_BTHA.reshape(B, T, self.num_k_heads, self.head_k_dim)
-        k_BTHA = k_BTHA.reshape(B, T, self.num_k_heads, self.head_k_dim)
-        v_BTHU = v_BTHU.reshape(B, T, self.num_v_heads, self.head_v_dim)
-
+        from jax.experimental.shard_map import shard_map
+        mesh = jax.sharding.get_abstract_mesh()
         beta_BTH = jax.nn.sigmoid(b_BTH)
         A_H = -jnp.exp(self.A_log[...].astype(jnp.float32))
         g_BTH = A_H * jax.nn.softplus(a_BTH.astype(jnp.float32) + self.dt_bias[...])
 
-        if self.gqa_factor > 1:
-            q_BTHA = jnp.broadcast_to(
-                q_BTHA[:, :, :, None, :],
-                (B, T, self.num_k_heads, self.gqa_factor, self.head_k_dim),
-            ).reshape(B, T, self.num_v_heads, self.head_k_dim)
-            k_BTHA = jnp.broadcast_to(
-                k_BTHA[:, :, :, None, :],
-                (B, T, self.num_k_heads, self.gqa_factor, self.head_k_dim),
-            ).reshape(B, T, self.num_v_heads, self.head_k_dim)
+        norm_w = self.norm.weight[...]
+        norm_eps = self.norm.eps
+        key_dim = self.key_dim
+        num_k_heads = self.num_k_heads
+        head_k_dim = self.head_k_dim
+        num_v_heads = self.num_v_heads
+        head_v_dim = self.head_v_dim
+        gqa_factor = self.gqa_factor
 
-        core_out_BTHU = chunk_gated_delta_rule(
-            q_BTHA,
-            k_BTHA,
-            v_BTHU,
-            g_BTH,
-            beta_BTH,
-            scan_state_shd=self.scan_state_shd,
-        )
+        def _full_deltanet(qkv_BTC, z_BTHU, g_BTH, beta_BTH, nw):
+            """Split → reshape → GQA → DeltaNet → norm.  All local (no TP)."""
+            B, T, C_local = qkv_BTC.shape
+            # Inside shard_map, dims are local. Derive local head counts from shapes.
+            local_v_heads = z_BTHU.shape[2]
+            local_k_heads = local_v_heads // gqa_factor if gqa_factor > 1 else local_v_heads
+            local_key_dim = local_k_heads * head_k_dim
+            q_BTA, k_BTA, v_BTU = jnp.split(qkv_BTC, [local_key_dim, local_key_dim * 2], axis=-1)
+            q_BTHA = q_BTA.reshape(B, T, local_k_heads, head_k_dim)
+            k_BTHA = k_BTA.reshape(B, T, local_k_heads, head_k_dim)
+            v_BTHU_ = v_BTU.reshape(B, T, local_v_heads, head_v_dim)
+            if gqa_factor > 1:
+                q_BTHA = jnp.broadcast_to(
+                    q_BTHA[:, :, :, None, :],
+                    (B, T, local_k_heads, gqa_factor, head_k_dim),
+                ).reshape(B, T, local_v_heads, head_k_dim)
+                k_BTHA = jnp.broadcast_to(
+                    k_BTHA[:, :, :, None, :],
+                    (B, T, local_k_heads, gqa_factor, head_k_dim),
+                ).reshape(B, T, local_v_heads, head_k_dim)
+            out = chunk_gated_delta_rule(q_BTHA, k_BTHA, v_BTHU_, g_BTH, beta_BTH)
+            # Inline RMSNormGated
+            BL = out.shape[0] * out.shape[1]
+            H, D = out.shape[2], out.shape[3]
+            core_flat = out.reshape(BL * H, D)
+            z_flat = z_BTHU.reshape(BL * H, D)
+            dtype = core_flat.dtype
+            x_f32 = core_flat.astype(jnp.float32)
+            variance = jnp.mean(x_f32 ** 2, axis=-1, keepdims=True)
+            normed = (x_f32 * jax.lax.rsqrt(variance + norm_eps)).astype(dtype)
+            normed = nw.astype(dtype) * normed
+            gated = normed * jax.nn.silu(z_flat.astype(jnp.float32))
+            return gated.astype(dtype).reshape(out.shape[0], out.shape[1], H * D)
 
-        flat_rows = B * T * self.num_v_heads
-        core_flat = jax.lax.reshape(core_out_BTHU, (flat_rows, self.head_v_dim), out_sharding=self.flat_norm_shd)
-        z_flat = jax.lax.reshape(z_BTHU, (flat_rows, self.head_v_dim), out_sharding=self.flat_norm_shd)
-        normed = self.norm(core_flat, z_flat)
-        normed_BTD = jax.lax.reshape(normed, (B, T, self.value_dim), out_sharding=self.shd_cfg.act_btd)
+        heads_shd = P(batch_axis, None, head_axis, None)
+        beta_g_shd = P(batch_axis, None, head_axis)
+
+        normed_BTD = shard_map(
+            _full_deltanet, mesh,
+            in_specs=(self.shd_cfg.act_btf, heads_shd, beta_g_shd, beta_g_shd, P(None)),
+            out_specs=self.shd_cfg.act_btf,
+            check_rep=False,
+        )(mixed_qkv_BTC, z_BTHU, g_BTH, beta_BTH, norm_w)
+
         out_BTD = self.out_proj(normed_BTD, out_sharding=self.shd_cfg.act_btd)
-        return reshard(out_BTD, self.shd_cfg.act_btd)
+        return out_BTD

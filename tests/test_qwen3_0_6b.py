@@ -72,6 +72,7 @@ class Qwen3MappingTest(absltest.TestCase):
             MODEL_ID,
             tp_size=1,
             fsdp_size=1,
+            dp_size=1,
         )
 
     def _tokenize(self, texts: list[str]):
@@ -89,7 +90,9 @@ class Qwen3MappingTest(absltest.TestCase):
 
     def _jax_prefill_logits(self, input_ids: torch.Tensor) -> np.ndarray:
         token_ids_BT = jnp.asarray(np.array(input_ids.cpu(), dtype=np.int32))
-        logits_BTV, _ = api.forward(self.jax_model, token_ids_BT, self.pad_id, self.cfg)
+        segment_ids_BT = 1 * (token_ids_BT != self.pad_id)
+        hidden_BTD, _ = self.jax_model(token_ids_BT, segment_ids_BT, None, jnp.array(0, dtype=jnp.int32))
+        logits_BTV = self.jax_model.lm_head(hidden_BTD)
         return np.asarray(logits_BTV, dtype=np.float32)
 
     def test_parameter_mapping_is_complete(self):
@@ -107,7 +110,7 @@ class Qwen3MappingTest(absltest.TestCase):
 
         # All JAX leaves should be populated and match abstract shapes.
         model_cls = api.registry.get_model_cls(self.cfg.variant)
-        with mesh_rules_for(tp_size=1, fsdp_size=1):
+        with mesh_rules_for(tp_size=1, fsdp_size=1, dp_size=1):
             _, abs_state = nnx.split(nnx.eval_shape(lambda: model_cls(self.cfg, rngs=nnx.Rngs(params=0))))
         abs_dict = nnx.to_pure_dict(abs_state)
         _, loaded_state = nnx.split(self.jax_model)
@@ -147,7 +150,9 @@ class Qwen3MappingTest(absltest.TestCase):
         pure_state = nnx.to_pure_dict(state)
         restored = nnx.merge(graph_def, pure_state)
         restored_token_ids_BT = jnp.asarray(np.array(inputs["input_ids"].cpu()), dtype=jnp.int32)
-        restored_logits_BTV, _ = api.forward(restored, restored_token_ids_BT, self.pad_id, self.cfg)
+        segment_ids_BT = 1 * (restored_token_ids_BT != self.pad_id)
+        restored_hidden_BTD, _ = restored(restored_token_ids_BT, segment_ids_BT, None, jnp.array(0, dtype=jnp.int32))
+        restored_logits_BTV = restored.lm_head(restored_hidden_BTD)
         restored_logits_BTV = np.asarray(restored_logits_BTV)
 
         np.testing.assert_allclose(restored_logits_BTV, baseline_BTV, rtol=0, atol=0)

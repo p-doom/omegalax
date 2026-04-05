@@ -11,8 +11,13 @@ from collections.abc import Sequence
 from typing import Any
 
 import numpy as np
-from PIL import Image
 from transformers import BaseImageProcessor, PreTrainedTokenizer
+
+from omegalax.data.qwen3_encoding import (
+    build_chatml_text as _build_chatml_text,
+    encode_qwen_messages as _encode_qwen_messages,
+    extract_images as _extract_images,
+)
 
 
 def _build_assistant_loss_mask(
@@ -41,76 +46,15 @@ def _build_assistant_loss_mask(
     content_starts = starts[is_asst] + 3
     content_ends = ends[is_asst]
 
-    # +1 at content start, -1 at <|im_end|> → cumsum gives the mask.
+    # +1 at content start, -1 after <|im_end|> → cumsum gives the mask.
+    # content_ends points at <|im_end|> itself, which must be a supervised
+    # target so the model learns to terminate; the \n that follows is not.
     signal = np.zeros(n, dtype=np.int32)
     valid = content_starts < n
+    ends_plus_one = content_ends[valid] + 1
     np.add.at(signal, content_starts[valid], 1)
-    np.add.at(signal, content_ends[valid], -1)
+    np.add.at(signal, ends_plus_one[ends_plus_one < n], -1)
     return np.cumsum(signal).astype(np.int32)
-
-
-def _build_chatml_text(
-    messages: list[dict[str, Any]],
-    image_grids: list[tuple[int, int, int]],
-    merge_size: int,
-) -> str:
-    """Build a ChatML string from messages, inserting image pad tokens.
-
-    ``image_grids`` contains one ``(grid_t, grid_h, grid_w)`` tuple per
-    image, in the order images appear across all messages.  For each image
-    the number of ``<|image_pad|>`` tokens is
-    ``grid_t * (grid_h // merge_size) * (grid_w // merge_size)``.
-    """
-    parts: list[str] = []
-    img_idx = 0
-
-    for msg in messages:
-        role = msg["role"]
-        content = msg["content"]
-
-        parts.append(f"<|im_start|>{role}\n")
-
-        if isinstance(content, str):
-            parts.append(content)
-        else:
-            for block in content:
-                if block["type"] == "text":
-                    parts.append(block["text"])
-                elif block["type"] == "image":
-                    grid_t, grid_h, grid_w = image_grids[img_idx]
-                    img_idx += 1
-                    n_tokens = grid_t * (grid_h // merge_size) * (grid_w // merge_size)
-                    parts.append(
-                        "<|vision_start|>"
-                        + "<|image_pad|>" * n_tokens
-                        + "<|vision_end|>"
-                    )
-
-        parts.append("<|im_end|>\n")
-
-    return "".join(parts)
-
-
-def _extract_images(messages: list[dict[str, Any]]) -> list[Image.Image]:
-    """Pull PIL images out of Qwen-style structured content blocks.
-
-    Only messages whose ``content`` is a list (structured-content format)
-    are inspected; plain-string content means text-only and is skipped.
-    """
-    images: list[Image.Image] = []
-    for msg in messages:
-        content = msg["content"]
-        if isinstance(content, str):
-            continue
-        for block in content:
-            if block["type"] != "image":
-                continue
-            if "image" in block:
-                img = block["image"]
-                images.append(img if isinstance(img, Image.Image) else Image.open(img))
-            elif "url" in block:
-                images.append(Image.open(block["url"]))
-    return images
 
 
 class TextSFTCollator:
@@ -136,13 +80,16 @@ class TextSFTCollator:
 
         for ex in examples:
             messages = ex["messages"]
-
-            result = self.tokenizer.apply_chat_template(
-                messages, tokenize=True, add_generation_prompt=False,
+            encoded = _encode_qwen_messages(
+                messages,
+                tokenizer=self.tokenizer,
             )
-            full_ids = result["input_ids"]
+            full_ids = encoded["input_ids"]
             if len(full_ids) > self.max_length:
-                full_ids = full_ids[-self.max_length:]
+                raise ValueError(
+                    f"Encoded example length {len(full_ids)} exceeds max_length={self.max_length}; "
+                    "rebuild the chunk index for this profile."
+                )
 
             seq_len = len(full_ids)
             pad_len = self.max_length - seq_len
@@ -233,23 +180,23 @@ class VLMSFTCollator:
 
         for ex in examples:
             messages = ex["messages"]
-
-            imgs = _extract_images(messages)
-            image_grids: list[tuple[int, int, int]] = []
-            if imgs:
-                has_images = True
-                processed = self.image_processor.preprocess(imgs, return_tensors="np")
-                pv = processed["pixel_values"]
-                grid_thw = processed["image_grid_thw"]
-                all_pixel_values.append(pv)
-                all_grid_thw.append(grid_thw)
-                image_grids = [tuple(row) for row in grid_thw.tolist()]
-
-            text = _build_chatml_text(messages, image_grids, self.image_processor.merge_size)
-            full_ids = self.tokenizer.encode(text, add_special_tokens=False)
-
+            encoded = _encode_qwen_messages(
+                messages,
+                tokenizer=self.tokenizer,
+                image_processor=self.image_processor,
+                include_pixels=True,
+            )
+            full_ids = encoded["input_ids"]
             if len(full_ids) > self.max_length:
-                full_ids = full_ids[-self.max_length:]
+                raise ValueError(
+                    f"Encoded example length {len(full_ids)} exceeds max_length={self.max_length}; "
+                    "rebuild the chunk index for this profile."
+                )
+
+            if "pixel_values" in encoded:
+                has_images = True
+                all_pixel_values.append(encoded["pixel_values"])
+                all_grid_thw.append(encoded["image_grid_thw"])
 
             seq_len = len(full_ids)
             pad_len = self.max_length - seq_len

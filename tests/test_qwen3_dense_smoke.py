@@ -19,7 +19,6 @@ from absl.testing import absltest
 from transformers import Qwen3Config as HFQwen3Config
 from transformers import Qwen3ForCausalLM
 
-from omegalax.text import api
 from omegalax.models.qwen3.config import make_config
 from omegalax.models.qwen3.loader import create_qwen3_from_safetensors
 
@@ -76,6 +75,7 @@ class Qwen3DenseSmokeTest(absltest.TestCase):
             SMOKE_ID,
             tp_size=1,
             fsdp_size=1,
+            dp_size=1,
         )
 
         torch_dtype = _JNP_TO_TORCH[cls.jax_cfg.dtype]
@@ -84,7 +84,9 @@ class Qwen3DenseSmokeTest(absltest.TestCase):
 
     def _jax_prefill_logits(self, tokens_np: np.ndarray) -> np.ndarray:
         token_ids_BT = jnp.asarray(tokens_np)
-        logits_BTV, _ = api.forward(self.jax_model, token_ids_BT, self.pad_id, self.jax_cfg)
+        segment_ids_BT = 1 * (token_ids_BT != self.pad_id)
+        hidden_BTD, _ = self.jax_model(token_ids_BT, segment_ids_BT, None, jnp.array(0, dtype=jnp.int32))
+        logits_BTV = self.jax_model.lm_head(hidden_BTD)
         return np.asarray(logits_BTV, dtype=np.float32)
 
     def test_weight_loading_succeeds(self):
@@ -132,14 +134,15 @@ class Qwen3DenseSmokeTest(absltest.TestCase):
 
         token_ids_BT = _random_input(batch_size=1, seq_len=16, vocab_size=HF_SMOKE_CFG.vocab_size)
         jax_token_ids_BT = jnp.asarray(token_ids_BT)
-        baseline_BTV, _ = api.forward(self.jax_model, jax_token_ids_BT, self.pad_id, self.jax_cfg)
-        baseline_BTV = np.asarray(baseline_BTV)
+        segment_ids_BT = 1 * (jax_token_ids_BT != self.pad_id)
+        baseline_hidden, _ = self.jax_model(jax_token_ids_BT, segment_ids_BT, None, jnp.array(0, dtype=jnp.int32))
+        baseline_BTV = np.asarray(self.jax_model.lm_head(baseline_hidden))
 
         graph_def, state = nnx.split(self.jax_model)
         pure_state = nnx.to_pure_dict(state)
         restored = nnx.merge(graph_def, pure_state)
-        restored_logits_BTV, _ = api.forward(restored, jax_token_ids_BT, self.pad_id, self.jax_cfg)
-        restored_logits_BTV = np.asarray(restored_logits_BTV)
+        restored_hidden, _ = restored(jax_token_ids_BT, segment_ids_BT, None, jnp.array(0, dtype=jnp.int32))
+        restored_logits_BTV = np.asarray(restored.lm_head(restored_hidden))
 
         np.testing.assert_array_equal(restored_logits_BTV, baseline_BTV)
 

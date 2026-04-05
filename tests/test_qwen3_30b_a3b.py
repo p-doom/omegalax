@@ -42,6 +42,7 @@ class Qwen3_30B_A3B_Test(absltest.TestCase):
             MODEL_ID,
             tp_size=1,
             fsdp_size=1,
+            dp_size=1,
         )
 
         cls.hf_model = Qwen3MoeForCausalLM.from_pretrained(
@@ -63,7 +64,9 @@ class Qwen3_30B_A3B_Test(absltest.TestCase):
 
     def _jax_prefill_logits(self, input_ids: torch.Tensor) -> np.ndarray:
         token_ids_BT = jnp.asarray(np.array(input_ids.cpu(), dtype=np.int32))
-        logits_BTV, _ = api.forward(self.jax_model, token_ids_BT, self.pad_id, self.cfg)
+        segment_ids_BT = 1 * (token_ids_BT != self.pad_id)
+        hidden_BTD, _ = self.jax_model(token_ids_BT, segment_ids_BT, None, jnp.array(0, dtype=jnp.int32))
+        logits_BTV = self.jax_model.lm_head(hidden_BTD)
         return np.asarray(logits_BTV, dtype=np.float32)
 
     def test_prefill_logits_match_hf(self):

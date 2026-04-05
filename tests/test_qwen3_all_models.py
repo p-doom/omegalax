@@ -66,6 +66,7 @@ class Qwen3AllModelsTest(parameterized.TestCase):
             model_id,
             tp_size=1,
             fsdp_size=1,
+            dp_size=1,
         )
 
         tokenizer = AutoTokenizer.from_pretrained(model_path)
@@ -89,8 +90,9 @@ class Qwen3AllModelsTest(parameterized.TestCase):
         with torch.no_grad():
             hf_logits_BTV = hf_model(**inputs).logits.cpu().numpy()
 
-        jax_logits_BTV, _ = api.forward(jax_model, token_ids_BT, pad_id, cfg)
-        jax_logits_BTV = np.asarray(jax_logits_BTV, dtype=np.float32)
+        segment_ids_BT = 1 * (token_ids_BT != pad_id)
+        hidden_BTD, _ = jax_model(token_ids_BT, segment_ids_BT, None, jnp.array(0, dtype=jnp.int32))
+        jax_logits_BTV = np.asarray(jax_model.lm_head(hidden_BTD), dtype=np.float32)
 
         mask = inputs["attention_mask"].numpy().astype(bool)
         j, h = jax_logits_BTV[mask], hf_logits_BTV[mask]

@@ -10,6 +10,9 @@ import jax.numpy as jnp
 from flax import nnx
 from jax.sharding import PartitionSpec as P, reshard
 
+from tokamax import dot_product_attention
+from tokamax._src.ops.attention.base import Mask
+
 from omegalax.models.shard_config import ShardConfig
 from .config import Qwen3VLVisionConfig
 
@@ -104,7 +107,7 @@ class VisionPatchEmbed(nnx.Module):
     def __call__(self, pixels: jax.Array) -> jax.Array:
         flat = pixels.reshape(-1, self.in_features)
         out_ND = self.proj(flat, out_sharding=self.hidden_shd)
-        return reshard(out_ND, self.hidden_shd)
+        return out_ND
 
 
 class VisionMLP(nnx.Module):
@@ -131,9 +134,9 @@ class VisionMLP(nnx.Module):
 
     def __call__(self, hidden_ND: jax.Array) -> jax.Array:
         ff_NF = self.fc1(hidden_ND, out_sharding=self.ff_shd)
-        ff_NF = reshard(jax.nn.gelu(ff_NF, approximate=True), self.ff_shd)
+        ff_NF = jax.nn.gelu(ff_NF, approximate=True)
         out_ND = self.fc2(ff_NF, out_sharding=self.hidden_shd)
-        return reshard(out_ND, self.hidden_shd)
+        return out_ND
 
 
 def _rotate_half(x: jax.Array) -> jax.Array:
@@ -186,27 +189,49 @@ class VisionAttention(nnx.Module):
         )
         self.hidden_shd = hidden_shd
         self.heads_shd = heads_shd
+        object.__setattr__(self, "_q_sharding", None)
+        object.__setattr__(self, "_q_sharding_spec", P(None, *heads_shd))
 
     def __call__(self, hidden_ND: jax.Array, cu_seqlens: jax.Array, cos_NK: jax.Array, sin_NK: jax.Array) -> jax.Array:
-        hidden_ND = reshard(hidden_ND, self.hidden_shd)
         N = hidden_ND.shape[0]
-        qkv = self.qkv(hidden_ND, out_sharding=self.hidden_shd).reshape(N, 3, self.num_heads, self.head_dim)
+        qkv_shd = P(self.hidden_shd[0], None, self.heads_shd[1], self.heads_shd[2])
+        qkv = jax.lax.reshape(
+            self.qkv(hidden_ND, out_sharding=self.hidden_shd),
+            (N, 3, self.num_heads, self.head_dim),
+            out_sharding=qkv_shd,
+        )
         q_NHK = reshard(qkv[:, 0], self.heads_shd)
         k_NHK = reshard(qkv[:, 1], self.heads_shd)
         v_NHK = reshard(qkv[:, 2], self.heads_shd)
 
         q_NHK, k_NHK = apply_rotary_pos_emb_vision(q_NHK, k_NHK, cos_NK, sin_NK)
 
-        seg_ids = jnp.searchsorted(cu_seqlens[1:], jnp.arange(N), side="right")
-        attn_mask_NM = seg_ids[:, None] == seg_ids[None, :]
+        _BLOCK = 128  # tokamax mosaic block alignment
+        N_padded = (N + _BLOCK - 1) // _BLOCK * _BLOCK
+        pad_n = N_padded - N
 
-        logits_HNM = jnp.einsum("NHK,MHK->HNM", q_NHK, k_NHK) * self.scale
-        logits_HNM = jnp.where(attn_mask_NM[None, :, :], logits_HNM, -1e9)
-        weights_HNM = jax.nn.softmax(logits_HNM.astype(jnp.float32), axis=-1).astype(q_NHK.dtype)
-        outputs_ND = jnp.einsum("HNM,MHK->NHK", weights_HNM, v_NHK).reshape(N, -1)
+        if pad_n > 0:
+            q_NHK = jnp.pad(q_NHK, ((0, pad_n), (0, 0), (0, 0)))
+            k_NHK = jnp.pad(k_NHK, ((0, pad_n), (0, 0), (0, 0)))
+            v_NHK = jnp.pad(v_NHK, ((0, pad_n), (0, 0), (0, 0)))
+
+        seg_ids = jnp.searchsorted(cu_seqlens[1:], jnp.arange(N_padded), side="right")
+        k_start = cu_seqlens[jnp.minimum(seg_ids, cu_seqlens.shape[0] - 2)]
+        k_end = cu_seqlens[jnp.minimum(seg_ids + 1, cu_seqlens.shape[0] - 1)]
+        is_pad = jnp.arange(N_padded) >= N
+        k_start = jnp.where(is_pad, N_padded, k_start)
+        k_end = jnp.where(is_pad, N_padded, k_end)
+        mask = Mask(k_start=k_start, k_end=k_end)
+
+        attn_NHK = dot_product_attention(
+            q_NHK[None], k_NHK[None], v_NHK[None],
+            mask=mask, scale=self.scale, is_causal=False, implementation="mosaic",
+            q_sharding=self._q_sharding,
+        )
+        outputs_ND = attn_NHK[0, :N].reshape(N, -1)
 
         out_ND = self.proj(outputs_ND, out_sharding=self.hidden_shd)
-        return reshard(out_ND, self.hidden_shd)
+        return out_ND
 
 
 class VisionBlock(nnx.Module):
@@ -219,9 +244,8 @@ class VisionBlock(nnx.Module):
 
     @partial(jax.remat, static_argnums=0)
     def __call__(self, hidden_ND: jax.Array, cu_seqlens: jax.Array, cos_NK: jax.Array, sin_NK: jax.Array) -> jax.Array:
-        hidden_ND = reshard(hidden_ND, self.hidden_shd)
-        hidden_ND = reshard(hidden_ND + self.attn(self.norm1(hidden_ND), cu_seqlens, cos_NK, sin_NK), self.hidden_shd)
-        hidden_ND = reshard(hidden_ND + self.mlp(self.norm2(hidden_ND)), self.hidden_shd)
+        hidden_ND = hidden_ND + self.attn(self.norm1(hidden_ND), cu_seqlens, cos_NK, sin_NK)
+        hidden_ND = hidden_ND + self.mlp(self.norm2(hidden_ND))
         return hidden_ND
 
 
@@ -261,18 +285,15 @@ class VisionPatchMerger(nnx.Module):
         self.ff_shd = ff_shd
 
     def __call__(self, hidden_ND: jax.Array) -> jax.Array:
-        hidden_ND = reshard(hidden_ND, self.hidden_shd)
         new_sizes = (hidden_ND.shape[0] * hidden_ND.shape[1] // self.hidden_size, self.hidden_size)
         if self.use_postshuffle_norm:
             normed = self.norm(jax.lax.reshape(hidden_ND, new_sizes, out_sharding=self.hidden_shd))
         else:
             normed = jax.lax.reshape(self.norm(hidden_ND), new_sizes, out_sharding=self.hidden_shd)
-        # FIXME (f.srambical):  we should probably approximate the gelu for increased throughput,
-        # even if that deviates from huggingface numerics
         ff_NF = self.fc1(normed, out_sharding=self.ff_shd)
-        ff_NF = reshard(jax.nn.gelu(ff_NF, approximate=False), self.ff_shd)
+        ff_NF = jax.nn.gelu(ff_NF, approximate=True)
         out_ND = self.fc2(ff_NF, out_sharding=self.hidden_shd)
-        return reshard(out_ND, self.hidden_shd)
+        return out_ND
 
 
 class VisionModel(nnx.Module):
@@ -371,7 +392,7 @@ class VisionModel(nnx.Module):
         total_tokens: int = hidden_ND.shape[0]
 
         pos_embeds_ND = self._interpolate_pos_embed(image_grid, total_tokens)
-        hidden_ND = reshard(hidden_ND + pos_embeds_ND, self.hidden_shd)
+        hidden_ND = hidden_ND + pos_embeds_ND
 
         rotary_emb_NK = self._compute_rotary_pos_emb(image_grid, total_tokens)
         emb_NK = jnp.concatenate([rotary_emb_NK, rotary_emb_NK], axis=-1)

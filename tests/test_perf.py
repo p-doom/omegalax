@@ -1,15 +1,20 @@
 """Tests for training FLOP counting and throughput metrics."""
 
+from unittest import mock
+
 from absl.testing import absltest
 
+from omegalax.distributed.mesh import process_local_batch_size
 from omegalax.models.qwen3.config import make_config as make_qwen3_config
 from omegalax.models.qwen3_5.config import make_config as make_qwen3_5_config
+from omegalax.models.qwen3_vl.config import make_vl_config as make_qwen3_vl_config
 from omegalax.trainers.perf import (
     PEAK_TFLOPS,
-    training_flops_per_token,
     per_device_flops_per_step,
+    qwen3_vl_vision_training_flops,
     step_metrics,
     StepTimer,
+    training_flops_per_token,
 )
 
 
@@ -54,6 +59,17 @@ class TrainingFlopsPerTokenTest(absltest.TestCase):
         self.assertGreater(flops, 0)
         self.assertEqual(flops, training_flops_per_token(full_cfg.text_config, seq_len))
 
+    def test_qwen3_vl_vision_training_flops_positive(self):
+        cfg = make_qwen3_vl_config("qwen3-vl-smoke")
+        flops = qwen3_vl_vision_training_flops(cfg, [[1, 4, 4]])
+        self.assertGreater(flops, 0)
+
+    def test_qwen3_vl_vision_training_flops_uses_full_batched_attention(self):
+        cfg = make_qwen3_vl_config("qwen3-vl-smoke")
+        single = qwen3_vl_vision_training_flops(cfg, [[1, 4, 4]])
+        doubled = qwen3_vl_vision_training_flops(cfg, [[1, 4, 4], [1, 4, 4]])
+        self.assertGreater(doubled, 2 * single)
+
 
 class PerDeviceFlopsStepTest(absltest.TestCase):
     def test_per_device_flops_per_step_positive(self):
@@ -61,12 +77,22 @@ class PerDeviceFlopsStepTest(absltest.TestCase):
         flops = per_device_flops_per_step(cfg, seq_len=8, batch_size=2)
         self.assertGreater(flops, 0)
 
+    def test_qwen3_vl_per_device_flops_adds_vision_cost(self):
+        cfg = make_qwen3_vl_config("qwen3-vl-smoke")
+        with mock.patch("jax.device_count", return_value=1):
+            base = per_device_flops_per_step(cfg, seq_len=8, batch_size=2)
+            with_images = per_device_flops_per_step(
+                cfg, seq_len=8, batch_size=2, image_grid_thw=[[1, 4, 4]]
+            )
+        self.assertGreater(with_images, base)
+
 
 class StepMetricsTest(absltest.TestCase):
     def test_step_metrics_zero_delta(self):
         import datetime
         out = step_metrics(1e12, datetime.timedelta(0), 64, 312.0)
         self.assertEqual(out["step_time_s"], 0.0)
+        self.assertEqual(out["global_tokens_per_sec"], 0.0)
         self.assertEqual(out["tokens_per_sec_per_device"], 0.0)
         self.assertEqual(out["tflops_per_device"], 0.0)
         self.assertEqual(out["mfu"], 0.0)
@@ -76,6 +102,7 @@ class StepMetricsTest(absltest.TestCase):
         # 1e12 FLOPs in 1 second -> 1 TFLOP/s; peak 312 -> mfu = 1/312
         out = step_metrics(1e12, datetime.timedelta(seconds=1), 64, 312.0)
         self.assertAlmostEqual(out["step_time_s"], 1.0)
+        self.assertAlmostEqual(out["global_tokens_per_sec"], 64.0)
         self.assertGreater(out["tokens_per_sec_per_device"], 0)
         self.assertAlmostEqual(out["tflops_per_device"], 1.0)
         self.assertAlmostEqual(out["mfu"], 1.0 / 312.0)
@@ -85,6 +112,17 @@ class StepMetricsTest(absltest.TestCase):
         out = step_metrics(1e12, datetime.timedelta(seconds=1), 64, None)
         self.assertEqual(out["mfu"], 0.0)
         self.assertGreater(out["tflops_per_device"], 0)
+
+
+class ProcessLocalBatchSizeTest(absltest.TestCase):
+    def test_returns_process_local_batch_size(self):
+        with mock.patch("jax.process_count", return_value=4):
+            self.assertEqual(process_local_batch_size(8), 2)
+
+    def test_rejects_non_divisible_global_batch_size(self):
+        with mock.patch("jax.process_count", return_value=3):
+            with self.assertRaisesRegex(ValueError, "divisible by data_parallel_size=3"):
+                process_local_batch_size(8)
 
 
 class StepTimerTest(absltest.TestCase):

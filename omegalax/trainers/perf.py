@@ -1,8 +1,8 @@
 """Throughput metrics for training: FLOP counting, step timing, and MFU.
 
-Uses the MaxText-style approach: theoretical model FLOPs
-We do NOT halve attention FLOPs for causal masking; the current implementation
-materializes the full attention matrix.
+Uses the MaxText-style approach: attention FLOPs for causal masking are
+halved (2*T*H*K per token instead of 4*T*H*K) since flash attention kernels
+skip masked blocks. Vision encoder attention (bidirectional) uses full FLOPs.
 """
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ import datetime
 from typing import Any, Union
 
 import jax
+import numpy as np
 
 from omegalax.models.qwen3.config import Qwen3Config
 from omegalax.models.qwen3_5.config import Qwen3_5Config, Qwen3_5TextConfig
@@ -84,7 +85,7 @@ def _training_flops_per_token_qwen3_dense(cfg: Qwen3Config, seq_len: int) -> int
 
     # Per layer, per token (matmul FLOPs: 2 * M * N * K for [M,K] @ [K,N])
     qkv_flops = 2 * D * (H + 2 * G) * K
-    attn_dot_flops = 4 * T * H * K  # full attention, no causal halving
+    attn_dot_flops = 2 * T * H * K  # causal attention: halved
     o_proj_flops = 2 * H * K * D
     attn_per_layer = qkv_flops + attn_dot_flops + o_proj_flops
     mlp_per_layer = 2 * 3 * D * F  # SwiGLU: gate, up, down
@@ -95,7 +96,11 @@ def _training_flops_per_token_qwen3_dense(cfg: Qwen3Config, seq_len: int) -> int
 
 
 def _training_flops_per_token_qwen3_vl(cfg: Qwen3VLConfig, seq_len: int) -> int:
-    """Qwen3-VL decoder FLOPs (same structure as Qwen3 MoE/dense)."""
+    """Qwen3-VL decoder FLOPs (same structure as Qwen3 MoE/dense).
+
+    This excludes the vision tower because its cost depends on the concrete
+    ``image_grid_thw`` values for each batch.
+    """
     D = cfg.emb_dim
     H = cfg.num_heads
     G = cfg.num_kv_heads
@@ -109,7 +114,7 @@ def _training_flops_per_token_qwen3_vl(cfg: Qwen3VLConfig, seq_len: int) -> int:
     T = seq_len
 
     qkv_flops = 2 * D * (H + 2 * G) * K
-    attn_dot_flops = 4 * T * H * K
+    attn_dot_flops = 2 * T * H * K  # causal attention: halved
     o_proj_flops = 2 * H * K * D
     attn_per_layer = qkv_flops + attn_dot_flops + o_proj_flops
 
@@ -128,6 +133,62 @@ def _training_flops_per_token_qwen3_vl(cfg: Qwen3VLConfig, seq_len: int) -> int:
     return forward_per_token * TRAINING_FLOP_MULTIPLIER
 
 
+def qwen3_vl_vision_training_flops(
+    cfg: Qwen3VLConfig, image_grid_thw: Any | None
+) -> int:
+    """Theoretical Qwen3-VL vision-tower FLOPs for one training step (x3).
+
+    Counts matmuls only and matches the current implementation in
+    ``omegalax.models.qwen3_vl.vision``:
+    - patch embed and patch mergers are linear layers;
+    - vision attention materializes the full ``(sum N_i)^2`` attention matrix
+      across all images in the batch before masking by ``vision_cu_seqlens``.
+    """
+    if image_grid_thw is None:
+        return 0
+
+    grid_N3 = np.asarray(image_grid_thw, dtype=np.int64)
+    if grid_N3.size == 0:
+        return 0
+    if grid_N3.ndim != 2 or grid_N3.shape[1] != 3:
+        raise ValueError(
+            f"Expected image_grid_thw with shape (num_images, 3), got {grid_N3.shape}."
+        )
+
+    vis = cfg.vision
+    merge = vis.spatial_merge_size
+
+    total_tokens = int(np.sum(grid_N3[:, 0] * grid_N3[:, 1] * grid_N3[:, 2]))
+    merged_tokens = int(
+        np.sum(grid_N3[:, 0] * (grid_N3[:, 1] // merge) * (grid_N3[:, 2] // merge))
+    )
+    if total_tokens <= 0 or merged_tokens <= 0:
+        return 0
+
+    D = vis.hidden_size
+    F = vis.intermediate_size
+    H = vis.num_heads
+    K = D // H
+    in_features = vis.in_channels * vis.temporal_patch_size * vis.patch_size**2
+
+    patch_embed_flops = 2 * total_tokens * in_features * D
+
+    qkv_flops = 2 * total_tokens * D * (3 * D)
+    attn_dot_flops = 4 * total_tokens * total_tokens * H * K
+    o_proj_flops = 2 * total_tokens * D * D
+    mlp_flops = 2 * total_tokens * D * F + 2 * total_tokens * F * D
+    block_flops = vis.depth * (qkv_flops + attn_dot_flops + o_proj_flops + mlp_flops)
+
+    merger_dim = D * (merge**2)
+    merger_fc1_flops = 2 * merged_tokens * merger_dim * merger_dim
+    merger_fc2_flops = 2 * merged_tokens * merger_dim * vis.out_hidden_size
+    num_mergers = 1 + len(vis.deepstack_visual_indexes)
+    merger_flops = num_mergers * (merger_fc1_flops + merger_fc2_flops)
+
+    forward = patch_embed_flops + block_flops + merger_flops
+    return forward * TRAINING_FLOP_MULTIPLIER
+
+
 def _training_flops_per_token_qwen3_moe(cfg: Qwen3Config, seq_len: int) -> int:
     D = cfg.emb_dim
     H = cfg.num_heads
@@ -142,7 +203,7 @@ def _training_flops_per_token_qwen3_moe(cfg: Qwen3Config, seq_len: int) -> int:
     T = seq_len
 
     qkv_flops = 2 * D * (H + 2 * G) * K
-    attn_dot_flops = 4 * T * H * K
+    attn_dot_flops = 2 * T * H * K  # causal attention: halved
     o_proj_flops = 2 * H * K * D
     attn_per_layer = qkv_flops + attn_dot_flops + o_proj_flops
 
@@ -182,7 +243,7 @@ def _training_flops_per_token_qwen3_5(cfg: Qwen3_5TextConfig, seq_len: int) -> i
         if layer_type == "full_attention":
             q_flops = 2 * D * (H * K * 2)
             kv_flops = 2 * D * (2 * G * K)
-            attn_dot = 4 * T * H * K
+            attn_dot = 2 * T * H * K  # causal attention: halved
             o_flops = 2 * H * K * D
             layer_flops += q_flops + kv_flops + attn_dot + o_flops
         else:
@@ -239,17 +300,27 @@ class StepTimer:
 
 
 def per_device_flops_per_step(
-    cfg: RunPerfConfig, seq_len: int, batch_size: int
+    cfg: RunPerfConfig,
+    seq_len: int,
+    batch_size: int,
+    image_grid_thw: Any | None = None,
 ) -> float:
-    """Total training FLOPs per step, divided by device count."""
+    """Total training FLOPs per step, divided by device count.
+
+    For Qwen3-VL, ``image_grid_thw`` adds the vision-tower FLOPs for the
+    concrete batch. Text-decoder FLOPs are still computed from the padded
+    ``seq_len`` and ``batch_size``.
+    """
     total = training_flops_per_token(cfg, seq_len) * seq_len * batch_size
+    if isinstance(cfg, Qwen3VLConfig):
+        total += qwen3_vl_vision_training_flops(cfg, image_grid_thw)
     return total / max(1, jax.device_count())
 
 
 def step_metrics(
     per_device_flops: float,
     step_delta: datetime.timedelta,
-    tokens_per_step: int,
+    global_tokens_per_step: int,
     peak_tflops: float | None,
 ) -> dict[str, float]:
     """Compute tokens/s, TFLOPS/device, and MFU from step timing."""
@@ -257,18 +328,20 @@ def step_metrics(
     if sec <= 0:
         return {
             "step_time_s": 0.0,
+            "global_tokens_per_sec": 0.0,
             "tokens_per_sec_per_device": 0.0,
             "tflops_per_device": 0.0,
             "mfu": 0.0,
         }
     n_devices = jax.device_count()
-    tokens_per_sec_total = tokens_per_step / sec
-    tokens_per_sec_per_device = tokens_per_sec_total / n_devices
+    global_tokens_per_sec = global_tokens_per_step / sec
+    tokens_per_sec_per_device = global_tokens_per_sec / n_devices
     flops_per_sec_per_device = per_device_flops / sec
     tflops_per_device = flops_per_sec_per_device / 1e12
     mfu = (flops_per_sec_per_device / (peak_tflops * 1e12)) if peak_tflops else 0.0
     return {
         "step_time_s": sec,
+        "global_tokens_per_sec": global_tokens_per_sec,
         "tokens_per_sec_per_device": tokens_per_sec_per_device,
         "tflops_per_device": tflops_per_device,
         "mfu": mfu,
@@ -284,9 +357,9 @@ def maybe_log_step_metrics(
     log_every: int,
     force: bool = False,
     per_device_flops: float,
-    tokens_per_step: int,
+    global_tokens_per_step: int,
     peak_tflops: float | None,
-    tb_writer: Any = None,
+    wandb_run: Any = None,
 ) -> dict[str, float] | None:
     """Optionally compute and log step metrics. Returns host_metrics if logged, else None."""
     should_log = is_primary_process and log_every and step_to_log % log_every == 0
@@ -300,14 +373,14 @@ def maybe_log_step_metrics(
         raise KeyError(f"Missing required metrics for logging: {missing}")
     host_metrics["step"] = step_to_log
     host_metrics.update(
-        step_metrics(per_device_flops, step_delta, tokens_per_step, peak_tflops)
+        step_metrics(per_device_flops, step_delta, global_tokens_per_step, peak_tflops)
     )
 
-    if tb_writer is not None and is_primary_process:
-        _TB_SKIP = {"step"}
-        for key, val in host_metrics.items():
-            if key not in _TB_SKIP:
-                tb_writer.add_scalar(f"train/{key}", val, step_to_log)
-        tb_writer.flush()
+    if wandb_run is not None and is_primary_process:
+        _SKIP = {"step"}
+        wandb_run.log(
+            {f"train/{k}": v for k, v in host_metrics.items() if k not in _SKIP},
+            step=step_to_log,
+        )
 
     return host_metrics

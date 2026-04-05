@@ -10,22 +10,32 @@ ShardingSpec: TypeAlias = PartitionSpec
 # Used with nnx.logical_axis_rules() so model code can annotate with semantic names.
 # Tuple of (logical_name, device_axis_name); None = replicated.
 DEFAULT_AXIS_RULES: tuple[tuple[str, str | None], ...] = (
-    ("batch", "fsdp"),
+    ("batch", ("dp", "fsdp")),
     ("vocab", "tp"),
     ("embed", "fsdp"),
-    ("hidden", "tp"),
+    ("hidden", None),
     ("heads", "tp"),
     ("kv_heads", "tp"),
     ("mlp", "tp"),
-    # FIXME (f.srambical)
+    # Experts replicated; TP on F and FSDP on D within each expert.
+    # For expert parallelism, add an "expert" mesh axis and map here.
     ("experts", None),
 )
+
+
+def _filter_axis(axis, mesh: Mesh):
+    """Drop mesh axes with size 1 from a single axis spec or tuple of axis specs."""
+    if axis is None:
+        return None
+    axes = (axis,) if isinstance(axis, str) else axis
+    kept = tuple(a for a in axes if mesh.shape[a] > 1)
+    return kept[0] if len(kept) == 1 else (kept or None)
 
 
 def axis_rules_for_mesh(mesh: Mesh) -> tuple[tuple[str, str | None], ...]:
     """Drop rules for mesh axes with size 1 (replicate instead of shard)."""
     return tuple(
-        (logical, axis if axis is not None and int(mesh.shape[axis]) > 1 else None)
+        (logical, _filter_axis(axis, mesh))
         for logical, axis in DEFAULT_AXIS_RULES
     )
 
@@ -37,6 +47,11 @@ class ShardConfig:
     act_btd: ShardingSpec
     act_btf: ShardingSpec
     act_btnh: ShardingSpec
+
+    @property
+    def logits_btv(self) -> ShardingSpec:
+        """Logits sharding: (batch, seq, vocab), batch from act_btd, vocab from act_btf (TP)."""
+        return P(self.act_btd[0], None, self.act_btf[2])
 
     @staticmethod
     def no_sharding():
@@ -50,9 +65,9 @@ class ShardConfig:
     @staticmethod
     def default():
         return ShardConfig(
-            act_btd=P("fsdp", None, "tp"),
-            act_btf=P("fsdp", None, "tp"),
-            act_btnh=P("fsdp", None, "tp", None),
+            act_btd=P(("dp", "fsdp"), None, None),
+            act_btf=P(("dp", "fsdp"), None, "tp"),
+            act_btnh=P(("dp", "fsdp"), None, "tp", None),
         )
 
 
@@ -63,7 +78,7 @@ def shard_config_for_mesh(shd_cfg: ShardConfig, mesh: Mesh) -> ShardConfig:
         **{
             field.name: P(
                 *(
-                    axis if axis is not None and int(mesh.shape[axis]) > 1 else None
+                    _filter_axis(axis, mesh)
                     for axis in getattr(shd_cfg, field.name)
                 )
             )

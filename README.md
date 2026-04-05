@@ -58,16 +58,60 @@ cache = api.make_cache(cfg, batch_size=2, token_len=32, generate_steps=8)
 next_logits, cache, aux_loss = api.decode(model, cache, tokens, pad_id=0, cfg=cfg)
 ```
 
-## Training with synthetic data
-Run a longer synthetic training loop with orbax checkpointing and JSONL logging:
-```bash
-uv run scripts/train_text_pretrain.py --model-id qwen3-smoke --num-steps 50 --save-dir runs/text-qwen3-smoke --tp-size 1 --fsdp-size 1
+## Training
+The expected flow is:
+1. Start from a raw JSONL file where each line is a session with a `session_id` and `messages`.
+2. Compile it into canonical payload-block ArrayRecord shards.
+3. Build a chunk-index dataset at the target sequence length.
+4. Train from the chunk-index dataset.
+
+Example raw JSONL row:
+```json
+{"session_id":"demo-0","messages":[{"role":"user","content":"Hello"},{"role":"assistant","content":"Hi there"}]}
 ```
-Run the VLM synthetic training loop:
+
+Compile a raw SFT dataset into Grain payload shards:
 ```bash
-uv run scripts/train_vlm.py --model-id qwen3-vl-smoke --num-steps 50 --save-dir runs/vlm-qwen3-vl-smoke --tp-size 1 --fsdp-size 1
+uv run scripts/compile_sft_dataset.py \
+  --data-path /path/to/train.jsonl \
+  --out-dir /path/to/train_payload \
+  --messages-per-record 128
 ```
-Resume from the latest checkpoint with `--resume`.
+
+Build a chunk index for text SFT:
+```bash
+uv run scripts/build_sft_chunk_index.py \
+  --data-path /path/to/train_payload \
+  --out-dir /path/to/train_chunks \
+  --model-id qwen3-smoke \
+  --max-length 512
+```
+
+If the dataset contains image content, also pass `--processor` (and optionally `--preprocessor-config`) when building the chunk index.
+
+Run text SFT from the compiled Grain chunk-index dataset:
+```bash
+uv run scripts/train_text_sft.py \
+  --model-id qwen3-smoke \
+  --data-path /path/to/train_chunks \
+  --max-length 512 \
+  --batch-size 8 \
+  --tp-size 1 \
+  --fsdp-size 1
+```
+
+Run VLM SFT from the compiled Grain chunk-index dataset:
+```bash
+uv run scripts/train_vlm_sft.py \
+  --model-id qwen3-vl-smoke \
+  --data-path /path/to/train_chunks \
+  --processor Qwen/Qwen3-VL-2B-Instruct \
+  --max-length 512 \
+  --batch-size 4 \
+  --tp-size 1 \
+  --fsdp-size 1
+```
+Resume from the latest checkpoint with `--resume`. Training checkpoints also persist the Grain iterator state.
 
 Export any supported model (Qwen3 dense/MoE, Qwen3.5, Qwen3-VL) to HuggingFace safetensors:
 ```bash

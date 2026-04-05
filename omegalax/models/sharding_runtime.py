@@ -21,7 +21,24 @@ def init_model_sharded(
     """Create a model with params born sharded. jax.jit is mandatory to avoid
     materializing a full unsharded copy (OOM for large models)."""
     with jax.set_mesh(mesh), nnx.logical_axis_rules(axis_rules):
-        return jax.jit(lambda rng: model_cls(cfg, rngs=nnx.Rngs(rng)))(rng)
+        model = jax.jit(lambda rng: model_cls(cfg, rngs=nnx.Rngs(rng)))(rng)
+    _finalize_q_shardings(model, mesh)
+    return model
+
+
+def _finalize_q_shardings(model: nnx.Module, mesh: Mesh) -> None:
+    """Convert ``_q_sharding_spec`` stored during ``__init__`` into ``NamedSharding``.
+
+    Modules set ``_q_sharding_spec`` in ``__init__`` (which runs inside
+    ``jax.jit``), but ``NamedSharding`` requires a concrete ``Mesh`` that is
+    only available outside ``jax.jit``.  This function bridges the gap.
+    """
+    for _, module in nnx.iter_modules(model):
+        spec = getattr(module, "_q_sharding_spec", None)
+        if spec is not None:
+            object.__setattr__(
+                module, "_q_sharding", NamedSharding(mesh, spec)
+            )
 
 
 def batch_partition_spec(shd_cfg: ShardConfig) -> PartitionSpec:

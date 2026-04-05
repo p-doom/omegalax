@@ -19,7 +19,6 @@ from absl.testing import absltest
 from transformers import Qwen3MoeForCausalLM
 from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig as HFQwen3MoeConfig
 
-from omegalax.text import api
 from omegalax.models.qwen3.config import make_config
 from omegalax.models.qwen3.loader import create_qwen3_from_safetensors
 
@@ -82,6 +81,7 @@ class Qwen3MoeWeightsTest(absltest.TestCase):
             SMOKE_MOE_ID,
             tp_size=1,
             fsdp_size=1,
+            dp_size=1,
         )
 
         torch_dtype = _JNP_TO_TORCH[cls.jax_cfg.dtype]
@@ -105,8 +105,9 @@ class Qwen3MoeWeightsTest(absltest.TestCase):
             hf_logits_BTV = hf_out.logits.cpu().float().numpy()
 
         jax_token_ids_BT = jnp.asarray(token_ids_BT)
-        jax_logits_BTV, _ = api.forward(self.jax_model, jax_token_ids_BT, self.pad_id, self.jax_cfg)
-        jax_logits_BTV = np.asarray(jax_logits_BTV, dtype=np.float32)
+        segment_ids_BT = 1 * (jax_token_ids_BT != self.pad_id)
+        hidden_BTD, _ = self.jax_model(jax_token_ids_BT, segment_ids_BT, None, jnp.array(0, dtype=jnp.int32))
+        jax_logits_BTV = np.asarray(self.jax_model.lm_head(hidden_BTD), dtype=np.float32)
 
         mask = attention_mask_BT.astype(bool)
         assert_logits_close(self, jax_logits_BTV, hf_logits_BTV, mask)
@@ -130,8 +131,9 @@ class Qwen3MoeWeightsTest(absltest.TestCase):
             hf_logits_BTV = hf_out.logits.cpu().float().numpy()
 
         jax_token_ids_BT = jnp.asarray(token_ids_BT)
-        jax_logits_BTV, _ = api.forward(self.jax_model, jax_token_ids_BT, self.pad_id, self.jax_cfg)
-        jax_logits_BTV = np.asarray(jax_logits_BTV, dtype=np.float32)
+        segment_ids_BT = 1 * (jax_token_ids_BT != self.pad_id)
+        hidden_BTD, _ = self.jax_model(jax_token_ids_BT, segment_ids_BT, None, jnp.array(0, dtype=jnp.int32))
+        jax_logits_BTV = np.asarray(self.jax_model.lm_head(hidden_BTD), dtype=np.float32)
 
         mask = attention_mask_BT.astype(bool)
         assert_logits_close(self, jax_logits_BTV, hf_logits_BTV, mask)
@@ -142,15 +144,16 @@ class Qwen3MoeWeightsTest(absltest.TestCase):
 
         token_ids_BT = _random_input(batch_size=1, seq_len=16, vocab_size=HF_SMOKE_CFG.vocab_size)
         jax_token_ids_BT = jnp.asarray(token_ids_BT)
+        segment_ids_BT = 1 * (jax_token_ids_BT != self.pad_id)
 
-        baseline_BTV, _ = api.forward(self.jax_model, jax_token_ids_BT, self.pad_id, self.jax_cfg)
-        baseline_BTV = np.asarray(baseline_BTV)
+        baseline_hidden, _ = self.jax_model(jax_token_ids_BT, segment_ids_BT, None, jnp.array(0, dtype=jnp.int32))
+        baseline_BTV = np.asarray(self.jax_model.lm_head(baseline_hidden))
 
         graph_def, state = nnx.split(self.jax_model)
         pure_state = nnx.to_pure_dict(state)
         restored = nnx.merge(graph_def, pure_state)
-        restored_logits_BTV, _ = api.forward(restored, jax_token_ids_BT, self.pad_id, self.jax_cfg)
-        restored_logits_BTV = np.asarray(restored_logits_BTV)
+        restored_hidden, _ = restored(jax_token_ids_BT, segment_ids_BT, None, jnp.array(0, dtype=jnp.int32))
+        restored_logits_BTV = np.asarray(restored.lm_head(restored_hidden))
 
         np.testing.assert_array_equal(restored_logits_BTV, baseline_BTV)
 

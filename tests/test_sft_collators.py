@@ -1,8 +1,6 @@
-"""Tests for SFT collators: loss-mask correctness, multi-turn, truncation."""
+"""Tests for SFT collators: loss-mask correctness, multi-turn, and overflow checks."""
 
-import json
 import os
-import tempfile
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
@@ -14,7 +12,6 @@ from transformers import AutoTokenizer
 from transformers import AutoImageProcessor
 
 from omegalax.data.collator_qwen3 import TextSFTCollator, VLMSFTCollator, _build_assistant_loss_mask, _build_chatml_text
-from omegalax.data.jsonl import JSONLDataset
 
 
 def _make_tokenizer():
@@ -108,6 +105,17 @@ class TextSFTCollatorTest(absltest.TestCase):
         for key in ("token_ids_BT", "attention_mask_BT", "loss_mask_BT"):
             self.assertEqual(batch[key].dtype, np.int32, f"{key} dtype mismatch")
 
+    def test_raises_on_overflow(self):
+        collator = TextSFTCollator(self.tokenizer, max_length=8)
+        examples = [
+            {"messages": [
+                {"role": "user", "content": "Tell me a story in many words."},
+                {"role": "assistant", "content": "This answer is intentionally too long for the tiny max length."},
+            ]},
+        ]
+        with self.assertRaisesRegex(ValueError, "exceeds max_length"):
+            collator(examples)
+
 
 class BuildAssistantLossMaskTest(absltest.TestCase):
     """Direct tests for the token-scanning loss mask builder."""
@@ -158,63 +166,19 @@ class BuildAssistantLossMaskTest(absltest.TestCase):
         _, mask = self._apply_and_mask(messages)
         self.assertEqual(np.sum(mask), 0)
 
-    def test_mask_excludes_im_end(self):
+    def test_mask_includes_assistant_im_end(self):
         messages = [
             {"role": "user", "content": "X"},
             {"role": "assistant", "content": "Y"},
         ]
         ids, mask = self._apply_and_mask(messages)
-        # <|im_end|> tokens should not be supervised
+        # Assistant <|im_end|> should be supervised so the model learns to terminate.
+        # User <|im_end|> should not be supervised.
         im_end_positions = np.where(ids == self._im_end_id)[0]
-        for pos in im_end_positions:
-            self.assertEqual(mask[pos], 0, f"<|im_end|> at position {pos} should not be masked")
-
-
-class JSONLDatasetTest(absltest.TestCase):
-    def test_load_and_iterate(self):
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
-            for i in range(5):
-                f.write(json.dumps({"messages": [{"role": "user", "content": f"msg{i}"}]}) + "\n")
-            f.flush()
-            ds = JSONLDataset(f.name)
-        self.assertEqual(len(ds), 5)
-        examples = list(ds.iter_examples(shuffle=False, seed=0, process_split=False, num_epochs=1))
-        self.assertEqual(len(examples), 5)
-        os.unlink(f.name)
-
-    def test_multimodal_messages_preserved(self):
-        """Structured content with image blocks is loaded as-is."""
-        example = {
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image", "url": "/data/imgs/a.png"},
-                        {"type": "text", "text": "describe"},
-                    ],
-                },
-                {"role": "assistant", "content": "A cat."},
-            ]
-        }
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
-            f.write(json.dumps(example) + "\n")
-            f.flush()
-            ds = JSONLDataset(f.name)
-        msg = ds.examples[0]["messages"][0]
-        self.assertEqual(msg["content"][0], {"type": "image", "url": "/data/imgs/a.png"})
-        self.assertEqual(msg["content"][1], {"type": "text", "text": "describe"})
-        self.assertEqual(ds.examples[0]["messages"][1]["content"], "A cat.")
-        os.unlink(f.name)
-
-    def test_epoch_count(self):
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
-            for i in range(3):
-                f.write(json.dumps({"messages": [{"role": "user", "content": str(i)}]}) + "\n")
-            f.flush()
-            ds = JSONLDataset(f.name)
-        examples = list(ds.iter_examples(shuffle=False, seed=0, process_split=False, num_epochs=2))
-        self.assertEqual(len(examples), 6)
-        os.unlink(f.name)
+        # First <|im_end|> is from user turn (not supervised)
+        self.assertEqual(mask[im_end_positions[0]], 0, "User <|im_end|> should not be supervised")
+        # Second <|im_end|> is from assistant turn (supervised)
+        self.assertEqual(mask[im_end_positions[1]], 1, "Assistant <|im_end|> should be supervised")
 
 
 class BuildChatMLTextTest(absltest.TestCase):
@@ -395,6 +359,27 @@ class VLMSFTCollatorTest(absltest.TestCase):
         self.assertGreater(np.sum(mask), 0)
         attn = batch["attention_mask_BT"][0]
         self.assertLess(np.sum(mask), np.sum(attn))
+
+    def test_raises_on_overflow(self):
+        from PIL import Image
+
+        img = Image.new("RGB", (200, 200), color=(100, 150, 200))
+        collator = VLMSFTCollator(
+            self.tokenizer,
+            max_length=8,
+            image_processor=self.image_processor,
+        )
+        examples = [
+            {"messages": [
+                {"role": "user", "content": [
+                    {"type": "image", "image": img},
+                    {"type": "text", "text": "Describe."},
+                ]},
+                {"role": "assistant", "content": "A solid color image."},
+            ]},
+        ]
+        with self.assertRaisesRegex(ValueError, "exceeds max_length"):
+            collator(examples)
 
 
 if __name__ == "__main__":

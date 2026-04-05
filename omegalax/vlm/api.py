@@ -115,10 +115,11 @@ def init_model(
     *,
     tp_size: int | None = None,
     fsdp_size: int | None = None,
+    dp_size: int | None = None,
 ) -> tuple[nnx.Module, VLMConfig]:
     """Initialize a vision-language model."""
     cfg = resolve_config(model_or_id)
-    mesh = ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size)
+    mesh = ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size)
     cfg = align_config_to_mesh(cfg, mesh)
 
     axis_rules = axis_rules_for_mesh(mesh)
@@ -143,39 +144,55 @@ def forward(
     vision_cu_seqlens: jax.Array | None = None,
     position_ids_ZBT: jax.Array | None = None,
 ):
-    """Forward pass for VLMs; supports text-only or multimodal batches."""
+    """Forward pass returning hidden states before lm_head, plus aux loss."""
     if attention_mask_BT is None:
         attention_mask_BT = (token_ids_BT != pad_id).astype(jnp.int32)
 
     if isinstance(model, Qwen3_5ForConditionalGeneration):
         segment_ids_BT = attention_mask_BT.astype(jnp.int32)
-        logits_BTV, aux_loss = model(
-            token_ids_BT,
-            segment_ids_BT,
-            None,
-            jnp.array(0, dtype=jnp.int32),
+        return model(
+            token_ids_BT, segment_ids_BT, None, jnp.array(0, dtype=jnp.int32),
             pixel_values=pixel_values,
             image_grid_thw=image_grid_thw,
             position_ids_ZBT=position_ids_ZBT,
         )
-        return logits_BTV, aux_loss
 
     if isinstance(model, Qwen3VL):
-        outputs = model(
-            token_ids_BT,
-            attention_mask_BT,
+        return model(
+            token_ids_BT, attention_mask_BT,
             position_ids_ZBT=position_ids_ZBT,
             pixel_values=pixel_values,
             image_grid_thw=image_grid_thw,
             vision_cu_seqlens=vision_cu_seqlens,
         )
-        if isinstance(outputs, tuple):
-            logits_BTV, aux_loss = outputs
-            return logits_BTV, aux_loss
-        else:
-            return outputs, jnp.array(0.0, dtype=jnp.float32)
 
     raise ValueError(f"Unsupported VLM model type: {type(model)}")
+
+
+
+def load_pretrained(
+    model_id: str,
+    *,
+    tp_size: int | None = None,
+    fsdp_size: int | None = None,
+    dp_size: int | None = None,
+) -> tuple[nnx.Module, VLMConfig]:
+    """Load a pretrained VLM from HuggingFace safetensors."""
+    from huggingface_hub import snapshot_download
+
+    from omegalax.models.qwen3_5 import create_qwen3_5_from_safetensors
+    from omegalax.models.qwen3_vl import create_qwen3_vl_from_safetensors
+
+    local_dir = snapshot_download(model_id)
+    cfg = resolve_config(model_id)
+    mesh = ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size)
+    if isinstance(cfg, Qwen3VLConfig):
+        model, cfg = create_qwen3_vl_from_safetensors(local_dir, tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size)
+        return model, cfg
+    if isinstance(cfg, Qwen3_5Config):
+        model, cfg = create_qwen3_5_from_safetensors(local_dir, tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size)
+        return model, cfg
+    raise ValueError(f"Unsupported VLM config type for pretrained loading: {type(cfg)}")
 
 
 def make_cache(*_args, **_kwargs):

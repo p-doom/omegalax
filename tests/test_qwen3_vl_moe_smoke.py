@@ -108,6 +108,7 @@ class Qwen3VLMoeSmokeTest(absltest.TestCase):
             cls.tmpdir,
             tp_size=1,
             fsdp_size=1,
+            dp_size=1,
         )
 
         torch_dtype = _JNP_TO_TORCH[cls.jax_cfg.dtype]
@@ -125,11 +126,11 @@ class Qwen3VLMoeSmokeTest(absltest.TestCase):
                 image_grid_thw=None,
             ).logits.cpu().float().numpy()
 
-        jax_logits_BTV, _ = self.jax_model(
+        hidden_BTD, _ = self.jax_model(
             jnp.asarray(token_ids_BT, dtype=jnp.int32),
             jnp.asarray(attention_mask_BT, dtype=jnp.int32),
         )
-        jax_logits_BTV = np.asarray(jax_logits_BTV, dtype=np.float32)
+        jax_logits_BTV = np.asarray(self.jax_model.lm_head(hidden_BTD), dtype=np.float32)
 
         mask = np.ones_like(token_ids_BT, dtype=bool)
         assert_logits_close(self, jax_logits_BTV, hf_logits_BTV, mask)

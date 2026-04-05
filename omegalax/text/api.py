@@ -97,10 +97,11 @@ def init_model(
     *,
     tp_size: int | None = None,
     fsdp_size: int | None = None,
+    dp_size: int | None = None,
 ) -> tuple[nnx.Module, TextConfig]:
     """Initialize a text-only model (Qwen3 or Qwen3.5 text) and return (model, cfg)."""
     cfg = resolve_config(model_or_id)
-    mesh = ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size)
+    mesh = ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size)
     cfg = align_config_to_mesh(cfg, mesh)
 
     axis_rules = axis_rules_for_mesh(mesh)
@@ -115,12 +116,11 @@ def init_model(
 
 
 def forward(model: nnx.Module, token_ids_BT: jax.Array, pad_id: int, cfg: TextConfig):
-    """Forward pass for text-only models; returns logits and aux loss."""
+    """Forward pass returning hidden states before lm_head, plus aux loss."""
     segment_ids_BT = 1 * (token_ids_BT != pad_id)
 
     if isinstance(model, (Qwen3, Qwen3_5ForCausalLM)):
-        logits_BTV, aux_loss = model(token_ids_BT, segment_ids_BT, None, jnp.array(0, dtype=jnp.int32))
-        return logits_BTV, aux_loss
+        return model(token_ids_BT, segment_ids_BT, None, jnp.array(0, dtype=jnp.int32))
 
     raise ValueError(f"Unsupported text model type: {type(model)}")
 
@@ -132,7 +132,8 @@ def decode(model: nnx.Module, cache: Cache, token_ids_BT: jax.Array, pad_id: int
 
     segment_ids_BT = 1 * (token_ids_BT != pad_id)
     num_right_pads = count_right_pads(token_ids_BT, pad_id)
-    logits_BTV, aux_loss = model(token_ids_BT, segment_ids_BT, cache, jnp.array(num_right_pads, dtype=jnp.int32))
+    hidden_BTD, aux_loss = model(token_ids_BT, segment_ids_BT, cache, jnp.array(num_right_pads, dtype=jnp.int32))
+    logits_BTV = model.lm_head(hidden_BTD, out_sharding=model.logits_shd)
 
     target_ind = token_ids_BT.shape[-1] - num_right_pads - 1
     return logits_BTV[:, target_ind], cache, aux_loss

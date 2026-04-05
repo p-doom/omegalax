@@ -10,7 +10,8 @@ Key differences from standard Qwen3 attention:
 import jax
 import jax.numpy as jnp
 from flax import nnx
-from jax.sharding import PartitionSpec, reshard
+from jax.sharding import PartitionSpec
+from tokamax import dot_product_attention
 
 from .config import Qwen3_5TextConfig
 from .norms import RMSNorm
@@ -18,10 +19,6 @@ from .rope import apply_text_rope
 
 P = PartitionSpec
 wp = nnx.with_partitioning
-
-
-def _mask_value(dtype: jnp.dtype) -> float:
-    return float(jnp.finfo(dtype).min)
 
 
 class Attention(nnx.Module):
@@ -76,7 +73,8 @@ class Attention(nnx.Module):
         self.n_rep = nh // nkv
         self.scale = hd ** -0.5
         self.hidden_shd = cfg.shd_cfg.act_btd
-        self.logits_shd = P(cfg.shd_cfg.act_btd[0], cfg.shd_cfg.act_btnh[2], None, None)
+        object.__setattr__(self, "_q_sharding", None)
+        object.__setattr__(self, "_q_sharding_spec", P(*cfg.shd_cfg.act_btnh))
 
     @jax.named_scope("attention")
     def __call__(
@@ -87,56 +85,40 @@ class Attention(nnx.Module):
         segment_ids_BT: jax.Array,
         position_ids_BT: jax.Array,
     ) -> jax.Array:
-        hidden_BTD = reshard(hidden_BTD, self.hidden_shd)
         B, T, _ = hidden_BTD.shape
 
-        q_out_BTHK2 = self.q_proj(hidden_BTD, out_sharding=self.shd_cfg.act_btf).reshape(
-            B, T, self.num_heads, self.head_dim * 2
+        heads_shd = self.shd_cfg.act_btnh
+        q_out_BTHK2 = jax.lax.reshape(
+            self.q_proj(hidden_BTD, out_sharding=self.shd_cfg.act_btf),
+            (B, T, self.num_heads, self.head_dim * 2),
+            out_sharding=P(heads_shd[0], heads_shd[1], heads_shd[2], None),
         )
         q_BTHK, gate_BTHK = jnp.split(q_out_BTHK2, 2, axis=-1)
-        gate_BTD = gate_BTHK.reshape(B, T, -1)
+        gate_BTD = jax.lax.reshape(gate_BTHK, (B, T, self.num_heads * self.head_dim), out_sharding=self.shd_cfg.act_btf)
 
-        q_BHTK = reshard(self.q_norm(q_BTHK), self.shd_cfg.act_btnh).transpose(0, 2, 1, 3)
-        k_BGTK = reshard(
-            self.k_norm(
-                self.k_proj(hidden_BTD, out_sharding=self.shd_cfg.act_btf).reshape(B, T, self.num_kv_heads, self.head_dim)
-            ),
-            self.shd_cfg.act_btnh,
-        ).transpose(0, 2, 1, 3)
-        v_BGTK = reshard(
-            self.v_proj(hidden_BTD, out_sharding=self.shd_cfg.act_btf).reshape(B, T, self.num_kv_heads, self.head_dim),
-            self.shd_cfg.act_btnh,
-        ).transpose(0, 2, 1, 3)
+        q_BTHK = self.q_norm(q_BTHK)
+        k_BTGK = self.k_norm(
+            jax.lax.reshape(
+                self.k_proj(hidden_BTD, out_sharding=self.shd_cfg.act_btf),
+                (B, T, self.num_kv_heads, self.head_dim),
+                out_sharding=heads_shd,
+            )
+        )
+        v_BTGK = jax.lax.reshape(
+            self.v_proj(hidden_BTD, out_sharding=self.shd_cfg.act_btf),
+            (B, T, self.num_kv_heads, self.head_dim),
+            out_sharding=heads_shd,
+        )
 
-        q_BHTK, k_BGTK = apply_text_rope(q_BHTK, k_BGTK, cos_BTK, sin_BTK)
+        q_BTHK, k_BTGK = apply_text_rope(q_BTHK, k_BTGK, cos_BTK, sin_BTK)
 
-        if self.n_rep > 1:
-            k_BHTK = jnp.broadcast_to(
-                k_BGTK[:, :, None, :, :],
-                (B, self.num_kv_heads, self.n_rep, T, self.head_dim),
-            ).reshape(B, self.num_heads, T, self.head_dim)
-            v_BHTK = jnp.broadcast_to(
-                v_BGTK[:, :, None, :, :],
-                (B, self.num_kv_heads, self.n_rep, T, self.head_dim),
-            ).reshape(B, self.num_heads, T, self.head_dim)
-        else:
-            k_BHTK = k_BGTK
-            v_BHTK = v_BGTK
-
-        logits_BHTS = jnp.matmul(q_BHTK, k_BHTK.transpose(0, 1, 3, 2)) * self.scale
-
-        q_pos_BT1 = position_ids_BT[:, :, None]
-        k_pos_B1T = position_ids_BT[:, None, :]
-        causal_mask_BTS = k_pos_B1T <= q_pos_BT1
-        seg_mask_BTS = segment_ids_BT[:, :, None] == segment_ids_BT[:, None, :]
-        combined_mask_BTS = (causal_mask_BTS & seg_mask_BTS)[:, None, :, :]
-        logits_BHTS = jnp.where(combined_mask_BTS, logits_BHTS, _mask_value(logits_BHTS.dtype))
-        logits_BHTS = reshard(logits_BHTS, self.logits_shd)
-
-        weights_BHTS = jax.nn.softmax(logits_BHTS.astype(jnp.float32), axis=-1).astype(logits_BHTS.dtype)
-        attn_out_BHTK = jnp.matmul(weights_BHTS, v_BHTK)
-        attn_out_BTD = attn_out_BHTK.transpose(0, 2, 1, 3).reshape(B, T, -1)
+        attn_BTHK = dot_product_attention(
+            q_BTHK, k_BTGK, v_BTGK,
+            is_causal=True, scale=self.scale, implementation="mosaic",
+            q_sharding=self._q_sharding,
+        )
+        attn_out_BTD = jax.lax.reshape(attn_BTHK, (B, T, self.num_heads * self.head_dim), out_sharding=self.shd_cfg.act_btf)
 
         attn_out_BTD = attn_out_BTD * jax.nn.sigmoid(gate_BTD)
         out_BTD = self.o_proj(attn_out_BTD, out_sharding=self.shd_cfg.act_btd)
-        return reshard(out_BTD, self.shd_cfg.act_btd)
+        return out_BTD
