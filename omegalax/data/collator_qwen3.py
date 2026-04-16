@@ -117,6 +117,51 @@ class TextSFTCollator:
         }
 
 
+def _pad_vision_arrays(
+    pixel_values: np.ndarray,
+    image_grid_thw: np.ndarray,
+    merge_size: int,
+    max_patches: int,
+    max_images: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Pad vision arrays to exact ``(max_patches, max_images)`` target.
+
+    Uses "absorber" dummy images whose grid entries are chosen to make the
+    total patch count equal ``max_patches`` exactly, preserving the invariant
+    ``pixel_values.shape[0] == sum(t*h*w for image_grid_thw)``.
+    """
+    real_images = image_grid_thw.shape[0]
+    real_patches = pixel_values.shape[0]
+    feat_dim = pixel_values.shape[1]
+    ms2 = merge_size * merge_size
+
+    num_dummies = max_images - real_images
+    extra_patches = max_patches - real_patches
+
+    if num_dummies == 0 and extra_patches == 0:
+        return pixel_values, image_grid_thw, _compute_vision_cu_seqlens(image_grid_thw)
+
+    # Build dummy grid entries: one absorber + simple (1, ms, ms) dummies.
+    dummy_grids: list[list[int]] = []
+    if num_dummies == 1:
+        dummy_grids.append([1, merge_size, extra_patches // merge_size])
+    else:
+        num_simple = num_dummies - 1
+        absorber_patches = extra_patches - num_simple * ms2
+        dummy_grids.append([1, merge_size, absorber_patches // merge_size])
+        dummy_grids.extend([[1, merge_size, merge_size]] * num_simple)
+
+    padded_grid = np.concatenate(
+        [image_grid_thw, np.array(dummy_grids, dtype=np.int32)], axis=0,
+    )
+    padded_pv = np.concatenate(
+        [pixel_values, np.zeros((extra_patches, feat_dim), dtype=pixel_values.dtype)],
+        axis=0,
+    )
+    padded_cu = _compute_vision_cu_seqlens(padded_grid)
+    return padded_pv, padded_grid, padded_cu
+
+
 def _compute_vision_cu_seqlens(image_grid_thw: np.ndarray) -> np.ndarray:
     """Return cumulative per-frame token counts for the vision tower.
 
@@ -154,10 +199,15 @@ class VLMSFTCollator:
         tokenizer: PreTrainedTokenizer,
         max_length: int,
         image_processor: BaseImageProcessor,
+        *,
+        max_vision_patches_per_sample: int | None = None,
+        max_vision_images_per_sample: int | None = None,
     ) -> None:
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.image_processor = image_processor
+        self._max_vision_patches_per_sample = max_vision_patches_per_sample
+        self._max_vision_images_per_sample = max_vision_images_per_sample
         assert tokenizer.pad_token_id is not None, "tokenizer must have pad_token_id set (e.g. Qwen3-VL, Qwen3.5)"
 
         self._im_start_id = tokenizer.convert_tokens_to_ids("<|im_start|>")
@@ -224,12 +274,11 @@ class VLMSFTCollator:
         }
 
         if has_images and all_pixel_values:
-            result["pixel_values"] = np.concatenate(all_pixel_values, axis=0)
-        if has_images and all_grid_thw:
+            pixel_values = np.concatenate(all_pixel_values, axis=0)
             image_grid_thw = np.concatenate(all_grid_thw, axis=0)
-            result["image_grid_thw"] = image_grid_thw
-            result["vision_cu_seqlens"] = _compute_vision_cu_seqlens(image_grid_thw)
 
+            # Compute position_ids from REAL (unpadded) grid — these only
+            # depend on real <|image_pad|> positions in token_ids_BT.
             position_ids, _ = get_rope_index(
                 result["token_ids_BT"],
                 image_grid_thw=image_grid_thw,
@@ -240,5 +289,23 @@ class VLMSFTCollator:
                 vision_start_token_id=self._vision_start_token_id,
             )
             result["position_ids_ZBT"] = position_ids.astype(np.int32)
+
+            # Pad vision arrays to static shapes so JAX JIT never recompiles.
+            # Per-sample limits are multiplied by batch size so the user
+            # doesn't need to recompute when changing batch_size.
+            if self._max_vision_patches_per_sample is not None and self._max_vision_images_per_sample is not None:
+                bs = len(examples)
+                pixel_values, image_grid_thw, vision_cu_seqlens = _pad_vision_arrays(
+                    pixel_values, image_grid_thw,
+                    merge_size=self.image_processor.merge_size,
+                    max_patches=self._max_vision_patches_per_sample * bs,
+                    max_images=self._max_vision_images_per_sample * bs,
+                )
+            else:
+                vision_cu_seqlens = _compute_vision_cu_seqlens(image_grid_thw)
+
+            result["pixel_values"] = pixel_values
+            result["image_grid_thw"] = image_grid_thw
+            result["vision_cu_seqlens"] = vision_cu_seqlens
 
         return result

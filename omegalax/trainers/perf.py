@@ -360,6 +360,7 @@ def maybe_log_step_metrics(
     global_tokens_per_step: int,
     peak_tflops: float | None,
     wandb_run: Any = None,
+    batch_size: int = 0,
 ) -> dict[str, float] | None:
     """Optionally compute and log step metrics. Returns host_metrics if logged, else None."""
     should_log = is_primary_process and log_every and step_to_log % log_every == 0
@@ -372,6 +373,8 @@ def maybe_log_step_metrics(
     if missing:
         raise KeyError(f"Missing required metrics for logging: {missing}")
     host_metrics["step"] = step_to_log
+    if batch_size > 0:
+        host_metrics["total_samples"] = step_to_log * batch_size
     host_metrics.update(
         step_metrics(per_device_flops, step_delta, global_tokens_per_step, peak_tflops)
     )

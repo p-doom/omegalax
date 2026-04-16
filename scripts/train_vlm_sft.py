@@ -67,6 +67,18 @@ flags.DEFINE_integer("grain_read_threads", 16, "Grain read threads.")
 flags.DEFINE_integer("grain_read_buffer_size", 500, "Grain read buffer size.")
 flags.DEFINE_integer("grain_workers", 0, "Grain multiprocessing workers.")
 flags.DEFINE_integer("grain_worker_buffer_size", 1, "Grain worker buffer size.")
+flags.DEFINE_integer("max_vision_patches_per_sample", 0,
+                     "Max vision patches per sample for JIT stability (0 = no padding). "
+                     "Multiplied by batch_size automatically.")
+flags.DEFINE_integer("max_vision_images_per_sample", 0,
+                     "Max images per sample for JIT stability (0 = no padding). "
+                     "Multiplied by batch_size automatically.")
+
+_ATTN_BACKENDS = ["mosaic", "mosaic_gpu", "cudnn", "xla", "xla_chunked", "triton"]
+flags.DEFINE_enum("text_attn_backend", "mosaic", _ATTN_BACKENDS,
+                  "Attention backend for the text decoder.")
+flags.DEFINE_enum("vision_attn_backend", "mosaic", _ATTN_BACKENDS,
+                  "Attention backend for the vision encoder.")
 
 
 def _default_save_dir(model_id: str) -> Path:
@@ -123,7 +135,13 @@ def main(_) -> None:
             ip_kwargs = json.load(f)
     image_processor = AutoImageProcessor.from_pretrained(repo_id, use_fast=False, **ip_kwargs)
     startup_log(f"loaded image processor from {repo_id!r}")
-    collator = VLMSFTCollator(tokenizer, max_length=FLAGS.max_length, image_processor=image_processor)
+    collator = VLMSFTCollator(
+        tokenizer,
+        max_length=FLAGS.max_length,
+        image_processor=image_processor,
+        max_vision_patches_per_sample=FLAGS.max_vision_patches_per_sample or None,
+        max_vision_images_per_sample=FLAGS.max_vision_images_per_sample or None,
+    )
     startup_log("built VLMSFTCollator")
     per_process_batch = process_local_batch_size(FLAGS.batch_size, dp_size=FLAGS.dp_size)
     startup_log(
@@ -212,6 +230,8 @@ def main(_) -> None:
             val_data_iter=val_data_iter,
             val_every=FLAGS.val_every,
             val_steps=FLAGS.val_steps,
+            vision_attn_backend=FLAGS.vision_attn_backend,
+            text_attn_backend=FLAGS.text_attn_backend,
         )
     finally:
         if wandb_run is not None:

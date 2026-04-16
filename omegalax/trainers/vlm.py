@@ -252,6 +252,8 @@ def run_sft(
     val_data_iter: checkpoint_utils.GrainIterator | None = None,
     val_every: int | None = None,
     val_steps: int = 10,
+    vision_attn_backend: str = "mosaic",
+    text_attn_backend: str = "mosaic",
 ) -> tuple[MixedPrecisionOptimizer, dict[str, float]]:
     """SFT a VLM from a Grain iterator; returns final optimizer + last metrics.
 
@@ -325,6 +327,9 @@ def run_sft(
             dp_size=dp_size,
         )
         startup_log("initialized model (random init)")
+    from omegalax.models.sharding_runtime import set_attn_backend
+    set_attn_backend(model, vision_backend=vision_attn_backend, text_backend=text_attn_backend)
+    startup_log(f"set attn backends: vision={vision_attn_backend} text={text_attn_backend}")
     with mesh_rules(mesh):
         optimizer = build_optimizer(model, lr_schedule_fn, train_cfg)
 
@@ -371,6 +376,7 @@ def run_sft(
             global_tokens_per_step=global_tokens_per_step,
             peak_tflops=peak_tflops,
             wandb_run=wandb_run,
+            batch_size=train_cfg.batch_size,
         )
         if result is not None:
             last_metrics = result
@@ -402,6 +408,12 @@ def run_sft(
                 train_cfg.batch_size,
                 image_grid_thw=batch.get("image_grid_thw"),
             )
+            # --- diagnostic: log vision array shapes to detect recompilation triggers ---
+            if is_primary_process and step <= 20:
+                _diag_shapes = {k: v.shape for k, v in batch.items() if k in ("pixel_values", "image_grid_thw", "vision_cu_seqlens")}
+                if _diag_shapes:
+                    print(f"[diag] step={step} micro={_micro} vision_shapes={_diag_shapes}", flush=True)
+            # --- end diagnostic ---
             batch = vlm_api.shard_batch_dict(batch, model_cfg, mesh)
             _, metrics = sft_step(optimizer, batch)
             micro_delta = timer.step()

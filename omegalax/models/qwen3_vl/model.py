@@ -330,6 +330,8 @@ class TextAttention(nnx.Module):
         self.num_kv_heads = cfg.num_kv_heads
         object.__setattr__(self, "_q_sharding", None)
         object.__setattr__(self, "_q_sharding_spec", P(*cfg.shd_cfg.act_btnh))
+        object.__setattr__(self, "_attn_backend", "mosaic_gpu")
+        object.__setattr__(self, "_attn_kind", "text")
 
     def __call__(self, hidden_BTD: jax.Array, sin_BTK: jax.Array, cos_BTK: jax.Array) -> jax.Array:
         B, T, _ = hidden_BTD.shape
@@ -346,7 +348,7 @@ class TextAttention(nnx.Module):
 
         attn_BTHK = dot_product_attention(
             q_BTHK, k_BTGK, v_BTGK,
-            is_causal=True, scale=self.scale, implementation="mosaic",
+            is_causal=True, scale=self.scale, implementation=self._attn_backend,
             q_sharding=self._q_sharding,
         )
         out_BTD = self.o_proj(jax.lax.reshape(attn_BTHK, (B, T, self.num_heads * self.head_dim), out_sharding=self.shd_cfg.act_btf), out_sharding=self.shd_cfg.act_btd)
@@ -432,9 +434,21 @@ class Qwen3VL(nnx.Module):
         if image_features_ND is not None:
             image_mask_BT = token_ids_BT == cfg.image_token_id
             visual_pos_mask_BT = image_mask_BT
-            batch_idx, seq_idx = jnp.where(image_mask_BT, size=image_features_ND.shape[0])
+            n_features = image_features_ND.shape[0]  # static after padding
+            seq_len = token_ids_BT.shape[1]
+            batch_idx, seq_idx = jnp.where(
+                image_mask_BT, size=n_features,
+                fill_value=(0, seq_len - 1),
+            )
+            # Mask out padding features so they scatter zeros to the
+            # harmless fill-value position (a pad token with attn_mask=0).
+            num_real = jnp.sum(image_mask_BT)
+            valid = jnp.arange(n_features) < num_real
+            safe_features = jnp.where(
+                valid[:, None], image_features_ND, 0.0,
+            ).astype(inputs_embeds_BTD.dtype)
             inputs_embeds_BTD = inputs_embeds_BTD.at[batch_idx, seq_idx].set(
-                image_features_ND.astype(inputs_embeds_BTD.dtype),
+                safe_features,
                 out_sharding=self.text.out_emb_shd,
             )
 
@@ -478,7 +492,15 @@ def _deepstack_process(
     out_sharding: P | None = None,
 ) -> jax.Array:
     """Add visual embeddings to hidden states at visual token positions."""
-    batch_idx, seq_idx = jnp.where(visual_pos_mask_BT, size=visual_embeds_ND.shape[0])
+    n_embeds = visual_embeds_ND.shape[0]
+    seq_len = hidden_BTD.shape[1]
+    batch_idx, seq_idx = jnp.where(
+        visual_pos_mask_BT, size=n_embeds,
+        fill_value=(0, seq_len - 1),
+    )
+    num_real = jnp.sum(visual_pos_mask_BT)
+    valid = jnp.arange(n_embeds) < num_real
     current_vals = hidden_BTD[batch_idx, seq_idx]
-    new_vals = current_vals + visual_embeds_ND.astype(current_vals.dtype)
+    safe_embeds = jnp.where(valid[:, None], visual_embeds_ND.astype(current_vals.dtype), 0.0)
+    new_vals = current_vals + safe_embeds
     return hidden_BTD.at[batch_idx, seq_idx].set(new_vals, out_sharding=out_sharding)

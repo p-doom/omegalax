@@ -41,6 +41,34 @@ def _finalize_q_shardings(model: nnx.Module, mesh: Mesh) -> None:
             )
 
 
+def _resolve_backend(name: str) -> str:
+    """Resolve the ``"mosaic"`` alias to the GPU/TPU-specific backend."""
+    if name == "mosaic":
+        return "mosaic_gpu" if "NVIDIA" in jax.extend.backend.get_default_device().device_kind else "mosaic_tpu"
+    return name
+
+
+def set_attn_backend(
+    model: nnx.Module,
+    vision_backend: str = "mosaic",
+    text_backend: str = "mosaic",
+) -> None:
+    """Set ``_attn_backend`` on every sub-module that declares one.
+
+    Modules are distinguished by their ``_attn_kind`` attribute
+    (``"vision"`` or ``"text"``).
+    """
+    vision_backend = _resolve_backend(vision_backend)
+    text_backend = _resolve_backend(text_backend)
+
+    for _, module in nnx.iter_modules(model):
+        kind = getattr(module, "_attn_kind", None)
+        if kind == "vision":
+            object.__setattr__(module, "_attn_backend", vision_backend)
+        elif kind == "text":
+            object.__setattr__(module, "_attn_backend", text_backend)
+
+
 def batch_partition_spec(shd_cfg: ShardConfig) -> PartitionSpec:
     return P(shd_cfg.act_btd[0], None)
 

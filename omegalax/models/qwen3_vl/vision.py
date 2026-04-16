@@ -10,7 +10,7 @@ import jax.numpy as jnp
 from flax import nnx
 from jax.sharding import PartitionSpec as P, reshard
 
-from tokamax import dot_product_attention
+from tokamax._src.ops.attention.api import IMPLEMENTATIONS as _ATTN_IMPLS
 from tokamax._src.ops.attention.base import Mask
 
 from omegalax.models.shard_config import ShardConfig
@@ -191,6 +191,8 @@ class VisionAttention(nnx.Module):
         self.heads_shd = heads_shd
         object.__setattr__(self, "_q_sharding", None)
         object.__setattr__(self, "_q_sharding_spec", P(None, *heads_shd))
+        object.__setattr__(self, "_attn_backend", "mosaic_gpu")
+        object.__setattr__(self, "_attn_kind", "vision")
 
     def __call__(self, hidden_ND: jax.Array, cu_seqlens: jax.Array, cos_NK: jax.Array, sin_NK: jax.Array) -> jax.Array:
         N = hidden_ND.shape[0]
@@ -223,9 +225,9 @@ class VisionAttention(nnx.Module):
         k_end = jnp.where(is_pad, N_padded, k_end)
         mask = Mask(k_start=k_start, k_end=k_end)
 
-        attn_NHK = dot_product_attention(
+        attn_NHK = _ATTN_IMPLS[self._attn_backend](
             q_NHK[None], k_NHK[None], v_NHK[None],
-            mask=mask, scale=self.scale, is_causal=False, implementation="mosaic",
+            mask=mask, logits_scale=self.scale,
             q_sharding=self._q_sharding,
         )
         outputs_ND = attn_NHK[0, :N].reshape(N, -1)
