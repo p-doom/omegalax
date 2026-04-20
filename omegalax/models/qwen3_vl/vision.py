@@ -10,11 +10,50 @@ import jax.numpy as jnp
 from flax import nnx
 from jax.sharding import PartitionSpec as P, reshard
 
+from jax._src.cudnn.fused_attention_stablehlo import (
+    MaskType as _CuDnnMaskType,
+    dot_product_attention as _cudnn_dot_product_attention,
+)
 from tokamax._src.ops.attention.api import IMPLEMENTATIONS as _ATTN_IMPLS
 from tokamax._src.ops.attention.base import Mask
 
 from omegalax.models.shard_config import ShardConfig
 from .config import Qwen3VLVisionConfig
+
+
+def _cudnn_packed_vision_attention(
+    q_NHK: jax.Array,
+    k_NHK: jax.Array,
+    v_NHK: jax.Array,
+    cu_seqlens: jax.Array,
+    scale: float,
+) -> jax.Array:
+    """Run vision attention via cuDNN's packed (THD) kernel.
+
+    All image tokens are concatenated along the sequence dim. ``cu_seqlens``
+    describes per-image segment boundaries; cuDNN uses these to skip
+    cross-segment tiles entirely rather than materializing a full [T, S] mask.
+
+    Args:
+        q_NHK, k_NHK, v_NHK: (N, num_heads, head_dim) with N == cu_seqlens[-1].
+        cu_seqlens: int32, shape (M+1,). Static length at trace time.
+        scale: attention logits scale.
+    Returns:
+        (N, num_heads, head_dim)
+    """
+    cu = cu_seqlens.astype(jnp.int32)
+    q_offsets = cu[None]
+    kv_offsets = cu[None]
+    seqlens = jnp.diff(cu)[None]
+
+    out = _cudnn_dot_product_attention(
+        q_NHK[None], k_NHK[None], v_NHK[None],
+        q_seqlen=seqlens, kv_seqlen=seqlens,
+        q_offsets=q_offsets, kv_offsets=kv_offsets,
+        scale=scale, mask_type=_CuDnnMaskType.NO_MASK,
+        qkv_layout="BTNH",
+    )
+    return out[0]
 
 
 def _token_spatial_coords(
@@ -208,29 +247,35 @@ class VisionAttention(nnx.Module):
 
         q_NHK, k_NHK = apply_rotary_pos_emb_vision(q_NHK, k_NHK, cos_NK, sin_NK)
 
-        _BLOCK = 128  # tokamax mosaic block alignment
-        N_padded = (N + _BLOCK - 1) // _BLOCK * _BLOCK
-        pad_n = N_padded - N
+        if self._attn_backend == "cudnn_packed":
+            attn_NHK = _cudnn_packed_vision_attention(
+                q_NHK, k_NHK, v_NHK, cu_seqlens, self.scale,
+            )
+            outputs_ND = attn_NHK.reshape(N, -1)
+        else:
+            _BLOCK = 128  # tokamax mosaic block alignment
+            N_padded = (N + _BLOCK - 1) // _BLOCK * _BLOCK
+            pad_n = N_padded - N
 
-        if pad_n > 0:
-            q_NHK = jnp.pad(q_NHK, ((0, pad_n), (0, 0), (0, 0)))
-            k_NHK = jnp.pad(k_NHK, ((0, pad_n), (0, 0), (0, 0)))
-            v_NHK = jnp.pad(v_NHK, ((0, pad_n), (0, 0), (0, 0)))
+            if pad_n > 0:
+                q_NHK = jnp.pad(q_NHK, ((0, pad_n), (0, 0), (0, 0)))
+                k_NHK = jnp.pad(k_NHK, ((0, pad_n), (0, 0), (0, 0)))
+                v_NHK = jnp.pad(v_NHK, ((0, pad_n), (0, 0), (0, 0)))
 
-        seg_ids = jnp.searchsorted(cu_seqlens[1:], jnp.arange(N_padded), side="right")
-        k_start = cu_seqlens[jnp.minimum(seg_ids, cu_seqlens.shape[0] - 2)]
-        k_end = cu_seqlens[jnp.minimum(seg_ids + 1, cu_seqlens.shape[0] - 1)]
-        is_pad = jnp.arange(N_padded) >= N
-        k_start = jnp.where(is_pad, N_padded, k_start)
-        k_end = jnp.where(is_pad, N_padded, k_end)
-        mask = Mask(k_start=k_start, k_end=k_end)
+            seg_ids = jnp.searchsorted(cu_seqlens[1:], jnp.arange(N_padded), side="right")
+            k_start = cu_seqlens[jnp.minimum(seg_ids, cu_seqlens.shape[0] - 2)]
+            k_end = cu_seqlens[jnp.minimum(seg_ids + 1, cu_seqlens.shape[0] - 1)]
+            is_pad = jnp.arange(N_padded) >= N
+            k_start = jnp.where(is_pad, N_padded, k_start)
+            k_end = jnp.where(is_pad, N_padded, k_end)
+            mask = Mask(k_start=k_start, k_end=k_end)
 
-        attn_NHK = _ATTN_IMPLS[self._attn_backend](
-            q_NHK[None], k_NHK[None], v_NHK[None],
-            mask=mask, logits_scale=self.scale,
-            q_sharding=self._q_sharding,
-        )
-        outputs_ND = attn_NHK[0, :N].reshape(N, -1)
+            attn_NHK = _ATTN_IMPLS[self._attn_backend](
+                q_NHK[None], k_NHK[None], v_NHK[None],
+                mask=mask, logits_scale=self.scale,
+                q_sharding=self._q_sharding,
+            )
+            outputs_ND = attn_NHK[0, :N].reshape(N, -1)
 
         out_ND = self.proj(outputs_ND, out_sharding=self.hidden_shd)
         return out_ND

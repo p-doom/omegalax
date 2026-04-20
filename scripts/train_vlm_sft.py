@@ -49,9 +49,6 @@ flags.DEFINE_string("save_dir", None, "Checkpoint save directory.")
 flags.DEFINE_string("jax_cache_dir", "/tmp/jax_cache", "Directory for JAX persistent compilation cache.")
 flags.DEFINE_integer("save_every", 50, "Save checkpoint every N steps.")
 flags.DEFINE_integer("log_every", 10, "Log metrics every N steps.")
-flags.DEFINE_string("profile_dir", None, "Directory for JAX profiling output.")
-flags.DEFINE_integer("profile_start", 3, "Step to start profiling (after JIT warmup).")
-flags.DEFINE_integer("profile_end", 8, "Step to stop profiling.")
 flags.DEFINE_bool("resume", False, "Resume from latest checkpoint.")
 flags.DEFINE_integer("pad_id", 0, "Padding token id.")
 flags.DEFINE_string("peak_tflops", None, "Peak TFLOPS for MFU calculation.")
@@ -74,7 +71,9 @@ flags.DEFINE_integer("max_vision_images_per_sample", 0,
                      "Max images per sample for JIT stability (0 = no padding). "
                      "Multiplied by batch_size automatically.")
 
-_ATTN_BACKENDS = ["mosaic", "mosaic_gpu", "cudnn", "xla", "xla_chunked", "triton"]
+_ATTN_BACKENDS = [
+    "mosaic", "mosaic_gpu", "cudnn", "cudnn_packed", "xla", "xla_chunked", "triton",
+]
 flags.DEFINE_enum("text_attn_backend", "mosaic", _ATTN_BACKENDS,
                   "Attention backend for the text decoder.")
 flags.DEFINE_enum("vision_attn_backend", "mosaic", _ATTN_BACKENDS,
@@ -224,8 +223,6 @@ def main(_) -> None:
             tp_size=FLAGS.tp_size,
             fsdp_size=FLAGS.fsdp_size,
             dp_size=FLAGS.dp_size,
-            profile_dir=FLAGS.profile_dir,
-            profile_steps=(FLAGS.profile_start, FLAGS.profile_end),
             wandb_run=wandb_run,
             val_data_iter=val_data_iter,
             val_every=FLAGS.val_every,

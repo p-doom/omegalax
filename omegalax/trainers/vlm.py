@@ -246,8 +246,6 @@ def run_sft(
     tp_size: int | None = None,
     fsdp_size: int | None = None,
     dp_size: int | None = None,
-    profile_dir: str | Path | None = None,
-    profile_steps: tuple[int, int] = (3, 8),
     wandb_run=None,
     val_data_iter: checkpoint_utils.GrainIterator | None = None,
     val_every: int | None = None,
@@ -381,18 +379,9 @@ def run_sft(
         if result is not None:
             last_metrics = result
 
-    prof_start, prof_end = profile_steps
-    is_profiling_active = False
-
     startup_log("entering training loop")
     for step_idx in range(start_step, train_cfg.num_steps):
         step = step_idx + 1
-
-        if profile_dir is not None and step_idx == prof_start and not is_profiling_active:
-            if is_primary_process:
-                print(f"[profiler] starting trace at step {step} -> {profile_dir}")
-            jax.profiler.start_trace(str(profile_dir))
-            is_profiling_active = True
 
         accum_loss = 0.0
         accum_sup_tokens = 0.0
@@ -408,12 +397,6 @@ def run_sft(
                 train_cfg.batch_size,
                 image_grid_thw=batch.get("image_grid_thw"),
             )
-            # --- diagnostic: log vision array shapes to detect recompilation triggers ---
-            if is_primary_process and step <= 20:
-                _diag_shapes = {k: v.shape for k, v in batch.items() if k in ("pixel_values", "image_grid_thw", "vision_cu_seqlens")}
-                if _diag_shapes:
-                    print(f"[diag] step={step} micro={_micro} vision_shapes={_diag_shapes}", flush=True)
-            # --- end diagnostic ---
             batch = vlm_api.shard_batch_dict(batch, model_cfg, mesh)
             _, metrics = sft_step(optimizer, batch)
             micro_delta = timer.step()
@@ -423,14 +406,6 @@ def run_sft(
             accum_grad_norm = accum_grad_norm + metrics["grad_norm"]
             accum_flops += micro_flops
             accum_time += micro_delta
-
-        if is_profiling_active and step >= prof_end:
-            jax.tree.map(lambda x: x.block_until_ready(), metrics)
-            jax.profiler.save_device_memory_profile(f"{profile_dir}/memory.prof")
-            jax.profiler.stop_trace()
-            is_profiling_active = False
-            if is_primary_process:
-                print(f"[profiler] stopped trace at step {step}")
 
         
         with jax.default_device('cpu'):
@@ -462,13 +437,6 @@ def run_sft(
                     {"val/loss": avg_val_loss, "val/sup_tokens": total_val_sup_tokens},
                     step=step,
                 )
-
-    if is_profiling_active:
-        jax.tree.map(lambda x: x.block_until_ready(), metrics)
-        jax.profiler.save_device_memory_profile(f"{profile_dir}/memory.prof")
-        jax.profiler.stop_trace()
-        if is_primary_process:
-            print("[profiler] stopped trace at end of training")
 
     _log_prev_metrics(force=True)
 
