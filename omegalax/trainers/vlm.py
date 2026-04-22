@@ -250,8 +250,7 @@ def run_sft(
     val_data_iter: checkpoint_utils.GrainIterator | None = None,
     val_every: int | None = None,
     val_steps: int = 10,
-    vision_attn_backend: str = "mosaic",
-    text_attn_backend: str = "mosaic",
+    text_attn_backend: str = "mosaic_gpu",
 ) -> tuple[MixedPrecisionOptimizer, dict[str, float]]:
     """SFT a VLM from a Grain iterator; returns final optimizer + last metrics.
 
@@ -326,8 +325,8 @@ def run_sft(
         )
         startup_log("initialized model (random init)")
     from omegalax.models.sharding_runtime import set_attn_backend
-    set_attn_backend(model, vision_backend=vision_attn_backend, text_backend=text_attn_backend)
-    startup_log(f"set attn backends: vision={vision_attn_backend} text={text_attn_backend}")
+    set_attn_backend(model, text_backend=text_attn_backend)
+    startup_log(f"set attn backend: text={text_attn_backend}")
     with mesh_rules(mesh):
         optimizer = build_optimizer(model, lr_schedule_fn, train_cfg)
 

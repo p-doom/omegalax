@@ -138,6 +138,13 @@ def _pad_vision_arrays(
     num_dummies = max_images - real_images
     extra_patches = max_patches - real_patches
 
+    if num_dummies < 0 or extra_patches < 0:
+        raise ValueError(
+            f"Batch exceeds padding budget: real_images={real_images} > "
+            f"max_images={max_images} or real_patches={real_patches} > "
+            f"max_patches={max_patches}. Increase the per-sample limits."
+        )
+
     if num_dummies == 0 and extra_patches == 0:
         return pixel_values, image_grid_thw, _compute_vision_cu_seqlens(image_grid_thw)
 

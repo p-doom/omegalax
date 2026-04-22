@@ -2,6 +2,14 @@
 
 from __future__ import annotations
 
+
+import os
+if os.environ.get("OMEGA_DISABLE_GC") == "1":
+    import gc
+    gc.disable()
+    print("[startup] OMEGA_DISABLE_GC=1: Python GC disabled", flush=True)
+
+
 import json
 from pathlib import Path
 
@@ -72,13 +80,10 @@ flags.DEFINE_integer("max_vision_images_per_sample", 0,
                      "Multiplied by batch_size automatically.")
 
 _ATTN_BACKENDS = [
-    "mosaic", "mosaic_gpu", "cudnn", "cudnn_packed", "xla", "xla_chunked", "triton",
+    "mosaic_tpu", "mosaic_gpu", "cudnn", "xla", "triton",
 ]
-flags.DEFINE_enum("text_attn_backend", "mosaic", _ATTN_BACKENDS,
+flags.DEFINE_enum("text_attn_backend", "mosaic_gpu", _ATTN_BACKENDS,
                   "Attention backend for the text decoder.")
-flags.DEFINE_enum("vision_attn_backend", "mosaic", _ATTN_BACKENDS,
-                  "Attention backend for the vision encoder.")
-
 
 def _default_save_dir(model_id: str) -> Path:
     safe_name = model_id.replace("/", "_")
@@ -134,6 +139,20 @@ def main(_) -> None:
             ip_kwargs = json.load(f)
     image_processor = AutoImageProcessor.from_pretrained(repo_id, use_fast=False, **ip_kwargs)
     startup_log(f"loaded image processor from {repo_id!r}")
+
+    if FLAGS.max_vision_patches_per_sample:
+        merge_size = int(image_processor.merge_size)
+        ms2 = merge_size * merge_size
+        max_patches = FLAGS.max_vision_patches_per_sample * FLAGS.batch_size
+        if max_patches % ms2 != 0:
+            raise ValueError(
+                f"max_vision_patches_per_sample * batch_size = "
+                f"{FLAGS.max_vision_patches_per_sample} * {FLAGS.batch_size} "
+                f"= {max_patches} must be divisible by merge_size**2={ms2} "
+                f"(remainder {max_patches % ms2}). Adjust the flags so their "
+                f"product is a multiple of {ms2}."
+            )
+
     collator = VLMSFTCollator(
         tokenizer,
         max_length=FLAGS.max_length,
@@ -227,7 +246,6 @@ def main(_) -> None:
             val_data_iter=val_data_iter,
             val_every=FLAGS.val_every,
             val_steps=FLAGS.val_steps,
-            vision_attn_backend=FLAGS.vision_attn_backend,
             text_attn_backend=FLAGS.text_attn_backend,
         )
     finally:
