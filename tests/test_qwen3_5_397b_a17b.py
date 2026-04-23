@@ -45,6 +45,7 @@ class Qwen3_5RealTest(absltest.TestCase):
             MODEL_ID,
             tp_size=1,
             fsdp_size=1,
+            dp_size=1,
         )
 
         cls.hf_model = HFModel.from_pretrained(

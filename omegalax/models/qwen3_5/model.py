@@ -56,7 +56,7 @@ class MLP(nnx.Module):
     def __call__(self, hidden_BTD: jax.Array) -> jax.Array:
         gate_BTF = self.gate_proj(hidden_BTD, out_sharding=self.shd_cfg.act_btf)
         up_BTF = self.up_proj(hidden_BTD, out_sharding=self.shd_cfg.act_btf)
-        activated_BTF = reshard(nnx.silu(gate_BTF) * up_BTF, self.shd_cfg.act_btf)
+        activated_BTF = nnx.silu(gate_BTF) * up_BTF
         return self.down_proj(activated_BTF, out_sharding=self.shd_cfg.act_btd)
 
 
@@ -71,13 +71,17 @@ class MoEFeedForward(nnx.Module):
         F_moe = cfg.moe_intermediate_size
 
         init = nnx.initializers.lecun_normal()
-        self.gate_up_proj = nnx.Param(
-            init(rngs.params(), (E, 2 * F_moe, D)),
-            sharding=(None, "mlp", "embed"),
-        )
-        self.down_proj = nnx.Param(
+        self.gate_proj = nnx.Param(
             init(rngs.params(), (E, D, F_moe)),
             sharding=(None, "embed", "mlp"),
+        )
+        self.up_proj = nnx.Param(
+            init(rngs.params(), (E, D, F_moe)),
+            sharding=(None, "embed", "mlp"),
+        )
+        self.down_proj = nnx.Param(
+            init(rngs.params(), (E, F_moe, D)),
+            sharding=(None, "mlp", "embed"),
         )
         self.router = nnx.Linear(
             D,
@@ -109,8 +113,8 @@ class MoEFeedForward(nnx.Module):
         cfg = self.cfg
         B, T = hidden_BTD.shape[:2]
         batch_axis = self.shd_cfg.act_btd[0]
-        hidden_axis = self.shd_cfg.act_btd[2]
         ff_axis = self.shd_cfg.act_btf[2]
+        hidden_axis = self.shd_cfg.act_btd[2]
 
         router_logits_BTE = self.router(hidden_BTD, out_sharding=P(batch_axis, None, None))
         probs_BTE = jax.nn.softmax(router_logits_BTE.astype(jnp.float32), axis=-1)
@@ -121,35 +125,49 @@ class MoEFeedForward(nnx.Module):
         topk_weights_BTk = topk_weights_BTk.astype(probs_BTE.dtype)
 
         compute_dtype = hidden_BTD.dtype
-        gate_up_proj = jnp.astype(self.gate_up_proj[...], compute_dtype)
+        gate_proj = jnp.astype(self.gate_proj[...], compute_dtype)
+        up_proj = jnp.astype(self.up_proj[...], compute_dtype)
         down_proj = jnp.astype(self.down_proj[...], compute_dtype)
 
         dense_hidden_BTD = reshard(hidden_BTD, P(batch_axis, None, None))
-        gate_up_BTEF = jnp.einsum(
-            "BTD,EFD->BTEF",
+        gate_BTEF = jnp.einsum(
+            "BTD,EDF->BTEF",
             dense_hidden_BTD,
-            gate_up_proj,
+            gate_proj,
             out_sharding=P(batch_axis, None, None, ff_axis),
         )
-        gate_BTEF, up_BTEF = jnp.split(gate_up_BTEF, 2, axis=-1)
+        up_BTEF = jnp.einsum(
+            "BTD,EDF->BTEF",
+            dense_hidden_BTD,
+            up_proj,
+            out_sharding=P(batch_axis, None, None, ff_axis),
+        )
         expert_hidden_BTEF = nnx.silu(gate_BTEF) * up_BTEF
         expert_out_BTED = jnp.einsum(
-            "BTEF,EDF->BTED",
+            "BTEF,EFD->BTED",
             expert_hidden_BTEF,
             down_proj,
             out_sharding=P(batch_axis, None, None, hidden_axis),
         )
 
-        flat_out = expert_out_BTED.reshape(B * T, cfg.num_experts, cfg.hidden_size)
+        flat_out = jax.lax.reshape(
+            expert_out_BTED,
+            (B * T, cfg.num_experts, cfg.hidden_size),
+            out_sharding=P(batch_axis, None, None),
+        )
         flat_idx = topk_idx_BTk.reshape(B * T, cfg.num_experts_per_tok)
         gathered = jnp.take_along_axis(flat_out, flat_idx[..., None], axis=1)
-        gathered = gathered.reshape(B, T, cfg.num_experts_per_tok, cfg.hidden_size)
+        gathered = jax.lax.reshape(
+            gathered,
+            (B, T, cfg.num_experts_per_tok, cfg.hidden_size),
+            out_sharding=P(batch_axis, None, None, None),
+        )
         moe_out_BTD = reshard(jnp.sum(gathered * topk_weights_BTk[..., None], axis=-2), self.shd_cfg.act_btd)
 
         shared_out_BTD = self.shared_expert(hidden_BTD)
         shared_gate = jax.nn.sigmoid(self.shared_expert_gate(hidden_BTD, out_sharding=P(batch_axis, None, None)))
         shared_out_BTD = shared_gate * shared_out_BTD
-        output_BTD = reshard(moe_out_BTD + shared_out_BTD, self.shd_cfg.act_btd)
+        output_BTD = moe_out_BTD + shared_out_BTD
 
         load_E = jnp.mean(probs_BTE, axis=(0, 1))
         uniform_E = jnp.full_like(load_E, 1.0 / cfg.num_experts)
@@ -351,7 +369,9 @@ class Qwen3_5ForConditionalGeneration(nnx.Module):
             )
             inputs_embeds_BTD = jnp.where(image_mask_BTD, 0.0, inputs_embeds_BTD)
             batch_indices, seq_indices = jnp.where(image_mask_BT)
-            inputs_embeds_BTD = inputs_embeds_BTD.at[batch_indices, seq_indices].set(image_embeds_ND)
+            inputs_embeds_BTD = inputs_embeds_BTD.at[batch_indices, seq_indices].set(
+                image_embeds_ND, out_sharding=self.text.out_emb_shd,
+            )
 
         return self.text(
             inputs_embeds_BTD=inputs_embeds_BTD,

@@ -11,7 +11,10 @@ import safetensors
 from etils import epath
 from flax import nnx
 
+import dataclasses
+
 from omegalax.distributed.mesh import ensure_mesh, mesh_rules
+from omegalax.models.shard_config import shard_config_for_mesh
 from omegalax.models.params_utils import (
     Transform,
     assign_weights_from_eval_shape,
@@ -141,9 +144,10 @@ def create_qwen3_vl_from_safetensors(
     *,
     tp_size: int | None = None,
     fsdp_size: int | None = None,
+    dp_size: int | None = None,
 ) -> tuple[Qwen3VL, Qwen3VLConfig]:
     """Load HuggingFace Qwen3-VL safetensors into a JAX Qwen3-VL model."""
-    mesh = ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size)
+    mesh = ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size)
 
     path = epath.Path(file_dir).expanduser()
     files = find_safetensors(file_dir)
@@ -151,6 +155,7 @@ def create_qwen3_vl_from_safetensors(
     hf_cfg = load_hf_config(path)
     cfg = make_vl_config_from_hf(hf_cfg)
     _assert_vl_config(cfg, hf_cfg)
+    cfg = dataclasses.replace(cfg, shd_cfg=shard_config_for_mesh(cfg.shd_cfg, mesh))
 
     with mesh_rules(mesh):
         model = nnx.eval_shape(lambda: Qwen3VL(cfg, rngs=nnx.Rngs(params=0)))
@@ -219,4 +224,6 @@ def create_qwen3_vl_from_safetensors(
 
     gc.collect()
     model = nnx.merge(graph_def, state_dict)
+    from omegalax.models.sharding_runtime import _finalize_q_shardings
+    _finalize_q_shardings(model, mesh)
     return model, cfg

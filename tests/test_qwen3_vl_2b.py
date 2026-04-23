@@ -72,6 +72,7 @@ class Qwen3VLMappingTest(absltest.TestCase):
             MODEL_ID,
             tp_size=1,
             fsdp_size=1,
+            dp_size=1,
         )
 
     def test_parameter_mapping_is_complete(self):
@@ -88,7 +89,7 @@ class Qwen3VLMappingTest(absltest.TestCase):
             self.fail(f"Unmapped HF parameter keys ({len(unmapped)}):\n" + "\n".join(sorted(unmapped)))
 
         from omegalax.models.qwen3_vl.model import Qwen3VL
-        with mesh_rules_for(tp_size=1, fsdp_size=1):
+        with mesh_rules_for(tp_size=1, fsdp_size=1, dp_size=1):
             _, abs_state = nnx.split(nnx.eval_shape(lambda: Qwen3VL(self.cfg, rngs=nnx.Rngs(params=0))))
         abs_dict = nnx.to_pure_dict(abs_state)
         _, loaded_state = nnx.split(self.jax_model)

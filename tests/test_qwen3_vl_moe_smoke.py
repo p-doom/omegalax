@@ -108,6 +108,7 @@ class Qwen3VLMoeSmokeTest(absltest.TestCase):
             cls.tmpdir,
             tp_size=1,
             fsdp_size=1,
+            dp_size=1,
         )
 
         torch_dtype = _JNP_TO_TORCH[cls.jax_cfg.dtype]

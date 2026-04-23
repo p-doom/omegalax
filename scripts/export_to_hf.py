@@ -20,6 +20,7 @@ flags.DEFINE_string("out_dir", None, "Destination directory for safetensors+conf
 flags.DEFINE_integer("seed", 0, "RNG seed used when initializing the model.")
 flags.DEFINE_integer("tp_size", None, "Tensor parallelism size.")
 flags.DEFINE_integer("fsdp_size", None, "FSDP parallelism size.")
+flags.DEFINE_integer("dp_size", None, "Data parallelism size.")
 flags.DEFINE_integer("pad_id", 0, "Padding token id (for cache creation).")
 
 
@@ -32,6 +33,7 @@ def _load_text_model():
         init_rng,
         tp_size=FLAGS.tp_size,
         fsdp_size=FLAGS.fsdp_size,
+        dp_size=FLAGS.dp_size,
     )
     return model, model_cfg
 
@@ -43,6 +45,7 @@ def _load_vlm_model():
         rng,
         tp_size=FLAGS.tp_size,
         fsdp_size=FLAGS.fsdp_size,
+        dp_size=FLAGS.dp_size,
     )
     return model, cfg
 

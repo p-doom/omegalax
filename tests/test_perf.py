@@ -121,7 +121,7 @@ class ProcessLocalBatchSizeTest(absltest.TestCase):
 
     def test_rejects_non_divisible_global_batch_size(self):
         with mock.patch("jax.process_count", return_value=3):
-            with self.assertRaisesRegex(ValueError, "divisible by process_count=3"):
+            with self.assertRaisesRegex(ValueError, "divisible by data_parallel_size=3"):
                 process_local_batch_size(8)
 
 

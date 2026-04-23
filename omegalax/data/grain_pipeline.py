@@ -240,19 +240,22 @@ def required_epochs_for_batches(
     *,
     batch_size: int,
     num_batches: int,
+    dp_size: int | None = None,
 ) -> int:
     if num_batches <= 0:
         return 1
     if batch_size <= 0:
         raise ValueError("batch_size must be > 0")
+    from omegalax.distributed.mesh import data_parallel_size
+
     metadata = load_compiled_metadata(path)
     num_records = int(metadata["num_records"])
-    process_count = jax.process_count()
-    records_per_epoch = num_records // process_count
+    dp = data_parallel_size(dp_size)
+    records_per_epoch = num_records // dp
     if records_per_epoch <= 0:
         raise ValueError(
             f"Compiled Grain dataset has {num_records} records, which is too small to shard "
-            f"across process_count={process_count} with drop_remainder=True."
+            f"across data_parallel_size={dp} with drop_remainder=True."
         )
     required_records = batch_size * num_batches
     return max(1, (required_records + records_per_epoch - 1) // records_per_epoch)
@@ -612,8 +615,10 @@ def make_grain_iterator(
     num_epochs: int = 1,
     read_options: grain.ReadOptions | None = None,
     multiprocessing_options: grain.MultiprocessingOptions | None = None,
+    dp_size: int | None = None,
 ):
     """Create a checkpointable Grain dataloader iterator over a chunk-index dataset."""
+    from omegalax.distributed.mesh import data_parallel_index, data_parallel_size
 
     compiled_path = Path(compiled_path).expanduser().resolve()
     metadata = load_compiled_metadata(compiled_path)
@@ -628,8 +633,12 @@ def make_grain_iterator(
     mp_options = multiprocessing_options or make_grain_multiprocessing_options()
     read_options = read_options or make_grain_read_options()
 
+    dp = data_parallel_size(dp_size)
+    dp_index = data_parallel_index(dp_size)
     source = grain.sources.ArrayRecordDataSource(shard_paths)
-    shard_options = grain.sharding.ShardByJaxProcess(drop_remainder=True)
+    shard_options = grain.sharding.NoSharding() if dp <= 1 else grain.sharding.ShardOptions(
+        shard_index=dp_index, shard_count=dp, drop_remainder=True,
+    )
     sampler = grain.samplers.IndexSampler(
         num_records=len(source),
         shard_options=shard_options,

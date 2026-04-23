@@ -140,7 +140,7 @@ def _make_grain_batch_iter(batch: dict[str, np.ndarray]):
 
 class ShardBatchDictTest(absltest.TestCase):
     def test_rank2_arrays(self):
-        mesh = ensure_mesh(tp_size=1, fsdp_size=1)
+        mesh = ensure_mesh(tp_size=1, fsdp_size=1, dp_size=1)
         shd_cfg = ShardConfig.no_sharding()
         batch = {
             "token_ids_BT": np.ones((2, 4), dtype=np.int32),
@@ -152,7 +152,7 @@ class ShardBatchDictTest(absltest.TestCase):
         self.assertEqual(out["token_ids_BT"].shape, (2, 4))
 
     def test_mixed_rank_arrays(self):
-        mesh = ensure_mesh(tp_size=1, fsdp_size=1)
+        mesh = ensure_mesh(tp_size=1, fsdp_size=1, dp_size=1)
         shd_cfg = ShardConfig.no_sharding()
         batch = {
             "token_ids_BT": np.ones((2, 4), dtype=np.int32),
@@ -184,6 +184,7 @@ class TextSFTTrainingTest(absltest.TestCase):
             log_every=0,
             tp_size=1,
             fsdp_size=1,
+            dp_size=1,
         )
         self.assertIn("loss", metrics)
         self.assertIn("supervised_tokens", metrics)
@@ -212,6 +213,7 @@ class VLMSFTTrainingTest(absltest.TestCase):
             log_every=0,
             tp_size=1,
             fsdp_size=1,
+            dp_size=1,
         )
         self.assertIn("loss", metrics)
         self.assertIn("supervised_tokens", metrics)
@@ -238,6 +240,7 @@ class VLMSFTTrainingTest(absltest.TestCase):
             log_every=0,
             tp_size=1,
             fsdp_size=1,
+            dp_size=1,
         )
         self.assertIn("loss", metrics)
         self.assertIn("supervised_tokens", metrics)

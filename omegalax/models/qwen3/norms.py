@@ -1,7 +1,6 @@
 import jax
 import jax.numpy as jnp
 from flax import nnx
-from tokamax import layer_norm
 
 
 class RMSNorm(nnx.Module):
@@ -21,10 +20,8 @@ class RMSNorm(nnx.Module):
 
     @jax.named_scope("rms_norm")
     def __call__(self, x: jax.Array) -> jax.Array:
-        return layer_norm(
-            x,
-            scale=self.scale[...],
-            offset=None,
-            epsilon=self.norm_eps,
-            subtract_mean=False,
-        )
+        dtype = x.dtype
+        x_f32 = x.astype(jnp.float32)
+        variance = jnp.mean(x_f32 * x_f32, axis=-1, keepdims=True)
+        normed = x_f32 * jax.lax.rsqrt(variance + self.norm_eps)
+        return (normed * self.scale[...].astype(jnp.float32)).astype(dtype)

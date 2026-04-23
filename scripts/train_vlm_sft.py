@@ -7,7 +7,7 @@ from pathlib import Path
 
 from absl import app, flags
 import jax
-from tensorboardX import SummaryWriter
+import wandb
 from transformers import AutoImageProcessor, AutoTokenizer
 
 from omegalax.data.collator_qwen3 import VLMSFTCollator
@@ -34,9 +34,17 @@ flags.DEFINE_integer("num_steps", 100, "Number of training steps.")
 flags.DEFINE_integer("batch_size", 4, "Global batch size across all JAX processes.")
 flags.DEFINE_float("learning_rate", 2e-5, "Learning rate.")
 flags.DEFINE_float("weight_decay", 0.01, "Weight decay.")
+flags.DEFINE_integer("warmup_steps", 0, "Linear LR warmup steps.")
+flags.DEFINE_enum("lr_schedule", "linear", ["linear", "cosine", "wsd"],
+                  "LR schedule after warmup: 'linear' (constant), 'cosine', or 'wsd' (warmup-stable-decay).")
+flags.DEFINE_float("lr_end_factor", 0.0, "Final LR as fraction of peak LR (cosine/wsd decay end value).")
+flags.DEFINE_float("lr_stable_fraction", 0.8, "Fraction of post-warmup steps at peak LR (wsd only).")
+flags.DEFINE_float("max_grad_norm", 1.0, "Max gradient norm for clipping (0 = no clipping).")
+flags.DEFINE_integer("grad_accum_steps", 1, "Gradient accumulation steps (1 = no accumulation).")
 flags.DEFINE_integer("seed", 0, "RNG seed.")
 flags.DEFINE_integer("tp_size", None, "Tensor parallelism size.")
 flags.DEFINE_integer("fsdp_size", None, "FSDP parallelism size.")
+flags.DEFINE_integer("dp_size", None, "Data parallelism size.")
 flags.DEFINE_string("save_dir", None, "Checkpoint save directory.")
 flags.DEFINE_string("jax_cache_dir", "/tmp/jax_cache", "Directory for JAX persistent compilation cache.")
 flags.DEFINE_integer("save_every", 50, "Save checkpoint every N steps.")
@@ -47,7 +55,11 @@ flags.DEFINE_integer("profile_end", 8, "Step to stop profiling.")
 flags.DEFINE_bool("resume", False, "Resume from latest checkpoint.")
 flags.DEFINE_integer("pad_id", 0, "Padding token id.")
 flags.DEFINE_string("peak_tflops", None, "Peak TFLOPS for MFU calculation.")
-flags.DEFINE_string("tensorboard_dir", None, "Directory for TensorBoard event files.")
+flags.DEFINE_string("wandb_entity", None, "Weights & Biases entity (team/user).")
+flags.DEFINE_string("wandb_project", None, "Weights & Biases project name.")
+flags.DEFINE_string("wandb_group", None, "Weights & Biases run group.")
+flags.DEFINE_string("wandb_name", None, "Weights & Biases run name.")
+flags.DEFINE_list("wandb_tags", [], "Comma-separated Weights & Biases tags.")
 flags.DEFINE_string("val_data_path", None, "Path to compiled Grain validation chunk-index dataset.")
 flags.DEFINE_integer("val_every", None, "Run validation every N training steps.")
 flags.DEFINE_integer("val_steps", 10, "Number of batches per validation run.")
@@ -70,6 +82,7 @@ def _grain_iter(
     shuffle: bool,
     seed: int,
     num_batches: int,
+    dp_size: int | None = None,
 ):
     return make_grain_iterator(
         data_path,
@@ -78,7 +91,8 @@ def _grain_iter(
         shuffle=shuffle,
         seed=seed,
         num_epochs=required_epochs_for_batches(
-            data_path, batch_size=per_process_batch_size, num_batches=num_batches
+            data_path, batch_size=per_process_batch_size, num_batches=num_batches,
+            dp_size=dp_size,
         ),
         read_options=make_grain_read_options(
             num_threads=FLAGS.grain_read_threads,
@@ -88,6 +102,7 @@ def _grain_iter(
             num_workers=FLAGS.grain_workers,
             per_worker_buffer_size=FLAGS.grain_worker_buffer_size,
         ),
+        dp_size=dp_size,
     )
 
 
@@ -110,7 +125,7 @@ def main(_) -> None:
     startup_log(f"loaded image processor from {repo_id!r}")
     collator = VLMSFTCollator(tokenizer, max_length=FLAGS.max_length, image_processor=image_processor)
     startup_log("built VLMSFTCollator")
-    per_process_batch = process_local_batch_size(FLAGS.batch_size)
+    per_process_batch = process_local_batch_size(FLAGS.batch_size, dp_size=FLAGS.dp_size)
     startup_log(
         f"model_id={FLAGS.model_id!r} data_path={FLAGS.data_path!r} "
         f"jax_compilation_cache_dir={FLAGS.jax_cache_dir!r} "
@@ -122,13 +137,15 @@ def main(_) -> None:
             f"per_process_batch_size={per_process_batch}"
         )
 
+    total_micro_batches = FLAGS.num_steps * FLAGS.grad_accum_steps
     data_iter = _grain_iter(
         FLAGS.data_path,
         collator,
         per_process_batch,
         shuffle=True,
         seed=FLAGS.seed,
-        num_batches=FLAGS.num_steps,
+        num_batches=total_micro_batches,
+        dp_size=FLAGS.dp_size,
     )
     startup_log("built train grain DataLoader iterator")
 
@@ -141,6 +158,7 @@ def main(_) -> None:
             shuffle=False,
             seed=FLAGS.seed,
             num_batches=max(1, (FLAGS.num_steps // max(FLAGS.val_every or FLAGS.num_steps, 1)) * FLAGS.val_steps),
+            dp_size=FLAGS.dp_size,
         )
         startup_log(f"built val grain DataLoader iterator from {FLAGS.val_data_path!r}")
 
@@ -151,6 +169,12 @@ def main(_) -> None:
         num_steps=FLAGS.num_steps,
         learning_rate=FLAGS.learning_rate,
         weight_decay=FLAGS.weight_decay,
+        warmup_steps=FLAGS.warmup_steps,
+        lr_schedule=FLAGS.lr_schedule,
+        lr_end_factor=FLAGS.lr_end_factor,
+        lr_stable_fraction=FLAGS.lr_stable_fraction,
+        max_grad_norm=FLAGS.max_grad_norm,
+        grad_accum_steps=FLAGS.grad_accum_steps,
         print_every=FLAGS.log_every,
     )
     save_dir = Path(FLAGS.save_dir) if FLAGS.save_dir else (
@@ -158,12 +182,16 @@ def main(_) -> None:
     )
     peak_tflops = resolve_peak_tflops(FLAGS.peak_tflops)
 
-    tb_writer = None
-    if FLAGS.tensorboard_dir and jax.process_index() == 0:
-        tb_dir = Path(FLAGS.tensorboard_dir)
-        tb_dir.mkdir(parents=True, exist_ok=True)
-        tb_writer = SummaryWriter(str(tb_dir))
-        tb_writer.add_hparams(flags.FLAGS.flag_values_dict(), {})
+    wandb_run = None
+    if FLAGS.wandb_project and jax.process_index() == 0:
+        wandb_run = wandb.init(
+            entity=FLAGS.wandb_entity,
+            project=FLAGS.wandb_project,
+            group=FLAGS.wandb_group,
+            name=FLAGS.wandb_name,
+            tags=FLAGS.wandb_tags or None,
+            config=flags.FLAGS.flag_values_dict(),
+        )
     try:
         _, last_metrics = vlm_trainer.run_sft(
             FLAGS.model_id,
@@ -177,16 +205,17 @@ def main(_) -> None:
             peak_tflops=peak_tflops,
             tp_size=FLAGS.tp_size,
             fsdp_size=FLAGS.fsdp_size,
+            dp_size=FLAGS.dp_size,
             profile_dir=FLAGS.profile_dir,
             profile_steps=(FLAGS.profile_start, FLAGS.profile_end),
-            tb_writer=tb_writer,
+            wandb_run=wandb_run,
             val_data_iter=val_data_iter,
             val_every=FLAGS.val_every,
             val_steps=FLAGS.val_steps,
         )
     finally:
-        if tb_writer is not None:
-            tb_writer.close()
+        if wandb_run is not None:
+            wandb_run.finish()
 
     if last_metrics:
         print(f"finished step={int(last_metrics['step'])} loss={last_metrics['loss']:.4f}")

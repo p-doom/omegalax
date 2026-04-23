@@ -66,6 +66,7 @@ class Qwen3AllModelsTest(parameterized.TestCase):
             model_id,
             tp_size=1,
             fsdp_size=1,
+            dp_size=1,
         )
 
         tokenizer = AutoTokenizer.from_pretrained(model_path)
