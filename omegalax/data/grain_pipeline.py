@@ -373,7 +373,7 @@ def build_chunk_index(
     records_per_shard: int = 100_000,
     overwrite: bool = False,
     profile_metadata: dict[str, Any] | None = None,
-    num_workers: int = 1,
+    num_workers: int = 2,
 ) -> Path:
     """Build an offline chunk index over a canonical payload-block dataset.
 
@@ -393,11 +393,9 @@ def build_chunk_index(
     if "payload_path" in payload_metadata:
         raise ValueError(f"Chunk indices can only be built from payload datasets, got chunk index: {payload_path}")
 
-    precomputed_lengths: dict[tuple[int, int], int] | None = None
-    if num_workers > 1:
-        precomputed_lengths = _precompute_message_lengths(
-            payload_path, measure_message, num_workers
-        )
+    precomputed_lengths = _precompute_message_lengths(
+        payload_path, measure_message, num_workers
+    )
 
     # -- token stats accumulators (populated lazily by the generator) ----------
     _msg_lengths: list[int] = []
@@ -461,10 +459,7 @@ def build_chunk_index(
                 current_num_images = 0
 
             for msg_offset, message in enumerate(block["messages"]):
-                if precomputed_lengths is not None:
-                    result = precomputed_lengths[(record_idx, msg_offset)]
-                else:
-                    result = measure_message(message)
+                result = precomputed_lengths[(record_idx, msg_offset)]
 
                 if isinstance(result, dict):
                     msg_length = result["length"]

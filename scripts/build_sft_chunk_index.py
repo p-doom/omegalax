@@ -22,7 +22,7 @@ flags.DEFINE_string("preprocessor_config", None, "Path to JSON file whose keys o
 flags.DEFINE_integer("max_length", None, "Maximum sequence length.", required=True)
 flags.DEFINE_integer("records_per_shard", 100_000, "Records per output shard.")
 flags.DEFINE_bool("overwrite", False, "Overwrite existing output directory.")
-flags.DEFINE_integer("num_workers", 1, "Number of parallel workers for message length measurement.")
+flags.DEFINE_integer("num_workers", 2, "Number of parallel workers for message length measurement.", lower_bound=2)
 
 
 def main(_) -> None:
