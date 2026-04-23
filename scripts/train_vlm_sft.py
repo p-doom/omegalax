@@ -3,13 +3,7 @@
 from __future__ import annotations
 
 
-import os
-if os.environ.get("OMEGA_DISABLE_GC") == "1":
-    import gc
-    gc.disable()
-    print("[startup] OMEGA_DISABLE_GC=1: Python GC disabled", flush=True)
-
-
+import gc
 import json
 from pathlib import Path
 
@@ -49,6 +43,7 @@ flags.DEFINE_float("lr_end_factor", 0.0, "Final LR as fraction of peak LR (cosin
 flags.DEFINE_float("lr_stable_fraction", 0.8, "Fraction of post-warmup steps at peak LR (wsd only).")
 flags.DEFINE_float("max_grad_norm", 1.0, "Max gradient norm for clipping (0 = no clipping).")
 flags.DEFINE_integer("grad_accum_steps", 1, "Gradient accumulation steps (1 = no accumulation).")
+flags.DEFINE_integer("gc_period", 0, "If >0, disable Python GC and collect every N training steps.")
 flags.DEFINE_integer("seed", 0, "RNG seed.")
 flags.DEFINE_integer("tp_size", None, "Tensor parallelism size.")
 flags.DEFINE_integer("fsdp_size", None, "FSDP parallelism size.")
@@ -228,6 +223,10 @@ def main(_) -> None:
             tags=FLAGS.wandb_tags or None,
             config=flags.FLAGS.flag_values_dict(),
         )
+    if FLAGS.gc_period:
+        gc.disable()
+        startup_log(f"gc_period={FLAGS.gc_period}: Python GC disabled, will collect every {FLAGS.gc_period} steps")
+
     try:
         _, last_metrics = vlm_trainer.run_sft(
             FLAGS.model_id,
@@ -247,8 +246,14 @@ def main(_) -> None:
             val_every=FLAGS.val_every,
             val_steps=FLAGS.val_steps,
             text_attn_backend=FLAGS.text_attn_backend,
+            gc_period=FLAGS.gc_period,
         )
     finally:
+
+        if FLAGS.gc_period:
+            gc.enable()
+            print(f"Training completed, re-enabling Python GC")
+
         if wandb_run is not None:
             wandb_run.finish()
 
