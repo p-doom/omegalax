@@ -243,7 +243,6 @@ class VisionAttention(nnx.Module):
 
         q_NHK, k_NHK = apply_rotary_pos_emb_vision(q_NHK, k_NHK, cos_NK, sin_NK)
 
-        # calls cuDNN's packed (THD) kernel.
         attn_NHK = _cudnn_packed_vision_attention(
             q_NHK, k_NHK, v_NHK, cu_seqlens, self.scale,
         )
