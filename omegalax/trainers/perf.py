@@ -1,8 +1,16 @@
 """Throughput metrics for training: FLOP counting, step timing, and MFU.
 
-Uses the MaxText-style approach: attention FLOPs for causal masking are
-halved (2*T*H*K per token instead of 4*T*H*K) since flash attention kernels
-skip masked blocks. Vision encoder attention (bidirectional) uses full FLOPs.
+Uses the MaxText-style ("algorithmic FLOPs") approach: attention FLOPs are
+counted only over positions the kernel actually visits.
+- Causal text attention is halved (2*T*H*K per token) because flash kernels
+  skip masked-out future positions.
+- Vision encoder attention is block-diagonal across images (sum of N_i^2
+  rather than (sum N_i)^2) because the cuDNN packed/THD kernel skips
+  cross-image tiles entirely via cu_seqlens.
+
+This matches the convention used by Megatron-LM, NeMo, and most published
+MFU numbers, and is consistent with the kernels in
+``omegalax.models.qwen3_vl.vision``.
 """
 
 from __future__ import annotations
@@ -140,9 +148,11 @@ def qwen3_vl_vision_training_flops(
 
     Counts matmuls only and matches the current implementation in
     ``omegalax.models.qwen3_vl.vision``:
-    - patch embed and patch mergers are linear layers;
-    - vision attention materializes the full ``(sum N_i)^2`` attention matrix
-      across all images in the batch before masking by ``vision_cu_seqlens``.
+    - patch embed and patch mergers are linear layers (linear in token count);
+    - vision attention is block-diagonal across images: the cuDNN packed/THD
+      kernel uses ``vision_cu_seqlens`` to skip cross-image tiles, so per-image
+      attention costs are summed (``sum_i 4 * N_i^2 * H * K``) rather than
+      computed over the concatenated batch (``4 * (sum_i N_i)^2 * H * K``).
     """
     if image_grid_thw is None:
         return 0
@@ -158,7 +168,9 @@ def qwen3_vl_vision_training_flops(
     vis = cfg.vision
     merge = vis.spatial_merge_size
 
-    total_tokens = int(np.sum(grid_N3[:, 0] * grid_N3[:, 1] * grid_N3[:, 2]))
+    per_image_tokens = grid_N3[:, 0] * grid_N3[:, 1] * grid_N3[:, 2]
+    total_tokens = int(np.sum(per_image_tokens))
+    sum_sq_tokens = int(np.sum(per_image_tokens * per_image_tokens))
     merged_tokens = int(
         np.sum(grid_N3[:, 0] * (grid_N3[:, 1] // merge) * (grid_N3[:, 2] // merge))
     )
@@ -174,7 +186,7 @@ def qwen3_vl_vision_training_flops(
     patch_embed_flops = 2 * total_tokens * in_features * D
 
     qkv_flops = 2 * total_tokens * D * (3 * D)
-    attn_dot_flops = 4 * total_tokens * total_tokens * H * K
+    attn_dot_flops = 4 * sum_sq_tokens * H * K  # block-diagonal: sum_i N_i^2
     o_proj_flops = 2 * total_tokens * D * D
     mlp_flops = 2 * total_tokens * D * F + 2 * total_tokens * F * D
     block_flops = vis.depth * (qkv_flops + attn_dot_flops + o_proj_flops + mlp_flops)
