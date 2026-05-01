@@ -85,8 +85,9 @@ def make_message_length_fn(
     exactly.  For a different chat template, implement an analogous factory and
     swap it in.
     """
+    merge_size = int(getattr(image_processor, "merge_size", 1)) if image_processor else 1
 
-    def _measure(message: dict[str, Any]) -> int:
+    def _measure(message: dict[str, Any]) -> int | dict[str, Any]:
         if image_processor is None and _message_has_images(message):
             raise ValueError(
                 "Encountered image content in message but no image_processor was provided. "
@@ -98,7 +99,24 @@ def make_message_length_fn(
             image_processor=image_processor,
             include_pixels=False,
         )
-        return int(len(encoded["input_ids"]))
+        length = int(len(encoded["input_ids"]))
+
+        grid_thw = encoded.get("image_grid_thw", np.empty((0, 3), dtype=np.int64))
+        num_images = int(grid_thw.shape[0])
+        vision_tokens = 0
+        vision_patches = 0
+        for row in grid_thw:
+            t, h, w = int(row[0]), int(row[1]), int(row[2])
+            vision_tokens += t * (h // merge_size) * (w // merge_size)
+            vision_patches += t * h * w
+
+        return {
+            "length": length,
+            "vision_tokens": vision_tokens,
+            "vision_patches": vision_patches,
+            "num_images": num_images,
+            "image_grid_thw": grid_thw.tolist(),
+        }
 
     return _measure
 

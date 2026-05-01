@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import json
+import multiprocessing as mp
+import numpy as np
 import shutil
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from itertools import chain
 from pathlib import Path
 from typing import Any
+
+from tqdm import tqdm
 
 from array_record.python.array_record_module import ArrayRecordWriter
 import grain
@@ -17,10 +21,16 @@ import numpy as np
 
 COMPILED_DATASET_VERSION = 1
 COMPILED_METADATA_FILENAME = "metadata.json"
+TOKEN_STATS_FILENAME = "token_stats.json"
 ARRAY_RECORD_SUFFIX = ".array_record"
 
 SOURCE_ID_KEY = "_omegalax_source_id"
 BATCH_SOURCE_IDS_KEY = "source_ids"
+
+# Worker-process global for the parallel chunk-index builder (origin/main).
+# Initialized once per worker via the Pool initializer, then reused for every
+# message-length call to avoid pickling the tokenizer per task.
+_measure_fn = None
 
 
 @dataclass(frozen=True)
@@ -277,6 +287,106 @@ def _iter_indexed_records(path: str | Path):
     for record_idx in range(len(source)):
         yield record_idx, json.loads(source[record_idx])
 
+
+def _measure_worker(keyed_message):
+    key, message = keyed_message
+    return key, _measure_fn(message)
+
+
+def _precompute_message_lengths(payload_path, measure_message, num_workers):
+    global _measure_fn
+    _measure_fn = measure_message
+
+    tasks: list[tuple[tuple[int, int], dict[str, Any]]] = []
+    for record_idx, block in _iter_indexed_records(payload_path):
+        for msg_offset, message in enumerate(block["messages"]):
+            tasks.append(((record_idx, msg_offset), message))
+
+    ctx = mp.get_context("fork")
+    chunksize = max(1, min(32, len(tasks) // num_workers))
+    with ctx.Pool(num_workers) as pool:
+        results = dict(tqdm(
+            pool.imap_unordered(_measure_worker, tasks, chunksize=chunksize),
+            total=len(tasks),
+            desc=f"Measuring messages ({num_workers} workers)",
+        ))
+    return results
+
+
+def _compute_distribution(values: list[int]) -> dict[str, int | float]:
+    """Compute summary statistics for a list of integers."""
+    if not values:
+        return {"sum": 0, "min": 0, "max": 0, "mean": 0.0, "median": 0.0,
+                "std": 0.0, "p95": 0.0, "p99": 0.0}
+    arr = np.array(values)
+    return {
+        "sum": int(arr.sum()),
+        "min": int(arr.min()),
+        "max": int(arr.max()),
+        "mean": round(float(arr.mean()), 2),
+        "median": round(float(np.median(arr)), 2),
+        "std": round(float(arr.std()), 2),
+        "p95": round(float(np.percentile(arr, 95)), 2),
+        "p99": round(float(np.percentile(arr, 99)), 2),
+    }
+
+
+def _frequency_table(values: list[int]) -> dict[str, int]:
+    """Return a ``{value: count}`` mapping sorted by value."""
+    counts: dict[int, int] = {}
+    for v in values:
+        counts[v] = counts.get(v, 0) + 1
+    return {str(k): v for k, v in sorted(counts.items())}
+
+
+def _emit_token_stats(
+    out_dir: Path,
+    *,
+    msg_lengths: list[int],
+    msg_vision_tokens: list[int],
+    msg_num_images: list[int],
+    chunk_lengths: list[int],
+    chunk_vision_tokens: list[int],
+    chunk_vision_patches: list[int],
+    chunk_num_images: list[int],
+    chunk_num_messages: list[int],
+    image_shape_counts: dict[str, int],
+) -> None:
+    """Assemble per-message / per-chunk token statistics and write them to
+    ``token_stats.json`` in ``out_dir``.
+    """
+    msg_text_tokens = [l - v for l, v in zip(msg_lengths, msg_vision_tokens)]
+    chunk_text_tokens = [l - v for l, v in zip(chunk_lengths, chunk_vision_tokens)]
+    stats = {
+        "per_message": {
+            "num_messages": len(msg_lengths),
+            "length": _compute_distribution(msg_lengths),
+            "text_tokens": _compute_distribution(msg_text_tokens),
+            "vision_tokens": _compute_distribution(msg_vision_tokens),
+            "num_images": _compute_distribution(msg_num_images),
+        },
+        "per_chunk": {
+            "num_chunks": len(chunk_lengths),
+            "measured_length": _compute_distribution(chunk_lengths),
+            "text_tokens": _compute_distribution(chunk_text_tokens),
+            "vision_tokens": _compute_distribution(chunk_vision_tokens),
+            "vision_patches": _compute_distribution(chunk_vision_patches),
+            "num_images": _compute_distribution(chunk_num_images),
+            "num_messages": _compute_distribution(chunk_num_messages),
+        },
+        "image_shapes": dict(sorted(
+            image_shape_counts.items(), key=lambda kv: -kv[1]
+        )),
+        "vision_variability": {
+            "num_images_per_chunk": _frequency_table(chunk_num_images),
+            "vision_tokens_per_chunk": _frequency_table(chunk_vision_tokens),
+            "vision_patches_per_chunk": _frequency_table(chunk_vision_patches),
+        },
+    }
+    stats_path = out_dir / TOKEN_STATS_FILENAME
+    stats_path.write_text(json.dumps(stats, indent=2) + "\n")
+
+
 def build_chunk_index(
     payload_path: str | Path,
     out_dir: str | Path,
@@ -286,15 +396,15 @@ def build_chunk_index(
     records_per_shard: int = 100_000,
     overwrite: bool = False,
     profile_metadata: dict[str, Any] | None = None,
+    num_workers: int = 2,
 ) -> Path:
     """Build an offline chunk index over a canonical payload-block dataset.
 
-    ``measure_message`` is called exactly once per message and must return the
-    number of tokens that message contributes to a sequence.  For chat templates
-    where tokenization is exactly additive at message boundaries (e.g. ChatML
-    with ``add_special_tokens=False``), the accumulated per-message sum equals
-    the full-sequence length exactly.  Swap in a different ``measure_message``
-    implementation for other chat templates.
+    ``measure_message`` is called exactly once per message and must return either
+    the number of tokens (``int``) or a dict containing at least a ``"length"``
+    key.  When a dict is returned, extra fields (``vision_tokens``,
+    ``num_images``, ``image_grid_thw``) are aggregated into per-chunk
+    descriptors and a ``token_stats.json`` summary is written next to the index.
     """
 
     if max_length <= 0:
@@ -306,10 +416,28 @@ def build_chunk_index(
     if "payload_path" in payload_metadata:
         raise ValueError(f"Chunk indices can only be built from payload datasets, got chunk index: {payload_path}")
 
+    precomputed_lengths = _precompute_message_lengths(
+        payload_path, measure_message, num_workers
+    )
+
+    # -- token stats accumulators (populated lazily by the generator) ----------
+    _msg_lengths: list[int] = []
+    _msg_vision_tokens: list[int] = []
+    _msg_num_images: list[int] = []
+    _chunk_lengths: list[int] = []
+    _chunk_vision_tokens: list[int] = []
+    _chunk_vision_patches: list[int] = []
+    _chunk_num_images: list[int] = []
+    _chunk_num_messages: list[int] = []
+    _image_shape_counts: dict[str, int] = {}
+
     def _iter_chunk_descriptors():
         current_session_id: str | None = None
         current_messages: list[dict[str, Any]] = []
         current_length = 0
+        current_vision_tokens = 0
+        current_vision_patches = 0
+        current_num_images = 0
         start_record_idx = 0
         start_message_offset = 0
         end_record_idx = 0
@@ -318,7 +446,7 @@ def build_chunk_index(
         def emit_current() -> dict[str, Any] | None:
             if current_session_id is None or not current_messages:
                 return None
-            return {
+            descriptor = {
                 "session_id": current_session_id,
                 "start_record_idx": start_record_idx,
                 "start_message_offset": start_message_offset,
@@ -327,6 +455,16 @@ def build_chunk_index(
                 "num_messages": len(current_messages),
                 "measured_length": current_length,
             }
+            if _msg_lengths:
+                descriptor["vision_tokens"] = current_vision_tokens
+                descriptor["vision_patches"] = current_vision_patches
+                descriptor["num_images"] = current_num_images
+                _chunk_lengths.append(current_length)
+                _chunk_vision_tokens.append(current_vision_tokens)
+                _chunk_vision_patches.append(current_vision_patches)
+                _chunk_num_images.append(current_num_images)
+                _chunk_num_messages.append(len(current_messages))
+            return descriptor
 
         for record_idx, block in _iter_indexed_records(payload_path):
             block_session_id = str(block["session_id"])
@@ -339,9 +477,30 @@ def build_chunk_index(
                 current_session_id = block_session_id
                 current_messages = []
                 current_length = 0
+                current_vision_tokens = 0
+                current_vision_patches = 0
+                current_num_images = 0
 
             for msg_offset, message in enumerate(block["messages"]):
-                msg_length = int(measure_message(message))
+                result = precomputed_lengths[(record_idx, msg_offset)]
+
+                if isinstance(result, dict):
+                    msg_length = result["length"]
+                    msg_vision_tokens = result["vision_tokens"]
+                    msg_vision_patches = result["vision_patches"]
+                    msg_num_images = result["num_images"]
+                    _msg_lengths.append(msg_length)
+                    _msg_vision_tokens.append(msg_vision_tokens)
+                    _msg_num_images.append(msg_num_images)
+                    for shape in result["image_grid_thw"]:
+                        key = str(tuple(shape))
+                        _image_shape_counts[key] = _image_shape_counts.get(key, 0) + 1
+                else:
+                    msg_length = int(result)
+                    msg_vision_tokens = 0
+                    msg_vision_patches = 0
+                    msg_num_images = 0
+
                 if msg_length > max_length:
                     raise ValueError(
                         f"Single message at session={block_session_id} record={record_idx} "
@@ -358,11 +517,17 @@ def build_chunk_index(
                     yield descriptor
                     current_messages = []
                     current_length = 0
+                    current_vision_tokens = 0
+                    current_vision_patches = 0
+                    current_num_images = 0
                     start_record_idx = record_idx
                     start_message_offset = msg_offset
 
                 current_messages.append(message)
                 current_length += msg_length
+                current_vision_tokens += msg_vision_tokens
+                current_vision_patches += msg_vision_patches
+                current_num_images += msg_num_images
                 end_record_idx = record_idx
                 end_message_offset = msg_offset + 1
 
@@ -370,7 +535,7 @@ def build_chunk_index(
         if descriptor is not None:
             yield descriptor
 
-    return _write_arrayrecord_dataset(
+    out_path = _write_arrayrecord_dataset(
         _iter_chunk_descriptors(),
         out_dir,
         records_per_shard=records_per_shard,
@@ -382,6 +547,22 @@ def build_chunk_index(
             "profile_metadata": profile_metadata or {},
         },
     )
+
+    if _msg_lengths:
+        _emit_token_stats(
+            out_dir,
+            msg_lengths=_msg_lengths,
+            msg_vision_tokens=_msg_vision_tokens,
+            msg_num_images=_msg_num_images,
+            chunk_lengths=_chunk_lengths,
+            chunk_vision_tokens=_chunk_vision_tokens,
+            chunk_vision_patches=_chunk_vision_patches,
+            chunk_num_images=_chunk_num_images,
+            chunk_num_messages=_chunk_num_messages,
+            image_shape_counts=_image_shape_counts,
+        )
+
+    return out_path
 
 class _JsonLoadsMap(grain.transforms.Map):
     def map(self, element):
