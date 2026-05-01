@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gc
+import json
 from pathlib import Path
 
 from absl import app, flags
@@ -12,6 +13,7 @@ from transformers import AutoTokenizer
 
 from omegalax.data.collator_qwen3 import TextSFTCollator
 from omegalax.data.grain_pipeline import (
+    MixSource,
     make_grain_iterator,
     make_grain_multiprocessing_options,
     make_grain_read_options,
@@ -26,7 +28,14 @@ from omegalax.trainers.text import startup_log
 FLAGS = flags.FLAGS
 
 flags.DEFINE_string("model_id", None, "HF model id.", required=True)
-flags.DEFINE_string("data_path", None, "Path to compiled Grain chunk-index dataset directory.", required=True)
+flags.DEFINE_string("data_path", None, "Path to compiled Grain chunk-index dataset directory.")
+flags.DEFINE_string(
+    "data_mix",
+    None,
+    'JSON list of {"path", "weight"} pairs to mix at the configured ratios, e.g. '
+    '\'[{"path":"/a","weight":0.7},{"path":"/b","weight":0.3}]\'. '
+    "Use this OR --data_path, not both.",
+)
 flags.DEFINE_string("tokenizer", None, "HF tokenizer name/path (defaults to --model_id).")
 flags.DEFINE_integer("max_length", 512, "Maximum sequence length.")
 flags.DEFINE_integer("num_steps", 100, "Number of training steps.")
@@ -77,8 +86,29 @@ def _default_save_dir(model_id: str) -> Path:
     return Path("runs") / "text_sft" / safe_name
 
 
+def _parse_data_mix(spec: str) -> list[MixSource]:
+    """Parse the --data_mix JSON spec into a list of MixSource."""
+    raw = json.loads(spec)
+    if not isinstance(raw, list) or not raw:
+        raise ValueError("--data_mix must be a non-empty JSON list of {path, weight} objects")
+    out: list[MixSource] = []
+    for entry in raw:
+        if not isinstance(entry, dict) or "path" not in entry:
+            raise ValueError(f"--data_mix entry must be an object with a 'path' field: {entry!r}")
+        out.append(MixSource(path=str(entry["path"]), weight=float(entry.get("weight", 1.0))))
+    return out
+
+
+def _resolve_train_sources() -> list[MixSource]:
+    if (FLAGS.data_path is None) == (FLAGS.data_mix is None):
+        raise ValueError("Specify exactly one of --data_path or --data_mix.")
+    if FLAGS.data_mix is not None:
+        return _parse_data_mix(FLAGS.data_mix)
+    return [MixSource(path=FLAGS.data_path, weight=1.0)]
+
+
 def _grain_iter(
-    data_path: str,
+    sources: list[MixSource],
     collator: TextSFTCollator,
     per_process_batch_size: int,
     *,
@@ -87,16 +117,23 @@ def _grain_iter(
     num_batches: int,
     dp_size: int | None = None,
 ):
+    # For mixed sources, repeat each indefinitely and let the trainer's
+    # step budget terminate. For a single source, keep the legacy bounded
+    # epoch count so deterministic-resume tests keep working.
+    if len(sources) == 1:
+        num_epochs: int | None = required_epochs_for_batches(
+            sources[0].path, batch_size=per_process_batch_size, num_batches=num_batches,
+            dp_size=dp_size,
+        )
+    else:
+        num_epochs = None
     return make_grain_iterator(
-        data_path,
+        sources,
         batch_size=per_process_batch_size,
         batch_fn=collator,
         shuffle=shuffle,
         seed=seed,
-        num_epochs=required_epochs_for_batches(
-            data_path, batch_size=per_process_batch_size, num_batches=num_batches,
-            dp_size=dp_size,
-        ),
+        num_epochs=num_epochs,
         read_options=make_grain_read_options(
             num_threads=FLAGS.grain_read_threads,
             prefetch_buffer_size=FLAGS.grain_read_buffer_size,
@@ -121,9 +158,11 @@ def main(_) -> None:
     assert FLAGS.max_length <= tokenizer.model_max_length, f"--max_length={FLAGS.max_length} exceeds tokenizer.model_max_length={tokenizer.model_max_length}"
     collator = TextSFTCollator(tokenizer, max_length=FLAGS.max_length)
     startup_log("built TextSFTCollator")
+    train_sources = _resolve_train_sources()
     per_process_batch = process_local_batch_size(FLAGS.batch_size, dp_size=FLAGS.dp_size)
+    sources_repr = ", ".join(f"{s.path}@{s.weight:g}" for s in train_sources)
     startup_log(
-        f"model_id={FLAGS.model_id!r} data_path={FLAGS.data_path!r} "
+        f"model_id={FLAGS.model_id!r} data_sources=[{sources_repr}] "
         f"jax_compilation_cache_dir={FLAGS.jax_cache_dir!r} "
         f"process_count={jax.process_count()} local_device_count={jax.local_device_count()}"
     )
@@ -135,7 +174,7 @@ def main(_) -> None:
 
     total_micro_batches = FLAGS.num_steps * FLAGS.grad_accum_steps
     data_iter = _grain_iter(
-        FLAGS.data_path,
+        train_sources,
         collator,
         per_process_batch,
         shuffle=True,
@@ -148,7 +187,7 @@ def main(_) -> None:
     val_data_iter = None
     if FLAGS.val_data_path:
         val_data_iter = _grain_iter(
-            FLAGS.val_data_path,
+            [MixSource(path=FLAGS.val_data_path, weight=1.0)],
             collator,
             per_process_batch,
             shuffle=False,

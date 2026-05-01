@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import json
 import shutil
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
 from itertools import chain
 from pathlib import Path
 from typing import Any
@@ -12,10 +13,28 @@ from typing import Any
 from array_record.python.array_record_module import ArrayRecordWriter
 import grain
 import jax
+import numpy as np
 
 COMPILED_DATASET_VERSION = 1
 COMPILED_METADATA_FILENAME = "metadata.json"
 ARRAY_RECORD_SUFFIX = ".array_record"
+
+SOURCE_ID_KEY = "_omegalax_source_id"
+BATCH_SOURCE_IDS_KEY = "source_ids"
+
+
+@dataclass(frozen=True)
+class MixSource:
+    """One dataset in a (potentially mixed) training corpus.
+
+    ``path`` is a compiled chunk-index dataset directory (with metadata.json
+    pointing at the payload). ``weight`` is unnormalized — relative weights
+    across sources determine the realized example mix (see
+    ``grain.MapDataset.mix``).
+    """
+
+    path: str | Path
+    weight: float = 1.0
 
 
 def _prepare_output_dir(out_dir: Path, *, overwrite: bool) -> None:
@@ -406,6 +425,44 @@ class _ChunkDescriptorResolver(grain.transforms.Map):
         return example
 
 
+class _TagSourceMap(grain.transforms.Map):
+    """Tag each example with its source index so batches expose realized mix ratios."""
+
+    def __init__(self, source_id: int) -> None:
+        self._source_id = int(source_id)
+
+    def map(self, example: dict[str, Any]) -> dict[str, Any]:
+        example[SOURCE_ID_KEY] = self._source_id
+        return example
+
+
+class _SourceTaggingCollator:
+    """Wrap a user-provided collator to surface per-example source ids in the batch."""
+
+    def __init__(self, inner) -> None:
+        self._inner = inner
+
+    def __call__(self, examples: Sequence[dict[str, Any]]) -> dict[str, Any]:
+        source_ids = np.asarray(
+            [int(ex.get(SOURCE_ID_KEY, 0)) for ex in examples], dtype=np.int32,
+        )
+        result = self._inner(examples)
+        result[BATCH_SOURCE_IDS_KEY] = source_ids
+        return result
+
+
+def pop_source_ids(batch: dict[str, Any]) -> np.ndarray | None:
+    """Pop source-id metadata from a batch dict before sharding.
+
+    Returns the per-example source ids attached by the mixing iterator
+    (shape ``(B,)``, int32), or None if the batch was not produced by a
+    source-tagging collator. Removing the key keeps it out of the JIT
+    cache key for ``sft_train_step`` and out of distributed sharding.
+    """
+    raw = batch.pop(BATCH_SOURCE_IDS_KEY, None)
+    return np.asarray(raw) if raw is not None else None
+
+
 def make_grain_read_options(
     *,
     num_threads: int = 16,
@@ -427,60 +484,133 @@ def make_grain_multiprocessing_options(
     )
 
 
+def _coerce_sources(
+    sources: str | Path | MixSource | Sequence[str | Path | MixSource],
+) -> list[MixSource]:
+    """Normalize mixed scalar/list inputs into a list of ``MixSource``."""
+    if isinstance(sources, (str, Path)):
+        return [MixSource(path=sources, weight=1.0)]
+    if isinstance(sources, MixSource):
+        return [sources]
+    out: list[MixSource] = []
+    for s in sources:
+        if isinstance(s, MixSource):
+            out.append(s)
+        elif isinstance(s, (str, Path)):
+            out.append(MixSource(path=s, weight=1.0))
+        else:
+            raise TypeError(f"Unsupported source spec: {s!r} (type {type(s).__name__})")
+    if not out:
+        raise ValueError("make_grain_iterator: at least one source required")
+    return out
+
+
+def _validate_mix_compatibility(
+    sources: list[MixSource], metadatas: list[dict[str, Any]],
+) -> None:
+    """Refuse mixes that would silently corrupt training (different tokenization, length, etc.)."""
+    if len(sources) <= 1:
+        return
+    max_lengths = {int(m["max_length"]) for m in metadatas if "max_length" in m}
+    if len(max_lengths) > 1:
+        raise ValueError(
+            f"Cannot mix datasets compiled with different max_length: {max_lengths}. "
+            f"Rebuild chunk indices with a shared --max_length."
+        )
+    tokenizer_ids = {
+        (m.get("profile_metadata") or {}).get("tokenizer_id")
+        for m in metadatas
+    }
+    tokenizer_ids.discard(None)
+    if len(tokenizer_ids) > 1:
+        raise ValueError(
+            f"Cannot mix datasets compiled with different tokenizers: {tokenizer_ids}."
+        )
+
+
 def make_grain_iterator(
-    compiled_path: str | Path,
+    sources: str | Path | MixSource | Sequence[str | Path | MixSource],
     *,
     batch_size: int,
     batch_fn,
     shuffle: bool = True,
     seed: int = 0,
-    num_epochs: int = 1,
+    num_epochs: int | None = 1,
     read_options: grain.ReadOptions | None = None,
     multiprocessing_options: grain.MultiprocessingOptions | None = None,
     dp_size: int | None = None,
 ):
-    """Create a checkpointable Grain dataloader iterator over a chunk-index dataset."""
-    from omegalax.distributed.mesh import data_parallel_index, data_parallel_size
+    """Create a checkpointable Grain iterator over one or more chunk-index datasets.
 
-    compiled_path = Path(compiled_path).expanduser().resolve()
-    metadata = load_compiled_metadata(compiled_path)
-    if "payload_path" not in metadata:
-        raise ValueError(f"Expected compiled Grain chunk-index dataset, missing payload_path: {compiled_path}")
+    When more than one source is supplied, examples are interleaved at the
+    configured ``MixSource.weight`` ratios via ``grain.MapDataset.mix`` —
+    every batch is a stochastic mix at the configured ratio, not a per-batch
+    round-robin. ``num_epochs=None`` repeats each source indefinitely; set a
+    finite value (per source) only for validation-style finite iteration.
+    """
+    from omegalax.distributed.mesh import data_parallel_index, data_parallel_size
 
     if batch_size <= 0:
         raise ValueError("batch_size must be > 0")
 
-    shard_paths = [str(path) for path in resolve_arrayrecord_paths(compiled_path)]
-    payload_path = str(metadata["payload_path"])
+    mix_sources = _coerce_sources(sources)
+    if any(s.weight < 0.0 for s in mix_sources):
+        raise ValueError(
+            f"Source weights must be non-negative: {[s.weight for s in mix_sources]}"
+        )
+    total_w = sum(s.weight for s in mix_sources)
+    if total_w <= 0.0:
+        raise ValueError("Sum of source weights must be > 0")
+    # Drop zero-weight entries before mixing — Grain rejects them, but ablation
+    # configs commonly zero out a source to disable it without changing structure.
+    # Source ids stay aligned with the user-provided list so metric tags remain stable.
+    active_indices = [i for i, s in enumerate(mix_sources) if s.weight > 0.0]
+    metadatas = [load_compiled_metadata(mix_sources[i].path) for i in active_indices]
+    for i, m in zip(active_indices, metadatas):
+        if "payload_path" not in m:
+            raise ValueError(
+                f"Expected compiled Grain chunk-index dataset, missing payload_path: {mix_sources[i].path}"
+            )
+    _validate_mix_compatibility(
+        [mix_sources[i] for i in active_indices], metadatas,
+    )
+    norm_weights = [
+        mix_sources[i].weight / total_w for i in active_indices
+    ]
+
     mp_options = multiprocessing_options or make_grain_multiprocessing_options()
     read_options = read_options or make_grain_read_options()
-
     dp = data_parallel_size(dp_size)
     dp_index = data_parallel_index(dp_size)
-    source = grain.sources.ArrayRecordDataSource(shard_paths)
-    shard_options = grain.sharding.NoSharding() if dp <= 1 else grain.sharding.ShardOptions(
-        shard_index=dp_index, shard_count=dp, drop_remainder=True,
+
+    per_source: list[grain.MapDataset] = []
+    for active_idx, original_idx in enumerate(active_indices):
+        s = mix_sources[original_idx]
+        m = metadatas[active_idx]
+        shard_paths = [str(p) for p in resolve_arrayrecord_paths(s.path)]
+        payload_path = str(m["payload_path"])
+        ds = grain.MapDataset.source(grain.sources.ArrayRecordDataSource(shard_paths))
+        if dp > 1:
+            # Contiguous-block DP shards with drop_remainder, matching the
+            # legacy IndexSampler(ShardOptions(drop_remainder=True)) behavior.
+            per_rank = len(ds) // dp
+            ds = ds[dp_index * per_rank : (dp_index + 1) * per_rank]
+        if shuffle:
+            ds = ds.shuffle(seed=seed + original_idx)
+        ds = ds.repeat(num_epochs)
+        ds = ds.map(_JsonLoadsMap())
+        ds = ds.map(_ChunkDescriptorResolver(payload_path))
+        # Tag with the user-facing source id (position in the original list),
+        # not the active-only index, so metric labels are stable across
+        # ablations that zero out individual sources.
+        ds = ds.map(_TagSourceMap(source_id=original_idx))
+        per_source.append(ds)
+
+    mixed = per_source[0] if len(per_source) == 1 else grain.MapDataset.mix(per_source, weights=norm_weights)
+    batched = mixed.batch(
+        batch_size=batch_size, drop_remainder=True, batch_fn=_SourceTaggingCollator(batch_fn),
     )
-    sampler = grain.samplers.IndexSampler(
-        num_records=len(source),
-        shard_options=shard_options,
-        shuffle=shuffle,
-        num_epochs=num_epochs,
-        seed=seed,
-    )
-    operations = [
-        _JsonLoadsMap(),
-        _ChunkDescriptorResolver(payload_path),
-        grain.transforms.Batch(batch_size=batch_size, drop_remainder=True, batch_fn=batch_fn),
-    ]
-    dataloader = grain.DataLoader(
-        data_source=source,
-        sampler=sampler,
-        operations=operations,
-        worker_count=mp_options.num_workers,
-        worker_buffer_size=mp_options.per_worker_buffer_size,
-        shard_options=shard_options,
-        read_options=read_options,
-        enable_profiling=mp_options.enable_profiling,
-    )
-    return iter(dataloader)
+    iter_ds = batched.to_iter_dataset(read_options)
+    if mp_options.num_workers > 0:
+        iter_ds = iter_ds.mp_prefetch(mp_options)
+    return iter(iter_ds)

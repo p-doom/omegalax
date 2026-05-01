@@ -381,6 +381,54 @@ class VLMSFTCollatorTest(absltest.TestCase):
         with self.assertRaisesRegex(ValueError, "exceeds max_length"):
             collator(examples)
 
+    def test_heterogeneous_batch_text_and_multimodal(self):
+        """Batches that mix text-only and multimodal samples must collate cleanly.
+
+        This is the fundamental requirement that lets data mixing pull
+        instruction-tuning text into a VLM run for catastrophic-forgetting
+        mitigation. Vision tensors come from the image-having sample only;
+        text-only contributes zero patches and zero image-pad tokens.
+        """
+        from PIL import Image
+        img = Image.new("RGB", (100, 100), color=(120, 30, 200))
+        examples = [
+            # Sample 0: text-only (would come from instruction-tuning data).
+            {"messages": [
+                {"role": "user", "content": "Quick question."},
+                {"role": "assistant", "content": "Quick answer."},
+            ]},
+            # Sample 1: multimodal (would come from VLM training data).
+            {"messages": [
+                {"role": "user", "content": [
+                    {"type": "image", "image": img},
+                    {"type": "text", "text": "Describe."},
+                ]},
+                {"role": "assistant", "content": "A solid color image."},
+            ]},
+        ]
+        batch = self.collator(examples)
+
+        self.assertEqual(batch["token_ids_BT"].shape, (2, self.max_length))
+        # Vision keys present (because sample 1 has an image), with zero
+        # contribution from sample 0.
+        self.assertIn("pixel_values", batch)
+        self.assertIn("image_grid_thw", batch)
+        self.assertIn("vision_cu_seqlens", batch)
+        self.assertIn("position_ids_ZBT", batch)
+
+        # Sample 0 has no <|image_pad|> tokens, sample 1 has exactly the count
+        # implied by image_grid_thw — the alignment that lets the row-major
+        # image-token scatter in the model forward put the right embedding
+        # into the right position in a heterogeneous batch.
+        image_pad_id = self.tokenizer.convert_tokens_to_ids("<|image_pad|>")
+        n_pad_sample_0 = int(np.sum(batch["token_ids_BT"][0] == image_pad_id))
+        n_pad_sample_1 = int(np.sum(batch["token_ids_BT"][1] == image_pad_id))
+        self.assertEqual(n_pad_sample_0, 0)
+        self.assertEqual(batch["image_grid_thw"].shape, (1, 3))
+        grid = batch["image_grid_thw"][0]
+        expected_pads = int(grid[0]) * (int(grid[1]) // 2) * (int(grid[2]) // 2)
+        self.assertEqual(n_pad_sample_1, expected_pads)
+
 
 if __name__ == "__main__":
     absltest.main()

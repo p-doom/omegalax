@@ -15,6 +15,7 @@ import optax
 import orbax.checkpoint as ocp
 
 from omegalax import export as export_lib
+from omegalax.data.grain_pipeline import pop_source_ids
 from omegalax.distributed.mesh import ensure_mesh, mesh_rules, required_batch_multiple
 from omegalax.models.params_utils import save_hf_config
 from omegalax.trainers import checkpoint_utils
@@ -389,9 +390,14 @@ def run_sft(
         accum_grad_norm = 0.0
         accum_flops = 0.0
         accum_time = datetime.timedelta(0)
+        source_counts: dict[int, int] = {}
 
         for _micro in range(accum_steps):
             batch = next(data_iter)
+            sids = pop_source_ids(batch)
+            if sids is not None:
+                for sid in sids.tolist():
+                    source_counts[sid] = source_counts.get(sid, 0) + 1
             micro_flops = per_device_flops_per_step(
                 model_cfg,
                 train_cfg.seq_len,
@@ -408,7 +414,7 @@ def run_sft(
             accum_flops += micro_flops
             accum_time += micro_delta
 
-        
+
         with jax.default_device('cpu'):
             window_metrics = {
                 "loss": accum_loss / accum_steps,
@@ -416,6 +422,10 @@ def run_sft(
                 "supervised_tokens": accum_sup_tokens,
                 "lr": lr_schedule_fn(step_idx),
             }
+            if len(source_counts) > 1:
+                total = float(sum(source_counts.values()))
+                for sid, cnt in source_counts.items():
+                    window_metrics[f"data_source_{sid}_frac"] = cnt / total
             _log_prev_metrics()
 
             prev_metrics = (step, window_metrics, accum_time, accum_flops)
@@ -431,6 +441,7 @@ def run_sft(
             total_val_sup_tokens = 0.0
             for _ in range(val_steps):
                 val_batch = next(val_data_iter)
+                pop_source_ids(val_batch)
                 val_batch = vlm_api.shard_batch_dict(val_batch, model_cfg, mesh)
                 val_loss, val_sup_tokens = eval_step(optimizer.model, val_batch)
                 total_val_loss += float(val_loss)
