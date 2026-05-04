@@ -66,11 +66,19 @@ def shard_batch_dict(
     shd_cfg: ShardConfig,
     mesh: Mesh,
 ) -> dict[str, jax.Array]:
-    """Shard every array in a batch dict: batch dim sharded, rest replicated."""
+    """Shard every array in a batch dict: batch dim sharded, rest replicated.
+
+    For ``position_ids_ZBT`` of shape ``(3, B, T)`` the batch dim is axis 1,
+    not axis 0 — sharding axis 0 (Z=3) across ``dp`` would silently stack
+    per-process position_ids along Z instead of B and corrupt M-RoPE.
+    """
     batch_axis = shd_cfg.act_btd[0]
     result = {}
     for key, arr in batch.items():
-        spec = P(batch_axis, *((None,) * (arr.ndim - 1)))
+        if key == "position_ids_ZBT" and arr.ndim == 3:
+            spec = P(None, batch_axis, None)
+        else:
+            spec = P(batch_axis, *((None,) * (arr.ndim - 1)))
         sharding = NamedSharding(mesh, spec)
         result[key] = jax.make_array_from_process_local_data(sharding, arr)
     return result
