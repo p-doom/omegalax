@@ -126,9 +126,15 @@ def _pad_vision_arrays(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Pad vision arrays to exact ``(max_patches, max_images)`` target.
 
-    Uses "absorber" dummy images whose grid entries are chosen to make the
-    total patch count equal ``max_patches`` exactly, preserving the invariant
+    Appends ``num_dummies - 1`` simple ``(1, ms, ms)`` rows and one "absorber"
+    ``(1, ms, w*)`` row whose width is sized so the total patch count lands on
+    ``max_patches`` exactly. Preserves
     ``pixel_values.shape[0] == sum(t*h*w for image_grid_thw)``.
+
+    Each grid row contributes at least ``ms2`` patches, so padding requires
+    ``extra_patches == num_dummies == 0`` (nothing to do) or
+    ``num_dummies >= 1 and extra_patches >= num_dummies * ms2``. Other budget
+    combinations are infeasible — increase the per-sample limits.
     """
     real_images = image_grid_thw.shape[0]
     real_patches = pixel_values.shape[0]
@@ -148,15 +154,27 @@ def _pad_vision_arrays(
     if num_dummies == 0 and extra_patches == 0:
         return pixel_values, image_grid_thw, _compute_vision_cu_seqlens(image_grid_thw)
 
-    # Build dummy grid entries: one absorber + simple (1, ms, ms) dummies.
-    dummy_grids: list[list[int]] = []
-    if num_dummies == 1:
-        dummy_grids.append([1, merge_size, extra_patches // merge_size])
-    else:
-        num_simple = num_dummies - 1
-        absorber_patches = extra_patches - num_simple * ms2
-        dummy_grids.append([1, merge_size, absorber_patches // merge_size])
-        dummy_grids.extend([[1, merge_size, merge_size]] * num_simple)
+    if num_dummies == 0 or extra_patches < num_dummies * ms2:
+        raise ValueError(
+            f"Vision budgets are infeasible for this batch: real_images="
+            f"{real_images}, real_patches={real_patches}, max_images="
+            f"{max_images}, max_patches={max_patches}, ms2={ms2}. Padding "
+            f"needs num_dummies>=1 and extra_patches>=num_dummies*ms2 (each "
+            f"dummy row costs at least ms2 patches). Increase "
+            f"max_vision_images_per_sample or max_vision_patches_per_sample "
+            f"so this invariant holds for every batch."
+        )
+
+    num_simple = num_dummies - 1
+    absorber_patches = extra_patches - num_simple * ms2  # >= ms2 by check above
+    if absorber_patches % merge_size != 0:
+        raise ValueError(
+            f"absorber_patches={absorber_patches} not divisible by "
+            f"merge_size={merge_size}; max_patches and every real image "
+            f"(h*w) must be multiples of merge_size."
+        )
+    dummy_grids: list[list[int]] = [[1, merge_size, absorber_patches // merge_size]]
+    dummy_grids.extend([[1, merge_size, merge_size]] * num_simple)
 
     padded_grid = np.concatenate(
         [image_grid_thw, np.array(dummy_grids, dtype=np.int32)], axis=0,

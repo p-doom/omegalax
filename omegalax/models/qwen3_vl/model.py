@@ -438,17 +438,11 @@ class Qwen3VL(nnx.Module):
             seq_len = token_ids_BT.shape[1]
             batch_idx, seq_idx = jnp.where(
                 image_mask_BT, size=n_features,
-                fill_value=(0, seq_len - 1),
+                fill_value=(0, seq_len),
             )
-            # Mask out padding features so they scatter zeros to the
-            # harmless fill-value position (a pad token with attn_mask=0).
-            num_real = jnp.sum(image_mask_BT)
-            valid = jnp.arange(n_features) < num_real
-            safe_features = jnp.where(
-                valid[:, None], image_features_ND, 0.0,
-            ).astype(inputs_embeds_BTD.dtype)
             inputs_embeds_BTD = inputs_embeds_BTD.at[batch_idx, seq_idx].set(
-                safe_features,
+                image_features_ND.astype(inputs_embeds_BTD.dtype),
+                mode='drop',
                 out_sharding=self.text.out_emb_shd,
             )
 
@@ -496,11 +490,10 @@ def _deepstack_process(
     seq_len = hidden_BTD.shape[1]
     batch_idx, seq_idx = jnp.where(
         visual_pos_mask_BT, size=n_embeds,
-        fill_value=(0, seq_len - 1),
+        fill_value=(0, seq_len),
     )
-    num_real = jnp.sum(visual_pos_mask_BT)
-    valid = jnp.arange(n_embeds) < num_real
-    current_vals = hidden_BTD[batch_idx, seq_idx]
-    safe_embeds = jnp.where(valid[:, None], visual_embeds_ND.astype(current_vals.dtype), 0.0)
-    new_vals = current_vals + safe_embeds
-    return hidden_BTD.at[batch_idx, seq_idx].set(new_vals, out_sharding=out_sharding)
+    return hidden_BTD.at[batch_idx, seq_idx].add(
+        visual_embeds_ND.astype(hidden_BTD.dtype),
+        mode='drop',
+        out_sharding=out_sharding,
+    )
