@@ -7,7 +7,7 @@ from typing import Any, cast
 import grain
 import orbax.checkpoint as ocp
 
-type GrainIterator = grain.DataLoaderIterator
+type GrainIterator = grain.DataLoaderIterator | grain.DatasetIterator
 
 
 def register_grain_iterator_handler(handler_registry: ocp.handlers.DefaultCheckpointHandlerRegistry) -> None:
