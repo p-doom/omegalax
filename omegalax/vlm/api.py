@@ -154,6 +154,7 @@ def forward(
             token_ids_BT, segment_ids_BT, None, jnp.array(0, dtype=jnp.int32),
             pixel_values=pixel_values,
             image_grid_thw=image_grid_thw,
+            vision_cu_seqlens=vision_cu_seqlens,
             position_ids_ZBT=position_ids_ZBT,
         )
 

@@ -63,6 +63,8 @@ class Attention(nnx.Module):
         self.num_kv_heads = cfg.num_kv_heads
         object.__setattr__(self, "_q_sharding", None)
         object.__setattr__(self, "_q_sharding_spec", P(*cfg.shd_cfg.act_btnh))
+        object.__setattr__(self, "_attn_backend", "mosaic_gpu")
+        object.__setattr__(self, "_attn_kind", "text")
 
     @jax.named_scope("attention")
     def __call__(self, hidden_BTD: jax.Array, cache, segment_ids_BT: jax.Array) -> jax.Array:
@@ -86,7 +88,7 @@ class Attention(nnx.Module):
             B, T, H, K = q_BTHK.shape
             attn_BTHK = dot_product_attention(
                 q_BTHK, k_BTGK, v_BTGK,
-                is_causal=True, scale=self.scale, implementation="mosaic",
+                is_causal=True, scale=self.scale, implementation=self._attn_backend,
                 q_sharding=self._q_sharding,
             )
             out_BTD = self.o_proj(jax.lax.reshape(attn_BTHK, (B, T, self.num_heads * K), out_sharding=self.shd_cfg.act_btf), out_sharding=self.shd_cfg.act_btd)

@@ -353,6 +353,7 @@ class Qwen3_5ForConditionalGeneration(nnx.Module):
         num_right_pads,
         pixel_values: jax.Array | None = None,
         image_grid_thw: jax.Array | None = None,
+        vision_cu_seqlens: jax.Array | None = None,
         position_ids_ZBT: jax.Array | None = None,
     ):
         del cache, num_right_pads
@@ -362,15 +363,25 @@ class Qwen3_5ForConditionalGeneration(nnx.Module):
         )
 
         if pixel_values is not None and image_grid_thw is not None:
-            image_embeds_ND = self.vision(pixel_values, image_grid_thw)
+            image_embeds_ND = self.vision(pixel_values, image_grid_thw, vision_cu_seqlens)
             image_mask_BT = (token_ids_BT == self.cfg.image_token_id)
             image_mask_BTD = jnp.broadcast_to(
                 image_mask_BT[:, :, None], inputs_embeds_BTD.shape
             )
             inputs_embeds_BTD = jnp.where(image_mask_BTD, 0.0, inputs_embeds_BTD)
-            batch_indices, seq_indices = jnp.where(image_mask_BT)
+            n_embeds = image_embeds_ND.shape[0]  # static after padding
+            seq_len = token_ids_BT.shape[1]
+            batch_indices, seq_indices = jnp.where(
+                image_mask_BT, size=n_embeds,
+                fill_value=(0, seq_len - 1),
+            )
+            num_real = jnp.sum(image_mask_BT)
+            valid = jnp.arange(n_embeds) < num_real
+            safe_embeds = jnp.where(
+                valid[:, None], image_embeds_ND, 0.0,
+            ).astype(inputs_embeds_BTD.dtype)
             inputs_embeds_BTD = inputs_embeds_BTD.at[batch_indices, seq_indices].set(
-                image_embeds_ND, out_sharding=self.text.out_emb_shd,
+                safe_embeds, out_sharding=self.text.out_emb_shd,
             )
 
         return self.text(
