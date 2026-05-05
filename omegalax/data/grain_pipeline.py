@@ -420,6 +420,30 @@ def build_chunk_index(
         payload_path, measure_message, num_workers
     )
 
+    # Per-session prefix-truncation point: the earliest (record_idx,
+    # msg_offset) of a message exceeding the chunk budget. The binner emits
+    # chunks for the valid prefix and drops the over-length message + tail.
+    session_truncate_at: dict[str, tuple[int, int]] = {}
+    for record_idx, block in _iter_indexed_records(payload_path):
+        block_session_id = str(block["session_id"])
+        if block_session_id in session_truncate_at:
+            continue
+        for msg_offset in range(len(block["messages"])):
+            result = precomputed_lengths[(record_idx, msg_offset)]
+            msg_length = result["length"] if isinstance(result, dict) else int(result)
+            if msg_length > max_length:
+                session_truncate_at[block_session_id] = (record_idx, msg_offset)
+                break
+    if session_truncate_at:
+        print(
+            f"[chunk_index] prefix-truncating {len(session_truncate_at)} session(s) "
+            f"at the first message exceeding max_length={max_length} "
+            f"(valid prefix turns are preserved as chunks): "
+            f"{sorted(session_truncate_at.keys())[:5]}"
+            + (" ..." if len(session_truncate_at) > 5 else ""),
+            flush=True,
+        )
+
     # -- token stats accumulators (populated lazily by the generator) ----------
     _msg_lengths: list[int] = []
     _msg_vision_tokens: list[int] = []
@@ -446,6 +470,12 @@ def build_chunk_index(
         def emit_current() -> dict[str, Any] | None:
             if current_session_id is None or not current_messages:
                 return None
+            # Skip chunks whose loss mask would be all zeros (no assistant
+            # tokens to supervise). Comes up after prefix-truncation on
+            # single-turn data where the over-length message is the only
+            # assistant turn.
+            if not any(m.get("role") == "assistant" for m in current_messages):
+                return None
             descriptor = {
                 "session_id": current_session_id,
                 "start_record_idx": start_record_idx,
@@ -466,8 +496,12 @@ def build_chunk_index(
                 _chunk_num_messages.append(len(current_messages))
             return descriptor
 
+        truncated_sessions: set[str] = set()
         for record_idx, block in _iter_indexed_records(payload_path):
             block_session_id = str(block["session_id"])
+            if block_session_id in truncated_sessions:
+                continue
+            truncate_pos = session_truncate_at.get(block_session_id)
             if current_session_id is None:
                 current_session_id = block_session_id
             elif block_session_id != current_session_id:
@@ -482,6 +516,18 @@ def build_chunk_index(
                 current_num_images = 0
 
             for msg_offset, message in enumerate(block["messages"]):
+                if truncate_pos is not None and (record_idx, msg_offset) >= truncate_pos:
+                    descriptor = emit_current()
+                    if descriptor is not None:
+                        yield descriptor
+                    current_messages = []
+                    current_length = 0
+                    current_vision_tokens = 0
+                    current_vision_patches = 0
+                    current_num_images = 0
+                    truncated_sessions.add(block_session_id)
+                    break
+
                 result = precomputed_lengths[(record_idx, msg_offset)]
 
                 if isinstance(result, dict):
@@ -501,20 +547,19 @@ def build_chunk_index(
                     msg_vision_patches = 0
                     msg_num_images = 0
 
-                if msg_length > max_length:
-                    raise ValueError(
-                        f"Single message at session={block_session_id} record={record_idx} "
-                        f"offset={msg_offset} exceeds max_length={max_length}"
-                    )
+                assert msg_length <= max_length, (
+                    f"prefix-truncation pre-scan missed session={block_session_id} "
+                    f"record={record_idx} offset={msg_offset} "
+                    f"(msg_length={msg_length} > max_length={max_length})"
+                )
 
                 if not current_messages:
                     start_record_idx = record_idx
                     start_message_offset = msg_offset
                 elif current_length + msg_length > max_length:
                     descriptor = emit_current()
-                    if descriptor is None:
-                        raise AssertionError("Expected a chunk descriptor before overflow split")
-                    yield descriptor
+                    if descriptor is not None:
+                        yield descriptor
                     current_messages = []
                     current_length = 0
                     current_vision_tokens = 0
@@ -647,7 +692,7 @@ def pop_source_ids(batch: dict[str, Any]) -> np.ndarray | None:
 def make_grain_read_options(
     *,
     num_threads: int = 16,
-    prefetch_buffer_size: int = 500,
+    prefetch_buffer_size: int = 4,
 ) -> grain.ReadOptions:
     return grain.ReadOptions(num_threads=num_threads, prefetch_buffer_size=prefetch_buffer_size)
 

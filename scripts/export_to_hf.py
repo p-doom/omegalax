@@ -17,6 +17,9 @@ the checkpoint and don't have to match.
 
 from __future__ import annotations
 
+import os
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+
 from pathlib import Path
 
 from absl import app, flags

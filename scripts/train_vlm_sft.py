@@ -73,7 +73,7 @@ flags.DEFINE_string("val_data_path", None, "Path to compiled Grain validation ch
 flags.DEFINE_integer("val_every", None, "Run validation every N training steps.")
 flags.DEFINE_integer("val_steps", 10, "Number of batches per validation run.")
 flags.DEFINE_integer("grain_read_threads", 16, "Grain read threads.")
-flags.DEFINE_integer("grain_read_buffer_size", 500, "Grain read buffer size.")
+flags.DEFINE_integer("grain_read_buffer_size", 4, "Grain read buffer size (in batches).")
 flags.DEFINE_integer("grain_workers", 8, "Grain multiprocessing workers.")
 flags.DEFINE_integer("grain_worker_buffer_size", 4, "Grain worker buffer size.")
 flags.DEFINE_integer("max_vision_patches_per_sample", 0,

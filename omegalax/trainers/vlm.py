@@ -106,7 +106,6 @@ def _make_checkpoint_manager(save_dir: Path, save_interval: int | None) -> ocp.C
     checkpoint_utils.register_grain_iterator_handler(handler_registry)
     options = ocp.CheckpointManagerOptions(
         save_interval_steps=save_interval,
-        max_to_keep=2,
         step_format_fixed_length=6,
         cleanup_tmp_directories=True,
     )
