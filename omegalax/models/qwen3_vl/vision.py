@@ -19,11 +19,35 @@ from omegalax.models.shard_config import ShardConfig
 from .config import Qwen3VLVisionConfig
 
 
+def _cudnn_packed_vision_attention_local(
+    q_NHK: jax.Array,
+    k_NHK: jax.Array,
+    v_NHK: jax.Array,
+    cu_seqlens: jax.Array,
+    seqlens: jax.Array,
+    scale: float,
+) -> jax.Array:
+    cu = cu_seqlens.astype(jnp.int32)
+    q_offsets = cu[None]
+    kv_offsets = cu[None]
+    seqlens_1M = seqlens.astype(jnp.int32)[None]
+
+    out = _cudnn_dot_product_attention(
+        q_NHK[None], k_NHK[None], v_NHK[None],
+        q_seqlen=seqlens_1M, kv_seqlen=seqlens_1M,
+        q_offsets=q_offsets, kv_offsets=kv_offsets,
+        scale=scale, mask_type=_CuDnnMaskType.NO_MASK,
+        qkv_layout="BTNH",
+    )
+    return out[0]
+
+
 def _cudnn_packed_vision_attention(
     q_NHK: jax.Array,
     k_NHK: jax.Array,
     v_NHK: jax.Array,
     cu_seqlens: jax.Array,
+    seqlens: jax.Array,
     scale: float,
 ) -> jax.Array:
     """Run vision attention via cuDNN's packed (THD) kernel.
@@ -32,26 +56,41 @@ def _cudnn_packed_vision_attention(
     describes per-image segment boundaries; cuDNN uses these to skip
     cross-segment tiles entirely rather than materializing a full [T, S] mask.
 
+    Under multi-device dp sharding, cuDNN's internal ``_fix_seqlen_offsets``
+    runs ``jnp.nonzero(..., size=size)`` on ``q_seqlen``, which lowers to a
+    scatter that can't resolve an output sharding when any of its inputs are
+    dp-sharded.  We wrap the whole call in ``shard_map`` so each device sees
+    only its local shards (no explicit sharding inside), matching cuDNN's
+    per-device view.
+
+    ``seqlens`` is passed in rather than computed via ``jnp.diff(cu_seqlens)``
+    since ``diff`` would slice a sharded (dp*(M+1),) axis to (dp*(M+1) - 1,),
+    which is not evenly divisible by ``dp``.
+
     Args:
         q_NHK, k_NHK, v_NHK: (N, num_heads, head_dim) with N == cu_seqlens[-1].
         cu_seqlens: int32, shape (M+1,). Static length at trace time.
+        seqlens: int32, shape (M,). Per-segment token counts.
         scale: attention logits scale.
     Returns:
         (N, num_heads, head_dim)
     """
-    cu = cu_seqlens.astype(jnp.int32)
-    q_offsets = cu[None]
-    kv_offsets = cu[None]
-    seqlens = jnp.diff(cu)[None]
+    sharding = jax.typeof(q_NHK).sharding
+    dp_axis = sharding.spec[0]
+    if dp_axis is None:
+        return _cudnn_packed_vision_attention_local(
+            q_NHK, k_NHK, v_NHK, cu_seqlens, seqlens, scale,
+        )
 
-    out = _cudnn_dot_product_attention(
-        q_NHK[None], k_NHK[None], v_NHK[None],
-        q_seqlen=seqlens, kv_seqlen=seqlens,
-        q_offsets=q_offsets, kv_offsets=kv_offsets,
-        scale=scale, mask_type=_CuDnnMaskType.NO_MASK,
-        qkv_layout="BTNH",
-    )
-    return out[0]
+    q_spec = P(dp_axis, None, None)
+    cu_spec = P(dp_axis)
+    return jax.shard_map(
+        lambda q, k, v, cu, sq: _cudnn_packed_vision_attention_local(q, k, v, cu, sq, scale),
+        mesh=sharding.mesh,
+        in_specs=(q_spec, q_spec, q_spec, cu_spec, cu_spec),
+        out_specs=q_spec,
+        check_vma=False,
+    )(q_NHK, k_NHK, v_NHK, cu_seqlens, seqlens)
 
 
 def _token_spatial_coords(
@@ -61,7 +100,8 @@ def _token_spatial_coords(
 
     Args:
         image_grid: int32 array of shape ``(num_images, 3)`` with ``(t, h, w)``
-            per image.
+            per image.  Expected to be replicated across the mesh; callers
+            should ``reshard`` before invoking this.
         merge_size: spatial merge factor (typically 2).
         total_tokens: total number of vision tokens across all images
             (``sum(t*h*w)``).  Must be a **static** Python int (known from
@@ -69,7 +109,7 @@ def _token_spatial_coords(
 
     Returns:
         row_coord, col_coord, image_id — each int32 of shape
-        ``(total_tokens,)``.
+        ``(total_tokens,)`` and replicated.
     """
     tokens_per_image = image_grid[:, 0] * image_grid[:, 1] * image_grid[:, 2]
     cu_tokens = jnp.concatenate(
@@ -229,7 +269,7 @@ class VisionAttention(nnx.Module):
         object.__setattr__(self, "_q_sharding", None)
         object.__setattr__(self, "_q_sharding_spec", P(None, *heads_shd))
 
-    def __call__(self, hidden_ND: jax.Array, cu_seqlens: jax.Array, cos_NK: jax.Array, sin_NK: jax.Array) -> jax.Array:
+    def __call__(self, hidden_ND: jax.Array, cu_seqlens: jax.Array, seqlens: jax.Array, cos_NK: jax.Array, sin_NK: jax.Array) -> jax.Array:
         N = hidden_ND.shape[0]
         qkv_shd = P(self.hidden_shd[0], None, self.heads_shd[1], self.heads_shd[2])
         qkv = jax.lax.reshape(
@@ -244,7 +284,7 @@ class VisionAttention(nnx.Module):
         q_NHK, k_NHK = apply_rotary_pos_emb_vision(q_NHK, k_NHK, cos_NK, sin_NK)
 
         attn_NHK = _cudnn_packed_vision_attention(
-            q_NHK, k_NHK, v_NHK, cu_seqlens, self.scale,
+            q_NHK, k_NHK, v_NHK, cu_seqlens, seqlens, self.scale,
         )
         outputs_ND = attn_NHK.reshape(N, -1)
 
@@ -261,8 +301,8 @@ class VisionBlock(nnx.Module):
         self.hidden_shd = hidden_shd
 
     @partial(jax.remat, static_argnums=0)
-    def __call__(self, hidden_ND: jax.Array, cu_seqlens: jax.Array, cos_NK: jax.Array, sin_NK: jax.Array) -> jax.Array:
-        hidden_ND = hidden_ND + self.attn(self.norm1(hidden_ND), cu_seqlens, cos_NK, sin_NK)
+    def __call__(self, hidden_ND: jax.Array, cu_seqlens: jax.Array, seqlens: jax.Array, cos_NK: jax.Array, sin_NK: jax.Array) -> jax.Array:
+        hidden_ND = hidden_ND + self.attn(self.norm1(hidden_ND), cu_seqlens, seqlens, cos_NK, sin_NK)
         hidden_ND = hidden_ND + self.mlp(self.norm2(hidden_ND))
         return hidden_ND
 
@@ -406,13 +446,28 @@ class VisionModel(nnx.Module):
     def __call__(
         self, pixel_values: jax.Array, image_grid: jax.Array, vision_cu_seqlens: jax.Array
     ) -> tuple[jax.Array, list[jax.Array]]:
+        # Per-image bookkeeping (cumsum, searchsorted, gathers into image_grid)
+        # doesn't vectorize across the dp-sharded batch axis; the scatter-style
+        # concats it produces force JAX's explicit-sharding mode to error.
+        # Replicating this small ``(num_images, 3)`` array keeps all the
+        # bookkeeping on one sharding and leaves pixel_values/hidden_ND
+        # dp-sharded for the actual vision compute.
+        image_grid = reshard(image_grid, P())
+        # Per-frame seqlens derived from the replicated grid.  Assumes t=1
+        # (single-frame images); for video inputs this needs per-frame
+        # expansion.  Reshard to dp so each device's cuDNN call sees its own
+        # local (M,) seqlens matching its local pixel patches.
+        seqlens_M = image_grid[:, 0] * image_grid[:, 1] * image_grid[:, 2]
+        seqlens_M = reshard(seqlens_M.astype(jnp.int32), P(self.hidden_shd[0]))
         hidden_ND = self.patch_embed(pixel_values)
         total_tokens: int = hidden_ND.shape[0]
 
         pos_embeds_ND = self._interpolate_pos_embed(image_grid, total_tokens)
+        pos_embeds_ND = reshard(pos_embeds_ND, self.hidden_shd)
         hidden_ND = hidden_ND + pos_embeds_ND
 
         rotary_emb_NK = self._compute_rotary_pos_emb(image_grid, total_tokens)
+        rotary_emb_NK = reshard(rotary_emb_NK, P(self.hidden_shd[0], None))
         emb_NK = jnp.concatenate([rotary_emb_NK, rotary_emb_NK], axis=-1)
         cos_NK, sin_NK = jnp.cos(emb_NK), jnp.sin(emb_NK)
         cos_NK = cos_NK.astype(self.config.dtype)
@@ -422,7 +477,7 @@ class VisionModel(nnx.Module):
 
         deepstack_features: list[jax.Array] = []
         for layer_num, blk in enumerate(self.blocks):
-            hidden_ND = blk(hidden_ND, cu_seqlens, cos_NK, sin_NK)
+            hidden_ND = blk(hidden_ND, cu_seqlens, seqlens_M, cos_NK, sin_NK)
             if layer_num in self.deepstack_visual_indexes:
                 idx = list(self.deepstack_visual_indexes).index(layer_num)
                 deepstack_features.append(self.deepstack_mergers[idx](hidden_ND))

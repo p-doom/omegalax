@@ -398,4 +398,18 @@ def maybe_log_step_metrics(
             step=step_to_log,
         )
 
+    if is_primary_process:
+        lr = host_metrics.get("lr", 0.0)
+        print(
+            f"step={step_to_log} "
+            f"loss={host_metrics['loss']:.4f} "
+            f"grad_norm={host_metrics['grad_norm']:.4f} "
+            f"lr={lr:.2e} "
+            f"tflops/dev={host_metrics.get('tflops_per_device', 0.0):.2f} "
+            f"mfu={host_metrics.get('mfu', 0.0) * 100:.1f}% "
+            f"tok/s/dev={host_metrics.get('tokens_per_sec_per_device', 0.0):.0f} "
+            f"step_time={host_metrics.get('step_time_s', 0.0):.2f}s",
+            flush=True,
+        )
+
     return host_metrics

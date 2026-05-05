@@ -431,17 +431,28 @@ class Qwen3VL(nnx.Module):
             self.text.embedder.dtype,
         )
 
+        print(f"image_features_ND.sharding: {image_features_ND.sharding}")
+        print(f"inputs_embeds_BTD.sharding: {inputs_embeds_BTD.sharding}")
+
         if image_features_ND is not None:
             image_mask_BT = token_ids_BT == cfg.image_token_id
             visual_pos_mask_BT = image_mask_BT
             n_features = image_features_ND.shape[0]  # static after padding
             seq_len = token_ids_BT.shape[1]
+            # ``jnp.where(..., size=n)`` lowers to nonzero/bincount/scatter
+            # internally; with a dp-sharded mask the intermediate scatter can't
+            # resolve an output sharding.  Gather to replicated for the index
+            # bookkeeping — the subsequent scatter back into the dp-sharded
+            # ``inputs_embeds_BTD`` respects the per-shard semantics because
+            # each device only owns its local batch rows.
+            image_mask_replicated = reshard(image_mask_BT, P())
             batch_idx, seq_idx = jnp.where(
-                image_mask_BT, size=n_features,
+                image_mask_replicated, size=n_features,
                 fill_value=(0, seq_len),
             )
+            image_features_replicated = reshard(image_features_ND, P())
             inputs_embeds_BTD = inputs_embeds_BTD.at[batch_idx, seq_idx].set(
-                image_features_ND.astype(inputs_embeds_BTD.dtype),
+                image_features_replicated.astype(inputs_embeds_BTD.dtype),
                 mode='drop',
                 out_sharding=self.text.out_emb_shd,
             )
@@ -488,12 +499,16 @@ def _deepstack_process(
     """Add visual embeddings to hidden states at visual token positions."""
     n_embeds = visual_embeds_ND.shape[0]
     seq_len = hidden_BTD.shape[1]
+    # See `__call__` above — ``jnp.where`` with ``size=`` requires replicated
+    # inputs under explicit multi-device sharding.
+    mask_replicated = reshard(visual_pos_mask_BT, P())
+    embeds_replicated = reshard(visual_embeds_ND, P())
     batch_idx, seq_idx = jnp.where(
-        visual_pos_mask_BT, size=n_embeds,
+        mask_replicated, size=n_embeds,
         fill_value=(0, seq_len),
     )
     return hidden_BTD.at[batch_idx, seq_idx].add(
-        visual_embeds_ND.astype(hidden_BTD.dtype),
+        embeds_replicated.astype(hidden_BTD.dtype),
         mode='drop',
         out_sharding=out_sharding,
     )
