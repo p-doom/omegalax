@@ -93,6 +93,7 @@ def _grain_iter(
     seed: int,
     num_batches: int,
     dp_size: int | None = None,
+    fsdp_size: int | None = None,
 ):
     return make_grain_iterator(
         data_path,
@@ -102,7 +103,7 @@ def _grain_iter(
         seed=seed,
         num_epochs=required_epochs_for_batches(
             data_path, batch_size=per_process_batch_size, num_batches=num_batches,
-            dp_size=dp_size,
+            dp_size=dp_size, fsdp_size=fsdp_size,
         ),
         read_options=make_grain_read_options(
             num_threads=FLAGS.grain_read_threads,
@@ -113,6 +114,7 @@ def _grain_iter(
             per_worker_buffer_size=FLAGS.grain_worker_buffer_size,
         ),
         dp_size=dp_size,
+        fsdp_size=fsdp_size,
     )
 
 
@@ -155,7 +157,9 @@ def main(_) -> None:
         max_vision_images_per_sample=FLAGS.max_vision_images_per_sample or None,
     )
     startup_log("built VLMSFTCollator")
-    per_process_batch = process_local_batch_size(FLAGS.batch_size, dp_size=FLAGS.dp_size)
+    per_process_batch = process_local_batch_size(
+        FLAGS.batch_size, dp_size=FLAGS.dp_size, fsdp_size=FLAGS.fsdp_size,
+    )
     startup_log(
         f"model_id={FLAGS.model_id!r} data_path={FLAGS.data_path!r} "
         f"jax_compilation_cache_dir={FLAGS.jax_cache_dir!r} "
@@ -176,6 +180,7 @@ def main(_) -> None:
         seed=FLAGS.seed,
         num_batches=total_micro_batches,
         dp_size=FLAGS.dp_size,
+        fsdp_size=FLAGS.fsdp_size,
     )
     startup_log("built train grain DataLoader iterator")
 
@@ -189,6 +194,7 @@ def main(_) -> None:
             seed=FLAGS.seed,
             num_batches=max(1, (FLAGS.num_steps // max(FLAGS.val_every or FLAGS.num_steps, 1)) * FLAGS.val_steps),
             dp_size=FLAGS.dp_size,
+            fsdp_size=FLAGS.fsdp_size,
         )
         startup_log(f"built val grain DataLoader iterator from {FLAGS.val_data_path!r}")
 

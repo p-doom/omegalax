@@ -426,13 +426,16 @@ class Qwen3VL(nnx.Module):
                 raise ValueError("vision_cu_seqlens is required when passing image_grid_thw to Qwen3VL")
             image_features_ND, deepstack_features = self.vision(pixel_values, image_grid_thw, vision_cu_seqlens)
 
+        # Gather the embedder to replicated before indexed lookup. With the embedder
+        # sharded (None, "fsdp") and the desired output ("fsdp", None, None), the
+        # at[...].get(out_sharding=...) lowers to alltoall to redistribute the D
+        # shard. Allgathering V*D=311MB (bf16) once is cheap and produces a local
+        # gather instead.
+        embedding_VD = reshard(self.text.embedder.embedding[...], P())
         inputs_embeds_BTD = jnp.astype(
-            self.text.embedder.embedding[...].at[(token_ids_BT,)].get(out_sharding=self.text.out_emb_shd),
+            embedding_VD.at[(token_ids_BT,)].get(out_sharding=self.text.out_emb_shd),
             self.text.embedder.dtype,
         )
-
-        print(f"image_features_ND.sharding: {image_features_ND.sharding}")
-        print(f"inputs_embeds_BTD.sharding: {inputs_embeds_BTD.sharding}")
 
         if image_features_ND is not None:
             image_mask_BT = token_ids_BT == cfg.image_token_id
