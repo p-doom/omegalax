@@ -117,6 +117,76 @@ class TextSFTCollator:
         }
 
 
+def _pad_vision_arrays(
+    pixel_values: np.ndarray,
+    image_grid_thw: np.ndarray,
+    merge_size: int,
+    max_patches: int,
+    max_images: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Pad vision arrays to exact ``(max_patches, max_images)`` target.
+
+    Appends ``num_dummies - 1`` simple ``(1, ms, ms)`` rows and one "absorber"
+    ``(1, ms, w*)`` row whose width is sized so the total patch count lands on
+    ``max_patches`` exactly. Preserves
+    ``pixel_values.shape[0] == sum(t*h*w for image_grid_thw)``.
+
+    Each grid row contributes at least ``ms2`` patches, so padding requires
+    ``extra_patches == num_dummies == 0`` (nothing to do) or
+    ``num_dummies >= 1 and extra_patches >= num_dummies * ms2``. Other budget
+    combinations are infeasible — increase the per-sample limits.
+    """
+    real_images = image_grid_thw.shape[0]
+    real_patches = pixel_values.shape[0]
+    feat_dim = pixel_values.shape[1]
+    ms2 = merge_size * merge_size
+
+    num_dummies = max_images - real_images
+    extra_patches = max_patches - real_patches
+
+    if num_dummies < 0 or extra_patches < 0:
+        raise ValueError(
+            f"Batch exceeds padding budget: real_images={real_images} > "
+            f"max_images={max_images} or real_patches={real_patches} > "
+            f"max_patches={max_patches}. Increase the per-sample limits."
+        )
+
+    if num_dummies == 0 and extra_patches == 0:
+        return pixel_values, image_grid_thw, _compute_vision_cu_seqlens(image_grid_thw)
+
+    if num_dummies == 0 or extra_patches < num_dummies * ms2:
+        raise ValueError(
+            f"Vision budgets are infeasible for this batch: real_images="
+            f"{real_images}, real_patches={real_patches}, max_images="
+            f"{max_images}, max_patches={max_patches}, ms2={ms2}. Padding "
+            f"needs num_dummies>=1 and extra_patches>=num_dummies*ms2 (each "
+            f"dummy row costs at least ms2 patches). Increase "
+            f"max_vision_images_per_sample or max_vision_patches_per_sample "
+            f"so this invariant holds for every batch."
+        )
+
+    num_simple = num_dummies - 1
+    absorber_patches = extra_patches - num_simple * ms2  # >= ms2 by check above
+    if absorber_patches % merge_size != 0:
+        raise ValueError(
+            f"absorber_patches={absorber_patches} not divisible by "
+            f"merge_size={merge_size}; max_patches and every real image "
+            f"(h*w) must be multiples of merge_size."
+        )
+    dummy_grids: list[list[int]] = [[1, merge_size, absorber_patches // merge_size]]
+    dummy_grids.extend([[1, merge_size, merge_size]] * num_simple)
+
+    padded_grid = np.concatenate(
+        [image_grid_thw, np.array(dummy_grids, dtype=np.int32)], axis=0,
+    )
+    padded_pv = np.concatenate(
+        [pixel_values, np.zeros((extra_patches, feat_dim), dtype=pixel_values.dtype)],
+        axis=0,
+    )
+    padded_cu = _compute_vision_cu_seqlens(padded_grid)
+    return padded_pv, padded_grid, padded_cu
+
+
 def _compute_vision_cu_seqlens(image_grid_thw: np.ndarray) -> np.ndarray:
     """Return cumulative per-frame token counts for the vision tower.
 
@@ -154,10 +224,15 @@ class VLMSFTCollator:
         tokenizer: PreTrainedTokenizer,
         max_length: int,
         image_processor: BaseImageProcessor,
+        *,
+        max_vision_patches_per_sample: int | None = None,
+        max_vision_images_per_sample: int | None = None,
     ) -> None:
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.image_processor = image_processor
+        self._max_vision_patches_per_sample = max_vision_patches_per_sample
+        self._max_vision_images_per_sample = max_vision_images_per_sample
         assert tokenizer.pad_token_id is not None, "tokenizer must have pad_token_id set (e.g. Qwen3-VL, Qwen3.5)"
 
         self._im_start_id = tokenizer.convert_tokens_to_ids("<|im_start|>")
@@ -224,12 +299,11 @@ class VLMSFTCollator:
         }
 
         if has_images and all_pixel_values:
-            result["pixel_values"] = np.concatenate(all_pixel_values, axis=0)
-        if has_images and all_grid_thw:
+            pixel_values = np.concatenate(all_pixel_values, axis=0)
             image_grid_thw = np.concatenate(all_grid_thw, axis=0)
-            result["image_grid_thw"] = image_grid_thw
-            result["vision_cu_seqlens"] = _compute_vision_cu_seqlens(image_grid_thw)
 
+            # Compute position_ids from REAL (unpadded) grid — these only
+            # depend on real <|image_pad|> positions in token_ids_BT.
             position_ids, _ = get_rope_index(
                 result["token_ids_BT"],
                 image_grid_thw=image_grid_thw,
@@ -240,5 +314,23 @@ class VLMSFTCollator:
                 vision_start_token_id=self._vision_start_token_id,
             )
             result["position_ids_ZBT"] = position_ids.astype(np.int32)
+
+            # Pad vision arrays to static shapes so JAX JIT never recompiles.
+            # Per-sample limits are multiplied by batch size so the user
+            # doesn't need to recompute when changing batch_size.
+            if self._max_vision_patches_per_sample is not None and self._max_vision_images_per_sample is not None:
+                bs = len(examples)
+                pixel_values, image_grid_thw, vision_cu_seqlens = _pad_vision_arrays(
+                    pixel_values, image_grid_thw,
+                    merge_size=self.image_processor.merge_size,
+                    max_patches=self._max_vision_patches_per_sample * bs,
+                    max_images=self._max_vision_images_per_sample * bs,
+                )
+            else:
+                vision_cu_seqlens = _compute_vision_cu_seqlens(image_grid_thw)
+
+            result["pixel_values"] = pixel_values
+            result["image_grid_thw"] = image_grid_thw
+            result["vision_cu_seqlens"] = vision_cu_seqlens
 
         return result

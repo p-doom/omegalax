@@ -41,6 +41,17 @@ def _finalize_q_shardings(model: nnx.Module, mesh: Mesh) -> None:
             )
 
 
+def set_attn_backend(
+    model: nnx.Module,
+    text_backend: str = "mosaic_gpu",
+) -> None:
+    """Set ``_attn_backend`` on every text attention sub-module."""
+
+    for _, module in nnx.iter_modules(model):
+        if getattr(module, "_attn_kind", None) == "text":
+            object.__setattr__(module, "_attn_backend", text_backend)
+
+
 def batch_partition_spec(shd_cfg: ShardConfig) -> PartitionSpec:
     return P(shd_cfg.act_btd[0], None)
 

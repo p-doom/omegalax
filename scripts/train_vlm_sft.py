@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import json
 from pathlib import Path
 
@@ -41,6 +42,7 @@ flags.DEFINE_float("lr_end_factor", 0.0, "Final LR as fraction of peak LR (cosin
 flags.DEFINE_float("lr_stable_fraction", 0.8, "Fraction of post-warmup steps at peak LR (wsd only).")
 flags.DEFINE_float("max_grad_norm", 1.0, "Max gradient norm for clipping (0 = no clipping).")
 flags.DEFINE_integer("grad_accum_steps", 1, "Gradient accumulation steps (1 = no accumulation).")
+flags.DEFINE_integer("gc_period", 0, "If >0, disable Python GC and collect every N training steps.")
 flags.DEFINE_integer("seed", 0, "RNG seed.")
 flags.DEFINE_integer("tp_size", None, "Tensor parallelism size.")
 flags.DEFINE_integer("fsdp_size", None, "FSDP parallelism size.")
@@ -49,9 +51,6 @@ flags.DEFINE_string("save_dir", None, "Checkpoint save directory.")
 flags.DEFINE_string("jax_cache_dir", "/tmp/jax_cache", "Directory for JAX persistent compilation cache.")
 flags.DEFINE_integer("save_every", 50, "Save checkpoint every N steps.")
 flags.DEFINE_integer("log_every", 10, "Log metrics every N steps.")
-flags.DEFINE_string("profile_dir", None, "Directory for JAX profiling output.")
-flags.DEFINE_integer("profile_start", 3, "Step to start profiling (after JIT warmup).")
-flags.DEFINE_integer("profile_end", 8, "Step to stop profiling.")
 flags.DEFINE_bool("resume", False, "Resume from latest checkpoint.")
 flags.DEFINE_integer("pad_id", 0, "Padding token id.")
 flags.DEFINE_string("peak_tflops", None, "Peak TFLOPS for MFU calculation.")
@@ -65,9 +64,20 @@ flags.DEFINE_integer("val_every", None, "Run validation every N training steps."
 flags.DEFINE_integer("val_steps", 10, "Number of batches per validation run.")
 flags.DEFINE_integer("grain_read_threads", 16, "Grain read threads.")
 flags.DEFINE_integer("grain_read_buffer_size", 500, "Grain read buffer size.")
-flags.DEFINE_integer("grain_workers", 0, "Grain multiprocessing workers.")
-flags.DEFINE_integer("grain_worker_buffer_size", 1, "Grain worker buffer size.")
+flags.DEFINE_integer("grain_workers", 8, "Grain multiprocessing workers.")
+flags.DEFINE_integer("grain_worker_buffer_size", 4, "Grain worker buffer size.")
+flags.DEFINE_integer("max_vision_patches_per_sample", 0,
+                     "Max vision patches per sample for JIT stability (0 = no padding). "
+                     "Multiplied by batch_size automatically.")
+flags.DEFINE_integer("max_vision_images_per_sample", 0,
+                     "Max images per sample for JIT stability (0 = no padding). "
+                     "Multiplied by batch_size automatically.")
 
+_ATTN_BACKENDS = [
+    "mosaic_tpu", "mosaic_gpu", "cudnn", "xla", "triton",
+]
+flags.DEFINE_enum("text_attn_backend", "mosaic_gpu", _ATTN_BACKENDS,
+                  "Attention backend for the text decoder.")
 
 def _default_save_dir(model_id: str) -> Path:
     safe_name = model_id.replace("/", "_")
@@ -123,7 +133,27 @@ def main(_) -> None:
             ip_kwargs = json.load(f)
     image_processor = AutoImageProcessor.from_pretrained(repo_id, use_fast=False, **ip_kwargs)
     startup_log(f"loaded image processor from {repo_id!r}")
-    collator = VLMSFTCollator(tokenizer, max_length=FLAGS.max_length, image_processor=image_processor)
+
+    if FLAGS.max_vision_patches_per_sample:
+        merge_size = int(image_processor.merge_size)
+        ms2 = merge_size * merge_size
+        max_patches = FLAGS.max_vision_patches_per_sample * FLAGS.batch_size
+        if max_patches % ms2 != 0:
+            raise ValueError(
+                f"max_vision_patches_per_sample * batch_size = "
+                f"{FLAGS.max_vision_patches_per_sample} * {FLAGS.batch_size} "
+                f"= {max_patches} must be divisible by merge_size**2={ms2} "
+                f"(remainder {max_patches % ms2}). Adjust the flags so their "
+                f"product is a multiple of {ms2}."
+            )
+
+    collator = VLMSFTCollator(
+        tokenizer,
+        max_length=FLAGS.max_length,
+        image_processor=image_processor,
+        max_vision_patches_per_sample=FLAGS.max_vision_patches_per_sample or None,
+        max_vision_images_per_sample=FLAGS.max_vision_images_per_sample or None,
+    )
     startup_log("built VLMSFTCollator")
     per_process_batch = process_local_batch_size(FLAGS.batch_size, dp_size=FLAGS.dp_size)
     startup_log(
@@ -192,6 +222,10 @@ def main(_) -> None:
             tags=FLAGS.wandb_tags or None,
             config=flags.FLAGS.flag_values_dict(),
         )
+    if FLAGS.gc_period:
+        gc.disable()
+        startup_log(f"gc_period={FLAGS.gc_period}: Python GC disabled, will collect every {FLAGS.gc_period} steps")
+
     try:
         _, last_metrics = vlm_trainer.run_sft(
             FLAGS.model_id,
@@ -206,14 +240,19 @@ def main(_) -> None:
             tp_size=FLAGS.tp_size,
             fsdp_size=FLAGS.fsdp_size,
             dp_size=FLAGS.dp_size,
-            profile_dir=FLAGS.profile_dir,
-            profile_steps=(FLAGS.profile_start, FLAGS.profile_end),
             wandb_run=wandb_run,
             val_data_iter=val_data_iter,
             val_every=FLAGS.val_every,
             val_steps=FLAGS.val_steps,
+            text_attn_backend=FLAGS.text_attn_backend,
+            gc_period=FLAGS.gc_period,
         )
     finally:
+
+        if FLAGS.gc_period:
+            gc.enable()
+            print(f"Training completed, re-enabling Python GC")
+
         if wandb_run is not None:
             wandb_run.finish()
 

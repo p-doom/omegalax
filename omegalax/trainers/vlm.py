@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import datetime
+import gc
 from pathlib import Path
 from flax import nnx
 import jax
@@ -246,12 +247,12 @@ def run_sft(
     tp_size: int | None = None,
     fsdp_size: int | None = None,
     dp_size: int | None = None,
-    profile_dir: str | Path | None = None,
-    profile_steps: tuple[int, int] = (3, 8),
     wandb_run=None,
     val_data_iter: checkpoint_utils.GrainIterator | None = None,
     val_every: int | None = None,
     val_steps: int = 10,
+    text_attn_backend: str = "mosaic_gpu",
+    gc_period: int = 0,
 ) -> tuple[MixedPrecisionOptimizer, dict[str, float]]:
     """SFT a VLM from a Grain iterator; returns final optimizer + last metrics.
 
@@ -325,6 +326,9 @@ def run_sft(
             dp_size=dp_size,
         )
         startup_log("initialized model (random init)")
+    from omegalax.models.sharding_runtime import set_attn_backend
+    set_attn_backend(model, text_backend=text_attn_backend)
+    startup_log(f"set attn backend: text={text_attn_backend}")
     with mesh_rules(mesh):
         optimizer = build_optimizer(model, lr_schedule_fn, train_cfg)
 
@@ -371,22 +375,14 @@ def run_sft(
             global_tokens_per_step=global_tokens_per_step,
             peak_tflops=peak_tflops,
             wandb_run=wandb_run,
+            batch_size=train_cfg.batch_size,
         )
         if result is not None:
             last_metrics = result
 
-    prof_start, prof_end = profile_steps
-    is_profiling_active = False
-
     startup_log("entering training loop")
     for step_idx in range(start_step, train_cfg.num_steps):
         step = step_idx + 1
-
-        if profile_dir is not None and step_idx == prof_start and not is_profiling_active:
-            if is_primary_process:
-                print(f"[profiler] starting trace at step {step} -> {profile_dir}")
-            jax.profiler.start_trace(str(profile_dir))
-            is_profiling_active = True
 
         accum_loss = 0.0
         accum_sup_tokens = 0.0
@@ -412,14 +408,6 @@ def run_sft(
             accum_flops += micro_flops
             accum_time += micro_delta
 
-        if is_profiling_active and step >= prof_end:
-            jax.tree.map(lambda x: x.block_until_ready(), metrics)
-            jax.profiler.save_device_memory_profile(f"{profile_dir}/memory.prof")
-            jax.profiler.stop_trace()
-            is_profiling_active = False
-            if is_primary_process:
-                print(f"[profiler] stopped trace at step {step}")
-
         
         with jax.default_device('cpu'):
             window_metrics = {
@@ -434,6 +422,9 @@ def run_sft(
 
         if checkpoint_manager is not None and save_every and step % save_every == 0:
             _save_sft_checkpoint(checkpoint_manager, optimizer, rng, step, data_iter)
+
+        if gc_period and step % gc_period == 0:
+            gc.collect()
 
         if eval_step is not None and val_every and step % val_every == 0:
             total_val_loss = 0.0
@@ -450,13 +441,6 @@ def run_sft(
                     {"val/loss": avg_val_loss, "val/sup_tokens": total_val_sup_tokens},
                     step=step,
                 )
-
-    if is_profiling_active:
-        jax.tree.map(lambda x: x.block_until_ready(), metrics)
-        jax.profiler.save_device_memory_profile(f"{profile_dir}/memory.prof")
-        jax.profiler.stop_trace()
-        if is_primary_process:
-            print("[profiler] stopped trace at end of training")
 
     _log_prev_metrics(force=True)
 
