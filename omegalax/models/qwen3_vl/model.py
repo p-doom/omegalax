@@ -426,8 +426,14 @@ class Qwen3VL(nnx.Module):
                 raise ValueError("vision_cu_seqlens is required when passing image_grid_thw to Qwen3VL")
             image_features_ND, deepstack_features = self.vision(pixel_values, image_grid_thw, vision_cu_seqlens)
 
+        # Gather the embedder to replicated before indexed lookup. With the embedder
+        # sharded (None, "fsdp") and the desired output ("fsdp", None, None), the
+        # at[...].get(out_sharding=...) lowers to alltoall to redistribute the D
+        # shard. Allgathering V*D=311MB (bf16) once is cheap and produces a local
+        # gather instead.
+        embedding_VD = reshard(self.text.embedder.embedding[...], P())
         inputs_embeds_BTD = jnp.astype(
-            self.text.embedder.embedding[...].at[(token_ids_BT,)].get(out_sharding=self.text.out_emb_shd),
+            embedding_VD.at[(token_ids_BT,)].get(out_sharding=self.text.out_emb_shd),
             self.text.embedder.dtype,
         )
 
@@ -445,18 +451,12 @@ class Qwen3VL(nnx.Module):
             image_mask_replicated = reshard(image_mask_BT, P())
             batch_idx, seq_idx = jnp.where(
                 image_mask_replicated, size=n_features,
-                fill_value=(0, seq_len - 1),
+                fill_value=(0, seq_len),
             )
-            # Mask out padding features so they scatter zeros to the
-            # harmless fill-value position (a pad token with attn_mask=0).
-            num_real = jnp.sum(image_mask_replicated)
-            valid = jnp.arange(n_features) < num_real
             image_features_replicated = reshard(image_features_ND, P())
-            safe_features = jnp.where(
-                valid[:, None], image_features_replicated, 0.0,
-            ).astype(inputs_embeds_BTD.dtype)
             inputs_embeds_BTD = inputs_embeds_BTD.at[batch_idx, seq_idx].set(
-                safe_features,
+                image_features_replicated.astype(inputs_embeds_BTD.dtype),
+                mode='drop',
                 out_sharding=self.text.out_emb_shd,
             )
 
@@ -508,11 +508,10 @@ def _deepstack_process(
     embeds_replicated = reshard(visual_embeds_ND, P())
     batch_idx, seq_idx = jnp.where(
         mask_replicated, size=n_embeds,
-        fill_value=(0, seq_len - 1),
+        fill_value=(0, seq_len),
     )
-    num_real = jnp.sum(mask_replicated)
-    valid = jnp.arange(n_embeds) < num_real
-    current_vals = hidden_BTD.at[batch_idx, seq_idx].get(out_sharding=P())
-    safe_embeds = jnp.where(valid[:, None], embeds_replicated.astype(current_vals.dtype), 0.0)
-    new_vals = current_vals + safe_embeds
-    return hidden_BTD.at[batch_idx, seq_idx].set(new_vals, out_sharding=out_sharding)
+    return hidden_BTD.at[batch_idx, seq_idx].add(
+        embeds_replicated.astype(hidden_BTD.dtype),
+        mode='drop',
+        out_sharding=out_sharding,
+    )

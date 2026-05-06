@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import datetime
+import gc
 from pathlib import Path
 from flax import nnx
 import jax
@@ -251,6 +252,7 @@ def run_sft(
     val_every: int | None = None,
     val_steps: int = 10,
     text_attn_backend: str = "mosaic_gpu",
+    gc_period: int = 0,
 ) -> tuple[MixedPrecisionOptimizer, dict[str, float]]:
     """SFT a VLM from a Grain iterator; returns final optimizer + last metrics.
 
@@ -420,6 +422,9 @@ def run_sft(
 
         if checkpoint_manager is not None and save_every and step % save_every == 0:
             _save_sft_checkpoint(checkpoint_manager, optimizer, rng, step, data_iter)
+
+        if gc_period and step % gc_period == 0:
+            gc.collect()
 
         if eval_step is not None and val_every and step % val_every == 0:
             total_val_loss = 0.0

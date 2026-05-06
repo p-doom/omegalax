@@ -68,9 +68,7 @@ def shard_batch_dict(
 ) -> dict[str, jax.Array]:
     """Shard every array in a batch dict: batch dim sharded, rest replicated.
 
-    For ``position_ids_ZBT`` of shape ``(3, B, T)`` the batch dim is axis 1,
-    not axis 0 — sharding axis 0 (Z=3) across ``dp`` would silently stack
-    per-process position_ids along Z instead of B and corrupt M-RoPE.
+    Note: ``position_ids_ZBT`` has shape ``(3, B, T)`` and the batch dim is axis 1,
     """
     batch_axis = shd_cfg.act_btd[0]
     result = {}

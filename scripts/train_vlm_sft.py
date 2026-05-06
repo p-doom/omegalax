@@ -2,14 +2,7 @@
 
 from __future__ import annotations
 
-
-import os
-if os.environ.get("OMEGA_DISABLE_GC") == "1":
-    import gc
-    gc.disable()
-    print("[startup] OMEGA_DISABLE_GC=1: Python GC disabled", flush=True)
-
-
+import gc
 import json
 from pathlib import Path
 
@@ -49,6 +42,7 @@ flags.DEFINE_float("lr_end_factor", 0.0, "Final LR as fraction of peak LR (cosin
 flags.DEFINE_float("lr_stable_fraction", 0.8, "Fraction of post-warmup steps at peak LR (wsd only).")
 flags.DEFINE_float("max_grad_norm", 1.0, "Max gradient norm for clipping (0 = no clipping).")
 flags.DEFINE_integer("grad_accum_steps", 1, "Gradient accumulation steps (1 = no accumulation).")
+flags.DEFINE_integer("gc_period", 0, "If >0, disable Python GC and collect every N training steps.")
 flags.DEFINE_integer("seed", 0, "RNG seed.")
 flags.DEFINE_integer("tp_size", None, "Tensor parallelism size.")
 flags.DEFINE_integer("fsdp_size", None, "FSDP parallelism size.")
@@ -99,6 +93,7 @@ def _grain_iter(
     seed: int,
     num_batches: int,
     dp_size: int | None = None,
+    fsdp_size: int | None = None,
 ):
     return make_grain_iterator(
         data_path,
@@ -108,7 +103,7 @@ def _grain_iter(
         seed=seed,
         num_epochs=required_epochs_for_batches(
             data_path, batch_size=per_process_batch_size, num_batches=num_batches,
-            dp_size=dp_size,
+            dp_size=dp_size, fsdp_size=fsdp_size,
         ),
         read_options=make_grain_read_options(
             num_threads=FLAGS.grain_read_threads,
@@ -119,6 +114,7 @@ def _grain_iter(
             per_worker_buffer_size=FLAGS.grain_worker_buffer_size,
         ),
         dp_size=dp_size,
+        fsdp_size=fsdp_size,
     )
 
 
@@ -161,7 +157,9 @@ def main(_) -> None:
         max_vision_images_per_sample=FLAGS.max_vision_images_per_sample or None,
     )
     startup_log("built VLMSFTCollator")
-    per_process_batch = process_local_batch_size(FLAGS.batch_size, dp_size=FLAGS.dp_size)
+    per_process_batch = process_local_batch_size(
+        FLAGS.batch_size, dp_size=FLAGS.dp_size, fsdp_size=FLAGS.fsdp_size,
+    )
     startup_log(
         f"model_id={FLAGS.model_id!r} data_path={FLAGS.data_path!r} "
         f"jax_compilation_cache_dir={FLAGS.jax_cache_dir!r} "
@@ -182,6 +180,7 @@ def main(_) -> None:
         seed=FLAGS.seed,
         num_batches=total_micro_batches,
         dp_size=FLAGS.dp_size,
+        fsdp_size=FLAGS.fsdp_size,
     )
     startup_log("built train grain DataLoader iterator")
 
@@ -195,6 +194,7 @@ def main(_) -> None:
             seed=FLAGS.seed,
             num_batches=max(1, (FLAGS.num_steps // max(FLAGS.val_every or FLAGS.num_steps, 1)) * FLAGS.val_steps),
             dp_size=FLAGS.dp_size,
+            fsdp_size=FLAGS.fsdp_size,
         )
         startup_log(f"built val grain DataLoader iterator from {FLAGS.val_data_path!r}")
 
@@ -228,6 +228,10 @@ def main(_) -> None:
             tags=FLAGS.wandb_tags or None,
             config=flags.FLAGS.flag_values_dict(),
         )
+    if FLAGS.gc_period:
+        gc.disable()
+        startup_log(f"gc_period={FLAGS.gc_period}: Python GC disabled, will collect every {FLAGS.gc_period} steps")
+
     try:
         _, last_metrics = vlm_trainer.run_sft(
             FLAGS.model_id,
@@ -247,8 +251,14 @@ def main(_) -> None:
             val_every=FLAGS.val_every,
             val_steps=FLAGS.val_steps,
             text_attn_backend=FLAGS.text_attn_backend,
+            gc_period=FLAGS.gc_period,
         )
     finally:
+
+        if FLAGS.gc_period:
+            gc.enable()
+            print(f"Training completed, re-enabling Python GC")
+
         if wandb_run is not None:
             wandb_run.finish()
 
