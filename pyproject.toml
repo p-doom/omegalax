@@ -14,6 +14,7 @@ dependencies = [
   "etils",
   "flax>0.12.0",
   "jax[cuda12]",
+  "jax-triton",
   "jaxtyping",
   "optax",
   "orbax-checkpoint",
@@ -21,6 +22,7 @@ dependencies = [
   "safetensors",
   "tokamax @ git+https://github.com/p-doom/tokamax.git@nested-mask", # change after fix has been upstreamed
   "transformers",
+  "triton", 
   "huggingface-hub",
   "wandb",
   "grain>=0.2.16",

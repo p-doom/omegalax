@@ -78,6 +78,16 @@ class Qwen3_5Config:
     vision_start_token_id: int = 248_053
     vision_end_token_id: int = 248_054
 
+    @property
+    def shd_cfg(self) -> ShardConfig:
+        """Top-level sharding view = the text decoder's sharding.
+
+        Mirrors ``Qwen3VLConfig.shd_cfg`` so cross-VLM call sites (trainers,
+        bench scripts) can read ``cfg.shd_cfg`` uniformly. Updates must still
+        go through ``text_config.shd_cfg`` (e.g., ``align_config_to_mesh``).
+        """
+        return self.text_config.shd_cfg
+
 
 _SMOKE_VISION = {
     "depth": 2,
