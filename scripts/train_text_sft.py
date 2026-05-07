@@ -22,6 +22,7 @@ from omegalax.data.grain_pipeline import (
 from omegalax.distributed.mesh import process_local_batch_size
 from omegalax.registry import resolve_hf_repo_id
 from omegalax.trainers import text as text_trainer
+from omegalax.trainers.checkpoint_utils import ResumeMode
 from omegalax.trainers.perf import resolve_peak_tflops
 from omegalax.trainers.text import startup_log
 
@@ -58,7 +59,15 @@ flags.DEFINE_string("save_dir", None, "Checkpoint save directory.")
 flags.DEFINE_string("jax_cache_dir", "/tmp/jax_cache", "Directory for JAX persistent compilation cache.")
 flags.DEFINE_integer("save_every", 50, "Save checkpoint every N steps.")
 flags.DEFINE_integer("log_every", 10, "Log metrics every N steps.")
-flags.DEFINE_bool("resume", False, "Resume from latest checkpoint.")
+flags.DEFINE_enum(
+    "resume",
+    ResumeMode.NEVER.value,
+    [m.value for m in ResumeMode],
+    "Checkpoint resume policy: 'never' (default, fresh start), 'if_present' "
+    "(resume if a checkpoint exists at --save_dir, else start fresh — right "
+    "mode for SLURM time-limit resubmits), 'required' (resume; error if no "
+    "checkpoint).",
+)
 flags.DEFINE_integer("pad_id", 0, "Padding token id.")
 flags.DEFINE_string("peak_tflops", None, "Peak TFLOPS for MFU calculation.")
 flags.DEFINE_string("wandb_entity", None, "Weights & Biases entity (team/user).")
@@ -212,8 +221,11 @@ def main(_) -> None:
         grad_accum_steps=FLAGS.grad_accum_steps,
         print_every=FLAGS.log_every,
     )
+    resume_mode = ResumeMode(FLAGS.resume)
     save_dir = Path(FLAGS.save_dir) if FLAGS.save_dir else (
-        _default_save_dir(FLAGS.model_id) if FLAGS.save_every > 0 or FLAGS.resume else None
+        _default_save_dir(FLAGS.model_id)
+        if FLAGS.save_every > 0 or resume_mode is not ResumeMode.NEVER
+        else None
     )
     peak_tflops = resolve_peak_tflops(FLAGS.peak_tflops)
 
@@ -239,7 +251,7 @@ def main(_) -> None:
             save_dir=save_dir,
             save_every=FLAGS.save_every,
             log_every=FLAGS.log_every,
-            resume=FLAGS.resume,
+            resume=resume_mode,
             pad_id=FLAGS.pad_id,
             peak_tflops=peak_tflops,
             tp_size=FLAGS.tp_size,

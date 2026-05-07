@@ -221,7 +221,7 @@ def run_sft(
     save_dir: str | Path | None = None,
     save_every: int = 0,
     log_every: int = 1,
-    resume: bool = False,
+    resume: checkpoint_utils.ResumeMode = checkpoint_utils.ResumeMode.NEVER,
     pad_id: int = 0,
     peak_tflops: float | None = None,
     tp_size: int | None = None,
@@ -241,18 +241,40 @@ def run_sft(
 
     If ``val_data_iter`` is provided, runs ``val_steps`` forward-only batches
     every ``val_every`` training steps and logs the average validation loss.
+
+    See :class:`omegalax.trainers.checkpoint_utils.ResumeMode` for the meaning of
+    each ``resume`` mode.
     """
     save_path = Path(save_dir).expanduser().resolve() if save_dir is not None else None
-    if resume:
-        if save_path is None:
-            raise ValueError("resume=True requires save_dir to be provided.")
-        if not save_path.exists():
-            raise ValueError(f"resume=True requires an existing checkpoint directory: {save_path}")
-        checkpoint_probe = _make_checkpoint_manager(save_path, save_interval=None)
-        latest_step = checkpoint_probe.latest_step()
-        checkpoint_probe.close()
-        if latest_step is None:
-            raise ValueError(f"resume=True but no checkpoints found under: {save_path}")
+
+    # Build the canonical CheckpointManager up-front so a single ``latest_step()``
+    # query drives both the model_cfg-source decision and the eventual restore.
+    # No throwaway probes.
+    checkpoint_manager: ocp.CheckpointManager | None = None
+    if save_path is not None:
+        save_path.mkdir(parents=True, exist_ok=True)
+        checkpoint_manager = _make_checkpoint_manager(save_path, save_interval=save_every or None)
+
+    latest_step = checkpoint_manager.latest_step() if checkpoint_manager is not None else None
+
+    if resume == checkpoint_utils.ResumeMode.REQUIRED and latest_step is None:
+        raise ValueError(
+            f"resume='required' but no checkpoint found at "
+            f"{save_path if save_path is not None else '<no save_dir provided>'}"
+        )
+
+    will_resume = (
+        resume in (checkpoint_utils.ResumeMode.IF_PRESENT, checkpoint_utils.ResumeMode.REQUIRED)
+        and latest_step is not None
+    )
+    if resume == checkpoint_utils.ResumeMode.IF_PRESENT:
+        startup_log(
+            f"resume=if_present: existing checkpoint detected at {save_path}; resuming"
+            if will_resume
+            else f"resume=if_present: no checkpoint at {save_path}; starting fresh"
+        )
+
+    if will_resume:
         model_cfg = text_api.resolve_config(str(save_path))
         startup_log(f"resolved model config from checkpoint {save_path!r}")
     else:
@@ -304,18 +326,19 @@ def run_sft(
     timer = StepTimer(warmup=2 * accum_steps)
     global_tokens_per_step = train_cfg.seq_len * train_cfg.batch_size * accum_steps
 
-    checkpoint_manager = None
-    if save_path is not None:
-        save_path.mkdir(parents=True, exist_ok=True)
+    if checkpoint_manager is not None and not will_resume:
+        # Write the HF config alongside the orbax tree only on a fresh start;
+        # on resume the file was written by the original run and matches by
+        # construction (we just resolved model_cfg from it).
         _write_checkpoint_config(save_path, model_cfg)
-        checkpoint_manager = _make_checkpoint_manager(save_path, save_interval=save_every or None)
+    if checkpoint_manager is not None:
         startup_log(f"checkpoint manager ready at {save_path!r}")
 
     start_step = 0
-    if resume:
-        if checkpoint_manager is None:
-            raise ValueError("resume=True requires save_dir to be provided.")
-        optimizer, start_step, rng, data_iter = _restore_sft_checkpoint(checkpoint_manager, optimizer, rng, data_iter)
+    if will_resume:
+        optimizer, start_step, rng, data_iter = _restore_sft_checkpoint(
+            checkpoint_manager, optimizer, rng, data_iter
+        )
         rng = jax.device_put(rng, replicated_rng_sharding)
         startup_log(f"restored checkpoint at step {start_step}")
 

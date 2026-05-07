@@ -2,12 +2,30 @@
 
 from __future__ import annotations
 
+from enum import StrEnum
 from typing import Any, cast
 
 import grain
 import orbax.checkpoint as ocp
 
 type GrainIterator = grain.DataLoaderIterator | grain.DatasetIterator
+
+
+class ResumeMode(StrEnum):
+    """Trainer resume policy.
+
+    NEVER      — always start fresh; do not consult any existing checkpoints.
+    IF_PRESENT — resume from the latest checkpoint at ``save_dir`` if one exists,
+                 otherwise start fresh. Right mode for SLURM time-limit recovery,
+                 where the same recipe may be submitted with no checkpoint yet
+                 (first run) or with checkpoints from a previous timed-out attempt.
+    REQUIRED   — resume; error if no usable checkpoint is found. Right mode for
+                 explicit "this must be a continuation" workflows.
+    """
+
+    NEVER = "never"
+    IF_PRESENT = "if_present"
+    REQUIRED = "required"
 
 
 def register_grain_iterator_handler(handler_registry: ocp.handlers.DefaultCheckpointHandlerRegistry) -> None:
