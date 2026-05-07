@@ -247,9 +247,6 @@ def run_sft(
     """
     save_path = Path(save_dir).expanduser().resolve() if save_dir is not None else None
 
-    # Build the canonical CheckpointManager up-front so a single ``latest_step()``
-    # query drives both the model_cfg-source decision and the eventual restore.
-    # No throwaway probes.
     checkpoint_manager: ocp.CheckpointManager | None = None
     if save_path is not None:
         save_path.mkdir(parents=True, exist_ok=True)

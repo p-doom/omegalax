@@ -27,6 +27,7 @@ from omegalax.trainers.perf import (
     StepTimer,
 )
 from omegalax.trainers.optim import MixedPrecisionOptimizer
+from omegalax.trainers.lora import LoRAParam, inject_lora
 from omegalax.trainers.text import startup_log
 from omegalax.vlm import api as vlm_api
 
@@ -43,11 +44,14 @@ class TrainConfig:
     weight_decay: float = 0.01
     warmup_steps: int = 0
     lr_schedule: str = "linear"
-    lr_end_factor: float = 0.0 
-    lr_stable_fraction: float = 0.8 
+    lr_end_factor: float = 0.0
+    lr_stable_fraction: float = 0.8
     max_grad_norm: float = 0.0
     grad_accum_steps: int = 1
     print_every: int = 1
+    enable_lora: bool = False
+    lora_rank: int = 32
+    lora_alpha: float = 32.0
 
 
 def init_model(
@@ -68,15 +72,22 @@ def init_model(
     return model
 
 
-def build_optimizer(model: nnx.Module, lr_schedule_fn: optax.Schedule | float, train_cfg: TrainConfig) -> MixedPrecisionOptimizer:
+def build_optimizer(
+    model: nnx.Module,
+    lr_schedule_fn: optax.Schedule | float,
+    train_cfg: TrainConfig,
+    *,
+    wrt=nnx.Param,
+) -> MixedPrecisionOptimizer:
     chain = []
     if train_cfg.max_grad_norm > 0:
         chain.append(optax.clip_by_global_norm(train_cfg.max_grad_norm))
-    chain.append(optax.adamw(lr_schedule_fn, weight_decay=train_cfg.weight_decay))
+    wd = 0.0 if wrt is LoRAParam else train_cfg.weight_decay
+    chain.append(optax.adamw(lr_schedule_fn, weight_decay=wd))
     tx = optax.chain(*chain)
     if train_cfg.grad_accum_steps > 1:
         tx = optax.MultiSteps(tx, every_k_schedule=train_cfg.grad_accum_steps)
-    opt = MixedPrecisionOptimizer(model, tx)
+    opt = MixedPrecisionOptimizer(model, tx, wrt=wrt)
     return opt
 
 
@@ -116,6 +127,21 @@ def _write_checkpoint_config(save_dir: Path, cfg) -> None:
     save_hf_config(export_lib.model_config_to_hf_dict(cfg), save_dir)
 
 
+def _write_lora_metadata(save_dir: Path, train_cfg: TrainConfig) -> None:
+    """Persist LoRA settings alongside the orbax tree.
+
+    The export driver reads this file to reconstruct the same optimizer
+    shape at restore time. Absent file ⇒ checkpoint was full-FT.
+    """
+    import json
+    meta = {
+        "enable_lora": bool(train_cfg.enable_lora),
+        "lora_rank": int(train_cfg.lora_rank),
+        "lora_alpha": float(train_cfg.lora_alpha),
+    }
+    (Path(save_dir) / "lora_metadata.json").write_text(json.dumps(meta, indent=2))
+
+
 def _save_sft_checkpoint(
     checkpoint_manager: ocp.CheckpointManager,
     optimizer: MixedPrecisionOptimizer,
@@ -146,13 +172,20 @@ def _restore_sft_checkpoint(
     return optimizer, int(latest_step), train_state["rng"], checkpoint_utils.restored_input_iter(restored)
 
 
-def make_sft_train_step(cfg, pad_id: int = 0):
+def make_sft_train_step(cfg, pad_id: int = 0, *, wrt=nnx.Param):
     """Build a JIT-compiled VLM SFT train step that consumes a batch dict.
 
     The batch dict must contain ``token_ids_BT``, ``attention_mask_BT``, and
     ``loss_mask_BT``.  It may also contain ``pixel_values`` and
     ``image_grid_thw`` for multimodal batches.
+
+    ``wrt`` selects which model variables receive gradients. Defaults to
+    ``nnx.Param`` (full FT). Pass ``LoRAParam`` for adapter-only training
+    — every other ``nnx.Param`` then sees zero gradient and contributes
+    no optimizer state.
     """
+
+    diff_state = nnx.DiffState(0, wrt)
 
     @nnx.jit(donate_argnums=0)
     def sft_train_step(optimizer: MixedPrecisionOptimizer, batch: dict[str, jax.Array]):
@@ -185,7 +218,9 @@ def make_sft_train_step(cfg, pad_id: int = 0):
             supervised_tokens = jnp.sum(loss_mask_BT[:, 1:].astype(jnp.float32))
             return loss, supervised_tokens
 
-        (loss, supervised_tokens), grads = nnx.value_and_grad(loss_fn, has_aux=True)(optimizer.model)
+        (loss, supervised_tokens), grads = nnx.value_and_grad(
+            loss_fn, argnums=diff_state, has_aux=True,
+        )(optimizer.model)
         optimizer.update(grads)
         metrics = {
             "loss": loss,
@@ -351,11 +386,26 @@ def run_sft(
     from omegalax.models.sharding_runtime import set_attn_backend
     set_attn_backend(model, text_backend=text_attn_backend)
     startup_log(f"set attn backend: text={text_attn_backend}")
+    if train_cfg.enable_lora:
+        with mesh_rules(mesh):
+            n_wrapped = inject_lora(
+                model,
+                r=train_cfg.lora_rank,
+                alpha=train_cfg.lora_alpha,
+                rngs=nnx.Rngs(train_cfg.seed),
+            )
+        startup_log(
+            f"LoRA enabled: r={train_cfg.lora_rank} alpha={train_cfg.lora_alpha} "
+            f"wrapped {n_wrapped} text-decoder Linear projections; vision frozen"
+        )
+        wrt_filter = LoRAParam
+    else:
+        wrt_filter = nnx.Param
     with mesh_rules(mesh):
-        optimizer = build_optimizer(model, lr_schedule_fn, train_cfg)
+        optimizer = build_optimizer(model, lr_schedule_fn, train_cfg, wrt=wrt_filter)
 
     startup_log("built optimizer")
-    sft_step = make_sft_train_step(model_cfg, pad_id=pad_id)
+    sft_step = make_sft_train_step(model_cfg, pad_id=pad_id, wrt=wrt_filter)
     eval_step = make_sft_eval_step(model_cfg, pad_id=pad_id) if val_data_iter is not None else None
     startup_log("built train step (jit)" + (" and eval step (jit)" if eval_step is not None else ""))
 
@@ -368,6 +418,7 @@ def run_sft(
         # on resume the file was written by the original run and matches by
         # construction (we just resolved model_cfg from it).
         _write_checkpoint_config(save_path, model_cfg)
+        _write_lora_metadata(save_path, train_cfg)
     if checkpoint_manager is not None:
         startup_log(f"checkpoint manager ready at {save_path!r}")
 

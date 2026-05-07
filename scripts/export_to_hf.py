@@ -100,6 +100,18 @@ def load_model():
     raise ValueError(f"Unsupported architecture for model id '{FLAGS.model_id}'")
 
 
+def _read_lora_metadata(save_dir: Path) -> dict:
+    """Return LoRA settings persisted by the trainer next to the orbax tree.
+
+    Absent file ⇒ checkpoint was full-FT (all defaults to off).
+    """
+    import json
+    p = save_dir / "lora_metadata.json"
+    if not p.exists():
+        return {"enable_lora": False, "lora_rank": 32, "lora_alpha": 32.0}
+    return json.loads(p.read_text())
+
+
 def _restore_trained_weights(model, cfg, checkpoint_path: Path):
     """Restore trained weights from an orbax step directory into ``model``.
 
@@ -107,7 +119,16 @@ def _restore_trained_weights(model, cfg, checkpoint_path: Path):
     shape matches), constructs a CheckpointManager handling only the
     train_state subkey, and updates ``model`` from the restored optimizer
     state.
+
+    For LoRA-trained checkpoints, the trainer wrote a
+    ``lora_metadata.json`` next to the orbax tree. We read it, inject
+    LoRA into the freshly-loaded base model BEFORE building the
+    optimizer, so the abstract optimizer state matches the saved shape
+    (LoRA-only opt_state + LoRA-augmented model state).
     """
+    save_dir = checkpoint_path.parent.resolve()
+    lora_meta = _read_lora_metadata(save_dir)
+
     train_cfg = vlm_trainer.TrainConfig(
         learning_rate=FLAGS.learning_rate,
         weight_decay=FLAGS.weight_decay,
@@ -118,6 +139,9 @@ def _restore_trained_weights(model, cfg, checkpoint_path: Path):
         lr_schedule=FLAGS.lr_schedule,
         lr_stable_fraction=FLAGS.lr_stable_fraction,
         lr_end_factor=FLAGS.lr_end_factor,
+        enable_lora=bool(lora_meta.get("enable_lora", False)),
+        lora_rank=int(lora_meta.get("lora_rank", 32)),
+        lora_alpha=float(lora_meta.get("lora_alpha", 32.0)),
     )
     lr_schedule_fn = build_lr_schedule(
         peak_lr=train_cfg.learning_rate,
@@ -127,7 +151,6 @@ def _restore_trained_weights(model, cfg, checkpoint_path: Path):
         end_factor=train_cfg.lr_end_factor,
         stable_fraction=train_cfg.lr_stable_fraction,
     )
-    save_dir = checkpoint_path.parent.resolve()
     step = int(checkpoint_path.name)
 
     # build_optimizer (and the abstract-state sharding it produces) needs
@@ -137,7 +160,21 @@ def _restore_trained_weights(model, cfg, checkpoint_path: Path):
     # produces P(None,) sharding for the rank-0 key which orbax rejects.
     rng = jax.device_put(jax.random.key(FLAGS.seed), NamedSharding(mesh, P()))
     with mesh_rules(mesh):
-        optimizer = vlm_trainer.build_optimizer(model, lr_schedule_fn, train_cfg)
+        if train_cfg.enable_lora:
+            from omegalax.trainers.lora import LoRAParam, inject_lora
+            n_wrapped = inject_lora(
+                model,
+                r=train_cfg.lora_rank,
+                alpha=train_cfg.lora_alpha,
+                rngs=nnx.Rngs(train_cfg.seed),
+            )
+            print(f"[export] re-injected LoRA into base for restore: r={train_cfg.lora_rank} wrapped={n_wrapped}")
+            wrt_filter = LoRAParam
+        else:
+            wrt_filter = nnx.Param
+        optimizer = vlm_trainer.build_optimizer(
+            model, lr_schedule_fn, train_cfg, wrt=wrt_filter,
+        )
 
         handler_registry = ocp.handlers.DefaultCheckpointHandlerRegistry()
         handler_registry.add("train_state", ocp.args.PyTreeRestore, ocp.handlers.PyTreeCheckpointHandler)

@@ -91,6 +91,13 @@ flags.DEFINE_integer("max_vision_patches_per_sample", 0,
 flags.DEFINE_integer("max_vision_images_per_sample", 0,
                      "Max images per sample for JIT stability (0 = no padding). "
                      "Multiplied by batch_size automatically.")
+flags.DEFINE_boolean("enable_lora", False,
+                     "Enable LoRA adapters on the text decoder's q/k/v/o + "
+                     "gate/up/down projections. Vision tower, embedder, "
+                     "lm_head and layernorms remain fully frozen.")
+flags.DEFINE_integer("lora_rank", 32, "LoRA rank (only used if --enable_lora).")
+flags.DEFINE_float("lora_alpha", 32.0,
+                   "LoRA alpha scaling. Effective LR multiplier is alpha/rank.")
 
 _ATTN_BACKENDS = [
     "mosaic_tpu", "mosaic_gpu", "cudnn", "xla", "triton",
@@ -252,6 +259,9 @@ def main(_) -> None:
         max_grad_norm=FLAGS.max_grad_norm,
         grad_accum_steps=FLAGS.grad_accum_steps,
         print_every=FLAGS.log_every,
+        enable_lora=FLAGS.enable_lora,
+        lora_rank=FLAGS.lora_rank,
+        lora_alpha=FLAGS.lora_alpha,
     )
     resume_mode = ResumeMode(FLAGS.resume)
     save_dir = Path(FLAGS.save_dir) if FLAGS.save_dir else (
