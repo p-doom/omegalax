@@ -67,12 +67,12 @@ def init_model(
     return model
 
 
-def build_optimizer(model: nnx.Module, lr_schedule_fn: optax.Schedule | float, train_cfg: TrainConfig) -> MixedPrecisionOptimizer:
+def build_optimizer(model: nnx.Module, lr_schedule_fn: optax.Schedule | float, train_cfg: TrainConfig, model_cfg: vlm_api.VLMConfig) -> MixedPrecisionOptimizer:
     chain = []
     if train_cfg.max_grad_norm > 0:
         chain.append(optax.clip_by_global_norm(train_cfg.max_grad_norm))
     chain.append(optax.adamw(lr_schedule_fn, weight_decay=train_cfg.weight_decay,
-                             mu_dtype=jnp.float32))
+                             mu_dtype=model_cfg.dtype))
     tx = optax.chain(*chain)
     if train_cfg.grad_accum_steps > 1:
         tx = optax.MultiSteps(tx, every_k_schedule=train_cfg.grad_accum_steps)
@@ -327,11 +327,16 @@ def run_sft(
             dp_size=dp_size,
         )
         startup_log("initialized model (random init)")
+    if wandb_run is not None and is_primary_process:
+        wandb_run.config.update(
+            {"model_cfg": export_lib.model_config_to_hf_dict(model_cfg)},
+            allow_val_change=True,
+        )
     from omegalax.models.sharding_runtime import set_attn_backend
     set_attn_backend(model, text_backend=text_attn_backend)
     startup_log(f"set attn backend: text={text_attn_backend}")
     with mesh_rules(mesh):
-        optimizer = build_optimizer(model, lr_schedule_fn, train_cfg)
+        optimizer = build_optimizer(model, lr_schedule_fn, train_cfg, model_cfg)
 
     startup_log("built optimizer")
     sft_step = make_sft_train_step(model_cfg, pad_id=pad_id)
