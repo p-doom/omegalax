@@ -356,11 +356,13 @@ class TextAttention(nnx.Module):
         q_BTHK = apply_rope(q_BTHK, sin_BTK, cos_BTK)
         k_BTGK = apply_rope(k_BTGK, sin_BTK, cos_BTK)
 
+        # force bfloat16 - tokamax attention only supports fp16/bf16
+        attn_in_dtype = q_BTHK.dtype
         attn_BTHK = dot_product_attention(
-            q_BTHK, k_BTGK, v_BTGK,
+            q_BTHK.astype(jnp.bfloat16), k_BTGK.astype(jnp.bfloat16), v_BTGK.astype(jnp.bfloat16),
             is_causal=True, scale=self.scale, implementation=self._attn_backend,
             q_sharding=self._q_sharding,
-        )
+        ).astype(attn_in_dtype)
         out_BTD = self.o_proj(jax.lax.reshape(attn_BTHK, (B, T, self.num_heads * self.head_dim), out_sharding=self.shd_cfg.act_btf), out_sharding=self.shd_cfg.act_btd)
         return out_BTD
 

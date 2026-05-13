@@ -31,6 +31,12 @@ def _cudnn_packed_vision_attention_local(
     kv_offsets = cu[None]
     seqlens_1M = seqlens.astype(jnp.int32)[None]
 
+    # force bfloat16 - cuDNN flash attention only supports fp16/bf16/fp8
+    orig_dtype = q_NHK.dtype
+    q_NHK = q_NHK.astype(jnp.bfloat16)
+    k_NHK = k_NHK.astype(jnp.bfloat16)
+    v_NHK = v_NHK.astype(jnp.bfloat16)
+
     out = _cudnn_dot_product_attention(
         q_NHK[None], k_NHK[None], v_NHK[None],
         q_seqlen=seqlens_1M, kv_seqlen=seqlens_1M,
@@ -38,7 +44,7 @@ def _cudnn_packed_vision_attention_local(
         scale=scale, mask_type=_CuDnnMaskType.NO_MASK,
         qkv_layout="BTNH",
     )
-    return out[0]
+    return out[0].astype(orig_dtype)
 
 
 def _cudnn_packed_vision_attention(
