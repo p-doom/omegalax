@@ -27,6 +27,7 @@ class Qwen3VLVisionConfig:
     num_position_embeddings: int
     deepstack_visual_indexes: tuple[int, ...]
     dtype: Any = jnp.bfloat16
+    param_dtype: Any = jnp.bfloat16
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -55,6 +56,7 @@ class Qwen3VLConfig:
     norm_topk_prob: bool = True
     shd_cfg: ShardConfig = dataclasses.field(default_factory=ShardConfig.default)
     dtype: Any = jnp.bfloat16
+    param_dtype: Any = jnp.bfloat16
 
     def is_moe_layer(self, layer_idx: int) -> bool:
         return (
@@ -287,7 +289,7 @@ def make_vl_config_from_hf(hf_cfg: dict[str, Any]) -> Qwen3VLConfig:
         image_token_id=_required(hf_cfg, "image_token_id", "hf_cfg"),
         video_token_id=_required(hf_cfg, "video_token_id", "hf_cfg"),
         vision_start_token_id=_required(hf_cfg, "vision_start_token_id", "hf_cfg"),
-        dtype=text_dtype,
+        param_dtype=text_dtype,
         vision=Qwen3VLVisionConfig(
             hidden_size=_required(vis, "hidden_size", "hf_cfg['vision_config']"),
             intermediate_size=_required(vis, "intermediate_size", "hf_cfg['vision_config']"),
@@ -301,6 +303,6 @@ def make_vl_config_from_hf(hf_cfg: dict[str, Any]) -> Qwen3VLConfig:
             hidden_act=_required(vis, "hidden_act", "hf_cfg['vision_config']"),
             num_position_embeddings=_required(vis, "num_position_embeddings", "hf_cfg['vision_config']"),
             deepstack_visual_indexes=tuple(_required(vis, "deepstack_visual_indexes", "hf_cfg['vision_config']")),
-            dtype=vision_dtype,
+            param_dtype=vision_dtype,
         ),
     )

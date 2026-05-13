@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from functools import partial
-from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -151,31 +150,35 @@ class LayerNorm(nnx.Module):
         *,
         rngs: nnx.Rngs,
         sharding: tuple[str | None, ...] = ("hidden",),
-        param_dtype: Any = jnp.float32,
     ):
-        self.scale = nnx.Param(jnp.ones(dim, dtype=param_dtype), sharding=sharding)
-        self.bias = nnx.Param(jnp.zeros(dim, dtype=param_dtype), sharding=sharding)
+        self.scale = nnx.Param(jnp.ones(dim, dtype=jnp.float32), sharding=sharding)
+        self.bias = nnx.Param(jnp.zeros(dim, dtype=jnp.float32), sharding=sharding)
         self.eps = eps
 
     def __call__(self, x: jax.Array) -> jax.Array:
-        mean = jnp.mean(x, axis=-1, keepdims=True)
-        var = jnp.var(x, axis=-1, keepdims=True)
-        normed = (x - mean) * jax.lax.rsqrt(var + self.eps)
-        return self.scale[...] * normed + self.bias[...]
+        dtype = x.dtype
+        x_f32 = x.astype(jnp.float32)
+        mean = jnp.mean(x_f32, axis=-1, keepdims=True)
+        var = jnp.var(x_f32, axis=-1, keepdims=True)
+        normed = jnp.astype((x_f32 - mean) * jax.lax.rsqrt(var + self.eps), dtype)
+        scale = jnp.astype(self.scale[...], dtype)
+        bias = jnp.astype(self.bias[...], dtype)
+        return scale * normed + bias
 
 
 class VisionPatchEmbed(nnx.Module):
     """Conv3D patch embedding, represented as a linear layer over flattened patches."""
 
-    def __init__(self, config: Qwen3VLVisionConfig, hidden_shd: P, *, rngs: nnx.Rngs):
-        in_features = config.in_channels * config.temporal_patch_size * config.patch_size**2
+    def __init__(self, cfg: Qwen3VLVisionConfig, hidden_shd: P, *, rngs: nnx.Rngs):
+        in_features = cfg.in_channels * cfg.temporal_patch_size * cfg.patch_size**2
         init = nnx.initializers.lecun_normal()
         self.proj = nnx.Linear(
             in_features,
-            config.hidden_size,
+            cfg.hidden_size,
             use_bias=True,
             rngs=rngs,
-            dtype=config.dtype,
+            dtype=cfg.dtype,
+            param_dtype=cfg.param_dtype,
             kernel_init=wp(init, (None, "hidden")),
         )
         self.in_features = in_features
@@ -196,6 +199,7 @@ class VisionMLP(nnx.Module):
             use_bias=True,
             rngs=rngs,
             dtype=config.dtype,
+            param_dtype=config.param_dtype,
             kernel_init=wp(init, (None, "hidden")),
         )
         self.fc2 = nnx.Linear(
@@ -204,6 +208,7 @@ class VisionMLP(nnx.Module):
             use_bias=True,
             rngs=rngs,
             dtype=config.dtype,
+            param_dtype=config.param_dtype,
             kernel_init=wp(init, ("hidden", None)),
         )
         self.hidden_shd = hidden_shd
@@ -254,6 +259,7 @@ class VisionAttention(nnx.Module):
             use_bias=True,
             rngs=rngs,
             dtype=config.dtype,
+            param_dtype=config.param_dtype,
             kernel_init=qkv_init,
         )
         self.proj = nnx.Linear(
@@ -262,6 +268,7 @@ class VisionAttention(nnx.Module):
             use_bias=True,
             rngs=rngs,
             dtype=config.dtype,
+            param_dtype=config.param_dtype,
             kernel_init=qkv_init,
         )
         self.hidden_shd = hidden_shd
@@ -293,11 +300,11 @@ class VisionAttention(nnx.Module):
 
 
 class VisionBlock(nnx.Module):
-    def __init__(self, config: Qwen3VLVisionConfig, hidden_shd: P, ff_shd: P, heads_shd: P, *, rngs: nnx.Rngs):
-        self.norm1 = LayerNorm(config.hidden_size, eps=1e-6, rngs=rngs)
-        self.norm2 = LayerNorm(config.hidden_size, eps=1e-6, rngs=rngs)
-        self.attn = VisionAttention(config, hidden_shd=hidden_shd, heads_shd=heads_shd, rngs=rngs)
-        self.mlp = VisionMLP(config, hidden_shd=hidden_shd, ff_shd=ff_shd, rngs=rngs)
+    def __init__(self, cfg: Qwen3VLVisionConfig, hidden_shd: P, ff_shd: P, heads_shd: P, *, rngs: nnx.Rngs):
+        self.norm1 = LayerNorm(cfg.hidden_size, eps=1e-6, rngs=rngs)
+        self.norm2 = LayerNorm(cfg.hidden_size, eps=1e-6, rngs=rngs)
+        self.attn = VisionAttention(cfg, hidden_shd=hidden_shd, heads_shd=heads_shd, rngs=rngs)
+        self.mlp = VisionMLP(cfg, hidden_shd=hidden_shd, ff_shd=ff_shd, rngs=rngs)
         self.hidden_shd = hidden_shd
 
     @partial(jax.remat, static_argnums=0)
@@ -310,17 +317,17 @@ class VisionBlock(nnx.Module):
 class VisionPatchMerger(nnx.Module):
     def __init__(
         self,
-        config: Qwen3VLVisionConfig,
+        cfg: Qwen3VLVisionConfig,
         hidden_shd: P,
         ff_shd: P,
         *,
         use_postshuffle_norm: bool = False,
         rngs: nnx.Rngs,
     ):
-        hidden_size = config.hidden_size * (config.spatial_merge_size**2)
+        hidden_size = cfg.hidden_size * (cfg.spatial_merge_size**2)
         self.hidden_size = hidden_size
         self.use_postshuffle_norm = use_postshuffle_norm
-        norm_dim = hidden_size if use_postshuffle_norm else config.hidden_size
+        norm_dim = hidden_size if use_postshuffle_norm else cfg.hidden_size
         self.norm = LayerNorm(norm_dim, eps=1e-6, rngs=rngs)
         init = nnx.initializers.lecun_normal()
         self.fc1 = nnx.Linear(
@@ -328,15 +335,17 @@ class VisionPatchMerger(nnx.Module):
             hidden_size,
             use_bias=True,
             rngs=rngs,
-            dtype=config.dtype,
+            dtype=cfg.dtype,
+            param_dtype=cfg.param_dtype,
             kernel_init=wp(init, (None, None)),
         )
         self.fc2 = nnx.Linear(
             hidden_size,
-            config.out_hidden_size,
+            cfg.out_hidden_size,
             use_bias=True,
             rngs=rngs,
-            dtype=config.dtype,
+            dtype=cfg.dtype,
+            param_dtype=cfg.param_dtype,
             kernel_init=wp(init, (None, "hidden")),
         )
         self.hidden_shd = hidden_shd
@@ -355,30 +364,31 @@ class VisionPatchMerger(nnx.Module):
 
 
 class VisionModel(nnx.Module):
-    def __init__(self, config: Qwen3VLVisionConfig, shd_cfg: ShardConfig, *, rngs: nnx.Rngs):
-        self.config = config
-        self.spatial_merge_size = config.spatial_merge_size
+    def __init__(self, cfg: Qwen3VLVisionConfig, shd_cfg: ShardConfig, *, rngs: nnx.Rngs):
+        self.cfg = cfg
+        self.spatial_merge_size = cfg.spatial_merge_size
         self.hidden_shd = P(shd_cfg.act_btd[0], shd_cfg.act_btd[2])
         self.ff_shd = P(shd_cfg.act_btd[0], shd_cfg.act_btf[2])
         self.heads_shd = P(shd_cfg.act_btd[0], shd_cfg.act_btnh[2], None)
-        self.patch_embed = VisionPatchEmbed(config, hidden_shd=self.hidden_shd, rngs=rngs)
+        self.patch_embed = VisionPatchEmbed(cfg, hidden_shd=self.hidden_shd, rngs=rngs)
         pos_init = nnx.initializers.normal(stddev=0.02)
         self.pos_embed = nnx.Embed(
-            num_embeddings=config.num_position_embeddings,
-            features=config.hidden_size,
-            dtype=config.dtype,
+            num_embeddings=cfg.num_position_embeddings,
+            features=cfg.hidden_size,
+            dtype=cfg.dtype,
+            param_dtype=cfg.param_dtype,
             rngs=rngs,
             embedding_init=wp(pos_init, (None, "hidden")),
         )
-        self.num_grid_per_side = int(config.num_position_embeddings**0.5)
-        head_dim = config.hidden_size // config.num_heads
+        self.num_grid_per_side = int(cfg.num_position_embeddings**0.5)
+        head_dim = cfg.hidden_size // cfg.num_heads
         self.rotary_dim = head_dim // 2
         self.rotary_theta = 10000.0
         self.blocks = nnx.List(
-            [VisionBlock(config, hidden_shd=self.hidden_shd, ff_shd=self.ff_shd, heads_shd=self.heads_shd, rngs=rngs) for _ in range(config.depth)]
+            [VisionBlock(cfg, hidden_shd=self.hidden_shd, ff_shd=self.ff_shd, heads_shd=self.heads_shd, rngs=rngs) for _ in range(cfg.depth)]
         )
         self.merger = VisionPatchMerger(
-            config,
+            cfg,
             hidden_shd=self.hidden_shd,
             ff_shd=self.ff_shd,
             use_postshuffle_norm=False,
@@ -387,16 +397,16 @@ class VisionModel(nnx.Module):
         self.deepstack_mergers = nnx.List(
             [
                 VisionPatchMerger(
-                    config,
+                    cfg,
                     hidden_shd=self.hidden_shd,
                     ff_shd=self.ff_shd,
                     use_postshuffle_norm=True,
                     rngs=rngs,
                 )
-                for _ in config.deepstack_visual_indexes
+                for _ in cfg.deepstack_visual_indexes
             ]
         )
-        self.deepstack_visual_indexes = config.deepstack_visual_indexes
+        self.deepstack_visual_indexes = cfg.deepstack_visual_indexes
 
     def _compute_rotary_pos_emb(self, image_grid: jax.Array, total_tokens: int) -> jax.Array:
         row, col, _ = _token_spatial_coords(image_grid, self.spatial_merge_size, total_tokens)
@@ -470,8 +480,8 @@ class VisionModel(nnx.Module):
         rotary_emb_NK = reshard(rotary_emb_NK, P(self.hidden_shd[0], None))
         emb_NK = jnp.concatenate([rotary_emb_NK, rotary_emb_NK], axis=-1)
         cos_NK, sin_NK = jnp.cos(emb_NK), jnp.sin(emb_NK)
-        cos_NK = cos_NK.astype(self.config.dtype)
-        sin_NK = sin_NK.astype(self.config.dtype)
+        cos_NK = cos_NK.astype(self.cfg.dtype)
+        sin_NK = sin_NK.astype(self.cfg.dtype)
 
         cu_seqlens = vision_cu_seqlens.astype(jnp.int32)
 

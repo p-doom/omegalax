@@ -28,7 +28,7 @@ class RMSNorm(nnx.Module):
         sharding: tuple[str | None, ...] = ("hidden",),
     ):
         self.scale = nnx.Param(
-            nnx.initializers.ones_init()(rngs.params(), (dim,)),
+            nnx.initializers.ones_init()(rngs.params(), (dim,), dtype=jnp.float32),
             sharding=sharding,
         )
         self.eps = eps
@@ -179,6 +179,7 @@ class TextMLP(nnx.Module):
             use_bias=False,
             rngs=rngs,
             dtype=cfg.dtype,
+            param_dtype=cfg.param_dtype,
             kernel_init=wp(init_fn, ("embed", "mlp")),
         )
         row_parallel = partial(
@@ -186,6 +187,7 @@ class TextMLP(nnx.Module):
             use_bias=False,
             rngs=rngs,
             dtype=cfg.dtype,
+            param_dtype=cfg.param_dtype,
             kernel_init=wp(init_fn, ("mlp", "embed")),
         )
         self.gate_proj = col_parallel(cfg.emb_dim, cfg.mlp_dim)
@@ -208,23 +210,25 @@ class TextMoEFeedForward(nnx.Module):
         E, D, F = cfg.num_experts, cfg.emb_dim, cfg.moe_intermediate_size
         init = nnx.initializers.lecun_normal()
         self.gate_proj = nnx.Param(
-            init(rngs.params(), (E, D, F)),
+            init(rngs.params(), (E, D, F), dtype=cfg.param_dtype),
             sharding=(None, "embed", "mlp"),
         )
         self.up_proj = nnx.Param(
-            init(rngs.params(), (E, D, F)),
+            init(rngs.params(), (E, D, F), dtype=cfg.param_dtype),
             sharding=(None, "embed", "mlp"),
         )
         self.down_proj = nnx.Param(
-            init(rngs.params(), (E, F, D)),
+            init(rngs.params(), (E, F, D), dtype=cfg.param_dtype),
             sharding=(None, "mlp", "embed"),
         )
+        # Router math is fp32 for stable expert selection
         self.router = nnx.Linear(
             D,
             E,
             use_bias=False,
             rngs=rngs,
-            dtype=cfg.dtype,
+            dtype=jnp.float32,
+            param_dtype=cfg.param_dtype,
             kernel_init=wp(init, ("embed", None)),
         )
 
@@ -234,19 +238,20 @@ class TextMoEFeedForward(nnx.Module):
         hidden_axis = self.shd_cfg.act_btd[2]
         ff_axis = self.shd_cfg.act_btf[2]
 
+        # Router math is fp32 for stable expert selection
         router_logits_BTE = self.router(hidden_BTD, out_sharding=P(batch_axis, None, None))
-        probs_BTE = jax.nn.softmax(router_logits_BTE.astype(jnp.float32), axis=-1)
+        probs_BTE = jax.nn.softmax(router_logits_BTE, axis=-1)
         topk_weights_BTk, topk_idx_BTk = jax.lax.top_k(probs_BTE, cfg.num_experts_per_tok)
         if cfg.norm_topk_prob:
             topk_weights_BTk = topk_weights_BTk / jnp.clip(
                 jnp.sum(topk_weights_BTk, axis=-1, keepdims=True), min=1e-9
             )
-        topk_weights_BTk = topk_weights_BTk.astype(probs_BTE.dtype)
+        # Cast back to activation dtype before mixing with expert outputs;
+        topk_weights_BTk = topk_weights_BTk.astype(cfg.dtype)
 
-        compute_dtype = hidden_BTD.dtype
-        gate_proj_EDF = jnp.astype(self.gate_proj[...], compute_dtype)
-        up_proj_EDF = jnp.astype(self.up_proj[...], compute_dtype)
-        down_proj_EFD = jnp.astype(self.down_proj[...], compute_dtype)
+        gate_proj_EDF = self.gate_proj[...].astype(cfg.dtype)
+        up_proj_EDF = self.up_proj[...].astype(cfg.dtype)
+        down_proj_EFD = self.down_proj[...].astype(cfg.dtype)
 
         dense_hidden_BTD = reshard(hidden_BTD, P(batch_axis, None, None))
         gate_BTEF = jnp.einsum(
@@ -276,7 +281,8 @@ class TextMoEFeedForward(nnx.Module):
         gathered = gathered.reshape(B, T, cfg.num_experts_per_tok, cfg.emb_dim)
         merged_BTD = reshard(jnp.sum(gathered * topk_weights_BTk[..., None], axis=-2), self.shd_cfg.act_btd)
 
-        expert_mask_BTkE = jax.nn.one_hot(topk_idx_BTk, cfg.num_experts, dtype=probs_BTE.dtype)
+        # Cast back to float32 for the aux_loss calculation
+        expert_mask_BTkE = jax.nn.one_hot(topk_idx_BTk, cfg.num_experts, dtype=jnp.float32)
         tokens_per_expert = jnp.mean(expert_mask_BTkE, axis=(0, 1))
         router_prob_per_expert_E = jnp.mean(probs_BTE, axis=(0, 1))
         aux_loss = jnp.sum(tokens_per_expert * router_prob_per_expert_E) * cfg.num_experts
@@ -295,6 +301,7 @@ class TextAttention(nnx.Module):
             use_bias=False,
             rngs=rngs,
             dtype=cfg.dtype,
+            param_dtype=cfg.param_dtype,
             kernel_init=qkv_init,
         )
         self.k_proj = nnx.Linear(
@@ -303,6 +310,7 @@ class TextAttention(nnx.Module):
             use_bias=False,
             rngs=rngs,
             dtype=cfg.dtype,
+            param_dtype=cfg.param_dtype,
             kernel_init=qkv_init,
         )
         self.v_proj = nnx.Linear(
@@ -311,6 +319,7 @@ class TextAttention(nnx.Module):
             use_bias=False,
             rngs=rngs,
             dtype=cfg.dtype,
+            param_dtype=cfg.param_dtype,
             kernel_init=qkv_init,
         )
         self.o_proj = nnx.Linear(
@@ -319,6 +328,7 @@ class TextAttention(nnx.Module):
             use_bias=False,
             rngs=rngs,
             dtype=cfg.dtype,
+            param_dtype=cfg.param_dtype,
             kernel_init=o_init,
         )
         self.q_norm = RMSNorm(cfg.head_dim, cfg.norm_eps, rngs=rngs, sharding=(None,))
@@ -383,6 +393,7 @@ class TextModel(nnx.Module):
             num_embeddings=cfg.vocab_size,
             features=cfg.emb_dim,
             dtype=cfg.dtype,
+            param_dtype=cfg.param_dtype,
             rngs=rngs,
             embedding_init=wp(embed_init, ("vocab", "embed")),
         )
@@ -404,6 +415,7 @@ class Qwen3VL(nnx.Module):
             use_bias=False,
             rngs=rngs,
             dtype=cfg.dtype,
+            param_dtype=cfg.param_dtype,
             kernel_init=wp(lm_head_init, ("embed", "vocab")),
         )
 
@@ -479,8 +491,6 @@ class Qwen3VL(nnx.Module):
         position_ids_ZBT = jnp.asarray(position_ids_ZBT)
 
         sin_BTK, cos_BTK = compute_mrope_pos_embeddings(position_ids_ZBT, cfg.head_dim, cfg.rope_theta, cfg.mrope_section)
-        sin_BTK = sin_BTK.astype(cfg.dtype)
-        cos_BTK = cos_BTK.astype(cfg.dtype)
 
         hidden_BTD = inputs_embeds_BTD
         aux_losses = []

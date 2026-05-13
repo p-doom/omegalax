@@ -71,7 +71,8 @@ def build_optimizer(model: nnx.Module, lr_schedule_fn: optax.Schedule | float, t
     chain = []
     if train_cfg.max_grad_norm > 0:
         chain.append(optax.clip_by_global_norm(train_cfg.max_grad_norm))
-    chain.append(optax.adamw(lr_schedule_fn, weight_decay=train_cfg.weight_decay))
+    chain.append(optax.adamw(lr_schedule_fn, weight_decay=train_cfg.weight_decay,
+                             mu_dtype=jnp.float32))
     tx = optax.chain(*chain)
     if train_cfg.grad_accum_steps > 1:
         tx = optax.MultiSteps(tx, every_k_schedule=train_cfg.grad_accum_steps)

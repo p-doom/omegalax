@@ -401,14 +401,17 @@ def maybe_log_step_metrics(
     if is_primary_process:
         lr = host_metrics.get("lr", 0.0)
         print(
+            f"time={datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} "
             f"step={step_to_log} "
             f"loss={host_metrics['loss']:.4f} "
             f"grad_norm={host_metrics['grad_norm']:.4f} "
-            f"lr={lr:.2e} "
-            f"tflops/dev={host_metrics.get('tflops_per_device', 0.0):.2f} "
-            f"mfu={host_metrics.get('mfu', 0.0) * 100:.1f}% "
-            f"tok/s/dev={host_metrics.get('tokens_per_sec_per_device', 0.0):.0f} "
-            f"step_time={host_metrics.get('step_time_s', 0.0):.2f}s",
+            f"train/total_samples={host_metrics.get('total_samples', 0)} "
+            f"train/global_tokens_per_sec={host_metrics.get('global_tokens_per_sec', 0.0):.0f} "
+            f"train/step_time_s={host_metrics.get('step_time_s', 0.0):.2f}s "
+            f"train/lr={lr:.2e} "
+            f"train/tflops_per_device={host_metrics.get('tflops_per_device', 0.0):.2f} "
+            f"train/mfu={host_metrics.get('mfu', 0.0) * 100:.1f}% "
+            f"train/tok/s/dev={host_metrics.get('tokens_per_sec_per_device', 0.0):.0f} ",
             flush=True,
         )
 

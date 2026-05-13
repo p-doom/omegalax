@@ -44,9 +44,9 @@ flags.DEFINE_float("max_grad_norm", 1.0, "Max gradient norm for clipping (0 = no
 flags.DEFINE_integer("grad_accum_steps", 1, "Gradient accumulation steps (1 = no accumulation).")
 flags.DEFINE_integer("gc_period", 0, "If >0, disable Python GC and collect every N training steps.")
 flags.DEFINE_integer("seed", 0, "RNG seed.")
-flags.DEFINE_integer("tp_size", None, "Tensor parallelism size.")
-flags.DEFINE_integer("fsdp_size", None, "FSDP parallelism size.")
-flags.DEFINE_integer("dp_size", None, "Data parallelism size.")
+flags.DEFINE_integer("tp_size", 1, "Tensor parallelism size.")
+flags.DEFINE_integer("fsdp_size", 1, "FSDP parallelism size.")
+flags.DEFINE_integer("dp_size", 1, "Data parallelism size.")
 flags.DEFINE_string("save_dir", None, "Checkpoint save directory.")
 flags.DEFINE_string("jax_cache_dir", "/tmp/jax_cache", "Directory for JAX persistent compilation cache.")
 flags.DEFINE_integer("save_every", 50, "Save checkpoint every N steps.")
@@ -92,8 +92,8 @@ def _grain_iter(
     shuffle: bool,
     seed: int,
     num_batches: int,
-    dp_size: int | None = None,
-    fsdp_size: int | None = None,
+    dp_size: int,
+    fsdp_size: int,
 ):
     return make_grain_iterator(
         data_path,

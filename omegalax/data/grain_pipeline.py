@@ -240,11 +240,10 @@ def required_epochs_for_batches(
         return 1
     if batch_size <= 0:
         raise ValueError("batch_size must be > 0")
-    from omegalax.distributed.mesh import data_parallel_size
 
     metadata = load_compiled_metadata(path)
     num_records = int(metadata["num_records"])
-    dp = data_parallel_size(dp_size, fsdp_size)
+    dp = dp_size * fsdp_size
     records_per_epoch = num_records // dp
     if records_per_epoch <= 0:
         raise ValueError(
@@ -442,7 +441,6 @@ def make_grain_iterator(
     fsdp_size: int | None = None,
 ):
     """Create a checkpointable Grain dataloader iterator over a chunk-index dataset."""
-    from omegalax.distributed.mesh import data_parallel_index, data_parallel_size
 
     compiled_path = Path(compiled_path).expanduser().resolve()
     metadata = load_compiled_metadata(compiled_path)
@@ -457,11 +455,11 @@ def make_grain_iterator(
     mp_options = multiprocessing_options or make_grain_multiprocessing_options()
     read_options = read_options or make_grain_read_options()
 
-    dp = data_parallel_size(dp_size, fsdp_size)
-    dp_index = data_parallel_index(dp_size, fsdp_size)
+    dp = dp_size * fsdp_size
+    dp_index = jax.process_index() % dp
     source = grain.sources.ArrayRecordDataSource(shard_paths)
     shard_options = grain.sharding.NoSharding() if dp <= 1 else grain.sharding.ShardOptions(
-        shard_index=dp_index, shard_count=dp, drop_remainder=True,
+        shard_index=dp_index, shard_count=dp , drop_remainder=True,
     )
     sampler = grain.samplers.IndexSampler(
         num_records=len(source),
