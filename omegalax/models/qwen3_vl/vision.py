@@ -155,7 +155,7 @@ class LayerNorm(nnx.Module):
         eps: float = 1e-6,
         *,
         rngs: nnx.Rngs,
-        sharding: tuple[str | None, ...] = ("hidden",),
+        sharding: tuple[str | None, ...] = (None,),
     ):
         self.scale = nnx.Param(jnp.ones(dim, dtype=jnp.float32), sharding=sharding)
         self.bias = nnx.Param(jnp.zeros(dim, dtype=jnp.float32), sharding=sharding)
@@ -178,6 +178,9 @@ class VisionPatchEmbed(nnx.Module):
     def __init__(self, cfg: Qwen3VLVisionConfig, hidden_shd: P, *, rngs: nnx.Rngs):
         in_features = cfg.in_channels * cfg.temporal_patch_size * cfg.patch_size**2
         init = nnx.initializers.lecun_normal()
+        # patch_embed is small (~6 MB) and its backward already needs a
+        # shard_map workaround for the dp-sharded activation; keep the kernel
+        # replicated so that shard_map's `P(None, None)` kernel spec stays valid.
         self.proj = nnx.Linear(
             in_features,
             cfg.hidden_size,
@@ -185,15 +188,34 @@ class VisionPatchEmbed(nnx.Module):
             rngs=rngs,
             dtype=cfg.dtype,
             param_dtype=cfg.param_dtype,
-            kernel_init=wp(init, (None, "hidden")),
+            kernel_init=wp(init, (None, None)),
         )
         self.in_features = in_features
         self.hidden_shd = hidden_shd
 
     def __call__(self, pixels: jax.Array) -> jax.Array:
         flat = pixels.reshape(-1, self.in_features)
-        out_ND = self.proj(flat, out_sharding=self.hidden_shd)
-        return out_ND
+        sharding = jax.typeof(flat).sharding
+        batch_axis = sharding.spec[0]
+        if batch_axis is None:
+            return self.proj(flat, out_sharding=self.hidden_shd)
+
+        # With ``flat`` sharded on the leading axis, the backward pass of the
+        # Linear computes ``dkernel = flat.T @ d_out`` whose contracting dim is
+        # sharded on both operands.  JAX's explicit-mesh mode can't infer the
+        # output sharding for that dot_general.  shard_map keeps the matmul
+        # local to each device and emits the implicit all-reduce on dkernel.
+        kernel = self.proj.kernel[...].astype(self.proj.dtype)
+        bias = self.proj.bias[...].astype(self.proj.dtype)
+        flat = flat.astype(self.proj.dtype)
+        in_spec = P(batch_axis, None)
+        return jax.shard_map(
+            lambda f, k, b: f @ k + b,
+            mesh=sharding.mesh,
+            in_specs=(in_spec, P(None, None), P(None,)),
+            out_specs=in_spec,
+            check_vma=False,
+        )(flat, kernel, bias)
 
 
 class VisionMLP(nnx.Module):
@@ -378,13 +400,17 @@ class VisionModel(nnx.Module):
         self.heads_shd = P(shd_cfg.act_btd[0], shd_cfg.act_btnh[2], None)
         self.patch_embed = VisionPatchEmbed(cfg, hidden_shd=self.hidden_shd, rngs=rngs)
         pos_init = nnx.initializers.normal(stddev=0.02)
+        # Keep pos_embed replicated: _interpolate_pos_embed does 4 indexed
+        # gathers on the feature axis and the result is added to dp-sharded
+        # activations. Sharding the feature axis here would force per-step
+        # alltoalls for ~10 MB of params — not worth it.
         self.pos_embed = nnx.Embed(
             num_embeddings=cfg.num_position_embeddings,
             features=cfg.hidden_size,
             dtype=cfg.dtype,
             param_dtype=cfg.param_dtype,
             rngs=rngs,
-            embedding_init=wp(pos_init, (None, "hidden")),
+            embedding_init=wp(pos_init, (None, None)),
         )
         self.num_grid_per_side = int(cfg.num_position_embeddings**0.5)
         head_dim = cfg.hidden_size // cfg.num_heads

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import contextlib
 import gc
 import json
 from pathlib import Path
@@ -20,11 +19,10 @@ from omegalax.data.grain_pipeline import (
     required_epochs_for_batches,
 )
 from omegalax.distributed.mesh import process_local_batch_size
-from omegalax.trainers import vlm as vlm_trainer
+from omegalax.trainers import vlm_same_batch as vlm_trainer
 from omegalax.registry import resolve_hf_repo_id
 from omegalax.trainers.text import startup_log
 from omegalax.trainers.perf import resolve_peak_tflops
-from omegalax import tokamax_cache
 
 FLAGS = flags.FLAGS
 
@@ -46,20 +44,13 @@ flags.DEFINE_float("max_grad_norm", 1.0, "Max gradient norm for clipping (0 = no
 flags.DEFINE_integer("grad_accum_steps", 1, "Gradient accumulation steps (1 = no accumulation).")
 flags.DEFINE_integer("gc_period", 0, "If >0, disable Python GC and collect every N training steps.")
 flags.DEFINE_integer("seed", 0, "RNG seed.")
-flags.DEFINE_integer("tp_size", 1, "Tensor parallelism size.")
-flags.DEFINE_integer("fsdp_size", 1, "FSDP parallelism size.")
-flags.DEFINE_integer("dp_size", 1, "Data parallelism size.")
+flags.DEFINE_integer("tp_size", None, "Tensor parallelism size.")
+flags.DEFINE_integer("fsdp_size", None, "FSDP parallelism size.")
+flags.DEFINE_integer("dp_size", None, "Data parallelism size.")
 flags.DEFINE_string("save_dir", None, "Checkpoint save directory.")
 flags.DEFINE_string("jax_cache_dir", "/tmp/jax_cache", "Directory for JAX persistent compilation cache.")
-flags.DEFINE_string("tokamax_cache_dir", None,
-                    "Directory for the tokamax persistent autotuning cache. "
-                    "Disabled if empty. One JSON file is written per device kind: "
-                    "<dir>/<device_kind_slug>.json. Loaded as overlay on entry, "
-                    "captures any autotune triggered during training on exit "
-                    "(rank 0 only).")
 flags.DEFINE_integer("save_every", 50, "Save checkpoint every N steps.")
 flags.DEFINE_integer("log_every", 10, "Log metrics every N steps.")
-flags.DEFINE_bool("log_memory", True, "Log per-process JAX/HBM memory at init and first few steps.")
 flags.DEFINE_bool("resume", False, "Resume from latest checkpoint.")
 flags.DEFINE_integer("pad_id", 0, "Padding token id.")
 flags.DEFINE_string("peak_tflops", None, "Peak TFLOPS for MFU calculation.")
@@ -101,8 +92,8 @@ def _grain_iter(
     shuffle: bool,
     seed: int,
     num_batches: int,
-    dp_size: int,
-    fsdp_size: int,
+    dp_size: int | None = None,
+    fsdp_size: int | None = None,
 ):
     return make_grain_iterator(
         data_path,
@@ -180,32 +171,19 @@ def main(_) -> None:
             f"per_process_batch_size={per_process_batch}"
         )
 
-    total_micro_batches = FLAGS.num_steps * FLAGS.grad_accum_steps
     data_iter = _grain_iter(
         FLAGS.data_path,
         collator,
         per_process_batch,
         shuffle=True,
         seed=FLAGS.seed,
-        num_batches=total_micro_batches,
+        num_batches=FLAGS.grad_accum_steps,
         dp_size=FLAGS.dp_size,
         fsdp_size=FLAGS.fsdp_size,
     )
-    startup_log("built train grain DataLoader iterator")
+    startup_log("built train grain DataLoader iterator (same-batch mode: only grad_accum_steps batches will be consumed)")
 
     val_data_iter = None
-    if FLAGS.val_data_path:
-        val_data_iter = _grain_iter(
-            FLAGS.val_data_path,
-            collator,
-            per_process_batch,
-            shuffle=False,
-            seed=FLAGS.seed,
-            num_batches=max(1, (FLAGS.num_steps // max(FLAGS.val_every or FLAGS.num_steps, 1)) * FLAGS.val_steps),
-            dp_size=FLAGS.dp_size,
-            fsdp_size=FLAGS.fsdp_size,
-        )
-        startup_log(f"built val grain DataLoader iterator from {FLAGS.val_data_path!r}")
 
     train_cfg = vlm_trainer.TrainConfig(
         seed=FLAGS.seed,
@@ -241,43 +219,27 @@ def main(_) -> None:
         gc.disable()
         startup_log(f"gc_period={FLAGS.gc_period}: Python GC disabled, will collect every {FLAGS.gc_period} steps")
 
-    if FLAGS.tokamax_cache_dir:
-        device_kind = jax.devices()[0].device_kind
-        slug = device_kind.lower().replace(" ", "_")
-        tokamax_cache_path = Path(FLAGS.tokamax_cache_dir) / f"{slug}.json"
-        tokamax_ctx = tokamax_cache.session_persistent_cache(
-            tokamax_cache_path, write=(jax.process_index() == 0),
-        )
-        startup_log(
-            f"tokamax_cache_path={tokamax_cache_path} "
-            f"write={jax.process_index() == 0}"
-        )
-    else:
-        tokamax_ctx = contextlib.nullcontext()
-
     try:
-        with tokamax_ctx:
-            _, last_metrics = vlm_trainer.run_sft(
-                FLAGS.model_id,
-                train_cfg,
-                data_iter,
-                save_dir=save_dir,
-                save_every=FLAGS.save_every,
-                log_every=FLAGS.log_every,
-                resume=FLAGS.resume,
-                pad_id=FLAGS.pad_id,
-                peak_tflops=peak_tflops,
-                tp_size=FLAGS.tp_size,
-                fsdp_size=FLAGS.fsdp_size,
-                dp_size=FLAGS.dp_size,
-                wandb_run=wandb_run,
-                val_data_iter=val_data_iter,
-                val_every=FLAGS.val_every,
-                val_steps=FLAGS.val_steps,
-                text_attn_backend=FLAGS.text_attn_backend,
-                gc_period=FLAGS.gc_period,
-                log_memory=FLAGS.log_memory,
-            )
+        _, last_metrics = vlm_trainer.run_sft(
+            FLAGS.model_id,
+            train_cfg,
+            data_iter,
+            save_dir=save_dir,
+            save_every=FLAGS.save_every,
+            log_every=FLAGS.log_every,
+            resume=FLAGS.resume,
+            pad_id=FLAGS.pad_id,
+            peak_tflops=peak_tflops,
+            tp_size=FLAGS.tp_size,
+            fsdp_size=FLAGS.fsdp_size,
+            dp_size=FLAGS.dp_size,
+            wandb_run=wandb_run,
+            val_data_iter=val_data_iter,
+            val_every=FLAGS.val_every,
+            val_steps=FLAGS.val_steps,
+            text_attn_backend=FLAGS.text_attn_backend,
+            gc_period=FLAGS.gc_period,
+        )
     finally:
 
         if FLAGS.gc_period:
