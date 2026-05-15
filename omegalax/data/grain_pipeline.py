@@ -397,6 +397,7 @@ def build_chunk_index(
     overwrite: bool = False,
     profile_metadata: dict[str, Any] | None = None,
     num_workers: int = 2,
+    system_message: dict[str, Any] | None = None,
 ) -> Path:
     """Build an offline chunk index over a canonical payload-block dataset.
 
@@ -405,6 +406,12 @@ def build_chunk_index(
     key.  When a dict is returned, extra fields (``vision_tokens``,
     ``num_images``, ``image_grid_thw``) are aggregated into per-chunk
     descriptors and a ``token_stats.json`` summary is written next to the index.
+
+    If ``system_message`` is provided, every emitted chunk has it prepended at
+    iteration time (see :class:`_ChunkDescriptorResolver`). The system message
+    is measured once with ``measure_message`` and its token count is subtracted
+    from the per-chunk budget so ``system_tokens + chunk_content_tokens``
+    stays within ``max_length``.
     """
 
     if max_length <= 0:
@@ -415,6 +422,19 @@ def build_chunk_index(
     payload_metadata = load_compiled_metadata(payload_path)
     if "payload_path" in payload_metadata:
         raise ValueError(f"Chunk indices can only be built from payload datasets, got chunk index: {payload_path}")
+
+    system_message_length = 0
+    if system_message is not None:
+        system_result = measure_message(system_message)
+        system_message_length = (
+            system_result["length"] if isinstance(system_result, dict) else int(system_result)
+        )
+        if system_message_length >= max_length:
+            raise ValueError(
+                f"system_message ({system_message_length} tokens) leaves no room "
+                f"for content under max_length={max_length}"
+            )
+    effective_max = max_length - system_message_length
 
     precomputed_lengths = _precompute_message_lengths(
         payload_path, measure_message, num_workers
@@ -431,14 +451,15 @@ def build_chunk_index(
         for msg_offset in range(len(block["messages"])):
             result = precomputed_lengths[(record_idx, msg_offset)]
             msg_length = result["length"] if isinstance(result, dict) else int(result)
-            if msg_length > max_length:
+            if msg_length > effective_max:
                 session_truncate_at[block_session_id] = (record_idx, msg_offset)
                 break
     if session_truncate_at:
         print(
             f"[chunk_index] prefix-truncating {len(session_truncate_at)} session(s) "
-            f"at the first message exceeding max_length={max_length} "
-            f"(valid prefix turns are preserved as chunks): "
+            f"at the first message exceeding effective_max={effective_max} "
+            f"(max_length={max_length}, system_tokens={system_message_length}; "
+            f"valid prefix turns are preserved as chunks): "
             f"{sorted(session_truncate_at.keys())[:5]}"
             + (" ..." if len(session_truncate_at) > 5 else ""),
             flush=True,
@@ -547,16 +568,17 @@ def build_chunk_index(
                     msg_vision_patches = 0
                     msg_num_images = 0
 
-                assert msg_length <= max_length, (
+                assert msg_length <= effective_max, (
                     f"prefix-truncation pre-scan missed session={block_session_id} "
                     f"record={record_idx} offset={msg_offset} "
-                    f"(msg_length={msg_length} > max_length={max_length})"
+                    f"(msg_length={msg_length} > effective_max={effective_max}, "
+                    f"max_length={max_length}, system_tokens={system_message_length})"
                 )
 
                 if not current_messages:
                     start_record_idx = record_idx
                     start_message_offset = msg_offset
-                elif current_length + msg_length > max_length:
+                elif current_length + msg_length > effective_max:
                     descriptor = emit_current()
                     if descriptor is not None:
                         yield descriptor
@@ -590,6 +612,8 @@ def build_chunk_index(
             "payload_num_records": int(payload_metadata["num_records"]),
             "max_length": max_length,
             "profile_metadata": profile_metadata or {},
+            "system_message": system_message,
+            "system_message_length": system_message_length,
         },
     )
 
@@ -615,9 +639,15 @@ class _JsonLoadsMap(grain.transforms.Map):
 
 
 class _ChunkDescriptorResolver(grain.transforms.Map):
-    def __init__(self, payload_path: str | Path) -> None:
+    def __init__(
+        self,
+        payload_path: str | Path,
+        *,
+        system_message: dict[str, Any] | None = None,
+    ) -> None:
         self._payload_shards = [str(path) for path in resolve_arrayrecord_paths(payload_path)]
         self._payload_source = None
+        self._system_message = system_message
 
     def _source(self):
         if self._payload_source is None:
@@ -641,6 +671,9 @@ class _ChunkDescriptorResolver(grain.transforms.Map):
             lo = start_message_offset if record_idx == start_record_idx else 0
             hi = end_message_offset if record_idx == end_record_idx else len(block["messages"])
             messages.extend(block["messages"][lo:hi])
+
+        if self._system_message is not None:
+            messages = [self._system_message, *messages]
 
         example = dict(session_meta)
         example["messages"] = messages
@@ -817,6 +850,7 @@ def make_grain_iterator(
         m = metadatas[active_idx]
         shard_paths = [str(p) for p in resolve_arrayrecord_paths(s.path)]
         payload_path = str(m["payload_path"])
+        system_message = m.get("system_message")
         ds = grain.MapDataset.source(grain.sources.ArrayRecordDataSource(shard_paths))
         if dp > 1:
             # Contiguous-block DP shards with drop_remainder, matching the
@@ -827,7 +861,7 @@ def make_grain_iterator(
             ds = ds.shuffle(seed=seed + original_idx)
         ds = ds.repeat(num_epochs)
         ds = ds.map(_JsonLoadsMap())
-        ds = ds.map(_ChunkDescriptorResolver(payload_path))
+        ds = ds.map(_ChunkDescriptorResolver(payload_path, system_message=system_message))
         # Tag with the user-facing source id (position in the original list),
         # not the active-only index, so metric labels are stable across
         # ablations that zero out individual sources.
