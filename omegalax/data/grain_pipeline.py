@@ -263,16 +263,16 @@ def required_epochs_for_batches(
     batch_size: int,
     num_batches: int,
     dp_size: int | None = None,
+    fsdp_size: int | None = None,
 ) -> int:
     if num_batches <= 0:
         return 1
     if batch_size <= 0:
         raise ValueError("batch_size must be > 0")
-    from omegalax.distributed.mesh import data_parallel_size
 
     metadata = load_compiled_metadata(path)
     num_records = int(metadata["num_records"])
-    dp = data_parallel_size(dp_size)
+    dp = (dp_size or 1) * (fsdp_size or 1)
     records_per_epoch = num_records // dp
     if records_per_epoch <= 0:
         raise ValueError(
@@ -798,6 +798,7 @@ def make_grain_iterator(
     read_options: grain.ReadOptions | None = None,
     multiprocessing_options: grain.MultiprocessingOptions | None = None,
     dp_size: int | None = None,
+    fsdp_size: int | None = None,
 ):
     """Create a checkpointable Grain iterator over one or more chunk-index datasets.
 
@@ -807,8 +808,6 @@ def make_grain_iterator(
     round-robin. ``num_epochs=None`` repeats each source indefinitely; set a
     finite value (per source) only for validation-style finite iteration.
     """
-    from omegalax.distributed.mesh import data_parallel_index, data_parallel_size
-
     if batch_size <= 0:
         raise ValueError("batch_size must be > 0")
 
@@ -839,8 +838,8 @@ def make_grain_iterator(
 
     mp_options = multiprocessing_options or make_grain_multiprocessing_options()
     read_options = read_options or make_grain_read_options()
-    dp = data_parallel_size(dp_size)
-    dp_index = data_parallel_index(dp_size)
+    dp = (dp_size or 1) * (fsdp_size or 1)
+    dp_index = jax.process_index() % dp
 
     per_source: list[grain.MapDataset] = []
     for active_idx, original_idx in enumerate(active_indices):

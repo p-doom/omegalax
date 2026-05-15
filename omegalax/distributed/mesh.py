@@ -32,21 +32,8 @@ def required_batch_multiple(batch_spec: PartitionSpec, mesh: Mesh) -> int:
     return int(mesh.shape[axis])
 
 
-def data_parallel_size(dp_size: int | None = None) -> int:
-    """Return the number of data-parallel shards."""
-    if dp_size is not None:
-        return dp_size
-    return jax.process_count()
-
-
-def data_parallel_index(dp_size: int | None = None) -> int:
-    """Return this process's index along the data-parallel axis."""
-    dp = data_parallel_size(dp_size)
-    return jax.process_index() % dp
-
-
-def process_local_batch_size(global_batch_size: int, dp_size: int | None = None) -> int:
-    dp = data_parallel_size(dp_size)
+def process_local_batch_size(global_batch_size: int, dp_size: int, fsdp_size: int) -> int:
+    dp = dp_size * fsdp_size
     if global_batch_size <= 0:
         raise ValueError(f"Global batch size must be > 0, got {global_batch_size}.")
     if global_batch_size % dp != 0:

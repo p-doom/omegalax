@@ -64,11 +64,15 @@ class TrainingFlopsPerTokenTest(absltest.TestCase):
         flops = qwen3_vl_vision_training_flops(cfg, [[1, 4, 4]])
         self.assertGreater(flops, 0)
 
-    def test_qwen3_vl_vision_training_flops_uses_full_batched_attention(self):
+    def test_qwen3_vl_vision_training_flops_block_diagonal_attention(self):
+        # Block-diagonal attention is linear in num_images for equal-sized
+        # images: two same-shape images cost exactly 2x one image (everything
+        # in the vision tower scales linearly in token count once attention
+        # is block-diagonal). Pre-fix this was super-linear.
         cfg = make_qwen3_vl_config("qwen3-vl-smoke")
         single = qwen3_vl_vision_training_flops(cfg, [[1, 4, 4]])
         doubled = qwen3_vl_vision_training_flops(cfg, [[1, 4, 4], [1, 4, 4]])
-        self.assertGreater(doubled, 2 * single)
+        self.assertEqual(doubled, 2 * single)
 
 
 class PerDeviceFlopsStepTest(absltest.TestCase):

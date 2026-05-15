@@ -27,6 +27,7 @@ class Qwen3VLVisionConfig:
     num_position_embeddings: int
     deepstack_visual_indexes: tuple[int, ...]
     dtype: Any = jnp.bfloat16
+    param_dtype: Any = jnp.bfloat16
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -55,6 +56,7 @@ class Qwen3VLConfig:
     norm_topk_prob: bool = True
     shd_cfg: ShardConfig = dataclasses.field(default_factory=ShardConfig.default)
     dtype: Any = jnp.bfloat16
+    param_dtype: Any = jnp.float32
 
     def is_moe_layer(self, layer_idx: int) -> bool:
         return (
