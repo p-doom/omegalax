@@ -326,7 +326,7 @@ class VisionBlock(nnx.Module):
         self.mlp = VisionMLP(cfg, hidden_shd=hidden_shd, ff_shd=ff_shd, rngs=rngs)
         self.hidden_shd = hidden_shd
 
-    @partial(jax.remat, static_argnums=0)
+    @partial(nnx.remat, policy=jax.checkpoint_policies.nothing_saveable)
     def __call__(self, hidden_ND: jax.Array, cu_seqlens: jax.Array, seqlens: jax.Array, cos_NK: jax.Array, sin_NK: jax.Array) -> jax.Array:
         hidden_ND = hidden_ND + self.attn(self.norm1(hidden_ND), cu_seqlens, seqlens, cos_NK, sin_NK)
         hidden_ND = hidden_ND + self.mlp(self.norm2(hidden_ND))
