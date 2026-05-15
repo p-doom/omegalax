@@ -341,6 +341,115 @@ class GrainPipelineTest(absltest.TestCase):
             self.assertNotEqual(process0_seed0 + process1_seed0, [str(i) for i in range(8)])
             self.assertNotEqual(process0_seed0 + process1_seed0, process0_seed1 + process1_seed1)
 
+    def test_build_chunk_index_with_system_message_prepends_to_every_chunk(self):
+        # Verifies via the chunk-descriptor resolver directly rather than
+        # through make_grain_iterator — the iterator path has unrelated
+        # breakage that an upstream test (test_build_chunk_index_splits_
+        # across_payload_blocks) also hits.
+        from omegalax.data.grain_pipeline import (
+            _ChunkDescriptorResolver,
+            load_compiled_metadata,
+            resolve_arrayrecord_paths,
+        )
+        import grain
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src = Path(tmpdir) / "train.jsonl"
+            self._write_jsonl(
+                src,
+                [
+                    {
+                        "messages": [
+                            {"role": "user", "content": "10"},
+                            {"role": "assistant", "content": "11"},
+                            {"role": "user", "content": "12"},
+                            {"role": "assistant", "content": "13"},
+                            {"role": "user", "content": "14"},
+                            {"role": "assistant", "content": "15"},
+                        ],
+                    },
+                ],
+            )
+            payload = compile_jsonl_to_arrayrecord(
+                src,
+                Path(tmpdir) / "payload",
+                messages_per_record=2,
+                records_per_shard=8,
+            )
+            system_message = {"role": "system", "content": "SYS"}
+            chunked = build_chunk_index(
+                payload,
+                Path(tmpdir) / "chunked",
+                max_length=3,
+                measure_message=lambda message: 1,
+                records_per_shard=8,
+                system_message=system_message,
+            )
+
+            # Persisted in chunk-index metadata so the iterator rebuilds the
+            # same chunks across runs without re-passing the prompt at iter time.
+            metadata = load_compiled_metadata(chunked)
+            self.assertEqual(metadata["system_message"], system_message)
+            self.assertEqual(metadata["system_message_length"], 1)
+
+            # Read the chunk descriptors directly off-disk and resolve each
+            # through the resolver; this is the same code path the iterator
+            # uses, just without the grain pipeline plumbing.
+            chunked_source = grain.sources.ArrayRecordDataSource(
+                [str(p) for p in resolve_arrayrecord_paths(chunked)]
+            )
+            descriptors = [json.loads(chunked_source[i]) for i in range(len(chunked_source))]
+
+            # Effective content budget = max_length - sys_len = 3 - 1 = 2;
+            # 6 content messages of length 1 split [2, 2, 2] across chunks.
+            self.assertEqual([d["measured_length"] for d in descriptors], [2, 2, 2])
+
+            resolver = _ChunkDescriptorResolver(
+                str(metadata["payload_path"]), system_message=system_message
+            )
+            examples = [resolver.map(d) for d in descriptors]
+            self.assertEqual([len(e["messages"]) for e in examples], [3, 3, 3])
+            for example in examples:
+                self.assertEqual(example["messages"][0], system_message)
+            self.assertEqual(
+                [e["messages"][1]["content"] for e in examples],
+                ["10", "12", "14"],
+            )
+
+            # And verify that without a system_message the resolver does not
+            # prepend anything (sources without system_message in metadata
+            # share the same code path during mixing).
+            no_sys_resolver = _ChunkDescriptorResolver(
+                str(metadata["payload_path"]), system_message=None
+            )
+            no_sys_examples = [no_sys_resolver.map(d) for d in descriptors]
+            self.assertEqual([len(e["messages"]) for e in no_sys_examples], [2, 2, 2])
+            for example in no_sys_examples:
+                self.assertNotEqual(example["messages"][0]["role"], "system")
+
+    def test_build_chunk_index_rejects_oversized_system_message(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src = Path(tmpdir) / "train.jsonl"
+            self._write_jsonl(
+                src,
+                [{"messages": [{"role": "user", "content": "a"}]}],
+            )
+            payload = compile_jsonl_to_arrayrecord(
+                src,
+                Path(tmpdir) / "payload",
+                messages_per_record=1,
+                records_per_shard=1,
+            )
+            with self.assertRaisesRegex(ValueError, "no room for content"):
+                build_chunk_index(
+                    payload,
+                    Path(tmpdir) / "chunked",
+                    max_length=2,
+                    measure_message=lambda message: 2,
+                    records_per_shard=1,
+                    system_message={"role": "system", "content": "SYS"},
+                )
+
     def test_resolve_arrayrecord_paths_rejects_raw_jsonl_files(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             src = Path(tmpdir) / "train.jsonl"
