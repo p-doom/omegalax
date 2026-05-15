@@ -376,7 +376,6 @@ class TextDecoderLayer(nnx.Module):
         self.is_moe = cfg.is_moe_layer(layer_idx)
         self.mlp = TextMoEFeedForward(cfg, rngs=rngs) if self.is_moe else TextMLP(cfg, rngs=rngs)
 
-    @partial(nnx.remat, policy=jax.checkpoint_policies.nothing_saveable)
     def __call__(self, hidden_BTD: jax.Array, sin_BTK: jax.Array, cos_BTK: jax.Array) -> tuple[jax.Array, jax.Array]:
         hidden_BTD = hidden_BTD + self.attn(self.input_layernorm(hidden_BTD), sin_BTK, cos_BTK)
         if self.is_moe:
@@ -494,10 +493,21 @@ class Qwen3VL(nnx.Module):
 
         sin_BTK, cos_BTK = compute_mrope_pos_embeddings(position_ids_ZBT, cfg.head_dim, cfg.rope_theta, cfg.mrope_section)
 
+        # Pure jax.remat with explicit nnx.split/merge -- see VisionModel.__call__
+        # for rationale. The @nnx.remat decorator form on TextDecoderLayer.__call__
+        # is a silent no-op (state captured via Python closure on ``layer`` is
+        # not traced through the remat boundary), so the activation stack across
+        # all 28 layers stays live during backward and exceeds the H100's 80 GiB
+        # at 32k seqlen. Passing state as a JAX-traced arg makes the barrier real.
         hidden_BTD = inputs_embeds_BTD
         aux_losses = []
         for layer_idx, layer in enumerate(self.text.layers):
-            hidden_BTD, aux_loss = layer(hidden_BTD, sin_BTK, cos_BTK)
+            gd, state = nnx.split(layer)
+            def _fwd(state, hidden, _gd=gd, _sin=sin_BTK, _cos=cos_BTK):
+                return nnx.merge(_gd, state)(hidden, _sin, _cos)
+            hidden_BTD, aux_loss = jax.remat(
+                _fwd, policy=jax.checkpoint_policies.nothing_saveable
+            )(state, hidden_BTD)
             aux_losses.append(aux_loss)
             if deepstack_features is not None and layer_idx < len(deepstack_features):
                 hidden_BTD = _deepstack_process(hidden_BTD, visual_pos_mask_BT, deepstack_features[layer_idx], out_sharding=self.text.out_emb_shd)

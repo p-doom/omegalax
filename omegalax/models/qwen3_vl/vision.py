@@ -326,7 +326,6 @@ class VisionBlock(nnx.Module):
         self.mlp = VisionMLP(cfg, hidden_shd=hidden_shd, ff_shd=ff_shd, rngs=rngs)
         self.hidden_shd = hidden_shd
 
-    @partial(nnx.remat, policy=jax.checkpoint_policies.nothing_saveable)
     def __call__(self, hidden_ND: jax.Array, cu_seqlens: jax.Array, seqlens: jax.Array, cos_NK: jax.Array, sin_NK: jax.Array) -> jax.Array:
         hidden_ND = hidden_ND + self.attn(self.norm1(hidden_ND), cu_seqlens, seqlens, cos_NK, sin_NK)
         hidden_ND = hidden_ND + self.mlp(self.norm2(hidden_ND))
@@ -519,12 +518,27 @@ class VisionModel(nnx.Module):
 
         cu_seqlens = vision_cu_seqlens.astype(jnp.int32)
 
+        # Pure jax.remat with explicit nnx.split/merge: passing the block's
+        # state as a JAX-traced argument (rather than via Python closure on
+        # ``blk``) is what makes the checkpoint barrier real.  An @nnx.remat
+        # decorator on VisionBlock.__call__ would treat ``self`` as a static
+        # Python object and the barrier would have no JAX-array inputs to
+        # checkpoint -- effectively a no-op.  With nothing_saveable, every
+        # intermediate is rematerialized in backward, so peak activation
+        # memory is just one layer's worth + the layer-boundary residual.
         deepstack_features: list[jax.Array] = []
+        deepstack_idx_set = set(self.deepstack_visual_indexes)
+        ds_merger_idx = 0
         for layer_num, blk in enumerate(self.blocks):
-            hidden_ND = blk(hidden_ND, cu_seqlens, seqlens_M, cos_NK, sin_NK)
-            if layer_num in self.deepstack_visual_indexes:
-                idx = list(self.deepstack_visual_indexes).index(layer_num)
-                deepstack_features.append(self.deepstack_mergers[idx](hidden_ND))
+            gd, state = nnx.split(blk)
+            def _fwd(state, hidden, _gd=gd, _cu=cu_seqlens, _sq=seqlens_M, _cos=cos_NK, _sin=sin_NK):
+                return nnx.merge(_gd, state)(hidden, _cu, _sq, _cos, _sin)
+            hidden_ND = jax.remat(
+                _fwd, policy=jax.checkpoint_policies.nothing_saveable
+            )(state, hidden_ND)
+            if layer_num in deepstack_idx_set:
+                deepstack_features.append(self.deepstack_mergers[ds_merger_idx](hidden_ND))
+                ds_merger_idx += 1
 
         merged_ND = self.merger(hidden_ND)
         return merged_ND, deepstack_features
