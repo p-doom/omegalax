@@ -81,11 +81,24 @@ def _cudnn_packed_vision_attention(
         (N, num_heads, head_dim)
     """
     sharding = jax.typeof(q_NHK).sharding
-    dp_axis = sharding.spec[0]
+    # When the vision encoder runs replicated (sharding.spec == P()), len(spec)
+    # is 0; treat that as dp_axis=None and take the replicated path.
+    dp_axis = sharding.spec[0] if len(sharding.spec) > 0 else None
     if dp_axis is None:
-        return _cudnn_packed_vision_attention_local(
-            q_NHK, k_NHK, v_NHK, cu_seqlens, seqlens, scale,
-        )
+        # Replicated path (vision encoder runs on AllGathered inputs under FSDP).
+        # The JVP of cuDNN's custom_call uses CustomSPMDPartitioning, which
+        # generates a sharding rule with a product factor of size 1 (batch=1 ×
+        # n_images) that the outer MLIR verifier rejects.  shard_map with all-
+        # P() specs creates a local execution scope that bypasses GSPMD's
+        # sharding-rule validation, the same way the dp-sharded path below
+        # bypasses it.
+        return jax.shard_map(
+            lambda q, k, v, cu, sq: _cudnn_packed_vision_attention_local(q, k, v, cu, sq, scale),
+            mesh=sharding.mesh,
+            in_specs=(P(), P(), P(), P(), P()),
+            out_specs=P(),
+            check_vma=False,
+        )(q_NHK, k_NHK, v_NHK, cu_seqlens, seqlens)
 
     q_spec = P(dp_axis, None, None)
     cu_spec = P(dp_axis)
@@ -284,11 +297,11 @@ class VisionAttention(nnx.Module):
 
     def __call__(self, hidden_ND: jax.Array, cu_seqlens: jax.Array, seqlens: jax.Array, cos_NK: jax.Array, sin_NK: jax.Array) -> jax.Array:
         N = hidden_ND.shape[0]
-        qkv_shd = P(self.hidden_shd[0], None, self.heads_shd[1], self.heads_shd[2])
+        # All vision shardings are P() (replicated) -- see VisionModel.__init__.
         qkv = jax.lax.reshape(
             self.qkv(hidden_ND, out_sharding=self.hidden_shd),
             (N, 3, self.num_heads, self.head_dim),
-            out_sharding=qkv_shd,
+            out_sharding=self.heads_shd,
         )
         q_NHK = reshard(qkv[:, 0], self.heads_shd)
         k_NHK = reshard(qkv[:, 1], self.heads_shd)
@@ -373,9 +386,21 @@ class VisionModel(nnx.Module):
     def __init__(self, cfg: Qwen3VLVisionConfig, shd_cfg: ShardConfig, *, rngs: nnx.Rngs):
         self.cfg = cfg
         self.spatial_merge_size = cfg.spatial_merge_size
-        self.hidden_shd = P(shd_cfg.act_btd[0], shd_cfg.act_btd[2])
-        self.ff_shd = P(shd_cfg.act_btd[0], shd_cfg.act_btf[2])
-        self.heads_shd = P(shd_cfg.act_btd[0], shd_cfg.act_btnh[2], None)
+        # Every vision Linear's backward has both contracting dims sharded with
+        # "fsdp" (the N=batch*patches axis from both the input activation and
+        # the gradient).  In JAX's explicit-sharding mode this is ambiguous --
+        # JAX can't decide whether to AllReduce, ReduceScatter-onto-D, or
+        # ReduceScatter-onto-K -- and errors with ShardingTypeError.  The codebase
+        # uses shard_map as the escape hatch for "GSPMD-incompatible regions"
+        # (see _cudnn_packed_vision_attention).  We follow the same pattern at a
+        # coarser scope: AllGather the vision inputs at VisionModel entry so the
+        # entire vision encoder operates on replicated activations.  All internal
+        # vision shardings become P(); FSDP semantics are preserved at the
+        # vision/text boundary, where image_features_ND is scattered back into
+        # the FSDP-sharded text embedding tensor.
+        self.hidden_shd = P()
+        self.ff_shd = P()
+        self.heads_shd = P()
         self.patch_embed = VisionPatchEmbed(cfg, hidden_shd=self.hidden_shd, rngs=rngs)
         pos_init = nnx.initializers.normal(stddev=0.02)
         self.pos_embed = nnx.Embed(
@@ -469,21 +494,24 @@ class VisionModel(nnx.Module):
         # bookkeeping on one sharding and leaves pixel_values/hidden_ND
         # dp-sharded for the actual vision compute.
         image_grid = reshard(image_grid, P())
-        # Per-frame seqlens derived from the replicated grid.  Assumes t=1
-        # (single-frame images); for video inputs this needs per-frame
-        # expansion.  Reshard to dp so each device's cuDNN call sees its own
-        # local (M,) seqlens matching its local pixel patches.
+        # AllGather pixel_values and vision_cu_seqlens to replicated so the
+        # entire vision encoder runs on replicated activations.  See
+        # VisionModel.__init__ for why we replicate (escape from FSDP-only-
+        # contracting-dims matmul ambiguity).  This is a manual shard_map at
+        # the boundary: AllGather here, ReduceScatter implicitly at the
+        # vision/text boundary (model.py's scatter into FSDP-sharded text
+        # embeddings).
+        pixel_values = reshard(pixel_values, P())
+        vision_cu_seqlens = reshard(vision_cu_seqlens, P())
         seqlens_M = image_grid[:, 0] * image_grid[:, 1] * image_grid[:, 2]
-        seqlens_M = reshard(seqlens_M.astype(jnp.int32), P(self.hidden_shd[0]))
+        seqlens_M = seqlens_M.astype(jnp.int32)
         hidden_ND = self.patch_embed(pixel_values)
         total_tokens: int = hidden_ND.shape[0]
 
         pos_embeds_ND = self._interpolate_pos_embed(image_grid, total_tokens)
-        pos_embeds_ND = reshard(pos_embeds_ND, self.hidden_shd)
         hidden_ND = hidden_ND + pos_embeds_ND
 
         rotary_emb_NK = self._compute_rotary_pos_emb(image_grid, total_tokens)
-        rotary_emb_NK = reshard(rotary_emb_NK, P(self.hidden_shd[0], None))
         emb_NK = jnp.concatenate([rotary_emb_NK, rotary_emb_NK], axis=-1)
         cos_NK, sin_NK = jnp.cos(emb_NK), jnp.sin(emb_NK)
         cos_NK = cos_NK.astype(self.cfg.dtype)
