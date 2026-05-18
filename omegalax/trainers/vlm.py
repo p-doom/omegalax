@@ -5,6 +5,9 @@ from __future__ import annotations
 import dataclasses
 import datetime
 import gc
+import os
+import signal
+import subprocess
 from pathlib import Path
 from flax import nnx
 import jax
@@ -315,6 +318,16 @@ def run_sft(
 
     latest_step = checkpoint_manager.latest_step() if checkpoint_manager is not None else None
 
+    if (
+        latest_step is not None
+        and latest_step >= train_cfg.num_steps
+        and resume in (checkpoint_utils.ResumeMode.IF_PRESENT, checkpoint_utils.ResumeMode.REQUIRED)
+    ):
+        startup_log(f"latest_step={latest_step} >= num_steps={train_cfg.num_steps}; exiting")
+        if checkpoint_manager is not None:
+            checkpoint_manager.close()
+        return None, None
+
     if resume == checkpoint_utils.ResumeMode.REQUIRED and latest_step is None:
         raise ValueError(
             f"resume='required' but no checkpoint found at "
@@ -461,6 +474,18 @@ def run_sft(
         if result is not None:
             last_metrics = result
 
+    # Flag-only handler: doing an orbax save or JAX collective from inside
+    # the signal handler deadlocks (handlers run on arbitrary threads and
+    # re-enter the runtime). The flag is read at a safe per-step point.
+    requeue_requested = False
+    def _request_requeue(signum, _frame):
+        nonlocal requeue_requested
+        if not requeue_requested:
+            startup_log(f"[signal] received {signum}; will requeue after current step")
+        requeue_requested = True
+    signal.signal(signal.SIGUSR1, _request_requeue)
+    signal.signal(signal.SIGTERM, _request_requeue)
+
     startup_log("entering training loop")
     for step_idx in range(start_step, train_cfg.num_steps):
         step = step_idx + 1
@@ -532,6 +557,18 @@ def run_sft(
                     {"val/loss": avg_val_loss, "val/sup_tokens": total_val_sup_tokens},
                     step=step,
                 )
+
+        if requeue_requested:
+            startup_log(f"[signal] saving checkpoint at step={step} and requeueing")
+            if checkpoint_manager is not None:
+                _save_sft_checkpoint(checkpoint_manager, optimizer, rng, step, data_iter)
+                checkpoint_manager.wait_until_finished()
+                checkpoint_manager.close()
+            slurm_job_id = os.environ.get("SLURM_JOB_ID")
+            if slurm_job_id and is_primary_process:
+                startup_log(f"[signal] scontrol requeue {slurm_job_id}")
+                subprocess.run(["scontrol", "requeue", slurm_job_id], check=False)
+            return optimizer, last_metrics
 
     _log_prev_metrics(force=True)
 
