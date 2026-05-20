@@ -410,16 +410,25 @@ class Qwen3VL(nnx.Module):
         self.logits_shd = P(cfg.shd_cfg.act_btd[0], None, None)
         self.vision = VisionModel(cfg.vision, shd_cfg=cfg.shd_cfg, rngs=rngs)
         self.text = TextModel(cfg, rngs=rngs)
-        lm_head_init = nnx.initializers.lecun_normal()
-        self.lm_head = nnx.Linear(
-            cfg.emb_dim,
-            cfg.vocab_size,
-            use_bias=False,
-            rngs=rngs,
-            dtype=cfg.dtype,
-            param_dtype=cfg.param_dtype,
-            kernel_init=wp(lm_head_init, ("embed", "vocab")),
-        )
+        if cfg.tie_word_embeddings:
+            self.lm_head = None
+        else:
+            lm_head_init = nnx.initializers.lecun_normal()
+            self.lm_head = nnx.Linear(
+                cfg.emb_dim,
+                cfg.vocab_size,
+                use_bias=False,
+                rngs=rngs,
+                dtype=cfg.dtype,
+                param_dtype=cfg.param_dtype,
+                kernel_init=wp(lm_head_init, ("embed", "vocab")),
+            )
+
+    def output_weight(self) -> jax.Array:
+        """Weight matrix used as the LM output projection: (emb_dim, vocab)."""
+        if self.lm_head is not None:
+            return self.lm_head.kernel[...]
+        return self.text.embedder.embedding[...].T
 
     def __call__(
         self,
@@ -440,16 +449,9 @@ class Qwen3VL(nnx.Module):
                 raise ValueError("vision_cu_seqlens is required when passing image_grid_thw to Qwen3VL")
             image_features_ND, deepstack_features = self.vision(pixel_values, image_grid_thw, vision_cu_seqlens)
 
-        # Gather the embedder to replicated before indexed lookup. With the embedder
-        # sharded (None, "fsdp") and the desired output ("fsdp", None, None), the
-        # at[...].get(out_sharding=...) lowers to alltoall to redistribute the D
-        # shard. Allgathering V*D=311MB (bf16) once is cheap and produces a local
-        # gather instead.
-        embedding_VD = reshard(self.text.embedder.embedding[...], P())
-        inputs_embeds_BTD = jnp.astype(
-            embedding_VD.at[(token_ids_BT,)].get(out_sharding=self.text.out_emb_shd),
-            self.text.embedder.dtype,
-        )
+        embedding_VD = jnp.astype(self.text.embedder.embedding[...], self.text.embedder.dtype)
+        embedding_VD = reshard(embedding_VD, P())
+        inputs_embeds_BTD = embedding_VD.at[(token_ids_BT,)].get(out_sharding=self.text.out_emb_shd)
 
         if image_features_ND is not None:
             image_mask_BT = token_ids_BT == cfg.image_token_id

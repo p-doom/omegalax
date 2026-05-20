@@ -177,7 +177,7 @@ def make_sft_train_step(cfg, pad_id: int = 0):
                 vision_cu_seqlens=vision_cu_seqlens,
                 position_ids_ZBT=position_ids_ZBT,
             )
-            lm_weight = model.lm_head.kernel[...]
+            lm_weight = model.output_weight()
             loss = chunked_cross_entropy_loss(
                 hidden_BTD, lm_weight, token_ids_BT, loss_mask_BT,
                 num_tiles=_NUM_LOSS_TILES,
@@ -222,7 +222,7 @@ def make_sft_eval_step(cfg, pad_id: int = 0):
             vision_cu_seqlens=vision_cu_seqlens,
             position_ids_ZBT=position_ids_ZBT,
         )
-        lm_weight = model.lm_head.kernel[...]
+        lm_weight = model.output_weight()
         loss = chunked_cross_entropy_loss(
             hidden_BTD, lm_weight, token_ids_BT, loss_mask_BT,
             num_tiles=_NUM_LOSS_TILES,
