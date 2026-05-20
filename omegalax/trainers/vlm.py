@@ -76,6 +76,7 @@ def build_optimizer(
     model: nnx.Module,
     lr_schedule_fn: optax.Schedule | float,
     train_cfg: TrainConfig,
+    model_cfg: vlm_api.VLMConfig,
     *,
     wrt=nnx.Param,
 ) -> MixedPrecisionOptimizer:
@@ -83,7 +84,7 @@ def build_optimizer(
     if train_cfg.max_grad_norm > 0:
         chain.append(optax.clip_by_global_norm(train_cfg.max_grad_norm))
     wd = 0.0 if wrt is LoRAParam else train_cfg.weight_decay
-    chain.append(optax.adamw(lr_schedule_fn, weight_decay=wd))
+    chain.append(optax.adamw(lr_schedule_fn, weight_decay=wd, mu_dtype=model_cfg.dtype))
     tx = optax.chain(*chain)
     if train_cfg.grad_accum_steps > 1:
         tx = optax.MultiSteps(tx, every_k_schedule=train_cfg.grad_accum_steps)
@@ -117,6 +118,7 @@ def _make_checkpoint_manager(save_dir: Path, save_interval: int | None) -> ocp.C
     checkpoint_utils.register_grain_iterator_handler(handler_registry)
     options = ocp.CheckpointManagerOptions(
         save_interval_steps=save_interval,
+        max_to_keep=2,
         step_format_fixed_length=6,
         cleanup_tmp_directories=True,
     )
@@ -209,7 +211,7 @@ def make_sft_train_step(cfg, pad_id: int = 0, *, wrt=nnx.Param):
                 vision_cu_seqlens=vision_cu_seqlens,
                 position_ids_ZBT=position_ids_ZBT,
             )
-            lm_weight = model.lm_head.kernel[...]
+            lm_weight = model.output_weight()
             loss = chunked_cross_entropy_loss(
                 hidden_BTD, lm_weight, token_ids_BT, loss_mask_BT,
                 num_tiles=_NUM_LOSS_TILES,
@@ -256,7 +258,7 @@ def make_sft_eval_step(cfg, pad_id: int = 0):
             vision_cu_seqlens=vision_cu_seqlens,
             position_ids_ZBT=position_ids_ZBT,
         )
-        lm_weight = model.lm_head.kernel[...]
+        lm_weight = model.output_weight()
         loss = chunked_cross_entropy_loss(
             hidden_BTD, lm_weight, token_ids_BT, loss_mask_BT,
             num_tiles=_NUM_LOSS_TILES,
@@ -383,6 +385,11 @@ def run_sft(
             dp_size=dp_size,
         )
         startup_log("initialized model (random init)")
+    if wandb_run is not None and is_primary_process:
+        wandb_run.config.update(
+            {"model_cfg": export_lib.model_config_to_hf_dict(model_cfg)},
+            allow_val_change=True,
+        )
     from omegalax.models.sharding_runtime import set_attn_backend
     set_attn_backend(model, text_backend=text_attn_backend)
     startup_log(f"set attn backend: text={text_attn_backend}")
@@ -402,7 +409,7 @@ def run_sft(
     else:
         wrt_filter = nnx.Param
     with mesh_rules(mesh):
-        optimizer = build_optimizer(model, lr_schedule_fn, train_cfg, wrt=wrt_filter)
+        optimizer = build_optimizer(model, lr_schedule_fn, train_cfg, model_cfg, wrt=wrt_filter)
 
     startup_log("built optimizer")
     sft_step = make_sft_train_step(model_cfg, pad_id=pad_id, wrt=wrt_filter)

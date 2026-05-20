@@ -6,6 +6,7 @@ import gc
 import re
 from typing import Any
 
+import jax
 import jax.numpy as jnp
 import safetensors
 from etils import epath
@@ -13,8 +14,9 @@ from flax import nnx
 
 import dataclasses
 
-from omegalax.distributed.mesh import ensure_mesh, mesh_rules
+from omegalax.distributed.mesh import axis_rules_for_mesh, ensure_mesh
 from omegalax.models.shard_config import shard_config_for_mesh
+from omegalax.models.sharding_runtime import init_model_sharded
 from omegalax.models.params_utils import (
     Transform,
     assign_weights_from_eval_shape,
@@ -157,10 +159,11 @@ def create_qwen3_vl_from_safetensors(
     _assert_vl_config(cfg, hf_cfg)
     cfg = dataclasses.replace(cfg, shd_cfg=shard_config_for_mesh(cfg.shd_cfg, mesh))
 
-    with mesh_rules(mesh):
-        model = nnx.eval_shape(lambda: Qwen3VL(cfg, rngs=nnx.Rngs(params=0)))
-    graph_def, abs_state = nnx.split(model)
-    state_dict = nnx.to_pure_dict(abs_state)
+    model = init_model_sharded(
+        Qwen3VL, cfg, jax.random.PRNGKey(0), mesh, axis_rules_for_mesh(mesh)
+    )
+    graph_def, state = nnx.split(model)
+    state_dict = nnx.to_pure_dict(state)
 
     non_expert_mapping = _get_non_expert_mapping()
     unmatched_hf_keys: list[str] = []
@@ -198,6 +201,9 @@ def create_qwen3_vl_from_safetensors(
                     unmatched_hf_keys.append(torch_key)
                     continue
 
+                if cfg.tie_word_embeddings and jax_key.startswith("lm_head"):
+                    continue
+
                 keys = [stoi(k) for k in jax_key.split(".")]
                 if transform == Transform.CONV3D:
                     tensor = tensor.reshape(tensor.shape[0], -1).T
@@ -219,8 +225,6 @@ def create_qwen3_vl_from_safetensors(
 
     check_conversion_errors(unmatched_hf_keys)
 
-    if cfg.tie_word_embeddings:
-        state_dict["lm_head"]["kernel"] = state_dict["text"]["embedder"]["embedding"].T
 
     gc.collect()
     model = nnx.merge(graph_def, state_dict)

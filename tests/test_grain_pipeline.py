@@ -87,6 +87,8 @@ class GrainPipelineTest(absltest.TestCase):
                     seed=0,
                     read_options=make_grain_read_options(num_threads=1, prefetch_buffer_size=1),
                     multiprocessing_options=make_grain_multiprocessing_options(num_workers=0, per_worker_buffer_size=1),
+                    dp_size=1,
+                    fsdp_size=1,
                 )
 
     def test_build_chunk_index_splits_across_payload_blocks(self):
@@ -129,6 +131,8 @@ class GrainPipelineTest(absltest.TestCase):
                 seed=0,
                 read_options=make_grain_read_options(num_threads=1, prefetch_buffer_size=1),
                 multiprocessing_options=make_grain_multiprocessing_options(num_workers=0, per_worker_buffer_size=1),
+                dp_size=1,
+                fsdp_size=1,
             )
             records = [next(iterator) for _ in range(3)]
             self.assertEqual([len(record["messages"]) for record in records], [2, 2, 1])
@@ -178,6 +182,8 @@ class GrainPipelineTest(absltest.TestCase):
                 seed=0,
                 read_options=make_grain_read_options(num_threads=1, prefetch_buffer_size=1),
                 multiprocessing_options=make_grain_multiprocessing_options(num_workers=0, per_worker_buffer_size=1),
+                dp_size=1,
+                fsdp_size=1,
             )
             first_batch = next(iterator)
             self.assertEqual(first_batch["starts"].tolist(), [10, 12])
@@ -208,6 +214,8 @@ class GrainPipelineTest(absltest.TestCase):
                 seed=0,
                 read_options=make_grain_read_options(num_threads=1, prefetch_buffer_size=1),
                 multiprocessing_options=make_grain_multiprocessing_options(num_workers=0, per_worker_buffer_size=1),
+                dp_size=1,
+                fsdp_size=1,
             )
             abstract_state = {"step": jax.ShapeDtypeStruct((), jnp.int32)}
             restored = manager.restore(
@@ -252,30 +260,33 @@ class GrainPipelineTest(absltest.TestCase):
                 records_per_shard=8,
             )
 
-            with mock.patch("jax.process_count", return_value=2):
-                with mock.patch("jax.process_index", return_value=0):
-                    iterator0 = make_grain_iterator(
-                        chunked,
-                        batch_size=1,
-                        batch_fn=lambda batch: batch[0],
-                        shuffle=False,
-                        seed=0,
-                        read_options=make_grain_read_options(num_threads=1, prefetch_buffer_size=1),
-                        multiprocessing_options=make_grain_multiprocessing_options(num_workers=0, per_worker_buffer_size=1),
-                    )
-                    records0 = [next(iterator0) for _ in range(2)]
+            with mock.patch("jax.process_index", return_value=0):
+                iterator0 = make_grain_iterator(
+                    chunked,
+                    batch_size=1,
+                    batch_fn=lambda batch: batch[0],
+                    shuffle=False,
+                    seed=0,
+                    read_options=make_grain_read_options(num_threads=1, prefetch_buffer_size=1),
+                    multiprocessing_options=make_grain_multiprocessing_options(num_workers=0, per_worker_buffer_size=1),
+                    dp_size=2,
+                    fsdp_size=1,
+                )
+                records0 = [next(iterator0) for _ in range(2)]
 
-                with mock.patch("jax.process_index", return_value=1):
-                    iterator1 = make_grain_iterator(
-                        chunked,
-                        batch_size=1,
-                        batch_fn=lambda batch: batch[0],
-                        shuffle=False,
-                        seed=0,
-                        read_options=make_grain_read_options(num_threads=1, prefetch_buffer_size=1),
-                        multiprocessing_options=make_grain_multiprocessing_options(num_workers=0, per_worker_buffer_size=1),
-                    )
-                    records1 = [next(iterator1) for _ in range(2)]
+            with mock.patch("jax.process_index", return_value=1):
+                iterator1 = make_grain_iterator(
+                    chunked,
+                    batch_size=1,
+                    batch_fn=lambda batch: batch[0],
+                    shuffle=False,
+                    seed=0,
+                    read_options=make_grain_read_options(num_threads=1, prefetch_buffer_size=1),
+                    multiprocessing_options=make_grain_multiprocessing_options(num_workers=0, per_worker_buffer_size=1),
+                    dp_size=2,
+                    fsdp_size=1,
+                )
+                records1 = [next(iterator1) for _ in range(2)]
 
             starts0 = [record["messages"][0]["content"] for record in records0]
             starts1 = [record["messages"][0]["content"] for record in records1]
@@ -312,20 +323,21 @@ class GrainPipelineTest(absltest.TestCase):
             )
 
             def collect_process_order(process_index: int, seed: int) -> list[str]:
-                with mock.patch("jax.process_count", return_value=2):
-                    with mock.patch("jax.process_index", return_value=process_index):
-                        iterator = make_grain_iterator(
-                            chunked,
-                            batch_size=1,
-                            batch_fn=lambda batch: batch[0],
-                            shuffle=True,
-                            seed=seed,
-                            read_options=make_grain_read_options(num_threads=1, prefetch_buffer_size=1),
-                            multiprocessing_options=make_grain_multiprocessing_options(
-                                num_workers=0, per_worker_buffer_size=1
-                            ),
-                        )
-                        return [next(iterator)["messages"][0]["content"] for _ in range(4)]
+                with mock.patch("jax.process_index", return_value=process_index):
+                    iterator = make_grain_iterator(
+                        chunked,
+                        batch_size=1,
+                        batch_fn=lambda batch: batch[0],
+                        shuffle=True,
+                        seed=seed,
+                        read_options=make_grain_read_options(num_threads=1, prefetch_buffer_size=1),
+                        multiprocessing_options=make_grain_multiprocessing_options(
+                            num_workers=0, per_worker_buffer_size=1
+                        ),
+                        dp_size=2,
+                        fsdp_size=1,
+                    )
+                    return [next(iterator)["messages"][0]["content"] for _ in range(4)]
 
             process0_seed0 = collect_process_order(0, seed=0)
             process1_seed0 = collect_process_order(1, seed=0)

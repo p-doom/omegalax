@@ -7,6 +7,7 @@ import re
 from enum import Enum
 from typing import Any, Callable
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 from etils import epath
@@ -34,6 +35,11 @@ def map_to_bonsai_key(mapping: dict[str, tuple[str, Enum]], torch_key: str):
         if match:
             return re.sub(pattern, jax_key, torch_key), transform
     return None, None
+
+
+def _place_like(value: jax.Array, target: Any) -> jax.Array:
+    sharding = getattr(target, "sharding", None)
+    return jax.device_put(value, sharding) if sharding is not None else value
 
 
 def assign_weights_from_eval_shape(
@@ -66,7 +72,7 @@ def assign_weights_from_eval_shape(
     if target_dtype is not None:
         value = value.astype(target_dtype)
 
-    node[leaf_key] = value
+    node[leaf_key] = _place_like(value, target)
 
 
 def assign_to_state_dict(
@@ -89,7 +95,7 @@ def assign_to_state_dict(
     target_dtype = getattr(target, "dtype", None)
     if target_dtype is not None:
         value = value.astype(target_dtype)
-    node[leaf_key] = value
+    node[leaf_key] = _place_like(value, target)
 
 
 # MoE expert loading helpers
