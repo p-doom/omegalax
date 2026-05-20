@@ -37,6 +37,21 @@ from omegalax.vlm import api as vlm_api
 P = PartitionSpec
 
 
+def _trainable_non_vision(path, x):
+    """NNX filter predicate: select every ``nnx.Param`` whose state-tree path
+    does not pass through ``Qwen3VL.vision`` (or any nested ``vision``
+    attribute). Used as the ``wrt`` filter for full-FT-with-frozen-vision
+    training. Mirrors ``DEFAULT_SKIP_PATHS = ("vision",)`` in ``lora.py``.
+    """
+    if not isinstance(x, nnx.Param):
+        return False
+    for part in path:
+        key = getattr(part, "key", None) or getattr(part, "name", None) or str(part)
+        if key == "vision":
+            return False
+    return True
+
+
 @dataclasses.dataclass(frozen=True)
 class TrainConfig:
     seed: int = 0
@@ -55,6 +70,7 @@ class TrainConfig:
     enable_lora: bool = False
     lora_rank: int = 32
     lora_alpha: float = 32.0
+    freeze_vision_tower: bool = False
 
 
 def init_model(
@@ -421,6 +437,11 @@ def run_sft(
     from omegalax.models.sharding_runtime import set_attn_backend
     set_attn_backend(model, text_backend=text_attn_backend)
     startup_log(f"set attn backend: text={text_attn_backend}")
+    if train_cfg.enable_lora and train_cfg.freeze_vision_tower:
+        raise ValueError(
+            "--enable_lora already freezes the vision tower; "
+            "--freeze_vision_tower is redundant. Pass at most one."
+        )
     if train_cfg.enable_lora:
         with mesh_rules(mesh):
             n_wrapped = inject_lora(
@@ -434,6 +455,11 @@ def run_sft(
             f"wrapped {n_wrapped} text-decoder Linear projections; vision frozen"
         )
         wrt_filter = LoRAParam
+    elif train_cfg.freeze_vision_tower:
+        wrt_filter = _trainable_non_vision
+        startup_log(
+            "vision tower frozen; full FT on text decoder + embedder + lm_head + layernorms"
+        )
     else:
         wrt_filter = nnx.Param
     with mesh_rules(mesh):

@@ -98,6 +98,11 @@ flags.DEFINE_boolean("enable_lora", False,
 flags.DEFINE_integer("lora_rank", 32, "LoRA rank (only used if --enable_lora).")
 flags.DEFINE_float("lora_alpha", 32.0,
                    "LoRA alpha scaling. Effective LR multiplier is alpha/rank.")
+flags.DEFINE_boolean("freeze_vision_tower", False,
+                     "Full FT on text decoder + embedder + lm_head + "
+                     "layernorms while freezing the vision tower at the "
+                     "gradient/opt-state layer. Mutually exclusive with "
+                     "--enable_lora (which already freezes vision).")
 
 _ATTN_BACKENDS = [
     "mosaic_tpu", "mosaic_gpu", "cudnn", "xla", "triton",
@@ -268,6 +273,7 @@ def main(_) -> None:
         enable_lora=FLAGS.enable_lora,
         lora_rank=FLAGS.lora_rank,
         lora_alpha=FLAGS.lora_alpha,
+        freeze_vision_tower=FLAGS.freeze_vision_tower,
     )
     resume_mode = ResumeMode(FLAGS.resume)
     save_dir = Path(FLAGS.save_dir) if FLAGS.save_dir else (
