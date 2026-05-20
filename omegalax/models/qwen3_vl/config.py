@@ -27,7 +27,7 @@ class Qwen3VLVisionConfig:
     num_position_embeddings: int
     deepstack_visual_indexes: tuple[int, ...]
     dtype: Any = jnp.bfloat16
-    param_dtype: Any = jnp.bfloat16
+    param_dtype: Any = jnp.float32
 
 
 @dataclasses.dataclass(frozen=True, slots=True)

@@ -462,17 +462,7 @@ class VisionModel(nnx.Module):
     def __call__(
         self, pixel_values: jax.Array, image_grid: jax.Array, vision_cu_seqlens: jax.Array
     ) -> tuple[jax.Array, list[jax.Array]]:
-        # Per-image bookkeeping (cumsum, searchsorted, gathers into image_grid)
-        # doesn't vectorize across the dp-sharded batch axis; the scatter-style
-        # concats it produces force JAX's explicit-sharding mode to error.
-        # Replicating this small ``(num_images, 3)`` array keeps all the
-        # bookkeeping on one sharding and leaves pixel_values/hidden_ND
-        # dp-sharded for the actual vision compute.
         image_grid = reshard(image_grid, P())
-        # Per-frame seqlens derived from the replicated grid.  Assumes t=1
-        # (single-frame images); for video inputs this needs per-frame
-        # expansion.  Reshard to dp so each device's cuDNN call sees its own
-        # local (M,) seqlens matching its local pixel patches.
         seqlens_M = image_grid[:, 0] * image_grid[:, 1] * image_grid[:, 2]
         seqlens_M = reshard(seqlens_M.astype(jnp.int32), P(self.hidden_shd[0]))
         hidden_ND = self.patch_embed(pixel_values)

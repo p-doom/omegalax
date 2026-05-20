@@ -458,12 +458,6 @@ class Qwen3VL(nnx.Module):
             visual_pos_mask_BT = image_mask_BT
             n_features = image_features_ND.shape[0]  # static after padding
             seq_len = token_ids_BT.shape[1]
-            # ``jnp.where(..., size=n)`` lowers to nonzero/bincount/scatter
-            # internally; with a dp-sharded mask the intermediate scatter can't
-            # resolve an output sharding.  Gather to replicated for the index
-            # bookkeeping — the subsequent scatter back into the dp-sharded
-            # ``inputs_embeds_BTD`` respects the per-shard semantics because
-            # each device only owns its local batch rows.
             image_mask_replicated = reshard(image_mask_BT, P())
             batch_idx, seq_idx = jnp.where(
                 image_mask_replicated, size=n_features,
@@ -516,8 +510,6 @@ def _deepstack_process(
     """Add visual embeddings to hidden states at visual token positions."""
     n_embeds = visual_embeds_ND.shape[0]
     seq_len = hidden_BTD.shape[1]
-    # See `__call__` above — ``jnp.where`` with ``size=`` requires replicated
-    # inputs under explicit multi-device sharding.
     mask_replicated = reshard(visual_pos_mask_BT, P())
     embeds_replicated = reshard(visual_embeds_ND, P())
     batch_idx, seq_idx = jnp.where(
