@@ -173,7 +173,22 @@ def _restore_sft_checkpoint(
     restore_args = checkpoint_utils.make_grain_restore_args(abstract_state, input_iter)
     restored = checkpoint_manager.restore(latest_step, args=restore_args)
     train_state = restored["train_state"]
-    nnx.update(optimizer, train_state["optimizer"])
+    # Canonicalize restored opt-state dtypes against the freshly-built
+    # optimizer's expectations. Older orbax checkpoints saved Adam's first
+    # moment as fp32 (optax's default), but build_optimizer now requests
+    # bf16 via mu_dtype=model_cfg.dtype. Without this cast, MultiSteps
+    # (grad_accum) would see fp32 (restored, passthrough in the
+    # not-yet-stepping branch) vs bf16 (active-step branch from optax) and
+    # lax.cond would reject the dtype mismatch at trace time. Casting here
+    # keeps the bf16-mu memory optimization while staying restore-compatible
+    # with checkpoints written under the old default.
+    expected_state = nnx.state(optimizer)
+    restored_state = jax.tree.map(
+        lambda exp, got: got.astype(exp.dtype) if exp.dtype != got.dtype else got,
+        expected_state,
+        train_state["optimizer"],
+    )
+    nnx.update(optimizer, restored_state)
     return optimizer, int(latest_step), train_state["rng"], checkpoint_utils.restored_input_iter(restored)
 
 
