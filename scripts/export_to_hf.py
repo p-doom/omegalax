@@ -173,7 +173,7 @@ def _restore_trained_weights(model, cfg, checkpoint_path: Path):
         else:
             wrt_filter = nnx.Param
         optimizer = vlm_trainer.build_optimizer(
-            model, lr_schedule_fn, train_cfg, wrt=wrt_filter,
+            model, lr_schedule_fn, train_cfg, cfg, wrt=wrt_filter,
         )
 
         handler_registry = ocp.handlers.DefaultCheckpointHandlerRegistry()
