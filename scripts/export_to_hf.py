@@ -34,7 +34,6 @@ from omegalax.distributed.mesh import ensure_mesh, mesh_rules
 from omegalax.text import api as text_api
 from omegalax.trainers import text as text_trainer
 from omegalax.trainers import vlm as vlm_trainer
-from omegalax.trainers.lr_schedule import build_lr_schedule
 from omegalax.vlm import api as vlm_api
 
 FLAGS = flags.FLAGS
@@ -115,65 +114,74 @@ def _read_lora_metadata(save_dir: Path) -> dict:
 def _restore_trained_weights(model, cfg, checkpoint_path: Path):
     """Restore trained weights from an orbax step directory into ``model``.
 
-    Builds an optimizer mirroring training-time wiring (so the saved pytree
-    shape matches), constructs a CheckpointManager handling only the
-    train_state subkey, and updates ``model`` from the restored optimizer
-    state.
+    Restores ONLY the model parameter subtree (``train_state/optimizer/model``)
+    from the saved checkpoint — never the optimizer state or step counters.
+    Optimizer state contains replicated scalar leaves stored as
+    ``(num_devices,)`` arrays by orbax; orbax doesn't collapse those to ``()``
+    on a smaller-device restore topology, so any export that asks for the
+    full train_state (model + opt_state + step + rng) fails with
+    ``Requested shape: () is not compatible with the stored shape: (N,)``
+    whenever training was done on more devices than the export node has. The
+    exporter only needs model weights for the HF safetensors write, so the
+    optimizer subtree is genuinely unneeded: skipping it sidesteps the bug
+    AND meaningfully reduces work / memory.
+
+    The restore uses explicit ``ocp.ArrayRestoreArgs(sharding=...,
+    global_shape=..., dtype=...)`` per leaf so orbax cross-topology-restores
+    cleanly without falling back to the on-disk sharding file (which still
+    references the original training devices).
 
     For LoRA-trained checkpoints, the trainer wrote a
-    ``lora_metadata.json`` next to the orbax tree. We read it, inject
-    LoRA into the freshly-loaded base model BEFORE building the
-    optimizer, so the abstract optimizer state matches the saved shape
-    (LoRA-only opt_state + LoRA-augmented model state).
+    ``lora_metadata.json`` next to the orbax tree. We read it and inject
+    LoRA into the freshly-loaded base model BEFORE deriving the abstract
+    template so the model state's tree shape matches the saved subtree.
     """
     save_dir = checkpoint_path.parent.resolve()
     lora_meta = _read_lora_metadata(save_dir)
-
-    train_cfg = vlm_trainer.TrainConfig(
-        learning_rate=FLAGS.learning_rate,
-        weight_decay=FLAGS.weight_decay,
-        max_grad_norm=FLAGS.max_grad_norm,
-        grad_accum_steps=FLAGS.grad_accum_steps,
-        num_steps=FLAGS.num_steps,
-        warmup_steps=FLAGS.warmup_steps,
-        lr_schedule=FLAGS.lr_schedule,
-        lr_stable_fraction=FLAGS.lr_stable_fraction,
-        lr_end_factor=FLAGS.lr_end_factor,
-        enable_lora=bool(lora_meta.get("enable_lora", False)),
-        lora_rank=int(lora_meta.get("lora_rank", 32)),
-        lora_alpha=float(lora_meta.get("lora_alpha", 32.0)),
-    )
-    lr_schedule_fn = build_lr_schedule(
-        peak_lr=train_cfg.learning_rate,
-        num_steps=train_cfg.num_steps,
-        warmup_steps=train_cfg.warmup_steps,
-        schedule=train_cfg.lr_schedule,
-        end_factor=train_cfg.lr_end_factor,
-        stable_fraction=train_cfg.lr_stable_fraction,
-    )
     step = int(checkpoint_path.name)
 
-    # build_optimizer (and the abstract-state sharding it produces) needs
-    # the logical->physical axis-rules context the trainer sets up.
     mesh = ensure_mesh(tp_size=FLAGS.tp_size, fsdp_size=FLAGS.fsdp_size, dp_size=FLAGS.dp_size)
-    # Replicated scalar rng placed on the mesh; otherwise _abstract_train_state
-    # produces P(None,) sharding for the rank-0 key which orbax rejects.
-    rng = jax.device_put(jax.random.key(FLAGS.seed), NamedSharding(mesh, P()))
+    default_sharding = NamedSharding(mesh, P())
+
     with mesh_rules(mesh):
-        if train_cfg.enable_lora:
-            from omegalax.trainers.lora import LoRAParam, inject_lora
+        if bool(lora_meta.get("enable_lora", False)):
+            from omegalax.trainers.lora import inject_lora
             n_wrapped = inject_lora(
                 model,
-                r=train_cfg.lora_rank,
-                alpha=train_cfg.lora_alpha,
-                rngs=nnx.Rngs(train_cfg.seed),
+                r=int(lora_meta.get("lora_rank", 32)),
+                alpha=float(lora_meta.get("lora_alpha", 32.0)),
+                rngs=nnx.Rngs(FLAGS.seed),
             )
-            print(f"[export] re-injected LoRA into base for restore: r={train_cfg.lora_rank} wrapped={n_wrapped}")
-            wrt_filter = LoRAParam
-        else:
-            wrt_filter = nnx.Param
-        optimizer = vlm_trainer.build_optimizer(
-            model, lr_schedule_fn, train_cfg, cfg, wrt=wrt_filter,
+            print(f"[export] re-injected LoRA into base for restore: "
+                  f"r={int(lora_meta.get('lora_rank', 32))} wrapped={n_wrapped}")
+
+        # Build abstract template for the model-params subtree only. The
+        # saved tree stored it under ``train_state/optimizer/model``; we
+        # mirror that nesting so orbax's path matching finds it.
+        model_state = nnx.state(model)
+        model_abstract = jax.tree.map(
+            lambda v: jax.ShapeDtypeStruct(
+                v.shape, v.dtype,
+                sharding=getattr(v, "sharding", None) or default_sharding,
+            ),
+            model_state,
+        )
+        params_only_abstract = {"optimizer": {"model": model_abstract}}
+
+        # Explicit ArrayRestoreArgs per leaf — bypasses orbax's disk-sharding
+        # fallback path which fails when the original training topology's
+        # devices aren't present on the export node.
+        def _to_restore_args(s):
+            if isinstance(s, jax.ShapeDtypeStruct):
+                return ocp.ArrayRestoreArgs(
+                    sharding=s.sharding if s.sharding is not None else default_sharding,
+                    global_shape=s.shape,
+                    dtype=s.dtype,
+                )
+            return s
+        params_only_restore_args = jax.tree.map(
+            _to_restore_args, params_only_abstract,
+            is_leaf=lambda x: isinstance(x, jax.ShapeDtypeStruct),
         )
 
         handler_registry = ocp.handlers.DefaultCheckpointHandlerRegistry()
@@ -181,20 +189,20 @@ def _restore_trained_weights(model, cfg, checkpoint_path: Path):
         options = ocp.CheckpointManagerOptions(step_format_fixed_length=6)
         cm = ocp.CheckpointManager(save_dir, options=options, handler_registry=handler_registry)
 
-        abstract_state = vlm_trainer._abstract_train_state(optimizer, rng)
-        # partial_restore=True: only restore keys present in both saved and
-        # abstract trees. The opt_state subtree may differ (different optax
-        # composition between save-time and now) but model weights match,
-        # which is all the exporter needs.
         restored = cm.restore(
             step,
             args=ocp.args.Composite(
-                train_state=ocp.args.PyTreeRestore(abstract_state, partial_restore=True),
+                train_state=ocp.args.PyTreeRestore(
+                    params_only_abstract,
+                    restore_args=params_only_restore_args,
+                    partial_restore=True,
+                ),
             ),
         )
-        nnx.update(optimizer, restored["train_state"]["optimizer"])
-    print(f"Restored train_state from step {step} at {save_dir}")
-    return optimizer.model
+        restored_model_state = restored["train_state"]["optimizer"]["model"]
+        nnx.update(model, restored_model_state)
+    print(f"Restored model params from step {step} at {save_dir}")
+    return model
 
 
 def main(_) -> None:
