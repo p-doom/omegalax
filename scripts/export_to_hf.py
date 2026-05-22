@@ -212,6 +212,7 @@ def main(_) -> None:
         ckpt = Path(FLAGS.checkpoint_path).expanduser()
         model = _restore_trained_weights(model, cfg, ckpt)
     out_dir = Path(FLAGS.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
     path = export_lib.export_model_to_hf(model, cfg, out_dir)
     print(f"Exported safetensors to {path}")
 
