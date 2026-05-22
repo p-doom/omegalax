@@ -95,7 +95,6 @@ def build_optimizer(
     model: nnx.Module,
     lr_schedule_fn: optax.Schedule | float,
     train_cfg: TrainConfig,
-    model_cfg: vlm_api.VLMConfig,
     *,
     wrt=nnx.Param,
 ) -> MixedPrecisionOptimizer:
@@ -103,7 +102,7 @@ def build_optimizer(
     if train_cfg.max_grad_norm > 0:
         chain.append(optax.clip_by_global_norm(train_cfg.max_grad_norm))
     wd = 0.0 if wrt is LoRAParam else train_cfg.weight_decay
-    chain.append(optax.adamw(lr_schedule_fn, weight_decay=wd, mu_dtype=model_cfg.dtype))
+    chain.append(optax.adamw(lr_schedule_fn, weight_decay=wd))
     tx = optax.chain(*chain)
     if train_cfg.grad_accum_steps > 1:
         tx = optax.MultiSteps(tx, every_k_schedule=train_cfg.grad_accum_steps)
@@ -189,14 +188,11 @@ def _restore_sft_checkpoint(
     restored = checkpoint_manager.restore(latest_step, args=restore_args)
     train_state = restored["train_state"]
     # Canonicalize restored opt-state dtypes against the freshly-built
-    # optimizer's expectations. Older orbax checkpoints saved Adam's first
-    # moment as fp32 (optax's default), but build_optimizer now requests
-    # bf16 via mu_dtype=model_cfg.dtype. Without this cast, MultiSteps
-    # (grad_accum) would see fp32 (restored, passthrough in the
-    # not-yet-stepping branch) vs bf16 (active-step branch from optax) and
-    # lax.cond would reject the dtype mismatch at trace time. Casting here
-    # keeps the bf16-mu memory optimization while staying restore-compatible
-    # with checkpoints written under the old default.
+    # optimizer's expectations: some prior checkpoints stored Adam's first
+    # moment in bf16; the optimizer now uses optax's default (fp32), so
+    # MultiSteps (grad_accum) would otherwise see a dtype mismatch between
+    # the passthrough branch (restored dtype) and the active-step branch
+    # (optax's expected dtype) and lax.cond would reject it at trace time.
     expected_state = nnx.state(optimizer)
     restored_state = jax.tree.map(
         lambda exp, got: got.astype(exp.dtype) if exp.dtype != got.dtype else got,
@@ -462,7 +458,7 @@ def run_sft(
     else:
         wrt_filter = nnx.Param
     with mesh_rules(mesh):
-        optimizer = build_optimizer(model, lr_schedule_fn, train_cfg, model_cfg, wrt=wrt_filter)
+        optimizer = build_optimizer(model, lr_schedule_fn, train_cfg, wrt=wrt_filter)
 
     startup_log("built optimizer")
     sft_step = make_sft_train_step(model_cfg, pad_id=pad_id, wrt=wrt_filter)
