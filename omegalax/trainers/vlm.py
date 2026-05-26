@@ -25,6 +25,11 @@ from omegalax.trainers import checkpoint_utils
 from omegalax.trainers.loss import chunked_cross_entropy_loss
 from omegalax.trainers.lr_schedule import build_lr_schedule
 from omegalax.trainers.perf import (
+    log_compiled_memory_analysis,
+    log_device_memory,
+    log_live_arrays,
+    log_pytree_bytes,
+    log_top_leaves_with_paths,
     maybe_log_step_metrics,
     per_device_flops_per_step,
     StepTimer,
@@ -319,6 +324,7 @@ def run_sft(
     val_steps: int = 10,
     text_attn_backend: str = "mosaic_gpu",
     gc_period: int = 0,
+    log_memory: bool = False,
 ) -> tuple[MixedPrecisionOptimizer, dict[str, float]]:
     """SFT a VLM from a Grain iterator; returns final optimizer + last metrics.
 
@@ -457,10 +463,21 @@ def run_sft(
         )
     else:
         wrt_filter = nnx.Param
+
+    if log_memory:
+        log_pytree_bytes("params (after load)", nnx.state(model, nnx.Param))
+        log_device_memory("after model load")
+
     with mesh_rules(mesh):
         optimizer = build_optimizer(model, lr_schedule_fn, train_cfg, wrt=wrt_filter)
 
     startup_log("built optimizer")
+    if log_memory:
+        log_pytree_bytes("optimizer.opt_state", nnx.state(optimizer.opt_state))
+        log_pytree_bytes("optimizer (params + state)", nnx.state(optimizer))
+        log_top_leaves_with_paths("optimizer (params + state) by path", nnx.state(optimizer), top_n=20)
+        log_device_memory("after optimizer build")
+ 
     sft_step = make_sft_train_step(model_cfg, pad_id=pad_id, wrt=wrt_filter)
     eval_step = make_sft_eval_step(model_cfg, pad_id=pad_id) if val_data_iter is not None else None
     startup_log("built train step (jit)" + (" and eval step (jit)" if eval_step is not None else ""))
@@ -523,6 +540,11 @@ def run_sft(
     signal.signal(signal.SIGTERM, _request_requeue)
 
     startup_log("entering training loop")
+    if log_memory:
+        log_device_memory("before first step")
+    _mem_logged_after_first_step = not log_memory
+    _mem_logged_steady_state = not log_memory
+ 
     for step_idx in range(start_step, train_cfg.num_steps):
         step = step_idx + 1
 
@@ -555,6 +577,17 @@ def run_sft(
             accum_flops += micro_flops
             accum_time += micro_delta
 
+        # Log memory after first step and after 5 steps
+        if not _mem_logged_after_first_step:
+            jax.block_until_ready(metrics["loss"])
+            log_device_memory("after first step (compile done)")
+            log_live_arrays("after first step (compile done)", top_n=20)
+            log_compiled_memory_analysis("sft_step", sft_step, optimizer, batch)
+            _mem_logged_after_first_step = True
+        elif not _mem_logged_steady_state and step_idx >= 4:
+            jax.block_until_ready(metrics["loss"])
+            log_device_memory("after step 5 (steady state)")
+            _mem_logged_steady_state = True
 
         with jax.default_device('cpu'):
             window_metrics = {
