@@ -104,6 +104,9 @@ flags.DEFINE_boolean("freeze_vision_tower", False,
                      "layernorms while freezing the vision tower at the "
                      "gradient/opt-state layer. Mutually exclusive with "
                      "--enable_lora (which already freezes vision).")
+flags.DEFINE_integer("num_loss_tiles", 4,
+                     "Number of tiles for chunked cross-entropy along the "
+                     "sequence axis. Must evenly divide (max_length - 1).")
 
 _ATTN_BACKENDS = [
     "mosaic_tpu", "mosaic_gpu", "cudnn", "xla", "triton",
@@ -275,6 +278,7 @@ def main(_) -> None:
         lora_rank=FLAGS.lora_rank,
         lora_alpha=FLAGS.lora_alpha,
         freeze_vision_tower=FLAGS.freeze_vision_tower,
+        num_loss_tiles=FLAGS.num_loss_tiles,
     )
     resume_mode = ResumeMode(FLAGS.resume)
     save_dir = Path(FLAGS.save_dir) if FLAGS.save_dir else (

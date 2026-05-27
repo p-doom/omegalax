@@ -76,6 +76,7 @@ class TrainConfig:
     lora_rank: int = 32
     lora_alpha: float = 32.0
     freeze_vision_tower: bool = False
+    num_loss_tiles: int = 4
 
 
 def init_model(
@@ -113,9 +114,6 @@ def build_optimizer(
         tx = optax.MultiSteps(tx, every_k_schedule=train_cfg.grad_accum_steps)
     opt = MixedPrecisionOptimizer(model, tx, wrt=wrt)
     return opt
-
-
-_NUM_LOSS_TILES = 4
 
 
 def _train_state(optimizer: MixedPrecisionOptimizer, rng: jax.Array) -> dict[str, object]:
@@ -208,7 +206,7 @@ def _restore_sft_checkpoint(
     return optimizer, int(latest_step), train_state["rng"], checkpoint_utils.restored_input_iter(restored)
 
 
-def make_sft_train_step(cfg, pad_id: int = 0, *, wrt=nnx.Param):
+def make_sft_train_step(cfg, pad_id: int = 0, *, wrt=nnx.Param, num_loss_tiles: int = 4):
     """Build a JIT-compiled VLM SFT train step that consumes a batch dict.
 
     The batch dict must contain ``token_ids_BT``, ``attention_mask_BT``, and
@@ -248,7 +246,7 @@ def make_sft_train_step(cfg, pad_id: int = 0, *, wrt=nnx.Param):
             lm_weight = model.output_weight()
             loss = chunked_cross_entropy_loss(
                 hidden_BTD, lm_weight, token_ids_BT, loss_mask_BT,
-                num_tiles=_NUM_LOSS_TILES,
+                num_tiles=num_loss_tiles,
                 logits_out_sharding=cfg.shd_cfg.logits_btv,
             ) + aux_loss
             supervised_tokens = jnp.sum(loss_mask_BT[:, 1:].astype(jnp.float32))
@@ -268,7 +266,7 @@ def make_sft_train_step(cfg, pad_id: int = 0, *, wrt=nnx.Param):
     return sft_train_step
 
 
-def make_sft_eval_step(cfg, pad_id: int = 0):
+def make_sft_eval_step(cfg, pad_id: int = 0, *, num_loss_tiles: int = 4):
     """Build a JIT-compiled VLM SFT eval step (forward only, no gradients)."""
 
     @nnx.jit
@@ -295,7 +293,7 @@ def make_sft_eval_step(cfg, pad_id: int = 0):
         lm_weight = model.output_weight()
         loss = chunked_cross_entropy_loss(
             hidden_BTD, lm_weight, token_ids_BT, loss_mask_BT,
-            num_tiles=_NUM_LOSS_TILES,
+            num_tiles=num_loss_tiles,
             logits_out_sharding=cfg.shd_cfg.logits_btv,
         ) + aux_loss
         supervised_tokens = jnp.sum(loss_mask_BT[:, 1:].astype(jnp.float32))
@@ -478,8 +476,13 @@ def run_sft(
         log_top_leaves_with_paths("optimizer (params + state) by path", nnx.state(optimizer), save_dir=save_path)
         log_device_memory("after optimizer build", save_dir=save_path)
  
-    sft_step = make_sft_train_step(model_cfg, pad_id=pad_id, wrt=wrt_filter)
-    eval_step = make_sft_eval_step(model_cfg, pad_id=pad_id) if val_data_iter is not None else None
+    sft_step = make_sft_train_step(
+        model_cfg, pad_id=pad_id, wrt=wrt_filter, num_loss_tiles=train_cfg.num_loss_tiles,
+    )
+    eval_step = (
+        make_sft_eval_step(model_cfg, pad_id=pad_id, num_loss_tiles=train_cfg.num_loss_tiles)
+        if val_data_iter is not None else None
+    )
     startup_log("built train step (jit)" + (" and eval step (jit)" if eval_step is not None else ""))
 
     accum_steps = train_cfg.grad_accum_steps
