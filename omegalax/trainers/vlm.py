@@ -525,7 +525,7 @@ def run_sft(
             global_tokens_per_step=global_tokens_per_step,
             peak_tflops=peak_tflops,
             wandb_run=wandb_run,
-            batch_size=train_cfg.batch_size,
+            batch_size=train_cfg.batch_size * accum_steps,
         )
         if result is not None:
             last_metrics = result
