@@ -6,6 +6,8 @@ from pathlib import Path
 
 import jax
 import tokamax
+from tokamax._src.autotuning.autotuner import AutotuningData
+from tokamax._src.benchmarking import BenchmarkData
 
 from omegalax.trainers.text import startup_log
 
@@ -46,9 +48,21 @@ def autotune_and_save(
         target = getattr(lowered, "lowered", lowered)
         args = ()
     result = tokamax.autotune(target, *args)
+    # AutotuningData also stores Exception entries for configs that failed at
+    # compile/benchmark time; pydantic can't serialize those, so drop them.
+    pruned = tokamax.AutotuningResult(
+        device_kind=result.device_kind,
+        data=tuple(
+            (
+                ba,
+                AutotuningData({k: v for k, v in d.items() if isinstance(v, BenchmarkData)}),
+            )
+            for ba, d in result.data
+        ),
+    )
     if jax.process_index() == 0:
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w") as f:
-            result.dump(f)
-        startup_log(f"saved tokamax autotuning cache ({len(result.data)} ops) to {path}")
-    return result
+            pruned.dump(f)
+        startup_log(f"saved tokamax autotuning cache ({len(pruned.data)} ops) to {path}")
+    return pruned
