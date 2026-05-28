@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import datetime
 import gc
@@ -22,6 +23,7 @@ from omegalax.data.grain_pipeline import pop_source_ids
 from omegalax.distributed.mesh import ensure_mesh, mesh_rules, required_batch_multiple
 from omegalax.models.params_utils import save_hf_config
 from omegalax.trainers import checkpoint_utils
+from omegalax.trainers import tokamax_cache as tokamax_cache_lib
 from omegalax.trainers.loss import chunked_cross_entropy_loss
 from omegalax.trainers.lr_schedule import build_lr_schedule
 from omegalax.trainers.perf import (
@@ -323,6 +325,7 @@ def run_sft(
     text_attn_backend: str = "mosaic_gpu",
     gc_period: int = 0,
     log_memory: bool = False,
+    tokamax_cache_dir: str | Path | None = None,
 ) -> tuple[MixedPrecisionOptimizer, dict[str, float]]:
     """SFT a VLM from a Grain iterator; returns final optimizer + last metrics.
 
@@ -542,12 +545,29 @@ def run_sft(
     signal.signal(signal.SIGUSR1, _request_requeue)
     signal.signal(signal.SIGTERM, _request_requeue)
 
+    autotune_result = None
+    pending_batch = None
+    if tokamax_cache_dir is not None:
+        autotune_result = tokamax_cache_lib.try_load(tokamax_cache_dir)
+        if autotune_result is None:
+            startup_log("priming tokamax autotuning with first training batch")
+            pending_batch = next(data_iter)
+            pending_batch_sharded = vlm_api.shard_batch_dict(pending_batch, model_cfg, mesh)
+            autotune_result = tokamax_cache_lib.autotune_and_save(
+                tokamax_cache_dir, sft_step, optimizer, pending_batch_sharded
+            )
+
+    # Push the autotuning overlay onto tokamax's lookup stack for the duration
+    # of training; this keeps the for-loop indentation unchanged.
+    _autotune_ctx = autotune_result if autotune_result is not None else contextlib.nullcontext()
+    _autotune_ctx.__enter__()
+
     startup_log("entering training loop")
     if log_memory:
         log_device_memory("before first step", save_dir=save_path)
     _mem_logged_after_first_step = not log_memory
     _mem_logged_steady_state = not log_memory
- 
+
     for step_idx in range(start_step, train_cfg.num_steps):
         step = step_idx + 1
 
@@ -559,7 +579,11 @@ def run_sft(
         source_counts: dict[int, int] = {}
 
         for _micro in range(accum_steps):
-            batch = next(data_iter)
+            if pending_batch is not None:
+                batch = pending_batch
+                pending_batch = None
+            else:
+                batch = next(data_iter)
             sids = pop_source_ids(batch)
             if sids is not None:
                 for sid in sids.tolist():
@@ -640,6 +664,7 @@ def run_sft(
             if slurm_job_id and is_primary_process:
                 startup_log(f"[signal] scontrol requeue {slurm_job_id}")
                 subprocess.run(["scontrol", "requeue", slurm_job_id], check=False)
+            _autotune_ctx.__exit__(None, None, None)
             return optimizer, last_metrics
 
     _log_prev_metrics(force=True)
@@ -650,4 +675,5 @@ def run_sft(
         checkpoint_manager.wait_until_finished()
         checkpoint_manager.close()
 
+    _autotune_ctx.__exit__(None, None, None)
     return optimizer, last_metrics

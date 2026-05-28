@@ -60,6 +60,12 @@ flags.DEFINE_integer("fsdp_size", 1, "FSDP parallelism size.")
 flags.DEFINE_integer("dp_size", 1, "Data parallelism size.")
 flags.DEFINE_string("save_dir", None, "Checkpoint save directory.")
 flags.DEFINE_string("jax_cache_dir", "/tmp/jax_cache", "Directory for JAX persistent compilation cache.")
+flags.DEFINE_string(
+    "tokamax_cache_dir",
+    None,
+    "Directory for the persistent tokamax autotuning cache. If unset, autotuning runs "
+    "every launch with no persistence.",
+)
 flags.DEFINE_integer("save_every", 50, "Save checkpoint every N steps.")
 flags.DEFINE_integer("log_every", 10, "Log metrics every N steps.")
 flags.DEFINE_bool("log_memory", True, "Log per-process JAX/HBM memory at init and first few steps.")
@@ -323,6 +329,7 @@ def main(_) -> None:
             text_attn_backend=FLAGS.text_attn_backend,
             gc_period=FLAGS.gc_period,
             log_memory=FLAGS.log_memory,
+            tokamax_cache_dir=FLAGS.tokamax_cache_dir,
         )
     finally:
 
