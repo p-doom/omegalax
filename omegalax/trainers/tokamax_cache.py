@@ -32,10 +32,20 @@ def autotune_and_save(
     callable_,
     *args,
 ) -> tokamax.AutotuningResult:
-    """Run `tokamax.autotune` and persist the result on process 0."""
+    """Run `tokamax.autotune` and persist the result on process 0.
+
+    nnx.jit returns a `flax.nnx.transforms.compilation.Lowered` from `.lower()`,
+    which tokamax does not recognize as `jax.stages.Lowered`. Lower manually
+    and pass the inner `jax.stages.Lowered` to keep tokamax's HLO walk happy.
+    """
     path = cache_path(cache_dir)
     startup_log(f"running tokamax autotuning -> {path}")
-    result = tokamax.autotune(callable_, *args)
+    target = callable_
+    if args and hasattr(callable_, "lower"):
+        lowered = callable_.lower(*args)
+        target = getattr(lowered, "lowered", lowered)
+        args = ()
+    result = tokamax.autotune(target, *args)
     if jax.process_index() == 0:
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w") as f:
