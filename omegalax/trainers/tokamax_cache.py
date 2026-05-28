@@ -62,7 +62,11 @@ def autotune_and_save(
     )
     if jax.process_index() == 0:
         path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "w") as f:
+        # Atomic write so a mid-dump crash can't leave a 0-byte file that
+        # would later be loaded as an empty (= invalid) AutotuningResult.
+        tmp_path = path.with_suffix(path.suffix + ".tmp")
+        with open(tmp_path, "w") as f:
             pruned.dump(f)
+        tmp_path.replace(path)
         startup_log(f"saved tokamax autotuning cache ({len(pruned.data)} ops) to {path}")
     return pruned
