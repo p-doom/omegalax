@@ -12,6 +12,7 @@ from jax.sharding import PartitionSpec, reshard
 from tokamax import dot_product_attention
 
 from .config import Qwen3VLConfig
+from .remat import remat_wrap
 from .vision import VisionModel
 
 P = PartitionSpec
@@ -367,6 +368,22 @@ class TextAttention(nnx.Module):
         return out_BTD
 
 
+def _text_decoder_fwd(
+    layer: "TextDecoderLayer",
+    hidden_BTD: jax.Array,
+    sin_BTK: jax.Array,
+    cos_BTK: jax.Array,
+) -> tuple[jax.Array, jax.Array]:
+    hidden_BTD = hidden_BTD + layer.attn(layer.input_layernorm(hidden_BTD), sin_BTK, cos_BTK)
+    if layer.is_moe:
+        ff_out_BTD, aux_loss = layer.mlp(layer.post_attention_layernorm(hidden_BTD))
+    else:
+        ff_out_BTD = layer.mlp(layer.post_attention_layernorm(hidden_BTD))
+        aux_loss = jnp.array(0.0, dtype=jnp.float32)
+    hidden_BTD = hidden_BTD + ff_out_BTD
+    return hidden_BTD, aux_loss
+
+
 class TextDecoderLayer(nnx.Module):
     def __init__(self, cfg: Qwen3VLConfig, layer_idx: int, *, rngs: nnx.Rngs):
         self.layer_idx = layer_idx
@@ -375,17 +392,10 @@ class TextDecoderLayer(nnx.Module):
         self.post_attention_layernorm = RMSNorm(cfg.emb_dim, cfg.norm_eps, rngs=rngs)
         self.is_moe = cfg.is_moe_layer(layer_idx)
         self.mlp = TextMoEFeedForward(cfg, rngs=rngs) if self.is_moe else TextMLP(cfg, rngs=rngs)
+        object.__setattr__(self, "_remat_policy", "nothing")
 
-    @partial(jax.remat, static_argnums=0)
     def __call__(self, hidden_BTD: jax.Array, sin_BTK: jax.Array, cos_BTK: jax.Array) -> tuple[jax.Array, jax.Array]:
-        hidden_BTD = hidden_BTD + self.attn(self.input_layernorm(hidden_BTD), sin_BTK, cos_BTK)
-        if self.is_moe:
-            ff_out_BTD, aux_loss = self.mlp(self.post_attention_layernorm(hidden_BTD))
-        else:
-            ff_out_BTD = self.mlp(self.post_attention_layernorm(hidden_BTD))
-            aux_loss = jnp.array(0.0, dtype=jnp.float32)
-        hidden_BTD = hidden_BTD + ff_out_BTD
-        return hidden_BTD, aux_loss
+        return remat_wrap(_text_decoder_fwd, self._remat_policy)(self, hidden_BTD, sin_BTK, cos_BTK)
 
 
 class TextModel(nnx.Module):

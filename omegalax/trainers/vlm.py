@@ -323,6 +323,7 @@ def run_sft(
     val_every: int | None = None,
     val_steps: int = 10,
     text_attn_backend: str = "mosaic_gpu",
+    remat_policy: str = "nothing",
     gc_period: int = 0,
     log_memory: bool = False,
     tokamax_cache_dir: str | Path | None = None,
@@ -436,9 +437,11 @@ def run_sft(
             {"model_cfg": export_lib.model_config_to_hf_dict(model_cfg)},
             allow_val_change=True,
         )
-    from omegalax.models.sharding_runtime import set_attn_backend
+    from omegalax.models.sharding_runtime import set_attn_backend, set_remat_policy
     set_attn_backend(model, text_backend=text_attn_backend)
     startup_log(f"set attn backend: text={text_attn_backend}")
+    set_remat_policy(model, remat_policy)
+    startup_log(f"set remat policy: {remat_policy}")
     if train_cfg.enable_lora and train_cfg.freeze_vision_tower:
         raise ValueError(
             "--enable_lora already freezes the vision tower; "
