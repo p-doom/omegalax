@@ -12,7 +12,6 @@ import wandb
 from transformers import AutoImageProcessor, AutoTokenizer
 
 from omegalax.data.collator_qwen3 import VLMSFTCollator
-from omegalax.models.qwen3_vl.remat import remat_policy_choices
 from omegalax.data.grain_pipeline import (
     MixSource,
     make_grain_iterator,
@@ -120,15 +119,6 @@ _ATTN_BACKENDS = [
 ]
 flags.DEFINE_enum("text_attn_backend", "mosaic_gpu", _ATTN_BACKENDS,
                   "Attention backend for the text decoder.")
-flags.DEFINE_enum(
-    "remat_policy", "nothing", list(remat_policy_choices()),
-    "Activation rematerialization policy applied to every TextDecoderLayer "
-    "and VisionBlock. 'nothing' (default) recomputes everything in backward "
-    "(min HBM, max FLOPs). 'dots_no_batch' saves weight-matmul outputs "
-    "(Q/K/V/O and MLP gate/up/down) — typical 15-30% step-time win. "
-    "'dots' saves all dot_generals including attention. 'offload' moves "
-    "saved matmuls to host RAM. 'none' disables remat entirely.",
-)
 
 def _default_save_dir(model_id: str) -> Path:
     safe_name = model_id.replace("/", "_")
@@ -337,7 +327,6 @@ def main(_) -> None:
             val_every=FLAGS.val_every,
             val_steps=FLAGS.val_steps,
             text_attn_backend=FLAGS.text_attn_backend,
-            remat_policy=FLAGS.remat_policy,
             gc_period=FLAGS.gc_period,
             log_memory=FLAGS.log_memory,
             tokamax_cache_dir=FLAGS.tokamax_cache_dir,

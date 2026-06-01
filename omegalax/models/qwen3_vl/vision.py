@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from functools import partial
+
 import jax
 import jax.numpy as jnp
 from flax import nnx
@@ -14,7 +16,6 @@ from jax._src.cudnn.fused_attention_stablehlo import (
 
 from omegalax.models.shard_config import ShardConfig
 from .config import Qwen3VLVisionConfig
-from .remat import remat_wrap
 
 
 def _cudnn_packed_vision_attention_local(
@@ -304,19 +305,6 @@ class VisionAttention(nnx.Module):
         return out_ND
 
 
-def _vision_block_fwd(
-    block: "VisionBlock",
-    hidden_ND: jax.Array,
-    cu_seqlens: jax.Array,
-    seqlens: jax.Array,
-    cos_NK: jax.Array,
-    sin_NK: jax.Array,
-) -> jax.Array:
-    hidden_ND = hidden_ND + block.attn(block.norm1(hidden_ND), cu_seqlens, seqlens, cos_NK, sin_NK)
-    hidden_ND = hidden_ND + block.mlp(block.norm2(hidden_ND))
-    return hidden_ND
-
-
 class VisionBlock(nnx.Module):
     def __init__(self, cfg: Qwen3VLVisionConfig, hidden_shd: P, ff_shd: P, heads_shd: P, *, rngs: nnx.Rngs):
         self.norm1 = LayerNorm(cfg.hidden_size, eps=1e-6, rngs=rngs)
@@ -324,10 +312,12 @@ class VisionBlock(nnx.Module):
         self.attn = VisionAttention(cfg, hidden_shd=hidden_shd, heads_shd=heads_shd, rngs=rngs)
         self.mlp = VisionMLP(cfg, hidden_shd=hidden_shd, ff_shd=ff_shd, rngs=rngs)
         self.hidden_shd = hidden_shd
-        object.__setattr__(self, "_remat_policy", "nothing")
 
+    @partial(jax.remat, static_argnums=0)
     def __call__(self, hidden_ND: jax.Array, cu_seqlens: jax.Array, seqlens: jax.Array, cos_NK: jax.Array, sin_NK: jax.Array) -> jax.Array:
-        return remat_wrap(_vision_block_fwd, self._remat_policy)(self, hidden_ND, cu_seqlens, seqlens, cos_NK, sin_NK)
+        hidden_ND = hidden_ND + self.attn(self.norm1(hidden_ND), cu_seqlens, seqlens, cos_NK, sin_NK)
+        hidden_ND = hidden_ND + self.mlp(self.norm2(hidden_ND))
+        return hidden_ND
 
 
 class VisionPatchMerger(nnx.Module):

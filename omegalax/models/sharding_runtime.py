@@ -52,13 +52,6 @@ def set_attn_backend(
             object.__setattr__(module, "_attn_backend", text_backend)
 
 
-def set_remat_policy(model: nnx.Module, policy_name: str) -> None:
-    """Set ``_remat_policy`` on every block that opted in (text + vision)."""
-    for _, module in nnx.iter_modules(model):
-        if hasattr(module, "_remat_policy"):
-            object.__setattr__(module, "_remat_policy", policy_name)
-
-
 def batch_partition_spec(shd_cfg: ShardConfig) -> PartitionSpec:
     return P(shd_cfg.act_btd[0], None)
 
