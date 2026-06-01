@@ -596,6 +596,9 @@ def run_sft(
                 train_cfg.seq_len,
                 train_cfg.batch_size,
                 image_grid_thw=batch.get("image_grid_thw"),
+                vision_trainable=not (
+                    train_cfg.freeze_vision_tower or train_cfg.enable_lora
+                ),
             )
             batch = vlm_api.shard_batch_dict(batch, model_cfg, mesh)
             _, metrics = sft_step(optimizer, batch)

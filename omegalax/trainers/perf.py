@@ -143,9 +143,9 @@ def _training_flops_per_token_qwen3_vl(cfg: Qwen3VLConfig, seq_len: int) -> int:
 
 
 def qwen3_vl_vision_training_flops(
-    cfg: Qwen3VLConfig, image_grid_thw: Any | None
+    cfg: Qwen3VLConfig, image_grid_thw: Any | None, *, vision_trainable: bool = True
 ) -> int:
-    """Theoretical Qwen3-VL vision-tower FLOPs for one training step (x3).
+    """Theoretical Qwen3-VL vision-tower FLOPs for one training step.
 
     Counts matmuls only and matches the current implementation in
     ``omegalax.models.qwen3_vl.vision``:
@@ -154,6 +154,13 @@ def qwen3_vl_vision_training_flops(
       kernel uses ``vision_cu_seqlens`` to skip cross-image tiles, so per-image
       attention costs are summed (``sum_i 4 * N_i^2 * H * K``) rather than
       computed over the concatenated batch (``4 * (sum_i N_i)^2 * H * K``).
+
+    ``vision_trainable`` controls the forward/backward multiplier. When the
+    vision tower is trained, FLOPs are forward + backward (``x3``). When it is
+    frozen (``--freeze_vision_tower`` or ``--enable_lora``, which take gradients
+    only ``wrt`` non-vision params), no backward is built for the tower, so it
+    runs forward-only (``x1``). Counting frozen vision at ``x3`` would inflate
+    MFU because the vision tower dominates this VLM's FLOPs.
     """
     if image_grid_thw is None:
         return 0
@@ -199,7 +206,8 @@ def qwen3_vl_vision_training_flops(
     merger_flops = num_mergers * (merger_fc1_flops + merger_fc2_flops)
 
     forward = patch_embed_flops + block_flops + merger_flops
-    return forward * TRAINING_FLOP_MULTIPLIER
+    multiplier = TRAINING_FLOP_MULTIPLIER if vision_trainable else 1
+    return forward * multiplier
 
 
 def _training_flops_per_token_qwen3_moe(cfg: Qwen3Config, seq_len: int) -> int:
@@ -487,16 +495,22 @@ def per_device_flops_per_step(
     seq_len: int,
     batch_size: int,
     image_grid_thw: Any | None = None,
+    *,
+    vision_trainable: bool = True,
 ) -> float:
     """Total training FLOPs per step, divided by device count.
 
     For Qwen3-VL, ``image_grid_thw`` adds the vision-tower FLOPs for the
     concrete batch. Text-decoder FLOPs are still computed from the padded
-    ``seq_len`` and ``batch_size``.
+    ``seq_len`` and ``batch_size``. ``vision_trainable=False`` counts the
+    frozen vision tower forward-only (``x1``) instead of forward+backward
+    (``x3``); see ``qwen3_vl_vision_training_flops``.
     """
     total = training_flops_per_token(cfg, seq_len) * seq_len * batch_size
     if isinstance(cfg, Qwen3VLConfig):
-        total += qwen3_vl_vision_training_flops(cfg, image_grid_thw)
+        total += qwen3_vl_vision_training_flops(
+            cfg, image_grid_thw, vision_trainable=vision_trainable
+        )
     return total / max(1, jax.device_count())
 
 
