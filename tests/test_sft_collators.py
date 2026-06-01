@@ -6,6 +6,7 @@ os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
 from absl.testing import absltest
 
+import ml_dtypes
 import numpy as np
 from transformers import AutoTokenizer
 
@@ -341,6 +342,31 @@ class VLMSFTCollatorTest(absltest.TestCase):
         grid = batch["image_grid_thw"][0]
         expected_pads = int(grid[0]) * (int(grid[1]) // 2) * (int(grid[2]) // 2)
         self.assertEqual(n_pad, expected_pads)
+
+    def test_pixel_values_dtype_is_bf16_by_default(self):
+        from PIL import Image
+        img = Image.new("RGB", (100, 100), color=(10, 20, 30))
+        examples = [
+            {"messages": [
+                {"role": "user", "content": [
+                    {"type": "image", "image": img},
+                    {"type": "text", "text": "Describe."},
+                ]},
+                {"role": "assistant", "content": "ok."},
+            ]},
+        ]
+        # Default: pixel_values are downcast to bf16 (the vision patch embed
+        # computes in bf16 anyway), halving the input buffer with no numerical
+        # change vs the implicit fp32->bf16 cast inside the Linear.
+        self.assertEqual(self.collator(examples)["pixel_values"].dtype, ml_dtypes.bfloat16)
+
+        # The override is honored, e.g. for a full-fp32-compute run.
+        fp32_collator = VLMSFTCollator(
+            self.tokenizer, max_length=self.max_length,
+            image_processor=self.image_processor,
+            pixel_values_dtype=np.float32,
+        )
+        self.assertEqual(fp32_collator(examples)["pixel_values"].dtype, np.float32)
 
     def test_loss_mask_on_assistant_only(self):
         from PIL import Image

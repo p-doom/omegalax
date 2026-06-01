@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import datetime
 import gc
@@ -22,9 +23,15 @@ from omegalax.data.grain_pipeline import pop_source_ids
 from omegalax.distributed.mesh import ensure_mesh, mesh_rules, required_batch_multiple
 from omegalax.models.params_utils import save_hf_config
 from omegalax.trainers import checkpoint_utils
+from omegalax.trainers import tokamax_cache as tokamax_cache_lib
 from omegalax.trainers.loss import chunked_cross_entropy_loss
 from omegalax.trainers.lr_schedule import build_lr_schedule
 from omegalax.trainers.perf import (
+    log_compiled_memory_analysis,
+    log_device_memory,
+    log_live_arrays,
+    log_pytree_bytes,
+    log_top_leaves_with_paths,
     maybe_log_step_metrics,
     per_device_flops_per_step,
     StepTimer,
@@ -71,6 +78,7 @@ class TrainConfig:
     lora_rank: int = 32
     lora_alpha: float = 32.0
     freeze_vision_tower: bool = False
+    num_loss_tiles: int = 4
 
 
 def init_model(
@@ -108,9 +116,6 @@ def build_optimizer(
         tx = optax.MultiSteps(tx, every_k_schedule=train_cfg.grad_accum_steps)
     opt = MixedPrecisionOptimizer(model, tx, wrt=wrt)
     return opt
-
-
-_NUM_LOSS_TILES = 4
 
 
 def _train_state(optimizer: MixedPrecisionOptimizer, rng: jax.Array) -> dict[str, object]:
@@ -203,7 +208,7 @@ def _restore_sft_checkpoint(
     return optimizer, int(latest_step), train_state["rng"], checkpoint_utils.restored_input_iter(restored)
 
 
-def make_sft_train_step(cfg, pad_id: int = 0, *, wrt=nnx.Param):
+def make_sft_train_step(cfg, pad_id: int = 0, *, wrt=nnx.Param, num_loss_tiles: int = 4):
     """Build a JIT-compiled VLM SFT train step that consumes a batch dict.
 
     The batch dict must contain ``token_ids_BT``, ``attention_mask_BT``, and
@@ -243,7 +248,7 @@ def make_sft_train_step(cfg, pad_id: int = 0, *, wrt=nnx.Param):
             lm_weight = model.output_weight()
             loss = chunked_cross_entropy_loss(
                 hidden_BTD, lm_weight, token_ids_BT, loss_mask_BT,
-                num_tiles=_NUM_LOSS_TILES,
+                num_tiles=num_loss_tiles,
                 logits_out_sharding=cfg.shd_cfg.logits_btv,
             ) + aux_loss
             supervised_tokens = jnp.sum(loss_mask_BT[:, 1:].astype(jnp.float32))
@@ -263,7 +268,7 @@ def make_sft_train_step(cfg, pad_id: int = 0, *, wrt=nnx.Param):
     return sft_train_step
 
 
-def make_sft_eval_step(cfg, pad_id: int = 0):
+def make_sft_eval_step(cfg, pad_id: int = 0, *, num_loss_tiles: int = 4):
     """Build a JIT-compiled VLM SFT eval step (forward only, no gradients)."""
 
     @nnx.jit
@@ -290,7 +295,7 @@ def make_sft_eval_step(cfg, pad_id: int = 0):
         lm_weight = model.output_weight()
         loss = chunked_cross_entropy_loss(
             hidden_BTD, lm_weight, token_ids_BT, loss_mask_BT,
-            num_tiles=_NUM_LOSS_TILES,
+            num_tiles=num_loss_tiles,
             logits_out_sharding=cfg.shd_cfg.logits_btv,
         ) + aux_loss
         supervised_tokens = jnp.sum(loss_mask_BT[:, 1:].astype(jnp.float32))
@@ -319,6 +324,8 @@ def run_sft(
     val_steps: int = 10,
     text_attn_backend: str = "mosaic_gpu",
     gc_period: int = 0,
+    log_memory: bool = False,
+    tokamax_cache_dir: str | Path | None = None,
 ) -> tuple[MixedPrecisionOptimizer, dict[str, float]]:
     """SFT a VLM from a Grain iterator; returns final optimizer + last metrics.
 
@@ -457,12 +464,28 @@ def run_sft(
         )
     else:
         wrt_filter = nnx.Param
+
+    if log_memory:
+        log_pytree_bytes("params (after load)", nnx.state(model, nnx.Param), save_dir=save_path)
+        log_device_memory("after model load", save_dir=save_path)
+
     with mesh_rules(mesh):
         optimizer = build_optimizer(model, lr_schedule_fn, train_cfg, wrt=wrt_filter)
 
     startup_log("built optimizer")
-    sft_step = make_sft_train_step(model_cfg, pad_id=pad_id, wrt=wrt_filter)
-    eval_step = make_sft_eval_step(model_cfg, pad_id=pad_id) if val_data_iter is not None else None
+    if log_memory:
+        log_pytree_bytes("optimizer.opt_state", nnx.state(optimizer.opt_state), save_dir=save_path)
+        log_pytree_bytes("optimizer (params + state)", nnx.state(optimizer), save_dir=save_path)
+        log_top_leaves_with_paths("optimizer (params + state) by path", nnx.state(optimizer), save_dir=save_path)
+        log_device_memory("after optimizer build", save_dir=save_path)
+ 
+    sft_step = make_sft_train_step(
+        model_cfg, pad_id=pad_id, wrt=wrt_filter, num_loss_tiles=train_cfg.num_loss_tiles,
+    )
+    eval_step = (
+        make_sft_eval_step(model_cfg, pad_id=pad_id, num_loss_tiles=train_cfg.num_loss_tiles)
+        if val_data_iter is not None else None
+    )
     startup_log("built train step (jit)" + (" and eval step (jit)" if eval_step is not None else ""))
 
     accum_steps = train_cfg.grad_accum_steps
@@ -505,7 +528,7 @@ def run_sft(
             global_tokens_per_step=global_tokens_per_step,
             peak_tflops=peak_tflops,
             wandb_run=wandb_run,
-            batch_size=train_cfg.batch_size,
+            batch_size=train_cfg.batch_size * accum_steps,
         )
         if result is not None:
             last_metrics = result
@@ -522,7 +545,29 @@ def run_sft(
     signal.signal(signal.SIGUSR1, _request_requeue)
     signal.signal(signal.SIGTERM, _request_requeue)
 
+    autotune_result = None
+    pending_batch = None
+    if tokamax_cache_dir is not None:
+        autotune_result = tokamax_cache_lib.try_load(tokamax_cache_dir)
+        if autotune_result is None:
+            startup_log("priming tokamax autotuning with first training batch")
+            pending_batch = next(data_iter)
+            pending_batch_sharded = vlm_api.shard_batch_dict(pending_batch, model_cfg, mesh)
+            autotune_result = tokamax_cache_lib.autotune_and_save(
+                tokamax_cache_dir, sft_step, optimizer, pending_batch_sharded
+            )
+
+    # Push the autotuning overlay onto tokamax's lookup stack for the duration
+    # of training; this keeps the for-loop indentation unchanged.
+    _autotune_ctx = autotune_result if autotune_result is not None else contextlib.nullcontext()
+    _autotune_ctx.__enter__()
+
     startup_log("entering training loop")
+    if log_memory:
+        log_device_memory("before first step", save_dir=save_path)
+    _mem_logged_after_first_step = not log_memory
+    _mem_logged_steady_state = not log_memory
+
     for step_idx in range(start_step, train_cfg.num_steps):
         step = step_idx + 1
 
@@ -534,7 +579,11 @@ def run_sft(
         source_counts: dict[int, int] = {}
 
         for _micro in range(accum_steps):
-            batch = next(data_iter)
+            if pending_batch is not None:
+                batch = pending_batch
+                pending_batch = None
+            else:
+                batch = next(data_iter)
             sids = pop_source_ids(batch)
             if sids is not None:
                 for sid in sids.tolist():
@@ -544,6 +593,9 @@ def run_sft(
                 train_cfg.seq_len,
                 train_cfg.batch_size,
                 image_grid_thw=batch.get("image_grid_thw"),
+                vision_trainable=not (
+                    train_cfg.freeze_vision_tower or train_cfg.enable_lora
+                ),
             )
             batch = vlm_api.shard_batch_dict(batch, model_cfg, mesh)
             _, metrics = sft_step(optimizer, batch)
@@ -555,6 +607,17 @@ def run_sft(
             accum_flops += micro_flops
             accum_time += micro_delta
 
+        # Log memory after first step and after 5 steps
+        if not _mem_logged_after_first_step:
+            jax.block_until_ready(metrics["loss"])
+            log_device_memory("after first step (compile done)", save_dir=save_path)
+            log_live_arrays("after first step (compile done)", save_dir=save_path)
+            log_compiled_memory_analysis("sft_step", sft_step, save_path, optimizer, batch)
+            _mem_logged_after_first_step = True
+        elif not _mem_logged_steady_state and step_idx >= 4:
+            jax.block_until_ready(metrics["loss"])
+            log_device_memory("after step 5 (steady state)", save_dir=save_path)
+            _mem_logged_steady_state = True
 
         with jax.default_device('cpu'):
             window_metrics = {
@@ -604,6 +667,7 @@ def run_sft(
             if slurm_job_id and is_primary_process:
                 startup_log(f"[signal] scontrol requeue {slurm_job_id}")
                 subprocess.run(["scontrol", "requeue", slurm_job_id], check=False)
+            _autotune_ctx.__exit__(None, None, None)
             return optimizer, last_metrics
 
     _log_prev_metrics(force=True)
@@ -614,4 +678,5 @@ def run_sft(
         checkpoint_manager.wait_until_finished()
         checkpoint_manager.close()
 
+    _autotune_ctx.__exit__(None, None, None)
     return optimizer, last_metrics

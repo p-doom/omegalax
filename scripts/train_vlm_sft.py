@@ -60,8 +60,15 @@ flags.DEFINE_integer("fsdp_size", 1, "FSDP parallelism size.")
 flags.DEFINE_integer("dp_size", 1, "Data parallelism size.")
 flags.DEFINE_string("save_dir", None, "Checkpoint save directory.")
 flags.DEFINE_string("jax_cache_dir", "/tmp/jax_cache", "Directory for JAX persistent compilation cache.")
+flags.DEFINE_string(
+    "tokamax_cache_dir",
+    None,
+    "Directory for the persistent tokamax autotuning cache. If unset, autotuning runs "
+    "every launch with no persistence.",
+)
 flags.DEFINE_integer("save_every", 50, "Save checkpoint every N steps.")
 flags.DEFINE_integer("log_every", 10, "Log metrics every N steps.")
+flags.DEFINE_bool("log_memory", True, "Log per-process JAX/HBM memory at init and first few steps.")
 flags.DEFINE_enum(
     "resume",
     ResumeMode.NEVER.value,
@@ -103,6 +110,9 @@ flags.DEFINE_boolean("freeze_vision_tower", False,
                      "layernorms while freezing the vision tower at the "
                      "gradient/opt-state layer. Mutually exclusive with "
                      "--enable_lora (which already freezes vision).")
+flags.DEFINE_integer("num_loss_tiles", 4,
+                     "Number of tiles for chunked cross-entropy along the "
+                     "sequence axis. Must evenly divide (max_length - 1).")
 
 _ATTN_BACKENDS = [
     "mosaic_tpu", "mosaic_gpu", "cudnn", "xla", "triton",
@@ -274,6 +284,7 @@ def main(_) -> None:
         lora_rank=FLAGS.lora_rank,
         lora_alpha=FLAGS.lora_alpha,
         freeze_vision_tower=FLAGS.freeze_vision_tower,
+        num_loss_tiles=FLAGS.num_loss_tiles,
     )
     resume_mode = ResumeMode(FLAGS.resume)
     save_dir = Path(FLAGS.save_dir) if FLAGS.save_dir else (
@@ -317,6 +328,8 @@ def main(_) -> None:
             val_steps=FLAGS.val_steps,
             text_attn_backend=FLAGS.text_attn_backend,
             gc_period=FLAGS.gc_period,
+            log_memory=FLAGS.log_memory,
+            tokamax_cache_dir=FLAGS.tokamax_cache_dir,
         )
     finally:
 

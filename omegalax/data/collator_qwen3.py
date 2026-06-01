@@ -10,6 +10,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Any
 
+import ml_dtypes
 import numpy as np
 from transformers import BaseImageProcessor, PreTrainedTokenizer
 
@@ -227,12 +228,14 @@ class VLMSFTCollator:
         *,
         max_vision_patches_per_sample: int | None = None,
         max_vision_images_per_sample: int | None = None,
+        pixel_values_dtype: Any = ml_dtypes.bfloat16,
     ) -> None:
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.image_processor = image_processor
         self._max_vision_patches_per_sample = max_vision_patches_per_sample
         self._max_vision_images_per_sample = max_vision_images_per_sample
+        self._pixel_values_dtype = pixel_values_dtype
         assert tokenizer.pad_token_id is not None, "tokenizer must have pad_token_id set (e.g. Qwen3-VL, Qwen3.5)"
 
         self._im_start_id = tokenizer.convert_tokens_to_ids("<|im_start|>")
@@ -342,7 +345,7 @@ class VLMSFTCollator:
         else:
             vision_cu_seqlens = _compute_vision_cu_seqlens(image_grid_thw)
 
-        result["pixel_values"] = pixel_values
+        result["pixel_values"] = pixel_values.astype(self._pixel_values_dtype, copy=False)
         result["image_grid_thw"] = image_grid_thw
         result["vision_cu_seqlens"] = vision_cu_seqlens
 

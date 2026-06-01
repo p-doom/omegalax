@@ -19,6 +19,7 @@ import datetime
 from typing import Any, Union
 
 import jax
+import jax.tree_util as jtu
 import numpy as np
 
 from omegalax.models.qwen3.config import Qwen3Config
@@ -142,9 +143,9 @@ def _training_flops_per_token_qwen3_vl(cfg: Qwen3VLConfig, seq_len: int) -> int:
 
 
 def qwen3_vl_vision_training_flops(
-    cfg: Qwen3VLConfig, image_grid_thw: Any | None
+    cfg: Qwen3VLConfig, image_grid_thw: Any | None, *, vision_trainable: bool = True
 ) -> int:
-    """Theoretical Qwen3-VL vision-tower FLOPs for one training step (x3).
+    """Theoretical Qwen3-VL vision-tower FLOPs for one training step.
 
     Counts matmuls only and matches the current implementation in
     ``omegalax.models.qwen3_vl.vision``:
@@ -153,6 +154,13 @@ def qwen3_vl_vision_training_flops(
       kernel uses ``vision_cu_seqlens`` to skip cross-image tiles, so per-image
       attention costs are summed (``sum_i 4 * N_i^2 * H * K``) rather than
       computed over the concatenated batch (``4 * (sum_i N_i)^2 * H * K``).
+
+    ``vision_trainable`` controls the forward/backward multiplier. When the
+    vision tower is trained, FLOPs are forward + backward (``x3``). When it is
+    frozen (``--freeze_vision_tower`` or ``--enable_lora``, which take gradients
+    only ``wrt`` non-vision params), no backward is built for the tower, so it
+    runs forward-only (``x1``). Counting frozen vision at ``x3`` would inflate
+    MFU because the vision tower dominates this VLM's FLOPs.
     """
     if image_grid_thw is None:
         return 0
@@ -198,7 +206,8 @@ def qwen3_vl_vision_training_flops(
     merger_flops = num_mergers * (merger_fc1_flops + merger_fc2_flops)
 
     forward = patch_embed_flops + block_flops + merger_flops
-    return forward * TRAINING_FLOP_MULTIPLIER
+    multiplier = TRAINING_FLOP_MULTIPLIER if vision_trainable else 1
+    return forward * multiplier
 
 
 def _training_flops_per_token_qwen3_moe(cfg: Qwen3Config, seq_len: int) -> int:
@@ -289,6 +298,176 @@ def _training_flops_per_token_qwen3_5(cfg: Qwen3_5TextConfig, seq_len: int) -> i
     return forward_per_token * TRAINING_FLOP_MULTIPLIER
 
 
+def _tree_global_bytes(tree) -> int:
+    """Logical bytes for every leaf in a pytree (global, ignores sharding)."""
+    total = 0
+    for x in jax.tree.leaves(tree):
+        dtype = getattr(x, "dtype", None)
+        size = getattr(x, "size", None)
+        if dtype is None or size is None:
+            continue
+        total += int(size) * dtype.itemsize
+    return total
+
+
+def _tree_local_bytes(tree) -> int:
+    """Bytes that physically live on this process's devices (sum of addressable shards)."""
+    total = 0
+    for x in jax.tree.leaves(tree):
+        shards = getattr(x, "addressable_shards", None)
+        if shards is not None:
+            for s in shards:
+                total += s.data.nbytes
+        elif hasattr(x, "nbytes"):
+            total += x.nbytes
+    return total
+
+
+def _write_memory_log(save_dir: Any, lines: list[str]) -> None:
+    """Append ``lines`` (timestamp-prefixed) to ``<save_dir>/memory.log``.
+
+    No-op on non-primary processes or when ``save_dir`` is None.
+    """
+    from pathlib import Path
+
+    log_path = Path(save_dir) / "memory.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with open(log_path, "a") as f:
+        for line in lines:
+            f.write(f"[{ts}] {line}\n")
+
+
+def log_pytree_bytes(name: str, tree, save_dir: Any) -> None:
+    """Log global + per-process byte counts for a pytree to ``save_dir/memory.log``."""
+    if jax.process_index() != 0:
+        return
+    n_leaves = len(jax.tree.leaves(tree))
+    gb = _tree_global_bytes(tree) / 1e9
+    lb = _tree_local_bytes(tree) / 1e9
+    _write_memory_log(
+        save_dir,
+        [f"{name}: leaves={n_leaves} global={gb:.3f} GB local(per-process)={lb:.3f} GB"],
+    )
+
+
+def log_device_memory(tag: str, save_dir: Any) -> None:
+    """Log per-device allocator stats (in-use / peak / limit / largest-free-block)."""
+    lines: list[str] = []
+    for d in jax.local_devices():
+        try:
+            s = d.memory_stats()
+        except Exception as e:
+            lines.append(
+                f"{tag} proc={jax.process_index()} dev={d.id}: memory_stats unavailable ({e})"
+            )
+            continue
+        if not s:
+            continue
+        in_use = s.get("bytes_in_use", 0) / 1e9
+        peak = s.get("peak_bytes_in_use", 0) / 1e9
+        limit = s.get("bytes_limit", 0) / 1e9
+        reserved = s.get("bytes_reserved", 0) / 1e9
+        largest_free = s.get("largest_free_block_bytes", 0) / 1e9
+        lines.append(
+            f"{tag} proc={jax.process_index()} dev={d.id}: "
+            f"in_use={in_use:.2f} GB peak={peak:.2f} GB "
+            f"limit={limit:.2f} GB reserved={reserved:.2f} GB "
+            f"largest_free_block={largest_free:.2f} GB"
+        )
+    if lines:
+        _write_memory_log(save_dir, lines)
+
+
+def log_top_leaves_with_paths(name: str, tree, save_dir: Any) -> None:
+    """Log all pytree leaves by local bytes (sorted desc) to ``save_dir/memory.log``.
+
+    Unlike ``log_live_arrays`` (which uses anonymous ``jax.live_arrays()``), this
+    walks a named pytree (e.g. ``nnx.state(optimizer)``) so each entry is tied
+    to the param/opt-state slot it came from. Appends to the log file so
+    multiple calls within a run accumulate.
+    """
+    if jax.process_index() != 0:
+        return
+    leaves_with_paths, _ = jtu.tree_flatten_with_path(tree)
+    sized = []
+    for path, x in leaves_with_paths:
+        shards = getattr(x, "addressable_shards", None)
+        if shards is not None:
+            nb = sum(s.data.nbytes for s in shards)
+        else:
+            nb = getattr(x, "nbytes", 0)
+        sized.append((nb, jtu.keystr(path), getattr(x, "shape", None), getattr(x, "dtype", None)))
+    sized.sort(reverse=True, key=lambda e: e[0])
+
+    lines = [f"{name}: all {len(sized)} leaves by local bytes"]
+    for nb, path, shape, dtype in sized:
+        lines.append(f"  {nb / 1e6:12.2f} MB {path}  shape={shape} dtype={dtype}")
+    _write_memory_log(save_dir, lines)
+
+
+def log_live_arrays(tag: str, save_dir: Any) -> None:
+    """Log a summary of all currently-alive JAX arrays on this process."""
+    if jax.process_index() != 0:
+        return
+    try:
+        arrays = jax.live_arrays()
+    except Exception as e:
+        _write_memory_log(save_dir, [f"{tag}: live_arrays unavailable ({e})"])
+        return
+    entries = []
+    total_local = 0
+    for a in arrays:
+        shards = getattr(a, "addressable_shards", None)
+        if shards is not None:
+            nb = sum(s.data.nbytes for s in shards)
+        else:
+            nb = getattr(a, "nbytes", 0)
+        total_local += nb
+        entries.append((nb, getattr(a, "shape", None), getattr(a, "dtype", None)))
+    entries.sort(reverse=True, key=lambda e: e[0])
+    lines = [f"{tag}: live_arrays count={len(arrays)} local_total={total_local / 1e9:.3f} GB"]
+    for nb, shape, dtype in entries:
+        lines.append(f"  {nb / 1e6:12.2f} MB shape={shape} dtype={dtype}")
+    _write_memory_log(save_dir, lines)
+
+
+def log_compiled_memory_analysis(name: str, jit_fn, save_dir: Any, *args, **kwargs) -> None:
+    """Best-effort: lower+compile the jit fn and log XLA's static memory analysis.
+
+    This re-traces but should hit the persistent compile cache. Wrapped in
+    try/except because (a) nnx.jit may not expose .lower for all signatures and
+    (b) some backends don't implement memory_analysis.
+    """
+    if jax.process_index() != 0:
+        return
+    try:
+        lowered = jit_fn.lower(*args, **kwargs)
+        compiled = lowered.compile()
+        ma = compiled.memory_analysis()
+    except Exception as e:
+        _write_memory_log(
+            save_dir, [f"{name}: memory_analysis unavailable ({type(e).__name__}: {e})"]
+        )
+        return
+    if ma is None:
+        _write_memory_log(save_dir, [f"{name}: memory_analysis returned None"])
+        return
+    fields = [
+        "argument_size_in_bytes",
+        "output_size_in_bytes",
+        "temp_size_in_bytes",
+        "alias_size_in_bytes",
+        "host_temp_size_in_bytes",
+    ]
+    parts = []
+    for f in fields:
+        v = getattr(ma, f, None)
+        if v is not None:
+            parts.append(f"{f[: -len('_in_bytes')]}={v / 1e9:.3f} GB")
+    _write_memory_log(save_dir, [f"{name}: " + " ".join(parts)])
+
+
 class StepTimer:
     """Wall-clock timer between step dispatches (no device sync).
 
@@ -316,16 +495,22 @@ def per_device_flops_per_step(
     seq_len: int,
     batch_size: int,
     image_grid_thw: Any | None = None,
+    *,
+    vision_trainable: bool = True,
 ) -> float:
     """Total training FLOPs per step, divided by device count.
 
     For Qwen3-VL, ``image_grid_thw`` adds the vision-tower FLOPs for the
     concrete batch. Text-decoder FLOPs are still computed from the padded
-    ``seq_len`` and ``batch_size``.
+    ``seq_len`` and ``batch_size``. ``vision_trainable=False`` counts the
+    frozen vision tower forward-only (``x1``) instead of forward+backward
+    (``x3``); see ``qwen3_vl_vision_training_flops``.
     """
     total = training_flops_per_token(cfg, seq_len) * seq_len * batch_size
     if isinstance(cfg, Qwen3VLConfig):
-        total += qwen3_vl_vision_training_flops(cfg, image_grid_thw)
+        total += qwen3_vl_vision_training_flops(
+            cfg, image_grid_thw, vision_trainable=vision_trainable
+        )
     return total / max(1, jax.device_count())
 
 

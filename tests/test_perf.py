@@ -64,6 +64,15 @@ class TrainingFlopsPerTokenTest(absltest.TestCase):
         flops = qwen3_vl_vision_training_flops(cfg, [[1, 4, 4]])
         self.assertGreater(flops, 0)
 
+    def test_qwen3_vl_vision_training_flops_frozen_is_forward_only(self):
+        # A frozen vision tower runs forward-only (x1); a trained one is
+        # forward+backward (x3). The frozen count must be exactly 1/3.
+        cfg = make_qwen3_vl_config("qwen3-vl-smoke")
+        grid = [[1, 4, 4]]
+        trained = qwen3_vl_vision_training_flops(cfg, grid, vision_trainable=True)
+        frozen = qwen3_vl_vision_training_flops(cfg, grid, vision_trainable=False)
+        self.assertEqual(trained, 3 * frozen)
+
     def test_qwen3_vl_vision_training_flops_block_diagonal_attention(self):
         # Block-diagonal attention is linear in num_images for equal-sized
         # images: two same-shape images cost exactly 2x one image (everything
@@ -89,6 +98,23 @@ class PerDeviceFlopsStepTest(absltest.TestCase):
                 cfg, seq_len=8, batch_size=2, image_grid_thw=[[1, 4, 4]]
             )
         self.assertGreater(with_images, base)
+
+    def test_qwen3_vl_per_device_flops_frozen_vision_only_scales_vision(self):
+        # Freezing the vision tower drops only the vision backward: the
+        # text-decoder term (= base, no images) is unchanged, while the vision
+        # contribution shrinks to 1/3 (forward-only).
+        cfg = make_qwen3_vl_config("qwen3-vl-smoke")
+        grid = [[1, 4, 4]]
+        with mock.patch("jax.device_count", return_value=1):
+            base = per_device_flops_per_step(cfg, seq_len=8, batch_size=2)
+            trained = per_device_flops_per_step(
+                cfg, seq_len=8, batch_size=2, image_grid_thw=grid
+            )
+            frozen = per_device_flops_per_step(
+                cfg, seq_len=8, batch_size=2, image_grid_thw=grid,
+                vision_trainable=False,
+            )
+        self.assertEqual(frozen, base + (trained - base) / 3)
 
 
 class StepMetricsTest(absltest.TestCase):
