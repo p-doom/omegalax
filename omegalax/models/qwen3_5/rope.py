@@ -12,7 +12,7 @@ def generate_vision_rope(seqlen: int, dim: int, theta: float = 10000.0):
         freqs_NK: (seqlen, dim // 2)
     """
     fraction = jnp.arange(0, dim, 2, dtype=jnp.float32) / dim
-    inv_freq = 1.0 / (theta ** fraction)
+    inv_freq = 1.0 / (theta**fraction)
     seq = jnp.arange(seqlen, dtype=jnp.float32)
     return jnp.outer(seq, inv_freq)
 
@@ -56,7 +56,7 @@ def generate_text_rope(
     """
     rotary_dim = int(head_dim * partial_rotary_factor)
     fraction = jnp.arange(0, rotary_dim, 2, dtype=jnp.float32) / rotary_dim
-    inv_freq = 1.0 / (rope_theta ** fraction)
+    inv_freq = 1.0 / (rope_theta**fraction)
 
     inv_freq_exp = inv_freq[None, None, :, None]
     pos_exp = position_ids_ZBT[:, :, None, :].astype(jnp.float32)
@@ -67,9 +67,7 @@ def generate_text_rope(
     return jnp.cos(emb_BTK), jnp.sin(emb_BTK)
 
 
-def _apply_interleaved_mrope(
-    freqs_ZBTK: jax.Array, mrope_section: tuple[int, ...]
-) -> jax.Array:
+def _apply_interleaved_mrope(freqs_ZBTK: jax.Array, mrope_section: tuple[int, ...]) -> jax.Array:
     """Interleave T, H, W frequencies.
 
     Args:

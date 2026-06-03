@@ -27,6 +27,7 @@ class Qwen3VLVisionConfig:
     num_position_embeddings: int
     deepstack_visual_indexes: tuple[int, ...]
     dtype: Any = jnp.bfloat16
+    param_dtype: Any = jnp.float32
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -55,6 +56,7 @@ class Qwen3VLConfig:
     norm_topk_prob: bool = True
     shd_cfg: ShardConfig = dataclasses.field(default_factory=ShardConfig.default)
     dtype: Any = jnp.bfloat16
+    param_dtype: Any = jnp.float32
 
     def is_moe_layer(self, layer_idx: int) -> bool:
         return (
@@ -175,7 +177,9 @@ def get_vl_spec(model_id: str) -> dict[str, Any]:
         return dict(_QWEN3_VL_SMOKE_SPECS[model_id])
     if model_id in _QWEN3_VL_REPOS:
         return {"hf_repo_id": model_id}
-    raise ValueError(f"Unsupported Qwen3-VL model_id '{model_id}'. Supported ids: {_SUPPORTED_MODEL_IDS}")
+    raise ValueError(
+        f"Unsupported Qwen3-VL model_id '{model_id}'. Supported ids: {_SUPPORTED_MODEL_IDS}"
+    )
 
 
 def resolve_qwen3_vl_repo_id(model_id: str) -> str:
@@ -232,7 +236,9 @@ def make_vl_config(model_id: str) -> Qwen3VLConfig:
         )
 
     if "/" not in model_id and not epath.Path(model_id).expanduser().exists():
-        raise ValueError(f"Unsupported Qwen3-VL model_id '{model_id}'. Supported ids: {_SUPPORTED_MODEL_IDS}")
+        raise ValueError(
+            f"Unsupported Qwen3-VL model_id '{model_id}'. Supported ids: {_SUPPORTED_MODEL_IDS}"
+        )
 
     hf_cfg = load_hf_config_from_source(resolve_qwen3_vl_repo_id(model_id))
     return make_vl_config_from_hf(hf_cfg)
@@ -278,12 +284,22 @@ def make_vl_config_from_hf(hf_cfg: dict[str, Any]) -> Qwen3VLConfig:
         norm_eps=_required(txt, "rms_norm_eps", "hf_cfg['text_config']"),
         tie_word_embeddings=_required(hf_cfg, "tie_word_embeddings", "hf_cfg"),
         mrope_section=tuple(mrope_section),
-        moe_intermediate_size=_required(txt, "moe_intermediate_size", "hf_cfg['text_config']") if is_moe else 0,
+        moe_intermediate_size=_required(txt, "moe_intermediate_size", "hf_cfg['text_config']")
+        if is_moe
+        else 0,
         num_experts=_required(txt, "num_experts", "hf_cfg['text_config']") if is_moe else 0,
-        num_experts_per_tok=_required(txt, "num_experts_per_tok", "hf_cfg['text_config']") if is_moe else 0,
-        mlp_only_layers=tuple(_required(txt, "mlp_only_layers", "hf_cfg['text_config']")) if is_moe else (),
-        decoder_sparse_step=_required(txt, "decoder_sparse_step", "hf_cfg['text_config']") if is_moe else 1,
-        norm_topk_prob=_required(txt, "norm_topk_prob", "hf_cfg['text_config']") if is_moe else True,
+        num_experts_per_tok=_required(txt, "num_experts_per_tok", "hf_cfg['text_config']")
+        if is_moe
+        else 0,
+        mlp_only_layers=tuple(_required(txt, "mlp_only_layers", "hf_cfg['text_config']"))
+        if is_moe
+        else (),
+        decoder_sparse_step=_required(txt, "decoder_sparse_step", "hf_cfg['text_config']")
+        if is_moe
+        else 1,
+        norm_topk_prob=_required(txt, "norm_topk_prob", "hf_cfg['text_config']")
+        if is_moe
+        else True,
         image_token_id=_required(hf_cfg, "image_token_id", "hf_cfg"),
         video_token_id=_required(hf_cfg, "video_token_id", "hf_cfg"),
         vision_start_token_id=_required(hf_cfg, "vision_start_token_id", "hf_cfg"),
@@ -299,8 +315,12 @@ def make_vl_config_from_hf(hf_cfg: dict[str, Any]) -> Qwen3VLConfig:
             out_hidden_size=_required(vis, "out_hidden_size", "hf_cfg['vision_config']"),
             depth=_required(vis, "depth", "hf_cfg['vision_config']"),
             hidden_act=_required(vis, "hidden_act", "hf_cfg['vision_config']"),
-            num_position_embeddings=_required(vis, "num_position_embeddings", "hf_cfg['vision_config']"),
-            deepstack_visual_indexes=tuple(_required(vis, "deepstack_visual_indexes", "hf_cfg['vision_config']")),
+            num_position_embeddings=_required(
+                vis, "num_position_embeddings", "hf_cfg['vision_config']"
+            ),
+            deepstack_visual_indexes=tuple(
+                _required(vis, "deepstack_visual_indexes", "hf_cfg['vision_config']")
+            ),
             dtype=vision_dtype,
         ),
     )

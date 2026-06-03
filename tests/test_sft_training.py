@@ -1,5 +1,6 @@
 """Smoke tests for SFT training loops and shard_batch_dict."""
 
+import contextlib
 import json
 import os
 from pathlib import Path
@@ -9,7 +10,6 @@ os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
 from absl.testing import absltest
 
-import jax
 import numpy as np
 
 from omegalax.data.grain_pipeline import (
@@ -28,14 +28,16 @@ from omegalax.trainers import text as text_trainer
 from omegalax.trainers import vlm as vlm_trainer
 
 
-def _make_synthetic_sft_batch(batch_size: int, seq_len: int, vocab_size: int) -> dict[str, np.ndarray]:
+def _make_synthetic_sft_batch(
+    batch_size: int, seq_len: int, vocab_size: int
+) -> dict[str, np.ndarray]:
     """Build a minimal SFT batch dict with random data and a simple loss mask."""
     rng = np.random.RandomState(42)
     token_ids = rng.randint(1, vocab_size, size=(batch_size, seq_len)).astype(np.int32)
     attention_mask = np.ones((batch_size, seq_len), dtype=np.int32)
     # Supervise the second half of the sequence
     loss_mask = np.zeros((batch_size, seq_len), dtype=np.int32)
-    loss_mask[:, seq_len // 2:] = 1
+    loss_mask[:, seq_len // 2 :] = 1
     return {
         "token_ids_BT": token_ids,
         "attention_mask_BT": attention_mask,
@@ -46,7 +48,9 @@ def _make_synthetic_sft_batch(batch_size: int, seq_len: int, vocab_size: int) ->
 def _make_multimodal_qwen3_vl_smoke_batch(seq_len: int = 8) -> dict[str, np.ndarray]:
     cfg = make_vl_config("qwen3-vl-smoke")
     llm_grid_t, h, w = 1, 4, 4
-    num_vision_tokens = llm_grid_t * (h // cfg.vision.spatial_merge_size) * (w // cfg.vision.spatial_merge_size)
+    num_vision_tokens = (
+        llm_grid_t * (h // cfg.vision.spatial_merge_size) * (w // cfg.vision.spatial_merge_size)
+    )
 
     seq = [11, cfg.vision_start_token_id, *([cfg.image_token_id] * num_vision_tokens), 21, 22]
     token_ids = np.zeros((1, seq_len), dtype=np.int32)
@@ -58,10 +62,15 @@ def _make_multimodal_qwen3_vl_smoke_batch(seq_len: int = 8) -> dict[str, np.ndar
 
     image_grid_thw = np.asarray([[llm_grid_t, h, w]], dtype=np.int32)
     vision_cu_seqlens = np.concatenate(
-        [np.zeros(1, dtype=np.int32), np.cumsum(np.asarray([h * w] * llm_grid_t, dtype=np.int32), dtype=np.int32)]
+        [
+            np.zeros(1, dtype=np.int32),
+            np.cumsum(np.asarray([h * w] * llm_grid_t, dtype=np.int32), dtype=np.int32),
+        ]
     )
     in_features = cfg.vision.in_channels * cfg.vision.temporal_patch_size * cfg.vision.patch_size**2
-    pixel_values = np.random.default_rng(0).standard_normal((llm_grid_t * h * w, in_features), dtype=np.float32)
+    pixel_values = np.random.default_rng(0).standard_normal(
+        (llm_grid_t * h * w, in_features), dtype=np.float32
+    )
 
     position_ids, _ = get_rope_index(
         token_ids,
@@ -133,9 +142,53 @@ def _make_grain_batch_iter(batch: dict[str, np.ndarray]):
             shuffle=False,
             seed=0,
             read_options=make_grain_read_options(num_threads=1, prefetch_buffer_size=1),
-            multiprocessing_options=make_grain_multiprocessing_options(num_workers=0, per_worker_buffer_size=1),
+            multiprocessing_options=make_grain_multiprocessing_options(
+                num_workers=0, per_worker_buffer_size=1
+            ),
         )
         yield from iterator
+
+
+@contextlib.contextmanager
+def _grain_iter_ctx(batch: dict[str, np.ndarray]):
+    """Yield a checkpointable Grain iterator (not a generator wrapper).
+
+    The trainer's checkpoint save path needs the underlying ``grain.DatasetIterator``
+    (not a ``yield from`` wrapper) so its position can be serialized via the
+    registered Grain checkpoint handler. The ArrayRecord files must outlive the
+    iterator, so the tempdir is owned by this context manager.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        src = Path(tmpdir) / "train.jsonl"
+        src.write_text(
+            json.dumps(
+                {
+                    "messages": [{"role": "user", "content": "stub"}],
+                    "batch": _to_jsonable(batch),
+                }
+            )
+            + "\n"
+        )
+        payload = compile_jsonl_to_arrayrecord(src, Path(tmpdir) / "payload", records_per_shard=1)
+        compiled = build_chunk_index(
+            payload,
+            Path(tmpdir) / "chunked",
+            max_length=1,
+            measure_message=lambda message: 1,
+            records_per_shard=1,
+        )
+        iterator = make_grain_iterator(
+            compiled,
+            batch_size=1,
+            batch_fn=lambda records: _restore_arrays(records[0]["batch"]),
+            shuffle=False,
+            seed=0,
+            read_options=make_grain_read_options(num_threads=1, prefetch_buffer_size=1),
+            multiprocessing_options=make_grain_multiprocessing_options(
+                num_workers=0, per_worker_buffer_size=1
+            ),
+        )
+        yield iterator
 
 
 class ShardBatchDictTest(absltest.TestCase):

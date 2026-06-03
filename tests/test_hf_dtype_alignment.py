@@ -63,7 +63,12 @@ def _qwen3_5_hf_cfg() -> dict:
             "num_key_value_heads": 2,
             "head_dim": 32,
             "rms_norm_eps": 1e-6,
-            "layer_types": ["linear_attention", "linear_attention", "linear_attention", "full_attention"],
+            "layer_types": [
+                "linear_attention",
+                "linear_attention",
+                "linear_attention",
+                "full_attention",
+            ],
             "rope_parameters": {
                 "rope_theta": 10_000,
                 "partial_rotary_factor": 0.25,

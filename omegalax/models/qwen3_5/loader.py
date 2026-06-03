@@ -48,14 +48,24 @@ def _assert_config(cfg: Qwen3_5Config, hf_cfg: dict):
 
     if cfg.text_config.is_moe:
         _require("num_experts", cfg.text_config.num_experts, txt["num_experts"])
-        _require("num_experts_per_tok", cfg.text_config.num_experts_per_tok, txt["num_experts_per_tok"])
-        _require("moe_intermediate_size", cfg.text_config.moe_intermediate_size, txt["moe_intermediate_size"])
+        _require(
+            "num_experts_per_tok", cfg.text_config.num_experts_per_tok, txt["num_experts_per_tok"]
+        )
+        _require(
+            "moe_intermediate_size",
+            cfg.text_config.moe_intermediate_size,
+            txt["moe_intermediate_size"],
+        )
     else:
         _require("intermediate_size", cfg.text_config.intermediate_size, txt["intermediate_size"])
 
     _require("rope_theta", cfg.text_config.rope_theta, rope_params["rope_theta"])
-    _require("mrope_section", tuple(cfg.text_config.mrope_section), tuple(rope_params["mrope_section"]))
-    _require("mrope_interleaved", cfg.text_config.mrope_interleaved, rope_params["mrope_interleaved"])
+    _require(
+        "mrope_section", tuple(cfg.text_config.mrope_section), tuple(rope_params["mrope_section"])
+    )
+    _require(
+        "mrope_interleaved", cfg.text_config.mrope_interleaved, rope_params["mrope_interleaved"]
+    )
 
     _require("vision.hidden_size", cfg.vision_config.hidden_size, vis["hidden_size"])
     _require("vision.depth", cfg.vision_config.depth, vis["depth"])
@@ -69,69 +79,53 @@ def _get_vision_key_mapping():
     p = r"model\.visual\."
     return {
         # Patch embedding (Conv3D handled separately)
-        p + r"patch_embed\.proj\.bias": (
-            "vision.patch_embed.proj.bias", Transform.BIAS
-        ),
+        p + r"patch_embed\.proj\.bias": ("vision.patch_embed.proj.bias", Transform.BIAS),
         # Position embedding
-        p + r"pos_embed\.weight": (
-            "vision.pos_embed.embedding", Transform.EMBED
-        ),
+        p + r"pos_embed\.weight": ("vision.pos_embed.embedding", Transform.EMBED),
         # Blocks
-        p + r"blocks\.([0-9]+)\.norm1\.weight": (
-            r"vision.blocks.\1.norm1.weight", Transform.SCALE
-        ),
-        p + r"blocks\.([0-9]+)\.norm1\.bias": (
-            r"vision.blocks.\1.norm1.bias", Transform.BIAS
-        ),
+        p + r"blocks\.([0-9]+)\.norm1\.weight": (r"vision.blocks.\1.norm1.weight", Transform.SCALE),
+        p + r"blocks\.([0-9]+)\.norm1\.bias": (r"vision.blocks.\1.norm1.bias", Transform.BIAS),
         p + r"blocks\.([0-9]+)\.attn\.qkv\.weight": (
-            r"vision.blocks.\1.attn.qkv.kernel", Transform.LINEAR
+            r"vision.blocks.\1.attn.qkv.kernel",
+            Transform.LINEAR,
         ),
         p + r"blocks\.([0-9]+)\.attn\.qkv\.bias": (
-            r"vision.blocks.\1.attn.qkv.bias", Transform.BIAS
+            r"vision.blocks.\1.attn.qkv.bias",
+            Transform.BIAS,
         ),
         p + r"blocks\.([0-9]+)\.attn\.proj\.weight": (
-            r"vision.blocks.\1.attn.proj.kernel", Transform.LINEAR
+            r"vision.blocks.\1.attn.proj.kernel",
+            Transform.LINEAR,
         ),
         p + r"blocks\.([0-9]+)\.attn\.proj\.bias": (
-            r"vision.blocks.\1.attn.proj.bias", Transform.BIAS
+            r"vision.blocks.\1.attn.proj.bias",
+            Transform.BIAS,
         ),
-        p + r"blocks\.([0-9]+)\.norm2\.weight": (
-            r"vision.blocks.\1.norm2.weight", Transform.SCALE
-        ),
-        p + r"blocks\.([0-9]+)\.norm2\.bias": (
-            r"vision.blocks.\1.norm2.bias", Transform.BIAS
-        ),
+        p + r"blocks\.([0-9]+)\.norm2\.weight": (r"vision.blocks.\1.norm2.weight", Transform.SCALE),
+        p + r"blocks\.([0-9]+)\.norm2\.bias": (r"vision.blocks.\1.norm2.bias", Transform.BIAS),
         p + r"blocks\.([0-9]+)\.mlp\.linear_fc1\.weight": (
-            r"vision.blocks.\1.mlp.fc1.kernel", Transform.LINEAR
+            r"vision.blocks.\1.mlp.fc1.kernel",
+            Transform.LINEAR,
         ),
         p + r"blocks\.([0-9]+)\.mlp\.linear_fc1\.bias": (
-            r"vision.blocks.\1.mlp.fc1.bias", Transform.BIAS
+            r"vision.blocks.\1.mlp.fc1.bias",
+            Transform.BIAS,
         ),
         p + r"blocks\.([0-9]+)\.mlp\.linear_fc2\.weight": (
-            r"vision.blocks.\1.mlp.fc2.kernel", Transform.LINEAR
+            r"vision.blocks.\1.mlp.fc2.kernel",
+            Transform.LINEAR,
         ),
         p + r"blocks\.([0-9]+)\.mlp\.linear_fc2\.bias": (
-            r"vision.blocks.\1.mlp.fc2.bias", Transform.BIAS
+            r"vision.blocks.\1.mlp.fc2.bias",
+            Transform.BIAS,
         ),
         # Merger
-        p + r"merger\.norm\.weight": (
-            "vision.merger.norm.weight", Transform.SCALE
-        ),
-        p + r"merger\.norm\.bias": (
-            "vision.merger.norm.bias", Transform.BIAS
-        ),
-        p + r"merger\.linear_fc1\.weight": (
-            "vision.merger.fc1.kernel", Transform.LINEAR
-        ),
-        p + r"merger\.linear_fc1\.bias": (
-            "vision.merger.fc1.bias", Transform.BIAS
-        ),
-        p + r"merger\.linear_fc2\.weight": (
-            "vision.merger.fc2.kernel", Transform.LINEAR
-        ),
-        p + r"merger\.linear_fc2\.bias": (
-            "vision.merger.fc2.bias", Transform.BIAS
-        ),
+        p + r"merger\.norm\.weight": ("vision.merger.norm.weight", Transform.SCALE),
+        p + r"merger\.norm\.bias": ("vision.merger.norm.bias", Transform.BIAS),
+        p + r"merger\.linear_fc1\.weight": ("vision.merger.fc1.kernel", Transform.LINEAR),
+        p + r"merger\.linear_fc1\.bias": ("vision.merger.fc1.bias", Transform.BIAS),
+        p + r"merger\.linear_fc2\.weight": ("vision.merger.fc2.kernel", Transform.LINEAR),
+        p + r"merger\.linear_fc2\.bias": ("vision.merger.fc2.bias", Transform.BIAS),
     }
 
 
@@ -140,77 +134,91 @@ def _get_text_key_mapping():
     p = r"model\.language_model\."
     L = r"([0-9]+)"
     return {
-        p + r"embed_tokens\.weight": (
-            "text.embedder.embedding", Transform.EMBED
-        ),
-        p + r"norm\.weight": (
-            "text.final_norm.weight", Transform.SCALE
-        ),
+        p + r"embed_tokens\.weight": ("text.embedder.embedding", Transform.EMBED),
+        p + r"norm\.weight": ("text.final_norm.weight", Transform.SCALE),
         p + r"layers\." + L + r"\.input_layernorm\.weight": (
-            r"text.layers.\1.input_layernorm.weight", Transform.SCALE
+            r"text.layers.\1.input_layernorm.weight",
+            Transform.SCALE,
         ),
         p + r"layers\." + L + r"\.post_attention_layernorm\.weight": (
-            r"text.layers.\1.post_attention_layernorm.weight", Transform.SCALE
+            r"text.layers.\1.post_attention_layernorm.weight",
+            Transform.SCALE,
         ),
         p + r"layers\." + L + r"\.self_attn\.q_proj\.weight": (
-            r"text.layers.\1.attn.q_proj.kernel", Transform.LINEAR
+            r"text.layers.\1.attn.q_proj.kernel",
+            Transform.LINEAR,
         ),
         p + r"layers\." + L + r"\.self_attn\.k_proj\.weight": (
-            r"text.layers.\1.attn.k_proj.kernel", Transform.LINEAR
+            r"text.layers.\1.attn.k_proj.kernel",
+            Transform.LINEAR,
         ),
         p + r"layers\." + L + r"\.self_attn\.v_proj\.weight": (
-            r"text.layers.\1.attn.v_proj.kernel", Transform.LINEAR
+            r"text.layers.\1.attn.v_proj.kernel",
+            Transform.LINEAR,
         ),
         p + r"layers\." + L + r"\.self_attn\.o_proj\.weight": (
-            r"text.layers.\1.attn.o_proj.kernel", Transform.LINEAR
+            r"text.layers.\1.attn.o_proj.kernel",
+            Transform.LINEAR,
         ),
         p + r"layers\." + L + r"\.self_attn\.q_norm\.weight": (
-            r"text.layers.\1.attn.q_norm.weight", Transform.SCALE
+            r"text.layers.\1.attn.q_norm.weight",
+            Transform.SCALE,
         ),
         p + r"layers\." + L + r"\.self_attn\.k_norm\.weight": (
-            r"text.layers.\1.attn.k_norm.weight", Transform.SCALE
+            r"text.layers.\1.attn.k_norm.weight",
+            Transform.SCALE,
         ),
         p + r"layers\." + L + r"\.linear_attn\.in_proj_qkv\.weight": (
-            r"text.layers.\1.linear_attn.in_proj_qkv.kernel", Transform.LINEAR
+            r"text.layers.\1.linear_attn.in_proj_qkv.kernel",
+            Transform.LINEAR,
         ),
         p + r"layers\." + L + r"\.linear_attn\.in_proj_z\.weight": (
-            r"text.layers.\1.linear_attn.in_proj_z.kernel", Transform.LINEAR
+            r"text.layers.\1.linear_attn.in_proj_z.kernel",
+            Transform.LINEAR,
         ),
         p + r"layers\." + L + r"\.linear_attn\.in_proj_b\.weight": (
-            r"text.layers.\1.linear_attn.in_proj_b.kernel", Transform.LINEAR
+            r"text.layers.\1.linear_attn.in_proj_b.kernel",
+            Transform.LINEAR,
         ),
         p + r"layers\." + L + r"\.linear_attn\.in_proj_a\.weight": (
-            r"text.layers.\1.linear_attn.in_proj_a.kernel", Transform.LINEAR
+            r"text.layers.\1.linear_attn.in_proj_a.kernel",
+            Transform.LINEAR,
         ),
         p + r"layers\." + L + r"\.linear_attn\.norm\.weight": (
-            r"text.layers.\1.linear_attn.norm.weight", Transform.SCALE
+            r"text.layers.\1.linear_attn.norm.weight",
+            Transform.SCALE,
         ),
         p + r"layers\." + L + r"\.linear_attn\.out_proj\.weight": (
-            r"text.layers.\1.linear_attn.out_proj.kernel", Transform.LINEAR
+            r"text.layers.\1.linear_attn.out_proj.kernel",
+            Transform.LINEAR,
         ),
         # MoE shared expert
         p + r"layers\." + L + r"\.mlp\.shared_expert\.gate_proj\.weight": (
-            r"text.layers.\1.mlp.shared_expert.gate_proj.kernel", Transform.LINEAR
+            r"text.layers.\1.mlp.shared_expert.gate_proj.kernel",
+            Transform.LINEAR,
         ),
         p + r"layers\." + L + r"\.mlp\.shared_expert\.up_proj\.weight": (
-            r"text.layers.\1.mlp.shared_expert.up_proj.kernel", Transform.LINEAR
+            r"text.layers.\1.mlp.shared_expert.up_proj.kernel",
+            Transform.LINEAR,
         ),
         p + r"layers\." + L + r"\.mlp\.shared_expert\.down_proj\.weight": (
-            r"text.layers.\1.mlp.shared_expert.down_proj.kernel", Transform.LINEAR
+            r"text.layers.\1.mlp.shared_expert.down_proj.kernel",
+            Transform.LINEAR,
         ),
         # Dense MLP (used when num_experts == 0)
         p + r"layers\." + L + r"\.mlp\.gate_proj\.weight": (
-            r"text.layers.\1.mlp.gate_proj.kernel", Transform.LINEAR
+            r"text.layers.\1.mlp.gate_proj.kernel",
+            Transform.LINEAR,
         ),
         p + r"layers\." + L + r"\.mlp\.up_proj\.weight": (
-            r"text.layers.\1.mlp.up_proj.kernel", Transform.LINEAR
+            r"text.layers.\1.mlp.up_proj.kernel",
+            Transform.LINEAR,
         ),
         p + r"layers\." + L + r"\.mlp\.down_proj\.weight": (
-            r"text.layers.\1.mlp.down_proj.kernel", Transform.LINEAR
+            r"text.layers.\1.mlp.down_proj.kernel",
+            Transform.LINEAR,
         ),
-        r"lm_head\.weight": (
-            "lm_head.kernel", Transform.LINEAR
-        ),
+        r"lm_head\.weight": ("lm_head.kernel", Transform.LINEAR),
     }
 
 
@@ -223,15 +231,9 @@ def _get_non_expert_mapping():
 
 
 # Regex patterns for special keys
-_CONV1D_RE = re.compile(
-    r"model\.language_model\.layers\.(\d+)\.linear_attn\.conv1d\.weight"
-)
-_DT_BIAS_RE = re.compile(
-    r"model\.language_model\.layers\.(\d+)\.linear_attn\.dt_bias"
-)
-_A_LOG_RE = re.compile(
-    r"model\.language_model\.layers\.(\d+)\.linear_attn\.A_log"
-)
+_CONV1D_RE = re.compile(r"model\.language_model\.layers\.(\d+)\.linear_attn\.conv1d\.weight")
+_DT_BIAS_RE = re.compile(r"model\.language_model\.layers\.(\d+)\.linear_attn\.dt_bias")
+_A_LOG_RE = re.compile(r"model\.language_model\.layers\.(\d+)\.linear_attn\.A_log")
 _EXPERT_GATE_UP_RE = re.compile(
     r"model\.language_model\.layers\.(\d+)\.mlp\.experts\.gate_up_proj$"
 )
@@ -241,15 +243,11 @@ _EXPERT_DOWN_BATCHED_RE = re.compile(
 _EXPERT_PER_RE = re.compile(
     r"model\.language_model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight"
 )
-_ROUTER_RE = re.compile(
-    r"model\.language_model\.layers\.(\d+)\.mlp\.gate\.weight"
-)
+_ROUTER_RE = re.compile(r"model\.language_model\.layers\.(\d+)\.mlp\.gate\.weight")
 _SHARED_EXPERT_GATE_RE = re.compile(
     r"model\.language_model\.layers\.(\d+)\.mlp\.shared_expert_gate\.weight"
 )
-_CONV3D_RE = re.compile(
-    r"model\.visual\.patch_embed\.proj\.weight"
-)
+_CONV3D_RE = re.compile(r"model\.visual\.patch_embed\.proj\.weight")
 
 
 def create_qwen3_5_from_safetensors(
@@ -315,8 +313,15 @@ def create_qwen3_5_from_safetensors(
             gate_EFD, up_EFD = np.split(fused_E2FD, 2, axis=1)
             gate_EDF = np.swapaxes(gate_EFD, 1, 2)
             up_EDF = np.swapaxes(up_EFD, 1, 2)
-            assign_to_state_dict(state_dict, f"text.layers.{layer_idx}.mlp.gate_proj", jnp.asarray(gate_EDF), torch_key)
-            assign_to_state_dict(state_dict, f"text.layers.{layer_idx}.mlp.up_proj", jnp.asarray(up_EDF), torch_key)
+            assign_to_state_dict(
+                state_dict,
+                f"text.layers.{layer_idx}.mlp.gate_proj",
+                jnp.asarray(gate_EDF),
+                torch_key,
+            )
+            assign_to_state_dict(
+                state_dict, f"text.layers.{layer_idx}.mlp.up_proj", jnp.asarray(up_EDF), torch_key
+            )
             return True
 
         # Batched down_proj: HF (E, D, F) → JAX (E, F, D)
@@ -325,7 +330,12 @@ def create_qwen3_5_from_safetensors(
             layer_idx = int(m.group(1))
             down_EDF = np.asarray(tensor)
             down_EFD = np.swapaxes(down_EDF, 1, 2)
-            assign_to_state_dict(state_dict, f"text.layers.{layer_idx}.mlp.down_proj", jnp.asarray(down_EFD), torch_key)
+            assign_to_state_dict(
+                state_dict,
+                f"text.layers.{layer_idx}.mlp.down_proj",
+                jnp.asarray(down_EFD),
+                torch_key,
+            )
             return True
 
         m = _EXPERT_PER_RE.match(torch_key)
@@ -361,7 +371,9 @@ def create_qwen3_5_from_safetensors(
                 # Special: Conv3D patch embedding
                 if _CONV3D_RE.match(torch_key):
                     value = jnp.asarray(tensor.transpose(2, 3, 4, 1, 0))
-                    assign_to_state_dict(state_dict, "vision.patch_embed.proj.kernel", value, torch_key)
+                    assign_to_state_dict(
+                        state_dict, "vision.patch_embed.proj.kernel", value, torch_key
+                    )
                     continue
 
                 # Linear attention specials
@@ -379,15 +391,15 @@ def create_qwen3_5_from_safetensors(
                     continue
 
                 keys = [stoi(k) for k in jax_key.split(".")]
-                assign_weights_from_eval_shape(
-                    keys, tensor, state_dict, torch_key, transform.value
-                )
+                assign_weights_from_eval_shape(keys, tensor, state_dict, torch_key, transform.value)
         gc.collect()
 
     # Assemble per-expert weights into batched format (per-expert HF format)
     if cfg.text_config.is_moe and expert_buf:
         num_experts = cfg.text_config.num_experts
-        layer_projs: dict[int, dict[str, dict[int, np.ndarray]]] = defaultdict(lambda: defaultdict(dict))
+        layer_projs: dict[int, dict[str, dict[int, np.ndarray]]] = defaultdict(
+            lambda: defaultdict(dict)
+        )
         for (layer_idx, proj_name), expert_tensors in expert_buf.items():
             layer_projs[layer_idx][proj_name] = expert_tensors
 
@@ -397,23 +409,35 @@ def create_qwen3_5_from_safetensors(
                 gates = [projs["gate_proj"][i] for i in range(num_experts)]
                 gate_EFD = np.stack(gates, axis=0)
                 gate_EDF = np.swapaxes(gate_EFD, 1, 2)
-                assign_to_state_dict(state_dict, f"text.layers.{layer_idx}.mlp.gate_proj",
-                                     jnp.asarray(gate_EDF), "experts.*.gate_proj")
+                assign_to_state_dict(
+                    state_dict,
+                    f"text.layers.{layer_idx}.mlp.gate_proj",
+                    jnp.asarray(gate_EDF),
+                    "experts.*.gate_proj",
+                )
 
             if "up_proj" in projs:
                 ups = [projs["up_proj"][i] for i in range(num_experts)]
                 up_EFD = np.stack(ups, axis=0)
                 up_EDF = np.swapaxes(up_EFD, 1, 2)
-                assign_to_state_dict(state_dict, f"text.layers.{layer_idx}.mlp.up_proj",
-                                     jnp.asarray(up_EDF), "experts.*.up_proj")
+                assign_to_state_dict(
+                    state_dict,
+                    f"text.layers.{layer_idx}.mlp.up_proj",
+                    jnp.asarray(up_EDF),
+                    "experts.*.up_proj",
+                )
 
             if "down_proj" in projs:
                 # HF per-expert down_proj.weight is (D, F). Stack → (E, D, F). Swap → (E, F, D).
                 downs = [projs["down_proj"][i] for i in range(num_experts)]
                 down_EDF = np.stack(downs, axis=0)
                 down_EFD = np.swapaxes(down_EDF, 1, 2)
-                assign_to_state_dict(state_dict, f"text.layers.{layer_idx}.mlp.down_proj",
-                                     jnp.asarray(down_EFD), "experts.*.down_proj")
+                assign_to_state_dict(
+                    state_dict,
+                    f"text.layers.{layer_idx}.mlp.down_proj",
+                    jnp.asarray(down_EFD),
+                    "experts.*.down_proj",
+                )
 
     check_conversion_errors(unmatched_hf_keys)
 
@@ -423,6 +447,7 @@ def create_qwen3_5_from_safetensors(
     gc.collect()
     model = nnx.merge(graph_def, state_dict)
     from omegalax.models.sharding_runtime import _finalize_q_shardings
+
     _finalize_q_shardings(model, mesh)
     return model, cfg
 

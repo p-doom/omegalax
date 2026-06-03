@@ -32,18 +32,28 @@ class ExportDenseTest(absltest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmpdir:
             export_qwen3_to_safetensors(model, cfg, tmpdir)
-            reloaded = create_qwen3_from_safetensors(tmpdir, "qwen3-smoke", tp_size=1, fsdp_size=1, dp_size=1)
+            reloaded = create_qwen3_from_safetensors(
+                tmpdir, "qwen3-smoke", tp_size=1, fsdp_size=1, dp_size=1
+            )
 
             embed_orig = np.asarray(jax.device_get(_get_value(model, "embedder.embedding")))
             embed_new = np.asarray(jax.device_get(_get_value(reloaded, "embedder.embedding")))
             np.testing.assert_allclose(embed_new, embed_orig, atol=0, rtol=0)
 
-            q_proj_orig = np.asarray(jax.device_get(_get_value(model, "layers.0.attn.q_proj.kernel")))
-            q_proj_new = np.asarray(jax.device_get(_get_value(reloaded, "layers.0.attn.q_proj.kernel")))
+            q_proj_orig = np.asarray(
+                jax.device_get(_get_value(model, "layers.0.attn.q_proj.kernel"))
+            )
+            q_proj_new = np.asarray(
+                jax.device_get(_get_value(reloaded, "layers.0.attn.q_proj.kernel"))
+            )
             np.testing.assert_allclose(q_proj_new, q_proj_orig, atol=0, rtol=0)
 
-            norm_orig = np.asarray(jax.device_get(_get_value(model, "layers.0.input_layernorm.scale")))
-            norm_new = np.asarray(jax.device_get(_get_value(reloaded, "layers.0.input_layernorm.scale")))
+            norm_orig = np.asarray(
+                jax.device_get(_get_value(model, "layers.0.input_layernorm.scale"))
+            )
+            norm_new = np.asarray(
+                jax.device_get(_get_value(reloaded, "layers.0.input_layernorm.scale"))
+            )
             np.testing.assert_allclose(norm_new, norm_orig, atol=0, rtol=0)
 
 

@@ -23,7 +23,11 @@ from .config import Qwen3VLConfig
 from .loader import _get_non_expert_mapping, create_qwen3_vl_from_safetensors
 from .model import Qwen3VL
 
-__all__ = ["create_qwen3_vl_from_safetensors", "export_qwen3_vl_to_safetensors", "qwen3_vl_to_hf_config_dict"]
+__all__ = [
+    "create_qwen3_vl_from_safetensors",
+    "export_qwen3_vl_to_safetensors",
+    "qwen3_vl_to_hf_config_dict",
+]
 
 
 def _jnp_dtype_to_hf(dtype: Any) -> str:
@@ -130,13 +134,19 @@ def export_qwen3_vl_to_safetensors(model: Qwen3VL, cfg: Qwen3VLConfig, out_dir: 
                     return False
                 suffix = m.group(2)
                 if suffix == "gate_proj":
-                    expert_params.setdefault(layer_idx, {})["gate_proj"] = np.asarray(jax.device_get(value))
+                    expert_params.setdefault(layer_idx, {})["gate_proj"] = np.asarray(
+                        jax.device_get(value)
+                    )
                     return True
                 if suffix == "up_proj":
-                    expert_params.setdefault(layer_idx, {})["up_proj"] = np.asarray(jax.device_get(value))
+                    expert_params.setdefault(layer_idx, {})["up_proj"] = np.asarray(
+                        jax.device_get(value)
+                    )
                     return True
                 if suffix == "down_proj":
-                    expert_params.setdefault(layer_idx, {})["down_proj"] = np.asarray(jax.device_get(value))
+                    expert_params.setdefault(layer_idx, {})["down_proj"] = np.asarray(
+                        jax.device_get(value)
+                    )
                     return True
                 if suffix == "router.kernel":
                     router_params[layer_idx] = np.asarray(jax.device_get(value))
@@ -155,7 +165,9 @@ def export_qwen3_vl_to_safetensors(model: Qwen3VL, cfg: Qwen3VLConfig, out_dir: 
             hf_key = hf_template.format(*m.groups())
             arr = np.asarray(jax.device_get(value))
             if transform == Transform.CONV3D:
-                raise RuntimeError(f"Unexpected CONV3D transform in generic export path for {jax_key}")
+                raise RuntimeError(
+                    f"Unexpected CONV3D transform in generic export path for {jax_key}"
+                )
             transform_rule = transform.value if hasattr(transform, "value") else transform
             arr = inverse_transform(arr, transform_rule)
             hf_tensors[hf_key] = arr
@@ -175,7 +187,9 @@ def export_qwen3_vl_to_safetensors(model: Qwen3VL, cfg: Qwen3VLConfig, out_dir: 
         )
 
     if unmatched:
-        raise RuntimeError(f"Unmapped JAX parameters during export:\n" + "\n".join(sorted(unmatched)))
+        raise RuntimeError(
+            "Unmapped JAX parameters during export:\n" + "\n".join(sorted(unmatched))
+        )
 
     stnp.save_file(hf_tensors, tensor_path)
     save_hf_config(qwen3_vl_to_hf_config_dict(cfg), out_path)

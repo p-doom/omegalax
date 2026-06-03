@@ -132,14 +132,22 @@ def decode(model: nnx.Module, cache: Cache, token_ids_BT: jax.Array, pad_id: int
 
     segment_ids_BT = 1 * (token_ids_BT != pad_id)
     num_right_pads = count_right_pads(token_ids_BT, pad_id)
-    hidden_BTD, aux_loss = model(token_ids_BT, segment_ids_BT, cache, jnp.array(num_right_pads, dtype=jnp.int32))
+    hidden_BTD, aux_loss = model(
+        token_ids_BT, segment_ids_BT, cache, jnp.array(num_right_pads, dtype=jnp.int32)
+    )
     logits_BTV = model.lm_head(hidden_BTD, out_sharding=model.logits_shd)
 
     target_ind = token_ids_BT.shape[-1] - num_right_pads - 1
     return logits_BTV[:, target_ind], cache, aux_loss
 
 
-def make_cache(cfg: TextConfig, batch_size: int, token_len: int, generate_steps: int, dtype: jnp.dtype = jnp.bfloat16):
+def make_cache(
+    cfg: TextConfig,
+    batch_size: int,
+    token_len: int,
+    generate_steps: int,
+    dtype: jnp.dtype = jnp.bfloat16,
+):
     """Create KV cache for generation; only supported for Qwen3."""
     if not isinstance(cfg, qwen3_registry.Qwen3Config):
         raise NotImplementedError("Cache is only available for Qwen3 text models.")

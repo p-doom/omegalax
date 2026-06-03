@@ -6,6 +6,7 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 
+
 class RMSNorm(nnx.Module):
     """Qwen3.5 RMSNorm: output = (1 + weight) * norm(x).
 
@@ -28,7 +29,7 @@ class RMSNorm(nnx.Module):
     def __call__(self, x: jax.Array) -> jax.Array:
         dtype = x.dtype
         x_f32 = x.astype(jnp.float32)
-        variance = jnp.mean(x_f32 ** 2, axis=-1, keepdims=True)
+        variance = jnp.mean(x_f32**2, axis=-1, keepdims=True)
         normed = x_f32 * jax.lax.rsqrt(variance + self.eps)
         return ((1.0 + self.weight[...].astype(jnp.float32)) * normed).astype(dtype)
 
@@ -52,7 +53,7 @@ class RMSNormGated(nnx.Module):
     def __call__(self, x: jax.Array, gate: jax.Array) -> jax.Array:
         dtype = x.dtype
         x_f32 = x.astype(jnp.float32)
-        variance = jnp.mean(x_f32 ** 2, axis=-1, keepdims=True)
+        variance = jnp.mean(x_f32**2, axis=-1, keepdims=True)
         normed = jnp.astype(x_f32 * jax.lax.rsqrt(variance + self.eps), dtype)
         weight = jnp.astype(self.weight[...], dtype)
         out = weight * normed

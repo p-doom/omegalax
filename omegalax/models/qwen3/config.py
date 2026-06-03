@@ -109,9 +109,7 @@ _QWEN3_DENSE_REPOS = (
     "Qwen/Qwen3-32B",
 )
 
-_QWEN3_MOE_REPOS = (
-    "Qwen/Qwen3-30B-A3B-Instruct-2507",
-)
+_QWEN3_MOE_REPOS = ("Qwen/Qwen3-30B-A3B-Instruct-2507",)
 
 _REAL_MODEL_IDS = (*_QWEN3_DENSE_REPOS, *_QWEN3_MOE_REPOS)
 _SUPPORTED_MODEL_IDS = sorted((*_QWEN3_SMOKE_SPECS.keys(), *_REAL_MODEL_IDS))
@@ -162,7 +160,9 @@ def get_spec(model_id: str) -> dict[str, Any]:
         return dict(_QWEN3_SMOKE_SPECS[model_id])
     if model_id in _REAL_MODEL_IDS:
         return {"hf_repo_id": model_id}
-    raise ValueError(f"Unsupported Qwen3 model_id '{model_id}'. Supported ids: {_SUPPORTED_MODEL_IDS}")
+    raise ValueError(
+        f"Unsupported Qwen3 model_id '{model_id}'. Supported ids: {_SUPPORTED_MODEL_IDS}"
+    )
 
 
 def is_supported_model_id(model_id: str) -> bool:
@@ -231,7 +231,9 @@ def make_config(model_id: str) -> Qwen3Config:
         return Qwen3Config.with_sharding(**kw)
 
     if "/" not in model_id and not epath.Path(model_id).expanduser().exists():
-        raise ValueError(f"Unsupported Qwen3 model_id '{model_id}'. Supported ids: {_SUPPORTED_MODEL_IDS}")
+        raise ValueError(
+            f"Unsupported Qwen3 model_id '{model_id}'. Supported ids: {_SUPPORTED_MODEL_IDS}"
+        )
 
     hf_cfg = load_hf_config_from_source(resolve_qwen3_repo_id(model_id))
     return make_config_from_hf(hf_cfg)

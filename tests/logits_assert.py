@@ -40,11 +40,13 @@ def assert_logits_close(
     max_abs = np.max(abs_diff)
     median_abs = np.median(abs_diff)
     test_case.assertLess(
-        max_abs, atol,
+        max_abs,
+        atol,
         f"max abs diff {max_abs:.4f} >= {atol} (median={median_abs:.4f})",
     )
     test_case.assertLess(
-        median_abs, median_atol,
+        median_abs,
+        median_atol,
         f"median abs diff {median_abs:.4f} >= {median_atol} (max={max_abs:.4f})",
     )
     if top1_min_match is not None:
@@ -52,6 +54,7 @@ def assert_logits_close(
         hf_top1 = np.argmax(hf_masked, axis=-1)
         match_rate = np.mean(jax_top1 == hf_top1)
         test_case.assertGreater(
-            match_rate, top1_min_match,
+            match_rate,
+            top1_min_match,
             f"top-1 match rate {match_rate:.2%} <= {top1_min_match:.0%}",
         )

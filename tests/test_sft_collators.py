@@ -6,12 +6,18 @@ os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
 from absl.testing import absltest
 
+import ml_dtypes
 import numpy as np
 from transformers import AutoTokenizer
 
 from transformers import AutoImageProcessor
 
-from omegalax.data.collator_qwen3 import TextSFTCollator, VLMSFTCollator, _build_assistant_loss_mask, _build_chatml_text
+from omegalax.data.collator_qwen3 import (
+    TextSFTCollator,
+    VLMSFTCollator,
+    _build_assistant_loss_mask,
+)
+from omegalax.data.qwen3_encoding import build_chatml_text as _build_chatml_text
 
 
 def _make_tokenizer():
@@ -28,10 +34,12 @@ class TextSFTCollatorTest(absltest.TestCase):
 
     def test_output_keys_and_shapes(self):
         examples = [
-            {"messages": [
-                {"role": "user", "content": "Hello"},
-                {"role": "assistant", "content": "Hi there!"},
-            ]},
+            {
+                "messages": [
+                    {"role": "user", "content": "Hello"},
+                    {"role": "assistant", "content": "Hi there!"},
+                ]
+            },
         ]
         batch = self.collator(examples)
         self.assertIn("token_ids_BT", batch)
@@ -43,10 +51,12 @@ class TextSFTCollatorTest(absltest.TestCase):
 
     def test_loss_mask_zero_on_padding(self):
         examples = [
-            {"messages": [
-                {"role": "user", "content": "Say X"},
-                {"role": "assistant", "content": "X"},
-            ]},
+            {
+                "messages": [
+                    {"role": "user", "content": "Say X"},
+                    {"role": "assistant", "content": "X"},
+                ]
+            },
         ]
         batch = self.collator(examples)
         attn = batch["attention_mask_BT"][0]
@@ -82,24 +92,30 @@ class TextSFTCollatorTest(absltest.TestCase):
 
     def test_batch_size(self):
         examples = [
-            {"messages": [
-                {"role": "user", "content": "A"},
-                {"role": "assistant", "content": "B"},
-            ]},
-            {"messages": [
-                {"role": "user", "content": "C"},
-                {"role": "assistant", "content": "D"},
-            ]},
+            {
+                "messages": [
+                    {"role": "user", "content": "A"},
+                    {"role": "assistant", "content": "B"},
+                ]
+            },
+            {
+                "messages": [
+                    {"role": "user", "content": "C"},
+                    {"role": "assistant", "content": "D"},
+                ]
+            },
         ]
         batch = self.collator(examples)
         self.assertEqual(batch["token_ids_BT"].shape[0], 2)
 
     def test_dtypes_are_int32(self):
         examples = [
-            {"messages": [
-                {"role": "user", "content": "X"},
-                {"role": "assistant", "content": "Y"},
-            ]},
+            {
+                "messages": [
+                    {"role": "user", "content": "X"},
+                    {"role": "assistant", "content": "Y"},
+                ]
+            },
         ]
         batch = self.collator(examples)
         for key in ("token_ids_BT", "attention_mask_BT", "loss_mask_BT"):
@@ -108,10 +124,15 @@ class TextSFTCollatorTest(absltest.TestCase):
     def test_raises_on_overflow(self):
         collator = TextSFTCollator(self.tokenizer, max_length=8)
         examples = [
-            {"messages": [
-                {"role": "user", "content": "Tell me a story in many words."},
-                {"role": "assistant", "content": "This answer is intentionally too long for the tiny max length."},
-            ]},
+            {
+                "messages": [
+                    {"role": "user", "content": "Tell me a story in many words."},
+                    {
+                        "role": "assistant",
+                        "content": "This answer is intentionally too long for the tiny max length.",
+                    },
+                ]
+            },
         ]
         with self.assertRaisesRegex(ValueError, "exceeds max_length"):
             collator(examples)
@@ -129,11 +150,15 @@ class BuildAssistantLossMaskTest(absltest.TestCase):
 
     def _apply_and_mask(self, messages):
         result = self.tokenizer.apply_chat_template(
-            messages, tokenize=True, add_generation_prompt=False,
+            messages,
+            tokenize=True,
+            add_generation_prompt=False,
         )
         ids = np.array(result["input_ids"], dtype=np.int32)
         mask = _build_assistant_loss_mask(
-            ids, self._im_start_id, self._im_end_id,
+            ids,
+            self._im_start_id,
+            self._im_end_id,
             self._assistant_token_id,
         )
         return ids, mask
@@ -194,10 +219,7 @@ class BuildChatMLTextTest(absltest.TestCase):
             {"role": "assistant", "content": "Hi!"},
         ]
         result = _build_chatml_text(messages, image_grids=[], merge_size=2)
-        expected = (
-            "<|im_start|>user\nHello<|im_end|>\n"
-            "<|im_start|>assistant\nHi!<|im_end|>\n"
-        )
+        expected = "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\nHi!<|im_end|>\n"
         self.assertEqual(result, expected)
 
     def test_text_only_multi_turn(self):
@@ -232,10 +254,13 @@ class BuildChatMLTextTest(absltest.TestCase):
 
     def test_image_tokens_inserted(self):
         messages = [
-            {"role": "user", "content": [
-                {"type": "image"},
-                {"type": "text", "text": "Describe."},
-            ]},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image"},
+                    {"type": "text", "text": "Describe."},
+                ],
+            },
             {"role": "assistant", "content": "A cat."},
         ]
         grid = (1, 8, 8)
@@ -249,11 +274,14 @@ class BuildChatMLTextTest(absltest.TestCase):
 
     def test_multi_image(self):
         messages = [
-            {"role": "user", "content": [
-                {"type": "image"},
-                {"type": "image"},
-                {"type": "text", "text": "Compare."},
-            ]},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image"},
+                    {"type": "image"},
+                    {"type": "text", "text": "Compare."},
+                ],
+            },
         ]
         grids = [(1, 4, 4), (1, 8, 8)]
         merge_size = 2
@@ -268,10 +296,13 @@ class BuildChatMLTextTest(absltest.TestCase):
     def test_encodes_correctly(self):
         """Verify that tokenizer.encode on our ChatML text produces valid token IDs."""
         messages = [
-            {"role": "user", "content": [
-                {"type": "image"},
-                {"type": "text", "text": "What is this?"},
-            ]},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image"},
+                    {"type": "text", "text": "What is this?"},
+                ],
+            },
             {"role": "assistant", "content": "A photo."},
         ]
         grid = (1, 4, 4)
@@ -295,38 +326,52 @@ class VLMSFTCollatorTest(absltest.TestCase):
         super().setUp()
         self.tokenizer = _make_tokenizer()
         self.image_processor = AutoImageProcessor.from_pretrained(
-            "Qwen/Qwen3-VL-2B-Instruct", use_fast=False, # force the numpy codepath
+            "Qwen/Qwen3-VL-2B-Instruct",
+            use_fast=False,  # force the numpy codepath
         )
         self.max_length = 256
         self.collator = VLMSFTCollator(
-            self.tokenizer, max_length=self.max_length,
+            self.tokenizer,
+            max_length=self.max_length,
             image_processor=self.image_processor,
         )
 
     def test_text_only_example(self):
         examples = [
-            {"messages": [
-                {"role": "user", "content": "Hello"},
-                {"role": "assistant", "content": "Hi!"},
-            ]},
+            {
+                "messages": [
+                    {"role": "user", "content": "Hello"},
+                    {"role": "assistant", "content": "Hi!"},
+                ]
+            },
         ]
         batch = self.collator(examples)
         self.assertIn("token_ids_BT", batch)
         self.assertEqual(batch["token_ids_BT"].shape, (1, self.max_length))
-        self.assertNotIn("pixel_values", batch)
-        self.assertNotIn("image_grid_thw", batch)
+        # Vision arrays are always emitted (as empty placeholders for text-only
+        # batches) so the JIT pytree structure stays constant and never recompiles.
+        self.assertIn("pixel_values", batch)
+        self.assertEqual(batch["pixel_values"].shape[0], 0)
+        self.assertIn("image_grid_thw", batch)
+        self.assertEqual(batch["image_grid_thw"].shape, (0, 3))
 
     def test_multimodal_example(self):
         from PIL import Image
+
         img = Image.new("RGB", (200, 200), color=(100, 150, 200))
         examples = [
-            {"messages": [
-                {"role": "user", "content": [
-                    {"type": "image", "image": img},
-                    {"type": "text", "text": "Describe."},
-                ]},
-                {"role": "assistant", "content": "A solid color image."},
-            ]},
+            {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image", "image": img},
+                            {"type": "text", "text": "Describe."},
+                        ],
+                    },
+                    {"role": "assistant", "content": "A solid color image."},
+                ]
+            },
         ]
         batch = self.collator(examples)
         self.assertIn("token_ids_BT", batch)
@@ -342,17 +387,55 @@ class VLMSFTCollatorTest(absltest.TestCase):
         expected_pads = int(grid[0]) * (int(grid[1]) // 2) * (int(grid[2]) // 2)
         self.assertEqual(n_pad, expected_pads)
 
+    def test_pixel_values_dtype_is_bf16_by_default(self):
+        from PIL import Image
+
+        img = Image.new("RGB", (100, 100), color=(10, 20, 30))
+        examples = [
+            {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image", "image": img},
+                            {"type": "text", "text": "Describe."},
+                        ],
+                    },
+                    {"role": "assistant", "content": "ok."},
+                ]
+            },
+        ]
+        # Default: pixel_values are downcast to bf16 (the vision patch embed
+        # computes in bf16 anyway), halving the input buffer with no numerical
+        # change vs the implicit fp32->bf16 cast inside the Linear.
+        self.assertEqual(self.collator(examples)["pixel_values"].dtype, ml_dtypes.bfloat16)
+
+        # The override is honored, e.g. for a full-fp32-compute run.
+        fp32_collator = VLMSFTCollator(
+            self.tokenizer,
+            max_length=self.max_length,
+            image_processor=self.image_processor,
+            pixel_values_dtype=np.float32,
+        )
+        self.assertEqual(fp32_collator(examples)["pixel_values"].dtype, np.float32)
+
     def test_loss_mask_on_assistant_only(self):
         from PIL import Image
+
         img = Image.new("RGB", (100, 100), color=(50, 50, 50))
         examples = [
-            {"messages": [
-                {"role": "user", "content": [
-                    {"type": "image", "image": img},
-                    {"type": "text", "text": "What?"},
-                ]},
-                {"role": "assistant", "content": "Nothing special."},
-            ]},
+            {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image", "image": img},
+                            {"type": "text", "text": "What?"},
+                        ],
+                    },
+                    {"role": "assistant", "content": "Nothing special."},
+                ]
+            },
         ]
         batch = self.collator(examples)
         mask = batch["loss_mask_BT"][0]
@@ -370,16 +453,77 @@ class VLMSFTCollatorTest(absltest.TestCase):
             image_processor=self.image_processor,
         )
         examples = [
-            {"messages": [
-                {"role": "user", "content": [
-                    {"type": "image", "image": img},
-                    {"type": "text", "text": "Describe."},
-                ]},
-                {"role": "assistant", "content": "A solid color image."},
-            ]},
+            {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image", "image": img},
+                            {"type": "text", "text": "Describe."},
+                        ],
+                    },
+                    {"role": "assistant", "content": "A solid color image."},
+                ]
+            },
         ]
         with self.assertRaisesRegex(ValueError, "exceeds max_length"):
             collator(examples)
+
+    def test_heterogeneous_batch_text_and_multimodal(self):
+        """Batches that mix text-only and multimodal samples must collate cleanly.
+
+        This is the fundamental requirement that lets data mixing pull
+        instruction-tuning text into a VLM run for catastrophic-forgetting
+        mitigation. Vision tensors come from the image-having sample only;
+        text-only contributes zero patches and zero image-pad tokens.
+        """
+        from PIL import Image
+
+        img = Image.new("RGB", (100, 100), color=(120, 30, 200))
+        examples = [
+            # Sample 0: text-only (would come from instruction-tuning data).
+            {
+                "messages": [
+                    {"role": "user", "content": "Quick question."},
+                    {"role": "assistant", "content": "Quick answer."},
+                ]
+            },
+            # Sample 1: multimodal (would come from VLM training data).
+            {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image", "image": img},
+                            {"type": "text", "text": "Describe."},
+                        ],
+                    },
+                    {"role": "assistant", "content": "A solid color image."},
+                ]
+            },
+        ]
+        batch = self.collator(examples)
+
+        self.assertEqual(batch["token_ids_BT"].shape, (2, self.max_length))
+        # Vision keys present (because sample 1 has an image), with zero
+        # contribution from sample 0.
+        self.assertIn("pixel_values", batch)
+        self.assertIn("image_grid_thw", batch)
+        self.assertIn("vision_cu_seqlens", batch)
+        self.assertIn("position_ids_ZBT", batch)
+
+        # Sample 0 has no <|image_pad|> tokens, sample 1 has exactly the count
+        # implied by image_grid_thw — the alignment that lets the row-major
+        # image-token scatter in the model forward put the right embedding
+        # into the right position in a heterogeneous batch.
+        image_pad_id = self.tokenizer.convert_tokens_to_ids("<|image_pad|>")
+        n_pad_sample_0 = int(np.sum(batch["token_ids_BT"][0] == image_pad_id))
+        n_pad_sample_1 = int(np.sum(batch["token_ids_BT"][1] == image_pad_id))
+        self.assertEqual(n_pad_sample_0, 0)
+        self.assertEqual(batch["image_grid_thw"].shape, (1, 3))
+        grid = batch["image_grid_thw"][0]
+        expected_pads = int(grid[0]) * (int(grid[1]) // 2) * (int(grid[2]) // 2)
+        self.assertEqual(n_pad_sample_1, expected_pads)
 
 
 if __name__ == "__main__":

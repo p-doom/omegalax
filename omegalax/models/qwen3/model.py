@@ -65,14 +65,20 @@ class MoEFeedForward(nnx.Module):
             sharding=(None, "mlp", "embed"),
         )
         self.router = nnx.Linear(
-            D, E, use_bias=False, rngs=rngs, dtype=cfg.dtype,
+            D,
+            E,
+            use_bias=False,
+            rngs=rngs,
+            dtype=cfg.dtype,
             kernel_init=wp(init, ("embed", None)),
         )
 
     @jax.named_scope("moe_feed_forward")
     def __call__(self, hidden_BTD: jax.Array) -> tuple[jax.Array, jax.Array]:
         cfg = self.cfg
-        router_logits_BTE = self.router(hidden_BTD, out_sharding=P(self.shd_cfg.act_btd[0], None, None))
+        router_logits_BTE = self.router(
+            hidden_BTD, out_sharding=P(self.shd_cfg.act_btd[0], None, None)
+        )
         probs_BTE = jax.nn.softmax(router_logits_BTE.astype(jnp.float32), axis=-1)
         topk_weights_BTk, topk_idx_BTk = jax.lax.top_k(probs_BTE, cfg.num_experts_per_tok)
         if cfg.norm_topk_prob:
@@ -90,28 +96,36 @@ class MoEFeedForward(nnx.Module):
 
         dense_hidden_BTD = reshard(hidden_BTD, P(self.shd_cfg.act_btd[0], None, None))
         gate_BTEF = jnp.einsum(
-            "BTD,EDF->BTEF", dense_hidden_BTD, gate_proj_EDF,
+            "BTD,EDF->BTEF",
+            dense_hidden_BTD,
+            gate_proj_EDF,
             out_sharding=P(batch_axis, None, None, ff_axis),
         )
         up_BTEF = jnp.einsum(
-            "BTD,EDF->BTEF", dense_hidden_BTD, up_proj_EDF,
+            "BTD,EDF->BTEF",
+            dense_hidden_BTD,
+            up_proj_EDF,
             out_sharding=P(batch_axis, None, None, ff_axis),
         )
         expert_hidden_BTEF = nnx.silu(gate_BTEF) * up_BTEF
         expert_out_BTED = jnp.einsum(
-            "BTEF,EFD->BTED", expert_hidden_BTEF, down_proj_EFD,
+            "BTEF,EFD->BTED",
+            expert_hidden_BTEF,
+            down_proj_EFD,
             out_sharding=P(batch_axis, None, None, hidden_axis),
         )
 
         B, T = hidden_BTD.shape[:2]
         flat_out = jax.lax.reshape(
-            expert_out_BTED, (B * T, cfg.num_experts, cfg.emb_dim),
+            expert_out_BTED,
+            (B * T, cfg.num_experts, cfg.emb_dim),
             out_sharding=P(batch_axis, None, hidden_axis),
         )
         flat_idx = topk_idx_BTk.reshape(B * T, cfg.num_experts_per_tok)
         gathered = jnp.take_along_axis(flat_out, flat_idx[..., None], axis=1)
         gathered = jax.lax.reshape(
-            gathered, (B, T, cfg.num_experts_per_tok, cfg.emb_dim),
+            gathered,
+            (B, T, cfg.num_experts_per_tok, cfg.emb_dim),
             out_sharding=P(batch_axis, None, None, hidden_axis),
         )
         merged_BTD = jnp.sum(gathered * topk_weights_BTk[..., None], axis=-2)
@@ -120,7 +134,9 @@ class MoEFeedForward(nnx.Module):
         expert_mask_BTkE = jax.nn.one_hot(topk_idx_BTk, cfg.num_experts, dtype=probs_BTE.dtype)
         tokens_per_expert = jnp.mean(expert_mask_BTkE, axis=(0, 1))
         router_prob_per_expert_E = jnp.mean(probs_BTE, axis=(0, 1))
-        aux_loss_raw = jnp.sum(tokens_per_expert * router_prob_per_expert_E[None, :]) * cfg.num_experts
+        aux_loss_raw = (
+            jnp.sum(tokens_per_expert * router_prob_per_expert_E[None, :]) * cfg.num_experts
+        )
         aux_loss = cfg.aux_loss_coef * aux_loss_raw
         return merged_BTD, aux_loss
 
@@ -164,11 +180,17 @@ class Qwen3(nnx.Module):
         )
         self.out_emb_shd = cfg.shd_cfg.act_btd
         self.logits_shd = P(cfg.shd_cfg.act_btd[0], None, None)
-        self.layers = nnx.List([DecoderLayer(cfg=cfg, layer_idx=i, rngs=rngs) for i in range(cfg.num_layers)])
+        self.layers = nnx.List(
+            [DecoderLayer(cfg=cfg, layer_idx=i, rngs=rngs) for i in range(cfg.num_layers)]
+        )
         self.final_norm = RMSNorm(cfg.emb_dim, cfg.norm_eps, rngs=rngs)
         lm_head_init = nnx.initializers.lecun_normal()
         self.lm_head = nnx.Linear(
-            cfg.emb_dim, cfg.vocab_size, use_bias=False, rngs=rngs, dtype=cfg.dtype,
+            cfg.emb_dim,
+            cfg.vocab_size,
+            use_bias=False,
+            rngs=rngs,
+            dtype=cfg.dtype,
             kernel_init=wp(lm_head_init, ("embed", "vocab")),
         )
 
@@ -184,5 +206,7 @@ class Qwen3(nnx.Module):
             hidden_BTD, aux = layer(hidden_BTD, layer_cache, segment_ids_BT)
             aux_losses.append(aux)
         hidden_BTD = self.final_norm(hidden_BTD)
-        total_aux = jnp.sum(jnp.stack(aux_losses)) if aux_losses else jnp.array(0.0, dtype=jnp.float32)
+        total_aux = (
+            jnp.sum(jnp.stack(aux_losses)) if aux_losses else jnp.array(0.0, dtype=jnp.float32)
+        )
         return hidden_BTD, total_aux

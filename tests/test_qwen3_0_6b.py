@@ -62,9 +62,16 @@ class Qwen3MappingTest(absltest.TestCase):
         cls.tokenizer = AutoTokenizer.from_pretrained(cls.model_path)
         hf_cfg = AutoConfig.from_pretrained(cls.model_path)
         hf_cfg.tie_word_embeddings = cls.cfg.tie_word_embeddings
-        cls.hf_model = Qwen3ForCausalLM.from_pretrained(
-            cls.model_path, config=hf_cfg, torch_dtype=torch.bfloat16, attn_implementation="eager"
-        ).to(cls.device).eval()
+        cls.hf_model = (
+            Qwen3ForCausalLM.from_pretrained(
+                cls.model_path,
+                config=hf_cfg,
+                torch_dtype=torch.bfloat16,
+                attn_implementation="eager",
+            )
+            .to(cls.device)
+            .eval()
+        )
         cls.pad_id = cls.tokenizer.pad_token_id or 0
 
         cls.jax_model = qwen3_loader.create_qwen3_from_safetensors(
@@ -91,7 +98,9 @@ class Qwen3MappingTest(absltest.TestCase):
     def _jax_prefill_logits(self, input_ids: torch.Tensor) -> np.ndarray:
         token_ids_BT = jnp.asarray(np.array(input_ids.cpu(), dtype=np.int32))
         segment_ids_BT = 1 * (token_ids_BT != self.pad_id)
-        hidden_BTD, _ = self.jax_model(token_ids_BT, segment_ids_BT, None, jnp.array(0, dtype=jnp.int32))
+        hidden_BTD, _ = self.jax_model(
+            token_ids_BT, segment_ids_BT, None, jnp.array(0, dtype=jnp.int32)
+        )
         logits_BTV = self.jax_model.lm_head(hidden_BTD)
         return np.asarray(logits_BTV, dtype=np.float32)
 
@@ -111,7 +120,9 @@ class Qwen3MappingTest(absltest.TestCase):
         # All JAX leaves should be populated and match abstract shapes.
         model_cls = api.registry.get_model_cls(self.cfg.variant)
         with mesh_rules_for(tp_size=1, fsdp_size=1, dp_size=1):
-            _, abs_state = nnx.split(nnx.eval_shape(lambda: model_cls(self.cfg, rngs=nnx.Rngs(params=0))))
+            _, abs_state = nnx.split(
+                nnx.eval_shape(lambda: model_cls(self.cfg, rngs=nnx.Rngs(params=0)))
+            )
         abs_dict = nnx.to_pure_dict(abs_state)
         _, loaded_state = nnx.split(self.jax_model)
         loaded_dict = nnx.to_pure_dict(loaded_state)
@@ -151,7 +162,9 @@ class Qwen3MappingTest(absltest.TestCase):
         restored = nnx.merge(graph_def, pure_state)
         restored_token_ids_BT = jnp.asarray(np.array(inputs["input_ids"].cpu()), dtype=jnp.int32)
         segment_ids_BT = 1 * (restored_token_ids_BT != self.pad_id)
-        restored_hidden_BTD, _ = restored(restored_token_ids_BT, segment_ids_BT, None, jnp.array(0, dtype=jnp.int32))
+        restored_hidden_BTD, _ = restored(
+            restored_token_ids_BT, segment_ids_BT, None, jnp.array(0, dtype=jnp.int32)
+        )
         restored_logits_BTV = restored.lm_head(restored_hidden_BTD)
         restored_logits_BTV = np.asarray(restored_logits_BTV)
 

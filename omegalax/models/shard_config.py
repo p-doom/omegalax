@@ -34,10 +34,7 @@ def _filter_axis(axis, mesh: Mesh):
 
 def axis_rules_for_mesh(mesh: Mesh) -> tuple[tuple[str, str | None], ...]:
     """Drop rules for mesh axes with size 1 (replicate instead of shard)."""
-    return tuple(
-        (logical, _filter_axis(axis, mesh))
-        for logical, axis in DEFAULT_AXIS_RULES
-    )
+    return tuple((logical, _filter_axis(axis, mesh)) for logical, axis in DEFAULT_AXIS_RULES)
 
 
 @dataclasses.dataclass(slots=True, frozen=True)
@@ -76,12 +73,7 @@ def shard_config_for_mesh(shd_cfg: ShardConfig, mesh: Mesh) -> ShardConfig:
     return dataclasses.replace(
         shd_cfg,
         **{
-            field.name: P(
-                *(
-                    _filter_axis(axis, mesh)
-                    for axis in getattr(shd_cfg, field.name)
-                )
-            )
+            field.name: P(*(_filter_axis(axis, mesh) for axis in getattr(shd_cfg, field.name)))
             for field in dataclasses.fields(shd_cfg)
         },
     )

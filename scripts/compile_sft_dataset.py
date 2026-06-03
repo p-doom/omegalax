@@ -10,7 +10,9 @@ FLAGS = flags.FLAGS
 
 flags.DEFINE_string("data_path", None, "Path to the raw JSONL dataset.", required=True)
 flags.DEFINE_string("out_dir", None, "Output directory for ArrayRecord shards.", required=True)
-flags.DEFINE_integer("messages_per_record", 128, "Maximum contiguous messages to store in one payload block.")
+flags.DEFINE_integer(
+    "messages_per_record", 128, "Maximum contiguous messages to store in one payload block."
+)
 flags.DEFINE_integer("records_per_shard", 10_000, "Records per output shard.")
 flags.DEFINE_bool("overwrite", False, "Overwrite existing output directory.")
 

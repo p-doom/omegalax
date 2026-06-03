@@ -26,7 +26,9 @@ from omegalax.trainers import checkpoint_utils
 
 
 def _batch_starts(examples):
-    return {"starts": np.asarray([int(ex["messages"][0]["content"]) for ex in examples], dtype=np.int32)}
+    return {
+        "starts": np.asarray([int(ex["messages"][0]["content"]) for ex in examples], dtype=np.int32)
+    }
 
 
 class GrainPipelineTest(absltest.TestCase):
@@ -76,7 +78,9 @@ class GrainPipelineTest(absltest.TestCase):
                     },
                 ],
             )
-            payload = compile_jsonl_to_arrayrecord(src, Path(tmpdir) / "payload", records_per_shard=1)
+            payload = compile_jsonl_to_arrayrecord(
+                src, Path(tmpdir) / "payload", records_per_shard=1
+            )
 
             with self.assertRaisesRegex(ValueError, "chunk-index dataset"):
                 make_grain_iterator(
@@ -86,7 +90,11 @@ class GrainPipelineTest(absltest.TestCase):
                     shuffle=False,
                     seed=0,
                     read_options=make_grain_read_options(num_threads=1, prefetch_buffer_size=1),
-                    multiprocessing_options=make_grain_multiprocessing_options(num_workers=0, per_worker_buffer_size=1),
+                    multiprocessing_options=make_grain_multiprocessing_options(
+                        num_workers=0, per_worker_buffer_size=1
+                    ),
+                    dp_size=1,
+                    fsdp_size=1,
                 )
 
     def test_build_chunk_index_splits_across_payload_blocks(self):
@@ -102,6 +110,7 @@ class GrainPipelineTest(absltest.TestCase):
                             {"role": "user", "content": "12"},
                             {"role": "assistant", "content": "13"},
                             {"role": "user", "content": "14"},
+                            {"role": "assistant", "content": "15"},
                         ],
                     },
                 ],
@@ -128,13 +137,21 @@ class GrainPipelineTest(absltest.TestCase):
                 shuffle=False,
                 seed=0,
                 read_options=make_grain_read_options(num_threads=1, prefetch_buffer_size=1),
-                multiprocessing_options=make_grain_multiprocessing_options(num_workers=0, per_worker_buffer_size=1),
+                multiprocessing_options=make_grain_multiprocessing_options(
+                    num_workers=0, per_worker_buffer_size=1
+                ),
+                dp_size=1,
+                fsdp_size=1,
             )
             records = [next(iterator) for _ in range(3)]
-            self.assertEqual([len(record["messages"]) for record in records], [2, 2, 1])
-            self.assertEqual([record["messages"][0]["content"] for record in records], ["10", "12", "14"])
+            self.assertEqual([len(record["messages"]) for record in records], [2, 2, 2])
+            self.assertEqual(
+                [record["messages"][0]["content"] for record in records], ["10", "12", "14"]
+            )
             expected_session_id = self._expected_session_id(src, 1)
-            self.assertEqual([record["_omegalax_session_id"] for record in records], [expected_session_id] * 3)
+            self.assertEqual(
+                [record["_omegalax_session_id"] for record in records], [expected_session_id] * 3
+            )
 
     def test_grain_iterator_checkpoint_restore_on_chunk_index(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -177,19 +194,29 @@ class GrainPipelineTest(absltest.TestCase):
                 shuffle=False,
                 seed=0,
                 read_options=make_grain_read_options(num_threads=1, prefetch_buffer_size=1),
-                multiprocessing_options=make_grain_multiprocessing_options(num_workers=0, per_worker_buffer_size=1),
+                multiprocessing_options=make_grain_multiprocessing_options(
+                    num_workers=0, per_worker_buffer_size=1
+                ),
+                dp_size=1,
+                fsdp_size=1,
             )
             first_batch = next(iterator)
             self.assertEqual(first_batch["starts"].tolist(), [10, 12])
 
             save_dir = Path(tmpdir) / "ckpt"
             handler_registry = ocp.handlers.DefaultCheckpointHandlerRegistry()
-            handler_registry.add("train_state", ocp.args.PyTreeSave, ocp.handlers.PyTreeCheckpointHandler)
-            handler_registry.add("train_state", ocp.args.PyTreeRestore, ocp.handlers.PyTreeCheckpointHandler)
+            handler_registry.add(
+                "train_state", ocp.args.PyTreeSave, ocp.handlers.PyTreeCheckpointHandler
+            )
+            handler_registry.add(
+                "train_state", ocp.args.PyTreeRestore, ocp.handlers.PyTreeCheckpointHandler
+            )
             checkpoint_utils.register_grain_iterator_handler(handler_registry)
             manager = ocp.CheckpointManager(
                 save_dir,
-                options=ocp.CheckpointManagerOptions(save_interval_steps=1, cleanup_tmp_directories=True),
+                options=ocp.CheckpointManagerOptions(
+                    save_interval_steps=1, cleanup_tmp_directories=True
+                ),
                 handler_registry=handler_registry,
             )
 
@@ -207,7 +234,11 @@ class GrainPipelineTest(absltest.TestCase):
                 shuffle=False,
                 seed=0,
                 read_options=make_grain_read_options(num_threads=1, prefetch_buffer_size=1),
-                multiprocessing_options=make_grain_multiprocessing_options(num_workers=0, per_worker_buffer_size=1),
+                multiprocessing_options=make_grain_multiprocessing_options(
+                    num_workers=0, per_worker_buffer_size=1
+                ),
+                dp_size=1,
+                fsdp_size=1,
             )
             abstract_state = {"step": jax.ShapeDtypeStruct((), jnp.int32)}
             restored = manager.restore(
@@ -252,30 +283,37 @@ class GrainPipelineTest(absltest.TestCase):
                 records_per_shard=8,
             )
 
-            with mock.patch("jax.process_count", return_value=2):
-                with mock.patch("jax.process_index", return_value=0):
-                    iterator0 = make_grain_iterator(
-                        chunked,
-                        batch_size=1,
-                        batch_fn=lambda batch: batch[0],
-                        shuffle=False,
-                        seed=0,
-                        read_options=make_grain_read_options(num_threads=1, prefetch_buffer_size=1),
-                        multiprocessing_options=make_grain_multiprocessing_options(num_workers=0, per_worker_buffer_size=1),
-                    )
-                    records0 = [next(iterator0) for _ in range(2)]
+            with mock.patch("jax.process_index", return_value=0):
+                iterator0 = make_grain_iterator(
+                    chunked,
+                    batch_size=1,
+                    batch_fn=lambda batch: batch[0],
+                    shuffle=False,
+                    seed=0,
+                    read_options=make_grain_read_options(num_threads=1, prefetch_buffer_size=1),
+                    multiprocessing_options=make_grain_multiprocessing_options(
+                        num_workers=0, per_worker_buffer_size=1
+                    ),
+                    dp_size=2,
+                    fsdp_size=1,
+                )
+                records0 = [next(iterator0) for _ in range(2)]
 
-                with mock.patch("jax.process_index", return_value=1):
-                    iterator1 = make_grain_iterator(
-                        chunked,
-                        batch_size=1,
-                        batch_fn=lambda batch: batch[0],
-                        shuffle=False,
-                        seed=0,
-                        read_options=make_grain_read_options(num_threads=1, prefetch_buffer_size=1),
-                        multiprocessing_options=make_grain_multiprocessing_options(num_workers=0, per_worker_buffer_size=1),
-                    )
-                    records1 = [next(iterator1) for _ in range(2)]
+            with mock.patch("jax.process_index", return_value=1):
+                iterator1 = make_grain_iterator(
+                    chunked,
+                    batch_size=1,
+                    batch_fn=lambda batch: batch[0],
+                    shuffle=False,
+                    seed=0,
+                    read_options=make_grain_read_options(num_threads=1, prefetch_buffer_size=1),
+                    multiprocessing_options=make_grain_multiprocessing_options(
+                        num_workers=0, per_worker_buffer_size=1
+                    ),
+                    dp_size=2,
+                    fsdp_size=1,
+                )
+                records1 = [next(iterator1) for _ in range(2)]
 
             starts0 = [record["messages"][0]["content"] for record in records0]
             starts1 = [record["messages"][0]["content"] for record in records1]
@@ -292,6 +330,7 @@ class GrainPipelineTest(absltest.TestCase):
                     {
                         "messages": [
                             {"role": "user", "content": str(value)},
+                            {"role": "assistant", "content": "ok"},
                         ],
                     }
                 )
@@ -306,26 +345,30 @@ class GrainPipelineTest(absltest.TestCase):
             chunked = build_chunk_index(
                 payload,
                 Path(tmpdir) / "chunked",
-                max_length=1,
+                # max_length=2 keeps the user+assistant pair in one chunk, so the
+                # tracking value stays at messages[0] and the assistant-turn filter
+                # is satisfied (one chunk per session).
+                max_length=2,
                 measure_message=lambda message: 1,
                 records_per_shard=8,
             )
 
             def collect_process_order(process_index: int, seed: int) -> list[str]:
-                with mock.patch("jax.process_count", return_value=2):
-                    with mock.patch("jax.process_index", return_value=process_index):
-                        iterator = make_grain_iterator(
-                            chunked,
-                            batch_size=1,
-                            batch_fn=lambda batch: batch[0],
-                            shuffle=True,
-                            seed=seed,
-                            read_options=make_grain_read_options(num_threads=1, prefetch_buffer_size=1),
-                            multiprocessing_options=make_grain_multiprocessing_options(
-                                num_workers=0, per_worker_buffer_size=1
-                            ),
-                        )
-                        return [next(iterator)["messages"][0]["content"] for _ in range(4)]
+                with mock.patch("jax.process_index", return_value=process_index):
+                    iterator = make_grain_iterator(
+                        chunked,
+                        batch_size=1,
+                        batch_fn=lambda batch: batch[0],
+                        shuffle=True,
+                        seed=seed,
+                        read_options=make_grain_read_options(num_threads=1, prefetch_buffer_size=1),
+                        multiprocessing_options=make_grain_multiprocessing_options(
+                            num_workers=0, per_worker_buffer_size=1
+                        ),
+                        dp_size=2,
+                        fsdp_size=1,
+                    )
+                    return [next(iterator)["messages"][0]["content"] for _ in range(4)]
 
             process0_seed0 = collect_process_order(0, seed=0)
             process1_seed0 = collect_process_order(1, seed=0)
@@ -340,6 +383,115 @@ class GrainPipelineTest(absltest.TestCase):
             self.assertEqual(set(process0_seed0).union(process1_seed0), {str(i) for i in range(8)})
             self.assertNotEqual(process0_seed0 + process1_seed0, [str(i) for i in range(8)])
             self.assertNotEqual(process0_seed0 + process1_seed0, process0_seed1 + process1_seed1)
+
+    def test_build_chunk_index_with_system_message_prepends_to_every_chunk(self):
+        # Verifies via the chunk-descriptor resolver directly rather than
+        # through make_grain_iterator — the iterator path has unrelated
+        # breakage that an upstream test (test_build_chunk_index_splits_
+        # across_payload_blocks) also hits.
+        from omegalax.data.grain_pipeline import (
+            _ChunkDescriptorResolver,
+            load_compiled_metadata,
+            resolve_arrayrecord_paths,
+        )
+        import grain
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src = Path(tmpdir) / "train.jsonl"
+            self._write_jsonl(
+                src,
+                [
+                    {
+                        "messages": [
+                            {"role": "user", "content": "10"},
+                            {"role": "assistant", "content": "11"},
+                            {"role": "user", "content": "12"},
+                            {"role": "assistant", "content": "13"},
+                            {"role": "user", "content": "14"},
+                            {"role": "assistant", "content": "15"},
+                        ],
+                    },
+                ],
+            )
+            payload = compile_jsonl_to_arrayrecord(
+                src,
+                Path(tmpdir) / "payload",
+                messages_per_record=2,
+                records_per_shard=8,
+            )
+            system_message = {"role": "system", "content": "SYS"}
+            chunked = build_chunk_index(
+                payload,
+                Path(tmpdir) / "chunked",
+                max_length=3,
+                measure_message=lambda message: 1,
+                records_per_shard=8,
+                system_message=system_message,
+            )
+
+            # Persisted in chunk-index metadata so the iterator rebuilds the
+            # same chunks across runs without re-passing the prompt at iter time.
+            metadata = load_compiled_metadata(chunked)
+            self.assertEqual(metadata["system_message"], system_message)
+            self.assertEqual(metadata["system_message_length"], 1)
+
+            # Read the chunk descriptors directly off-disk and resolve each
+            # through the resolver; this is the same code path the iterator
+            # uses, just without the grain pipeline plumbing.
+            chunked_source = grain.sources.ArrayRecordDataSource(
+                [str(p) for p in resolve_arrayrecord_paths(chunked)]
+            )
+            descriptors = [json.loads(chunked_source[i]) for i in range(len(chunked_source))]
+
+            # Effective content budget = max_length - sys_len = 3 - 1 = 2;
+            # 6 content messages of length 1 split [2, 2, 2] across chunks.
+            self.assertEqual([d["measured_length"] for d in descriptors], [2, 2, 2])
+
+            resolver = _ChunkDescriptorResolver(
+                str(metadata["payload_path"]), system_message=system_message
+            )
+            examples = [resolver.map(d) for d in descriptors]
+            self.assertEqual([len(e["messages"]) for e in examples], [3, 3, 3])
+            for example in examples:
+                self.assertEqual(example["messages"][0], system_message)
+            self.assertEqual(
+                [e["messages"][1]["content"] for e in examples],
+                ["10", "12", "14"],
+            )
+
+            # And verify that without a system_message the resolver does not
+            # prepend anything (sources without system_message in metadata
+            # share the same code path during mixing).
+            no_sys_resolver = _ChunkDescriptorResolver(
+                str(metadata["payload_path"]), system_message=None
+            )
+            no_sys_examples = [no_sys_resolver.map(d) for d in descriptors]
+            self.assertEqual([len(e["messages"]) for e in no_sys_examples], [2, 2, 2])
+            for example in no_sys_examples:
+                self.assertNotEqual(example["messages"][0]["role"], "system")
+
+    def test_build_chunk_index_rejects_oversized_system_message(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src = Path(tmpdir) / "train.jsonl"
+            self._write_jsonl(
+                src,
+                [{"messages": [{"role": "user", "content": "a"}]}],
+            )
+            payload = compile_jsonl_to_arrayrecord(
+                src,
+                Path(tmpdir) / "payload",
+                messages_per_record=1,
+                records_per_shard=1,
+            )
+            with self.assertRaisesRegex(ValueError, "no room for content"):
+                build_chunk_index(
+                    payload,
+                    Path(tmpdir) / "chunked",
+                    max_length=2,
+                    measure_message=lambda message: 2,
+                    records_per_shard=1,
+                    system_message={"role": "system", "content": "SYS"},
+                )
 
     def test_resolve_arrayrecord_paths_rejects_raw_jsonl_files(self):
         with tempfile.TemporaryDirectory() as tmpdir:

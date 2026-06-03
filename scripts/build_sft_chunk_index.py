@@ -13,16 +13,36 @@ from omegalax.registry import resolve_hf_repo_id
 
 FLAGS = flags.FLAGS
 
-flags.DEFINE_string("data_path", None, "Path to a canonical compiled payload-block dataset.", required=True)
+flags.DEFINE_string(
+    "data_path", None, "Path to a canonical compiled payload-block dataset.", required=True
+)
 flags.DEFINE_string("out_dir", None, "Output directory for the chunk-index dataset.", required=True)
-flags.DEFINE_string("model_id", None, "Model id used to resolve the default tokenizer.", required=True)
+flags.DEFINE_string(
+    "model_id", None, "Model id used to resolve the default tokenizer.", required=True
+)
 flags.DEFINE_string("tokenizer", None, "HF tokenizer name/path (defaults to --model_id).")
-flags.DEFINE_string("processor", None, "HF repo to read image config from when the dataset contains images.")
-flags.DEFINE_string("preprocessor_config", None, "Path to JSON file whose keys override default image processor config.")
+flags.DEFINE_string(
+    "processor", None, "HF repo to read image config from when the dataset contains images."
+)
+flags.DEFINE_string(
+    "preprocessor_config",
+    None,
+    "Path to JSON file whose keys override default image processor config.",
+)
 flags.DEFINE_integer("max_length", None, "Maximum sequence length.", required=True)
 flags.DEFINE_integer("records_per_shard", 100_000, "Records per output shard.")
 flags.DEFINE_bool("overwrite", False, "Overwrite existing output directory.")
-flags.DEFINE_integer("num_workers", 2, "Number of parallel workers for message length measurement.", lower_bound=2)
+flags.DEFINE_integer(
+    "num_workers", 2, "Number of parallel workers for message length measurement.", lower_bound=2
+)
+flags.DEFINE_string(
+    "system_message_text",
+    "",
+    "If non-empty, prepend a text-only system message with this content to "
+    "every emitted chunk. Persisted in chunk-index metadata; the iterator "
+    "injects it at resolve time and the per-chunk token budget is reduced "
+    "by the system message's measured length.",
+)
 
 
 def main(_) -> None:
@@ -37,7 +57,16 @@ def main(_) -> None:
         if FLAGS.preprocessor_config:
             with open(FLAGS.preprocessor_config) as f:
                 ip_kwargs = json.load(f)
-        image_processor = AutoImageProcessor.from_pretrained(processor_name, use_fast=False, **ip_kwargs)
+        image_processor = AutoImageProcessor.from_pretrained(
+            processor_name, use_fast=False, **ip_kwargs
+        )
+
+    system_message = None
+    if FLAGS.system_message_text:
+        system_message = {
+            "role": "system",
+            "content": [{"type": "text", "text": FLAGS.system_message_text}],
+        }
 
     out_dir = build_chunk_index(
         FLAGS.data_path,
@@ -47,6 +76,7 @@ def main(_) -> None:
         records_per_shard=FLAGS.records_per_shard,
         overwrite=FLAGS.overwrite,
         num_workers=FLAGS.num_workers,
+        system_message=system_message,
         profile_metadata={
             "model_id": FLAGS.model_id,
             "tokenizer": tokenizer_name,

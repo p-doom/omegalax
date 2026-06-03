@@ -13,8 +13,5 @@ def _real_weights_enabled() -> bool:
 
 
 def requires_real_weights(obj):
-    reason = (
-        "Requires real model weights/checkpoint downloads. "
-        f"Set {_ENV_VAR}=1 to run."
-    )
+    reason = f"Requires real model weights/checkpoint downloads. Set {_ENV_VAR}=1 to run."
     return unittest.skipUnless(_real_weights_enabled(), reason)(obj)

@@ -65,9 +65,7 @@ def build_lr_schedule(
             boundaries.append(warmup_steps)
         schedules.append(optax.constant_schedule(peak_lr))
         boundaries.append(warmup_steps + stable_steps)
-        schedules.append(
-            optax.linear_schedule(peak_lr, end_lr, decay_phase_steps)
-        )
+        schedules.append(optax.linear_schedule(peak_lr, end_lr, decay_phase_steps))
         return optax.join_schedules(schedules, boundaries)
 
     raise ValueError(f"Unknown lr_schedule={schedule!r}. Expected 'linear', 'cosine', or 'wsd'.")

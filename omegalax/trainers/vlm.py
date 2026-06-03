@@ -2,34 +2,61 @@
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import datetime
 import gc
+import os
+import signal
+import subprocess
 from pathlib import Path
 from flax import nnx
 import jax
 import jax.numpy as jnp
-from jax.sharding import Mesh, NamedSharding, PartitionSpec
-import numpy as np
+from jax.sharding import NamedSharding, PartitionSpec
 import optax
 import orbax.checkpoint as ocp
+from orbax.checkpoint import checkpoint_managers as ocm
 
 from omegalax import export as export_lib
+from omegalax.data.grain_pipeline import pop_source_ids
 from omegalax.distributed.mesh import ensure_mesh, mesh_rules, required_batch_multiple
 from omegalax.models.params_utils import save_hf_config
 from omegalax.trainers import checkpoint_utils
+from omegalax.trainers import tokamax_cache as tokamax_cache_lib
 from omegalax.trainers.loss import chunked_cross_entropy_loss
 from omegalax.trainers.lr_schedule import build_lr_schedule
 from omegalax.trainers.perf import (
+    log_compiled_memory_analysis,
+    log_device_memory,
+    log_live_arrays,
+    log_pytree_bytes,
+    log_top_leaves_with_paths,
     maybe_log_step_metrics,
     per_device_flops_per_step,
     StepTimer,
 )
 from omegalax.trainers.optim import MixedPrecisionOptimizer
+from omegalax.trainers.lora import LoRAParam, inject_lora
 from omegalax.trainers.text import startup_log
 from omegalax.vlm import api as vlm_api
 
 P = PartitionSpec
+
+
+def _trainable_non_vision(path, x):
+    """NNX filter predicate: select every ``nnx.Param`` whose state-tree path
+    does not pass through ``Qwen3VL.vision`` (or any nested ``vision``
+    attribute). Used as the ``wrt`` filter for full-FT-with-frozen-vision
+    training. Mirrors ``DEFAULT_SKIP_PATHS = ("vision",)`` in ``lora.py``.
+    """
+    if not isinstance(x, nnx.Param):
+        return False
+    for part in path:
+        key = getattr(part, "key", None) or getattr(part, "name", None) or str(part)
+        if key == "vision":
+            return False
+    return True
 
 
 @dataclasses.dataclass(frozen=True)
@@ -42,11 +69,16 @@ class TrainConfig:
     weight_decay: float = 0.01
     warmup_steps: int = 0
     lr_schedule: str = "linear"
-    lr_end_factor: float = 0.0 
-    lr_stable_fraction: float = 0.8 
+    lr_end_factor: float = 0.0
+    lr_stable_fraction: float = 0.8
     max_grad_norm: float = 0.0
     grad_accum_steps: int = 1
     print_every: int = 1
+    enable_lora: bool = False
+    lora_rank: int = 32
+    lora_alpha: float = 32.0
+    freeze_vision_tower: bool = False
+    num_loss_tiles: int = 4
 
 
 def init_model(
@@ -67,19 +99,23 @@ def init_model(
     return model
 
 
-def build_optimizer(model: nnx.Module, lr_schedule_fn: optax.Schedule | float, train_cfg: TrainConfig) -> MixedPrecisionOptimizer:
+def build_optimizer(
+    model: nnx.Module,
+    lr_schedule_fn: optax.Schedule | float,
+    train_cfg: TrainConfig,
+    *,
+    wrt=nnx.Param,
+) -> MixedPrecisionOptimizer:
     chain = []
     if train_cfg.max_grad_norm > 0:
         chain.append(optax.clip_by_global_norm(train_cfg.max_grad_norm))
-    chain.append(optax.adamw(lr_schedule_fn, weight_decay=train_cfg.weight_decay))
+    wd = 0.0 if wrt is LoRAParam else train_cfg.weight_decay
+    chain.append(optax.adamw(lr_schedule_fn, weight_decay=wd))
     tx = optax.chain(*chain)
     if train_cfg.grad_accum_steps > 1:
         tx = optax.MultiSteps(tx, every_k_schedule=train_cfg.grad_accum_steps)
-    opt = MixedPrecisionOptimizer(model, tx)
+    opt = MixedPrecisionOptimizer(model, tx, wrt=wrt)
     return opt
-
-
-_NUM_LOSS_TILES = 4
 
 
 def _train_state(optimizer: MixedPrecisionOptimizer, rng: jax.Array) -> dict[str, object]:
@@ -96,24 +132,60 @@ def _abstract_train_state(optimizer: MixedPrecisionOptimizer, rng: jax.Array) ->
     }
 
 
-def _make_checkpoint_manager(save_dir: Path, save_interval: int | None) -> ocp.CheckpointManager:
-    """Orbax requires an absolute checkpoint path."""
+def _make_checkpoint_manager(
+    save_dir: Path,
+    save_interval: int | None,
+    keep_period: int | None = None,
+    keep_latest: int | None = None,
+) -> ocp.CheckpointManager:
+    """Orbax requires an absolute checkpoint path.
+
+    ``keep_period`` permanently retains every checkpoint whose step is a multiple
+    of it (e.g. full-epoch boundaries); for it to ever fire it must be a multiple
+    of ``save_interval`` since the loop only saves at multiples of ``save_interval``.
+    ``keep_latest`` additionally retains the N most-recent checkpoints. When
+    ``keep_period`` is unset the manager keeps every checkpoint (prior behavior).
+    """
     save_dir = Path(save_dir).expanduser().resolve()
     handler_registry = ocp.handlers.DefaultCheckpointHandlerRegistry()
     handler_registry.add("train_state", ocp.args.PyTreeSave, ocp.handlers.PyTreeCheckpointHandler)
-    handler_registry.add("train_state", ocp.args.PyTreeRestore, ocp.handlers.PyTreeCheckpointHandler)
+    handler_registry.add(
+        "train_state", ocp.args.PyTreeRestore, ocp.handlers.PyTreeCheckpointHandler
+    )
     checkpoint_utils.register_grain_iterator_handler(handler_registry)
+    preservation_policy = None
+    if keep_period:
+        policies = [ocm.EveryNSteps(keep_period, exact_interval=True)]
+        if keep_latest:
+            policies.append(ocm.LatestN(keep_latest))
+        preservation_policy = ocm.AnyPreservationPolicy(policies)
     options = ocp.CheckpointManagerOptions(
         save_interval_steps=save_interval,
-        max_to_keep=2,
         step_format_fixed_length=6,
         cleanup_tmp_directories=True,
+        preservation_policy=preservation_policy,
     )
     return ocp.CheckpointManager(save_dir, options=options, handler_registry=handler_registry)
 
 
 def _write_checkpoint_config(save_dir: Path, cfg) -> None:
     save_hf_config(export_lib.model_config_to_hf_dict(cfg), save_dir)
+
+
+def _write_lora_metadata(save_dir: Path, train_cfg: TrainConfig) -> None:
+    """Persist LoRA settings alongside the orbax tree.
+
+    The export driver reads this file to reconstruct the same optimizer
+    shape at restore time. Absent file ⇒ checkpoint was full-FT.
+    """
+    import json
+
+    meta = {
+        "enable_lora": bool(train_cfg.enable_lora),
+        "lora_rank": int(train_cfg.lora_rank),
+        "lora_alpha": float(train_cfg.lora_alpha),
+    }
+    (Path(save_dir) / "lora_metadata.json").write_text(json.dumps(meta, indent=2))
 
 
 def _save_sft_checkpoint(
@@ -142,17 +214,41 @@ def _restore_sft_checkpoint(
     restore_args = checkpoint_utils.make_grain_restore_args(abstract_state, input_iter)
     restored = checkpoint_manager.restore(latest_step, args=restore_args)
     train_state = restored["train_state"]
-    nnx.update(optimizer, train_state["optimizer"])
-    return optimizer, int(latest_step), train_state["rng"], checkpoint_utils.restored_input_iter(restored)
+    # Canonicalize restored opt-state dtypes against the freshly-built
+    # optimizer's expectations: some prior checkpoints stored Adam's first
+    # moment in bf16; the optimizer now uses optax's default (fp32), so
+    # MultiSteps (grad_accum) would otherwise see a dtype mismatch between
+    # the passthrough branch (restored dtype) and the active-step branch
+    # (optax's expected dtype) and lax.cond would reject it at trace time.
+    expected_state = nnx.state(optimizer)
+    restored_state = jax.tree.map(
+        lambda exp, got: got.astype(exp.dtype) if exp.dtype != got.dtype else got,
+        expected_state,
+        train_state["optimizer"],
+    )
+    nnx.update(optimizer, restored_state)
+    return (
+        optimizer,
+        int(latest_step),
+        train_state["rng"],
+        checkpoint_utils.restored_input_iter(restored),
+    )
 
 
-def make_sft_train_step(cfg, pad_id: int = 0):
+def make_sft_train_step(cfg, pad_id: int = 0, *, wrt=nnx.Param, num_loss_tiles: int = 4):
     """Build a JIT-compiled VLM SFT train step that consumes a batch dict.
 
     The batch dict must contain ``token_ids_BT``, ``attention_mask_BT``, and
     ``loss_mask_BT``.  It may also contain ``pixel_values`` and
     ``image_grid_thw`` for multimodal batches.
+
+    ``wrt`` selects which model variables receive gradients. Defaults to
+    ``nnx.Param`` (full FT). Pass ``LoRAParam`` for adapter-only training
+    — every other ``nnx.Param`` then sees zero gradient and contributes
+    no optimizer state.
     """
+
+    diff_state = nnx.DiffState(0, wrt)
 
     @nnx.jit(donate_argnums=0)
     def sft_train_step(optimizer: MixedPrecisionOptimizer, batch: dict[str, jax.Array]):
@@ -176,16 +272,26 @@ def make_sft_train_step(cfg, pad_id: int = 0):
                 vision_cu_seqlens=vision_cu_seqlens,
                 position_ids_ZBT=position_ids_ZBT,
             )
-            lm_weight = model.lm_head.kernel[...]
-            loss = chunked_cross_entropy_loss(
-                hidden_BTD, lm_weight, token_ids_BT, loss_mask_BT,
-                num_tiles=_NUM_LOSS_TILES,
-                logits_out_sharding=cfg.shd_cfg.logits_btv,
-            ) + aux_loss
+            lm_weight = model.output_weight()
+            loss = (
+                chunked_cross_entropy_loss(
+                    hidden_BTD,
+                    lm_weight,
+                    token_ids_BT,
+                    loss_mask_BT,
+                    num_tiles=num_loss_tiles,
+                    logits_out_sharding=cfg.shd_cfg.logits_btv,
+                )
+                + aux_loss
+            )
             supervised_tokens = jnp.sum(loss_mask_BT[:, 1:].astype(jnp.float32))
             return loss, supervised_tokens
 
-        (loss, supervised_tokens), grads = nnx.value_and_grad(loss_fn, has_aux=True)(optimizer.model)
+        (loss, supervised_tokens), grads = nnx.value_and_grad(
+            loss_fn,
+            argnums=diff_state,
+            has_aux=True,
+        )(optimizer.model)
         optimizer.update(grads)
         metrics = {
             "loss": loss,
@@ -197,7 +303,7 @@ def make_sft_train_step(cfg, pad_id: int = 0):
     return sft_train_step
 
 
-def make_sft_eval_step(cfg, pad_id: int = 0):
+def make_sft_eval_step(cfg, pad_id: int = 0, *, num_loss_tiles: int = 4):
     """Build a JIT-compiled VLM SFT eval step (forward only, no gradients)."""
 
     @nnx.jit
@@ -221,12 +327,18 @@ def make_sft_eval_step(cfg, pad_id: int = 0):
             vision_cu_seqlens=vision_cu_seqlens,
             position_ids_ZBT=position_ids_ZBT,
         )
-        lm_weight = model.lm_head.kernel[...]
-        loss = chunked_cross_entropy_loss(
-            hidden_BTD, lm_weight, token_ids_BT, loss_mask_BT,
-            num_tiles=_NUM_LOSS_TILES,
-            logits_out_sharding=cfg.shd_cfg.logits_btv,
-        ) + aux_loss
+        lm_weight = model.output_weight()
+        loss = (
+            chunked_cross_entropy_loss(
+                hidden_BTD,
+                lm_weight,
+                token_ids_BT,
+                loss_mask_BT,
+                num_tiles=num_loss_tiles,
+                logits_out_sharding=cfg.shd_cfg.logits_btv,
+            )
+            + aux_loss
+        )
         supervised_tokens = jnp.sum(loss_mask_BT[:, 1:].astype(jnp.float32))
         return loss, supervised_tokens
 
@@ -240,8 +352,10 @@ def run_sft(
     *,
     save_dir: str | Path | None = None,
     save_every: int = 0,
+    keep_period: int = 0,
+    keep_latest: int = 1,
     log_every: int = 1,
-    resume: bool = False,
+    resume: checkpoint_utils.ResumeMode = checkpoint_utils.ResumeMode.NEVER,
     pad_id: int = 0,
     peak_tflops: float | None = None,
     tp_size: int | None = None,
@@ -253,6 +367,8 @@ def run_sft(
     val_steps: int = 10,
     text_attn_backend: str = "mosaic_gpu",
     gc_period: int = 0,
+    log_memory: bool = False,
+    tokamax_cache_dir: str | Path | None = None,
 ) -> tuple[MixedPrecisionOptimizer, dict[str, float]]:
     """SFT a VLM from a Grain iterator; returns final optimizer + last metrics.
 
@@ -262,18 +378,55 @@ def run_sft(
 
     If ``val_data_iter`` is provided, runs ``val_steps`` forward-only batches
     every ``val_every`` training steps and logs the average validation loss.
+
+    See :class:`omegalax.trainers.checkpoint_utils.ResumeMode` for the meaning of
+    each ``resume`` mode.
     """
     save_path = Path(save_dir).expanduser().resolve() if save_dir is not None else None
-    if resume:
-        if save_path is None:
-            raise ValueError("resume=True requires save_dir to be provided.")
-        if not save_path.exists():
-            raise ValueError(f"resume=True requires an existing checkpoint directory: {save_path}")
-        checkpoint_probe = _make_checkpoint_manager(save_path, save_interval=None)
-        latest_step = checkpoint_probe.latest_step()
-        checkpoint_probe.close()
-        if latest_step is None:
-            raise ValueError(f"resume=True but no checkpoints found under: {save_path}")
+
+    # Build the canonical CheckpointManager up-front so a single ``latest_step()``
+    # query drives both the model_cfg-source decision and the eventual restore.
+    # No throwaway probes.
+    checkpoint_manager: ocp.CheckpointManager | None = None
+    if save_path is not None:
+        save_path.mkdir(parents=True, exist_ok=True)
+        checkpoint_manager = _make_checkpoint_manager(
+            save_path,
+            save_interval=save_every or None,
+            keep_period=keep_period or None,
+            keep_latest=keep_latest or None,
+        )
+
+    latest_step = checkpoint_manager.latest_step() if checkpoint_manager is not None else None
+
+    if (
+        latest_step is not None
+        and latest_step >= train_cfg.num_steps
+        and resume in (checkpoint_utils.ResumeMode.IF_PRESENT, checkpoint_utils.ResumeMode.REQUIRED)
+    ):
+        startup_log(f"latest_step={latest_step} >= num_steps={train_cfg.num_steps}; exiting")
+        if checkpoint_manager is not None:
+            checkpoint_manager.close()
+        return None, None
+
+    if resume == checkpoint_utils.ResumeMode.REQUIRED and latest_step is None:
+        raise ValueError(
+            f"resume='required' but no checkpoint found at "
+            f"{save_path if save_path is not None else '<no save_dir provided>'}"
+        )
+
+    will_resume = (
+        resume in (checkpoint_utils.ResumeMode.IF_PRESENT, checkpoint_utils.ResumeMode.REQUIRED)
+        and latest_step is not None
+    )
+    if resume == checkpoint_utils.ResumeMode.IF_PRESENT:
+        startup_log(
+            f"resume=if_present: existing checkpoint detected at {save_path}; resuming"
+            if will_resume
+            else f"resume=if_present: no checkpoint at {save_path}; starting fresh"
+        )
+
+    if will_resume:
         model_cfg = vlm_api.resolve_config(str(save_path))
         startup_log(f"resolved model config from checkpoint {save_path!r}")
     else:
@@ -308,7 +461,7 @@ def run_sft(
         stable_fraction=train_cfg.lr_stable_fraction,
     )
 
-    if not resume and isinstance(model_id_or_cfg, str):
+    if not will_resume and isinstance(model_id_or_cfg, str):
         model, model_cfg = vlm_api.load_pretrained(
             model_id_or_cfg,
             tp_size=tp_size,
@@ -326,33 +479,90 @@ def run_sft(
             dp_size=dp_size,
         )
         startup_log("initialized model (random init)")
+    if wandb_run is not None and is_primary_process:
+        wandb_run.config.update(
+            {"model_cfg": export_lib.model_config_to_hf_dict(model_cfg)},
+            allow_val_change=True,
+        )
     from omegalax.models.sharding_runtime import set_attn_backend
+
     set_attn_backend(model, text_backend=text_attn_backend)
     startup_log(f"set attn backend: text={text_attn_backend}")
+    if train_cfg.enable_lora and train_cfg.freeze_vision_tower:
+        raise ValueError(
+            "--enable_lora already freezes the vision tower; "
+            "--freeze_vision_tower is redundant. Pass at most one."
+        )
+    if train_cfg.enable_lora:
+        with mesh_rules(mesh):
+            n_wrapped = inject_lora(
+                model,
+                r=train_cfg.lora_rank,
+                alpha=train_cfg.lora_alpha,
+                rngs=nnx.Rngs(train_cfg.seed),
+            )
+        startup_log(
+            f"LoRA enabled: r={train_cfg.lora_rank} alpha={train_cfg.lora_alpha} "
+            f"wrapped {n_wrapped} text-decoder Linear projections; vision frozen"
+        )
+        wrt_filter = LoRAParam
+    elif train_cfg.freeze_vision_tower:
+        wrt_filter = _trainable_non_vision
+        startup_log(
+            "vision tower frozen; full FT on text decoder + embedder + lm_head + layernorms"
+        )
+    else:
+        wrt_filter = nnx.Param
+
+    if log_memory:
+        log_pytree_bytes("params (after load)", nnx.state(model, nnx.Param), save_dir=save_path)
+        log_device_memory("after model load", save_dir=save_path)
+
     with mesh_rules(mesh):
-        optimizer = build_optimizer(model, lr_schedule_fn, train_cfg)
+        optimizer = build_optimizer(model, lr_schedule_fn, train_cfg, wrt=wrt_filter)
 
     startup_log("built optimizer")
-    sft_step = make_sft_train_step(model_cfg, pad_id=pad_id)
-    eval_step = make_sft_eval_step(model_cfg, pad_id=pad_id) if val_data_iter is not None else None
-    startup_log("built train step (jit)" + (" and eval step (jit)" if eval_step is not None else ""))
+    if log_memory:
+        log_pytree_bytes("optimizer.opt_state", nnx.state(optimizer.opt_state), save_dir=save_path)
+        log_pytree_bytes("optimizer (params + state)", nnx.state(optimizer), save_dir=save_path)
+        log_top_leaves_with_paths(
+            "optimizer (params + state) by path", nnx.state(optimizer), save_dir=save_path
+        )
+        log_device_memory("after optimizer build", save_dir=save_path)
+
+    sft_step = make_sft_train_step(
+        model_cfg,
+        pad_id=pad_id,
+        wrt=wrt_filter,
+        num_loss_tiles=train_cfg.num_loss_tiles,
+    )
+    eval_step = (
+        make_sft_eval_step(model_cfg, pad_id=pad_id, num_loss_tiles=train_cfg.num_loss_tiles)
+        if val_data_iter is not None
+        else None
+    )
+    startup_log(
+        "built train step (jit)" + (" and eval step (jit)" if eval_step is not None else "")
+    )
 
     accum_steps = train_cfg.grad_accum_steps
     timer = StepTimer(warmup=2 * accum_steps)
     global_tokens_per_step = train_cfg.seq_len * train_cfg.batch_size * accum_steps
 
-    checkpoint_manager = None
-    if save_path is not None:
-        save_path.mkdir(parents=True, exist_ok=True)
+    if checkpoint_manager is not None and not will_resume:
+        # Write the HF config alongside the orbax tree only on a fresh start;
+        # on resume the file was written by the original run and matches by
+        # construction (we just resolved model_cfg from it).
         _write_checkpoint_config(save_path, model_cfg)
-        checkpoint_manager = _make_checkpoint_manager(save_path, save_interval=save_every or None)
+        _write_lora_metadata(save_path, train_cfg)
+    if checkpoint_manager is not None:
         startup_log(f"checkpoint manager ready at {save_path!r}")
 
     start_step = 0
-    if resume:
-        if checkpoint_manager is None:
-            raise ValueError("resume=True requires save_dir to be provided.")
-        optimizer, start_step, rng, data_iter = _restore_sft_checkpoint(checkpoint_manager, optimizer, rng, data_iter)
+    if will_resume:
+        optimizer, start_step, rng, data_iter = _restore_sft_checkpoint(
+            checkpoint_manager, optimizer, rng, data_iter
+        )
         rng = jax.device_put(rng, replicated_rng_sharding)
         startup_log(f"restored checkpoint at step {start_step}")
 
@@ -375,12 +585,48 @@ def run_sft(
             global_tokens_per_step=global_tokens_per_step,
             peak_tflops=peak_tflops,
             wandb_run=wandb_run,
-            batch_size=train_cfg.batch_size,
+            batch_size=train_cfg.batch_size * accum_steps,
         )
         if result is not None:
             last_metrics = result
 
+    # Flag-only handler: doing an orbax save or JAX collective from inside
+    # the signal handler deadlocks (handlers run on arbitrary threads and
+    # re-enter the runtime). The flag is read at a safe per-step point.
+    requeue_requested = False
+
+    def _request_requeue(signum, _frame):
+        nonlocal requeue_requested
+        if not requeue_requested:
+            startup_log(f"[signal] received {signum}; will requeue after current step")
+        requeue_requested = True
+
+    signal.signal(signal.SIGUSR1, _request_requeue)
+    signal.signal(signal.SIGTERM, _request_requeue)
+
+    autotune_result = None
+    pending_batch = None
+    if tokamax_cache_dir is not None:
+        autotune_result = tokamax_cache_lib.try_load(tokamax_cache_dir)
+        if autotune_result is None:
+            startup_log("priming tokamax autotuning with first training batch")
+            pending_batch = next(data_iter)
+            pending_batch_sharded = vlm_api.shard_batch_dict(pending_batch, model_cfg, mesh)
+            autotune_result = tokamax_cache_lib.autotune_and_save(
+                tokamax_cache_dir, sft_step, optimizer, pending_batch_sharded
+            )
+
+    # Push the autotuning overlay onto tokamax's lookup stack for the duration
+    # of training; this keeps the for-loop indentation unchanged.
+    _autotune_ctx = autotune_result if autotune_result is not None else contextlib.nullcontext()
+    _autotune_ctx.__enter__()
+
     startup_log("entering training loop")
+    if log_memory:
+        log_device_memory("before first step", save_dir=save_path)
+    _mem_logged_after_first_step = not log_memory
+    _mem_logged_steady_state = not log_memory
+
     for step_idx in range(start_step, train_cfg.num_steps):
         step = step_idx + 1
 
@@ -389,14 +635,24 @@ def run_sft(
         accum_grad_norm = 0.0
         accum_flops = 0.0
         accum_time = datetime.timedelta(0)
+        source_counts: dict[int, int] = {}
 
         for _micro in range(accum_steps):
-            batch = next(data_iter)
+            if pending_batch is not None:
+                batch = pending_batch
+                pending_batch = None
+            else:
+                batch = next(data_iter)
+            sids = pop_source_ids(batch)
+            if sids is not None:
+                for sid in sids.tolist():
+                    source_counts[sid] = source_counts.get(sid, 0) + 1
             micro_flops = per_device_flops_per_step(
                 model_cfg,
                 train_cfg.seq_len,
                 train_cfg.batch_size,
                 image_grid_thw=batch.get("image_grid_thw"),
+                vision_trainable=not (train_cfg.freeze_vision_tower or train_cfg.enable_lora),
             )
             batch = vlm_api.shard_batch_dict(batch, model_cfg, mesh)
             _, metrics = sft_step(optimizer, batch)
@@ -408,14 +664,29 @@ def run_sft(
             accum_flops += micro_flops
             accum_time += micro_delta
 
-        
-        with jax.default_device('cpu'):
+        # Log memory after first step and after 5 steps
+        if not _mem_logged_after_first_step:
+            jax.block_until_ready(metrics["loss"])
+            log_device_memory("after first step (compile done)", save_dir=save_path)
+            log_live_arrays("after first step (compile done)", save_dir=save_path)
+            log_compiled_memory_analysis("sft_step", sft_step, save_path, optimizer, batch)
+            _mem_logged_after_first_step = True
+        elif not _mem_logged_steady_state and step_idx >= 4:
+            jax.block_until_ready(metrics["loss"])
+            log_device_memory("after step 5 (steady state)", save_dir=save_path)
+            _mem_logged_steady_state = True
+
+        with jax.default_device("cpu"):
             window_metrics = {
                 "loss": accum_loss / accum_steps,
                 "grad_norm": accum_grad_norm / accum_steps,
                 "supervised_tokens": accum_sup_tokens,
                 "lr": lr_schedule_fn(step_idx),
             }
+            if len(source_counts) > 1:
+                total = float(sum(source_counts.values()))
+                for sid, cnt in source_counts.items():
+                    window_metrics[f"data_source_{sid}_frac"] = cnt / total
             _log_prev_metrics()
 
             prev_metrics = (step, window_metrics, accum_time, accum_flops)
@@ -431,6 +702,7 @@ def run_sft(
             total_val_sup_tokens = 0.0
             for _ in range(val_steps):
                 val_batch = next(val_data_iter)
+                pop_source_ids(val_batch)
                 val_batch = vlm_api.shard_batch_dict(val_batch, model_cfg, mesh)
                 val_loss, val_sup_tokens = eval_step(optimizer.model, val_batch)
                 total_val_loss += float(val_loss)
@@ -442,12 +714,28 @@ def run_sft(
                     step=step,
                 )
 
+        if requeue_requested:
+            startup_log(f"[signal] saving checkpoint at step={step} and requeueing")
+            if checkpoint_manager is not None:
+                _save_sft_checkpoint(checkpoint_manager, optimizer, rng, step, data_iter)
+                checkpoint_manager.wait_until_finished()
+                checkpoint_manager.close()
+            slurm_job_id = os.environ.get("SLURM_JOB_ID")
+            if slurm_job_id and is_primary_process:
+                startup_log(f"[signal] scontrol requeue {slurm_job_id}")
+                subprocess.run(["scontrol", "requeue", slurm_job_id], check=False)
+            _autotune_ctx.__exit__(None, None, None)
+            return optimizer, last_metrics
+
     _log_prev_metrics(force=True)
 
     if checkpoint_manager is not None:
         if last_metrics and (not save_every or last_metrics["step"] % save_every != 0):
-            _save_sft_checkpoint(checkpoint_manager, optimizer, rng, int(last_metrics["step"]), data_iter)
+            _save_sft_checkpoint(
+                checkpoint_manager, optimizer, rng, int(last_metrics["step"]), data_iter
+            )
         checkpoint_manager.wait_until_finished()
         checkpoint_manager.close()
 
+    _autotune_ctx.__exit__(None, None, None)
     return optimizer, last_metrics

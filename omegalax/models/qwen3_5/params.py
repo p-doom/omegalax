@@ -21,7 +21,11 @@ from .config import Qwen3_5Config
 from .loader import _get_non_expert_mapping, create_qwen3_5_from_safetensors
 from .model import Qwen3_5ForConditionalGeneration
 
-__all__ = ["create_qwen3_5_from_safetensors", "export_qwen3_5_to_safetensors", "qwen3_5_to_hf_config_dict"]
+__all__ = [
+    "create_qwen3_5_from_safetensors",
+    "export_qwen3_5_to_safetensors",
+    "qwen3_5_to_hf_config_dict",
+]
 
 
 def _jnp_dtype_to_hf(dtype: Any) -> str:
@@ -138,7 +142,9 @@ def export_qwen3_5_to_safetensors(
         if m:
             layer_idx = m.group(1)
             arr = np.asarray(jax.device_get(value))
-            hf_tensors[f"model.language_model.layers.{layer_idx}.linear_attn.norm.weight"] = arr.astype(np.float32)
+            hf_tensors[f"model.language_model.layers.{layer_idx}.linear_attn.norm.weight"] = (
+                arr.astype(np.float32)
+            )
             return True
 
         # Vision merger norm.weight (SCALE, no transform)
@@ -152,9 +158,9 @@ def export_qwen3_5_to_safetensors(
         if m:
             layer_idx = m.group(1)
             arr = np.asarray(jax.device_get(value))
-            hf_tensors[f"model.language_model.layers.{layer_idx}.linear_attn.conv1d.weight"] = arr[:, None, :].astype(
-                np.float32
-            )
+            hf_tensors[f"model.language_model.layers.{layer_idx}.linear_attn.conv1d.weight"] = arr[
+                :, None, :
+            ].astype(np.float32)
             return True
 
         # dt_bias
@@ -162,7 +168,9 @@ def export_qwen3_5_to_safetensors(
         if m:
             layer_idx = m.group(1)
             arr = np.asarray(jax.device_get(value))
-            hf_tensors[f"model.language_model.layers.{layer_idx}.linear_attn.dt_bias"] = arr.astype(np.float32)
+            hf_tensors[f"model.language_model.layers.{layer_idx}.linear_attn.dt_bias"] = arr.astype(
+                np.float32
+            )
             return True
 
         # A_log
@@ -170,7 +178,9 @@ def export_qwen3_5_to_safetensors(
         if m:
             layer_idx = m.group(1)
             arr = np.asarray(jax.device_get(value))
-            hf_tensors[f"model.language_model.layers.{layer_idx}.linear_attn.A_log"] = arr.astype(np.float32)
+            hf_tensors[f"model.language_model.layers.{layer_idx}.linear_attn.A_log"] = arr.astype(
+                np.float32
+            )
             return True
 
         if not cfg.text_config.is_moe:
@@ -181,7 +191,9 @@ def export_qwen3_5_to_safetensors(
         if m:
             layer_idx = m.group(1)
             arr = np.asarray(jax.device_get(value))
-            hf_tensors[f"model.language_model.layers.{layer_idx}.mlp.experts.gate_up_proj"] = arr.astype(np.float32)
+            hf_tensors[f"model.language_model.layers.{layer_idx}.mlp.experts.gate_up_proj"] = (
+                arr.astype(np.float32)
+            )
             return True
 
         # MoE expert down_proj: stored as-is (E, D, F)
@@ -189,7 +201,9 @@ def export_qwen3_5_to_safetensors(
         if m:
             layer_idx = m.group(1)
             arr = np.asarray(jax.device_get(value))
-            hf_tensors[f"model.language_model.layers.{layer_idx}.mlp.experts.down_proj"] = arr.astype(np.float32)
+            hf_tensors[f"model.language_model.layers.{layer_idx}.mlp.experts.down_proj"] = (
+                arr.astype(np.float32)
+            )
             return True
 
         # MoE router: (D, E) -> (E, D)
@@ -197,7 +211,9 @@ def export_qwen3_5_to_safetensors(
         if m:
             layer_idx = m.group(1)
             arr = np.asarray(jax.device_get(value))
-            hf_tensors[f"model.language_model.layers.{layer_idx}.mlp.gate.weight"] = arr.T.astype(np.float32)
+            hf_tensors[f"model.language_model.layers.{layer_idx}.mlp.gate.weight"] = arr.T.astype(
+                np.float32
+            )
             return True
 
         # Shared expert gate: (D, 1) -> (1, D)
@@ -232,7 +248,9 @@ def export_qwen3_5_to_safetensors(
             unmatched.append(jax_key)
 
     if unmatched:
-        raise RuntimeError(f"Unmapped JAX parameters during export:\n" + "\n".join(sorted(unmatched)))
+        raise RuntimeError(
+            "Unmapped JAX parameters during export:\n" + "\n".join(sorted(unmatched))
+        )
 
     stnp.save_file(hf_tensors, tensor_path)
     save_hf_config(qwen3_5_to_hf_config_dict(cfg), out_path)

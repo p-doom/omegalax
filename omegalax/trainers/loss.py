@@ -70,8 +70,9 @@ def chunked_cross_entropy_loss(
     T1 = T - 1
 
     if num_tiles <= 1 or T1 < num_tiles:
-        logits_BTV = jnp.einsum("BTD,DV->BTV", hidden_BTD, lm_head_kernel_DV,
-                                out_sharding=logits_out_sharding)
+        logits_BTV = jnp.einsum(
+            "BTD,DV->BTV", hidden_BTD, lm_head_kernel_DV, out_sharding=logits_out_sharding
+        )
         loss_sum, mask_sum = _cross_entropy_with_logits(logits_BTV, targets_BT, mask_BT)
         return loss_sum / jnp.maximum(mask_sum, 1.0)
 
@@ -90,8 +91,9 @@ def chunked_cross_entropy_loss(
     @jax.remat
     def _remat_chunk(h_BSD, tgt_BS, msk_BS):
         """Compute logits + CE for one chunk; remat discards logits in backward."""
-        logits_BSV = jnp.einsum("BSD,DV->BSV", h_BSD, lm_head_kernel_DV,
-                                out_sharding=logits_out_sharding)
+        logits_BSV = jnp.einsum(
+            "BSD,DV->BSV", h_BSD, lm_head_kernel_DV, out_sharding=logits_out_sharding
+        )
         return _cross_entropy_with_logits(logits_BSV, tgt_BS, msk_BS)
 
     def _scan_body(acc, chunk_data):
@@ -107,9 +109,9 @@ def chunked_cross_entropy_loss(
         _scan_body,
         (jnp.array(0.0, dtype=jnp.float32), jnp.array(0.0, dtype=jnp.float32)),
         (
-            jnp.moveaxis(hidden_BCSD, 1, 0),   # (num_tiles, B, chunk_size, D)
-            jnp.moveaxis(targets_BCS, 1, 0),    # (num_tiles, B, chunk_size)
-            jnp.moveaxis(mask_BCS, 1, 0),       # (num_tiles, B, chunk_size)
+            jnp.moveaxis(hidden_BCSD, 1, 0),  # (num_tiles, B, chunk_size, D)
+            jnp.moveaxis(targets_BCS, 1, 0),  # (num_tiles, B, chunk_size)
+            jnp.moveaxis(mask_BCS, 1, 0),  # (num_tiles, B, chunk_size)
         ),
         unroll=1,
     )

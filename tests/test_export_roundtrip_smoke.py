@@ -53,7 +53,9 @@ class ExportRoundTripTest(absltest.TestCase):
             model = Qwen3(cfg, rngs=rngs)
             with tempfile.TemporaryDirectory() as tmpdir:
                 export_qwen3_to_safetensors(model, cfg, tmpdir)
-                loaded = create_qwen3_from_safetensors(tmpdir, "qwen3-smoke", tp_size=1, fsdp_size=1, dp_size=1)
+                loaded = create_qwen3_from_safetensors(
+                    tmpdir, "qwen3-smoke", tp_size=1, fsdp_size=1, dp_size=1
+                )
         _assert_params_equal(self, model, loaded)
 
     def test_qwen3_moe_round_trip(self):
@@ -63,7 +65,9 @@ class ExportRoundTripTest(absltest.TestCase):
             model = Qwen3(cfg, rngs=rngs)
             with tempfile.TemporaryDirectory() as tmpdir:
                 export_qwen3_to_safetensors(model, cfg, tmpdir)
-                loaded = create_qwen3_from_safetensors(tmpdir, "qwen3-smoke-moe", tp_size=1, fsdp_size=1, dp_size=1)
+                loaded = create_qwen3_from_safetensors(
+                    tmpdir, "qwen3-smoke-moe", tp_size=1, fsdp_size=1, dp_size=1
+                )
         _assert_params_equal(self, model, loaded)
 
     def test_qwen3_vl_round_trip(self):

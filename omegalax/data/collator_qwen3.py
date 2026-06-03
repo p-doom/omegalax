@@ -10,13 +10,12 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Any
 
+import ml_dtypes
 import numpy as np
 from transformers import BaseImageProcessor, PreTrainedTokenizer
 
 from omegalax.data.qwen3_encoding import (
-    build_chatml_text as _build_chatml_text,
     encode_qwen_messages as _encode_qwen_messages,
-    extract_images as _extract_images,
 )
 
 
@@ -67,7 +66,9 @@ class TextSFTCollator:
     def __init__(self, tokenizer: PreTrainedTokenizer, max_length: int) -> None:
         self.tokenizer = tokenizer
         self.max_length = max_length
-        assert tokenizer.pad_token_id is not None, "tokenizer must have pad_token_id set (e.g. Qwen3-VL, Qwen3.5)"
+        assert tokenizer.pad_token_id is not None, (
+            "tokenizer must have pad_token_id set (e.g. Qwen3-VL, Qwen3.5)"
+        )
 
         self._im_start_id = tokenizer.convert_tokens_to_ids("<|im_start|>")
         self._im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
@@ -97,12 +98,16 @@ class TextSFTCollator:
             attn_mask = np.ones(seq_len, dtype=np.int32)
 
             loss_mask = _build_assistant_loss_mask(
-                token_ids, self._im_start_id, self._im_end_id,
+                token_ids,
+                self._im_start_id,
+                self._im_end_id,
                 self._assistant_token_id,
             )
 
             if pad_len > 0:
-                token_ids = np.pad(token_ids, (0, pad_len), constant_values=self.tokenizer.pad_token_id)
+                token_ids = np.pad(
+                    token_ids, (0, pad_len), constant_values=self.tokenizer.pad_token_id
+                )
                 attn_mask = np.pad(attn_mask, (0, pad_len), constant_values=0)
                 loss_mask = np.pad(loss_mask, (0, pad_len), constant_values=0)
 
@@ -177,7 +182,8 @@ def _pad_vision_arrays(
     dummy_grids.extend([[1, merge_size, merge_size]] * num_simple)
 
     padded_grid = np.concatenate(
-        [image_grid_thw, np.array(dummy_grids, dtype=np.int32)], axis=0,
+        [image_grid_thw, np.array(dummy_grids, dtype=np.int32)],
+        axis=0,
     )
     padded_pv = np.concatenate(
         [pixel_values, np.zeros((extra_patches, feat_dim), dtype=pixel_values.dtype)],
@@ -198,7 +204,10 @@ def _compute_vision_cu_seqlens(image_grid_thw: np.ndarray) -> np.ndarray:
     for t, h, w in image_grid_thw.tolist():
         frame_token_counts.extend([int(h) * int(w)] * int(t))
     return np.concatenate(
-        [np.zeros(1, dtype=np.int32), np.cumsum(np.asarray(frame_token_counts, dtype=np.int32), dtype=np.int32)]
+        [
+            np.zeros(1, dtype=np.int32),
+            np.cumsum(np.asarray(frame_token_counts, dtype=np.int32), dtype=np.int32),
+        ]
     )
 
 
@@ -227,13 +236,17 @@ class VLMSFTCollator:
         *,
         max_vision_patches_per_sample: int | None = None,
         max_vision_images_per_sample: int | None = None,
+        pixel_values_dtype: Any = ml_dtypes.bfloat16,
     ) -> None:
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.image_processor = image_processor
         self._max_vision_patches_per_sample = max_vision_patches_per_sample
         self._max_vision_images_per_sample = max_vision_images_per_sample
-        assert tokenizer.pad_token_id is not None, "tokenizer must have pad_token_id set (e.g. Qwen3-VL, Qwen3.5)"
+        self._pixel_values_dtype = pixel_values_dtype
+        assert tokenizer.pad_token_id is not None, (
+            "tokenizer must have pad_token_id set (e.g. Qwen3-VL, Qwen3.5)"
+        )
 
         self._im_start_id = tokenizer.convert_tokens_to_ids("<|im_start|>")
         self._im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
@@ -243,6 +256,16 @@ class VLMSFTCollator:
         self._video_token_id = tokenizer.convert_tokens_to_ids("<|video_pad|>")
         self._vision_start_token_id = tokenizer.convert_tokens_to_ids("<|vision_start|>")
 
+        # Per-patch feat dim from the HF image processor's (T, C, P, P) flatten,
+        # used to shape the all-text-only placeholder so ``pixel_values`` stays
+        # in the batch dict at fixed shape (else ``train_step`` recompiles).
+        self._patch_feat_dim = (
+            image_processor.temporal_patch_size
+            * len(image_processor.image_mean)
+            * image_processor.patch_size
+            * image_processor.patch_size
+        )
+
     def __call__(self, examples: Sequence[dict[str, Any]]) -> dict[str, np.ndarray]:
         from omegalax.models.qwen3_vl.model import get_rope_index
 
@@ -251,7 +274,6 @@ class VLMSFTCollator:
         batch_mask: list[np.ndarray] = []
         all_pixel_values: list[np.ndarray] = []
         all_grid_thw: list[np.ndarray] = []
-        has_images = False
 
         for ex in examples:
             messages = ex["messages"]
@@ -269,7 +291,6 @@ class VLMSFTCollator:
                 )
 
             if "pixel_values" in encoded:
-                has_images = True
                 all_pixel_values.append(encoded["pixel_values"])
                 all_grid_thw.append(encoded["image_grid_thw"])
 
@@ -279,12 +300,16 @@ class VLMSFTCollator:
             attn_mask = np.ones(seq_len, dtype=np.int32)
 
             loss_mask = _build_assistant_loss_mask(
-                token_ids, self._im_start_id, self._im_end_id,
+                token_ids,
+                self._im_start_id,
+                self._im_end_id,
                 self._assistant_token_id,
             )
 
             if pad_len > 0:
-                token_ids = np.pad(token_ids, (0, pad_len), constant_values=self.tokenizer.pad_token_id)
+                token_ids = np.pad(
+                    token_ids, (0, pad_len), constant_values=self.tokenizer.pad_token_id
+                )
                 attn_mask = np.pad(attn_mask, (0, pad_len), constant_values=0)
                 loss_mask = np.pad(loss_mask, (0, pad_len), constant_values=0)
 
@@ -298,39 +323,46 @@ class VLMSFTCollator:
             "loss_mask_BT": np.stack(batch_mask).astype(np.int32),
         }
 
-        if has_images and all_pixel_values:
+        if all_pixel_values:
             pixel_values = np.concatenate(all_pixel_values, axis=0)
             image_grid_thw = np.concatenate(all_grid_thw, axis=0)
+        else:
+            pixel_values = np.zeros((0, self._patch_feat_dim), dtype=np.float32)
+            image_grid_thw = np.zeros((0, 3), dtype=np.int32)
 
-            # Compute position_ids from REAL (unpadded) grid — these only
-            # depend on real <|image_pad|> positions in token_ids_BT.
-            position_ids, _ = get_rope_index(
-                result["token_ids_BT"],
-                image_grid_thw=image_grid_thw,
-                attention_mask=result["attention_mask_BT"],
-                spatial_merge_size=self.image_processor.merge_size,
-                image_token_id=self._image_token_id,
-                video_token_id=self._video_token_id,
-                vision_start_token_id=self._vision_start_token_id,
+        # Compute position_ids from REAL (unpadded) grid — these only
+        # depend on real <|image_pad|> positions in token_ids_BT.
+        position_ids, _ = get_rope_index(
+            result["token_ids_BT"],
+            image_grid_thw=image_grid_thw,
+            attention_mask=result["attention_mask_BT"],
+            spatial_merge_size=self.image_processor.merge_size,
+            image_token_id=self._image_token_id,
+            video_token_id=self._video_token_id,
+            vision_start_token_id=self._vision_start_token_id,
+        )
+        result["position_ids_ZBT"] = position_ids.astype(np.int32)
+
+        # Pad vision arrays to static shapes so JAX JIT never recompiles.
+        # Per-sample limits are multiplied by batch size so the user
+        # doesn't need to recompute when changing batch_size.
+        if (
+            self._max_vision_patches_per_sample is not None
+            and self._max_vision_images_per_sample is not None
+        ):
+            bs = len(examples)
+            pixel_values, image_grid_thw, vision_cu_seqlens = _pad_vision_arrays(
+                pixel_values,
+                image_grid_thw,
+                merge_size=self.image_processor.merge_size,
+                max_patches=self._max_vision_patches_per_sample * bs,
+                max_images=self._max_vision_images_per_sample * bs,
             )
-            result["position_ids_ZBT"] = position_ids.astype(np.int32)
+        else:
+            vision_cu_seqlens = _compute_vision_cu_seqlens(image_grid_thw)
 
-            # Pad vision arrays to static shapes so JAX JIT never recompiles.
-            # Per-sample limits are multiplied by batch size so the user
-            # doesn't need to recompute when changing batch_size.
-            if self._max_vision_patches_per_sample is not None and self._max_vision_images_per_sample is not None:
-                bs = len(examples)
-                pixel_values, image_grid_thw, vision_cu_seqlens = _pad_vision_arrays(
-                    pixel_values, image_grid_thw,
-                    merge_size=self.image_processor.merge_size,
-                    max_patches=self._max_vision_patches_per_sample * bs,
-                    max_images=self._max_vision_images_per_sample * bs,
-                )
-            else:
-                vision_cu_seqlens = _compute_vision_cu_seqlens(image_grid_thw)
-
-            result["pixel_values"] = pixel_values
-            result["image_grid_thw"] = image_grid_thw
-            result["vision_cu_seqlens"] = vision_cu_seqlens
+        result["pixel_values"] = pixel_values.astype(self._pixel_values_dtype, copy=False)
+        result["image_grid_thw"] = image_grid_thw
+        result["vision_cu_seqlens"] = vision_cu_seqlens
 
         return result
