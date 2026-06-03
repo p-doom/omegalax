@@ -10,9 +10,10 @@ git config core.hooksPath .githooks
 
 ## `pre-commit`
 
-Blocks a commit if any **staged** Python file is not `ruff`-formatted, and
-prints the exact command to fix it. Requires [`uv`](https://docs.astral.sh/uv/)
-on `PATH` (it runs `uvx ruff …`; no separate install needed).
+Blocks a commit if any **staged** Python file fails `ruff check` (lint) or is
+not `ruff format`-clean, and prints the exact command to fix each. Requires
+[`uv`](https://docs.astral.sh/uv/) on `PATH` (it runs `uvx ruff …`; no separate
+install needed).
 
 - Formatting rules live in `pyproject.toml` (`[tool.ruff]`, line-length 100).
 - The ruff version is pinned inside the hook so it matches the repo-wide
