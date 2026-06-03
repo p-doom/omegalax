@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# Pre-commit hook: verify staged Python files are ruff-formatted.
+#
+# Enable once per clone (shared across worktrees):
+#     git config core.hooksPath .githooks
+#
+# Fix reported issues with:
+#     uvx ruff format <files>     # or: uvx ruff format omegalax scripts tests
+#
+# Notes:
+# * Only files staged for the current commit are checked, so the repo-wide
+#   format state is never re-scanned on every commit.
+# * The working-tree version of each staged file is checked (the common case);
+#   partially-staged files are checked as they appear on disk.
+set -euo pipefail
+
+# Pinned so the hook formats identically to the repo-wide `style:` baseline.
+# Bump in lockstep with a fresh `uvx ruff@<ver> format omegalax scripts tests`.
+RUFF_VERSION="0.15.15"
+
+# Staged Python files: Added / Copied / Modified / Renamed (skip Deleted).
+mapfile -t files < <(git diff --cached --name-only --diff-filter=ACMR -- '*.py')
+if [ ${#files[@]} -eq 0 ]; then
+  exit 0
+fi
+
+if ! command -v uvx >/dev/null 2>&1; then
+  echo "pre-commit: 'uvx' not found. Install uv: https://docs.astral.sh/uv/" >&2
+  exit 1
+fi
+
+if ! uvx "ruff@${RUFF_VERSION}" format --check "${files[@]}"; then
+  {
+    echo
+    echo "pre-commit: formatting issues in staged files. Fix with:"
+    echo "    uvx ruff@${RUFF_VERSION} format ${files[*]}"
+    echo "then 'git add' the changes and commit again."
+    echo "(bypass once with 'git commit --no-verify' if you must.)"
+  } >&2
+  exit 1
+fi
