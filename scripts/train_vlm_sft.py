@@ -67,6 +67,18 @@ flags.DEFINE_string(
     "every launch with no persistence.",
 )
 flags.DEFINE_integer("save_every", 50, "Save checkpoint every N steps.")
+flags.DEFINE_integer(
+    "keep_period",
+    0,
+    "Permanently retain every checkpoint whose step is a multiple of this value "
+    "(0 = keep all). Must be a multiple of --save_every to ever fire (the loop only "
+    "saves at multiples of --save_every).",
+)
+flags.DEFINE_integer(
+    "keep_latest",
+    2,
+    "Also retain the N most-recent checkpoints regardless of --keep_period.",
+)
 flags.DEFINE_integer("log_every", 10, "Log metrics every N steps.")
 flags.DEFINE_bool("log_memory", True, "Log per-process JAX/HBM memory at init and first few steps.")
 flags.DEFINE_enum(
@@ -315,6 +327,8 @@ def main(_) -> None:
             data_iter,
             save_dir=save_dir,
             save_every=FLAGS.save_every,
+            keep_period=FLAGS.keep_period,
+            keep_latest=FLAGS.keep_latest,
             log_every=FLAGS.log_every,
             resume=resume_mode,
             pad_id=FLAGS.pad_id,

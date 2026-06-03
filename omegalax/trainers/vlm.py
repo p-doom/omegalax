@@ -17,6 +17,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec
 import numpy as np
 import optax
 import orbax.checkpoint as ocp
+from orbax.checkpoint import checkpoint_managers as ocm
 
 from omegalax import export as export_lib
 from omegalax.data.grain_pipeline import pop_source_ids
@@ -132,17 +133,36 @@ def _abstract_train_state(optimizer: MixedPrecisionOptimizer, rng: jax.Array) ->
     }
 
 
-def _make_checkpoint_manager(save_dir: Path, save_interval: int | None) -> ocp.CheckpointManager:
-    """Orbax requires an absolute checkpoint path."""
+def _make_checkpoint_manager(
+    save_dir: Path,
+    save_interval: int | None,
+    keep_period: int | None = None,
+    keep_latest: int | None = None,
+) -> ocp.CheckpointManager:
+    """Orbax requires an absolute checkpoint path.
+
+    ``keep_period`` permanently retains every checkpoint whose step is a multiple
+    of it (e.g. full-epoch boundaries); for it to ever fire it must be a multiple
+    of ``save_interval`` since the loop only saves at multiples of ``save_interval``.
+    ``keep_latest`` additionally retains the N most-recent checkpoints. When
+    ``keep_period`` is unset the manager keeps every checkpoint (prior behavior).
+    """
     save_dir = Path(save_dir).expanduser().resolve()
     handler_registry = ocp.handlers.DefaultCheckpointHandlerRegistry()
     handler_registry.add("train_state", ocp.args.PyTreeSave, ocp.handlers.PyTreeCheckpointHandler)
     handler_registry.add("train_state", ocp.args.PyTreeRestore, ocp.handlers.PyTreeCheckpointHandler)
     checkpoint_utils.register_grain_iterator_handler(handler_registry)
+    preservation_policy = None
+    if keep_period:
+        policies = [ocm.EveryNSteps(keep_period, exact_interval=True)]
+        if keep_latest:
+            policies.append(ocm.LatestN(keep_latest))
+        preservation_policy = ocm.AnyPreservationPolicy(policies)
     options = ocp.CheckpointManagerOptions(
         save_interval_steps=save_interval,
         step_format_fixed_length=6,
         cleanup_tmp_directories=True,
+        preservation_policy=preservation_policy,
     )
     return ocp.CheckpointManager(save_dir, options=options, handler_registry=handler_registry)
 
@@ -311,6 +331,8 @@ def run_sft(
     *,
     save_dir: str | Path | None = None,
     save_every: int = 0,
+    keep_period: int = 0,
+    keep_latest: int = 1,
     log_every: int = 1,
     resume: checkpoint_utils.ResumeMode = checkpoint_utils.ResumeMode.NEVER,
     pad_id: int = 0,
@@ -347,7 +369,12 @@ def run_sft(
     checkpoint_manager: ocp.CheckpointManager | None = None
     if save_path is not None:
         save_path.mkdir(parents=True, exist_ok=True)
-        checkpoint_manager = _make_checkpoint_manager(save_path, save_interval=save_every or None)
+        checkpoint_manager = _make_checkpoint_manager(
+            save_path,
+            save_interval=save_every or None,
+            keep_period=keep_period or None,
+            keep_latest=keep_latest or None,
+        )
 
     latest_step = checkpoint_manager.latest_step() if checkpoint_manager is not None else None
 
