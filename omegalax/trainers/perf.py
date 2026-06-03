@@ -179,9 +179,7 @@ def qwen3_vl_vision_training_flops(
     per_image_tokens = grid_N3[:, 0] * grid_N3[:, 1] * grid_N3[:, 2]
     total_tokens = int(np.sum(per_image_tokens))
     sum_sq_tokens = int(np.sum(per_image_tokens * per_image_tokens))
-    merged_tokens = int(
-        np.sum(grid_N3[:, 0] * (grid_N3[:, 1] // merge) * (grid_N3[:, 2] // merge))
-    )
+    merged_tokens = int(np.sum(grid_N3[:, 0] * (grid_N3[:, 1] // merge) * (grid_N3[:, 2] // merge)))
     if total_tokens <= 0 or merged_tokens <= 0:
         return 0
 
@@ -275,7 +273,9 @@ def _training_flops_per_token_qwen3_5(cfg: Qwen3_5TextConfig, seq_len: int) -> i
             in_proj_a = 2 * D * nv
             out_proj = 2 * value_dim * D
             delta_rule_per_token = 2 * nv * (ak * av)
-            layer_flops += in_proj_qkv + in_proj_z + in_proj_b + in_proj_a + out_proj + delta_rule_per_token
+            layer_flops += (
+                in_proj_qkv + in_proj_z + in_proj_b + in_proj_a + out_proj + delta_rule_per_token
+            )
 
         if cfg.is_moe:
             E = cfg.num_experts

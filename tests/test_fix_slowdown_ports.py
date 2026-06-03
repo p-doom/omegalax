@@ -17,6 +17,7 @@ Requires GPU with cuDNN (head_dim=64 used to satisfy the cuDNN kernel).
 from __future__ import annotations
 
 import os
+
 os.environ.setdefault("JAX_PLATFORMS", "cuda")
 
 import jax
@@ -52,7 +53,7 @@ def _block_diag_reference(
     v = v_NHK.astype(jnp.float32)
     seg = np.zeros(N, dtype=np.int32)
     for i in range(len(cu_seqlens) - 1):
-        seg[int(cu_seqlens[i]):int(cu_seqlens[i + 1])] = i
+        seg[int(cu_seqlens[i]) : int(cu_seqlens[i + 1])] = i
     seg_j = jnp.asarray(seg)
     mask_NN = seg_j[:, None] == seg_j[None, :]  # block-diagonal
     logits_HNN = jnp.einsum("nhk,mhk->hnm", q, k) * scale
@@ -91,14 +92,15 @@ class CuDnnPackedVisionAttentionTest(absltest.TestCase):
         v_jax = jnp.asarray(v, dtype=jnp.bfloat16)
         cu_jax = jnp.asarray(cu)
 
-        scale = 1.0 / (K ** 0.5)
+        scale = 1.0 / (K**0.5)
         out_cudnn = _cudnn_packed_vision_attention(q_jax, k_jax, v_jax, cu_jax, scale)
         out_ref = _block_diag_reference(q_jax, k_jax, v_jax, cu, scale)
 
         np.testing.assert_allclose(
             np.asarray(out_cudnn, dtype=np.float32),
             np.asarray(out_ref, dtype=np.float32),
-            rtol=2e-2, atol=2e-2,
+            rtol=2e-2,
+            atol=2e-2,
         )
 
 
@@ -125,7 +127,6 @@ def _qwen3_test_cfg() -> Qwen3Config:
 
 
 class Qwen3TextAttnBackendSwapTest(absltest.TestCase):
-
     def test_mosaic_gpu_and_cudnn_outputs_match(self):
         cfg = _qwen3_test_cfg()
         with mesh_rules_for(tp_size=1, fsdp_size=1, dp_size=1):
@@ -206,7 +207,7 @@ def _make_vlm_inputs(cfg: Qwen3_5Config, real_grids, max_images=None, max_patche
     total_img_tokens = sum(img_tokens_per_image)
     tokens = np.full((1, total_img_tokens + 4), 7, dtype=np.int32)
     tokens[0, 0] = 1  # bos
-    tokens[0, 1:1 + total_img_tokens] = cfg.image_token_id
+    tokens[0, 1 : 1 + total_img_tokens] = cfg.image_token_id
 
     patch_dim = (
         cfg.vision_config.in_channels
@@ -220,7 +221,8 @@ def _make_vlm_inputs(cfg: Qwen3_5Config, real_grids, max_images=None, max_patche
 
     if max_images is not None:
         pv, grid, cu = _pad_vision_arrays(
-            pv, grid,
+            pv,
+            grid,
             merge_size=ms,
             max_patches=max_patches,
             max_images=max_images,
@@ -271,16 +273,33 @@ class Qwen3_5PaddingNoOpTest(absltest.TestCase):
 
         toks_a, seg_a, pv_a, grid_a, cu_a, pos_a = _make_vlm_inputs(cfg, real_grids)
         toks_b, seg_b, pv_b, grid_b, cu_b, pos_b = _make_vlm_inputs(
-            cfg, real_grids, max_images=max_images, max_patches=max_patches,
+            cfg,
+            real_grids,
+            max_images=max_images,
+            max_patches=max_patches,
         )
         np.testing.assert_array_equal(np.asarray(toks_a), np.asarray(toks_b))
 
-        h_a, _ = model(toks_a, seg_a, None, jnp.array(0, dtype=jnp.int32),
-                       pixel_values=pv_a, image_grid_thw=grid_a,
-                       vision_cu_seqlens=cu_a, position_ids_ZBT=pos_a)
-        h_b, _ = model(toks_b, seg_b, None, jnp.array(0, dtype=jnp.int32),
-                       pixel_values=pv_b, image_grid_thw=grid_b,
-                       vision_cu_seqlens=cu_b, position_ids_ZBT=pos_b)
+        h_a, _ = model(
+            toks_a,
+            seg_a,
+            None,
+            jnp.array(0, dtype=jnp.int32),
+            pixel_values=pv_a,
+            image_grid_thw=grid_a,
+            vision_cu_seqlens=cu_a,
+            position_ids_ZBT=pos_a,
+        )
+        h_b, _ = model(
+            toks_b,
+            seg_b,
+            None,
+            jnp.array(0, dtype=jnp.int32),
+            pixel_values=pv_b,
+            image_grid_thw=grid_b,
+            vision_cu_seqlens=cu_b,
+            position_ids_ZBT=pos_b,
+        )
 
         out_a = np.asarray(h_a, dtype=np.float32)
         out_b = np.asarray(h_b, dtype=np.float32)
@@ -289,7 +308,10 @@ class Qwen3_5PaddingNoOpTest(absltest.TestCase):
         # with zero; unpadded leaves the embedding intact. Exclude that
         # position from the comparison.
         np.testing.assert_allclose(
-            out_b[:, :-1], out_a[:, :-1], rtol=3e-2, atol=3e-2,
+            out_b[:, :-1],
+            out_a[:, :-1],
+            rtol=3e-2,
+            atol=3e-2,
         )
 
 
@@ -330,8 +352,11 @@ class Qwen3_5JitStabilityTest(absltest.TestCase):
             pv = rng.randn(real_patches, patch_dim).astype(np.float32)
             grid = np.array(real_grids, dtype=np.int32)
             pv, grid, cu = _pad_vision_arrays(
-                pv, grid, merge_size=ms,
-                max_patches=max_patches, max_images=max_images,
+                pv,
+                grid,
+                merge_size=ms,
+                max_patches=max_patches,
+                max_images=max_images,
             )
             return (
                 jnp.asarray(pv, dtype=jnp.bfloat16),
@@ -350,9 +375,9 @@ class Qwen3_5JitStabilityTest(absltest.TestCase):
 
         # Sanity: choose grids whose patch counts are <= max_patches and
         # whose image counts are <= max_images.
-        a = padded_vision([[1, ms, ms]])                     # 1 image, 4 patches
-        b = padded_vision([[1, ms, ms], [1, ms, 2 * ms]])    # 2 images, 4+8=12 patches
-        c = padded_vision([[1, 2 * ms, 2 * ms]])              # 1 image, 16 patches
+        a = padded_vision([[1, ms, ms]])  # 1 image, 4 patches
+        b = padded_vision([[1, ms, ms], [1, ms, 2 * ms]])  # 2 images, 4+8=12 patches
+        c = padded_vision([[1, 2 * ms, 2 * ms]])  # 1 image, 16 patches
         # All three must produce identical PADDED shapes.
         self.assertEqual(a[0].shape, b[0].shape)
         self.assertEqual(a[1].shape, b[1].shape)
@@ -368,7 +393,8 @@ class Qwen3_5JitStabilityTest(absltest.TestCase):
         _ = vision_fwd(model, *c)
         jax.tree.map(lambda x: x.block_until_ready(), _)
         self.assertEqual(
-            trace_count[0], 1,
+            trace_count[0],
+            1,
             "Recompile triggered by changing real image counts under static padding "
             f"(trace_count={trace_count[0]}).",
         )

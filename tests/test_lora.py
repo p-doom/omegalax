@@ -13,6 +13,7 @@ Run on CPU; no model loading. Validate:
 from __future__ import annotations
 
 import os
+
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
 from absl.testing import absltest
@@ -94,7 +95,6 @@ def _make_model(seed: int = 0, d: int = 16, mlp: int = 32, n_layers: int = 2):
 
 
 class LoRATest(absltest.TestCase):
-
     def test_forward_parity_at_zero_init(self):
         """With B=0 by construction, the LoRA-wrapped model must produce
         bit-identical outputs to the unwrapped model."""
@@ -159,7 +159,9 @@ class LoRATest(absltest.TestCase):
                 base_snapshots[".".join(map(str, path))] = np.asarray(mod.kernel[...]).copy()
 
         optimizer = nnx.Optimizer(
-            model, optax.adamw(learning_rate=1e-2, weight_decay=0.0), wrt=LoRAParam,
+            model,
+            optax.adamw(learning_rate=1e-2, weight_decay=0.0),
+            wrt=LoRAParam,
         )
         x = jax.random.normal(jax.random.key(42), (2, 4, 16), dtype=jnp.float32)
 
@@ -216,8 +218,13 @@ class LoRATest(absltest.TestCase):
 
     def test_default_target_modules_match_qwen3vl_attribute_names(self):
         expected = {
-            "q_proj", "k_proj", "v_proj", "o_proj",
-            "gate_proj", "up_proj", "down_proj",
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
         }
         self.assertEqual(set(DEFAULT_TARGET_MODULES), expected)
 
@@ -246,7 +253,9 @@ class LoRATest(absltest.TestCase):
             return jnp.sum(m(x) ** 2), jnp.array(1.0)
 
         (loss, _), grads = nnx.value_and_grad(
-            loss_fn, argnums=nnx.DiffState(0, LoRAParam), has_aux=True,
+            loss_fn,
+            argnums=nnx.DiffState(0, LoRAParam),
+            has_aux=True,
         )(model)
         opt.update(grads)
 

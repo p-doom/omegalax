@@ -35,11 +35,7 @@ def build_chatml_text(
                     grid_t, grid_h, grid_w = image_grids[img_idx]
                     img_idx += 1
                     n_tokens = grid_t * (grid_h // merge_size) * (grid_w // merge_size)
-                    parts.append(
-                        "<|vision_start|>"
-                        + "<|image_pad|>" * n_tokens
-                        + "<|vision_end|>"
-                    )
+                    parts.append("<|vision_start|>" + "<|image_pad|>" * n_tokens + "<|vision_end|>")
 
         parts.append("<|im_end|>\n")
 

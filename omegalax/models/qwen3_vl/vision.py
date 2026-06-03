@@ -38,10 +38,15 @@ def _cudnn_packed_vision_attention_local(
     v_NHK = v_NHK.astype(jnp.bfloat16)
 
     out = _cudnn_dot_product_attention(
-        q_NHK[None], k_NHK[None], v_NHK[None],
-        q_seqlen=seqlens_1M, kv_seqlen=seqlens_1M,
-        q_offsets=q_offsets, kv_offsets=kv_offsets,
-        scale=scale, mask_type=_CuDnnMaskType.NO_MASK,
+        q_NHK[None],
+        k_NHK[None],
+        v_NHK[None],
+        q_seqlen=seqlens_1M,
+        kv_seqlen=seqlens_1M,
+        q_offsets=q_offsets,
+        kv_offsets=kv_offsets,
+        scale=scale,
+        mask_type=_CuDnnMaskType.NO_MASK,
         qkv_layout="BTNH",
     )
     return out[0].astype(orig_dtype)
@@ -84,7 +89,12 @@ def _cudnn_packed_vision_attention(
     dp_axis = sharding.spec[0]
     if dp_axis is None:
         return _cudnn_packed_vision_attention_local(
-            q_NHK, k_NHK, v_NHK, cu_seqlens, seqlens, scale,
+            q_NHK,
+            k_NHK,
+            v_NHK,
+            cu_seqlens,
+            seqlens,
+            scale,
         )
 
     q_spec = P(dp_axis, None, None)
@@ -142,6 +152,7 @@ def _token_spatial_coords(
     row_coord = block_r * merge_size + intra_r
     col_coord = block_c * merge_size + intra_c
     return row_coord, col_coord, image_id
+
 
 wp = nnx.with_partitioning
 
@@ -282,7 +293,14 @@ class VisionAttention(nnx.Module):
         object.__setattr__(self, "_q_sharding", None)
         object.__setattr__(self, "_q_sharding_spec", P(None, *heads_shd))
 
-    def __call__(self, hidden_ND: jax.Array, cu_seqlens: jax.Array, seqlens: jax.Array, cos_NK: jax.Array, sin_NK: jax.Array) -> jax.Array:
+    def __call__(
+        self,
+        hidden_ND: jax.Array,
+        cu_seqlens: jax.Array,
+        seqlens: jax.Array,
+        cos_NK: jax.Array,
+        sin_NK: jax.Array,
+    ) -> jax.Array:
         N = hidden_ND.shape[0]
         qkv_shd = P(self.hidden_shd[0], None, self.heads_shd[1], self.heads_shd[2])
         qkv = jax.lax.reshape(
@@ -297,7 +315,12 @@ class VisionAttention(nnx.Module):
         q_NHK, k_NHK = apply_rotary_pos_emb_vision(q_NHK, k_NHK, cos_NK, sin_NK)
 
         attn_NHK = _cudnn_packed_vision_attention(
-            q_NHK, k_NHK, v_NHK, cu_seqlens, seqlens, self.scale,
+            q_NHK,
+            k_NHK,
+            v_NHK,
+            cu_seqlens,
+            seqlens,
+            self.scale,
         )
         outputs_ND = attn_NHK.reshape(N, -1)
 
@@ -306,7 +329,9 @@ class VisionAttention(nnx.Module):
 
 
 class VisionBlock(nnx.Module):
-    def __init__(self, cfg: Qwen3VLVisionConfig, hidden_shd: P, ff_shd: P, heads_shd: P, *, rngs: nnx.Rngs):
+    def __init__(
+        self, cfg: Qwen3VLVisionConfig, hidden_shd: P, ff_shd: P, heads_shd: P, *, rngs: nnx.Rngs
+    ):
         self.norm1 = LayerNorm(cfg.hidden_size, eps=1e-6, rngs=rngs)
         self.norm2 = LayerNorm(cfg.hidden_size, eps=1e-6, rngs=rngs)
         self.attn = VisionAttention(cfg, hidden_shd=hidden_shd, heads_shd=heads_shd, rngs=rngs)
@@ -314,8 +339,17 @@ class VisionBlock(nnx.Module):
         self.hidden_shd = hidden_shd
 
     @partial(jax.remat, static_argnums=0)
-    def __call__(self, hidden_ND: jax.Array, cu_seqlens: jax.Array, seqlens: jax.Array, cos_NK: jax.Array, sin_NK: jax.Array) -> jax.Array:
-        hidden_ND = hidden_ND + self.attn(self.norm1(hidden_ND), cu_seqlens, seqlens, cos_NK, sin_NK)
+    def __call__(
+        self,
+        hidden_ND: jax.Array,
+        cu_seqlens: jax.Array,
+        seqlens: jax.Array,
+        cos_NK: jax.Array,
+        sin_NK: jax.Array,
+    ) -> jax.Array:
+        hidden_ND = hidden_ND + self.attn(
+            self.norm1(hidden_ND), cu_seqlens, seqlens, cos_NK, sin_NK
+        )
         hidden_ND = hidden_ND + self.mlp(self.norm2(hidden_ND))
         return hidden_ND
 
@@ -391,7 +425,16 @@ class VisionModel(nnx.Module):
         self.rotary_dim = head_dim // 2
         self.rotary_theta = 10000.0
         self.blocks = nnx.List(
-            [VisionBlock(cfg, hidden_shd=self.hidden_shd, ff_shd=self.ff_shd, heads_shd=self.heads_shd, rngs=rngs) for _ in range(cfg.depth)]
+            [
+                VisionBlock(
+                    cfg,
+                    hidden_shd=self.hidden_shd,
+                    ff_shd=self.ff_shd,
+                    heads_shd=self.heads_shd,
+                    rngs=rngs,
+                )
+                for _ in range(cfg.depth)
+            ]
         )
         self.merger = VisionPatchMerger(
             cfg,

@@ -151,7 +151,10 @@ def forward(
     if isinstance(model, Qwen3_5ForConditionalGeneration):
         segment_ids_BT = attention_mask_BT.astype(jnp.int32)
         return model(
-            token_ids_BT, segment_ids_BT, None, jnp.array(0, dtype=jnp.int32),
+            token_ids_BT,
+            segment_ids_BT,
+            None,
+            jnp.array(0, dtype=jnp.int32),
             pixel_values=pixel_values,
             image_grid_thw=image_grid_thw,
             vision_cu_seqlens=vision_cu_seqlens,
@@ -160,7 +163,8 @@ def forward(
 
     if isinstance(model, Qwen3VL):
         return model(
-            token_ids_BT, attention_mask_BT,
+            token_ids_BT,
+            attention_mask_BT,
             position_ids_ZBT=position_ids_ZBT,
             pixel_values=pixel_values,
             image_grid_thw=image_grid_thw,
@@ -168,7 +172,6 @@ def forward(
         )
 
     raise ValueError(f"Unsupported VLM model type: {type(model)}")
-
 
 
 def load_pretrained(
@@ -188,10 +191,14 @@ def load_pretrained(
     cfg = resolve_config(model_id)
     mesh = ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size)
     if isinstance(cfg, Qwen3VLConfig):
-        model, cfg = create_qwen3_vl_from_safetensors(local_dir, tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size)
+        model, cfg = create_qwen3_vl_from_safetensors(
+            local_dir, tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size
+        )
         return model, cfg
     if isinstance(cfg, Qwen3_5Config):
-        model, cfg = create_qwen3_5_from_safetensors(local_dir, tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size)
+        model, cfg = create_qwen3_5_from_safetensors(
+            local_dir, tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size
+        )
         return model, cfg
     raise ValueError(f"Unsupported VLM config type for pretrained loading: {type(cfg)}")
 

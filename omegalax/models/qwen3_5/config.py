@@ -121,7 +121,12 @@ _QWEN3_5_SMOKE_SPECS: dict[str, dict[str, Any]] = {
             "num_key_value_heads": 2,
             "head_dim": 32,
             "rms_norm_eps": 1e-6,
-            "layer_types": ("linear_attention", "linear_attention", "linear_attention", "full_attention"),
+            "layer_types": (
+                "linear_attention",
+                "linear_attention",
+                "linear_attention",
+                "full_attention",
+            ),
             "rope_theta": 10_000,
             "partial_rotary_factor": 0.25,
             "mrope_section": (2, 1, 1),
@@ -142,7 +147,12 @@ _QWEN3_5_SMOKE_SPECS: dict[str, dict[str, Any]] = {
             "num_key_value_heads": 2,
             "head_dim": 32,
             "rms_norm_eps": 1e-6,
-            "layer_types": ("linear_attention", "linear_attention", "linear_attention", "full_attention"),
+            "layer_types": (
+                "linear_attention",
+                "linear_attention",
+                "linear_attention",
+                "full_attention",
+            ),
             "rope_theta": 10_000,
             "partial_rotary_factor": 0.25,
             "mrope_section": (2, 1, 1),
@@ -199,7 +209,9 @@ def get_qwen3_5_spec(model_id: str) -> dict[str, Any]:
         return dict(_QWEN3_5_SMOKE_SPECS[model_id])
     if model_id in _QWEN3_5_REPOS:
         return {"hf_repo_id": model_id}
-    raise ValueError(f"Unsupported Qwen3.5 model_id '{model_id}'. Supported ids: {_SUPPORTED_MODEL_IDS}")
+    raise ValueError(
+        f"Unsupported Qwen3.5 model_id '{model_id}'. Supported ids: {_SUPPORTED_MODEL_IDS}"
+    )
 
 
 def is_supported_qwen3_5_model_id(model_id: str) -> bool:
@@ -227,7 +239,9 @@ def make_config(model_id: str) -> Qwen3_5Config:
         )
 
     if "/" not in model_id and not epath.Path(model_id).expanduser().exists():
-        raise ValueError(f"Unsupported Qwen3.5 model_id '{model_id}'. Supported ids: {_SUPPORTED_MODEL_IDS}")
+        raise ValueError(
+            f"Unsupported Qwen3.5 model_id '{model_id}'. Supported ids: {_SUPPORTED_MODEL_IDS}"
+        )
 
     hf_cfg = load_hf_config_from_source(resolve_qwen3_5_repo_id(model_id))
     return make_config_from_hf(hf_cfg)
@@ -311,7 +325,9 @@ def make_config_from_hf(hf_cfg: dict[str, Any]) -> Qwen3_5Config:
             spatial_merge_size=_required(vis, "spatial_merge_size", "hf_cfg['vision_config']"),
             in_channels=_required(vis, "in_channels", "hf_cfg['vision_config']"),
             out_hidden_size=_required(vis, "out_hidden_size", "hf_cfg['vision_config']"),
-            num_position_embeddings=_required(vis, "num_position_embeddings", "hf_cfg['vision_config']"),
+            num_position_embeddings=_required(
+                vis, "num_position_embeddings", "hf_cfg['vision_config']"
+            ),
             dtype=vision_dtype,
         ),
         text_config=Qwen3_5TextConfig(**text_kw),

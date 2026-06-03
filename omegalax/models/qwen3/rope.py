@@ -15,4 +15,6 @@ def apply_rope(x_BTHK: jax.Array, sin_BTK: jax.Array, cos_BTK: jax.Array) -> jax
     x1, x2 = x_BTHK[..., : x_BTHK.shape[-1] // 2], x_BTHK[..., x_BTHK.shape[-1] // 2 :]
     sin_BTK = sin_BTK[:, :, None, :]
     cos_BTK = cos_BTK[:, :, None, :]
-    return jnp.concatenate([x1 * cos_BTK - x2 * sin_BTK, x2 * cos_BTK + x1 * sin_BTK], axis=-1).astype(x_BTHK.dtype)
+    return jnp.concatenate(
+        [x1 * cos_BTK - x2 * sin_BTK, x2 * cos_BTK + x1 * sin_BTK], axis=-1
+    ).astype(x_BTHK.dtype)

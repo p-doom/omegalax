@@ -42,10 +42,15 @@ def _cudnn_packed_vision_attention(
     seqlens = jnp.diff(cu)[None]
 
     out = _cudnn_dot_product_attention(
-        q_NHK[None], k_NHK[None], v_NHK[None],
-        q_seqlen=seqlens, kv_seqlen=seqlens,
-        q_offsets=q_offsets, kv_offsets=kv_offsets,
-        scale=scale, mask_type=_CuDnnMaskType.NO_MASK,
+        q_NHK[None],
+        k_NHK[None],
+        v_NHK[None],
+        q_seqlen=seqlens,
+        kv_seqlen=seqlens,
+        q_offsets=q_offsets,
+        kv_offsets=kv_offsets,
+        scale=scale,
+        mask_type=_CuDnnMaskType.NO_MASK,
         qkv_layout="BTNH",
     )
     return out[0]
@@ -87,6 +92,7 @@ def _token_spatial_coords(
     col_coord = block_c * merge_size + intra_c
     return row_coord, col_coord, image_id
 
+
 wp = nnx.with_partitioning
 
 
@@ -118,7 +124,9 @@ class VisionPatchEmbed(nnx.Module):
             pixels: flattened pixel patches (num_patches, C * tp * p * p).
         """
         N = pixels.shape[0]
-        patches = pixels.reshape(N, self.temporal_patch_size, self.patch_size, self.patch_size, self.in_channels)
+        patches = pixels.reshape(
+            N, self.temporal_patch_size, self.patch_size, self.patch_size, self.in_channels
+        )
         embedded = self.proj(patches)
         return jax.lax.reshape(embedded, (N, self.embed_dim), out_sharding=self.hidden_shd)
 
@@ -157,7 +165,7 @@ class VisionAttention(nnx.Module):
     def __init__(self, cfg: Qwen3_5VisionConfig, hidden_shd: P, heads_shd: P, *, rngs: nnx.Rngs):
         self.num_heads = cfg.num_heads
         self.head_dim = cfg.hidden_size // cfg.num_heads
-        self.scale = self.head_dim ** -0.5
+        self.scale = self.head_dim**-0.5
         init = nnx.initializers.lecun_normal()
         qkv_init = wp(init, (None, "hidden"))
         self.qkv = nnx.Linear(
@@ -190,7 +198,9 @@ class VisionAttention(nnx.Module):
         sin_NK: jax.Array,
     ) -> jax.Array:
         N = hidden_ND.shape[0]
-        qkv = self.qkv(hidden_ND, out_sharding=self.hidden_shd).reshape(N, 3, self.num_heads, self.head_dim)
+        qkv = self.qkv(hidden_ND, out_sharding=self.hidden_shd).reshape(
+            N, 3, self.num_heads, self.head_dim
+        )
         q_NHK = reshard(qkv[:, 0], self.heads_shd)
         k_NHK = reshard(qkv[:, 1], self.heads_shd)
         v_NHK = reshard(qkv[:, 2], self.heads_shd)
@@ -198,7 +208,11 @@ class VisionAttention(nnx.Module):
         q_NHK, k_NHK = apply_vision_rope(q_NHK, k_NHK, cos_NK, sin_NK)
 
         attn_NHK = _cudnn_packed_vision_attention(
-            q_NHK, k_NHK, v_NHK, cu_seqlens, self.scale,
+            q_NHK,
+            k_NHK,
+            v_NHK,
+            cu_seqlens,
+            self.scale,
         )
         outputs_ND = attn_NHK.reshape(N, -1)
 
@@ -207,7 +221,9 @@ class VisionAttention(nnx.Module):
 
 
 class VisionBlock(nnx.Module):
-    def __init__(self, cfg: Qwen3_5VisionConfig, hidden_shd: P, ff_shd: P, heads_shd: P, *, rngs: nnx.Rngs):
+    def __init__(
+        self, cfg: Qwen3_5VisionConfig, hidden_shd: P, ff_shd: P, heads_shd: P, *, rngs: nnx.Rngs
+    ):
         self.norm1 = LayerNorm(cfg.hidden_size, 1e-6, rngs=rngs)
         self.norm2 = LayerNorm(cfg.hidden_size, 1e-6, rngs=rngs)
         self.attn = VisionAttention(cfg, hidden_shd=hidden_shd, heads_shd=heads_shd, rngs=rngs)
@@ -223,7 +239,7 @@ class VisionBlock(nnx.Module):
 
 class VisionPatchMerger(nnx.Module):
     def __init__(self, cfg: Qwen3_5VisionConfig, hidden_shd: P, ff_shd: P, *, rngs: nnx.Rngs):
-        merged_dim = cfg.hidden_size * (cfg.spatial_merge_size ** 2)
+        merged_dim = cfg.hidden_size * (cfg.spatial_merge_size**2)
         self.norm = LayerNorm(cfg.hidden_size, 1e-6, rngs=rngs)
         init = nnx.initializers.lecun_normal()
         self.fc1 = nnx.Linear(
@@ -277,13 +293,24 @@ class VisionModel(nnx.Module):
             dtype=cfg.dtype,
             embedding_init=wp(pos_init, (None, "hidden")),
         )
-        self.num_grid_per_side = int(cfg.num_position_embeddings ** 0.5)
+        self.num_grid_per_side = int(cfg.num_position_embeddings**0.5)
         head_dim = cfg.hidden_size // cfg.num_heads
         self.rotary_half_dim = head_dim // 2
         self.blocks = nnx.List(
-            [VisionBlock(cfg, hidden_shd=self.hidden_shd, ff_shd=self.ff_shd, heads_shd=self.heads_shd, rngs=rngs) for _ in range(cfg.depth)]
+            [
+                VisionBlock(
+                    cfg,
+                    hidden_shd=self.hidden_shd,
+                    ff_shd=self.ff_shd,
+                    heads_shd=self.heads_shd,
+                    rngs=rngs,
+                )
+                for _ in range(cfg.depth)
+            ]
         )
-        self.merger = VisionPatchMerger(cfg, hidden_shd=self.hidden_shd, ff_shd=self.ff_shd, rngs=rngs)
+        self.merger = VisionPatchMerger(
+            cfg, hidden_shd=self.hidden_shd, ff_shd=self.ff_shd, rngs=rngs
+        )
 
     def _rot_pos_emb(self, grid_thw: jax.Array, total_tokens: int) -> jax.Array:
         """Build per-token 2-D rotary embeddings from grid info."""
@@ -298,7 +325,9 @@ class VisionModel(nnx.Module):
 
     def _fast_pos_embed_interpolate(self, grid_thw: jax.Array, total_tokens: int) -> jax.Array:
         """Bilinear position embedding interpolation."""
-        row, col, img_id = _token_spatial_coords(grid_thw, self.cfg.spatial_merge_size, total_tokens)
+        row, col, img_id = _token_spatial_coords(
+            grid_thw, self.cfg.spatial_merge_size, total_tokens
+        )
         pos_weight_VD = self.pos_embed.embedding[...]
         n = self.num_grid_per_side
 
@@ -355,12 +384,16 @@ class VisionModel(nnx.Module):
             # Eager fallback (e.g. unit tests passing raw grids). Under JIT
             # the caller must precompute and pass cu_seqlens — `jnp.repeat`
             # below has data-dependent output shape.
-            cu_seqlens = jnp.concatenate([
-                jnp.array([0], dtype=jnp.int32),
-                jnp.cumsum(
-                    jnp.repeat(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0], out_sharding=P())
-                ).astype(jnp.int32),
-            ])
+            cu_seqlens = jnp.concatenate(
+                [
+                    jnp.array([0], dtype=jnp.int32),
+                    jnp.cumsum(
+                        jnp.repeat(
+                            grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0], out_sharding=P()
+                        )
+                    ).astype(jnp.int32),
+                ]
+            )
 
         for blk in self.blocks:
             hidden_ND = blk(hidden_ND, cu_seqlens, cos_NK, sin_NK)

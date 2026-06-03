@@ -10,6 +10,7 @@ from .utils import compute_positions_from_segment_ids, count_left_pads
 
 wp = nnx.with_partitioning
 
+
 def _mask_value(dtype: jnp.dtype) -> float:
     return float(jnp.finfo(dtype).min)
 
@@ -72,9 +73,23 @@ class Attention(nnx.Module):
         k_proj_BTF = self.k_proj(hidden_BTD, out_sharding=self.shd_cfg.act_btf)
         v_proj_BTF = self.v_proj(hidden_BTD, out_sharding=self.shd_cfg.act_btf)
         B, T = hidden_BTD.shape[:2]
-        q_BTHK = self.q_norm(jax.lax.reshape(q_proj_BTF, (B, T, self.num_heads, self.head_dim), out_sharding=self.shd_cfg.act_btnh))
-        k_BTGK = self.k_norm(jax.lax.reshape(k_proj_BTF, (B, T, self.num_kv_heads, self.head_dim), out_sharding=self.shd_cfg.act_btnh))
-        v_BTGK = jax.lax.reshape(v_proj_BTF, (B, T, self.num_kv_heads, self.head_dim), out_sharding=self.shd_cfg.act_btnh)
+        q_BTHK = self.q_norm(
+            jax.lax.reshape(
+                q_proj_BTF,
+                (B, T, self.num_heads, self.head_dim),
+                out_sharding=self.shd_cfg.act_btnh,
+            )
+        )
+        k_BTGK = self.k_norm(
+            jax.lax.reshape(
+                k_proj_BTF,
+                (B, T, self.num_kv_heads, self.head_dim),
+                out_sharding=self.shd_cfg.act_btnh,
+            )
+        )
+        v_BTGK = jax.lax.reshape(
+            v_proj_BTF, (B, T, self.num_kv_heads, self.head_dim), out_sharding=self.shd_cfg.act_btnh
+        )
 
         if cache is None:
             positions_BT = compute_positions_from_segment_ids(segment_ids_BT)
@@ -87,16 +102,27 @@ class Attention(nnx.Module):
 
             B, T, H, K = q_BTHK.shape
             attn_BTHK = dot_product_attention(
-                q_BTHK, k_BTGK, v_BTGK,
-                is_causal=True, scale=self.scale, implementation=self._attn_backend,
+                q_BTHK,
+                k_BTGK,
+                v_BTGK,
+                is_causal=True,
+                scale=self.scale,
+                implementation=self._attn_backend,
                 q_sharding=self._q_sharding,
             )
-            out_BTD = self.o_proj(jax.lax.reshape(attn_BTHK, (B, T, self.num_heads * K), out_sharding=self.shd_cfg.act_btf), out_sharding=self.shd_cfg.act_btd)
+            out_BTD = self.o_proj(
+                jax.lax.reshape(
+                    attn_BTHK, (B, T, self.num_heads * K), out_sharding=self.shd_cfg.act_btf
+                ),
+                out_sharding=self.shd_cfg.act_btd,
+            )
             return out_BTD
 
         left_pads_B = count_left_pads(segment_ids_BT)
         left_pads_B = reshard(left_pads_B, P(self.shd_cfg.act_btnh[0]))
-        cache.start_ind.set_value(jnp.where(cache.start_ind[...] < 0, left_pads_B, cache.start_ind[...]))
+        cache.start_ind.set_value(
+            jnp.where(cache.start_ind[...] < 0, left_pads_B, cache.start_ind[...])
+        )
         positions_BT = compute_positions_from_segment_ids(segment_ids_BT) + cache.cur_ind[...]
         sin_BTK, cos_BTK = generate_pos_embeddings(positions_BT, self.head_dim)
         sin_BTK = sin_BTK.astype(self.dtype)
@@ -109,15 +135,22 @@ class Attention(nnx.Module):
         cache.k_cache[...] = jax.lax.dynamic_update_slice(cache.k_cache[...], k_BTGK, slice_indices)
 
         B, T, H, K = q_BTHK.shape
-        q_BTGRK = jax.lax.reshape(q_BTHK, (B, T, self.num_kv_heads, self.n_rep, K), out_sharding=P(self.shd_cfg.act_btnh[0], None, self.shd_cfg.act_btnh[2], None, None))
+        q_BTGRK = jax.lax.reshape(
+            q_BTHK,
+            (B, T, self.num_kv_heads, self.n_rep, K),
+            out_sharding=P(self.shd_cfg.act_btnh[0], None, self.shd_cfg.act_btnh[2], None, None),
+        )
         logits_BTSGR: jax.Array = jnp.asarray(
-            jnp.einsum("BTGRK,BSGK->BTSGR", q_BTGRK, cache.k_cache[...])
-            * self.scale
+            jnp.einsum("BTGRK,BSGK->BTSGR", q_BTGRK, cache.k_cache[...]) * self.scale
         )
 
-        q_pos_BT = cache.cur_ind[...] + jnp.arange(T, dtype=jnp.int32)[None, :] - cache.start_ind[:, None]
+        q_pos_BT = (
+            cache.cur_ind[...] + jnp.arange(T, dtype=jnp.int32)[None, :] - cache.start_ind[:, None]
+        )
         ts = jnp.arange(cache.size, dtype=jnp.int32)
-        kv_valid_BS = (ts[None, :] >= cache.start_ind[:, None]) & (ts[None, :] < cache.cur_ind[...] + T)
+        kv_valid_BS = (ts[None, :] >= cache.start_ind[:, None]) & (
+            ts[None, :] < cache.cur_ind[...] + T
+        )
         k_pos_BS = ts[None, :] - cache.start_ind[:, None]
         causal_mask_BTS = k_pos_BS[:, None, :] <= q_pos_BT[:, :, None]
         segment_mask_BTS = kv_valid_BS[:, None, :] == segment_ids_BT[:, :, None]
@@ -125,10 +158,19 @@ class Attention(nnx.Module):
         attn_mask = final_mask_BTS[:, :, :, None, None]
         logits_BTSGR = jnp.where(attn_mask, logits_BTSGR, _mask_value(logits_BTSGR.dtype))
 
-        weights_BTSGR = jax.nn.softmax(logits_BTSGR.astype(jnp.float32), axis=2).astype(logits_BTSGR.dtype)
+        weights_BTSGR = jax.nn.softmax(logits_BTSGR.astype(jnp.float32), axis=2).astype(
+            logits_BTSGR.dtype
+        )
         attn_BTGRK = jnp.einsum("BTSGR,BSGK->BTGRK", weights_BTSGR, cache.v_cache[...])
-        attn_BTHK = jax.lax.reshape(attn_BTGRK, (B, T, self.num_heads, K), out_sharding=self.shd_cfg.act_btnh)
+        attn_BTHK = jax.lax.reshape(
+            attn_BTGRK, (B, T, self.num_heads, K), out_sharding=self.shd_cfg.act_btnh
+        )
 
         cache.cur_ind[...] = cache.cur_ind[...] + T
-        out_BTD = self.o_proj(jax.lax.reshape(attn_BTHK, (B, T, self.num_heads * K), out_sharding=self.shd_cfg.act_btf), out_sharding=self.shd_cfg.act_btd)
+        out_BTD = self.o_proj(
+            jax.lax.reshape(
+                attn_BTHK, (B, T, self.num_heads * K), out_sharding=self.shd_cfg.act_btf
+            ),
+            out_sharding=self.shd_cfg.act_btd,
+        )
         return out_BTD

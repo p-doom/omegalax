@@ -45,12 +45,12 @@ def _l2norm(x: jax.Array, axis: int = -1, eps: float = 1e-6) -> jax.Array:
 
 
 def _state_pass_kernel(
-    kcd_ref,         # (J, C, A)  fp32  — A_inv @ (kb * exp(g_cum))
-    k_dec_ref,       # (J, C, A)  fp32  — k * exp(g_last - g_cum)
-    u_pre_ref,       # (J, C, U)  fp32  — A_inv @ vb
-    df_ref,          # (J,)       fp32  — exp(g_last)
-    state_out_ref,   # (J, A, U)  fp32  — state at the *start* of each chunk
-    v_new_out_ref,   # (J, C, U)  fp32  — corrected v
+    kcd_ref,  # (J, C, A)  fp32  — A_inv @ (kb * exp(g_cum))
+    k_dec_ref,  # (J, C, A)  fp32  — k * exp(g_last - g_cum)
+    u_pre_ref,  # (J, C, U)  fp32  — A_inv @ vb
+    df_ref,  # (J,)       fp32  — exp(g_last)
+    state_out_ref,  # (J, A, U)  fp32  — state at the *start* of each chunk
+    v_new_out_ref,  # (J, C, U)  fp32  — corrected v
     *,
     A: int,
     U: int,
@@ -61,10 +61,10 @@ def _state_pass_kernel(
     state_init = jnp.zeros((A, U), dtype=jnp.float32)
 
     def body(j, state):
-        kcd = kcd_ref[j]            # (C, A)
-        k_dec = k_dec_ref[j]        # (C, A)
-        u_pre = u_pre_ref[j]        # (C, U)
-        df = df_ref[j]              # scalar
+        kcd = kcd_ref[j]  # (C, A)
+        k_dec = k_dec_ref[j]  # (C, A)
+        u_pre = u_pre_ref[j]  # (C, U)
+        df = df_ref[j]  # scalar
 
         # Save state at the start of this chunk for the parallel output pass.
         state_out_ref[j] = state.astype(state_out_ref.dtype)
@@ -96,9 +96,7 @@ def _state_pass_pallas(
 
     Returns ``(state_in, v_new)`` — both shape ``(B, H, J, ...)``.
     """
-    return _state_pass_pallas_fwd_only(
-        kcd_BHJCA, k_dec_BHJCA, u_pre_BHJCU, df_BHJ
-    )
+    return _state_pass_pallas_fwd_only(kcd_BHJCA, k_dec_BHJCA, u_pre_BHJCU, df_BHJ)
 
 
 def _state_pass_pallas_fwd_only(kcd, k_dec, u_pre, df):
@@ -111,7 +109,7 @@ def _state_pass_pallas_fwd_only(kcd, k_dec, u_pre, df):
     spec_a = pl.BlockSpec((None, None, J, C, A), lambda b, h: (b, h, 0, 0, 0))
     spec_u = pl.BlockSpec((None, None, J, C, U), lambda b, h: (b, h, 0, 0, 0))
     spec_s = pl.BlockSpec((None, None, J, A, U), lambda b, h: (b, h, 0, 0, 0))
-    spec_d = pl.BlockSpec((None, None, J),       lambda b, h: (b, h, 0))
+    spec_d = pl.BlockSpec((None, None, J), lambda b, h: (b, h, 0))
 
     return pl.pallas_call(
         kernel,
@@ -159,11 +157,11 @@ def _state_pass_bwd(residuals, cotangents):
     U = u_pre.shape[-1]
 
     def body(dstate, j):
-        kcd_j = kcd[:, :, j]            # (B, H, C, A)
+        kcd_j = kcd[:, :, j]  # (B, H, C, A)
         k_dec_j = k_dec[:, :, j]
         v_new_j = v_new[:, :, j]
-        df_j = df[:, :, j]              # (B, H)
-        state_j = state_in[:, :, j]     # (B, H, A, U)
+        df_j = df[:, :, j]  # (B, H)
+        state_j = state_in[:, :, j]  # (B, H, A, U)
         dstate_in_j = dstate_in[:, :, j]
         dv_new_saved_j = dv_new[:, :, j]
 
@@ -186,7 +184,10 @@ def _state_pass_bwd(residuals, cotangents):
 
     dstate_init = jnp.zeros((B, H, A, U), dtype=jnp.float32)
     _, (dkcd_JBHCA, dk_dec_JBHCA, du_pre_JBHCU, ddf_JBH) = jax.lax.scan(
-        body, dstate_init, jnp.arange(J), reverse=True,
+        body,
+        dstate_init,
+        jnp.arange(J),
+        reverse=True,
     )
     # scan stacks outputs along axis 0 → reorder to (B, H, J, ...)
     dkcd_BHJCA = jnp.transpose(dkcd_JBHCA, (1, 2, 0, 3, 4))
@@ -246,7 +247,7 @@ def chunk_gated_delta_rule_pallas(
     Tp = T + pad
     J = Tp // C
 
-    scale = A ** -0.5
+    scale = A**-0.5
     q_BHTA = q_BHTA * scale
 
     kb_BHTA = k_BHTA * beta_BHT[..., None]
@@ -297,7 +298,9 @@ def chunk_gated_delta_rule_pallas(
     qkt = jnp.einsum("BHJLA,BHJMA->BHJLM", q_BHJCA, k_BHJCA) * decay_mask
     intra = jnp.where(upper1, 0.0, qkt)
     inter = inter_decay_BHJC[..., None] * jnp.einsum(
-        "BHJLA,BHJAU->BHJLU", q_BHJCA, state_in_BHJAU,
+        "BHJLA,BHJAU->BHJLU",
+        q_BHJCA,
+        state_in_BHJAU,
     )
     out_BHJCU = inter + jnp.einsum("BHJLM,BHJMU->BHJLU", intra, v_new_BHJCU)
 

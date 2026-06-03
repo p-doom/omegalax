@@ -18,12 +18,18 @@ from absl import app, flags
 
 FLAGS = flags.FLAGS
 
-flags.DEFINE_string("data_path", None, "Path to a compiled Grain chunk-index dataset directory.", required=True)
-flags.DEFINE_integer("batch_size", None, "Global batch size across all JAX processes.", required=True)
+flags.DEFINE_string(
+    "data_path", None, "Path to a compiled Grain chunk-index dataset directory.", required=True
+)
+flags.DEFINE_integer(
+    "batch_size", None, "Global batch size across all JAX processes.", required=True
+)
 flags.DEFINE_integer("dp_size", 1, "Data parallelism size.")
 flags.DEFINE_integer("fsdp_size", 1, "FSDP parallelism size.")
 flags.DEFINE_integer("grad_accum_steps", 1, "Gradient accumulation steps.")
-flags.DEFINE_integer("num_steps", None, "If set, also report how many epochs --num_steps corresponds to.")
+flags.DEFINE_integer(
+    "num_steps", None, "If set, also report how many epochs --num_steps corresponds to."
+)
 
 
 def main(_) -> None:

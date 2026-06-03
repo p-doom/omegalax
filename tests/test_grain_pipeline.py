@@ -26,7 +26,9 @@ from omegalax.trainers import checkpoint_utils
 
 
 def _batch_starts(examples):
-    return {"starts": np.asarray([int(ex["messages"][0]["content"]) for ex in examples], dtype=np.int32)}
+    return {
+        "starts": np.asarray([int(ex["messages"][0]["content"]) for ex in examples], dtype=np.int32)
+    }
 
 
 class GrainPipelineTest(absltest.TestCase):
@@ -76,7 +78,9 @@ class GrainPipelineTest(absltest.TestCase):
                     },
                 ],
             )
-            payload = compile_jsonl_to_arrayrecord(src, Path(tmpdir) / "payload", records_per_shard=1)
+            payload = compile_jsonl_to_arrayrecord(
+                src, Path(tmpdir) / "payload", records_per_shard=1
+            )
 
             with self.assertRaisesRegex(ValueError, "chunk-index dataset"):
                 make_grain_iterator(
@@ -86,7 +90,9 @@ class GrainPipelineTest(absltest.TestCase):
                     shuffle=False,
                     seed=0,
                     read_options=make_grain_read_options(num_threads=1, prefetch_buffer_size=1),
-                    multiprocessing_options=make_grain_multiprocessing_options(num_workers=0, per_worker_buffer_size=1),
+                    multiprocessing_options=make_grain_multiprocessing_options(
+                        num_workers=0, per_worker_buffer_size=1
+                    ),
                     dp_size=1,
                     fsdp_size=1,
                 )
@@ -131,15 +137,21 @@ class GrainPipelineTest(absltest.TestCase):
                 shuffle=False,
                 seed=0,
                 read_options=make_grain_read_options(num_threads=1, prefetch_buffer_size=1),
-                multiprocessing_options=make_grain_multiprocessing_options(num_workers=0, per_worker_buffer_size=1),
+                multiprocessing_options=make_grain_multiprocessing_options(
+                    num_workers=0, per_worker_buffer_size=1
+                ),
                 dp_size=1,
                 fsdp_size=1,
             )
             records = [next(iterator) for _ in range(3)]
             self.assertEqual([len(record["messages"]) for record in records], [2, 2, 2])
-            self.assertEqual([record["messages"][0]["content"] for record in records], ["10", "12", "14"])
+            self.assertEqual(
+                [record["messages"][0]["content"] for record in records], ["10", "12", "14"]
+            )
             expected_session_id = self._expected_session_id(src, 1)
-            self.assertEqual([record["_omegalax_session_id"] for record in records], [expected_session_id] * 3)
+            self.assertEqual(
+                [record["_omegalax_session_id"] for record in records], [expected_session_id] * 3
+            )
 
     def test_grain_iterator_checkpoint_restore_on_chunk_index(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -182,7 +194,9 @@ class GrainPipelineTest(absltest.TestCase):
                 shuffle=False,
                 seed=0,
                 read_options=make_grain_read_options(num_threads=1, prefetch_buffer_size=1),
-                multiprocessing_options=make_grain_multiprocessing_options(num_workers=0, per_worker_buffer_size=1),
+                multiprocessing_options=make_grain_multiprocessing_options(
+                    num_workers=0, per_worker_buffer_size=1
+                ),
                 dp_size=1,
                 fsdp_size=1,
             )
@@ -191,12 +205,18 @@ class GrainPipelineTest(absltest.TestCase):
 
             save_dir = Path(tmpdir) / "ckpt"
             handler_registry = ocp.handlers.DefaultCheckpointHandlerRegistry()
-            handler_registry.add("train_state", ocp.args.PyTreeSave, ocp.handlers.PyTreeCheckpointHandler)
-            handler_registry.add("train_state", ocp.args.PyTreeRestore, ocp.handlers.PyTreeCheckpointHandler)
+            handler_registry.add(
+                "train_state", ocp.args.PyTreeSave, ocp.handlers.PyTreeCheckpointHandler
+            )
+            handler_registry.add(
+                "train_state", ocp.args.PyTreeRestore, ocp.handlers.PyTreeCheckpointHandler
+            )
             checkpoint_utils.register_grain_iterator_handler(handler_registry)
             manager = ocp.CheckpointManager(
                 save_dir,
-                options=ocp.CheckpointManagerOptions(save_interval_steps=1, cleanup_tmp_directories=True),
+                options=ocp.CheckpointManagerOptions(
+                    save_interval_steps=1, cleanup_tmp_directories=True
+                ),
                 handler_registry=handler_registry,
             )
 
@@ -214,7 +234,9 @@ class GrainPipelineTest(absltest.TestCase):
                 shuffle=False,
                 seed=0,
                 read_options=make_grain_read_options(num_threads=1, prefetch_buffer_size=1),
-                multiprocessing_options=make_grain_multiprocessing_options(num_workers=0, per_worker_buffer_size=1),
+                multiprocessing_options=make_grain_multiprocessing_options(
+                    num_workers=0, per_worker_buffer_size=1
+                ),
                 dp_size=1,
                 fsdp_size=1,
             )
@@ -269,7 +291,9 @@ class GrainPipelineTest(absltest.TestCase):
                     shuffle=False,
                     seed=0,
                     read_options=make_grain_read_options(num_threads=1, prefetch_buffer_size=1),
-                    multiprocessing_options=make_grain_multiprocessing_options(num_workers=0, per_worker_buffer_size=1),
+                    multiprocessing_options=make_grain_multiprocessing_options(
+                        num_workers=0, per_worker_buffer_size=1
+                    ),
                     dp_size=2,
                     fsdp_size=1,
                 )
@@ -283,7 +307,9 @@ class GrainPipelineTest(absltest.TestCase):
                     shuffle=False,
                     seed=0,
                     read_options=make_grain_read_options(num_threads=1, prefetch_buffer_size=1),
-                    multiprocessing_options=make_grain_multiprocessing_options(num_workers=0, per_worker_buffer_size=1),
+                    multiprocessing_options=make_grain_multiprocessing_options(
+                        num_workers=0, per_worker_buffer_size=1
+                    ),
                     dp_size=2,
                     fsdp_size=1,
                 )

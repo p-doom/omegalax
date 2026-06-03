@@ -114,6 +114,7 @@ def _write_arrayrecord_dataset(
     (out_dir / COMPILED_METADATA_FILENAME).write_text(json.dumps(final_metadata, indent=2) + "\n")
     return out_dir
 
+
 def _make_payload_block_record(
     *,
     session_id: str,
@@ -150,7 +151,9 @@ def _iter_jsonl_message_blocks(
                 continue
             raw = json.loads(line)
             messages = raw["messages"]
-            assert isinstance(messages, list), f"Expected 'messages' to be a list at {path}:{line_num}"
+            assert isinstance(messages, list), (
+                f"Expected 'messages' to be a list at {path}:{line_num}"
+            )
 
             session_id = _build_session_id(path, line_num)
             session_meta = {k: v for k, v in raw.items() if k not in {"messages", "session_id"}}
@@ -238,7 +241,9 @@ def resolve_arrayrecord_paths(path: str | Path) -> list[Path]:
             )
         return [path]
     metadata_path = path / COMPILED_METADATA_FILENAME
-    assert metadata_path.is_file(), f"Compiled Grain dataset metadata does not exist: {metadata_path}"
+    assert metadata_path.is_file(), (
+        f"Compiled Grain dataset metadata does not exist: {metadata_path}"
+    )
     metadata = json.loads(metadata_path.read_text())
     shard_paths = [path / rel for rel in metadata["shard_paths"]]
 
@@ -256,6 +261,7 @@ def load_compiled_metadata(path: str | Path) -> dict[str, Any]:
     if not metadata_path.exists():
         raise ValueError(f"Compiled Grain dataset metadata does not exist: {metadata_path}")
     return json.loads(metadata_path.read_text())
+
 
 def required_epochs_for_batches(
     path: str | Path,
@@ -282,6 +288,7 @@ def required_epochs_for_batches(
     required_records = batch_size * num_batches
     return max(1, (required_records + records_per_epoch - 1) // records_per_epoch)
 
+
 def _iter_indexed_records(path: str | Path):
     source = grain.sources.ArrayRecordDataSource([str(p) for p in resolve_arrayrecord_paths(path)])
     for record_idx in range(len(source)):
@@ -305,19 +312,29 @@ def _precompute_message_lengths(payload_path, measure_message, num_workers):
     ctx = mp.get_context("fork")
     chunksize = max(1, min(32, len(tasks) // num_workers))
     with ctx.Pool(num_workers) as pool:
-        results = dict(tqdm(
-            pool.imap_unordered(_measure_worker, tasks, chunksize=chunksize),
-            total=len(tasks),
-            desc=f"Measuring messages ({num_workers} workers)",
-        ))
+        results = dict(
+            tqdm(
+                pool.imap_unordered(_measure_worker, tasks, chunksize=chunksize),
+                total=len(tasks),
+                desc=f"Measuring messages ({num_workers} workers)",
+            )
+        )
     return results
 
 
 def _compute_distribution(values: list[int]) -> dict[str, int | float]:
     """Compute summary statistics for a list of integers."""
     if not values:
-        return {"sum": 0, "min": 0, "max": 0, "mean": 0.0, "median": 0.0,
-                "std": 0.0, "p95": 0.0, "p99": 0.0}
+        return {
+            "sum": 0,
+            "min": 0,
+            "max": 0,
+            "mean": 0.0,
+            "median": 0.0,
+            "std": 0.0,
+            "p95": 0.0,
+            "p99": 0.0,
+        }
     arr = np.array(values)
     return {
         "sum": int(arr.sum()),
@@ -374,9 +391,7 @@ def _emit_token_stats(
             "num_images": _compute_distribution(chunk_num_images),
             "num_messages": _compute_distribution(chunk_num_messages),
         },
-        "image_shapes": dict(sorted(
-            image_shape_counts.items(), key=lambda kv: -kv[1]
-        )),
+        "image_shapes": dict(sorted(image_shape_counts.items(), key=lambda kv: -kv[1])),
         "vision_variability": {
             "num_images_per_chunk": _frequency_table(chunk_num_images),
             "vision_tokens_per_chunk": _frequency_table(chunk_vision_tokens),
@@ -421,7 +436,9 @@ def build_chunk_index(
     out_dir = Path(out_dir).expanduser().resolve()
     payload_metadata = load_compiled_metadata(payload_path)
     if "payload_path" in payload_metadata:
-        raise ValueError(f"Chunk indices can only be built from payload datasets, got chunk index: {payload_path}")
+        raise ValueError(
+            f"Chunk indices can only be built from payload datasets, got chunk index: {payload_path}"
+        )
 
     system_message_length = 0
     if system_message is not None:
@@ -436,9 +453,7 @@ def build_chunk_index(
             )
     effective_max = max_length - system_message_length
 
-    precomputed_lengths = _precompute_message_lengths(
-        payload_path, measure_message, num_workers
-    )
+    precomputed_lengths = _precompute_message_lengths(payload_path, measure_message, num_workers)
 
     # Per-session prefix-truncation point: the earliest (record_idx,
     # msg_offset) of a message exceeding the chunk budget. The binner emits
@@ -633,6 +648,7 @@ def build_chunk_index(
 
     return out_path
 
+
 class _JsonLoadsMap(grain.transforms.Map):
     def map(self, element):
         return json.loads(element)
@@ -703,7 +719,8 @@ class _SourceTaggingCollator:
 
     def __call__(self, examples: Sequence[dict[str, Any]]) -> dict[str, Any]:
         source_ids = np.asarray(
-            [int(ex.get(SOURCE_ID_KEY, 0)) for ex in examples], dtype=np.int32,
+            [int(ex.get(SOURCE_ID_KEY, 0)) for ex in examples],
+            dtype=np.int32,
         )
         result = self._inner(examples)
         result[BATCH_SOURCE_IDS_KEY] = source_ids
@@ -765,7 +782,8 @@ def _coerce_sources(
 
 
 def _validate_mix_compatibility(
-    sources: list[MixSource], metadatas: list[dict[str, Any]],
+    sources: list[MixSource],
+    metadatas: list[dict[str, Any]],
 ) -> None:
     """Refuse mixes that would silently corrupt training (different tokenization, length, etc.)."""
     if len(sources) <= 1:
@@ -776,10 +794,7 @@ def _validate_mix_compatibility(
             f"Cannot mix datasets compiled with different max_length: {max_lengths}. "
             f"Rebuild chunk indices with a shared --max_length."
         )
-    tokenizer_ids = {
-        (m.get("profile_metadata") or {}).get("tokenizer_id")
-        for m in metadatas
-    }
+    tokenizer_ids = {(m.get("profile_metadata") or {}).get("tokenizer_id") for m in metadatas}
     tokenizer_ids.discard(None)
     if len(tokenizer_ids) > 1:
         raise ValueError(
@@ -816,9 +831,7 @@ def make_grain_iterator(
 
     mix_sources = _coerce_sources(sources)
     if any(s.weight < 0.0 for s in mix_sources):
-        raise ValueError(
-            f"Source weights must be non-negative: {[s.weight for s in mix_sources]}"
-        )
+        raise ValueError(f"Source weights must be non-negative: {[s.weight for s in mix_sources]}")
     total_w = sum(s.weight for s in mix_sources)
     if total_w <= 0.0:
         raise ValueError("Sum of source weights must be > 0")
@@ -833,11 +846,10 @@ def make_grain_iterator(
                 f"Expected compiled Grain chunk-index dataset, missing payload_path: {mix_sources[i].path}"
             )
     _validate_mix_compatibility(
-        [mix_sources[i] for i in active_indices], metadatas,
+        [mix_sources[i] for i in active_indices],
+        metadatas,
     )
-    norm_weights = [
-        mix_sources[i].weight / total_w for i in active_indices
-    ]
+    norm_weights = [mix_sources[i].weight / total_w for i in active_indices]
 
     mp_options = multiprocessing_options or make_grain_multiprocessing_options()
     read_options = read_options or make_grain_read_options()
@@ -868,9 +880,15 @@ def make_grain_iterator(
         ds = ds.map(_TagSourceMap(source_id=original_idx))
         per_source.append(ds)
 
-    mixed = per_source[0] if len(per_source) == 1 else grain.MapDataset.mix(per_source, weights=norm_weights)
+    mixed = (
+        per_source[0]
+        if len(per_source) == 1
+        else grain.MapDataset.mix(per_source, weights=norm_weights)
+    )
     batched = mixed.batch(
-        batch_size=batch_size, drop_remainder=True, batch_fn=_SourceTaggingCollator(batch_fn),
+        batch_size=batch_size,
+        drop_remainder=True,
+        batch_fn=_SourceTaggingCollator(batch_fn),
     )
     iter_ds = batched.to_iter_dataset(read_options)
     if mp_options.num_workers > 0:

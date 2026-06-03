@@ -35,6 +35,7 @@ def _make_spy(original_fn, captured: list):
     def spy(*args, **kwargs):
         dtypes = {}
         import inspect
+
         sig = inspect.signature(original_fn)
         bound = sig.bind(*args, **kwargs)
         bound.apply_defaults()
@@ -70,23 +71,36 @@ class Qwen3RopeDtypeTest(_RopeDtypeTestBase):
         hidden = jnp.ones((B, T, cfg.emb_dim), dtype=MODEL_DTYPE)
         seg = jnp.ones((B, T), dtype=jnp.int32)
 
-        with mock.patch.object(attn_mod, "generate_pos_embeddings", gen_spy), \
-             mock.patch.object(attn_mod, "apply_rope", apply_spy):
+        with (
+            mock.patch.object(attn_mod, "generate_pos_embeddings", gen_spy),
+            mock.patch.object(attn_mod, "apply_rope", apply_spy),
+        ):
             attn(hidden, None, seg)
 
         self.assertLen(gen_calls, 1)
         gen_out_sin, gen_out_cos = orig_gen(jnp.arange(T)[None, :], cfg.head_dim)
-        self.assertEqual(gen_out_sin.dtype, jnp.float32, "generate_pos_embeddings must produce float32")
-        self.assertEqual(gen_out_cos.dtype, jnp.float32, "generate_pos_embeddings must produce float32")
+        self.assertEqual(
+            gen_out_sin.dtype, jnp.float32, "generate_pos_embeddings must produce float32"
+        )
+        self.assertEqual(
+            gen_out_cos.dtype, jnp.float32, "generate_pos_embeddings must produce float32"
+        )
 
         self.assertLen(apply_calls, 2, "apply_rope should be called for q and k")
         for i, call in enumerate(apply_calls):
-            self.assertEqual(call["sin_BTK"], MODEL_DTYPE,
-                             f"apply_rope call {i}: sin_BTK should be {MODEL_DTYPE}")
-            self.assertEqual(call["cos_BTK"], MODEL_DTYPE,
-                             f"apply_rope call {i}: cos_BTK should be {MODEL_DTYPE}")
-            self.assertEqual(call["x_BTHK"], MODEL_DTYPE,
-                             f"apply_rope call {i}: x_BTHK should be {MODEL_DTYPE}")
+            self.assertEqual(
+                call["sin_BTK"],
+                MODEL_DTYPE,
+                f"apply_rope call {i}: sin_BTK should be {MODEL_DTYPE}",
+            )
+            self.assertEqual(
+                call["cos_BTK"],
+                MODEL_DTYPE,
+                f"apply_rope call {i}: cos_BTK should be {MODEL_DTYPE}",
+            )
+            self.assertEqual(
+                call["x_BTHK"], MODEL_DTYPE, f"apply_rope call {i}: x_BTHK should be {MODEL_DTYPE}"
+            )
 
 
 class Qwen3_5TextRopeDtypeTest(_RopeDtypeTestBase):
@@ -117,8 +131,10 @@ class Qwen3_5TextRopeDtypeTest(_RopeDtypeTestBase):
         tokens = jnp.ones((B, T), dtype=jnp.int32)
         seg = jnp.ones((B, T), dtype=jnp.int32)
 
-        with mock.patch.object(model_mod, "generate_text_rope", gen_spy), \
-             mock.patch.object(model_mod.DecoderLayer, "__call__", layer_spy):
+        with (
+            mock.patch.object(model_mod, "generate_text_rope", gen_spy),
+            mock.patch.object(model_mod.DecoderLayer, "__call__", layer_spy),
+        ):
             model(tokens, seg, None, jnp.array(0, dtype=jnp.int32))
 
         self.assertLen(gen_calls, 1)
@@ -127,18 +143,22 @@ class Qwen3_5TextRopeDtypeTest(_RopeDtypeTestBase):
 
         gen_out_cos, gen_out_sin = orig_gen(
             jnp.stack([jnp.arange(T)[None, :]] * 3, axis=0),
-            text_cfg.head_dim, text_cfg.partial_rotary_factor,
-            text_cfg.rope_theta, text_cfg.mrope_section,
+            text_cfg.head_dim,
+            text_cfg.partial_rotary_factor,
+            text_cfg.rope_theta,
+            text_cfg.mrope_section,
         )
         self.assertEqual(gen_out_cos.dtype, jnp.float32, "generate_text_rope must produce float32")
         self.assertEqual(gen_out_sin.dtype, jnp.float32, "generate_text_rope must produce float32")
 
         self.assertGreater(len(layer_calls), 0)
         for i, call in enumerate(layer_calls):
-            self.assertEqual(call["cos"], MODEL_DTYPE,
-                             f"Layer {i}: cos_BTK should be {MODEL_DTYPE} after cast")
-            self.assertEqual(call["sin"], MODEL_DTYPE,
-                             f"Layer {i}: sin_BTK should be {MODEL_DTYPE} after cast")
+            self.assertEqual(
+                call["cos"], MODEL_DTYPE, f"Layer {i}: cos_BTK should be {MODEL_DTYPE} after cast"
+            )
+            self.assertEqual(
+                call["sin"], MODEL_DTYPE, f"Layer {i}: sin_BTK should be {MODEL_DTYPE} after cast"
+            )
 
 
 class Qwen3_5VisionRopeDtypeTest(_RopeDtypeTestBase):
@@ -173,10 +193,12 @@ class Qwen3_5VisionRopeDtypeTest(_RopeDtypeTestBase):
 
         self.assertGreater(len(block_calls), 0)
         for i, call in enumerate(block_calls):
-            self.assertEqual(call["cos"], vis_cfg.dtype,
-                             f"Vision block {i}: cos_NK should be {vis_cfg.dtype}")
-            self.assertEqual(call["sin"], vis_cfg.dtype,
-                             f"Vision block {i}: sin_NK should be {vis_cfg.dtype}")
+            self.assertEqual(
+                call["cos"], vis_cfg.dtype, f"Vision block {i}: cos_NK should be {vis_cfg.dtype}"
+            )
+            self.assertEqual(
+                call["sin"], vis_cfg.dtype, f"Vision block {i}: sin_NK should be {vis_cfg.dtype}"
+            )
 
 
 class Qwen3VLRopeDtypeTest(_RopeDtypeTestBase):
@@ -206,26 +228,34 @@ class Qwen3VLRopeDtypeTest(_RopeDtypeTestBase):
         tokens = jnp.ones((B, T), dtype=jnp.int32)
         attn_mask = jnp.ones((B, T), dtype=jnp.int32)
 
-        with mock.patch.object(model_mod, "compute_mrope_pos_embeddings", gen_spy), \
-             mock.patch.object(model_mod.TextDecoderLayer, "__call__", layer_spy):
+        with (
+            mock.patch.object(model_mod, "compute_mrope_pos_embeddings", gen_spy),
+            mock.patch.object(model_mod.TextDecoderLayer, "__call__", layer_spy),
+        ):
             model(tokens, attn_mask)
 
         self.assertLen(gen_calls, 1)
         gen_out_sin, gen_out_cos = orig_gen(
             jnp.stack([jnp.arange(T)[None, :]] * 3, axis=0),
-            cfg.head_dim, cfg.rope_theta, cfg.mrope_section,
+            cfg.head_dim,
+            cfg.rope_theta,
+            cfg.mrope_section,
         )
-        self.assertEqual(gen_out_sin.dtype, jnp.float32,
-                         "compute_mrope_pos_embeddings must produce float32 sin")
-        self.assertEqual(gen_out_cos.dtype, jnp.float32,
-                         "compute_mrope_pos_embeddings must produce float32 cos")
+        self.assertEqual(
+            gen_out_sin.dtype, jnp.float32, "compute_mrope_pos_embeddings must produce float32 sin"
+        )
+        self.assertEqual(
+            gen_out_cos.dtype, jnp.float32, "compute_mrope_pos_embeddings must produce float32 cos"
+        )
 
         self.assertGreater(len(layer_calls), 0)
         for i, call in enumerate(layer_calls):
-            self.assertEqual(call["sin"], MODEL_DTYPE,
-                             f"Layer {i}: sin_BTK should be {MODEL_DTYPE} after cast")
-            self.assertEqual(call["cos"], MODEL_DTYPE,
-                             f"Layer {i}: cos_BTK should be {MODEL_DTYPE} after cast")
+            self.assertEqual(
+                call["sin"], MODEL_DTYPE, f"Layer {i}: sin_BTK should be {MODEL_DTYPE} after cast"
+            )
+            self.assertEqual(
+                call["cos"], MODEL_DTYPE, f"Layer {i}: cos_BTK should be {MODEL_DTYPE} after cast"
+            )
 
 
 class Qwen3VLVisionRopeDtypeTest(_RopeDtypeTestBase):
@@ -262,10 +292,12 @@ class Qwen3VLVisionRopeDtypeTest(_RopeDtypeTestBase):
 
         self.assertGreater(len(block_calls), 0)
         for i, call in enumerate(block_calls):
-            self.assertEqual(call["cos"], vis_cfg.dtype,
-                             f"Vision block {i}: cos_NK should be {vis_cfg.dtype}")
-            self.assertEqual(call["sin"], vis_cfg.dtype,
-                             f"Vision block {i}: sin_NK should be {vis_cfg.dtype}")
+            self.assertEqual(
+                call["cos"], vis_cfg.dtype, f"Vision block {i}: cos_NK should be {vis_cfg.dtype}"
+            )
+            self.assertEqual(
+                call["sin"], vis_cfg.dtype, f"Vision block {i}: sin_NK should be {vis_cfg.dtype}"
+            )
 
 
 if __name__ == "__main__":

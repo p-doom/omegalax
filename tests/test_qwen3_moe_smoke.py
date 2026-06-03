@@ -27,7 +27,11 @@ from tests.logits_assert import assert_logits_close
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
 
-_JNP_TO_TORCH = {jnp.float32: torch.float32, jnp.bfloat16: torch.bfloat16, jnp.float16: torch.float16}
+_JNP_TO_TORCH = {
+    jnp.float32: torch.float32,
+    jnp.bfloat16: torch.bfloat16,
+    jnp.float16: torch.float16,
+}
 
 SMOKE_MOE_ID = "qwen3-smoke-moe"
 
@@ -60,7 +64,6 @@ def _random_input(batch_size: int = 1, seq_len: int = 16, vocab_size: int = 512,
 
 
 class Qwen3MoeWeightsTest(absltest.TestCase):
-
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
@@ -106,7 +109,9 @@ class Qwen3MoeWeightsTest(absltest.TestCase):
 
         jax_token_ids_BT = jnp.asarray(token_ids_BT)
         segment_ids_BT = 1 * (jax_token_ids_BT != self.pad_id)
-        hidden_BTD, _ = self.jax_model(jax_token_ids_BT, segment_ids_BT, None, jnp.array(0, dtype=jnp.int32))
+        hidden_BTD, _ = self.jax_model(
+            jax_token_ids_BT, segment_ids_BT, None, jnp.array(0, dtype=jnp.int32)
+        )
         jax_logits_BTV = np.asarray(self.jax_model.lm_head(hidden_BTD), dtype=np.float32)
 
         mask = attention_mask_BT.astype(bool)
@@ -132,7 +137,9 @@ class Qwen3MoeWeightsTest(absltest.TestCase):
 
         jax_token_ids_BT = jnp.asarray(token_ids_BT)
         segment_ids_BT = 1 * (jax_token_ids_BT != self.pad_id)
-        hidden_BTD, _ = self.jax_model(jax_token_ids_BT, segment_ids_BT, None, jnp.array(0, dtype=jnp.int32))
+        hidden_BTD, _ = self.jax_model(
+            jax_token_ids_BT, segment_ids_BT, None, jnp.array(0, dtype=jnp.int32)
+        )
         jax_logits_BTV = np.asarray(self.jax_model.lm_head(hidden_BTD), dtype=np.float32)
 
         mask = attention_mask_BT.astype(bool)
@@ -146,13 +153,17 @@ class Qwen3MoeWeightsTest(absltest.TestCase):
         jax_token_ids_BT = jnp.asarray(token_ids_BT)
         segment_ids_BT = 1 * (jax_token_ids_BT != self.pad_id)
 
-        baseline_hidden, _ = self.jax_model(jax_token_ids_BT, segment_ids_BT, None, jnp.array(0, dtype=jnp.int32))
+        baseline_hidden, _ = self.jax_model(
+            jax_token_ids_BT, segment_ids_BT, None, jnp.array(0, dtype=jnp.int32)
+        )
         baseline_BTV = np.asarray(self.jax_model.lm_head(baseline_hidden))
 
         graph_def, state = nnx.split(self.jax_model)
         pure_state = nnx.to_pure_dict(state)
         restored = nnx.merge(graph_def, pure_state)
-        restored_hidden, _ = restored(jax_token_ids_BT, segment_ids_BT, None, jnp.array(0, dtype=jnp.int32))
+        restored_hidden, _ = restored(
+            jax_token_ids_BT, segment_ids_BT, None, jnp.array(0, dtype=jnp.int32)
+        )
         restored_logits_BTV = np.asarray(restored.lm_head(restored_hidden))
 
         np.testing.assert_array_equal(restored_logits_BTV, baseline_BTV)

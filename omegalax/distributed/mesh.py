@@ -17,7 +17,9 @@ _AXES = ("tp", "fsdp", "dp")
 def _resolve_mesh_shape(tp_size: int, fsdp_size: int, dp_size: int) -> tuple[int, int, int]:
     ndev = jax.device_count()
     if tp_size <= 0 or fsdp_size <= 0 or dp_size <= 0:
-        raise ValueError(f"Mesh axes must be > 0, got tp={tp_size}, fsdp={fsdp_size}, dp={dp_size}.")
+        raise ValueError(
+            f"Mesh axes must be > 0, got tp={tp_size}, fsdp={fsdp_size}, dp={dp_size}."
+        )
     if tp_size * fsdp_size * dp_size != ndev:
         raise ValueError(
             f"Mesh shape ({tp_size}, {fsdp_size}, {dp_size}) does not match device_count={ndev}."
@@ -38,8 +40,7 @@ def process_local_batch_size(global_batch_size: int, dp_size: int, fsdp_size: in
         raise ValueError(f"Global batch size must be > 0, got {global_batch_size}.")
     if global_batch_size % dp != 0:
         raise ValueError(
-            f"Global batch size {global_batch_size} must be divisible by "
-            f"data_parallel_size={dp}."
+            f"Global batch size {global_batch_size} must be divisible by data_parallel_size={dp}."
         )
     return global_batch_size // dp
 
@@ -55,7 +56,9 @@ def set_default_mesh(tp_size: int, fsdp_size: int, dp_size: int) -> Mesh:
     return mesh
 
 
-def ensure_mesh(tp_size: int | None = None, fsdp_size: int | None = None, dp_size: int | None = None) -> Mesh:
+def ensure_mesh(
+    tp_size: int | None = None, fsdp_size: int | None = None, dp_size: int | None = None
+) -> Mesh:
     current_mesh = get_mesh()
     abstract_mesh = get_abstract_mesh()
     has_active_mesh = not abstract_mesh.empty

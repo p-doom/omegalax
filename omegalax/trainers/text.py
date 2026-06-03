@@ -67,7 +67,9 @@ def init_model(
     fsdp_size: int | None = None,
     dp_size: int | None = None,
 ) -> tuple[nnx.Module, text_api.TextConfig]:
-    return text_api.init_model(cfg_or_model_id, rng, tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size)
+    return text_api.init_model(
+        cfg_or_model_id, rng, tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size
+    )
 
 
 def build_optimizer(model: nnx.Module, train_cfg: TrainConfig) -> MixedPrecisionOptimizer:
@@ -112,7 +114,9 @@ def _make_checkpoint_manager(save_dir: Path, save_interval: int | None) -> ocp.C
     save_dir = Path(save_dir).expanduser().resolve()
     handler_registry = ocp.handlers.DefaultCheckpointHandlerRegistry()
     handler_registry.add("train_state", ocp.args.PyTreeSave, ocp.handlers.PyTreeCheckpointHandler)
-    handler_registry.add("train_state", ocp.args.PyTreeRestore, ocp.handlers.PyTreeCheckpointHandler)
+    handler_registry.add(
+        "train_state", ocp.args.PyTreeRestore, ocp.handlers.PyTreeCheckpointHandler
+    )
     checkpoint_utils.register_grain_iterator_handler(handler_registry)
     options = ocp.CheckpointManagerOptions(
         save_interval_steps=save_interval,
@@ -154,7 +158,12 @@ def _restore_sft_checkpoint(
     restored = checkpoint_manager.restore(latest_step, args=restore_args)
     train_state = restored["train_state"]
     nnx.update(optimizer, train_state["optimizer"])
-    return optimizer, int(latest_step), train_state["rng"], checkpoint_utils.restored_input_iter(restored)
+    return (
+        optimizer,
+        int(latest_step),
+        train_state["rng"],
+        checkpoint_utils.restored_input_iter(restored),
+    )
 
 
 def make_sft_train_step(cfg, pad_id: int = 0):
@@ -172,15 +181,23 @@ def make_sft_train_step(cfg, pad_id: int = 0):
         def loss_fn(model):
             hidden_BTD, aux_loss = text_api.forward(model, token_ids_BT, pad_id, cfg)
             lm_weight = model.lm_head.kernel[...]
-            loss = chunked_cross_entropy_loss(
-                hidden_BTD, lm_weight, token_ids_BT, loss_mask_BT,
-                num_tiles=_NUM_LOSS_TILES,
-                logits_out_sharding=cfg.shd_cfg.logits_btv,
-            ) + aux_loss
+            loss = (
+                chunked_cross_entropy_loss(
+                    hidden_BTD,
+                    lm_weight,
+                    token_ids_BT,
+                    loss_mask_BT,
+                    num_tiles=_NUM_LOSS_TILES,
+                    logits_out_sharding=cfg.shd_cfg.logits_btv,
+                )
+                + aux_loss
+            )
             supervised_tokens = jnp.sum(loss_mask_BT[:, 1:].astype(jnp.float32))
             return loss, supervised_tokens
 
-        (loss, supervised_tokens), grads = nnx.value_and_grad(loss_fn, has_aux=True)(optimizer.model)
+        (loss, supervised_tokens), grads = nnx.value_and_grad(loss_fn, has_aux=True)(
+            optimizer.model
+        )
         optimizer.update(grads)
         metrics = {
             "loss": loss,
@@ -202,11 +219,17 @@ def make_sft_eval_step(cfg, pad_id: int = 0):
 
         hidden_BTD, aux_loss = text_api.forward(model, token_ids_BT, pad_id, cfg)
         lm_weight = model.lm_head.kernel[...]
-        loss = chunked_cross_entropy_loss(
-            hidden_BTD, lm_weight, token_ids_BT, loss_mask_BT,
-            num_tiles=_NUM_LOSS_TILES,
-            logits_out_sharding=cfg.shd_cfg.logits_btv,
-        ) + aux_loss
+        loss = (
+            chunked_cross_entropy_loss(
+                hidden_BTD,
+                lm_weight,
+                token_ids_BT,
+                loss_mask_BT,
+                num_tiles=_NUM_LOSS_TILES,
+                logits_out_sharding=cfg.shd_cfg.logits_btv,
+            )
+            + aux_loss
+        )
         supervised_tokens = jnp.sum(loss_mask_BT[:, 1:].astype(jnp.float32))
         return loss, supervised_tokens
 
@@ -297,9 +320,12 @@ def run_sft(
 
     is_primary_process = jax.process_index() == 0
 
-    model, model_cfg = init_model(model_cfg, init_rng, tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size)
+    model, model_cfg = init_model(
+        model_cfg, init_rng, tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size
+    )
     startup_log("initialized model")
     from omegalax.models.sharding_runtime import set_attn_backend
+
     set_attn_backend(model, text_backend=text_attn_backend)
     startup_log(f"set attn backend: text={text_attn_backend}")
     with mesh_rules(mesh):
@@ -317,7 +343,9 @@ def run_sft(
     startup_log("built optimizer")
     sft_step = make_sft_train_step(model_cfg, pad_id=pad_id)
     eval_step = make_sft_eval_step(model_cfg, pad_id=pad_id) if val_data_iter is not None else None
-    startup_log("built train step (jit)" + (" and eval step (jit)" if eval_step is not None else ""))
+    startup_log(
+        "built train step (jit)" + (" and eval step (jit)" if eval_step is not None else "")
+    )
 
     accum_steps = train_cfg.grad_accum_steps
     timer = StepTimer(warmup=2 * accum_steps)
@@ -395,8 +423,12 @@ def run_sft(
             accum_flops += micro_flops
             accum_time += micro_delta
 
-        with jax.default_device('cpu'):
-            current_lr = float(lr_schedule_fn(step_idx)) if callable(lr_schedule_fn) else float(lr_schedule_fn)
+        with jax.default_device("cpu"):
+            current_lr = (
+                float(lr_schedule_fn(step_idx))
+                if callable(lr_schedule_fn)
+                else float(lr_schedule_fn)
+            )
         window_metrics = {
             "loss": accum_loss / accum_steps,
             "grad_norm": accum_grad_norm / accum_steps,
@@ -438,7 +470,9 @@ def run_sft(
 
     if checkpoint_manager is not None:
         if last_metrics and (not save_every or last_metrics["step"] % save_every != 0):
-            _save_sft_checkpoint(checkpoint_manager, optimizer, rng, int(last_metrics["step"]), data_iter)
+            _save_sft_checkpoint(
+                checkpoint_manager, optimizer, rng, int(last_metrics["step"]), data_iter
+            )
         checkpoint_manager.wait_until_finished()
         checkpoint_manager.close()
 

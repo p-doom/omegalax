@@ -60,9 +60,16 @@ class Qwen3VLMappingTest(absltest.TestCase):
         cls.model_path = snapshot_download(MODEL_ID)
         cls.processor = AutoProcessor.from_pretrained(cls.model_path)
         hf_cfg = AutoConfig.from_pretrained(cls.model_path)
-        cls.hf_model = Qwen3VLForConditionalGeneration.from_pretrained(
-            cls.model_path, config=hf_cfg, torch_dtype=torch.bfloat16, attn_implementation="eager"
-        ).to(cls.device).eval()
+        cls.hf_model = (
+            Qwen3VLForConditionalGeneration.from_pretrained(
+                cls.model_path,
+                config=hf_cfg,
+                torch_dtype=torch.bfloat16,
+                attn_implementation="eager",
+            )
+            .to(cls.device)
+            .eval()
+        )
         cls.pad_id = cls.processor.tokenizer.pad_token_id or 0
 
         hf_cfg_dict = load_hf_config(cls.model_path)
@@ -86,11 +93,16 @@ class Qwen3VLMappingTest(absltest.TestCase):
                     if jax_key is None:
                         unmapped.append(torch_key)
         if unmapped:
-            self.fail(f"Unmapped HF parameter keys ({len(unmapped)}):\n" + "\n".join(sorted(unmapped)))
+            self.fail(
+                f"Unmapped HF parameter keys ({len(unmapped)}):\n" + "\n".join(sorted(unmapped))
+            )
 
         from omegalax.models.qwen3_vl.model import Qwen3VL
+
         with mesh_rules_for(tp_size=1, fsdp_size=1, dp_size=1):
-            _, abs_state = nnx.split(nnx.eval_shape(lambda: Qwen3VL(self.cfg, rngs=nnx.Rngs(params=0))))
+            _, abs_state = nnx.split(
+                nnx.eval_shape(lambda: Qwen3VL(self.cfg, rngs=nnx.Rngs(params=0)))
+            )
         abs_dict = nnx.to_pure_dict(abs_state)
         _, loaded_state = nnx.split(self.jax_model)
         loaded_dict = nnx.to_pure_dict(loaded_state)
@@ -107,15 +119,22 @@ class Qwen3VLMappingTest(absltest.TestCase):
     def test_text_only_prefill_logits_match_hf(self):
         """Text-only forward (no images) should match HF model."""
         messages = [{"role": "user", "content": [{"type": "text", "text": PROMPT}]}]
-        text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        text = self.processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
         inputs = self.processor.tokenizer(text, return_tensors="pt", padding=True)
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
         with torch.no_grad():
-            hf_logits_BTV = self.hf_model(
-                input_ids=inputs["input_ids"],
-                attention_mask=inputs["attention_mask"],
-            ).logits.float().cpu().numpy()
+            hf_logits_BTV = (
+                self.hf_model(
+                    input_ids=inputs["input_ids"],
+                    attention_mask=inputs["attention_mask"],
+                )
+                .logits.float()
+                .cpu()
+                .numpy()
+            )
 
         token_ids_BT = jnp.asarray(np.array(inputs["input_ids"].cpu(), dtype=np.int32))
         attention_mask_BT = jnp.asarray(np.array(inputs["attention_mask"].cpu(), dtype=np.int32))
@@ -136,14 +155,21 @@ class Qwen3VLMappingTest(absltest.TestCase):
             )
             for p in prompts
         ]
-        inputs = self.processor.tokenizer(texts, return_tensors="pt", padding=True, padding_side="left")
+        inputs = self.processor.tokenizer(
+            texts, return_tensors="pt", padding=True, padding_side="left"
+        )
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
         with torch.no_grad():
-            hf_logits_BTV = self.hf_model(
-                input_ids=inputs["input_ids"],
-                attention_mask=inputs["attention_mask"],
-            ).logits.float().cpu().numpy()
+            hf_logits_BTV = (
+                self.hf_model(
+                    input_ids=inputs["input_ids"],
+                    attention_mask=inputs["attention_mask"],
+                )
+                .logits.float()
+                .cpu()
+                .numpy()
+            )
 
         token_ids_BT = jnp.asarray(np.array(inputs["input_ids"].cpu(), dtype=np.int32))
         attention_mask_BT = jnp.asarray(np.array(inputs["attention_mask"].cpu(), dtype=np.int32))
@@ -167,9 +193,13 @@ class Qwen3VLMappingTest(absltest.TestCase):
                 ],
             }
         ]
-        text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        text = self.processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
         inputs = self.processor(text=[text], images=[img], return_tensors="pt", padding=True)
-        inputs = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
+        inputs = {
+            k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()
+        }
 
         with torch.no_grad():
             hf_logits_BTV = self.hf_model(**inputs).logits.float().cpu().numpy()
@@ -184,11 +214,14 @@ class Qwen3VLMappingTest(absltest.TestCase):
                 [
                     np.zeros(1, dtype=np.int32),
                     np.cumsum(
-                        np.asarray([
-                            int(h) * int(w)
-                            for t, h, w in image_grid_thw_np.tolist()
-                            for _ in range(int(t))
-                        ], dtype=np.int32),
+                        np.asarray(
+                            [
+                                int(h) * int(w)
+                                for t, h, w in image_grid_thw_np.tolist()
+                                for _ in range(int(t))
+                            ],
+                            dtype=np.int32,
+                        ),
                         dtype=np.int32,
                     ),
                 ]

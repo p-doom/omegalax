@@ -71,7 +71,7 @@ class Attention(nnx.Module):
         self.num_kv_heads = nkv
         self.head_dim = hd
         self.n_rep = nh // nkv
-        self.scale = hd ** -0.5
+        self.scale = hd**-0.5
         self.hidden_shd = cfg.shd_cfg.act_btd
         object.__setattr__(self, "_q_sharding", None)
         object.__setattr__(self, "_q_sharding_spec", P(*cfg.shd_cfg.act_btnh))
@@ -96,7 +96,9 @@ class Attention(nnx.Module):
             out_sharding=P(heads_shd[0], heads_shd[1], heads_shd[2], None),
         )
         q_BTHK, gate_BTHK = jnp.split(q_out_BTHK2, 2, axis=-1)
-        gate_BTD = jax.lax.reshape(gate_BTHK, (B, T, self.num_heads * self.head_dim), out_sharding=self.shd_cfg.act_btf)
+        gate_BTD = jax.lax.reshape(
+            gate_BTHK, (B, T, self.num_heads * self.head_dim), out_sharding=self.shd_cfg.act_btf
+        )
 
         q_BTHK = self.q_norm(q_BTHK)
         k_BTGK = self.k_norm(
@@ -115,11 +117,17 @@ class Attention(nnx.Module):
         q_BTHK, k_BTGK = apply_text_rope(q_BTHK, k_BTGK, cos_BTK, sin_BTK)
 
         attn_BTHK = dot_product_attention(
-            q_BTHK, k_BTGK, v_BTGK,
-            is_causal=True, scale=self.scale, implementation=self._attn_backend,
+            q_BTHK,
+            k_BTGK,
+            v_BTGK,
+            is_causal=True,
+            scale=self.scale,
+            implementation=self._attn_backend,
             q_sharding=self._q_sharding,
         )
-        attn_out_BTD = jax.lax.reshape(attn_BTHK, (B, T, self.num_heads * self.head_dim), out_sharding=self.shd_cfg.act_btf)
+        attn_out_BTD = jax.lax.reshape(
+            attn_BTHK, (B, T, self.num_heads * self.head_dim), out_sharding=self.shd_cfg.act_btf
+        )
 
         attn_out_BTD = attn_out_BTD * jax.nn.sigmoid(gate_BTD)
         out_BTD = self.o_proj(attn_out_BTD, out_sharding=self.shd_cfg.act_btd)

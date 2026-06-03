@@ -27,7 +27,6 @@ PROMPT = "Why is the sky blue instead of another color like purple?"
 
 @requires_real_weights
 class Qwen3_30B_A3B_Test(absltest.TestCase):
-
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
@@ -45,9 +44,15 @@ class Qwen3_30B_A3B_Test(absltest.TestCase):
             dp_size=1,
         )
 
-        cls.hf_model = Qwen3MoeForCausalLM.from_pretrained(
-            cls.model_path, torch_dtype=torch.bfloat16, attn_implementation="eager",
-        ).to(cls.device).eval()
+        cls.hf_model = (
+            Qwen3MoeForCausalLM.from_pretrained(
+                cls.model_path,
+                torch_dtype=torch.bfloat16,
+                attn_implementation="eager",
+            )
+            .to(cls.device)
+            .eval()
+        )
 
     def _tokenize(self, texts: list[str]):
         chat_texts = [
@@ -65,7 +70,9 @@ class Qwen3_30B_A3B_Test(absltest.TestCase):
     def _jax_prefill_logits(self, input_ids: torch.Tensor) -> np.ndarray:
         token_ids_BT = jnp.asarray(np.array(input_ids.cpu(), dtype=np.int32))
         segment_ids_BT = 1 * (token_ids_BT != self.pad_id)
-        hidden_BTD, _ = self.jax_model(token_ids_BT, segment_ids_BT, None, jnp.array(0, dtype=jnp.int32))
+        hidden_BTD, _ = self.jax_model(
+            token_ids_BT, segment_ids_BT, None, jnp.array(0, dtype=jnp.int32)
+        )
         logits_BTV = self.jax_model.lm_head(hidden_BTD)
         return np.asarray(logits_BTV, dtype=np.float32)
 

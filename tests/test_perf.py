@@ -107,11 +107,12 @@ class PerDeviceFlopsStepTest(absltest.TestCase):
         grid = [[1, 4, 4]]
         with mock.patch("jax.device_count", return_value=1):
             base = per_device_flops_per_step(cfg, seq_len=8, batch_size=2)
-            trained = per_device_flops_per_step(
-                cfg, seq_len=8, batch_size=2, image_grid_thw=grid
-            )
+            trained = per_device_flops_per_step(cfg, seq_len=8, batch_size=2, image_grid_thw=grid)
             frozen = per_device_flops_per_step(
-                cfg, seq_len=8, batch_size=2, image_grid_thw=grid,
+                cfg,
+                seq_len=8,
+                batch_size=2,
+                image_grid_thw=grid,
                 vision_trainable=False,
             )
         self.assertEqual(frozen, base + (trained - base) / 3)
@@ -120,6 +121,7 @@ class PerDeviceFlopsStepTest(absltest.TestCase):
 class StepMetricsTest(absltest.TestCase):
     def test_step_metrics_zero_delta(self):
         import datetime
+
         out = step_metrics(1e12, datetime.timedelta(0), 64, 312.0)
         self.assertEqual(out["step_time_s"], 0.0)
         self.assertEqual(out["global_tokens_per_sec"], 0.0)
@@ -129,6 +131,7 @@ class StepMetricsTest(absltest.TestCase):
 
     def test_step_metrics_positive_delta(self):
         import datetime
+
         # 1e12 FLOPs in 1 second -> 1 TFLOP/s; peak 312 -> mfu = 1/312
         out = step_metrics(1e12, datetime.timedelta(seconds=1), 64, 312.0)
         self.assertAlmostEqual(out["step_time_s"], 1.0)
@@ -139,6 +142,7 @@ class StepMetricsTest(absltest.TestCase):
 
     def test_step_metrics_no_peak_skips_mfu(self):
         import datetime
+
         out = step_metrics(1e12, datetime.timedelta(seconds=1), 64, None)
         self.assertEqual(out["mfu"], 0.0)
         self.assertGreater(out["tflops_per_device"], 0)

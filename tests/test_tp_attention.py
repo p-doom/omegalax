@@ -1,4 +1,5 @@
 """Minimal test: tokamax attention forward+backward with TP-sharded heads."""
+
 import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
@@ -28,9 +29,16 @@ from tokamax import dot_product_attention
 # Test 1: Forward only (should work with q_sharding)
 print("\n--- Test 1: Forward with q_sharding ---")
 try:
-    out = jax.jit(lambda q, k, v: dot_product_attention(
-        q, k, v, is_causal=True, implementation="mosaic", q_sharding=q_sharding,
-    ))(q, k, v)
+    out = jax.jit(
+        lambda q, k, v: dot_product_attention(
+            q,
+            k,
+            v,
+            is_causal=True,
+            implementation="mosaic",
+            q_sharding=q_sharding,
+        )
+    )(q, k, v)
     print(f"Forward OK: out.shape={out.shape}")
 except Exception as e:
     print(f"Forward FAILED: {e}")
@@ -38,9 +46,15 @@ except Exception as e:
 # Test 2: Forward+Backward with q_sharding (is_causal)
 print("\n--- Test 2: Forward+Backward with q_sharding (is_causal) ---")
 try:
+
     def loss_fn(q, k, v):
         out = dot_product_attention(
-            q, k, v, is_causal=True, implementation="mosaic", q_sharding=q_sharding,
+            q,
+            k,
+            v,
+            is_causal=True,
+            implementation="mosaic",
+            q_sharding=q_sharding,
         )
         return out.sum()
 
@@ -54,13 +68,20 @@ except Exception as e:
 print("\n--- Test 2b: Forward+Backward with q_sharding + Mask ---")
 try:
     from tokamax._src.ops.attention.base import Mask
+
     k_start = jax.device_put(jnp.zeros(T, dtype=jnp.int32), NamedSharding(mesh, P(None)))
     k_end = jax.device_put(jnp.full(T, T, dtype=jnp.int32), NamedSharding(mesh, P(None)))
     mask = Mask(k_start=k_start, k_end=k_end)
 
     def loss_fn_mask(q, k, v):
         out = dot_product_attention(
-            q, k, v, mask=mask, is_causal=False, implementation="mosaic", q_sharding=q_sharding,
+            q,
+            k,
+            v,
+            mask=mask,
+            is_causal=False,
+            implementation="mosaic",
+            q_sharding=q_sharding,
         )
         return out.sum()
 
@@ -68,15 +89,22 @@ try:
     dq_mask = grad_fn_mask(q, k, v)
     print(f"Grad OK: dq_mask.shape={dq_mask.shape}")
 except Exception as e:
-    import traceback; traceback.print_exc(file=__import__('sys').stdout)
+    import traceback
+
+    traceback.print_exc(file=__import__("sys").stdout)
     print(f"Grad FAILED: {type(e).__name__}: {e}")
 
 # Test 3: Forward+Backward WITHOUT q_sharding (current broken path)
 print("\n--- Test 3: Forward+Backward without q_sharding ---")
 try:
+
     def loss_fn_no_sharding(q, k, v):
         out = dot_product_attention(
-            q, k, v, is_causal=True, implementation="mosaic",
+            q,
+            k,
+            v,
+            is_causal=True,
+            implementation="mosaic",
         )
         return out.sum()
 

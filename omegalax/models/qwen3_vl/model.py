@@ -36,7 +36,7 @@ class RMSNorm(nnx.Module):
     def __call__(self, x: jax.Array) -> jax.Array:
         dtype = x.dtype
         x_f32 = x.astype(jnp.float32)
-        variance = jnp.mean(x_f32 ** 2, axis=-1, keepdims=True)
+        variance = jnp.mean(x_f32**2, axis=-1, keepdims=True)
         normed = jnp.astype(x_f32 * jax.lax.rsqrt(variance + self.eps), dtype)
         scale = jnp.astype(self.scale[...], dtype)
         return scale * normed
@@ -47,7 +47,9 @@ def apply_rope(x_BTHK: jax.Array, sin_BTK: jax.Array, cos_BTK: jax.Array) -> jax
     x1, x2 = x_BTHK[..., :half], x_BTHK[..., half:]
     sin_BTK = sin_BTK[:, :, None, :]
     cos_BTK = cos_BTK[:, :, None, :]
-    return jnp.concatenate([x1 * cos_BTK - x2 * sin_BTK, x2 * cos_BTK + x1 * sin_BTK], axis=-1).astype(x_BTHK.dtype)
+    return jnp.concatenate(
+        [x1 * cos_BTK - x2 * sin_BTK, x2 * cos_BTK + x1 * sin_BTK], axis=-1
+    ).astype(x_BTHK.dtype)
 
 
 def compute_mrope_pos_embeddings(
@@ -106,7 +108,9 @@ def get_rope_index(
     else:
         video_grid_thw_list = None
 
-    image_grid_thw_list = np.asarray(image_grid_thw).tolist() if image_grid_thw is not None else None
+    image_grid_thw_list = (
+        np.asarray(image_grid_thw).tolist() if image_grid_thw is not None else None
+    )
 
     batch_size, seq_len = input_ids_np.shape
     position_ids = np.zeros((3, batch_size, seq_len), dtype=np.int64)
@@ -125,8 +129,16 @@ def get_rope_index(
         remain_images, remain_videos = image_nums, video_nums
 
         for _ in range(image_nums + video_nums):
-            ed_image = input_tokens.index(image_token_id, st) if (image_token_id in input_tokens[st:] and remain_images > 0) else len(input_tokens) + 1
-            ed_video = input_tokens.index(video_token_id, st) if (video_token_id in input_tokens[st:] and remain_videos > 0) else len(input_tokens) + 1
+            ed_image = (
+                input_tokens.index(image_token_id, st)
+                if (image_token_id in input_tokens[st:] and remain_images > 0)
+                else len(input_tokens) + 1
+            )
+            ed_video = (
+                input_tokens.index(video_token_id, st)
+                if (video_token_id in input_tokens[st:] and remain_videos > 0)
+                else len(input_tokens) + 1
+            )
 
             if ed_image < ed_video:
                 t, h, w = image_grid_thw_list[image_index]
@@ -165,7 +177,9 @@ def get_rope_index(
             llm_positions = np.zeros((3, 0), dtype=np.int64)
 
         position_ids[:, i, attention_mask_np[i] == 1] = llm_positions
-        mrope_position_deltas.append(int(llm_positions.max() + 1 - seq_len) if llm_positions.size > 0 else 0)
+        mrope_position_deltas.append(
+            int(llm_positions.max() + 1 - seq_len) if llm_positions.size > 0 else 0
+        )
 
     return position_ids, np.array(mrope_position_deltas).reshape(-1, 1)
 
@@ -279,7 +293,9 @@ class TextMoEFeedForward(nnx.Module):
         flat_idx = topk_idx_BTk.reshape(B * T, cfg.num_experts_per_tok)
         gathered = jnp.take_along_axis(flat_out, flat_idx[..., None], axis=1)
         gathered = gathered.reshape(B, T, cfg.num_experts_per_tok, cfg.emb_dim)
-        merged_BTD = reshard(jnp.sum(gathered * topk_weights_BTk[..., None], axis=-2), self.shd_cfg.act_btd)
+        merged_BTD = reshard(
+            jnp.sum(gathered * topk_weights_BTk[..., None], axis=-2), self.shd_cfg.act_btd
+        )
 
         # Cast back to float32 for the aux_loss calculation
         expert_mask_BTkE = jax.nn.one_hot(topk_idx_BTk, cfg.num_experts, dtype=jnp.float32)
@@ -349,9 +365,23 @@ class TextAttention(nnx.Module):
         k_proj_BTF = self.k_proj(hidden_BTD, out_sharding=self.shd_cfg.act_btf)
         v_proj_BTF = self.v_proj(hidden_BTD, out_sharding=self.shd_cfg.act_btf)
 
-        q_BTHK = self.q_norm(jax.lax.reshape(q_proj_BTF, (B, T, self.num_heads, self.head_dim), out_sharding=self.shd_cfg.act_btnh))
-        k_BTGK = self.k_norm(jax.lax.reshape(k_proj_BTF, (B, T, self.num_kv_heads, self.head_dim), out_sharding=self.shd_cfg.act_btnh))
-        v_BTGK = jax.lax.reshape(v_proj_BTF, (B, T, self.num_kv_heads, self.head_dim), out_sharding=self.shd_cfg.act_btnh)
+        q_BTHK = self.q_norm(
+            jax.lax.reshape(
+                q_proj_BTF,
+                (B, T, self.num_heads, self.head_dim),
+                out_sharding=self.shd_cfg.act_btnh,
+            )
+        )
+        k_BTGK = self.k_norm(
+            jax.lax.reshape(
+                k_proj_BTF,
+                (B, T, self.num_kv_heads, self.head_dim),
+                out_sharding=self.shd_cfg.act_btnh,
+            )
+        )
+        v_BTGK = jax.lax.reshape(
+            v_proj_BTF, (B, T, self.num_kv_heads, self.head_dim), out_sharding=self.shd_cfg.act_btnh
+        )
 
         q_BTHK = apply_rope(q_BTHK, sin_BTK, cos_BTK)
         k_BTGK = apply_rope(k_BTGK, sin_BTK, cos_BTK)
@@ -359,11 +389,20 @@ class TextAttention(nnx.Module):
         # force bfloat16 - tokamax attention only supports fp16/bf16
         attn_in_dtype = q_BTHK.dtype
         attn_BTHK = dot_product_attention(
-            q_BTHK.astype(jnp.bfloat16), k_BTGK.astype(jnp.bfloat16), v_BTGK.astype(jnp.bfloat16),
-            is_causal=True, scale=self.scale, implementation=self._attn_backend,
+            q_BTHK.astype(jnp.bfloat16),
+            k_BTGK.astype(jnp.bfloat16),
+            v_BTGK.astype(jnp.bfloat16),
+            is_causal=True,
+            scale=self.scale,
+            implementation=self._attn_backend,
             q_sharding=self._q_sharding,
         ).astype(attn_in_dtype)
-        out_BTD = self.o_proj(jax.lax.reshape(attn_BTHK, (B, T, self.num_heads * self.head_dim), out_sharding=self.shd_cfg.act_btf), out_sharding=self.shd_cfg.act_btd)
+        out_BTD = self.o_proj(
+            jax.lax.reshape(
+                attn_BTHK, (B, T, self.num_heads * self.head_dim), out_sharding=self.shd_cfg.act_btf
+            ),
+            out_sharding=self.shd_cfg.act_btd,
+        )
         return out_BTD
 
 
@@ -377,7 +416,9 @@ class TextDecoderLayer(nnx.Module):
         self.mlp = TextMoEFeedForward(cfg, rngs=rngs) if self.is_moe else TextMLP(cfg, rngs=rngs)
 
     @partial(jax.remat, static_argnums=0)
-    def __call__(self, hidden_BTD: jax.Array, sin_BTK: jax.Array, cos_BTK: jax.Array) -> tuple[jax.Array, jax.Array]:
+    def __call__(
+        self, hidden_BTD: jax.Array, sin_BTK: jax.Array, cos_BTK: jax.Array
+    ) -> tuple[jax.Array, jax.Array]:
         hidden_BTD = hidden_BTD + self.attn(self.input_layernorm(hidden_BTD), sin_BTK, cos_BTK)
         if self.is_moe:
             ff_out_BTD, aux_loss = self.mlp(self.post_attention_layernorm(hidden_BTD))
@@ -400,7 +441,9 @@ class TextModel(nnx.Module):
             embedding_init=wp(embed_init, ("vocab", "embed")),
         )
         self.out_emb_shd = cfg.shd_cfg.act_btd
-        self.layers = nnx.List([TextDecoderLayer(cfg, layer_idx=i, rngs=rngs) for i in range(cfg.num_layers)])
+        self.layers = nnx.List(
+            [TextDecoderLayer(cfg, layer_idx=i, rngs=rngs) for i in range(cfg.num_layers)]
+        )
         self.final_norm = RMSNorm(cfg.emb_dim, cfg.norm_eps, rngs=rngs)
 
 
@@ -446,8 +489,12 @@ class Qwen3VL(nnx.Module):
         visual_pos_mask_BT = None
         if pixel_values is not None and image_grid_thw is not None:
             if vision_cu_seqlens is None:
-                raise ValueError("vision_cu_seqlens is required when passing image_grid_thw to Qwen3VL")
-            image_features_ND, deepstack_features = self.vision(pixel_values, image_grid_thw, vision_cu_seqlens)
+                raise ValueError(
+                    "vision_cu_seqlens is required when passing image_grid_thw to Qwen3VL"
+                )
+            image_features_ND, deepstack_features = self.vision(
+                pixel_values, image_grid_thw, vision_cu_seqlens
+            )
 
         embedding_VD = jnp.astype(self.text.embedder.embedding[...], self.text.embedder.dtype)
         embedding_VD = reshard(embedding_VD, P())
@@ -460,13 +507,14 @@ class Qwen3VL(nnx.Module):
             seq_len = token_ids_BT.shape[1]
             image_mask_replicated = reshard(image_mask_BT, P())
             batch_idx, seq_idx = jnp.where(
-                image_mask_replicated, size=n_features,
+                image_mask_replicated,
+                size=n_features,
                 fill_value=(0, seq_len),
             )
             image_features_replicated = reshard(image_features_ND, P())
             inputs_embeds_BTD = inputs_embeds_BTD.at[batch_idx, seq_idx].set(
                 image_features_replicated.astype(inputs_embeds_BTD.dtype),
-                mode='drop',
+                mode="drop",
                 out_sharding=self.text.out_emb_shd,
             )
 
@@ -488,7 +536,9 @@ class Qwen3VL(nnx.Module):
 
         position_ids_ZBT = jnp.asarray(position_ids_ZBT)
 
-        sin_BTK, cos_BTK = compute_mrope_pos_embeddings(position_ids_ZBT, cfg.head_dim, cfg.rope_theta, cfg.mrope_section)
+        sin_BTK, cos_BTK = compute_mrope_pos_embeddings(
+            position_ids_ZBT, cfg.head_dim, cfg.rope_theta, cfg.mrope_section
+        )
 
         hidden_BTD = inputs_embeds_BTD
         aux_losses = []
@@ -496,15 +546,24 @@ class Qwen3VL(nnx.Module):
             hidden_BTD, aux_loss = layer(hidden_BTD, sin_BTK, cos_BTK)
             aux_losses.append(aux_loss)
             if deepstack_features is not None and layer_idx < len(deepstack_features):
-                hidden_BTD = _deepstack_process(hidden_BTD, visual_pos_mask_BT, deepstack_features[layer_idx], out_sharding=self.text.out_emb_shd)
+                hidden_BTD = _deepstack_process(
+                    hidden_BTD,
+                    visual_pos_mask_BT,
+                    deepstack_features[layer_idx],
+                    out_sharding=self.text.out_emb_shd,
+                )
 
         hidden_BTD = self.text.final_norm(hidden_BTD)
-        total_aux = jnp.sum(jnp.stack(aux_losses)) if aux_losses else jnp.array(0.0, dtype=jnp.float32)
+        total_aux = (
+            jnp.sum(jnp.stack(aux_losses)) if aux_losses else jnp.array(0.0, dtype=jnp.float32)
+        )
         return hidden_BTD, total_aux
 
 
 def _deepstack_process(
-    hidden_BTD: jax.Array, visual_pos_mask_BT: jax.Array, visual_embeds_ND: jax.Array,
+    hidden_BTD: jax.Array,
+    visual_pos_mask_BT: jax.Array,
+    visual_embeds_ND: jax.Array,
     out_sharding: P | None = None,
 ) -> jax.Array:
     """Add visual embeddings to hidden states at visual token positions."""
@@ -513,11 +572,12 @@ def _deepstack_process(
     mask_replicated = reshard(visual_pos_mask_BT, P())
     embeds_replicated = reshard(visual_embeds_ND, P())
     batch_idx, seq_idx = jnp.where(
-        mask_replicated, size=n_embeds,
+        mask_replicated,
+        size=n_embeds,
         fill_value=(0, seq_len),
     )
     return hidden_BTD.at[batch_idx, seq_idx].add(
         embeds_replicated.astype(hidden_BTD.dtype),
-        mode='drop',
+        mode="drop",
         out_sharding=out_sharding,
     )

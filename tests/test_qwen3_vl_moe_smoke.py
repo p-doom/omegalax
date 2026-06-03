@@ -20,7 +20,11 @@ from tests.logits_assert import assert_logits_close
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
 
-_JNP_TO_TORCH = {jnp.float32: torch.float32, jnp.bfloat16: torch.bfloat16, jnp.float16: torch.float16}
+_JNP_TO_TORCH = {
+    jnp.float32: torch.float32,
+    jnp.bfloat16: torch.bfloat16,
+    jnp.float16: torch.float16,
+}
 
 
 def _random_tokens(batch: int, seq: int, vocab: int, seed: int = 0):
@@ -115,16 +119,23 @@ class Qwen3VLMoeSmokeTest(absltest.TestCase):
         cls.hf_model = hf_model.to(torch_dtype)
 
     def test_forward_logits_match_hf(self):
-        token_ids_BT = _random_tokens(batch=1, seq=8, vocab=self.config_dict["text_config"]["vocab_size"])
+        token_ids_BT = _random_tokens(
+            batch=1, seq=8, vocab=self.config_dict["text_config"]["vocab_size"]
+        )
         attention_mask_BT = np.ones_like(token_ids_BT, dtype=np.int64)
 
         with torch.no_grad():
-            hf_logits_BTV = self.hf_model(
-                input_ids=torch.tensor(token_ids_BT, dtype=torch.long),
-                attention_mask=torch.tensor(attention_mask_BT, dtype=torch.long),
-                pixel_values=None,
-                image_grid_thw=None,
-            ).logits.cpu().float().numpy()
+            hf_logits_BTV = (
+                self.hf_model(
+                    input_ids=torch.tensor(token_ids_BT, dtype=torch.long),
+                    attention_mask=torch.tensor(attention_mask_BT, dtype=torch.long),
+                    pixel_values=None,
+                    image_grid_thw=None,
+                )
+                .logits.cpu()
+                .float()
+                .numpy()
+            )
 
         hidden_BTD, _ = self.jax_model(
             jnp.asarray(token_ids_BT, dtype=jnp.int32),

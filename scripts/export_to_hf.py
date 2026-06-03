@@ -18,6 +18,7 @@ the checkpoint and don't have to match.
 from __future__ import annotations
 
 import os
+
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
 from pathlib import Path
@@ -47,18 +48,27 @@ flags.DEFINE_integer("dp_size", None, "Data parallelism size.")
 flags.DEFINE_integer("pad_id", 0, "Padding token id (for cache creation).")
 
 # Trained-checkpoint mode: set to a step dir like /.../first_training_run_*/010000/
-flags.DEFINE_string("checkpoint_path", None,
-                    "If set, restore weights from this orbax step directory "
-                    "before exporting. Parent dir is treated as the save_dir.")
+flags.DEFINE_string(
+    "checkpoint_path",
+    None,
+    "If set, restore weights from this orbax step directory "
+    "before exporting. Parent dir is treated as the save_dir.",
+)
 # Optimizer-shape flags; defaults match a typical full-finetune (max_grad_norm>0
 # and grad_accum_steps>1). Override if the saved checkpoint used different
 # wiring.
-flags.DEFINE_float("max_grad_norm", 0.5,
-                   "Affects optimizer state shape: >0 includes optax.clip_by_global_norm.")
-flags.DEFINE_integer("grad_accum_steps", 8,
-                     "Affects optimizer state shape: >1 wraps with optax.MultiSteps.")
-flags.DEFINE_float("learning_rate", 1e-5, "LR (numeric value not saved; needed only for build_optimizer).")
-flags.DEFINE_float("weight_decay", 0.01, "WD (numeric value not saved; needed only for build_optimizer).")
+flags.DEFINE_float(
+    "max_grad_norm", 0.5, "Affects optimizer state shape: >0 includes optax.clip_by_global_norm."
+)
+flags.DEFINE_integer(
+    "grad_accum_steps", 8, "Affects optimizer state shape: >1 wraps with optax.MultiSteps."
+)
+flags.DEFINE_float(
+    "learning_rate", 1e-5, "LR (numeric value not saved; needed only for build_optimizer)."
+)
+flags.DEFINE_float(
+    "weight_decay", 0.01, "WD (numeric value not saved; needed only for build_optimizer)."
+)
 flags.DEFINE_integer("warmup_steps", 1000, "LR-schedule warmup steps (not saved).")
 flags.DEFINE_integer("num_steps", 200000, "LR-schedule total steps (not saved).")
 flags.DEFINE_string("lr_schedule", "wsd", "LR schedule kind (not saved).")
@@ -105,6 +115,7 @@ def _read_lora_metadata(save_dir: Path) -> dict:
     Absent file ⇒ checkpoint was full-FT (all defaults to off).
     """
     import json
+
     p = save_dir / "lora_metadata.json"
     if not p.exists():
         return {"enable_lora": False, "lora_rank": 32, "lora_alpha": 32.0}
@@ -146,14 +157,17 @@ def _restore_trained_weights(model, cfg, checkpoint_path: Path):
     with mesh_rules(mesh):
         if bool(lora_meta.get("enable_lora", False)):
             from omegalax.trainers.lora import inject_lora
+
             n_wrapped = inject_lora(
                 model,
                 r=int(lora_meta.get("lora_rank", 32)),
                 alpha=float(lora_meta.get("lora_alpha", 32.0)),
                 rngs=nnx.Rngs(FLAGS.seed),
             )
-            print(f"[export] re-injected LoRA into base for restore: "
-                  f"r={int(lora_meta.get('lora_rank', 32))} wrapped={n_wrapped}")
+            print(
+                f"[export] re-injected LoRA into base for restore: "
+                f"r={int(lora_meta.get('lora_rank', 32))} wrapped={n_wrapped}"
+            )
 
         # Build abstract template for the model-params subtree only. The
         # saved tree stored it under ``train_state/optimizer/model``; we
@@ -161,7 +175,8 @@ def _restore_trained_weights(model, cfg, checkpoint_path: Path):
         model_state = nnx.state(model)
         model_abstract = jax.tree.map(
             lambda v: jax.ShapeDtypeStruct(
-                v.shape, v.dtype,
+                v.shape,
+                v.dtype,
                 sharding=getattr(v, "sharding", None) or default_sharding,
             ),
             model_state,
@@ -179,13 +194,17 @@ def _restore_trained_weights(model, cfg, checkpoint_path: Path):
                     dtype=s.dtype,
                 )
             return s
+
         params_only_restore_args = jax.tree.map(
-            _to_restore_args, params_only_abstract,
+            _to_restore_args,
+            params_only_abstract,
             is_leaf=lambda x: isinstance(x, jax.ShapeDtypeStruct),
         )
 
         handler_registry = ocp.handlers.DefaultCheckpointHandlerRegistry()
-        handler_registry.add("train_state", ocp.args.PyTreeRestore, ocp.handlers.PyTreeCheckpointHandler)
+        handler_registry.add(
+            "train_state", ocp.args.PyTreeRestore, ocp.handlers.PyTreeCheckpointHandler
+        )
         options = ocp.CheckpointManagerOptions(step_format_fixed_length=6)
         cm = ocp.CheckpointManager(save_dir, options=options, handler_registry=handler_registry)
 

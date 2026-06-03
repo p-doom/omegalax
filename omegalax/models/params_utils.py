@@ -18,6 +18,7 @@ TransformRule = tuple[tuple[int, ...] | None, tuple[int, ...] | None, bool] | No
 
 class Transform(Enum):
     """Canonical transform for HF -> JAX weight mapping."""
+
     LINEAR = ((1, 0), None, False)
     EMBED = None
     SCALE = None
@@ -66,7 +67,9 @@ def assign_weights_from_eval_shape(
     target = node[leaf_key]
 
     if hasattr(target, "shape") and target.shape != value.shape:
-        raise ValueError(f"Shape mismatch for '{torch_key}': expected {target.shape}, got {value.shape}")
+        raise ValueError(
+            f"Shape mismatch for '{torch_key}': expected {target.shape}, got {value.shape}"
+        )
 
     target_dtype = getattr(target, "dtype", None)
     if target_dtype is not None:
@@ -111,9 +114,15 @@ def init_expert_buffers(
     expert_fill: dict[tuple[int, str], int] = {}
     for layer_idx in range(num_layers):
         if is_moe_layer(layer_idx):
-            expert_arrays[(layer_idx, "gate_proj")] = np.empty((num_experts, emb_dim, moe_dim), dtype=np.float32)  # EDF
-            expert_arrays[(layer_idx, "up_proj")] = np.empty((num_experts, emb_dim, moe_dim), dtype=np.float32)  # EDF
-            expert_arrays[(layer_idx, "down_proj")] = np.empty((num_experts, moe_dim, emb_dim), dtype=np.float32)  # EFD
+            expert_arrays[(layer_idx, "gate_proj")] = np.empty(
+                (num_experts, emb_dim, moe_dim), dtype=np.float32
+            )  # EDF
+            expert_arrays[(layer_idx, "up_proj")] = np.empty(
+                (num_experts, emb_dim, moe_dim), dtype=np.float32
+            )  # EDF
+            expert_arrays[(layer_idx, "down_proj")] = np.empty(
+                (num_experts, moe_dim, emb_dim), dtype=np.float32
+            )  # EFD
             for proj in ("gate_proj", "up_proj", "down_proj"):
                 expert_fill[(layer_idx, proj)] = 0
     return expert_arrays, expert_fill
@@ -138,8 +147,12 @@ def handle_moe_key(
         if (layer_idx, "gate_proj") in expert_arrays:
             fused_E2FD = np.asarray(get_tensor(torch_key))
             gate_EFD, up_EFD = np.split(fused_E2FD, 2, axis=1)
-            expert_arrays[(layer_idx, "gate_proj")] = np.swapaxes(gate_EFD.astype(np.float32), 1, 2)  # -> EDF
-            expert_arrays[(layer_idx, "up_proj")] = np.swapaxes(up_EFD.astype(np.float32), 1, 2)  # -> EDF
+            expert_arrays[(layer_idx, "gate_proj")] = np.swapaxes(
+                gate_EFD.astype(np.float32), 1, 2
+            )  # -> EDF
+            expert_arrays[(layer_idx, "up_proj")] = np.swapaxes(
+                up_EFD.astype(np.float32), 1, 2
+            )  # -> EDF
             expert_fill[(layer_idx, "gate_proj")] = num_experts
             expert_fill[(layer_idx, "up_proj")] = num_experts
         else:
@@ -151,7 +164,9 @@ def handle_moe_key(
         layer_idx = int(down_m.group(1))
         if (layer_idx, "down_proj") in expert_arrays:
             down_EDF = np.asarray(get_tensor(torch_key))
-            expert_arrays[(layer_idx, "down_proj")] = np.swapaxes(down_EDF.astype(np.float32), 1, 2)  # -> EFD
+            expert_arrays[(layer_idx, "down_proj")] = np.swapaxes(
+                down_EDF.astype(np.float32), 1, 2
+            )  # -> EFD
             expert_fill[(layer_idx, "down_proj")] = num_experts
         else:
             unmatched.append(torch_key)
@@ -243,7 +258,9 @@ def write_moe_experts_to_hf(
         gate_EFD = np.swapaxes(gate_EDF, 1, 2)
         up_EFD = np.swapaxes(up_EDF, 1, 2)
         gate_up_E2FD = np.concatenate([gate_EFD, up_EFD], axis=1)
-        hf_tensors[f"{hf_prefix}.{layer_idx}.mlp.experts.gate_up_proj"] = gate_up_E2FD.astype(np.float32)
+        hf_tensors[f"{hf_prefix}.{layer_idx}.mlp.experts.gate_up_proj"] = gate_up_E2FD.astype(
+            np.float32
+        )
         down_EDF = np.swapaxes(down_EFD, 1, 2)
         hf_tensors[f"{hf_prefix}.{layer_idx}.mlp.experts.down_proj"] = down_EDF.astype(np.float32)
         router_DE = router_params.get(layer_idx)
@@ -264,9 +281,7 @@ def find_safetensors(file_dir: str | epath.Path) -> list[epath.Path]:
 def check_conversion_errors(unmatched: list[str]) -> None:
     """Raise RuntimeError if there are unmatched HuggingFace keys."""
     if unmatched:
-        raise RuntimeError(
-            f"Unmapped HuggingFace parameters:\n" + "\n".join(sorted(unmatched))
-        )
+        raise RuntimeError(f"Unmapped HuggingFace parameters:\n" + "\n".join(sorted(unmatched)))
 
 
 def load_hf_config(path: str | epath.Path) -> dict[str, Any]:

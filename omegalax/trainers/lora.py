@@ -47,8 +47,13 @@ import jax.numpy as jnp
 # they fall through silently — Qwen3-VL-2B-Instruct is dense (no MoE
 # layers) so this doesn't bite us.
 DEFAULT_TARGET_MODULES: tuple[str, ...] = (
-    "q_proj", "k_proj", "v_proj", "o_proj",
-    "gate_proj", "up_proj", "down_proj",
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
 )
 
 # Subtree attribute names to skip during injection. Any module whose
@@ -110,7 +115,7 @@ class LoRALinear(nnx.Module):
         # No sharding metadata: A and B are tiny (~r·d each) and replicated
         # across the mesh; the surrounding matmul output sharding is
         # constrained explicitly via ``out_sharding`` in ``__call__``.
-        a_init_fn = nnx.initializers.uniform(scale=1.0 / (d_in ** 0.5))
+        a_init_fn = nnx.initializers.uniform(scale=1.0 / (d_in**0.5))
         self.lora_A = LoRAParam(
             a_init_fn(rngs.params(), (d_in, r), adapter_dtype),
         )

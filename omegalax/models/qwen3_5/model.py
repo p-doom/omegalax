@@ -162,10 +162,14 @@ class MoEFeedForward(nnx.Module):
             (B, T, cfg.num_experts_per_tok, cfg.hidden_size),
             out_sharding=P(batch_axis, None, None, None),
         )
-        moe_out_BTD = reshard(jnp.sum(gathered * topk_weights_BTk[..., None], axis=-2), self.shd_cfg.act_btd)
+        moe_out_BTD = reshard(
+            jnp.sum(gathered * topk_weights_BTk[..., None], axis=-2), self.shd_cfg.act_btd
+        )
 
         shared_out_BTD = self.shared_expert(hidden_BTD)
-        shared_gate = jax.nn.sigmoid(self.shared_expert_gate(hidden_BTD, out_sharding=P(batch_axis, None, None)))
+        shared_gate = jax.nn.sigmoid(
+            self.shared_expert_gate(hidden_BTD, out_sharding=P(batch_axis, None, None))
+        )
         shared_out_BTD = shared_gate * shared_out_BTD
         output_BTD = moe_out_BTD + shared_out_BTD
 
@@ -193,8 +197,11 @@ class DecoderLayer(nnx.Module):
             self.mlp = MoEFeedForward(cfg, rngs=rngs)
         else:
             self.mlp = MLP(
-                cfg.hidden_size, cfg.intermediate_size, cfg.shd_cfg,
-                dtype=cfg.dtype, rngs=rngs,
+                cfg.hidden_size,
+                cfg.intermediate_size,
+                cfg.shd_cfg,
+                dtype=cfg.dtype,
+                rngs=rngs,
             )
         self.input_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, rngs=rngs)
         self.post_attention_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, rngs=rngs)
@@ -246,9 +253,9 @@ class TextModel(nnx.Module):
             embedding_init=wp(embed_init, ("vocab", "embed")),
         )
         self.out_emb_shd = cfg.shd_cfg.act_btd
-        self.layers = nnx.List([
-            DecoderLayer(cfg, i, rngs=rngs) for i in range(cfg.num_hidden_layers)
-        ])
+        self.layers = nnx.List(
+            [DecoderLayer(cfg, i, rngs=rngs) for i in range(cfg.num_hidden_layers)]
+        )
         self.final_norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, rngs=rngs)
 
     @jax.named_scope("text_model")
@@ -296,7 +303,14 @@ class TextModel(nnx.Module):
 
         aux_losses = []
         for layer in self.layers:
-            hidden_BTD, aux = layer(hidden_BTD, cos_BTK, sin_BTK, segment_ids_BT, text_position_ids_BT, attention_mask_BT)
+            hidden_BTD, aux = layer(
+                hidden_BTD,
+                cos_BTK,
+                sin_BTK,
+                segment_ids_BT,
+                text_position_ids_BT,
+                attention_mask_BT,
+            )
             aux_losses.append(aux)
 
         hidden_BTD = self.final_norm(hidden_BTD)
@@ -358,30 +372,34 @@ class Qwen3_5ForConditionalGeneration(nnx.Module):
     ):
         del cache, num_right_pads
         inputs_embeds_BTD = jnp.astype(
-            self.text.embedder.embedding[...].at[(token_ids_BT,)].get(out_sharding=self.text.out_emb_shd),
+            self.text.embedder.embedding[...]
+            .at[(token_ids_BT,)]
+            .get(out_sharding=self.text.out_emb_shd),
             self.text.embedder.dtype,
         )
 
         if pixel_values is not None and image_grid_thw is not None:
             image_embeds_ND = self.vision(pixel_values, image_grid_thw, vision_cu_seqlens)
-            image_mask_BT = (token_ids_BT == self.cfg.image_token_id)
-            image_mask_BTD = jnp.broadcast_to(
-                image_mask_BT[:, :, None], inputs_embeds_BTD.shape
-            )
+            image_mask_BT = token_ids_BT == self.cfg.image_token_id
+            image_mask_BTD = jnp.broadcast_to(image_mask_BT[:, :, None], inputs_embeds_BTD.shape)
             inputs_embeds_BTD = jnp.where(image_mask_BTD, 0.0, inputs_embeds_BTD)
             n_embeds = image_embeds_ND.shape[0]  # static after padding
             seq_len = token_ids_BT.shape[1]
             batch_indices, seq_indices = jnp.where(
-                image_mask_BT, size=n_embeds,
+                image_mask_BT,
+                size=n_embeds,
                 fill_value=(0, seq_len - 1),
             )
             num_real = jnp.sum(image_mask_BT)
             valid = jnp.arange(n_embeds) < num_real
             safe_embeds = jnp.where(
-                valid[:, None], image_embeds_ND, 0.0,
+                valid[:, None],
+                image_embeds_ND,
+                0.0,
             ).astype(inputs_embeds_BTD.dtype)
             inputs_embeds_BTD = inputs_embeds_BTD.at[batch_indices, seq_indices].set(
-                safe_embeds, out_sharding=self.text.out_emb_shd,
+                safe_embeds,
+                out_sharding=self.text.out_emb_shd,
             )
 
         return self.text(

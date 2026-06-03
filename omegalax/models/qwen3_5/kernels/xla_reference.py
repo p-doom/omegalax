@@ -40,8 +40,7 @@ def chunk_gated_delta_rule_xla(
     k_BTHA = _l2norm(k_BTHA, axis=-1)
 
     q_BHTA, k_BHTA, v_BHTU = [
-        x.transpose(0, 2, 1, 3).astype(jnp.float32)
-        for x in (q_BTHA, k_BTHA, v_BTHU)
+        x.transpose(0, 2, 1, 3).astype(jnp.float32) for x in (q_BTHA, k_BTHA, v_BTHU)
     ]
     beta_BHT = beta_BTH.transpose(0, 2, 1).astype(jnp.float32)
     g_BHT = g_BTH.transpose(0, 2, 1).astype(jnp.float32)
@@ -58,7 +57,7 @@ def chunk_gated_delta_rule_xla(
         g_BHT = jnp.pad(g_BHT, ((0, 0), (0, 0), (0, pad_size)))
     total_T = T + pad_size
 
-    scale = A ** -0.5
+    scale = A**-0.5
     q_BHTA = q_BHTA * scale
 
     vb_BHTU = v_BHTU * beta_BHT[..., None]
@@ -106,7 +105,7 @@ def chunk_gated_delta_rule_xla(
         kcd_j_BHLA = k_cumdecay_BHJLA[:, :, chunk_idx]
         dm_j_LM = decay_mask_LM[:, :, chunk_idx]
 
-        intra_BHLM = (jnp.einsum("BHLA,BHMA->BHLM", q_j_BHLA, k_j_BHMA) * dm_j_LM)
+        intra_BHLM = jnp.einsum("BHLA,BHMA->BHLM", q_j_BHLA, k_j_BHMA) * dm_j_LM
         intra_BHLM = jnp.where(upper_mask_1_LM, 0.0, intra_BHLM)
 
         v_prime_BHLU = jnp.einsum("BHLA,BHAU->BHLU", kcd_j_BHLA, st_BHAU)
@@ -123,14 +122,14 @@ def chunk_gated_delta_rule_xla(
         g_decay_BHL = jnp.exp(g_j_BHL[:, :, -1:] - g_j_BHL)
         k_decayed_BHMA = k_j_BHMA * g_decay_BHL[..., None]
         new_st_BHAU = st_BHAU * jnp.exp(g_last) + jnp.einsum(
-            "BHMA,BHMU->BHAU", k_decayed_BHMA, v_new_BHLU,
+            "BHMA,BHMU->BHAU",
+            k_decayed_BHMA,
+            v_new_BHLU,
         )
 
         return new_st_BHAU, chunk_out_BHLU
 
-    state_BHAU, core_out_chunks = jax.lax.scan(
-        chunk_step, state_BHAU, jnp.arange(J)
-    )
+    state_BHAU, core_out_chunks = jax.lax.scan(chunk_step, state_BHAU, jnp.arange(J))
     core_out_BHJLU = core_out_chunks.transpose(1, 2, 0, 3, 4)
     core_out_BHTU = core_out_BHJLU.reshape(B, H, -1, U)[:, :, :T, :]
     return core_out_BHTU.transpose(0, 2, 1, 3)

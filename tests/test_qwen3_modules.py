@@ -8,14 +8,14 @@ Empirically measured per-module error on Qwen3-0.6B (CPU, float32):
 
   Module            max_diff    ULPs
   ──────────────────────────────────
-  RMSNorm           ~1e-6       ~1  
-  RoPE cos/sin      ~6e-8       <1  
-  apply_rope        ~5e-7       ~2  
+  RMSNorm           ~1e-6       ~1
+  RoPE cos/sin      ~6e-8       <1
+  apply_rope        ~5e-7       ~2
   linear (Q/K/V/O)  ~7e-6       6-13
-  q_norm / k_norm   ~8e-6       ~2  
-  full attention     ~1e-6       ~4  
+  q_norm / k_norm   ~8e-6       ~2
+  full attention     ~1e-6       ~4
   full MLP           ~1e-6       ~44
-  full decoder layer ~3e-6       ~5  
+  full decoder layer ~3e-6       ~5
 
 Linear projections dominate at 6-13 ULPs because XLA CPU and PyTorch CPU
 use different BLAS implementations with different dot-product accumulation
@@ -51,12 +51,12 @@ PROMPT = "Why is the sky blue instead of another color like purple?"
 # Per-module absolute tolerances, derived from empirical measurements.
 # Each tolerance is set to ~2x the observed max_diff for that module to
 # guard against regressions while staying as tight as empirically feasible.
-NORM_ATOL = 2e-6          # RMSNorm: measured ~1e-6 (1 ULP)
-ROPE_ATOL = 1e-6          # RoPE: measured ~5e-7 (<1-2 ULPs)
-LINEAR_ATOL = 2e-5        # matmuls: measured ~7e-6 (6-13 ULPs)
-ATTENTION_ATOL = 5e-6     # full attention: measured ~1.2e-6 (3-4 ULPs)
-MLP_ATOL = 5e-6           # full MLP: measured ~1e-6
-DECODER_LAYER_ATOL = 1e-5 # full layer: measured ~3e-6 (5 ULPs)
+NORM_ATOL = 2e-6  # RMSNorm: measured ~1e-6 (1 ULP)
+ROPE_ATOL = 1e-6  # RoPE: measured ~5e-7 (<1-2 ULPs)
+LINEAR_ATOL = 2e-5  # matmuls: measured ~7e-6 (6-13 ULPs)
+ATTENTION_ATOL = 5e-6  # full attention: measured ~1.2e-6 (3-4 ULPs)
+MLP_ATOL = 5e-6  # full MLP: measured ~1e-6
+DECODER_LAYER_ATOL = 1e-5  # full layer: measured ~3e-6 (5 ULPs)
 
 
 def _to_jax(t: torch.Tensor) -> jax.Array:
@@ -136,8 +136,8 @@ class Qwen3ModuleTest(absltest.TestCase):
         position_ids_jax = jnp.arange(seq_len, dtype=jnp.int32)[None, :]
         jax_sin, jax_cos = generate_pos_embeddings(position_ids_jax, head_dim)
 
-        hf_cos_half = _to_np(hf_cos)[..., :head_dim // 2]
-        hf_sin_half = _to_np(hf_sin)[..., :head_dim // 2]
+        hf_cos_half = _to_np(hf_cos)[..., : head_dim // 2]
+        hf_sin_half = _to_np(hf_sin)[..., : head_dim // 2]
         self._assert_close(jax_cos, hf_cos_half, atol=ROPE_ATOL, msg="RoPE cos")
         self._assert_close(jax_sin, hf_sin_half, atol=ROPE_ATOL, msg="RoPE sin")
 
@@ -176,6 +176,7 @@ class Qwen3ModuleTest(absltest.TestCase):
         with torch.no_grad():
             pos_emb = self.hf_model.model.rotary_emb(self.hf_emb, position_ids_torch)
             from transformers.masking_utils import create_causal_mask
+
             causal_mask = create_causal_mask(
                 config=self.hf_model.config,
                 inputs_embeds=self.hf_emb,
@@ -223,6 +224,7 @@ class Qwen3ModuleTest(absltest.TestCase):
         with torch.no_grad():
             pos_emb = self.hf_model.model.rotary_emb(self.hf_emb, position_ids_torch)
             from transformers.masking_utils import create_causal_mask
+
             causal_mask = create_causal_mask(
                 config=self.hf_model.config,
                 inputs_embeds=self.hf_emb,

@@ -150,7 +150,9 @@ def _make_checkpoint_manager(
     save_dir = Path(save_dir).expanduser().resolve()
     handler_registry = ocp.handlers.DefaultCheckpointHandlerRegistry()
     handler_registry.add("train_state", ocp.args.PyTreeSave, ocp.handlers.PyTreeCheckpointHandler)
-    handler_registry.add("train_state", ocp.args.PyTreeRestore, ocp.handlers.PyTreeCheckpointHandler)
+    handler_registry.add(
+        "train_state", ocp.args.PyTreeRestore, ocp.handlers.PyTreeCheckpointHandler
+    )
     checkpoint_utils.register_grain_iterator_handler(handler_registry)
     preservation_policy = None
     if keep_period:
@@ -178,6 +180,7 @@ def _write_lora_metadata(save_dir: Path, train_cfg: TrainConfig) -> None:
     shape at restore time. Absent file ⇒ checkpoint was full-FT.
     """
     import json
+
     meta = {
         "enable_lora": bool(train_cfg.enable_lora),
         "lora_rank": int(train_cfg.lora_rank),
@@ -225,7 +228,12 @@ def _restore_sft_checkpoint(
         train_state["optimizer"],
     )
     nnx.update(optimizer, restored_state)
-    return optimizer, int(latest_step), train_state["rng"], checkpoint_utils.restored_input_iter(restored)
+    return (
+        optimizer,
+        int(latest_step),
+        train_state["rng"],
+        checkpoint_utils.restored_input_iter(restored),
+    )
 
 
 def make_sft_train_step(cfg, pad_id: int = 0, *, wrt=nnx.Param, num_loss_tiles: int = 4):
@@ -266,16 +274,24 @@ def make_sft_train_step(cfg, pad_id: int = 0, *, wrt=nnx.Param, num_loss_tiles: 
                 position_ids_ZBT=position_ids_ZBT,
             )
             lm_weight = model.output_weight()
-            loss = chunked_cross_entropy_loss(
-                hidden_BTD, lm_weight, token_ids_BT, loss_mask_BT,
-                num_tiles=num_loss_tiles,
-                logits_out_sharding=cfg.shd_cfg.logits_btv,
-            ) + aux_loss
+            loss = (
+                chunked_cross_entropy_loss(
+                    hidden_BTD,
+                    lm_weight,
+                    token_ids_BT,
+                    loss_mask_BT,
+                    num_tiles=num_loss_tiles,
+                    logits_out_sharding=cfg.shd_cfg.logits_btv,
+                )
+                + aux_loss
+            )
             supervised_tokens = jnp.sum(loss_mask_BT[:, 1:].astype(jnp.float32))
             return loss, supervised_tokens
 
         (loss, supervised_tokens), grads = nnx.value_and_grad(
-            loss_fn, argnums=diff_state, has_aux=True,
+            loss_fn,
+            argnums=diff_state,
+            has_aux=True,
         )(optimizer.model)
         optimizer.update(grads)
         metrics = {
@@ -313,11 +329,17 @@ def make_sft_eval_step(cfg, pad_id: int = 0, *, num_loss_tiles: int = 4):
             position_ids_ZBT=position_ids_ZBT,
         )
         lm_weight = model.output_weight()
-        loss = chunked_cross_entropy_loss(
-            hidden_BTD, lm_weight, token_ids_BT, loss_mask_BT,
-            num_tiles=num_loss_tiles,
-            logits_out_sharding=cfg.shd_cfg.logits_btv,
-        ) + aux_loss
+        loss = (
+            chunked_cross_entropy_loss(
+                hidden_BTD,
+                lm_weight,
+                token_ids_BT,
+                loss_mask_BT,
+                num_tiles=num_loss_tiles,
+                logits_out_sharding=cfg.shd_cfg.logits_btv,
+            )
+            + aux_loss
+        )
         supervised_tokens = jnp.sum(loss_mask_BT[:, 1:].astype(jnp.float32))
         return loss, supervised_tokens
 
@@ -464,6 +486,7 @@ def run_sft(
             allow_val_change=True,
         )
     from omegalax.models.sharding_runtime import set_attn_backend
+
     set_attn_backend(model, text_backend=text_attn_backend)
     startup_log(f"set attn backend: text={text_attn_backend}")
     if train_cfg.enable_lora and train_cfg.freeze_vision_tower:
@@ -503,17 +526,25 @@ def run_sft(
     if log_memory:
         log_pytree_bytes("optimizer.opt_state", nnx.state(optimizer.opt_state), save_dir=save_path)
         log_pytree_bytes("optimizer (params + state)", nnx.state(optimizer), save_dir=save_path)
-        log_top_leaves_with_paths("optimizer (params + state) by path", nnx.state(optimizer), save_dir=save_path)
+        log_top_leaves_with_paths(
+            "optimizer (params + state) by path", nnx.state(optimizer), save_dir=save_path
+        )
         log_device_memory("after optimizer build", save_dir=save_path)
- 
+
     sft_step = make_sft_train_step(
-        model_cfg, pad_id=pad_id, wrt=wrt_filter, num_loss_tiles=train_cfg.num_loss_tiles,
+        model_cfg,
+        pad_id=pad_id,
+        wrt=wrt_filter,
+        num_loss_tiles=train_cfg.num_loss_tiles,
     )
     eval_step = (
         make_sft_eval_step(model_cfg, pad_id=pad_id, num_loss_tiles=train_cfg.num_loss_tiles)
-        if val_data_iter is not None else None
+        if val_data_iter is not None
+        else None
     )
-    startup_log("built train step (jit)" + (" and eval step (jit)" if eval_step is not None else ""))
+    startup_log(
+        "built train step (jit)" + (" and eval step (jit)" if eval_step is not None else "")
+    )
 
     accum_steps = train_cfg.grad_accum_steps
     timer = StepTimer(warmup=2 * accum_steps)
@@ -564,11 +595,13 @@ def run_sft(
     # the signal handler deadlocks (handlers run on arbitrary threads and
     # re-enter the runtime). The flag is read at a safe per-step point.
     requeue_requested = False
+
     def _request_requeue(signum, _frame):
         nonlocal requeue_requested
         if not requeue_requested:
             startup_log(f"[signal] received {signum}; will requeue after current step")
         requeue_requested = True
+
     signal.signal(signal.SIGUSR1, _request_requeue)
     signal.signal(signal.SIGTERM, _request_requeue)
 
@@ -620,9 +653,7 @@ def run_sft(
                 train_cfg.seq_len,
                 train_cfg.batch_size,
                 image_grid_thw=batch.get("image_grid_thw"),
-                vision_trainable=not (
-                    train_cfg.freeze_vision_tower or train_cfg.enable_lora
-                ),
+                vision_trainable=not (train_cfg.freeze_vision_tower or train_cfg.enable_lora),
             )
             batch = vlm_api.shard_batch_dict(batch, model_cfg, mesh)
             _, metrics = sft_step(optimizer, batch)
@@ -646,7 +677,7 @@ def run_sft(
             log_device_memory("after step 5 (steady state)", save_dir=save_path)
             _mem_logged_steady_state = True
 
-        with jax.default_device('cpu'):
+        with jax.default_device("cpu"):
             window_metrics = {
                 "loss": accum_loss / accum_steps,
                 "grad_norm": accum_grad_norm / accum_steps,
@@ -701,7 +732,9 @@ def run_sft(
 
     if checkpoint_manager is not None:
         if last_metrics and (not save_every or last_metrics["step"] % save_every != 0):
-            _save_sft_checkpoint(checkpoint_manager, optimizer, rng, int(last_metrics["step"]), data_iter)
+            _save_sft_checkpoint(
+                checkpoint_manager, optimizer, rng, int(last_metrics["step"]), data_iter
+            )
         checkpoint_manager.wait_until_finished()
         checkpoint_manager.close()
 

@@ -30,7 +30,6 @@ PROMPT = "Why is the sky blue instead of another color like purple?"
 
 @requires_real_weights
 class Qwen3_5_0_8B_Test(absltest.TestCase):
-
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
@@ -48,9 +47,15 @@ class Qwen3_5_0_8B_Test(absltest.TestCase):
             dp_size=1,
         )
 
-        cls.hf_model = HFModel.from_pretrained(
-            cls.model_path, torch_dtype=torch.bfloat16, attn_implementation="eager",
-        ).to(cls.device).eval()
+        cls.hf_model = (
+            HFModel.from_pretrained(
+                cls.model_path,
+                torch_dtype=torch.bfloat16,
+                attn_implementation="eager",
+            )
+            .to(cls.device)
+            .eval()
+        )
 
     def _tokenize(self, texts: list[str]):
         chat_texts = [
@@ -68,7 +73,10 @@ class Qwen3_5_0_8B_Test(absltest.TestCase):
         token_ids_BT = jnp.asarray(tokens_np)
         segment_ids_BT = (token_ids_BT != self.pad_id).astype(jnp.int32)
         hidden_BTD, _ = self.jax_model(
-            token_ids_BT, segment_ids_BT, None, jnp.array(0, dtype=jnp.int32),
+            token_ids_BT,
+            segment_ids_BT,
+            None,
+            jnp.array(0, dtype=jnp.int32),
         )
         logits_BTV = self.jax_model.lm_head(hidden_BTD)
         return np.asarray(logits_BTV, dtype=np.float32)
@@ -76,11 +84,16 @@ class Qwen3_5_0_8B_Test(absltest.TestCase):
     def test_prefill_logits_match_hf(self):
         inputs = self._tokenize([PROMPT])
         with torch.no_grad():
-            hf_logits_BTV = self.hf_model(
-                input_ids=inputs["input_ids"],
-                attention_mask=inputs["attention_mask"],
-                use_cache=False,
-            ).logits.float().cpu().numpy()
+            hf_logits_BTV = (
+                self.hf_model(
+                    input_ids=inputs["input_ids"],
+                    attention_mask=inputs["attention_mask"],
+                    use_cache=False,
+                )
+                .logits.float()
+                .cpu()
+                .numpy()
+            )
 
         jax_logits_BTV = self._jax_prefill_logits(
             np.array(inputs["input_ids"].cpu(), dtype=np.int32),

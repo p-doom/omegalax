@@ -55,7 +55,6 @@ def _make_params():
 
 @requires_real_weights
 class Qwen3AllModelsTest(parameterized.TestCase):
-
     @parameterized.named_parameters(_make_params())
     def test_prefill_logits_match_hf(self, model_id):
         model_path = snapshot_download(model_id)
@@ -74,7 +73,9 @@ class Qwen3AllModelsTest(parameterized.TestCase):
         hf_cfg = AutoConfig.from_pretrained(model_path)
         hf_cfg.tie_word_embeddings = cfg.tie_word_embeddings
         hf_model = AutoModelForCausalLM.from_pretrained(
-            model_path, config=hf_cfg, torch_dtype=torch.float32,
+            model_path,
+            config=hf_cfg,
+            torch_dtype=torch.float32,
         ).eval()
 
         pad_id = tokenizer.pad_token_id or 0

@@ -40,7 +40,9 @@ def _assert_vl_config(cfg: Qwen3VLConfig, hf_cfg: dict):
 
     def _require(name, lhs, rhs):
         if lhs != rhs:
-            raise ValueError(f"Config mismatch for {name}: expected {lhs}, found {rhs} in HF config")
+            raise ValueError(
+                f"Config mismatch for {name}: expected {lhs}, found {rhs} in HF config"
+            )
 
     _require("vocab_size", cfg.vocab_size, txt["vocab_size"])
     _require("num_layers", cfg.num_layers, txt["num_hidden_layers"])
@@ -65,10 +67,16 @@ def _assert_vl_config(cfg: Qwen3VLConfig, hf_cfg: dict):
     _require("vision.num_heads", cfg.vision.num_heads, vis["num_heads"])
     _require("vision.depth", cfg.vision.depth, vis["depth"])
     _require("vision.patch_size", cfg.vision.patch_size, vis["patch_size"])
-    _require("vision.temporal_patch_size", cfg.vision.temporal_patch_size, vis["temporal_patch_size"])
+    _require(
+        "vision.temporal_patch_size", cfg.vision.temporal_patch_size, vis["temporal_patch_size"]
+    )
     _require("vision.spatial_merge_size", cfg.vision.spatial_merge_size, vis["spatial_merge_size"])
     _require("vision.out_hidden_size", cfg.vision.out_hidden_size, vis["out_hidden_size"])
-    _require("vision.num_position_embeddings", cfg.vision.num_position_embeddings, vis["num_position_embeddings"])
+    _require(
+        "vision.num_position_embeddings",
+        cfg.vision.num_position_embeddings,
+        vis["num_position_embeddings"],
+    )
 
 
 def _get_vision_key_mapping():
@@ -126,7 +134,10 @@ def _get_text_key_mapping():
     m[l + r"\.mlp\.up_proj\.weight"] = (r"text.layers.\1.mlp.up_proj.kernel", T.LINEAR)
     m[l + r"\.mlp\.down_proj\.weight"] = (r"text.layers.\1.mlp.down_proj.kernel", T.LINEAR)
     m[l + r"\.input_layernorm\.weight"] = (r"text.layers.\1.input_layernorm.scale", T.SCALE)
-    m[l + r"\.post_attention_layernorm\.weight"] = (r"text.layers.\1.post_attention_layernorm.scale", T.SCALE)
+    m[l + r"\.post_attention_layernorm\.weight"] = (
+        r"text.layers.\1.post_attention_layernorm.scale",
+        T.SCALE,
+    )
     m[r"model\.language_model\.norm\.weight"] = ("text.final_norm.scale", T.SCALE)
     m[r"lm_head\.weight"] = ("lm_head.kernel", T.LINEAR)
     return m
@@ -159,9 +170,7 @@ def create_qwen3_vl_from_safetensors(
     _assert_vl_config(cfg, hf_cfg)
     cfg = dataclasses.replace(cfg, shd_cfg=shard_config_for_mesh(cfg.shd_cfg, mesh))
 
-    model = init_model_sharded(
-        Qwen3VL, cfg, jax.random.PRNGKey(0), mesh, axis_rules_for_mesh(mesh)
-    )
+    model = init_model_sharded(Qwen3VL, cfg, jax.random.PRNGKey(0), mesh, axis_rules_for_mesh(mesh))
     graph_def, state = nnx.split(model)
     state_dict = nnx.to_pure_dict(state)
 
@@ -171,9 +180,7 @@ def create_qwen3_vl_from_safetensors(
     is_moe = cfg.num_experts > 0
     if is_moe:
         E, D, F = cfg.num_experts, cfg.emb_dim, cfg.moe_intermediate_size
-        expert_arrays, expert_fill = init_expert_buffers(
-            cfg.num_layers, E, D, F, cfg.is_moe_layer
-        )
+        expert_arrays, expert_fill = init_expert_buffers(cfg.num_layers, E, D, F, cfg.is_moe_layer)
         router_buf: dict[int, Any] = {}
     else:
         expert_arrays = {}
@@ -209,8 +216,14 @@ def create_qwen3_vl_from_safetensors(
                     tensor = tensor.reshape(tensor.shape[0], -1).T
                     assign_weights_from_eval_shape(keys, tensor, state_dict, torch_key, None)
                 else:
-                    transform_value = transform.value if transform not in (Transform.BIAS, Transform.EMBED, Transform.SCALE) else None
-                    assign_weights_from_eval_shape(keys, tensor, state_dict, torch_key, transform_value)
+                    transform_value = (
+                        transform.value
+                        if transform not in (Transform.BIAS, Transform.EMBED, Transform.SCALE)
+                        else None
+                    )
+                    assign_weights_from_eval_shape(
+                        keys, tensor, state_dict, torch_key, transform_value
+                    )
         gc.collect()
 
     if is_moe:
@@ -225,9 +238,9 @@ def create_qwen3_vl_from_safetensors(
 
     check_conversion_errors(unmatched_hf_keys)
 
-
     gc.collect()
     model = nnx.merge(graph_def, state_dict)
     from omegalax.models.sharding_runtime import _finalize_q_shardings
+
     _finalize_q_shardings(model, mesh)
     return model, cfg

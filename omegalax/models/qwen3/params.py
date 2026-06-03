@@ -82,7 +82,9 @@ def qwen3_to_hf_config_dict(cfg: Qwen3Config) -> dict[str, Any]:
 
 
 def export_qwen3_to_safetensors(
-    model: Qwen3, cfg: Qwen3Config, out_dir: str | Path | epath.Path,
+    model: Qwen3,
+    cfg: Qwen3Config,
+    out_dir: str | Path | epath.Path,
 ) -> Path | epath.Path:
     """Export a Qwen3 nnx model (dense or MoE) to HuggingFace-style safetensors."""
     out_dir = epath.Path(out_dir).expanduser()
@@ -106,17 +108,23 @@ def export_qwen3_to_safetensors(
 
         m = re.fullmatch(r"layers\.([0-9]+)\.mlp\.gate_proj", jax_key)
         if m and cfg.is_moe_layer(int(m.group(1))):
-            expert_params.setdefault(int(m.group(1)), {})["gate_proj"] = np.asarray(jax.device_get(value))
+            expert_params.setdefault(int(m.group(1)), {})["gate_proj"] = np.asarray(
+                jax.device_get(value)
+            )
             return True
 
         m = re.fullmatch(r"layers\.([0-9]+)\.mlp\.up_proj", jax_key)
         if m and cfg.is_moe_layer(int(m.group(1))):
-            expert_params.setdefault(int(m.group(1)), {})["up_proj"] = np.asarray(jax.device_get(value))
+            expert_params.setdefault(int(m.group(1)), {})["up_proj"] = np.asarray(
+                jax.device_get(value)
+            )
             return True
 
         m = re.fullmatch(r"layers\.([0-9]+)\.mlp\.down_proj", jax_key)
         if m and cfg.is_moe_layer(int(m.group(1))):
-            expert_params.setdefault(int(m.group(1)), {})["down_proj"] = np.asarray(jax.device_get(value))
+            expert_params.setdefault(int(m.group(1)), {})["down_proj"] = np.asarray(
+                jax.device_get(value)
+            )
             return True
 
         m = re.fullmatch(r"layers\.([0-9]+)\.mlp\.router\.kernel", jax_key)
@@ -147,8 +155,11 @@ def export_qwen3_to_safetensors(
 
     if cfg.is_moe:
         write_moe_experts_to_hf(
-            expert_params, router_params, hf_tensors,
-            num_layers=cfg.num_layers, is_moe_layer=cfg.is_moe_layer,
+            expert_params,
+            router_params,
+            hf_tensors,
+            num_layers=cfg.num_layers,
+            is_moe_layer=cfg.is_moe_layer,
             hf_prefix="model.layers",
         )
 

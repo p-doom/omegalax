@@ -68,7 +68,9 @@ class TextSFTCollator:
     def __init__(self, tokenizer: PreTrainedTokenizer, max_length: int) -> None:
         self.tokenizer = tokenizer
         self.max_length = max_length
-        assert tokenizer.pad_token_id is not None, "tokenizer must have pad_token_id set (e.g. Qwen3-VL, Qwen3.5)"
+        assert tokenizer.pad_token_id is not None, (
+            "tokenizer must have pad_token_id set (e.g. Qwen3-VL, Qwen3.5)"
+        )
 
         self._im_start_id = tokenizer.convert_tokens_to_ids("<|im_start|>")
         self._im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
@@ -98,12 +100,16 @@ class TextSFTCollator:
             attn_mask = np.ones(seq_len, dtype=np.int32)
 
             loss_mask = _build_assistant_loss_mask(
-                token_ids, self._im_start_id, self._im_end_id,
+                token_ids,
+                self._im_start_id,
+                self._im_end_id,
                 self._assistant_token_id,
             )
 
             if pad_len > 0:
-                token_ids = np.pad(token_ids, (0, pad_len), constant_values=self.tokenizer.pad_token_id)
+                token_ids = np.pad(
+                    token_ids, (0, pad_len), constant_values=self.tokenizer.pad_token_id
+                )
                 attn_mask = np.pad(attn_mask, (0, pad_len), constant_values=0)
                 loss_mask = np.pad(loss_mask, (0, pad_len), constant_values=0)
 
@@ -178,7 +184,8 @@ def _pad_vision_arrays(
     dummy_grids.extend([[1, merge_size, merge_size]] * num_simple)
 
     padded_grid = np.concatenate(
-        [image_grid_thw, np.array(dummy_grids, dtype=np.int32)], axis=0,
+        [image_grid_thw, np.array(dummy_grids, dtype=np.int32)],
+        axis=0,
     )
     padded_pv = np.concatenate(
         [pixel_values, np.zeros((extra_patches, feat_dim), dtype=pixel_values.dtype)],
@@ -199,7 +206,10 @@ def _compute_vision_cu_seqlens(image_grid_thw: np.ndarray) -> np.ndarray:
     for t, h, w in image_grid_thw.tolist():
         frame_token_counts.extend([int(h) * int(w)] * int(t))
     return np.concatenate(
-        [np.zeros(1, dtype=np.int32), np.cumsum(np.asarray(frame_token_counts, dtype=np.int32), dtype=np.int32)]
+        [
+            np.zeros(1, dtype=np.int32),
+            np.cumsum(np.asarray(frame_token_counts, dtype=np.int32), dtype=np.int32),
+        ]
     )
 
 
@@ -236,7 +246,9 @@ class VLMSFTCollator:
         self._max_vision_patches_per_sample = max_vision_patches_per_sample
         self._max_vision_images_per_sample = max_vision_images_per_sample
         self._pixel_values_dtype = pixel_values_dtype
-        assert tokenizer.pad_token_id is not None, "tokenizer must have pad_token_id set (e.g. Qwen3-VL, Qwen3.5)"
+        assert tokenizer.pad_token_id is not None, (
+            "tokenizer must have pad_token_id set (e.g. Qwen3-VL, Qwen3.5)"
+        )
 
         self._im_start_id = tokenizer.convert_tokens_to_ids("<|im_start|>")
         self._im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
@@ -292,12 +304,16 @@ class VLMSFTCollator:
             attn_mask = np.ones(seq_len, dtype=np.int32)
 
             loss_mask = _build_assistant_loss_mask(
-                token_ids, self._im_start_id, self._im_end_id,
+                token_ids,
+                self._im_start_id,
+                self._im_end_id,
                 self._assistant_token_id,
             )
 
             if pad_len > 0:
-                token_ids = np.pad(token_ids, (0, pad_len), constant_values=self.tokenizer.pad_token_id)
+                token_ids = np.pad(
+                    token_ids, (0, pad_len), constant_values=self.tokenizer.pad_token_id
+                )
                 attn_mask = np.pad(attn_mask, (0, pad_len), constant_values=0)
                 loss_mask = np.pad(loss_mask, (0, pad_len), constant_values=0)
 
@@ -334,10 +350,14 @@ class VLMSFTCollator:
         # Pad vision arrays to static shapes so JAX JIT never recompiles.
         # Per-sample limits are multiplied by batch size so the user
         # doesn't need to recompute when changing batch_size.
-        if self._max_vision_patches_per_sample is not None and self._max_vision_images_per_sample is not None:
+        if (
+            self._max_vision_patches_per_sample is not None
+            and self._max_vision_images_per_sample is not None
+        ):
             bs = len(examples)
             pixel_values, image_grid_thw, vision_cu_seqlens = _pad_vision_arrays(
-                pixel_values, image_grid_thw,
+                pixel_values,
+                image_grid_thw,
                 merge_size=self.image_processor.merge_size,
                 max_patches=self._max_vision_patches_per_sample * bs,
                 max_images=self._max_vision_images_per_sample * bs,

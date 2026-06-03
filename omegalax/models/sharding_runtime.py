@@ -36,9 +36,7 @@ def _finalize_q_shardings(model: nnx.Module, mesh: Mesh) -> None:
     for _, module in nnx.iter_modules(model):
         spec = getattr(module, "_q_sharding_spec", None)
         if spec is not None:
-            object.__setattr__(
-                module, "_q_sharding", NamedSharding(mesh, spec)
-            )
+            object.__setattr__(module, "_q_sharding", NamedSharding(mesh, spec))
 
 
 def set_attn_backend(

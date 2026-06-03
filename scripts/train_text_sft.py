@@ -44,10 +44,18 @@ flags.DEFINE_integer("batch_size", 8, "Global batch size across all JAX processe
 flags.DEFINE_float("learning_rate", 2e-5, "Learning rate.")
 flags.DEFINE_float("weight_decay", 0.01, "Weight decay.")
 flags.DEFINE_integer("warmup_steps", 0, "Linear LR warmup steps.")
-flags.DEFINE_enum("lr_schedule", "linear", ["linear", "cosine", "wsd"],
-                  "LR schedule after warmup: 'linear' (constant), 'cosine', or 'wsd' (warmup-stable-decay).")
-flags.DEFINE_float("lr_end_factor", 0.0, "Final LR as fraction of peak LR (cosine/wsd decay end value).")
-flags.DEFINE_float("lr_stable_fraction", 0.8, "Fraction of post-warmup steps at peak LR (wsd only).")
+flags.DEFINE_enum(
+    "lr_schedule",
+    "linear",
+    ["linear", "cosine", "wsd"],
+    "LR schedule after warmup: 'linear' (constant), 'cosine', or 'wsd' (warmup-stable-decay).",
+)
+flags.DEFINE_float(
+    "lr_end_factor", 0.0, "Final LR as fraction of peak LR (cosine/wsd decay end value)."
+)
+flags.DEFINE_float(
+    "lr_stable_fraction", 0.8, "Fraction of post-warmup steps at peak LR (wsd only)."
+)
 flags.DEFINE_float("max_grad_norm", 1.0, "Max gradient norm for clipping (0 = no clipping).")
 flags.DEFINE_integer("grad_accum_steps", 1, "Gradient accumulation steps (1 = no accumulation).")
 flags.DEFINE_integer("gc_period", 0, "If >0, disable Python GC and collect every N training steps.")
@@ -56,7 +64,9 @@ flags.DEFINE_integer("tp_size", None, "Tensor parallelism size.")
 flags.DEFINE_integer("fsdp_size", 1, "FSDP parallelism size.")
 flags.DEFINE_integer("dp_size", 1, "Data parallelism size.")
 flags.DEFINE_string("save_dir", None, "Checkpoint save directory.")
-flags.DEFINE_string("jax_cache_dir", "/tmp/jax_cache", "Directory for JAX persistent compilation cache.")
+flags.DEFINE_string(
+    "jax_cache_dir", "/tmp/jax_cache", "Directory for JAX persistent compilation cache."
+)
 flags.DEFINE_integer("save_every", 50, "Save checkpoint every N steps.")
 flags.DEFINE_integer("log_every", 10, "Log metrics every N steps.")
 flags.DEFINE_enum(
@@ -84,10 +94,15 @@ flags.DEFINE_integer("grain_workers", 8, "Grain multiprocessing workers.")
 flags.DEFINE_integer("grain_worker_buffer_size", 4, "Grain worker buffer size.")
 
 _ATTN_BACKENDS = [
-    "mosaic_tpu", "mosaic_gpu", "cudnn", "xla", "triton",
+    "mosaic_tpu",
+    "mosaic_gpu",
+    "cudnn",
+    "xla",
+    "triton",
 ]
-flags.DEFINE_enum("text_attn_backend", "mosaic_gpu", _ATTN_BACKENDS,
-                  "Attention backend for the text decoder.")
+flags.DEFINE_enum(
+    "text_attn_backend", "mosaic_gpu", _ATTN_BACKENDS, "Attention backend for the text decoder."
+)
 
 
 def _default_save_dir(model_id: str) -> Path:
@@ -132,8 +147,11 @@ def _grain_iter(
     # epoch count so deterministic-resume tests keep working.
     if len(sources) == 1:
         num_epochs: int | None = required_epochs_for_batches(
-            sources[0].path, batch_size=per_process_batch_size, num_batches=num_batches,
-            dp_size=dp_size, fsdp_size=fsdp_size,
+            sources[0].path,
+            batch_size=per_process_batch_size,
+            num_batches=num_batches,
+            dp_size=dp_size,
+            fsdp_size=fsdp_size,
         )
     else:
         num_epochs = None
@@ -166,12 +184,16 @@ def main(_) -> None:
     tokenizer_name = FLAGS.tokenizer or resolve_hf_repo_id(FLAGS.model_id)
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
     startup_log(f"loaded tokenizer from {tokenizer_name!r}")
-    assert FLAGS.max_length <= tokenizer.model_max_length, f"--max_length={FLAGS.max_length} exceeds tokenizer.model_max_length={tokenizer.model_max_length}"
+    assert FLAGS.max_length <= tokenizer.model_max_length, (
+        f"--max_length={FLAGS.max_length} exceeds tokenizer.model_max_length={tokenizer.model_max_length}"
+    )
     collator = TextSFTCollator(tokenizer, max_length=FLAGS.max_length)
     startup_log("built TextSFTCollator")
     train_sources = _resolve_train_sources()
     per_process_batch = process_local_batch_size(
-        FLAGS.batch_size, dp_size=FLAGS.dp_size, fsdp_size=FLAGS.fsdp_size,
+        FLAGS.batch_size,
+        dp_size=FLAGS.dp_size,
+        fsdp_size=FLAGS.fsdp_size,
     )
     sources_repr = ", ".join(f"{s.path}@{s.weight:g}" for s in train_sources)
     startup_log(
@@ -206,7 +228,9 @@ def main(_) -> None:
             per_process_batch,
             shuffle=False,
             seed=FLAGS.seed,
-            num_batches=max(1, (FLAGS.num_steps // max(FLAGS.val_every or FLAGS.num_steps, 1)) * FLAGS.val_steps),
+            num_batches=max(
+                1, (FLAGS.num_steps // max(FLAGS.val_every or FLAGS.num_steps, 1)) * FLAGS.val_steps
+            ),
             dp_size=FLAGS.dp_size,
             fsdp_size=FLAGS.fsdp_size,
         )
@@ -228,10 +252,14 @@ def main(_) -> None:
         print_every=FLAGS.log_every,
     )
     resume_mode = ResumeMode(FLAGS.resume)
-    save_dir = Path(FLAGS.save_dir) if FLAGS.save_dir else (
-        _default_save_dir(FLAGS.model_id)
-        if FLAGS.save_every > 0 or resume_mode is not ResumeMode.NEVER
-        else None
+    save_dir = (
+        Path(FLAGS.save_dir)
+        if FLAGS.save_dir
+        else (
+            _default_save_dir(FLAGS.model_id)
+            if FLAGS.save_every > 0 or resume_mode is not ResumeMode.NEVER
+            else None
+        )
     )
     peak_tflops = resolve_peak_tflops(FLAGS.peak_tflops)
 
@@ -247,7 +275,9 @@ def main(_) -> None:
         )
     if FLAGS.gc_period:
         gc.disable()
-        startup_log(f"gc_period={FLAGS.gc_period}: Python GC disabled, will collect every {FLAGS.gc_period} steps")
+        startup_log(
+            f"gc_period={FLAGS.gc_period}: Python GC disabled, will collect every {FLAGS.gc_period} steps"
+        )
 
     try:
         _, last_metrics = text_trainer.run_sft(
