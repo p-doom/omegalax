@@ -314,8 +314,12 @@ class VLMSFTCollatorTest(absltest.TestCase):
         batch = self.collator(examples)
         self.assertIn("token_ids_BT", batch)
         self.assertEqual(batch["token_ids_BT"].shape, (1, self.max_length))
-        self.assertNotIn("pixel_values", batch)
-        self.assertNotIn("image_grid_thw", batch)
+        # Vision arrays are always emitted (as empty placeholders for text-only
+        # batches) so the JIT pytree structure stays constant and never recompiles.
+        self.assertIn("pixel_values", batch)
+        self.assertEqual(batch["pixel_values"].shape[0], 0)
+        self.assertIn("image_grid_thw", batch)
+        self.assertEqual(batch["image_grid_thw"].shape, (0, 3))
 
     def test_multimodal_example(self):
         from PIL import Image

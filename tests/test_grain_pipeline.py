@@ -104,6 +104,7 @@ class GrainPipelineTest(absltest.TestCase):
                             {"role": "user", "content": "12"},
                             {"role": "assistant", "content": "13"},
                             {"role": "user", "content": "14"},
+                            {"role": "assistant", "content": "15"},
                         ],
                     },
                 ],
@@ -135,7 +136,7 @@ class GrainPipelineTest(absltest.TestCase):
                 fsdp_size=1,
             )
             records = [next(iterator) for _ in range(3)]
-            self.assertEqual([len(record["messages"]) for record in records], [2, 2, 1])
+            self.assertEqual([len(record["messages"]) for record in records], [2, 2, 2])
             self.assertEqual([record["messages"][0]["content"] for record in records], ["10", "12", "14"])
             expected_session_id = self._expected_session_id(src, 1)
             self.assertEqual([record["_omegalax_session_id"] for record in records], [expected_session_id] * 3)
@@ -303,6 +304,7 @@ class GrainPipelineTest(absltest.TestCase):
                     {
                         "messages": [
                             {"role": "user", "content": str(value)},
+                            {"role": "assistant", "content": "ok"},
                         ],
                     }
                 )
@@ -317,7 +319,10 @@ class GrainPipelineTest(absltest.TestCase):
             chunked = build_chunk_index(
                 payload,
                 Path(tmpdir) / "chunked",
-                max_length=1,
+                # max_length=2 keeps the user+assistant pair in one chunk, so the
+                # tracking value stays at messages[0] and the assistant-turn filter
+                # is satisfied (one chunk per session).
+                max_length=2,
                 measure_message=lambda message: 1,
                 records_per_shard=8,
             )

@@ -53,8 +53,8 @@ flags.DEFINE_integer("grad_accum_steps", 1, "Gradient accumulation steps (1 = no
 flags.DEFINE_integer("gc_period", 0, "If >0, disable Python GC and collect every N training steps.")
 flags.DEFINE_integer("seed", 0, "RNG seed.")
 flags.DEFINE_integer("tp_size", None, "Tensor parallelism size.")
-flags.DEFINE_integer("fsdp_size", None, "FSDP parallelism size.")
-flags.DEFINE_integer("dp_size", None, "Data parallelism size.")
+flags.DEFINE_integer("fsdp_size", 1, "FSDP parallelism size.")
+flags.DEFINE_integer("dp_size", 1, "Data parallelism size.")
 flags.DEFINE_string("save_dir", None, "Checkpoint save directory.")
 flags.DEFINE_string("jax_cache_dir", "/tmp/jax_cache", "Directory for JAX persistent compilation cache.")
 flags.DEFINE_integer("save_every", 50, "Save checkpoint every N steps.")
@@ -124,7 +124,8 @@ def _grain_iter(
     shuffle: bool,
     seed: int,
     num_batches: int,
-    dp_size: int | None = None,
+    dp_size: int,
+    fsdp_size: int,
 ):
     # For mixed sources, repeat each indefinitely and let the trainer's
     # step budget terminate. For a single source, keep the legacy bounded
@@ -132,7 +133,7 @@ def _grain_iter(
     if len(sources) == 1:
         num_epochs: int | None = required_epochs_for_batches(
             sources[0].path, batch_size=per_process_batch_size, num_batches=num_batches,
-            dp_size=dp_size,
+            dp_size=dp_size, fsdp_size=fsdp_size,
         )
     else:
         num_epochs = None
@@ -152,6 +153,7 @@ def _grain_iter(
             per_worker_buffer_size=FLAGS.grain_worker_buffer_size,
         ),
         dp_size=dp_size,
+        fsdp_size=fsdp_size,
     )
 
 
@@ -168,7 +170,9 @@ def main(_) -> None:
     collator = TextSFTCollator(tokenizer, max_length=FLAGS.max_length)
     startup_log("built TextSFTCollator")
     train_sources = _resolve_train_sources()
-    per_process_batch = process_local_batch_size(FLAGS.batch_size, dp_size=FLAGS.dp_size)
+    per_process_batch = process_local_batch_size(
+        FLAGS.batch_size, dp_size=FLAGS.dp_size, fsdp_size=FLAGS.fsdp_size,
+    )
     sources_repr = ", ".join(f"{s.path}@{s.weight:g}" for s in train_sources)
     startup_log(
         f"model_id={FLAGS.model_id!r} data_sources=[{sources_repr}] "
@@ -190,6 +194,7 @@ def main(_) -> None:
         seed=FLAGS.seed,
         num_batches=total_micro_batches,
         dp_size=FLAGS.dp_size,
+        fsdp_size=FLAGS.fsdp_size,
     )
     startup_log("built train grain DataLoader iterator")
 
@@ -203,6 +208,7 @@ def main(_) -> None:
             seed=FLAGS.seed,
             num_batches=max(1, (FLAGS.num_steps // max(FLAGS.val_every or FLAGS.num_steps, 1)) * FLAGS.val_steps),
             dp_size=FLAGS.dp_size,
+            fsdp_size=FLAGS.fsdp_size,
         )
         startup_log(f"built val grain DataLoader iterator from {FLAGS.val_data_path!r}")
 

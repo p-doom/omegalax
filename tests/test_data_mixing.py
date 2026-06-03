@@ -42,12 +42,21 @@ def _write_jsonl(path: Path, rows: list[dict]) -> None:
 def _build_chunked_source(
     tmpdir: Path, *, name: str, contents: list[str],
 ) -> Path:
-    """Compile a single-message-per-session JSONL into a chunk-index dataset."""
+    """Compile a user+assistant-per-session JSONL into a chunk-index dataset.
+
+    Each session pairs the tracking value (carried as the user turn so tests can
+    read it back at ``messages[0]``) with a trivial assistant turn, so the chunk
+    survives ``build_chunk_index``'s assistant-turn filter. ``max_length=2`` keeps
+    both messages in a single chunk, preserving one chunk per session.
+    """
     src = tmpdir / f"{name}.jsonl"
     _write_jsonl(
         src,
         [
-            {"messages": [{"role": "user", "content": value}]}
+            {"messages": [
+                {"role": "user", "content": value},
+                {"role": "assistant", "content": "ok"},
+            ]}
             for value in contents
         ],
     )
@@ -60,7 +69,7 @@ def _build_chunked_source(
     chunked = build_chunk_index(
         payload,
         tmpdir / f"{name}_chunked",
-        max_length=1,
+        max_length=2,
         measure_message=lambda _msg: 1,
         records_per_shard=8,
     )
@@ -70,6 +79,8 @@ def _build_chunked_source(
 _FAST_OPTS = dict(
     read_options=make_grain_read_options(num_threads=1, prefetch_buffer_size=1),
     multiprocessing_options=make_grain_multiprocessing_options(num_workers=0, per_worker_buffer_size=1),
+    dp_size=1,
+    fsdp_size=1,
 )
 
 
@@ -208,7 +219,10 @@ class DataMixingTest(absltest.TestCase):
             tmpdir = Path(tmp)
             # Build two payloads, then chunk-index them with different max_lengths.
             src_a = tmpdir / "a.jsonl"
-            _write_jsonl(src_a, [{"messages": [{"role": "user", "content": "x"}]}])
+            _write_jsonl(src_a, [{"messages": [
+                {"role": "user", "content": "x"},
+                {"role": "assistant", "content": "ok"},
+            ]}])
             payload_a = compile_jsonl_to_arrayrecord(
                 src_a, tmpdir / "a_payload", messages_per_record=1, records_per_shard=8,
             )
