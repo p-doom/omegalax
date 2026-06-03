@@ -13,8 +13,7 @@ from pathlib import Path
 from flax import nnx
 import jax
 import jax.numpy as jnp
-from jax.sharding import Mesh, NamedSharding, PartitionSpec
-import numpy as np
+from jax.sharding import NamedSharding, PartitionSpec
 import optax
 import orbax.checkpoint as ocp
 from orbax.checkpoint import checkpoint_managers as ocm

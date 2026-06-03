@@ -5,7 +5,6 @@ from __future__ import annotations
 import gc
 from typing import Any
 
-import jax.numpy as jnp
 import numpy as np
 import safetensors
 from etils import epath

@@ -188,7 +188,7 @@ def export_qwen3_vl_to_safetensors(model: Qwen3VL, cfg: Qwen3VLConfig, out_dir: 
 
     if unmatched:
         raise RuntimeError(
-            f"Unmapped JAX parameters during export:\n" + "\n".join(sorted(unmatched))
+            "Unmapped JAX parameters during export:\n" + "\n".join(sorted(unmatched))
         )
 
     stnp.save_file(hf_tensors, tensor_path)

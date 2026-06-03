@@ -281,7 +281,7 @@ def find_safetensors(file_dir: str | epath.Path) -> list[epath.Path]:
 def check_conversion_errors(unmatched: list[str]) -> None:
     """Raise RuntimeError if there are unmatched HuggingFace keys."""
     if unmatched:
-        raise RuntimeError(f"Unmapped HuggingFace parameters:\n" + "\n".join(sorted(unmatched)))
+        raise RuntimeError("Unmapped HuggingFace parameters:\n" + "\n".join(sorted(unmatched)))
 
 
 def load_hf_config(path: str | epath.Path) -> dict[str, Any]:

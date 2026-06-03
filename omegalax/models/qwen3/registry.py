@@ -2,7 +2,6 @@
 
 from .config import (
     Qwen3Config,
-    get_spec,
     is_supported_model_id,
     list_qwen3_dense_model_ids,
     list_qwen3_moe_model_ids,

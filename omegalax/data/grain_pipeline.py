@@ -17,7 +17,6 @@ from tqdm import tqdm
 from array_record.python.array_record_module import ArrayRecordWriter
 import grain
 import jax
-import numpy as np
 
 COMPILED_DATASET_VERSION = 1
 COMPILED_METADATA_FILENAME = "metadata.json"
@@ -372,8 +371,8 @@ def _emit_token_stats(
     """Assemble per-message / per-chunk token statistics and write them to
     ``token_stats.json`` in ``out_dir``.
     """
-    msg_text_tokens = [l - v for l, v in zip(msg_lengths, msg_vision_tokens)]
-    chunk_text_tokens = [l - v for l, v in zip(chunk_lengths, chunk_vision_tokens)]
+    msg_text_tokens = [total - vis for total, vis in zip(msg_lengths, msg_vision_tokens)]
+    chunk_text_tokens = [total - vis for total, vis in zip(chunk_lengths, chunk_vision_tokens)]
     stats = {
         "per_message": {
             "num_messages": len(msg_lengths),

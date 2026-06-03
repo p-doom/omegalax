@@ -10,7 +10,6 @@ os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
 from absl.testing import absltest
 
-import jax
 import numpy as np
 
 from omegalax.data.grain_pipeline import (

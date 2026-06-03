@@ -6,7 +6,6 @@ from pathlib import Path
 os.environ.setdefault("JAX_PLATFORMS", "cuda")
 os.environ["USE_HUB_KERNELS"] = "false"
 
-import jax
 import jax.numpy as jnp
 import numpy as np
 import safetensors

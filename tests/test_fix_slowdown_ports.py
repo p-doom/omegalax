@@ -334,7 +334,6 @@ class Qwen3_5JitStabilityTest(absltest.TestCase):
             model = Qwen3_5ForConditionalGeneration(cfg=cfg, rngs=nnx.Rngs(params=0))
 
         ms = cfg.vision_config.spatial_merge_size
-        ms2 = ms * ms
         max_images = 4
         # Both batches padded to identical (max_images, max_patches).
         # Pick max_patches large enough for either real grid.

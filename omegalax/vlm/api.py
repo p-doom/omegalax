@@ -189,7 +189,9 @@ def load_pretrained(
 
     local_dir = snapshot_download(model_id)
     cfg = resolve_config(model_id)
-    mesh = ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size)
+    # Validates any active mesh matches the requested (tp, fsdp, dp); the loaders
+    # below build their own mesh from these sizes, so the return value is unused.
+    ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size)
     if isinstance(cfg, Qwen3VLConfig):
         model, cfg = create_qwen3_vl_from_safetensors(
             local_dir, tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size

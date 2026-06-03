@@ -66,7 +66,6 @@ def chunk_gated_delta_rule_xla(
     J = total_T // chunk_size
     q_BHJLA = q_BHTA.reshape(B, H, J, chunk_size, A)
     k_BHJLA = k_BHTA.reshape(B, H, J, chunk_size, A)
-    v_BHJLU = v_BHTU.reshape(B, H, J, chunk_size, U)
     kb_BHJLA = kb_BHTA.reshape(B, H, J, chunk_size, A)
     vb_BHJLU = vb_BHTU.reshape(B, H, J, chunk_size, U)
     g_BHJL = g_BHT.reshape(B, H, J, chunk_size)

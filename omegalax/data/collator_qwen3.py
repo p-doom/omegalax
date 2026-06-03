@@ -15,9 +15,7 @@ import numpy as np
 from transformers import BaseImageProcessor, PreTrainedTokenizer
 
 from omegalax.data.qwen3_encoding import (
-    build_chatml_text as _build_chatml_text,
     encode_qwen_messages as _encode_qwen_messages,
-    extract_images as _extract_images,
 )
 
 
@@ -276,7 +274,6 @@ class VLMSFTCollator:
         batch_mask: list[np.ndarray] = []
         all_pixel_values: list[np.ndarray] = []
         all_grid_thw: list[np.ndarray] = []
-        has_images = False
 
         for ex in examples:
             messages = ex["messages"]
@@ -294,7 +291,6 @@ class VLMSFTCollator:
                 )
 
             if "pixel_values" in encoded:
-                has_images = True
                 all_pixel_values.append(encoded["pixel_values"])
                 all_grid_thw.append(encoded["image_grid_thw"])
 

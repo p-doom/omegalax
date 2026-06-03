@@ -11,12 +11,10 @@ import tempfile
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
-import jax
 import jax.numpy as jnp
 import numpy as np
 import torch
 from absl.testing import absltest
-from PIL import Image
 from transformers import Qwen3VLForConditionalGeneration
 from transformers.models.qwen3_vl.configuration_qwen3_vl import (
     Qwen3VLConfig as HFQwen3VLConfig,

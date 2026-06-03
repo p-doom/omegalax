@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Any, cast
+from typing import Any, TypeAlias, cast
 
 import grain
 import orbax.checkpoint as ocp
 
-type GrainIterator = grain.DataLoaderIterator | grain.DatasetIterator
+# NOTE: plain `TypeAlias` (not the PEP 695 `type X = ...` statement) so the module
+# imports on Python 3.11, matching `requires-python = ">=3.11"`.
+GrainIterator: TypeAlias = grain.DataLoaderIterator | grain.DatasetIterator
 
 
 class ResumeMode(StrEnum):

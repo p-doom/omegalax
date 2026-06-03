@@ -399,7 +399,7 @@ def main(_) -> None:
     finally:
         if FLAGS.gc_period:
             gc.enable()
-            print(f"Training completed, re-enabling Python GC")
+            print("Training completed, re-enabling Python GC")
 
         if wandb_run is not None:
             wandb_run.finish()

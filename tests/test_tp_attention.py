@@ -2,7 +2,7 @@
 
 import jax
 import jax.numpy as jnp
-from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+from jax.sharding import NamedSharding, PartitionSpec as P
 
 jax.distributed.initialize()
 
@@ -24,7 +24,7 @@ v = jax.device_put(jax.random.normal(rng, (B, T, h, K), dtype=jnp.bfloat16), q_s
 print(f"q.shape={q.shape}, sharding={q.sharding}")
 print(f"k.shape={k.shape}, sharding={k.sharding}")
 
-from tokamax import dot_product_attention
+from tokamax import dot_product_attention  # noqa: E402  (after jax.distributed.initialize)
 
 # Test 1: Forward only (should work with q_sharding)
 print("\n--- Test 1: Forward with q_sharding ---")

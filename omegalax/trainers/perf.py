@@ -247,13 +247,11 @@ def _training_flops_per_token_qwen3_5(cfg: Qwen3_5TextConfig, seq_len: int) -> i
     G = cfg.num_key_value_heads
     K = cfg.head_dim
     V = cfg.vocab_size
-    L = cfg.num_hidden_layers
     T = seq_len
 
     key_dim = cfg.linear_key_head_dim * cfg.linear_num_key_heads
     value_dim = cfg.linear_value_head_dim * cfg.linear_num_value_heads
     nv = cfg.linear_num_value_heads
-    nk = cfg.linear_num_key_heads
     ak = cfg.linear_key_head_dim
     av = cfg.linear_value_head_dim
 

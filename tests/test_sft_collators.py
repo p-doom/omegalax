@@ -16,8 +16,8 @@ from omegalax.data.collator_qwen3 import (
     TextSFTCollator,
     VLMSFTCollator,
     _build_assistant_loss_mask,
-    _build_chatml_text,
 )
+from omegalax.data.qwen3_encoding import build_chatml_text as _build_chatml_text
 
 
 def _make_tokenizer():

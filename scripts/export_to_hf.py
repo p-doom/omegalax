@@ -32,9 +32,6 @@ from flax import nnx
 from omegalax import export as export_lib
 from omegalax import registry
 from omegalax.distributed.mesh import ensure_mesh, mesh_rules
-from omegalax.text import api as text_api
-from omegalax.trainers import text as text_trainer
-from omegalax.trainers import vlm as vlm_trainer
 from omegalax.vlm import api as vlm_api
 
 FLAGS = flags.FLAGS

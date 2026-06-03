@@ -12,7 +12,6 @@ from unittest import mock
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
-import jax
 import jax.numpy as jnp
 from absl.testing import absltest
 

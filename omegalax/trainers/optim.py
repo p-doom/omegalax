@@ -5,7 +5,6 @@ from __future__ import annotations
 from flax import nnx
 import jax
 import jax.numpy as jnp
-import optax
 
 
 class MixedPrecisionOptimizer(nnx.ModelAndOptimizer):

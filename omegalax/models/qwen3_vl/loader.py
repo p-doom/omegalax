@@ -3,11 +3,9 @@
 from __future__ import annotations
 
 import gc
-import re
 from typing import Any
 
 import jax
-import jax.numpy as jnp
 import safetensors
 from etils import epath
 from flax import nnx
@@ -123,18 +121,18 @@ def _get_text_key_mapping():
     T = Transform
     m: dict[str, tuple[str, Transform]] = {}
     m[r"model\.language_model\.embed_tokens\.weight"] = ("text.embedder.embedding", T.EMBED)
-    l = r"model\.language_model\.layers\.([0-9]+)"
-    m[l + r"\.self_attn\.q_proj\.weight"] = (r"text.layers.\1.attn.q_proj.kernel", T.LINEAR)
-    m[l + r"\.self_attn\.k_proj\.weight"] = (r"text.layers.\1.attn.k_proj.kernel", T.LINEAR)
-    m[l + r"\.self_attn\.v_proj\.weight"] = (r"text.layers.\1.attn.v_proj.kernel", T.LINEAR)
-    m[l + r"\.self_attn\.o_proj\.weight"] = (r"text.layers.\1.attn.o_proj.kernel", T.LINEAR)
-    m[l + r"\.self_attn\.q_norm\.weight"] = (r"text.layers.\1.attn.q_norm.scale", T.SCALE)
-    m[l + r"\.self_attn\.k_norm\.weight"] = (r"text.layers.\1.attn.k_norm.scale", T.SCALE)
-    m[l + r"\.mlp\.gate_proj\.weight"] = (r"text.layers.\1.mlp.gate_proj.kernel", T.LINEAR)
-    m[l + r"\.mlp\.up_proj\.weight"] = (r"text.layers.\1.mlp.up_proj.kernel", T.LINEAR)
-    m[l + r"\.mlp\.down_proj\.weight"] = (r"text.layers.\1.mlp.down_proj.kernel", T.LINEAR)
-    m[l + r"\.input_layernorm\.weight"] = (r"text.layers.\1.input_layernorm.scale", T.SCALE)
-    m[l + r"\.post_attention_layernorm\.weight"] = (
+    lyr = r"model\.language_model\.layers\.([0-9]+)"
+    m[lyr + r"\.self_attn\.q_proj\.weight"] = (r"text.layers.\1.attn.q_proj.kernel", T.LINEAR)
+    m[lyr + r"\.self_attn\.k_proj\.weight"] = (r"text.layers.\1.attn.k_proj.kernel", T.LINEAR)
+    m[lyr + r"\.self_attn\.v_proj\.weight"] = (r"text.layers.\1.attn.v_proj.kernel", T.LINEAR)
+    m[lyr + r"\.self_attn\.o_proj\.weight"] = (r"text.layers.\1.attn.o_proj.kernel", T.LINEAR)
+    m[lyr + r"\.self_attn\.q_norm\.weight"] = (r"text.layers.\1.attn.q_norm.scale", T.SCALE)
+    m[lyr + r"\.self_attn\.k_norm\.weight"] = (r"text.layers.\1.attn.k_norm.scale", T.SCALE)
+    m[lyr + r"\.mlp\.gate_proj\.weight"] = (r"text.layers.\1.mlp.gate_proj.kernel", T.LINEAR)
+    m[lyr + r"\.mlp\.up_proj\.weight"] = (r"text.layers.\1.mlp.up_proj.kernel", T.LINEAR)
+    m[lyr + r"\.mlp\.down_proj\.weight"] = (r"text.layers.\1.mlp.down_proj.kernel", T.LINEAR)
+    m[lyr + r"\.input_layernorm\.weight"] = (r"text.layers.\1.input_layernorm.scale", T.SCALE)
+    m[lyr + r"\.post_attention_layernorm\.weight"] = (
         r"text.layers.\1.post_attention_layernorm.scale",
         T.SCALE,
     )

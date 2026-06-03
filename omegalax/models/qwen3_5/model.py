@@ -9,7 +9,7 @@ from jax.sharding import PartitionSpec, reshard
 
 from omegalax.models.shard_config import ShardConfig
 from .attention import Attention
-from .config import Qwen3_5Config, Qwen3_5TextConfig, Qwen3_5VisionConfig
+from .config import Qwen3_5Config, Qwen3_5TextConfig
 from .deltanet import GatedDeltaNet
 from .norms import RMSNorm
 from .rope import generate_text_rope

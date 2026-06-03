@@ -18,7 +18,7 @@ M — chunk position (column / source)
 import jax
 import jax.numpy as jnp
 from flax import nnx
-from jax.sharding import PartitionSpec, reshard
+from jax.sharding import PartitionSpec
 
 from .kernels import chunk_gated_delta_rule
 from .config import Qwen3_5TextConfig
@@ -161,10 +161,7 @@ class GatedDeltaNet(nnx.Module):
 
         norm_w = self.norm.weight[...]
         norm_eps = self.norm.eps
-        key_dim = self.key_dim
-        num_k_heads = self.num_k_heads
         head_k_dim = self.head_k_dim
-        num_v_heads = self.num_v_heads
         head_v_dim = self.head_v_dim
         gqa_factor = self.gqa_factor
 
