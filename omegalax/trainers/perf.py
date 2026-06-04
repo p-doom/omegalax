@@ -591,6 +591,8 @@ def maybe_log_step_metrics(
             f"train/total_samples={host_metrics.get('total_samples', 0)} "
             f"train/global_tokens_per_sec={host_metrics.get('global_tokens_per_sec', 0.0):.0f} "
             f"train/step_time_s={host_metrics.get('step_time_s', 0.0):.2f}s "
+            f"train/supervised_tokens={host_metrics.get('supervised_tokens', 0.0):.0f} "
+            f"train/total_tokens={host_metrics.get('total_tokens', 0.0):.0f} "
             f"train/lr={lr:.2e} "
             f"train/tflops_per_device={host_metrics.get('tflops_per_device', 0.0):.2f} "
             f"train/mfu={host_metrics.get('mfu', 0.0) * 100:.1f}% "

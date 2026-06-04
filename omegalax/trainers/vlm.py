@@ -285,9 +285,10 @@ def make_sft_train_step(cfg, pad_id: int = 0, *, wrt=nnx.Param, num_loss_tiles: 
                 + aux_loss
             )
             supervised_tokens = jnp.sum(loss_mask_BT[:, 1:].astype(jnp.float32))
-            return loss, supervised_tokens
+            total_tokens = jnp.sum(attention_mask_BT.astype(jnp.float32))
+            return loss, (supervised_tokens, total_tokens)
 
-        (loss, supervised_tokens), grads = nnx.value_and_grad(
+        (loss, (supervised_tokens, total_tokens)), grads = nnx.value_and_grad(
             loss_fn,
             argnums=diff_state,
             has_aux=True,
@@ -297,6 +298,7 @@ def make_sft_train_step(cfg, pad_id: int = 0, *, wrt=nnx.Param, num_loss_tiles: 
             "loss": loss,
             "grad_norm": optax.tree.norm(grads),
             "supervised_tokens": supervised_tokens,
+            "total_tokens": total_tokens,
         }
         return loss, metrics
 
@@ -632,6 +634,7 @@ def run_sft(
 
         accum_loss = 0.0
         accum_sup_tokens = 0.0
+        accum_total_tokens = 0.0
         accum_grad_norm = 0.0
         accum_flops = 0.0
         accum_time = datetime.timedelta(0)
@@ -647,11 +650,12 @@ def run_sft(
             if sids is not None:
                 for sid in sids.tolist():
                     source_counts[sid] = source_counts.get(sid, 0) + 1
+            grid_thw = batch.get("image_grid_thw")
             micro_flops = per_device_flops_per_step(
                 model_cfg,
                 train_cfg.seq_len,
                 train_cfg.batch_size,
-                image_grid_thw=batch.get("image_grid_thw"),
+                image_grid_thw=grid_thw,
                 vision_trainable=not (train_cfg.freeze_vision_tower or train_cfg.enable_lora),
             )
             batch = vlm_api.shard_batch_dict(batch, model_cfg, mesh)
@@ -660,6 +664,7 @@ def run_sft(
 
             accum_loss = accum_loss + metrics["loss"]
             accum_sup_tokens = accum_sup_tokens + metrics["supervised_tokens"]
+            accum_total_tokens = accum_total_tokens + metrics["total_tokens"]
             accum_grad_norm = accum_grad_norm + metrics["grad_norm"]
             accum_flops += micro_flops
             accum_time += micro_delta
@@ -681,6 +686,7 @@ def run_sft(
                 "loss": accum_loss / accum_steps,
                 "grad_norm": accum_grad_norm / accum_steps,
                 "supervised_tokens": accum_sup_tokens,
+                "total_tokens": accum_total_tokens,
                 "lr": lr_schedule_fn(step_idx),
             }
             if len(source_counts) > 1:
