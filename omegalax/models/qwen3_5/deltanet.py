@@ -8,8 +8,14 @@ Module-local dimension key (supplements the global key in models/__init__.py):
 B — batch size
 H — number of value heads (num_v_heads)
 T — sequence length
+C — combined qkv projection dimension
+    (conv_dim = 2 * (num_k_heads * A) + (num_v_heads * U))
+D — model / hidden dimension (hidden_size)
 A — key head dimension (linear_key_head_dim)
 U — value head dimension (linear_value_head_dim)
+P — flattened q/k projection dimension (key_dim = num_k_heads * A)
+O — flattened value projection dimension (value_dim = num_v_heads * U)
+K — convolution kernel dimension (linear_conv_kernel_dim)
 J — number of chunks (total_T // chunk_size)
 L — chunk position (row / target)
 M — chunk position (column / source)
@@ -72,20 +78,10 @@ class GatedDeltaNet(nnx.Module):
             D, self.value_dim, use_bias=False, rngs=rngs, dtype=cfg.dtype, kernel_init=in_proj_init
         )
         self.in_proj_b = nnx.Linear(
-            D,
-            self.num_v_heads,
-            use_bias=False,
-            rngs=rngs,
-            dtype=cfg.dtype,
-            kernel_init=in_proj_init,
+            D, self.num_v_heads, use_bias=False, rngs=rngs, dtype=cfg.dtype, kernel_init=in_proj_init
         )
         self.in_proj_a = nnx.Linear(
-            D,
-            self.num_v_heads,
-            use_bias=False,
-            rngs=rngs,
-            dtype=cfg.dtype,
-            kernel_init=in_proj_init,
+            D, self.num_v_heads, use_bias=False, rngs=rngs, dtype=cfg.dtype, kernel_init=in_proj_init
         )
 
         self.conv_weight = nnx.Param(
@@ -99,8 +95,9 @@ class GatedDeltaNet(nnx.Module):
             sharding=(None,),
         )
 
-        batch_axis = cfg.shd_cfg.act_btd[0]
-        head_axis = cfg.shd_cfg.act_btnh[2]
+        heads_shd = cfg.shd_cfg.act_btnh
+        batch_axis = heads_shd[0]
+        head_axis = heads_shd[2]
         if batch_axis is None:
             flat_axis = head_axis
         elif head_axis is None or head_axis == batch_axis:
@@ -113,7 +110,9 @@ class GatedDeltaNet(nnx.Module):
         self.hidden_shd = cfg.shd_cfg.act_btd
         self.scan_state_shd = P(batch_axis, head_axis, None, None)
         self.flat_norm_shd = P(flat_axis, None)
-        self.norm = RMSNormGated(self.head_v_dim, cfg.rms_norm_eps, rngs=rngs, sharding=(None,))
+        self.norm = RMSNormGated(
+            self.head_v_dim, cfg.rms_norm_eps, rngs=rngs, sharding=(None,)
+        )
         self.out_proj = nnx.Linear(
             self.value_dim,
             D,
@@ -124,36 +123,45 @@ class GatedDeltaNet(nnx.Module):
         )
 
     @jax.named_scope("gated_delta_net")
-    def __call__(
-        self, hidden_BTD: jax.Array, attention_mask_BT: jax.Array | None = None
-    ) -> jax.Array:
+    def __call__(self, hidden_BTD: jax.Array, attention_mask_BT: jax.Array | None = None) -> jax.Array:
         if attention_mask_BT is not None and attention_mask_BT.shape[1] > 1:
             hidden_BTD = hidden_BTD * attention_mask_BT[:, :, None]
 
         B, T, _ = hidden_BTD.shape
 
-        batch_axis = self.shd_cfg.act_btd[0]
-        head_axis = self.shd_cfg.act_btnh[2]
-        mixed_qkv_BCT = self.in_proj_qkv(hidden_BTD, out_sharding=self.shd_cfg.act_btf).transpose(
-            0, 2, 1
-        )
+        heads_shd = self.shd_cfg.act_btnh
+        batch_axis = heads_shd[0]
+        head_axis = heads_shd[2]
+        beta_g_shd = P(batch_axis, None, head_axis)
+        mixed_qkv_BCT = self.in_proj_qkv(hidden_BTD, out_sharding=self.shd_cfg.act_btf).transpose(0, 2, 1)
         z_BTHU = jax.lax.reshape(
             self.in_proj_z(hidden_BTD, out_sharding=self.shd_cfg.act_btf),
             (B, T, self.num_v_heads, self.head_v_dim),
-            out_sharding=P(batch_axis, None, head_axis, None),
+            out_sharding=heads_shd,
         )
-        b_BTH = self.in_proj_b(hidden_BTD, out_sharding=P(batch_axis, None, head_axis))
-        a_BTH = self.in_proj_a(hidden_BTD, out_sharding=P(batch_axis, None, head_axis))
+        b_BTH = self.in_proj_b(hidden_BTD, out_sharding=beta_g_shd)
+        a_BTH = self.in_proj_a(hidden_BTD, out_sharding=beta_g_shd)
 
-        mixed_qkv_BCT = nnx.silu(
-            _causal_depthwise_conv1d(
-                mixed_qkv_BCT, self.conv_weight[...].astype(mixed_qkv_BCT.dtype)
-            )
-        )
+        mixed_qkv_BCT = nnx.silu(_causal_depthwise_conv1d(mixed_qkv_BCT, self.conv_weight[...].astype(mixed_qkv_BCT.dtype)))
         mixed_qkv_BTC = mixed_qkv_BCT.transpose(0, 2, 1)
+        q_BTP, k_BTP, v_BTO = jnp.split(mixed_qkv_BTC, [self.key_dim, self.key_dim * 2], axis=-1)
+        q_BTHA = jax.lax.reshape(
+            q_BTP,
+            (B, T, self.num_k_heads, self.head_k_dim),
+            out_sharding=heads_shd,
+        )
+        k_BTHA = jax.lax.reshape(
+            k_BTP,
+            (B, T, self.num_k_heads, self.head_k_dim),
+            out_sharding=heads_shd,
+        )
+        v_BTHU = jax.lax.reshape(
+            v_BTO,
+            (B, T, self.num_v_heads, self.head_v_dim),
+            out_sharding=heads_shd,
+        )
 
         from jax.experimental.shard_map import shard_map
-
         mesh = jax.sharding.get_abstract_mesh()
         beta_BTH = jax.nn.sigmoid(b_BTH)
         A_H = -jnp.exp(self.A_log[...].astype(jnp.float32))
@@ -162,20 +170,16 @@ class GatedDeltaNet(nnx.Module):
         norm_w = self.norm.weight[...]
         norm_eps = self.norm.eps
         head_k_dim = self.head_k_dim
-        head_v_dim = self.head_v_dim
         gqa_factor = self.gqa_factor
 
-        def _full_deltanet(qkv_BTC, z_BTHU, g_BTH, beta_BTH, nw):
-            """Split → reshape → GQA → DeltaNet → norm.  All local (no TP)."""
-            B, T, C_local = qkv_BTC.shape
-            # Inside shard_map, dims are local. Derive local head counts from shapes.
-            local_v_heads = z_BTHU.shape[2]
-            local_k_heads = local_v_heads // gqa_factor if gqa_factor > 1 else local_v_heads
-            local_key_dim = local_k_heads * head_k_dim
-            q_BTA, k_BTA, v_BTU = jnp.split(qkv_BTC, [local_key_dim, local_key_dim * 2], axis=-1)
-            q_BTHA = q_BTA.reshape(B, T, local_k_heads, head_k_dim)
-            k_BTHA = k_BTA.reshape(B, T, local_k_heads, head_k_dim)
-            v_BTHU_ = v_BTU.reshape(B, T, local_v_heads, head_v_dim)
+        def _full_deltanet(q_BTHA, k_BTHA, v_BTHU, z_BTHU, g_BTH, beta_BTH, nw):
+            """GQA → DeltaNet → norm. All inputs have shard-local head axes."""
+            B, T = q_BTHA.shape[:2]
+            local_k_heads = q_BTHA.shape[2]
+            local_v_heads = v_BTHU.shape[2]
+            assert k_BTHA.shape[2] == local_k_heads
+            assert z_BTHU.shape[2] == local_v_heads
+            assert local_v_heads == local_k_heads * gqa_factor
             if gqa_factor > 1:
                 q_BTHA = jnp.broadcast_to(
                     q_BTHA[:, :, :, None, :],
@@ -185,7 +189,7 @@ class GatedDeltaNet(nnx.Module):
                     k_BTHA[:, :, :, None, :],
                     (B, T, local_k_heads, gqa_factor, head_k_dim),
                 ).reshape(B, T, local_v_heads, head_k_dim)
-            out = chunk_gated_delta_rule(q_BTHA, k_BTHA, v_BTHU_, g_BTH, beta_BTH)
+            out = chunk_gated_delta_rule(q_BTHA, k_BTHA, v_BTHU, g_BTH, beta_BTH)
             # Inline RMSNormGated
             BL = out.shape[0] * out.shape[1]
             H, D = out.shape[2], out.shape[3]
@@ -193,22 +197,18 @@ class GatedDeltaNet(nnx.Module):
             z_flat = z_BTHU.reshape(BL * H, D)
             dtype = core_flat.dtype
             x_f32 = core_flat.astype(jnp.float32)
-            variance = jnp.mean(x_f32**2, axis=-1, keepdims=True)
+            variance = jnp.mean(x_f32 ** 2, axis=-1, keepdims=True)
             normed = (x_f32 * jax.lax.rsqrt(variance + norm_eps)).astype(dtype)
             normed = nw.astype(dtype) * normed
             gated = normed * jax.nn.silu(z_flat.astype(jnp.float32))
             return gated.astype(dtype).reshape(out.shape[0], out.shape[1], H * D)
 
-        heads_shd = P(batch_axis, None, head_axis, None)
-        beta_g_shd = P(batch_axis, None, head_axis)
-
         normed_BTD = shard_map(
-            _full_deltanet,
-            mesh,
-            in_specs=(self.shd_cfg.act_btf, heads_shd, beta_g_shd, beta_g_shd, P(None)),
+            _full_deltanet, mesh,
+            in_specs=(heads_shd, heads_shd, heads_shd, heads_shd, beta_g_shd, beta_g_shd, P(None)),
             out_specs=self.shd_cfg.act_btf,
             check_rep=False,
-        )(mixed_qkv_BTC, z_BTHU, g_BTH, beta_BTH, norm_w)
+        )(q_BTHA, k_BTHA, v_BTHU, z_BTHU, g_BTH, beta_BTH, norm_w)
 
         out_BTD = self.out_proj(normed_BTD, out_sharding=self.shd_cfg.act_btd)
         return out_BTD
