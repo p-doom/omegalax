@@ -183,6 +183,7 @@ class GatedDeltaNet(nnx.Module):
             if gqa_factor > 1:
                 q_BTHA = jnp.broadcast_to(
                     q_BTHA[:, :, :, None, :],
+                    
                     (B, T, local_k_heads, gqa_factor, head_k_dim),
                 ).reshape(B, T, local_v_heads, head_k_dim)
                 k_BTHA = jnp.broadcast_to(
@@ -192,16 +193,16 @@ class GatedDeltaNet(nnx.Module):
             out = chunk_gated_delta_rule(q_BTHA, k_BTHA, v_BTHU, g_BTH, beta_BTH)
             # Inline RMSNormGated
             BL = out.shape[0] * out.shape[1]
-            H, D = out.shape[2], out.shape[3]
-            core_flat = out.reshape(BL * H, D)
-            z_flat = z_BTHU.reshape(BL * H, D)
+            H, U = out.shape[2], out.shape[3]
+            core_flat = out.reshape(BL * H, U)
+            z_flat = z_BTHU.reshape(BL * H, U)
             dtype = core_flat.dtype
             x_f32 = core_flat.astype(jnp.float32)
             variance = jnp.mean(x_f32 ** 2, axis=-1, keepdims=True)
             normed = (x_f32 * jax.lax.rsqrt(variance + norm_eps)).astype(dtype)
             normed = nw.astype(dtype) * normed
             gated = normed * jax.nn.silu(z_flat.astype(jnp.float32))
-            return gated.astype(dtype).reshape(out.shape[0], out.shape[1], H * D)
+            return gated.astype(dtype).reshape(out.shape[0], out.shape[1], H * U)
 
         normed_BTD = shard_map(
             _full_deltanet, mesh,
