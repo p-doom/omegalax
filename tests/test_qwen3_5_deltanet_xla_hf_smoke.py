@@ -3,7 +3,7 @@
 import os
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
-os.environ.setdefault("OMEGALAX_DELTANET_KERNEL", "xla")
+os.environ["OMEGALAX_DELTANET_KERNEL"] = "xla"
 
 import jax.numpy as jnp
 import numpy as np
