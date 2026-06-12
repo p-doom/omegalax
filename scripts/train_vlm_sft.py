@@ -28,7 +28,7 @@ from omegalax.trainers.perf import resolve_peak_tflops
 
 FLAGS = flags.FLAGS
 
-flags.DEFINE_string("model_id", None, "HF model id.", required=True)
+flags.DEFINE_string("model_id", None, "HF model id.")
 flags.DEFINE_string("data_path", None, "Path to compiled Grain chunk-index dataset directory.")
 flags.DEFINE_string(
     "data_mix",
@@ -47,103 +47,111 @@ flags.DEFINE_string(
     None,
     "Path to JSON file whose keys override default image processor config.",
 )
-flags.DEFINE_integer("max_length", 512, "Maximum sequence length.")
-flags.DEFINE_integer("num_steps", 100, "Number of training steps.")
-flags.DEFINE_integer("batch_size", 4, "Global batch size across all JAX processes.")
-flags.DEFINE_float("learning_rate", 2e-5, "Learning rate.")
-flags.DEFINE_float("weight_decay", 0.01, "Weight decay.")
-flags.DEFINE_integer("warmup_steps", 0, "Linear LR warmup steps.")
+flags.DEFINE_integer("max_length", None, "Maximum sequence length.")
+flags.DEFINE_integer("num_steps", None, "Number of training steps.")
+flags.DEFINE_integer("batch_size", None, "Global batch size across all JAX processes.")
+flags.DEFINE_float("learning_rate", None, "Learning rate.")
+flags.DEFINE_float("weight_decay", None, "Weight decay.")
+flags.DEFINE_integer("warmup_steps", None, "Linear LR warmup steps.")
 flags.DEFINE_enum(
     "lr_schedule",
-    "linear",
+    None,
     ["linear", "cosine", "wsd"],
     "LR schedule after warmup: 'linear' (constant), 'cosine', or 'wsd' (warmup-stable-decay).",
 )
 flags.DEFINE_float(
-    "lr_end_factor", 0.0, "Final LR as fraction of peak LR (cosine/wsd decay end value)."
+    "lr_end_factor",
+    None,
+    "Final LR as fraction of peak LR (cosine/wsd decay end value). Required for cosine/wsd.",
 )
 flags.DEFINE_float(
-    "lr_stable_fraction", 0.8, "Fraction of post-warmup steps at peak LR (wsd only)."
+    "lr_stable_fraction",
+    None,
+    "Fraction of post-warmup steps at peak LR (wsd only). Required for wsd.",
 )
-flags.DEFINE_float("max_grad_norm", 1.0, "Max gradient norm for clipping (0 = no clipping).")
-flags.DEFINE_integer("grad_accum_steps", 1, "Gradient accumulation steps (1 = no accumulation).")
-flags.DEFINE_integer("gc_period", 0, "If >0, disable Python GC and collect every N training steps.")
-flags.DEFINE_integer("seed", 0, "RNG seed.")
-flags.DEFINE_integer("tp_size", 1, "Tensor parallelism size.")
-flags.DEFINE_integer("fsdp_size", 1, "FSDP parallelism size.")
-flags.DEFINE_integer("dp_size", 1, "Data parallelism size.")
+flags.DEFINE_float("max_grad_norm", None, "Max gradient norm for clipping (0 = no clipping).")
+flags.DEFINE_integer("grad_accum_steps", None, "Gradient accumulation steps (1 = no accumulation).")
+flags.DEFINE_integer(
+    "gc_period", None, "If >0, disable Python GC and collect every N training steps."
+)
+flags.DEFINE_integer("seed", None, "RNG seed.")
+flags.DEFINE_integer("tp_size", None, "Tensor parallelism size.")
+flags.DEFINE_integer("fsdp_size", None, "FSDP parallelism size.")
+flags.DEFINE_integer("dp_size", None, "Data parallelism size.")
 flags.DEFINE_string("save_dir", None, "Checkpoint save directory.")
-flags.DEFINE_string(
-    "jax_cache_dir", "/tmp/jax_cache", "Directory for JAX persistent compilation cache."
-)
+flags.DEFINE_string("jax_cache_dir", None, "Directory for JAX persistent compilation cache.")
 flags.DEFINE_string(
     "tokamax_cache_dir",
     None,
     "Directory for the persistent tokamax autotuning cache. If unset, autotuning runs "
     "every launch with no persistence.",
 )
-flags.DEFINE_integer("save_every", 50, "Save checkpoint every N steps.")
+flags.DEFINE_integer("save_every", None, "Save checkpoint every N steps.")
 flags.DEFINE_integer(
     "keep_period",
-    0,
+    None,
     "Permanently retain every checkpoint whose step is a multiple of this value "
     "(0 = keep all). Must be a multiple of --save_every to ever fire (the loop only "
     "saves at multiples of --save_every).",
 )
 flags.DEFINE_integer(
     "keep_latest",
-    2,
+    None,
     "Also retain the N most-recent checkpoints regardless of --keep_period.",
 )
-flags.DEFINE_integer("log_every", 10, "Log metrics every N steps.")
-flags.DEFINE_bool("log_memory", True, "Log per-process JAX/HBM memory at init and first few steps.")
+flags.DEFINE_integer("log_every", None, "Log metrics every N steps.")
+flags.DEFINE_bool("log_memory", None, "Log per-process JAX/HBM memory at init and first few steps.")
 flags.DEFINE_enum(
     "resume",
-    ResumeMode.NEVER.value,
+    None,
     [m.value for m in ResumeMode],
-    "Checkpoint resume policy: 'never' (default, fresh start), 'if_present' "
+    "Checkpoint resume policy: 'never' (fresh start), 'if_present' "
     "(resume if a checkpoint exists at --save_dir, else start fresh — right "
     "mode for SLURM time-limit resubmits), 'required' (resume; error if no "
     "checkpoint).",
 )
-flags.DEFINE_integer("pad_id", 0, "Padding token id.")
+flags.DEFINE_integer("pad_id", None, "Padding token id.")
 flags.DEFINE_string("peak_tflops", None, "Peak TFLOPS for MFU calculation.")
 flags.DEFINE_string("wandb_entity", None, "Weights & Biases entity (team/user).")
-flags.DEFINE_string("wandb_project", None, "Weights & Biases project name.")
+flags.DEFINE_string("wandb_project", None, "Weights & Biases project name (opt-in gate for wandb).")
 flags.DEFINE_string("wandb_group", None, "Weights & Biases run group.")
 flags.DEFINE_string("wandb_name", None, "Weights & Biases run name.")
-flags.DEFINE_list("wandb_tags", [], "Comma-separated Weights & Biases tags.")
+flags.DEFINE_list("wandb_tags", None, "Comma-separated Weights & Biases tags.")
 flags.DEFINE_string("val_data_path", None, "Path to compiled Grain validation chunk-index dataset.")
 flags.DEFINE_integer("val_every", None, "Run validation every N training steps.")
-flags.DEFINE_integer("val_steps", 10, "Number of batches per validation run.")
-flags.DEFINE_integer("grain_read_threads", 16, "Grain read threads.")
-flags.DEFINE_integer("grain_read_buffer_size", 4, "Grain read buffer size (in batches).")
-flags.DEFINE_integer("grain_workers", 8, "Grain multiprocessing workers.")
-flags.DEFINE_integer("grain_worker_buffer_size", 4, "Grain worker buffer size.")
+flags.DEFINE_integer("val_steps", None, "Number of batches per validation run.")
+flags.DEFINE_integer("grain_read_threads", None, "Grain read threads.")
+flags.DEFINE_integer("grain_read_buffer_size", None, "Grain read buffer size (in batches).")
+flags.DEFINE_integer("grain_workers", None, "Grain multiprocessing workers.")
+flags.DEFINE_integer("grain_worker_buffer_size", None, "Grain worker buffer size.")
 flags.DEFINE_integer(
     "max_vision_patches_per_sample",
-    0,
+    None,
     "Max vision patches per sample for JIT stability (0 = no padding). "
     "Multiplied by batch_size automatically.",
 )
 flags.DEFINE_integer(
     "max_vision_images_per_sample",
-    0,
+    None,
     "Max images per sample for JIT stability (0 = no padding). "
     "Multiplied by batch_size automatically.",
 )
 flags.DEFINE_boolean(
     "enable_lora",
-    False,
+    None,
     "Enable LoRA adapters on the text decoder's q/k/v/o + "
     "gate/up/down projections. Vision tower, embedder, "
     "lm_head and layernorms remain fully frozen.",
 )
-flags.DEFINE_integer("lora_rank", 32, "LoRA rank (only used if --enable_lora).")
-flags.DEFINE_float("lora_alpha", 32.0, "LoRA alpha scaling. Effective LR multiplier is alpha/rank.")
+flags.DEFINE_integer("lora_rank", None, "LoRA rank (required if --enable_lora).")
+flags.DEFINE_float(
+    "lora_alpha",
+    None,
+    "LoRA alpha scaling (required if --enable_lora). Effective LR multiplier is alpha/rank.",
+)
 flags.DEFINE_boolean(
     "freeze_vision_tower",
-    False,
+    None,
     "Full FT on text decoder + embedder + lm_head + "
     "layernorms while freezing the vision tower at the "
     "gradient/opt-state layer. Mutually exclusive with "
@@ -151,7 +159,7 @@ flags.DEFINE_boolean(
 )
 flags.DEFINE_integer(
     "num_loss_tiles",
-    4,
+    None,
     "Number of tiles for chunked cross-entropy along the "
     "sequence axis. Must evenly divide (max_length - 1).",
 )
@@ -164,13 +172,98 @@ _ATTN_BACKENDS = [
     "triton",
 ]
 flags.DEFINE_enum(
-    "text_attn_backend", "mosaic_gpu", _ATTN_BACKENDS, "Attention backend for the text decoder."
+    "text_attn_backend", None, _ATTN_BACKENDS, "Attention backend for the text decoder."
 )
 
+_REQUIRED = [
+    "model_id",
+    "max_length",
+    "num_steps",
+    "batch_size",
+    "learning_rate",
+    "weight_decay",
+    "warmup_steps",
+    "lr_schedule",
+    "max_grad_norm",
+    "grad_accum_steps",
+    "gc_period",
+    "seed",
+    "tp_size",
+    "fsdp_size",
+    "dp_size",
+    "save_dir",
+    "jax_cache_dir",
+    "save_every",
+    "keep_period",
+    "keep_latest",
+    "log_every",
+    "log_memory",
+    "resume",
+    "pad_id",
+    "peak_tflops",
+    "grain_read_threads",
+    "grain_read_buffer_size",
+    "grain_workers",
+    "grain_worker_buffer_size",
+    "max_vision_patches_per_sample",
+    "max_vision_images_per_sample",
+    "num_loss_tiles",
+    "text_attn_backend",
+    "enable_lora",
+    "freeze_vision_tower",
+]
 
-def _default_save_dir(model_id: str) -> Path:
-    safe_name = model_id.replace("/", "_")
-    return Path("runs") / "vlm_sft" / safe_name
+
+def _validate_flags() -> None:
+    """Fail loudly at startup if any required flag is unset, listing every problem at once.
+
+    The recipe TOML is the single source of truth, so a forgotten key must error rather than
+    silently fall back to a default. Hard-required flags (`_REQUIRED`) must always be present;
+    feature-gated flags are required only when their feature is enabled.
+    """
+    problems: list[str] = []
+
+    for name in _REQUIRED:
+        if FLAGS[name].value is None:
+            problems.append(name)
+
+    # Exactly one data source.
+    if (FLAGS.data_path is None) == (FLAGS.data_mix is None):
+        problems.append("exactly one of {data_path, data_mix} (got neither or both)")
+
+    # enable_lora / freeze_vision_tower are mutually exclusive (both freeze the vision tower).
+    if FLAGS.enable_lora and FLAGS.freeze_vision_tower:
+        problems.append("enable_lora and freeze_vision_tower are mutually exclusive")
+
+    # LoRA hyperparameters required only when LoRA is on.
+    if FLAGS.enable_lora:
+        for name in ("lora_rank", "lora_alpha"):
+            if FLAGS[name].value is None:
+                problems.append(f"{name} (required when enable_lora=true)")
+
+    # Validation cadence required only when a validation set is configured.
+    if FLAGS.val_data_path:
+        for name in ("val_every", "val_steps"):
+            if FLAGS[name].value is None:
+                problems.append(f"{name} (required when val_data_path is set)")
+
+    # LR-schedule shape parameters required only for the schedules that use them.
+    if FLAGS.lr_schedule in ("cosine", "wsd") and FLAGS.lr_end_factor is None:
+        problems.append(f"lr_end_factor (required when lr_schedule={FLAGS.lr_schedule})")
+    if FLAGS.lr_schedule == "wsd" and FLAGS.lr_stable_fraction is None:
+        problems.append("lr_stable_fraction (required when lr_schedule=wsd)")
+
+    # Weights & Biases is opt-in via wandb_project; if on, identifying fields are required.
+    if FLAGS.wandb_project:
+        for name in ("wandb_entity", "wandb_group", "wandb_name"):
+            if FLAGS[name].value is None:
+                problems.append(f"{name} (required when wandb_project is set)")
+
+    if problems:
+        raise ValueError(
+            "Missing or invalid required flags (the recipe TOML must set these):\n  "
+            + "\n  ".join(problems)
+        )
 
 
 def _parse_data_mix(spec: str) -> list[MixSource]:
@@ -236,6 +329,7 @@ def _grain_iter(
 
 
 def main(_) -> None:
+    _validate_flags()
     jax.config.update("jax_compilation_cache_dir", FLAGS.jax_cache_dir)
     jax.distributed.initialize()
     startup_log(f"jax_compilation_cache_dir={FLAGS.jax_cache_dir}")
@@ -344,15 +438,7 @@ def main(_) -> None:
         num_loss_tiles=FLAGS.num_loss_tiles,
     )
     resume_mode = ResumeMode(FLAGS.resume)
-    save_dir = (
-        Path(FLAGS.save_dir)
-        if FLAGS.save_dir
-        else (
-            _default_save_dir(FLAGS.model_id)
-            if FLAGS.save_every > 0 or resume_mode is not ResumeMode.NEVER
-            else None
-        )
-    )
+    save_dir = Path(FLAGS.save_dir)
     peak_tflops = resolve_peak_tflops(FLAGS.peak_tflops)
 
     wandb_run = None
