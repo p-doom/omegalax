@@ -5,16 +5,15 @@ from __future__ import annotations
 import gc
 from typing import Any
 
-import jax
 import safetensors
 from etils import epath
 from flax import nnx
 
 import dataclasses
 
-from omegalax.distributed.mesh import axis_rules_for_mesh, ensure_mesh
+from omegalax.distributed.mesh import ensure_mesh, mesh_rules
 from omegalax.models.shard_config import shard_config_for_mesh
-from omegalax.models.sharding_runtime import init_model_sharded
+from omegalax.models.sharding_runtime import _finalize_q_shardings
 from omegalax.models.params_utils import (
     Transform,
     assign_weights_from_eval_shape,
@@ -168,9 +167,18 @@ def create_qwen3_vl_from_safetensors(
     _assert_vl_config(cfg, hf_cfg)
     cfg = dataclasses.replace(cfg, shd_cfg=shard_config_for_mesh(cfg.shd_cfg, mesh))
 
-    model = init_model_sharded(Qwen3VL, cfg, jax.random.PRNGKey(0), mesh, axis_rules_for_mesh(mesh))
-    graph_def, state = nnx.split(model)
-    state_dict = nnx.to_pure_dict(state)
+    # Build an *abstract* model (shapes/dtypes/shardings only, zero device bytes)
+    # instead of materializing random weights we'd immediately overwrite. The throwaway
+    # init was a full second copy of the params held live alongside the loaded weights,
+    # doubling peak HBM during load (~70 GB for the 8B). `get_partition_spec` resolves
+    # the logical axis annotations to concrete PartitionSpecs so each loaded tensor is
+    # placed directly onto its FSDP/TP shard (eval_shape only attaches an AbstractMesh
+    # sharding, which device_put cannot consume).
+    with mesh_rules(mesh):
+        model = nnx.eval_shape(lambda: Qwen3VL(cfg, rngs=nnx.Rngs(params=0)))
+        graph_def, abs_state = nnx.split(model)
+        pspec_dict = nnx.to_pure_dict(nnx.get_partition_spec(abs_state))
+    state_dict = nnx.to_pure_dict(abs_state)
 
     non_expert_mapping = _get_non_expert_mapping()
     unmatched_hf_keys: list[str] = []
@@ -212,7 +220,9 @@ def create_qwen3_vl_from_safetensors(
                 keys = [stoi(k) for k in jax_key.split(".")]
                 if transform == Transform.CONV3D:
                     tensor = tensor.reshape(tensor.shape[0], -1).T
-                    assign_weights_from_eval_shape(keys, tensor, state_dict, torch_key, None)
+                    assign_weights_from_eval_shape(
+                        keys, tensor, state_dict, torch_key, None, mesh=mesh, pspec_dict=pspec_dict
+                    )
                 else:
                     transform_value = (
                         transform.value
@@ -220,7 +230,13 @@ def create_qwen3_vl_from_safetensors(
                         else None
                     )
                     assign_weights_from_eval_shape(
-                        keys, tensor, state_dict, torch_key, transform_value
+                        keys,
+                        tensor,
+                        state_dict,
+                        torch_key,
+                        transform_value,
+                        mesh=mesh,
+                        pspec_dict=pspec_dict,
                     )
         gc.collect()
 
@@ -232,13 +248,13 @@ def create_qwen3_vl_from_safetensors(
             state_dict,
             num_experts=cfg.num_experts,
             jax_layer_prefix="text.layers",
+            mesh=mesh,
+            pspec_dict=pspec_dict,
         )
 
     check_conversion_errors(unmatched_hf_keys)
 
     gc.collect()
     model = nnx.merge(graph_def, state_dict)
-    from omegalax.models.sharding_runtime import _finalize_q_shardings
-
     _finalize_q_shardings(model, mesh)
     return model, cfg
