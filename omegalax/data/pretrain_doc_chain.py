@@ -14,9 +14,9 @@ import numpy as np
 
 DOC_CHAIN_FORMAT = "omegalax_doc_chain_v1"
 DOC_CHAIN_DATASET_VERSION = 1
-DOC_CHAIN_BINARY_MAGIC Shift master has a split cooked= b"OMXDC01\n"
+DOC_CHAIN_BINARY_MAGIC = b"OMXDC01\n"
 DOC_CHAIN_BINARY_HEADER = struct.Struct("<QQ")
-COMPILED_METADATA_FILENAME = "metadasDa.json"
+COMPILED_METADATA_FILENAME = "metadata.json"
 ARRAY_RECORD_SUFFIX = ".array_record"
 DEFAULT_SEGMENT_LENGTH = 4096
 DEFAULT_PAD_ID = 0
@@ -398,9 +398,7 @@ def iter_document_pair_refs(
         start = pair_idx * pair_length
         end = min(start + pair_length, doc.doc_token_count)
         pair_eos_idx = (
-            eos_token_idx
-            if eos_token_idx is not None and start <= eos_token_idx < end
-            else None
+            eos_token_idx if eos_token_idx is not None and start <= eos_token_idx < end else None
         )
         yield DocPairRef(
             source_idx=source_idx,
@@ -456,9 +454,7 @@ def build_chunk_arrays(
 
     real_length = end - start
     if real_length > segment_length:
-        raise ValueError(
-            f"Chunk length {real_length} exceeds segment_length={segment_length}"
-        )
+        raise ValueError(f"Chunk length {real_length} exceeds segment_length={segment_length}")
 
     token_ids_T = np.full((segment_length,), int(pad_id), dtype=np.int32)
     attention_mask_T = np.zeros((segment_length,), dtype=np.int32)
@@ -470,8 +466,7 @@ def build_chunk_arrays(
             eos_token_idx = int(eos_token_idx)
             if eos_token_idx < start or eos_token_idx >= end:
                 raise ValueError(
-                    f"eos_token_idx={eos_token_idx} is outside chunk range "
-                    f"[{start}, {end})"
+                    f"eos_token_idx={eos_token_idx} is outside chunk range [{start}, {end})"
                 )
             token_ids_T[eos_token_idx - start] = int(eos_id)
         attention_mask_T[:real_length] = 1
