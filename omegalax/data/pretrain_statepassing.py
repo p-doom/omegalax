@@ -1,14 +1,16 @@
-"""Pair-sampled pretraining iterator for state passing."""
+"""Pair-sampled pretraining iterators for state passing."""
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import Any
 
+import grain
 import numpy as np
 
 from omegalax.data.pretrain_doc_chain import (
+    DEFAULT_DOC_CHAIN_SPLIT,
     DEFAULT_PAD_ID,
     DEFAULT_SEGMENT_LENGTH,
     BATCH_PRETRAIN_METADATA_KEY,
@@ -16,11 +18,17 @@ from omegalax.data.pretrain_doc_chain import (
     DocPairRef,
     build_pair_arrays,
     iter_document_pair_refs,
+    load_arrayrecord_metadata,
+    make_pretrain_index_record_dataset,
     pair_ref_to_record,
+    resolve_arrayrecord_paths,
     resolve_pretrain_dp,
+    rewrite_doc_chain_source_paths,
+    write_json_arrayrecord_dataset,
 )
 
-DocumentKey = tuple[int, int]
+STATEPASSING_PAIR_INDEX_FORMAT = "omegalax_pretrain_statepassing_pair_index_v1"
+STATEPASSING_INDEX_SHUFFLE_ROUNDS = 4
 
 
 def _pair_ref_from_record(record: dict[str, Any]) -> DocPairRef:
@@ -38,222 +46,194 @@ def _pair_ref_from_record(record: dict[str, Any]) -> DocPairRef:
     )
 
 
-class StatepassingPretrainIterator:
+def build_statepassing_pair_index(
+    sources: str | Path | Sequence[str | Path],
+    out_dir: str | Path,
+    *,
+    segment_length: int = DEFAULT_SEGMENT_LENGTH,
+    eos_id: int | None = None,
+    split: str = DEFAULT_DOC_CHAIN_SPLIT,
+    records_per_shard: int = 100_000,
+    overwrite: bool = False,
+) -> Path:
+    if segment_length <= 0:
+        raise ValueError("segment_length must be > 0")
+
+    reader = DocChainReader(sources, split=split)
+    dynamic_metadata: dict[str, Any] = {
+        "format": STATEPASSING_PAIR_INDEX_FORMAT,
+        "source_paths": [str(path) for path in reader.source_paths],
+        "segment_length": int(segment_length),
+        "eos_id": eos_id,
+        "num_pairs": 0,
+        "num_source_records": 0,
+        "source_record_counts": [],
+    }
+
+    def _iter_index_records() -> Iterator[dict[str, Any]]:
+        source_record_counts = [0 for _ in reader.source_paths]
+        num_pairs = 0
+        for source_idx, record_idx, doc in reader.iter_records():
+            source_record_counts[source_idx] += 1
+            for pair in iter_document_pair_refs(
+                doc,
+                segment_length=segment_length,
+                source_idx=source_idx,
+                record_idx=record_idx,
+                eos_id=eos_id,
+            ):
+                num_pairs += 1
+                yield pair_ref_to_record(pair)
+        dynamic_metadata["num_pairs"] = num_pairs
+        dynamic_metadata["num_source_records"] = sum(source_record_counts)
+        dynamic_metadata["source_record_counts"] = source_record_counts
+
+    return write_json_arrayrecord_dataset(
+        _iter_index_records(),
+        out_dir,
+        records_per_shard=records_per_shard,
+        overwrite=overwrite,
+        metadata=dynamic_metadata,
+    )
+
+
+def _load_pair_index_metadata(
+    index_path: str | Path,
+    segment_length: int | None,
+) -> dict[str, Any]:
+    metadata = load_arrayrecord_metadata(index_path)
+    fmt = metadata.get("format")
+    if fmt != STATEPASSING_PAIR_INDEX_FORMAT:
+        raise ValueError(f"Expected {STATEPASSING_PAIR_INDEX_FORMAT} dataset, got format={fmt}")
+    index_segment_length = int(metadata["segment_length"])
+    if segment_length is not None and int(segment_length) != index_segment_length:
+        raise ValueError(
+            f"segment_length mismatch: index has {index_segment_length}, "
+            f"loader got {segment_length}"
+        )
+    return metadata
+
+
+def _is_statepassing_pair_index(path: str | Path) -> bool:
+    path = Path(path).expanduser().resolve()
+    if not path.is_dir():
+        return False
+    try:
+        return load_arrayrecord_metadata(path).get("format") == STATEPASSING_PAIR_INDEX_FORMAT
+    except ValueError:
+        return False
+
+
+def _single_statepassing_pair_index_path(
+    sources: str | Path | Sequence[str | Path],
+) -> Path | None:
+    if isinstance(sources, (str, Path)):
+        path = Path(sources).expanduser().resolve()
+        return path if _is_statepassing_pair_index(path) else None
+    if isinstance(sources, Sequence) and len(sources) == 1:
+        path = Path(sources[0]).expanduser().resolve()
+        return path if _is_statepassing_pair_index(path) else None
+    return None
+
+
+def _make_batch(
+    pairs: Sequence[DocPairRef],
+    *,
+    reader: DocChainReader,
+    segment_length: int,
+    pad_id: int,
+    eos_id: int | None,
+) -> dict[str, Any]:
+    token_ids = []
+    attention_masks = []
+    loss_masks = []
+    chunk_indices = []
+    reset_states = []
+    last_chunk_flags = []
+    doc_ids = []
+    source_indices = []
+    record_indices = []
+    pair_indices = []
+    doc_cache = {}
+
+    for pair in pairs:
+        doc_key = (pair.source_idx, pair.record_idx)
+        doc = doc_cache.get(doc_key)
+        if doc is None:
+            doc = reader.read(pair.source_idx, pair.record_idx)
+            doc_cache[doc_key] = doc
+        if doc.doc_id != pair.doc_id or doc.doc_token_count != pair.doc_token_count:
+            raise ValueError(
+                "Statepassing pair index does not match source record "
+                f"source_idx={pair.source_idx}, record_idx={pair.record_idx}"
+            )
+        arrays = build_pair_arrays(
+            doc.token_ids,
+            pair,
+            segment_length=segment_length,
+            pad_id=pad_id,
+            eos_id=eos_id,
+        )
+        token_ids.append(arrays["token_ids_ST"])
+        attention_masks.append(arrays["attention_mask_ST"])
+        loss_masks.append(arrays["loss_mask_ST"])
+        chunk_indices.append(arrays["chunk_idx_S"])
+        reset_states.append(arrays["reset_state_S"])
+        last_chunk_flags.append(arrays["is_last_chunk_S"])
+        doc_ids.append(pair.doc_id)
+        source_indices.append(pair.source_idx)
+        record_indices.append(pair.record_idx)
+        pair_indices.append(pair.pair_idx)
+
+    return {
+        "token_ids_BST": np.stack(token_ids).astype(np.int32, copy=False),
+        "attention_mask_BST": np.stack(attention_masks).astype(np.int32, copy=False),
+        "loss_mask_BST": np.stack(loss_masks).astype(np.int32, copy=False),
+        "chunk_idx_BS": np.stack(chunk_indices).astype(np.int32, copy=False),
+        "reset_state_BS": np.stack(reset_states).astype(np.bool_, copy=False),
+        "is_last_chunk_BS": np.stack(last_chunk_flags).astype(np.bool_, copy=False),
+        BATCH_PRETRAIN_METADATA_KEY: {
+            "doc_ids": doc_ids,
+            "source_idx_B": np.asarray(source_indices, dtype=np.int32),
+            "record_idx_B": np.asarray(record_indices, dtype=np.int32),
+            "pair_idx_B": np.asarray(pair_indices, dtype=np.int32),
+        },
+    }
+
+
+class _StatepassingPretrainBatchBuilder:
     def __init__(
         self,
-        sources: str | Path | Sequence[str | Path],
         *,
-        batch_size: int,
-        segment_length: int = DEFAULT_SEGMENT_LENGTH,
-        pad_id: int = DEFAULT_PAD_ID,
+        source_paths: Sequence[str | Path],
+        segment_length: int,
+        pad_id: int,
         eos_id: int | None = None,
-        shuffle: bool = True,
-        seed: int = 0,
-        num_epochs: int | None = None,
-        dp_size: int = 1,
-        fsdp_size: int = 1,
-        dp_index: int | None = None,
-        process_index: int | None = None,
     ) -> None:
-        if batch_size <= 0:
-            raise ValueError("batch_size must be > 0")
-        if batch_size % 2:
-            raise ValueError("batch_size must be even for 2-segment statepassing samples")
-        if segment_length <= 0:
-            raise ValueError("segment_length must be > 0")
-
-        effective_dp_size, resolved_dp_index = resolve_pretrain_dp(
-            dp_size=dp_size,
-            fsdp_size=fsdp_size,
-            process_index=process_index,
-        )
-        if dp_index is not None:
-            resolved_dp_index = int(dp_index)
-        if resolved_dp_index < 0 or resolved_dp_index >= effective_dp_size:
-            raise ValueError(
-                f"dp_index must be in [0, {effective_dp_size}), got {resolved_dp_index}"
-            )
-
-        self.reader = DocChainReader(sources)
-        self.batch_size = int(batch_size)
-        self.pair_batch_size = self.batch_size // 2
+        self.source_paths = [str(path) for path in source_paths]
         self.segment_length = int(segment_length)
         self.pad_id = int(pad_id)
         self.eos_id = eos_id
-        self.shuffle = bool(shuffle)
-        self.seed = int(seed)
-        self.num_epochs = num_epochs
-        self.dp_size = int(effective_dp_size)
-        self.dp_index = int(resolved_dp_index)
+        self.reader: DocChainReader | None = None
 
-        self._pairs_by_record: dict[DocumentKey, list[DocPairRef]] = {}
-        for source_idx, record_idx, doc in self.reader.iter_records():
-            for pair in iter_document_pair_refs(
-                doc,
-                segment_length=self.segment_length,
-                source_idx=source_idx,
-                record_idx=record_idx,
-                eos_id=self.eos_id,
-            ):
-                key = (source_idx, record_idx)
-                self._pairs_by_record.setdefault(key, []).append(pair)
-
-        self._record_keys = list(self._pairs_by_record)
-        if not self._record_keys:
-            raise ValueError("Statepassing iterator requires at least one retained pair")
-
-        self._epoch = 0
-        self._order: list[DocPairRef] = []
-        self._order_pos = 0
-        self._reset_epoch_order()
-
-    def __iter__(self) -> "StatepassingPretrainIterator":
-        return self
-
-    def _reset_epoch_order(self) -> None:
-        record_keys = list(self._record_keys)
-        rng = np.random.default_rng(self.seed + self._epoch)
-        if self.shuffle:
-            rng.shuffle(record_keys)
-
-        assigned_pairs = [
-            pair
-            for key in record_keys[self.dp_index :: self.dp_size]
-            for pair in self._pairs_by_record[key]
-        ]
-        if self.shuffle:
-            rng.shuffle(assigned_pairs)
-        if not assigned_pairs:
-            raise ValueError(
-                f"No statepassing pairs assigned to dp_index={self.dp_index} "
-                f"with dp_size={self.dp_size}"
-            )
-
-        self._order = assigned_pairs
-        self._order_pos = 0
-
-    def _advance_epoch(self) -> bool:
-        if self.num_epochs is not None and self._epoch + 1 >= self.num_epochs:
-            return False
-        self._epoch += 1
-        self._reset_epoch_order()
-        return True
-
-    def _next_pair(self) -> DocPairRef:
-        if self._order_pos >= len(self._order) and not self._advance_epoch():
-            raise StopIteration
-        pair = self._order[self._order_pos]
-        self._order_pos += 1
-        return pair
-
-    def __next__(self) -> dict[str, Any]:
-        batch_pairs: list[DocPairRef] = []
-        while len(batch_pairs) < self.pair_batch_size:
-            batch_pairs.append(self._next_pair())
-
-        token_ids = []
-        attention_masks = []
-        loss_masks = []
-        chunk_indices = []
-        reset_states = []
-        last_chunk_flags = []
-        doc_ids = []
-        source_indices = []
-        record_indices = []
-        pair_indices = []
-        doc_cache = {}
-
-        for pair in batch_pairs:
-            doc_key = (pair.source_idx, pair.record_idx)
-            doc = doc_cache.get(doc_key)
-            if doc is None:
-                doc = self.reader.read(pair.source_idx, pair.record_idx)
-                doc_cache[doc_key] = doc
-            arrays = build_pair_arrays(
-                doc.token_ids,
-                pair,
-                segment_length=self.segment_length,
-                pad_id=self.pad_id,
-                eos_id=self.eos_id,
-            )
-            token_ids.append(arrays["token_ids_ST"])
-            attention_masks.append(arrays["attention_mask_ST"])
-            loss_masks.append(arrays["loss_mask_ST"])
-            chunk_indices.append(arrays["chunk_idx_S"])
-            reset_states.append(arrays["reset_state_S"])
-            last_chunk_flags.append(arrays["is_last_chunk_S"])
-            doc_ids.append(pair.doc_id)
-            source_indices.append(pair.source_idx)
-            record_indices.append(pair.record_idx)
-            pair_indices.append(pair.pair_idx)
-
-        return {
-            "token_ids_BST": np.stack(token_ids).astype(np.int32),
-            "attention_mask_BST": np.stack(attention_masks).astype(np.int32),
-            "loss_mask_BST": np.stack(loss_masks).astype(np.int32),
-            "chunk_idx_BS": np.stack(chunk_indices).astype(np.int32),
-            "reset_state_BS": np.stack(reset_states).astype(np.bool_),
-            "is_last_chunk_BS": np.stack(last_chunk_flags).astype(np.bool_),
-            BATCH_PRETRAIN_METADATA_KEY: {
-                "doc_ids": doc_ids,
-                "source_idx_B": np.asarray(source_indices, dtype=np.int32),
-                "record_idx_B": np.asarray(record_indices, dtype=np.int32),
-                "pair_idx_B": np.asarray(pair_indices, dtype=np.int32),
-            },
-        }
-
-    def state_dict(self) -> dict[str, Any]:
-        return {
-            "version": 2,
-            "source_paths": [str(path) for path in self.reader.source_paths],
-            "batch_size": self.batch_size,
-            "segment_length": self.segment_length,
-            "pad_id": self.pad_id,
-            "eos_id": self.eos_id,
-            "shuffle": self.shuffle,
-            "seed": self.seed,
-            "num_epochs": self.num_epochs,
-            "dp_size": self.dp_size,
-            "dp_index": self.dp_index,
-            "epoch": self._epoch,
-            "order": [pair_ref_to_record(pair) for pair in self._order],
-            "order_pos": self._order_pos,
-        }
-
-    def load_state_dict(self, state: dict[str, Any]) -> None:
-        if int(state.get("version", 0)) != 2:
-            raise ValueError(
-                f"Unsupported statepassing iterator state version: {state.get('version')}"
-            )
-        expected = {
-            "source_paths": [str(path) for path in self.reader.source_paths],
-            "batch_size": self.batch_size,
-            "segment_length": self.segment_length,
-            "pad_id": self.pad_id,
-            "eos_id": self.eos_id,
-            "shuffle": self.shuffle,
-            "seed": self.seed,
-            "num_epochs": self.num_epochs,
-            "dp_size": self.dp_size,
-            "dp_index": self.dp_index,
-        }
-        for key, value in expected.items():
-            if state.get(key) != value:
-                raise ValueError(
-                    f"Statepassing iterator state mismatch for {key}: "
-                    f"state={state.get(key)!r}, iterator={value!r}"
-                )
-
-        self._epoch = int(state["epoch"])
-        self._order = [_pair_ref_from_record(pair_state) for pair_state in state["order"]]
-        self._order_pos = int(state["order_pos"])
+    def __call__(self, records: Sequence[dict[str, Any]]) -> dict[str, Any]:
+        if self.reader is None:
+            self.reader = DocChainReader(self.source_paths)
+        pairs = [_pair_ref_from_record(record) for record in records]
+        return _make_batch(
+            pairs,
+            reader=self.reader,
+            segment_length=self.segment_length,
+            pad_id=self.pad_id,
+            eos_id=self.eos_id,
+        )
 
 
 def make_statepassing_iterator(
     sources: str | Path | Sequence[str | Path],
     *,
     batch_size: int,
-    segment_length: int = DEFAULT_SEGMENT_LENGTH,
+    segment_length: int | None = DEFAULT_SEGMENT_LENGTH,
     pad_id: int = DEFAULT_PAD_ID,
     eos_id: int | None = None,
     shuffle: bool = True,
@@ -263,21 +243,86 @@ def make_statepassing_iterator(
     fsdp_size: int = 1,
     dp_index: int | None = None,
     process_index: int | None = None,
-) -> StatepassingPretrainIterator:
-    return StatepassingPretrainIterator(
-        sources,
-        batch_size=batch_size,
-        segment_length=segment_length,
-        pad_id=pad_id,
-        eos_id=eos_id,
-        shuffle=shuffle,
-        seed=seed,
-        num_epochs=num_epochs,
+    grain_workers: int = 8,
+    grain_worker_buffer_size: int = 1,
+    grain_read_threads: int = 16,
+    grain_read_prefetch_buffer_size: int = 4,
+) -> Iterator[dict[str, Any]]:
+    if batch_size <= 0:
+        raise ValueError("batch_size must be > 0")
+    if batch_size % 2:
+        raise ValueError("batch_size must be even for 2-segment statepassing samples")
+    if grain_workers < 0:
+        raise ValueError("grain_workers must be >= 0")
+    if grain_worker_buffer_size <= 0:
+        raise ValueError("grain_worker_buffer_size must be > 0")
+    if grain_read_threads <= 0:
+        raise ValueError("grain_read_threads must be > 0")
+    if grain_read_prefetch_buffer_size <= 0:
+        raise ValueError("grain_read_prefetch_buffer_size must be > 0")
+
+    index_path = _single_statepassing_pair_index_path(sources)
+    if index_path is None:
+        raise ValueError(
+            "Statepassing pretraining requires a statepassing pair index; "
+            "call build_statepassing_pair_index first."
+        )
+
+    effective_dp_size, resolved_dp_index = resolve_pretrain_dp(
         dp_size=dp_size,
         fsdp_size=fsdp_size,
-        dp_index=dp_index,
         process_index=process_index,
     )
+    if dp_index is not None:
+        resolved_dp_index = int(dp_index)
+    if resolved_dp_index < 0 or resolved_dp_index >= effective_dp_size:
+        raise ValueError(f"dp_index must be in [0, {effective_dp_size}), got {resolved_dp_index}")
 
+    metadata = _load_pair_index_metadata(index_path, segment_length)
+    index_segment_length = int(metadata["segment_length"])
+    index_eos_id = metadata.get("eos_id")
+    if eos_id != index_eos_id:
+        raise ValueError(f"eos_id mismatch: index has {index_eos_id}, loader got {eos_id}")
 
-make_statepassing_pretrain_iterator = make_statepassing_iterator
+    source_paths = rewrite_doc_chain_source_paths(metadata["source_paths"])
+    index_shard_paths = resolve_arrayrecord_paths(index_path)
+    index_source = grain.sources.ArrayRecordDataSource([str(path) for path in index_shard_paths])
+    num_records = len(index_source)
+    if num_records == 0:
+        raise ValueError(f"Statepassing pair index has no records: {index_path}")
+
+    dataset, _ = make_pretrain_index_record_dataset(
+        index_shard_paths=index_shard_paths,
+        num_records=num_records,
+        num_epochs=num_epochs,
+        dp_size=effective_dp_size,
+        dp_index=resolved_dp_index,
+        records_per_local_batch=batch_size // 2,
+        shuffle=shuffle,
+        seed=seed,
+        shuffle_rounds=STATEPASSING_INDEX_SHUFFLE_ROUNDS,
+    )
+    batched = dataset.batch(
+        batch_size=batch_size // 2,
+        drop_remainder=True,
+        batch_fn=_StatepassingPretrainBatchBuilder(
+            source_paths=source_paths,
+            segment_length=index_segment_length,
+            pad_id=pad_id,
+            eos_id=eos_id,
+        ),
+    )
+    iter_dataset = batched.to_iter_dataset(
+        grain.ReadOptions(
+            num_threads=grain_read_threads,
+            prefetch_buffer_size=grain_read_prefetch_buffer_size,
+        )
+    )
+    if grain_workers > 0:
+        iter_dataset = iter_dataset.mp_prefetch(
+            grain.MultiprocessingOptions(
+                num_workers=grain_workers,
+                per_worker_buffer_size=grain_worker_buffer_size,
+            )
+        )
+    return iter(iter_dataset)
