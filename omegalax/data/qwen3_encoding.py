@@ -2,11 +2,52 @@
 
 from __future__ import annotations
 
+import atexit
+import io
+import os
+from collections import OrderedDict
+from pathlib import Path
 from typing import Any
+from urllib.parse import unquote, urlparse
 
 import numpy as np
 from PIL import Image
 from transformers import BaseImageProcessor, PreTrainedTokenizer
+
+_ARRAYRECORD_IMAGE_URI_SCHEME = "ar"
+_ARRAYRECORD_IMAGE_CACHE_SIZE = int(os.environ.get("OMEGALAX_ARRAYRECORD_IMAGE_CACHE_SIZE", "128"))
+_ARRAYRECORD_IMAGE_SOURCES: OrderedDict[str, Any] = OrderedDict()
+
+
+def _close_arrayrecord_reader(reader: Any) -> None:
+    close = getattr(reader, "close", None)
+    if close is not None:
+        close()
+
+
+def _close_arrayrecord_image_sources() -> None:
+    while _ARRAYRECORD_IMAGE_SOURCES:
+        _, reader = _ARRAYRECORD_IMAGE_SOURCES.popitem(last=False)
+        _close_arrayrecord_reader(reader)
+
+
+def _get_arrayrecord_image_reader(path: str) -> Any:
+    reader = _ARRAYRECORD_IMAGE_SOURCES.get(path)
+    if reader is not None:
+        _ARRAYRECORD_IMAGE_SOURCES.move_to_end(path)
+        return reader
+
+    from array_record.python.array_record_module import ArrayRecordReader  # noqa: PLC0415
+
+    reader = ArrayRecordReader(path)
+    if _ARRAYRECORD_IMAGE_CACHE_SIZE <= 0:
+        return reader
+
+    while len(_ARRAYRECORD_IMAGE_SOURCES) >= _ARRAYRECORD_IMAGE_CACHE_SIZE:
+        _, old_reader = _ARRAYRECORD_IMAGE_SOURCES.popitem(last=False)
+        _close_arrayrecord_reader(old_reader)
+    _ARRAYRECORD_IMAGE_SOURCES[path] = reader
+    return reader
 
 
 def build_chatml_text(
@@ -42,6 +83,53 @@ def build_chatml_text(
     return "".join(parts)
 
 
+def _is_arrayrecord_image_uri(value: object) -> bool:
+    return isinstance(value, str) and value.startswith(f"{_ARRAYRECORD_IMAGE_URI_SCHEME}://")
+
+
+def _parse_arrayrecord_image_uri(uri: str) -> tuple[Path, int]:
+    parsed = urlparse(uri)
+    if parsed.scheme != _ARRAYRECORD_IMAGE_URI_SCHEME:
+        raise ValueError(f"not an ArrayRecord image URI: {uri!r}")
+    if parsed.netloc:
+        raise ValueError(
+            f"unsupported named ArrayRecord image URI {uri!r}; expected ar:///path#record"
+        )
+    if not parsed.path or not parsed.fragment:
+        raise ValueError(f"malformed ArrayRecord image URI: {uri!r}")
+    try:
+        record_index = int(parsed.fragment)
+    except ValueError as e:
+        raise ValueError(f"ArrayRecord URI fragment must be an integer: {uri!r}") from e
+    if record_index < 0:
+        raise ValueError(f"ArrayRecord URI record index must be non-negative: {uri!r}")
+    return Path(unquote(parsed.path)), record_index
+
+
+def _open_arrayrecord_image(uri: str) -> Image.Image:
+    shard_path, record_index = _parse_arrayrecord_image_uri(uri)
+    key = str(shard_path)
+    reader = _get_arrayrecord_image_reader(key)
+    try:
+        jpeg_bytes = reader.read([record_index])[0]
+        with Image.open(io.BytesIO(jpeg_bytes)) as img:
+            return img.convert("RGB")
+    finally:
+        if _ARRAYRECORD_IMAGE_CACHE_SIZE <= 0:
+            _close_arrayrecord_reader(reader)
+
+
+atexit.register(_close_arrayrecord_image_sources)
+
+
+def _open_image_ref(ref: Any) -> Image.Image:
+    if isinstance(ref, Image.Image):
+        return ref
+    if _is_arrayrecord_image_uri(ref):
+        return _open_arrayrecord_image(ref)
+    return Image.open(ref)
+
+
 def extract_images(messages: list[dict[str, Any]]) -> list[Image.Image]:
     """Pull PIL images out of Qwen structured-content blocks."""
 
@@ -54,10 +142,9 @@ def extract_images(messages: list[dict[str, Any]]) -> list[Image.Image]:
             if block["type"] != "image":
                 continue
             if "image" in block:
-                img = block["image"]
-                images.append(img if isinstance(img, Image.Image) else Image.open(img))
+                images.append(_open_image_ref(block["image"]))
             elif "url" in block:
-                images.append(Image.open(block["url"]))
+                images.append(_open_image_ref(block["url"]))
     return images
 
 
