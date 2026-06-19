@@ -19,7 +19,7 @@ from omegalax.data.pretrain_doc_chain import (
     iter_document_pair_refs,
     load_doc_chain_metadata,
     pop_pretrain_metadata,
-    resolve_doc_chain_sources,
+    resolve_doc_chain_buckets,
     resolve_pretrain_dp,
 )
 from omegalax.data.pretrain_iid_pipeline import (
@@ -55,6 +55,6 @@ __all__ = [
     "make_statepassing_iterator",
     "pop_pretrain_metadata",
     "pop_source_ids",
-    "resolve_doc_chain_sources",
+    "resolve_doc_chain_buckets",
     "resolve_pretrain_dp",
 ]

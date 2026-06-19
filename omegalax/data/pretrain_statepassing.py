@@ -23,7 +23,7 @@ from omegalax.data.pretrain_doc_chain import (
     pair_ref_to_record,
     resolve_arrayrecord_paths,
     resolve_pretrain_dp,
-    rewrite_doc_chain_source_paths,
+    rewrite_doc_chain_bucket_paths,
     write_json_arrayrecord_dataset,
 )
 
@@ -34,7 +34,7 @@ STATEPASSING_INDEX_SHUFFLE_ROUNDS = 4
 def _pair_ref_from_record(record: dict[str, Any]) -> DocPairRef:
     eos_token_idx = record.get("eos_token_idx")
     return DocPairRef(
-        source_idx=int(record["source_idx"]),
+        bucket_idx=int(record["bucket_idx"]),
         record_idx=int(record["record_idx"]),
         doc_id=str(record["doc_id"]),
         pair_idx=int(record["pair_idx"]),
@@ -47,7 +47,7 @@ def _pair_ref_from_record(record: dict[str, Any]) -> DocPairRef:
 
 
 def build_statepassing_pair_index(
-    sources: str | Path | Sequence[str | Path],
+    buckets: str | Path | Sequence[str | Path],
     out_dir: str | Path,
     *,
     segment_length: int = DEFAULT_SEGMENT_LENGTH,
@@ -59,34 +59,34 @@ def build_statepassing_pair_index(
     if segment_length <= 0:
         raise ValueError("segment_length must be > 0")
 
-    reader = DocChainReader(sources, split=split)
+    reader = DocChainReader(buckets, split=split)
     dynamic_metadata: dict[str, Any] = {
         "format": STATEPASSING_PAIR_INDEX_FORMAT,
-        "source_paths": [str(path) for path in reader.source_paths],
+        "bucket_paths": [str(path) for path in reader.bucket_paths],
         "segment_length": int(segment_length),
         "eos_id": eos_id,
         "num_pairs": 0,
-        "num_source_records": 0,
-        "source_record_counts": [],
+        "num_bucket_records": 0,
+        "bucket_record_counts": [],
     }
 
     def _iter_index_records() -> Iterator[dict[str, Any]]:
-        source_record_counts = [0 for _ in reader.source_paths]
+        bucket_record_counts = [0 for _ in reader.bucket_paths]
         num_pairs = 0
-        for source_idx, record_idx, doc in reader.iter_records():
-            source_record_counts[source_idx] += 1
+        for bucket_idx, record_idx, doc in reader.iter_records():
+            bucket_record_counts[bucket_idx] += 1
             for pair in iter_document_pair_refs(
                 doc,
                 segment_length=segment_length,
-                source_idx=source_idx,
+                bucket_idx=bucket_idx,
                 record_idx=record_idx,
                 eos_id=eos_id,
             ):
                 num_pairs += 1
                 yield pair_ref_to_record(pair)
         dynamic_metadata["num_pairs"] = num_pairs
-        dynamic_metadata["num_source_records"] = sum(source_record_counts)
-        dynamic_metadata["source_record_counts"] = source_record_counts
+        dynamic_metadata["num_bucket_records"] = sum(bucket_record_counts)
+        dynamic_metadata["bucket_record_counts"] = bucket_record_counts
 
     return write_json_arrayrecord_dataset(
         _iter_index_records(),
@@ -125,13 +125,13 @@ def _is_statepassing_pair_index(path: str | Path) -> bool:
 
 
 def _single_statepassing_pair_index_path(
-    sources: str | Path | Sequence[str | Path],
+    indexes: str | Path | Sequence[str | Path],
 ) -> Path | None:
-    if isinstance(sources, (str, Path)):
-        path = Path(sources).expanduser().resolve()
+    if isinstance(indexes, (str, Path)):
+        path = Path(indexes).expanduser().resolve()
         return path if _is_statepassing_pair_index(path) else None
-    if isinstance(sources, Sequence) and len(sources) == 1:
-        path = Path(sources[0]).expanduser().resolve()
+    if isinstance(indexes, Sequence) and len(indexes) == 1:
+        path = Path(indexes[0]).expanduser().resolve()
         return path if _is_statepassing_pair_index(path) else None
     return None
 
@@ -151,21 +151,21 @@ def _make_batch(
     reset_states = []
     last_chunk_flags = []
     doc_ids = []
-    source_indices = []
+    bucket_indices = []
     record_indices = []
     pair_indices = []
     doc_cache = {}
 
     for pair in pairs:
-        doc_key = (pair.source_idx, pair.record_idx)
+        doc_key = (pair.bucket_idx, pair.record_idx)
         doc = doc_cache.get(doc_key)
         if doc is None:
-            doc = reader.read(pair.source_idx, pair.record_idx)
+            doc = reader.read(pair.bucket_idx, pair.record_idx)
             doc_cache[doc_key] = doc
         if doc.doc_id != pair.doc_id or doc.doc_token_count != pair.doc_token_count:
             raise ValueError(
-                "Statepassing pair index does not match source record "
-                f"source_idx={pair.source_idx}, record_idx={pair.record_idx}"
+                "Statepassing pair index does not match bucket record "
+                f"bucket_idx={pair.bucket_idx}, record_idx={pair.record_idx}"
             )
         arrays = build_pair_arrays(
             doc.token_ids,
@@ -181,7 +181,7 @@ def _make_batch(
         reset_states.append(arrays["reset_state_S"])
         last_chunk_flags.append(arrays["is_last_chunk_S"])
         doc_ids.append(pair.doc_id)
-        source_indices.append(pair.source_idx)
+        bucket_indices.append(pair.bucket_idx)
         record_indices.append(pair.record_idx)
         pair_indices.append(pair.pair_idx)
 
@@ -194,7 +194,7 @@ def _make_batch(
         "is_last_chunk_BS": np.stack(last_chunk_flags).astype(np.bool_, copy=False),
         BATCH_PRETRAIN_METADATA_KEY: {
             "doc_ids": doc_ids,
-            "source_idx_B": np.asarray(source_indices, dtype=np.int32),
+            "bucket_idx_B": np.asarray(bucket_indices, dtype=np.int32),
             "record_idx_B": np.asarray(record_indices, dtype=np.int32),
             "pair_idx_B": np.asarray(pair_indices, dtype=np.int32),
         },
@@ -205,12 +205,12 @@ class _StatepassingPretrainBatchBuilder:
     def __init__(
         self,
         *,
-        source_paths: Sequence[str | Path],
+        bucket_paths: Sequence[str | Path],
         segment_length: int,
         pad_id: int,
         eos_id: int | None = None,
     ) -> None:
-        self.source_paths = [str(path) for path in source_paths]
+        self.bucket_paths = [str(path) for path in bucket_paths]
         self.segment_length = int(segment_length)
         self.pad_id = int(pad_id)
         self.eos_id = eos_id
@@ -218,7 +218,7 @@ class _StatepassingPretrainBatchBuilder:
 
     def __call__(self, records: Sequence[dict[str, Any]]) -> dict[str, Any]:
         if self.reader is None:
-            self.reader = DocChainReader(self.source_paths)
+            self.reader = DocChainReader(self.bucket_paths)
         pairs = [_pair_ref_from_record(record) for record in records]
         return _make_batch(
             pairs,
@@ -230,7 +230,7 @@ class _StatepassingPretrainBatchBuilder:
 
 
 def make_statepassing_iterator(
-    sources: str | Path | Sequence[str | Path],
+    indexes: str | Path | Sequence[str | Path],
     *,
     batch_size: int,
     segment_length: int | None = DEFAULT_SEGMENT_LENGTH,
@@ -261,7 +261,7 @@ def make_statepassing_iterator(
     if grain_read_prefetch_buffer_size <= 0:
         raise ValueError("grain_read_prefetch_buffer_size must be > 0")
 
-    index_path = _single_statepassing_pair_index_path(sources)
+    index_path = _single_statepassing_pair_index_path(indexes)
     if index_path is None:
         raise ValueError(
             "Statepassing pretraining requires a statepassing pair index; "
@@ -284,7 +284,7 @@ def make_statepassing_iterator(
     if eos_id != index_eos_id:
         raise ValueError(f"eos_id mismatch: index has {index_eos_id}, loader got {eos_id}")
 
-    source_paths = rewrite_doc_chain_source_paths(metadata["source_paths"])
+    bucket_paths = rewrite_doc_chain_bucket_paths(metadata["bucket_paths"])
     index_shard_paths = resolve_arrayrecord_paths(index_path)
     index_source = grain.sources.ArrayRecordDataSource([str(path) for path in index_shard_paths])
     num_records = len(index_source)
@@ -306,7 +306,7 @@ def make_statepassing_iterator(
         batch_size=batch_size // 2,
         drop_remainder=True,
         batch_fn=_StatepassingPretrainBatchBuilder(
-            source_paths=source_paths,
+            bucket_paths=bucket_paths,
             segment_length=index_segment_length,
             pad_id=pad_id,
             eos_id=eos_id,

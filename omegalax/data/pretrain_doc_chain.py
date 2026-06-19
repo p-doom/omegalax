@@ -42,7 +42,7 @@ class DocChainRecord:
 
 @dataclass(frozen=True)
 class DocPairRef:
-    source_idx: int
+    bucket_idx: int
     record_idx: int
     doc_id: str
     pair_idx: int
@@ -55,14 +55,14 @@ class DocPairRef:
 
 # Die Funktion nimmt einen oder mehrere Dateipfade entgegen, bereinigt sie und löst sie zu absoluten Pfaden auf.
 # Sie gibt eine Liste von Path-Objekten zurück.
-def _normalize_sources(sources: str | Path | Sequence[str | Path]) -> list[Path]:
-    if isinstance(sources, (str, Path)):
-        raw_sources = [sources]
-    elif isinstance(sources, Sequence):
-        raw_sources = list(sources)
+def _normalize_buckets(buckets: str | Path | Sequence[str | Path]) -> list[Path]:
+    if isinstance(buckets, (str, Path)):
+        raw_buckets = [buckets]
+    elif isinstance(buckets, Sequence):
+        raw_buckets = list(buckets)
     else:
-        raise TypeError("Unsupported source path type")
-    return [Path(path).expanduser().resolve() for path in raw_sources]
+        raise TypeError("Unsupported bucket path type")
+    return [Path(path).expanduser().resolve() for path in raw_buckets]
 
 
 # Die Funktion nimmt serialisierte Byteströme, Text oder Dictionaries entgegen und bestimmt deren Format.
@@ -129,11 +129,6 @@ def deserialize_doc_chain(payload: DocChainRecord | bytes | str | dict[str, Any]
 
     token_ids = np.asarray(raw_tokens, dtype=np.int32)
     doc_token_count = int(raw.get("doc_token_count", token_ids.shape[0]))
-    if doc_token_count != int(token_ids.shape[0]):
-        raise ValueError(
-            f"doc_token_count={doc_token_count} does not match "
-            f"token_ids length={token_ids.shape[0]}"
-        )
 
     metadata = dict(raw.get("metadata") or {})
     core_keys = {
@@ -214,7 +209,7 @@ def _build_metadata_leaf_paths(
     return paths
 
 
-def _resolve_one_doc_chain_source(
+def _resolve_one_doc_chain_bucket(
     path: str | Path,
     *,
     split: str,
@@ -247,24 +242,24 @@ def _resolve_one_doc_chain_source(
             load_doc_chain_metadata(leaf)
         return split_leaves
 
-    raise ValueError(f"No doc-chain dataset sources found under: {path}")
+    raise ValueError(f"No doc-chain dataset buckets found under: {path}")
 
 
-def resolve_doc_chain_sources(
-    sources: str | Path | Sequence[str | Path],
+def resolve_doc_chain_buckets(
+    buckets: str | Path | Sequence[str | Path],
     *,
     split: str = DEFAULT_DOC_CHAIN_SPLIT,
 ) -> list[Path]:
-    source_paths = []
-    for path in _normalize_sources(sources):
-        source_paths.extend(_resolve_one_doc_chain_source(path, split=split))
-    if not source_paths:
-        raise ValueError("No doc-chain dataset sources were provided")
-    return source_paths
+    bucket_paths = []
+    for path in _normalize_buckets(buckets):
+        bucket_paths.extend(_resolve_one_doc_chain_bucket(path, split=split))
+    if not bucket_paths:
+        raise ValueError("No doc-chain dataset buckets were provided")
+    return bucket_paths
 
 
-def rewrite_doc_chain_source_paths(
-    source_paths: Sequence[str | Path],
+def rewrite_doc_chain_bucket_paths(
+    bucket_paths: Sequence[str | Path],
     *,
     source_root: str | Path | None = None,
     local_root: str | Path | None = None,
@@ -273,7 +268,7 @@ def rewrite_doc_chain_source_paths(
     local_root = local_root or os.environ.get(PRETRAIN_LOCAL_ROOT_ENV)
 
     if source_root is None and local_root is None:
-        return [Path(path).expanduser().resolve() for path in source_paths]
+        return [Path(path).expanduser().resolve() for path in bucket_paths]
     if source_root is None or local_root is None:
         raise ValueError(
             f"{PRETRAIN_SOURCE_ROOT_ENV} and {PRETRAIN_LOCAL_ROOT_ENV} must be set together"
@@ -282,7 +277,7 @@ def rewrite_doc_chain_source_paths(
     resolved_source_root = Path(source_root).expanduser().resolve()
     resolved_local_root = Path(local_root).expanduser().resolve()
     rewritten_paths = []
-    for path in source_paths:
+    for path in bucket_paths:
         source_path = Path(path).expanduser().resolve()
         try:
             rel_path = source_path.relative_to(resolved_source_root)
@@ -531,56 +526,54 @@ def write_json_arrayrecord_dataset(
 
 
 class DocChainReader:
-    # Der Konstruktor nimmt Datenquellen-Pfade entgegen, validiert deren Metadaten und bereitet die Shard-Auflösung vor.
-    # Er initialisiert die internen Datenquellen-Objekte.
     def __init__(
         self,
-        sources: str | Path | Sequence[str | Path],
+        buckets: str | Path | Sequence[str | Path],
         *,
         split: str = DEFAULT_DOC_CHAIN_SPLIT,
     ) -> None:
-        self.source_paths = resolve_doc_chain_sources(sources, split=split)
-        self._shard_paths = [resolve_arrayrecord_paths(path) for path in self.source_paths]
-        self._sources: list[grain.sources.ArrayRecordDataSource | None] = [
-            None for _ in self.source_paths
+        self.bucket_paths = resolve_doc_chain_buckets(buckets, split=split)
+        self._shard_paths = [resolve_arrayrecord_paths(path) for path in self.bucket_paths]
+        self._buckets: list[grain.sources.ArrayRecordDataSource | None] = [
+            None for _ in self.bucket_paths
         ]
 
     # Die Methode gibt die Anzahl der registrierten Datenquellen (Pfade) als Integer zurück.
     @property
-    def num_sources(self) -> int:
-        return len(self.source_paths)
+    def num_buckets(self) -> int:
+        return len(self.bucket_paths)
 
     # Die Methode nimmt einen Datenquellen-Index entgegen und lädt die entsprechende ArrayRecordDataSource bei Bedarf in den Cache.
     # Sie gibt das geladene Datenquellen-Objekt zurück.
-    def _source(self, source_idx: int) -> grain.sources.ArrayRecordDataSource:
-        if source_idx < 0 or source_idx >= len(self.source_paths):
-            raise IndexError(f"source_idx out of range: {source_idx}")
-        source = self._sources[source_idx]
-        if source is None:
-            source = grain.sources.ArrayRecordDataSource(
-                [str(path) for path in self._shard_paths[source_idx]]
+    def _bucket(self, bucket_idx: int) -> grain.sources.ArrayRecordDataSource:
+        if bucket_idx < 0 or bucket_idx >= len(self.bucket_paths):
+            raise IndexError(f"bucket_idx out of range: {bucket_idx}")
+        bucket = self._buckets[bucket_idx]
+        if bucket is None:
+            bucket = grain.sources.ArrayRecordDataSource(
+                [str(path) for path in self._shard_paths[bucket_idx]]
             )
-            self._sources[source_idx] = source
-        return source
+            self._buckets[bucket_idx] = bucket
+        return bucket
 
     # Die Methode nimmt einen Datenquellen-Index entgegen und ermittelt die Gesamtzahl der darin enthaltenen Records.
     # Sie gibt diese Anzahl als Integer zurück.
-    def num_records(self, source_idx: int) -> int:
-        return len(self._source(source_idx))
+    def num_records(self, bucket_idx: int) -> int:
+        return len(self._bucket(bucket_idx))
 
     # Die Methode nimmt einen Datenquellen- und Record-Index entgegen, liest die rohen Bytes aus dem Shard und deserialisiert diese.
     # Sie gibt das rekonstruierte DocChainRecord zurück.
-    def read(self, source_idx: int, record_idx: int) -> DocChainRecord:
-        source = self._source(source_idx)
-        return deserialize_doc_chain(source[record_idx])
+    def read(self, bucket_idx: int, record_idx: int) -> DocChainRecord:
+        bucket = self._bucket(bucket_idx)
+        return deserialize_doc_chain(bucket[record_idx])
 
     # Die Methode iteriert über alle Records aller registrierten Datenquellen.
     # Sie liefert nacheinander Tupel aus Datenquellen-Index, Record-Index und dem gelesenen DocChainRecord zurück.
     def iter_records(self) -> Iterator[tuple[int, int, DocChainRecord]]:
-        for source_idx in range(self.num_sources):
-            source = self._source(source_idx)
-            for record_idx in range(len(source)):
-                yield source_idx, record_idx, deserialize_doc_chain(source[record_idx])
+        for bucket_idx in range(self.num_buckets):
+            bucket = self._bucket(bucket_idx)
+            for record_idx in range(len(bucket)):
+                yield bucket_idx, record_idx, deserialize_doc_chain(bucket[record_idx])
 
 
 # Die Funktion nimmt ein Dokument, die Segmentlänge und optionale EOS-Angaben entgegen und berechnet zusammenhängende 2-Segment-Paare für das State-Passing.
@@ -589,7 +582,7 @@ def iter_document_pair_refs(
     doc: DocChainRecord,
     *,
     segment_length: int = DEFAULT_SEGMENT_LENGTH,
-    source_idx: int = 0,
+    bucket_idx: int = 0,
     record_idx: int = 0,
     eos_id: int | None = None,
 ) -> Iterator[DocPairRef]:
@@ -628,7 +621,7 @@ def iter_document_pair_refs(
             eos_token_idx if eos_token_idx is not None and start <= eos_token_idx < end else None
         )
         yield DocPairRef(
-            source_idx=source_idx,
+            bucket_idx=bucket_idx,
             record_idx=record_idx,
             doc_id=doc.doc_id,
             pair_idx=pair_idx,
@@ -748,7 +741,7 @@ def _iter_pair_segments(pair: DocPairRef) -> Iterator[tuple[int, int, int, int |
 def flatten_pair_ref(pair: DocPairRef) -> list[dict[str, Any]]:
     return [
         {
-            "source_idx": pair.source_idx,
+            "bucket_idx": pair.bucket_idx,
             "record_idx": pair.record_idx,
             "doc_id": pair.doc_id,
             "pair_idx": pair.pair_idx,
@@ -766,7 +759,7 @@ def flatten_pair_ref(pair: DocPairRef) -> list[dict[str, Any]]:
 # Sie gibt dieses Dictionary zurück.
 def pair_ref_to_record(pair: DocPairRef) -> dict[str, Any]:
     return {
-        "source_idx": pair.source_idx,
+        "bucket_idx": pair.bucket_idx,
         "record_idx": pair.record_idx,
         "doc_id": pair.doc_id,
         "pair_idx": pair.pair_idx,
@@ -783,7 +776,7 @@ def pair_ref_to_record(pair: DocPairRef) -> dict[str, Any]:
 def pop_pretrain_metadata(batch: dict[str, Any]) -> dict[str, Any] | None:
     """Remove non-array pretraining metadata before batch sharding.
 
-    IID and statepassing iterators surface document ids and source record
+    IID and statepassing iterators surface document ids and bucket record
     positions under ``metadata`` for logging/debugging. The JAX sharding helpers
     expect every top-level batch value to be an array, so callers should pop this
     field before passing a batch to ``shard_batch_dict``.

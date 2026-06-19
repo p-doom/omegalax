@@ -22,7 +22,7 @@ from omegalax.data.pretrain_doc_chain import (
     make_pretrain_index_record_dataset,
     resolve_arrayrecord_paths,
     resolve_pretrain_dp,
-    rewrite_doc_chain_source_paths,
+    rewrite_doc_chain_bucket_paths,
     write_json_arrayrecord_dataset,
 )
 
@@ -34,7 +34,7 @@ IID_INDEX_SHUFFLE_ROUNDS = 4
 # Sie liest die Quelldokumente ein, zerlegt sie in Segment-Paare, flacht diese zu einzelnen Chunk-Referenzen also quasi ein inhaltsverzeichnis für sammples ab und speichert sie als ArrayRecord-Dataset ab.
 # Sie gibt den Pfad des Ausgabeordners zurück.
 def build_iid_chunk_index(
-    sources: str | Path | Sequence[str | Path],
+    buckets: str | Path | Sequence[str | Path],
     out_dir: str | Path,
     *,
     segment_length: int = DEFAULT_SEGMENT_LENGTH,
@@ -46,31 +46,31 @@ def build_iid_chunk_index(
     if segment_length <= 0:
         raise ValueError("segment_length must be > 0")
 
-    reader = DocChainReader(sources, split=split)
+    reader = DocChainReader(buckets, split=split)
     dynamic_metadata: dict[str, Any] = {
         "format": IID_CHUNK_INDEX_FORMAT,
-        "source_paths": [str(path) for path in reader.source_paths],
+        "bucket_paths": [str(path) for path in reader.bucket_paths],
         "segment_length": int(segment_length),
         "eos_id": eos_id,
         "num_chunks": 0,
         "num_pairs": 0,
-        "num_source_records": 0,
-        "source_record_counts": [],
+        "num_bucket_records": 0,
+        "bucket_record_counts": [],
     }
 
     # Die Hilfsfunktion nimmt keine Argumente entgegen.
     # Sie durchläuft alle Originaldokumente, zählt die verarbeiteten Records und generiert flache Chunk-Referenzen.
     # Sie liefert die einzelnen Chunk-Referenzen nacheinander als Iterator zurück.
     def _iter_index_records() -> Iterator[dict[str, Any]]:
-        source_record_counts = [0 for _ in reader.source_paths]
+        bucket_record_counts = [0 for _ in reader.bucket_paths]
         num_chunks = 0
         num_pairs = 0
-        for source_idx, record_idx, doc in reader.iter_records():
-            source_record_counts[source_idx] += 1
+        for bucket_idx, record_idx, doc in reader.iter_records():
+            bucket_record_counts[bucket_idx] += 1
             for pair in iter_document_pair_refs(
                 doc,
                 segment_length=segment_length,
-                source_idx=source_idx,
+                bucket_idx=bucket_idx,
                 record_idx=record_idx,
                 eos_id=eos_id,
             ):
@@ -80,8 +80,8 @@ def build_iid_chunk_index(
                     yield chunk
         dynamic_metadata["num_chunks"] = num_chunks
         dynamic_metadata["num_pairs"] = num_pairs
-        dynamic_metadata["num_source_records"] = sum(source_record_counts)
-        dynamic_metadata["source_record_counts"] = source_record_counts
+        dynamic_metadata["num_bucket_records"] = sum(bucket_record_counts)
+        dynamic_metadata["bucket_record_counts"] = bucket_record_counts
 
     return write_json_arrayrecord_dataset(
         _iter_index_records(),
@@ -125,24 +125,24 @@ def _make_batch(
     loss_masks = []
     chunk_indices = []
     doc_ids = []
-    source_indices = []
+    bucket_indices = []
     record_indices = []
     pair_indices = []
     segments_in_pair = []
     doc_cache = {}
 
     for entry in entries:
-        source_idx = int(entry["source_idx"])
+        bucket_idx = int(entry["bucket_idx"])
         record_idx = int(entry["record_idx"])
-        doc_key = (source_idx, record_idx)
+        doc_key = (bucket_idx, record_idx)
         doc = doc_cache.get(doc_key)
         if doc is None:
-            doc = reader.read(source_idx, record_idx)
+            doc = reader.read(bucket_idx, record_idx)
             doc_cache[doc_key] = doc
         if doc.doc_id != str(entry["doc_id"]):
             raise ValueError(
-                "IID chunk index does not match source record "
-                f"source_idx={source_idx}, record_idx={record_idx}"
+                "IID chunk index does not match bucket record "
+                f"bucket_idx={bucket_idx}, record_idx={record_idx}"
             )
         arrays = build_chunk_arrays(
             doc.token_ids,
@@ -158,7 +158,7 @@ def _make_batch(
         loss_masks.append(arrays["loss_mask_T"])
         chunk_indices.append(int(entry["chunk_idx"]))
         doc_ids.append(str(entry["doc_id"]))
-        source_indices.append(source_idx)
+        bucket_indices.append(bucket_idx)
         record_indices.append(record_idx)
         pair_indices.append(int(entry["pair_idx"]))
         segments_in_pair.append(int(entry["segment_in_pair"]))
@@ -170,7 +170,7 @@ def _make_batch(
         "chunk_idx_B": np.asarray(chunk_indices, dtype=np.int32),
         BATCH_PRETRAIN_METADATA_KEY: {
             "doc_ids": doc_ids,
-            "source_idx_B": np.asarray(source_indices, dtype=np.int32),
+            "bucket_idx_B": np.asarray(bucket_indices, dtype=np.int32),
             "record_idx_B": np.asarray(record_indices, dtype=np.int32),
             "pair_idx_B": np.asarray(pair_indices, dtype=np.int32),
             "segment_in_pair_B": np.asarray(segments_in_pair, dtype=np.int32),
@@ -182,12 +182,12 @@ class _IIDPretrainBatchBuilder:
     def __init__(
         self,
         *,
-        source_paths: Sequence[str | Path],
+        bucket_paths: Sequence[str | Path],
         segment_length: int,
         pad_id: int,
         eos_id: int | None,
     ) -> None:
-        self.source_paths = [str(path) for path in source_paths]
+        self.bucket_paths = [str(path) for path in bucket_paths]
         self.segment_length = int(segment_length)
         self.pad_id = int(pad_id)
         self.eos_id = eos_id
@@ -195,7 +195,7 @@ class _IIDPretrainBatchBuilder:
 
     def __call__(self, entries: Sequence[dict[str, Any]]) -> dict[str, Any]:
         if self.reader is None:
-            self.reader = DocChainReader(self.source_paths)
+            self.reader = DocChainReader(self.bucket_paths)
         return _make_batch(
             entries,
             reader=self.reader,
@@ -255,7 +255,7 @@ def make_iid_iterator(
     if eos_id != index_eos_id:
         raise ValueError(f"eos_id mismatch: index has {index_eos_id}, loader got {eos_id}")
 
-    source_paths = rewrite_doc_chain_source_paths(metadata["source_paths"])
+    bucket_paths = rewrite_doc_chain_bucket_paths(metadata["bucket_paths"])
     index_shard_paths = resolve_arrayrecord_paths(index_path)
     index_source = grain.sources.ArrayRecordDataSource([str(path) for path in index_shard_paths])
     num_records = len(index_source)
@@ -277,7 +277,7 @@ def make_iid_iterator(
         batch_size=batch_size,
         drop_remainder=True,
         batch_fn=_IIDPretrainBatchBuilder(
-            source_paths=source_paths,
+            bucket_paths=bucket_paths,
             segment_length=index_segment_length,
             pad_id=pad_id,
             eos_id=eos_id,
