@@ -22,7 +22,7 @@ from omegalax.data.pretrain_doc_chain import (
     make_pretrain_index_record_dataset,
     resolve_arrayrecord_paths,
     resolve_pretrain_dp,
-    rewrite_doc_chain_bucket_paths,
+    rewrite_doc_chain_root_path,
     write_json_arrayrecord_dataset,
 )
 
@@ -30,11 +30,8 @@ IID_CHUNK_INDEX_FORMAT = "omegalax_pretrain_iid_chunk_index_v1"
 IID_INDEX_SHUFFLE_ROUNDS = 4
 
 
-# Die Funktion nimmt Quellpfade, einen Ausgabeordner und Chunk-Konfigurationen entgegen.
-# Sie liest die Quelldokumente ein, zerlegt sie in Segment-Paare, flacht diese zu einzelnen Chunk-Referenzen also quasi ein inhaltsverzeichnis für sammples ab und speichert sie als ArrayRecord-Dataset ab.
-# Sie gibt den Pfad des Ausgabeordners zurück.
 def build_iid_chunk_index(
-    buckets: str | Path | Sequence[str | Path],
+    root: str | Path,
     out_dir: str | Path,
     *,
     segment_length: int = DEFAULT_SEGMENT_LENGTH,
@@ -46,10 +43,12 @@ def build_iid_chunk_index(
     if segment_length <= 0:
         raise ValueError("segment_length must be > 0")
 
-    reader = DocChainReader(buckets, split=split)
+    reader = DocChainReader(root, split=split)
     dynamic_metadata: dict[str, Any] = {
         "format": IID_CHUNK_INDEX_FORMAT,
-        "bucket_paths": [str(path) for path in reader.bucket_paths],
+        "doc_chain_root": str(reader.root),
+        "split": reader.split,
+        "bucket_names": list(reader.bucket_names),
         "segment_length": int(segment_length),
         "eos_id": eos_id,
         "num_chunks": 0,
@@ -58,9 +57,6 @@ def build_iid_chunk_index(
         "bucket_record_counts": [],
     }
 
-    # Die Hilfsfunktion nimmt keine Argumente entgegen.
-    # Sie durchläuft alle Originaldokumente, zählt die verarbeiteten Records und generiert flache Chunk-Referenzen.
-    # Sie liefert die einzelnen Chunk-Referenzen nacheinander als Iterator zurück.
     def _iter_index_records() -> Iterator[dict[str, Any]]:
         bucket_record_counts = [0 for _ in reader.bucket_paths]
         num_chunks = 0
@@ -92,9 +88,6 @@ def build_iid_chunk_index(
     )
 
 
-# Die Funktion nimmt den Pfad des Index-Ordners und die erwartete Segmentlänge entgegen.
-# Sie lädt und überprüft die Metadatendatei des Index auf Formatkompatibilität und korrekte Segmentlänge.
-# Sie gibt das geladene Metadaten-Dictionary zurück.
 def _load_index_metadata(index_path: str | Path, segment_length: int | None) -> dict[str, Any]:
     metadata = load_arrayrecord_metadata(index_path)
     fmt = metadata.get("format")
@@ -109,9 +102,6 @@ def _load_index_metadata(index_path: str | Path, segment_length: int | None) -> 
     return metadata
 
 
-# Die Funktion nimmt eine Liste von Indexeinträgen, einen Reader und Formatierungsparameter entgegen.
-# Sie lädt die rohen Token-IDs der Einträge über den Reader, schneidet und paddet diese auf die Segmentlänge und stapelt sie zu Batches zusammen.
-# Sie gibt ein Dictionary mit den fertigen Batch-Arrays und Metadaten zurück.
 def _make_batch(
     entries: Sequence[dict[str, Any]],
     *,
@@ -182,12 +172,16 @@ class _IIDPretrainBatchBuilder:
     def __init__(
         self,
         *,
-        bucket_paths: Sequence[str | Path],
+        doc_chain_root: str | Path,
+        split: str,
+        bucket_names: Sequence[str],
         segment_length: int,
         pad_id: int,
         eos_id: int | None,
     ) -> None:
-        self.bucket_paths = [str(path) for path in bucket_paths]
+        self.doc_chain_root = str(doc_chain_root)
+        self.split = str(split)
+        self.bucket_names = list(bucket_names)
         self.segment_length = int(segment_length)
         self.pad_id = int(pad_id)
         self.eos_id = eos_id
@@ -195,7 +189,10 @@ class _IIDPretrainBatchBuilder:
 
     def __call__(self, entries: Sequence[dict[str, Any]]) -> dict[str, Any]:
         if self.reader is None:
-            self.reader = DocChainReader(self.bucket_paths)
+            reader = DocChainReader(self.doc_chain_root, split=self.split)
+            if reader.bucket_names != self.bucket_names:
+                raise ValueError("IID chunk index bucket_names do not match doc-chain root")
+            self.reader = reader
         return _make_batch(
             entries,
             reader=self.reader,
@@ -205,9 +202,6 @@ class _IIDPretrainBatchBuilder:
         )
 
 
-# Die Funktion nimmt den Pfad des Index-Ordners sowie Batch- und Sharding-Parameter entgegen.
-# Sie baut eine Grain-Pipeline, die Indexeinträge zu fertigen IID-Pretraining-Batches verarbeitet.
-# Sie gibt einen Iterator über fertige Batch-Dictionaries zurück.
 def make_iid_iterator(
     index_path: str | Path,
     *,
@@ -255,7 +249,9 @@ def make_iid_iterator(
     if eos_id != index_eos_id:
         raise ValueError(f"eos_id mismatch: index has {index_eos_id}, loader got {eos_id}")
 
-    bucket_paths = rewrite_doc_chain_bucket_paths(metadata["bucket_paths"])
+    doc_chain_root = rewrite_doc_chain_root_path(metadata["doc_chain_root"])
+    split = str(metadata["split"])
+    bucket_names = [str(name) for name in metadata["bucket_names"]]
     index_shard_paths = resolve_arrayrecord_paths(index_path)
     index_source = grain.sources.ArrayRecordDataSource([str(path) for path in index_shard_paths])
     num_records = len(index_source)
@@ -277,7 +273,9 @@ def make_iid_iterator(
         batch_size=batch_size,
         drop_remainder=True,
         batch_fn=_IIDPretrainBatchBuilder(
-            bucket_paths=bucket_paths,
+            doc_chain_root=doc_chain_root,
+            split=split,
+            bucket_names=bucket_names,
             segment_length=index_segment_length,
             pad_id=pad_id,
             eos_id=eos_id,

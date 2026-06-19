@@ -21,7 +21,6 @@ DOC_CHAIN_DATASET_VERSION = 1
 DOC_CHAIN_BINARY_MAGIC = b"OMXDC01\n"
 DOC_CHAIN_BINARY_HEADER = struct.Struct("<QQ")
 COMPILED_METADATA_FILENAME = "metadata.json"
-BUILD_METADATA_FILENAME = "build_metadata.json"
 ARRAY_RECORD_SUFFIX = ".array_record"
 DEFAULT_SEGMENT_LENGTH = 4096
 DEFAULT_PAD_ID = 0
@@ -53,20 +52,6 @@ class DocPairRef:
     eos_token_idx: int | None = None
 
 
-# Die Funktion nimmt einen oder mehrere Dateipfade entgegen, bereinigt sie und löst sie zu absoluten Pfaden auf.
-# Sie gibt eine Liste von Path-Objekten zurück.
-def _normalize_buckets(buckets: str | Path | Sequence[str | Path]) -> list[Path]:
-    if isinstance(buckets, (str, Path)):
-        raw_buckets = [buckets]
-    elif isinstance(buckets, Sequence):
-        raw_buckets = list(buckets)
-    else:
-        raise TypeError("Unsupported bucket path type")
-    return [Path(path).expanduser().resolve() for path in raw_buckets]
-
-
-# Die Funktion nimmt serialisierte Byteströme, Text oder Dictionaries entgegen und bestimmt deren Format.
-# Sie parst diese Daten und gibt das rohe Metadaten-Dictionary zurück.
 def _json_payload(payload: bytes | str | dict[str, Any]) -> dict[str, Any]:
     if isinstance(payload, bytes):
         if payload.startswith(DOC_CHAIN_BINARY_MAGIC):
@@ -79,8 +64,6 @@ def _json_payload(payload: bytes | str | dict[str, Any]) -> dict[str, Any]:
     raise TypeError(f"Unsupported doc-chain payload type: {type(payload).__name__}")
 
 
-# Die Funktion nimmt ein binäres Byte-Array im OMXDC01\n Format entgegen und liest den Header sowie die Token-Bytes aus.
-# Sie gibt ein bereinigtes Python-Dictionary mit den Token-IDs als NumPy-Array zurück.
 def _binary_payload(payload: bytes) -> dict[str, Any]:
     pos = len(DOC_CHAIN_BINARY_MAGIC)
     header_end = pos + DOC_CHAIN_BINARY_HEADER.size
@@ -103,8 +86,6 @@ def _binary_payload(payload: bytes) -> dict[str, Any]:
     return header
 
 
-# Die Funktion nimmt verschiedene Record-Formate entgegen, parst diese mittels der internen Payload-Hilfsfunktionen und validiert die Pflichtfelder.
-# Sie gibt ein gebrauchsfertiges DocChainRecord-Objekt zurück.
 def deserialize_doc_chain(payload: DocChainRecord | bytes | str | dict[str, Any]) -> DocChainRecord:
     if isinstance(payload, DocChainRecord):
         return payload
@@ -156,8 +137,6 @@ def deserialize_doc_chain(payload: DocChainRecord | bytes | str | dict[str, Any]
     )
 
 
-# Die Funktion nimmt den Pfad eines Datensatz-Ordners entgegen und prüft, ob die dazugehörige metadata.json existiert.
-# Sie parst die JSON-Metadaten und gibt sie als Dictionary zurück.
 def load_arrayrecord_metadata(path: str | Path) -> dict[str, Any]:
     path = Path(path).expanduser().resolve()
     metadata_path = path / COMPILED_METADATA_FILENAME
@@ -166,8 +145,6 @@ def load_arrayrecord_metadata(path: str | Path) -> dict[str, Any]:
     return json.loads(metadata_path.read_text())
 
 
-# Die Funktion nimmt den Pfad eines Datensatzes entgegen und lädt dessen Metadaten.
-# Sie überprüft das Formatflag und gibt das Metadaten-Dictionary zurück.
 def load_doc_chain_metadata(path: str | Path) -> dict[str, Any]:
     metadata = load_arrayrecord_metadata(path)
     fmt = metadata.get("format") or metadata.get("dataset_format")
@@ -176,99 +153,53 @@ def load_doc_chain_metadata(path: str | Path) -> dict[str, Any]:
     return metadata
 
 
-def _leaf_paths(path: Path) -> list[Path]:
-    if not path.is_dir():
-        return []
-    candidates = sorted(child for child in path.iterdir() if child.is_dir())
-    return [child for child in candidates if (child / COMPILED_METADATA_FILENAME).exists()]
-
-
-def _build_metadata_leaf_paths(
-    path: Path,
-    *,
-    split: str,
-) -> list[Path] | None:
-    build_metadata_path = path / BUILD_METADATA_FILENAME
-    if not build_metadata_path.exists():
-        return None
-
-    build_metadata = json.loads(build_metadata_path.read_text())
-    leaves = build_metadata.get("leaves")
-    if not isinstance(leaves, dict):
-        raise ValueError(f"{build_metadata_path} is missing a leaves object")
-
-    paths = []
-    for rel in leaves:
-        parts = Path(rel).parts
-        if len(parts) != 2 or parts[0] != split:
-            continue
-        paths.append(path / rel)
-
-    if not paths:
-        raise ValueError(f"{build_metadata_path} does not list split={split!r}")
-    return paths
-
-
-def _resolve_one_doc_chain_bucket(
-    path: str | Path,
-    *,
-    split: str,
-) -> list[Path]:
-    path = Path(path).expanduser().resolve()
-    if path.is_file():
-        return [path]
-
-    if (path / COMPILED_METADATA_FILENAME).exists():
-        load_doc_chain_metadata(path)
-        return [path]
-
-    build_metadata_leaves = _build_metadata_leaf_paths(path, split=split)
-    if build_metadata_leaves is not None:
-        for leaf in build_metadata_leaves:
-            load_doc_chain_metadata(leaf)
-        return build_metadata_leaves
-
-    split_path = path / split
-    if split_path.is_dir():
-        root_leaves = _leaf_paths(split_path)
-        if root_leaves:
-            for leaf in root_leaves:
-                load_doc_chain_metadata(leaf)
-            return root_leaves
-
-    split_leaves = _leaf_paths(path)
-    if split_leaves:
-        for leaf in split_leaves:
-            load_doc_chain_metadata(leaf)
-        return split_leaves
-
-    raise ValueError(f"No doc-chain dataset buckets found under: {path}")
+def _bucket_sort_key(path: Path) -> tuple[int, int, str]:
+    suffix = path.name.removeprefix("bucket_")
+    unit = suffix[-1:].lower()
+    value_text = suffix[:-1] if unit == "k" else suffix
+    try:
+        value = int(value_text)
+    except ValueError:
+        return (1, 0, path.name)
+    if unit == "k":
+        value *= 1024
+    return (0, value, path.name)
 
 
 def resolve_doc_chain_buckets(
-    buckets: str | Path | Sequence[str | Path],
+    root: str | Path,
     *,
     split: str = DEFAULT_DOC_CHAIN_SPLIT,
 ) -> list[Path]:
-    bucket_paths = []
-    for path in _normalize_buckets(buckets):
-        bucket_paths.extend(_resolve_one_doc_chain_bucket(path, split=split))
+    root = Path(root).expanduser().resolve()
+    split_path = root / split
+    if not split_path.is_dir():
+        raise ValueError(f"Doc-chain split directory does not exist: {split_path}")
+    bucket_paths = sorted(
+        (
+            child.resolve()
+            for child in split_path.iterdir()
+            if child.is_dir() and child.name.startswith("bucket_")
+        ),
+        key=_bucket_sort_key,
+    )
     if not bucket_paths:
-        raise ValueError("No doc-chain dataset buckets were provided")
+        raise ValueError(f"No doc-chain dataset buckets found under: {split_path}")
     return bucket_paths
 
 
-def rewrite_doc_chain_bucket_paths(
-    bucket_paths: Sequence[str | Path],
+def rewrite_doc_chain_root_path(
+    root: str | Path,
     *,
     source_root: str | Path | None = None,
     local_root: str | Path | None = None,
-) -> list[Path]:
+) -> Path:
     source_root = source_root or os.environ.get(PRETRAIN_SOURCE_ROOT_ENV)
     local_root = local_root or os.environ.get(PRETRAIN_LOCAL_ROOT_ENV)
+    root_path = Path(root).expanduser().resolve()
 
     if source_root is None and local_root is None:
-        return [Path(path).expanduser().resolve() for path in bucket_paths]
+        return root_path
     if source_root is None or local_root is None:
         raise ValueError(
             f"{PRETRAIN_SOURCE_ROOT_ENV} and {PRETRAIN_LOCAL_ROOT_ENV} must be set together"
@@ -276,26 +207,32 @@ def rewrite_doc_chain_bucket_paths(
 
     resolved_source_root = Path(source_root).expanduser().resolve()
     resolved_local_root = Path(local_root).expanduser().resolve()
-    rewritten_paths = []
-    for path in bucket_paths:
-        source_path = Path(path).expanduser().resolve()
-        try:
-            rel_path = source_path.relative_to(resolved_source_root)
-        except ValueError as exc:
-            raise ValueError(
-                f"Cannot rewrite doc-chain source path outside {PRETRAIN_SOURCE_ROOT_ENV}: "
-                f"{source_path} is not under {resolved_source_root}"
-            ) from exc
+    try:
+        rel_path = root_path.relative_to(resolved_source_root)
+    except ValueError as exc:
+        raise ValueError(
+            f"Cannot rewrite doc-chain root path outside {PRETRAIN_SOURCE_ROOT_ENV}: "
+            f"{root_path} is not under {resolved_source_root}"
+        ) from exc
 
-        rewritten_path = resolved_local_root / rel_path
-        if not rewritten_path.exists():
-            raise ValueError(f"Rewritten doc-chain source path does not exist: {rewritten_path}")
-        rewritten_paths.append(rewritten_path)
-    return rewritten_paths
+    rewritten_path = resolved_local_root / rel_path
+    if not rewritten_path.exists():
+        raise ValueError(f"Rewritten doc-chain root path does not exist: {rewritten_path}")
+    return rewritten_path
 
 
-# Die Funktion nimmt eine Datei oder einen Ordnerpfad entgegen und löst alle enthaltenen Shard-Pfade auf.
-# Sie prüft, ob die Dateien existieren, und gibt eine Liste von Path-Objekten der .array_record-Dateien zurück.
+def _resolve_doc_chain_bucket_shards(bucket_path: str | Path) -> list[Path]:
+    bucket_path = Path(bucket_path).expanduser().resolve()
+    metadata = load_doc_chain_metadata(bucket_path)
+    shard_paths = [bucket_path / rel for rel in metadata["shard_paths"]]
+    if not shard_paths:
+        raise ValueError(f"No ArrayRecord shards found under: {bucket_path}")
+    missing = [p for p in shard_paths if not p.exists()]
+    if missing:
+        raise ValueError(f"Missing ArrayRecord shard(s): {missing}")
+    return shard_paths
+
+
 def resolve_arrayrecord_paths(path: str | Path) -> list[Path]:
     path = Path(path).expanduser().resolve()
     if path.is_file():
@@ -316,8 +253,6 @@ def resolve_arrayrecord_paths(path: str | Path) -> list[Path]:
     return shard_paths
 
 
-# Die Funktion nimmt den Pfad eines Index-Ordners entgegen und liest alle JSON-Indexeinträge.
-# Sie liefert als Iterator nacheinander Tupel aus Record-Index und dem geparsten Dictionary.
 def iter_json_arrayrecord_records(path: str | Path) -> Iterator[tuple[int, dict[str, Any]]]:
     source = grain.sources.ArrayRecordDataSource([str(p) for p in resolve_arrayrecord_paths(path)])
     for record_idx in range(len(source)):
@@ -528,23 +463,23 @@ def write_json_arrayrecord_dataset(
 class DocChainReader:
     def __init__(
         self,
-        buckets: str | Path | Sequence[str | Path],
+        root: str | Path,
         *,
         split: str = DEFAULT_DOC_CHAIN_SPLIT,
     ) -> None:
-        self.bucket_paths = resolve_doc_chain_buckets(buckets, split=split)
-        self._shard_paths = [resolve_arrayrecord_paths(path) for path in self.bucket_paths]
+        self.root = Path(root).expanduser().resolve()
+        self.split = str(split)
+        self.bucket_paths = resolve_doc_chain_buckets(self.root, split=self.split)
+        self.bucket_names = [path.name for path in self.bucket_paths]
+        self._shard_paths = [_resolve_doc_chain_bucket_shards(path) for path in self.bucket_paths]
         self._buckets: list[grain.sources.ArrayRecordDataSource | None] = [
             None for _ in self.bucket_paths
         ]
 
-    # Die Methode gibt die Anzahl der registrierten Datenquellen (Pfade) als Integer zurück.
     @property
     def num_buckets(self) -> int:
         return len(self.bucket_paths)
 
-    # Die Methode nimmt einen Datenquellen-Index entgegen und lädt die entsprechende ArrayRecordDataSource bei Bedarf in den Cache.
-    # Sie gibt das geladene Datenquellen-Objekt zurück.
     def _bucket(self, bucket_idx: int) -> grain.sources.ArrayRecordDataSource:
         if bucket_idx < 0 or bucket_idx >= len(self.bucket_paths):
             raise IndexError(f"bucket_idx out of range: {bucket_idx}")
@@ -556,19 +491,13 @@ class DocChainReader:
             self._buckets[bucket_idx] = bucket
         return bucket
 
-    # Die Methode nimmt einen Datenquellen-Index entgegen und ermittelt die Gesamtzahl der darin enthaltenen Records.
-    # Sie gibt diese Anzahl als Integer zurück.
     def num_records(self, bucket_idx: int) -> int:
         return len(self._bucket(bucket_idx))
 
-    # Die Methode nimmt einen Datenquellen- und Record-Index entgegen, liest die rohen Bytes aus dem Shard und deserialisiert diese.
-    # Sie gibt das rekonstruierte DocChainRecord zurück.
     def read(self, bucket_idx: int, record_idx: int) -> DocChainRecord:
         bucket = self._bucket(bucket_idx)
         return deserialize_doc_chain(bucket[record_idx])
 
-    # Die Methode iteriert über alle Records aller registrierten Datenquellen.
-    # Sie liefert nacheinander Tupel aus Datenquellen-Index, Record-Index und dem gelesenen DocChainRecord zurück.
     def iter_records(self) -> Iterator[tuple[int, int, DocChainRecord]]:
         for bucket_idx in range(self.num_buckets):
             bucket = self._bucket(bucket_idx)
@@ -576,8 +505,6 @@ class DocChainReader:
                 yield bucket_idx, record_idx, deserialize_doc_chain(bucket[record_idx])
 
 
-# Die Funktion nimmt ein Dokument, die Segmentlänge und optionale EOS-Angaben entgegen und berechnet zusammenhängende 2-Segment-Paare für das State-Passing.
-# Sie gibt nacheinander die berechneten DocPairRef-Objekte als Iterator zurück.
 def iter_document_pair_refs(
     doc: DocChainRecord,
     *,
@@ -633,8 +560,6 @@ def iter_document_pair_refs(
         )
 
 
-# Die Funktion nimmt Token-IDs sowie einen Offset-Bereich entgegen, schneidet den Bereich aus und paddet ihn auf die feste Länge.
-# Sie gibt ein Dictionary mit den Trainings-Arrays und deren Masken zurück.
 def build_chunk_arrays(
     token_ids: Sequence[int] | np.ndarray,
     *,
@@ -680,8 +605,6 @@ def build_chunk_arrays(
     }
 
 
-# Die Funktion nimmt Token-IDs und eine Paar-Referenz entgegen, verarbeitet beide Segmente des Paars separat und heftet sie zusammen.
-# Sie gibt ein Dictionary mit 2D-Arrays und Zustands-Flags wie reset_state_S zurück.
 def build_pair_arrays(
     token_ids: Sequence[int] | np.ndarray,
     pair: DocPairRef,
@@ -722,8 +645,6 @@ def build_pair_arrays(
     }
 
 
-# Die Funktion nimmt eine Paar-Referenz entgegen, berechnet die genauen Start- und Endpositionen beider Segmente und ermittelt eventuell vorhandene EOS-Indizes.
-# Sie liefert nacheinander diese Positionsdaten als Iterator zurück.
 def _iter_pair_segments(pair: DocPairRef) -> Iterator[tuple[int, int, int, int | None]]:
     for segment_in_pair, (start, end) in enumerate(
         ((pair.start, min(pair.mid, pair.end)), (pair.mid, pair.end))
@@ -736,8 +657,6 @@ def _iter_pair_segments(pair: DocPairRef) -> Iterator[tuple[int, int, int, int |
         yield segment_in_pair, start, end, eos_token_idx
 
 
-# Die Funktion nimmt eine Paar-Referenz entgegen und zerlegt sie in zwei einzelne, flache Chunk-Referenzen mit passenden Indices.
-# Sie gibt eine Liste von Dictionaries mit diesen Chunk-Daten zurück.
 def flatten_pair_ref(pair: DocPairRef) -> list[dict[str, Any]]:
     return [
         {
@@ -755,8 +674,6 @@ def flatten_pair_ref(pair: DocPairRef) -> list[dict[str, Any]]:
     ]
 
 
-# Die Funktion nimmt eine Paar-Referenz entgegen und konvertiert sie in ein einfaches Python-Dictionary, das sich leicht JSON-serialisieren lässt.
-# Sie gibt dieses Dictionary zurück.
 def pair_ref_to_record(pair: DocPairRef) -> dict[str, Any]:
     return {
         "bucket_idx": pair.bucket_idx,
@@ -771,8 +688,6 @@ def pair_ref_to_record(pair: DocPairRef) -> dict[str, Any]:
     }
 
 
-# Die Funktion nimmt ein Batch-Dictionary entgegen und entfernt daraus den Metadaten-Key, der für das Training nicht als Array benötigt wird.
-# Sie gibt die extrahierten Metadaten zurück und modifiziert das Batch-Dictionary direkt.
 def pop_pretrain_metadata(batch: dict[str, Any]) -> dict[str, Any] | None:
     """Remove non-array pretraining metadata before batch sharding.
 
@@ -786,8 +701,6 @@ def pop_pretrain_metadata(batch: dict[str, Any]) -> dict[str, Any] | None:
     return dict(raw) if raw is not None else None
 
 
-# Die Funktion nimmt die Konfiguration der verteilten Umgebung entgegen und ermittelt die effektive Partitionsgröße sowie den lokalen Shard-Index.
-# Sie gibt ein Tupel aus Gesamt-Datenparallelismus und GPU-ID zurück.
 def resolve_pretrain_dp(
     *,
     dp_size: int,
