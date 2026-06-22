@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import gc
 import json
+import os
 from pathlib import Path
 
 from absl import app, flags
@@ -177,9 +178,18 @@ def _grain_iter(
 
 def main(_) -> None:
     jax.config.update("jax_compilation_cache_dir", FLAGS.jax_cache_dir)
-    jax.distributed.initialize()
     startup_log(f"jax_compilation_cache_dir={FLAGS.jax_cache_dir}")
-    startup_log("jax.distributed initialized")
+    distributed_mode = os.environ.get("OMEGALAX_JAX_DISTRIBUTED", "auto").lower()
+    slurm_ntasks = int(os.environ.get("SLURM_NTASKS", "1") or "1")
+    should_initialize_distributed = (
+        distributed_mode in {"1", "true", "yes", "on"}
+        or (distributed_mode == "auto" and slurm_ntasks > 1)
+    )
+    if should_initialize_distributed:
+        jax.distributed.initialize()
+        startup_log("jax.distributed initialized")
+    else:
+        startup_log("jax.distributed skipped for single-process run")
 
     tokenizer_name = FLAGS.tokenizer or resolve_hf_repo_id(FLAGS.model_id)
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)

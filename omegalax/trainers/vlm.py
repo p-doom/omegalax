@@ -22,6 +22,11 @@ from omegalax import export as export_lib
 from omegalax.data.grain_pipeline import pop_source_ids
 from omegalax.distributed.mesh import ensure_mesh, mesh_rules, required_batch_multiple
 from omegalax.models.params_utils import save_hf_config
+from omegalax.models.qwen3_vl.config import (
+    Qwen3VLConfig,
+    save_pi0_action_expert_metadata,
+    with_pi0_action_expert,
+)
 from omegalax.trainers import checkpoint_utils
 from omegalax.trainers import tokamax_cache as tokamax_cache_lib
 from omegalax.trainers.loss import chunked_cross_entropy_loss
@@ -44,6 +49,10 @@ from omegalax.vlm import api as vlm_api
 P = PartitionSpec
 
 
+def _path_key(part) -> str:
+    return getattr(part, "key", None) or getattr(part, "name", None) or str(part)
+
+
 def _trainable_non_vision(path, x):
     """NNX filter predicate: select every ``nnx.Param`` whose state-tree path
     does not pass through ``Qwen3VL.vision`` (or any nested ``vision``
@@ -53,10 +62,28 @@ def _trainable_non_vision(path, x):
     if not isinstance(x, nnx.Param):
         return False
     for part in path:
-        key = getattr(part, "key", None) or getattr(part, "name", None) or str(part)
+        key = _path_key(part)
         if key == "vision":
             return False
     return True
+
+
+def _is_pi0_action_expert_path(path) -> bool:
+    keys = {_path_key(part) for part in path}
+    return bool(
+        {"action_input_proj", "action_output_proj", "action_expert"} & keys
+    )
+
+
+def _trainable_pi0_action_expert(path, x):
+    return isinstance(x, nnx.Param) and _is_pi0_action_expert_path(path)
+
+
+def _trainable_pi0_action_expert_lm_head(path, x):
+    if not isinstance(x, nnx.Param):
+        return False
+    keys = {_path_key(part) for part in path}
+    return _is_pi0_action_expert_path(path) or "lm_head" in keys
 
 
 @dataclasses.dataclass(frozen=True)
@@ -79,6 +106,25 @@ class TrainConfig:
     lora_alpha: float = 32.0
     freeze_vision_tower: bool = False
     num_loss_tiles: int = 4
+    pi0_action_expert_enabled: bool = False
+    pi0_action_width: int = 1024
+    pi0_action_mlp_size: int = 4096
+    pi0_action_expert_init_path: str | None = None
+    pi0_train_scope: str = "non_vision"
+    early_stop_loss: float | None = None
+
+
+def _apply_pi0_train_config(cfg, train_cfg: TrainConfig):
+    if not train_cfg.pi0_action_expert_enabled:
+        return cfg
+    if not isinstance(cfg, Qwen3VLConfig):
+        raise ValueError("pi0 action expert training is only supported for Qwen3-VL configs")
+    return with_pi0_action_expert(
+        cfg,
+        enabled=True,
+        action_width=train_cfg.pi0_action_width,
+        action_mlp_size=train_cfg.pi0_action_mlp_size,
+    )
 
 
 def init_model(
@@ -170,6 +216,8 @@ def _make_checkpoint_manager(
 
 def _write_checkpoint_config(save_dir: Path, cfg) -> None:
     save_hf_config(export_lib.model_config_to_hf_dict(cfg), save_dir)
+    if isinstance(cfg, Qwen3VLConfig):
+        save_pi0_action_expert_metadata(cfg, save_dir)
 
 
 def _write_lora_metadata(save_dir: Path, train_cfg: TrainConfig) -> None:
@@ -197,7 +245,7 @@ def _save_sft_checkpoint(
 ) -> None:
     train_state = _train_state(optimizer, rng)
     save_args = checkpoint_utils.make_grain_save_args(train_state, input_iter)
-    checkpoint_manager.save(step, args=save_args)
+    checkpoint_manager.save(step, args=save_args, force=True)
 
 
 def _restore_sft_checkpoint(
@@ -259,6 +307,11 @@ def make_sft_train_step(cfg, pad_id: int = 0, *, wrt=nnx.Param, num_loss_tiles: 
         image_grid_thw = batch.get("image_grid_thw")
         vision_cu_seqlens = batch.get("vision_cu_seqlens")
         position_ids_ZBT = batch.get("position_ids_ZBT")
+        action_expert_mask_BT = (
+            batch.get("action_expert_mask_BT", loss_mask_BT)
+            if getattr(cfg, "pi0_action_expert_enabled", False)
+            else None
+        )
 
         def loss_fn(model):
             hidden_BTD, aux_loss = vlm_api.forward(
@@ -271,6 +324,7 @@ def make_sft_train_step(cfg, pad_id: int = 0, *, wrt=nnx.Param, num_loss_tiles: 
                 image_grid_thw=image_grid_thw,
                 vision_cu_seqlens=vision_cu_seqlens,
                 position_ids_ZBT=position_ids_ZBT,
+                action_expert_mask_BT=action_expert_mask_BT,
             )
             lm_weight = model.output_weight()
             loss = (
@@ -317,6 +371,11 @@ def make_sft_eval_step(cfg, pad_id: int = 0, *, num_loss_tiles: int = 4):
         image_grid_thw = batch.get("image_grid_thw")
         vision_cu_seqlens = batch.get("vision_cu_seqlens")
         position_ids_ZBT = batch.get("position_ids_ZBT")
+        action_expert_mask_BT = (
+            batch.get("action_expert_mask_BT", loss_mask_BT)
+            if getattr(cfg, "pi0_action_expert_enabled", False)
+            else None
+        )
 
         hidden_BTD, aux_loss = vlm_api.forward(
             model,
@@ -328,6 +387,7 @@ def make_sft_eval_step(cfg, pad_id: int = 0, *, num_loss_tiles: int = 4):
             image_grid_thw=image_grid_thw,
             vision_cu_seqlens=vision_cu_seqlens,
             position_ids_ZBT=position_ids_ZBT,
+            action_expert_mask_BT=action_expert_mask_BT,
         )
         lm_weight = model.output_weight()
         loss = (
@@ -356,6 +416,7 @@ def run_sft(
     save_every: int = 0,
     keep_period: int = 0,
     keep_latest: int = 1,
+    save_steps: tuple[int, ...] | None = None,
     log_every: int = 1,
     resume: checkpoint_utils.ResumeMode = checkpoint_utils.ResumeMode.NEVER,
     pad_id: int = 0,
@@ -385,6 +446,7 @@ def run_sft(
     each ``resume`` mode.
     """
     save_path = Path(save_dir).expanduser().resolve() if save_dir is not None else None
+    save_steps_set = {int(step) for step in (save_steps or ()) if int(step) > 0}
 
     # Build the canonical CheckpointManager up-front so a single ``latest_step()``
     # query drives both the model_cfg-source decision and the eventual restore.
@@ -433,6 +495,7 @@ def run_sft(
         startup_log(f"resolved model config from checkpoint {save_path!r}")
     else:
         model_cfg = vlm_api.resolve_config(model_id_or_cfg)
+        model_cfg = _apply_pi0_train_config(model_cfg, train_cfg)
         startup_log("resolved model config")
     startup_log(f"model_cfg={model_cfg}")
     mesh = ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size)
@@ -463,12 +526,19 @@ def run_sft(
         stable_fraction=train_cfg.lr_stable_fraction,
     )
 
-    if not will_resume and isinstance(model_id_or_cfg, str):
+    should_load_pretrained = (
+        not will_resume
+        and isinstance(model_id_or_cfg, str)
+        and not model_id_or_cfg.startswith(("qwen3-vl-smoke", "qwen3.5-smoke"))
+    )
+    if should_load_pretrained:
         model, model_cfg = vlm_api.load_pretrained(
             model_id_or_cfg,
             tp_size=tp_size,
             fsdp_size=fsdp_size,
             dp_size=dp_size,
+            cfg_override=model_cfg,
+            pi0_action_expert_init_path=train_cfg.pi0_action_expert_init_path,
         )
         model_cfg = vlm_api.align_config_to_mesh(model_cfg, mesh)
         startup_log("loaded pretrained model")
@@ -496,6 +566,8 @@ def run_sft(
             "--freeze_vision_tower is redundant. Pass at most one."
         )
     if train_cfg.enable_lora:
+        if train_cfg.pi0_action_expert_enabled:
+            raise ValueError("--enable_lora is not supported together with --pi0_action_expert")
         with mesh_rules(mesh):
             n_wrapped = inject_lora(
                 model,
@@ -508,6 +580,25 @@ def run_sft(
             f"wrapped {n_wrapped} text-decoder Linear projections; vision frozen"
         )
         wrt_filter = LoRAParam
+    elif getattr(model_cfg, "pi0_action_expert_enabled", False):
+        scope = train_cfg.pi0_train_scope
+        if scope == "expert_only":
+            wrt_filter = _trainable_pi0_action_expert
+            startup_log("pi0 action expert enabled; training action expert + adapters only")
+        elif scope == "expert_lm_head":
+            wrt_filter = _trainable_pi0_action_expert_lm_head
+            startup_log("pi0 action expert enabled; training action expert + lm_head")
+        elif scope == "non_vision":
+            wrt_filter = _trainable_non_vision
+            startup_log("pi0 action expert enabled; training non-vision params")
+        elif scope == "all":
+            wrt_filter = nnx.Param
+            startup_log("pi0 action expert enabled; training all params including vision")
+        else:
+            raise ValueError(
+                f"Unsupported pi0_train_scope={scope!r}; expected expert_only, "
+                "expert_lm_head, non_vision, or all"
+            )
     elif train_cfg.freeze_vision_tower:
         wrt_filter = _trainable_non_vision
         startup_log(
@@ -613,6 +704,7 @@ def run_sft(
         if autotune_result is None:
             startup_log("priming tokamax autotuning with first training batch")
             pending_batch = next(data_iter)
+            pop_source_ids(pending_batch)
             pending_batch_sharded = vlm_api.shard_batch_dict(pending_batch, model_cfg, mesh)
             autotune_result = tokamax_cache_lib.autotune_and_save(
                 tokamax_cache_dir, sft_step, optimizer, pending_batch_sharded
@@ -682,12 +774,17 @@ def run_sft(
             _mem_logged_steady_state = True
 
         with jax.default_device("cpu"):
+            current_lr = (
+                float(lr_schedule_fn(step_idx))
+                if callable(lr_schedule_fn)
+                else float(lr_schedule_fn)
+            )
             window_metrics = {
                 "loss": accum_loss / accum_steps,
                 "grad_norm": accum_grad_norm / accum_steps,
                 "supervised_tokens": accum_sup_tokens,
                 "total_tokens": accum_total_tokens,
-                "lr": lr_schedule_fn(step_idx),
+                "lr": current_lr,
             }
             if len(source_counts) > 1:
                 total = float(sum(source_counts.values()))
@@ -696,8 +793,24 @@ def run_sft(
             _log_prev_metrics()
 
             prev_metrics = (step, window_metrics, accum_time, accum_flops)
+            if train_cfg.early_stop_loss is not None:
+                current_loss = float(jax.device_get(window_metrics["loss"]))
+                if current_loss <= train_cfg.early_stop_loss:
+                    _log_prev_metrics(force=True)
+                    startup_log(
+                        f"early_stop_loss reached at step={step}: "
+                        f"loss={current_loss:.8f} <= {train_cfg.early_stop_loss:.8f}"
+                    )
+                    if checkpoint_manager is not None:
+                        _save_sft_checkpoint(checkpoint_manager, optimizer, rng, step, data_iter)
+                        checkpoint_manager.wait_until_finished()
+                        checkpoint_manager.close()
+                    _autotune_ctx.__exit__(None, None, None)
+                    return optimizer, last_metrics
 
-        if checkpoint_manager is not None and save_every and step % save_every == 0:
+        should_save_interval = bool(save_every and step % save_every == 0)
+        should_save_milestone = step in save_steps_set
+        if checkpoint_manager is not None and (should_save_interval or should_save_milestone):
             _save_sft_checkpoint(checkpoint_manager, optimizer, rng, step, data_iter)
 
         if gc_period and step % gc_period == 0:
@@ -736,10 +849,14 @@ def run_sft(
     _log_prev_metrics(force=True)
 
     if checkpoint_manager is not None:
-        if last_metrics and (not save_every or last_metrics["step"] % save_every != 0):
-            _save_sft_checkpoint(
-                checkpoint_manager, optimizer, rng, int(last_metrics["step"]), data_iter
+        if last_metrics:
+            final_step = int(last_metrics["step"])
+            final_was_saved = bool(
+                (save_every and final_step % save_every == 0)
+                or final_step in save_steps_set
             )
+            if not final_was_saved:
+                _save_sft_checkpoint(checkpoint_manager, optimizer, rng, final_step, data_iter)
         checkpoint_manager.wait_until_finished()
         checkpoint_manager.close()
 

@@ -4,10 +4,30 @@ from __future__ import annotations
 
 import gc
 import json
+import multiprocessing as mp
+import os
 from pathlib import Path
 
 from absl import app, flags
 import jax
+
+
+def _jax_distributed_requested() -> bool:
+    if mp.current_process().name != "MainProcess":
+        return False
+    distributed_mode = os.environ.get("OMEGALAX_JAX_DISTRIBUTED", "auto").lower()
+    slurm_ntasks = int(os.environ.get("SLURM_NTASKS", "1") or "1")
+    return (
+        distributed_mode in {"1", "true", "yes", "on"}
+        or (distributed_mode == "auto" and slurm_ntasks > 1)
+    )
+
+
+_JAX_DISTRIBUTED_INITIALIZED = False
+if _jax_distributed_requested():
+    jax.distributed.initialize()
+    _JAX_DISTRIBUTED_INITIALIZED = True
+
 import wandb
 from transformers import AutoImageProcessor, AutoTokenizer
 
@@ -99,7 +119,13 @@ flags.DEFINE_integer(
     None,
     "Also retain the N most-recent checkpoints regardless of --keep_period.",
 )
+flags.DEFINE_string("save_steps", "", "Comma-separated explicit checkpoint steps, e.g. 20,50,100,200.")
 flags.DEFINE_integer("log_every", None, "Log metrics every N steps.")
+flags.DEFINE_float(
+    "early_stop_loss",
+    None,
+    "If set, stop training and save the current checkpoint when train loss is <= this value.",
+)
 flags.DEFINE_bool("log_memory", None, "Log per-process JAX/HBM memory at init and first few steps.")
 flags.DEFINE_enum(
     "resume",
@@ -162,6 +188,36 @@ flags.DEFINE_integer(
     None,
     "Number of tiles for chunked cross-entropy along the "
     "sequence axis. Must evenly divide (max_length - 1).",
+)
+flags.DEFINE_boolean(
+    "pi0_action_expert",
+    False,
+    "Enable the Qwen3-VL pi0-style action expert training path. "
+    "Assistant loss-mask tokens are routed through the narrow expert.",
+)
+flags.DEFINE_integer(
+    "pi0_action_width",
+    1024,
+    "Residual width of the pi0 action expert. SGLang default for "
+    "the original action expert is 1024.",
+)
+flags.DEFINE_integer(
+    "pi0_action_mlp_size",
+    4096,
+    "SwiGLU intermediate width of the pi0 action expert. SGLang "
+    "default for the original action expert is 4096.",
+)
+flags.DEFINE_string(
+    "pi0_action_expert_init_path",
+    None,
+    "Optional SGLang-format pi0 action expert safetensors to load "
+    "before training. Do not pass the all-zero dummy file for real training.",
+)
+flags.DEFINE_enum(
+    "pi0_train_scope",
+    "non_vision",
+    ["expert_only", "expert_lm_head", "non_vision", "all"],
+    "Trainable parameter scope when --pi0_action_expert is enabled.",
 )
 
 _ATTN_BACKENDS = [
@@ -234,6 +290,10 @@ def _validate_flags() -> None:
     # enable_lora / freeze_vision_tower are mutually exclusive (both freeze the vision tower).
     if FLAGS.enable_lora and FLAGS.freeze_vision_tower:
         problems.append("enable_lora and freeze_vision_tower are mutually exclusive")
+    if FLAGS.pi0_action_expert and FLAGS.enable_lora:
+        problems.append("pi0_action_expert and enable_lora are mutually exclusive")
+    if not FLAGS.pi0_action_expert and FLAGS.pi0_action_expert_init_path:
+        problems.append("pi0_action_expert_init_path requires pi0_action_expert=true")
 
     # LoRA hyperparameters required only when LoRA is on.
     if FLAGS.enable_lora:
@@ -331,9 +391,15 @@ def _grain_iter(
 def main(_) -> None:
     _validate_flags()
     jax.config.update("jax_compilation_cache_dir", FLAGS.jax_cache_dir)
-    jax.distributed.initialize()
     startup_log(f"jax_compilation_cache_dir={FLAGS.jax_cache_dir}")
-    startup_log("jax.distributed initialized")
+    should_initialize_distributed = _jax_distributed_requested()
+    if should_initialize_distributed and not _JAX_DISTRIBUTED_INITIALIZED:
+        jax.distributed.initialize()
+        startup_log("jax.distributed initialized")
+    elif should_initialize_distributed:
+        startup_log("jax.distributed initialized")
+    else:
+        startup_log("jax.distributed skipped for single-process run")
 
     repo_id = FLAGS.processor or resolve_hf_repo_id(FLAGS.model_id)
     tokenizer = AutoTokenizer.from_pretrained(repo_id)
@@ -417,6 +483,12 @@ def main(_) -> None:
         )
         startup_log(f"built val grain DataLoader iterator from {FLAGS.val_data_path!r}")
 
+    save_steps = tuple(
+        sorted({int(part.strip()) for part in FLAGS.save_steps.split(",") if part.strip()})
+    )
+    if any(step <= 0 for step in save_steps):
+        raise ValueError(f"--save_steps must contain positive integers, got {FLAGS.save_steps!r}")
+
     train_cfg = vlm_trainer.TrainConfig(
         seed=FLAGS.seed,
         batch_size=FLAGS.batch_size,
@@ -436,6 +508,12 @@ def main(_) -> None:
         lora_alpha=FLAGS.lora_alpha,
         freeze_vision_tower=FLAGS.freeze_vision_tower,
         num_loss_tiles=FLAGS.num_loss_tiles,
+        pi0_action_expert_enabled=FLAGS.pi0_action_expert,
+        pi0_action_width=FLAGS.pi0_action_width,
+        pi0_action_mlp_size=FLAGS.pi0_action_mlp_size,
+        pi0_action_expert_init_path=FLAGS.pi0_action_expert_init_path,
+        pi0_train_scope=FLAGS.pi0_train_scope,
+        early_stop_loss=FLAGS.early_stop_loss,
     )
     resume_mode = ResumeMode(FLAGS.resume)
     save_dir = Path(FLAGS.save_dir)
@@ -466,6 +544,7 @@ def main(_) -> None:
             save_every=FLAGS.save_every,
             keep_period=FLAGS.keep_period,
             keep_latest=FLAGS.keep_latest,
+            save_steps=save_steps,
             log_every=FLAGS.log_every,
             resume=resume_mode,
             pad_id=FLAGS.pad_id,

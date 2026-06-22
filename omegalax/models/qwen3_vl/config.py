@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 from typing import Any
 
 import jax.numpy as jnp
@@ -10,6 +11,12 @@ from etils import epath
 
 from omegalax.models.params_utils import load_hf_config_from_source
 from omegalax.models.shard_config import ShardConfig
+
+
+PI0_ACTION_EXPERT_CONFIG_FILENAME = "pi0_action_expert_config.json"
+PI0_ACTION_EXPERT_FILENAME_TEMPLATE = (
+    "qwen3_vl_pi0_action_expert_w{width}_m{mlp_size}_l{num_layers}.safetensors"
+)
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -57,6 +64,9 @@ class Qwen3VLConfig:
     shd_cfg: ShardConfig = dataclasses.field(default_factory=ShardConfig.default)
     dtype: Any = jnp.bfloat16
     param_dtype: Any = jnp.float32
+    pi0_action_expert_enabled: bool = False
+    pi0_action_width: int = 1024
+    pi0_action_mlp_size: int = 4096
 
     def is_moe_layer(self, layer_idx: int) -> bool:
         return (
@@ -324,3 +334,97 @@ def make_vl_config_from_hf(hf_cfg: dict[str, Any]) -> Qwen3VLConfig:
             dtype=vision_dtype,
         ),
     )
+
+
+def with_pi0_action_expert(
+    cfg: Qwen3VLConfig,
+    *,
+    enabled: bool,
+    action_width: int = 1024,
+    action_mlp_size: int = 4096,
+) -> Qwen3VLConfig:
+    """Return ``cfg`` with the runtime-only pi0 action expert settings applied."""
+    if action_width <= 0:
+        raise ValueError(f"pi0 action width must be positive, got {action_width}")
+    if action_mlp_size <= 0:
+        raise ValueError(f"pi0 action MLP size must be positive, got {action_mlp_size}")
+    return dataclasses.replace(
+        cfg,
+        pi0_action_expert_enabled=bool(enabled),
+        pi0_action_width=int(action_width),
+        pi0_action_mlp_size=int(action_mlp_size),
+    )
+
+
+def pi0_action_expert_metadata(cfg: Qwen3VLConfig) -> dict[str, Any] | None:
+    """Serialize the OmegaLax-only action expert config.
+
+    This intentionally stays out of HuggingFace ``config.json`` so exported
+    model directories remain ordinary Qwen3-VL checkpoints for downstream
+    runtimes.
+    """
+    if not cfg.pi0_action_expert_enabled:
+        return None
+    return {
+        "enabled": True,
+        "action_width": int(cfg.pi0_action_width),
+        "action_mlp_size": int(cfg.pi0_action_mlp_size),
+        "num_layers": int(cfg.num_layers),
+    }
+
+
+def pi0_action_expert_filename(cfg: Qwen3VLConfig) -> str:
+    return PI0_ACTION_EXPERT_FILENAME_TEMPLATE.format(
+        width=int(cfg.pi0_action_width),
+        mlp_size=int(cfg.pi0_action_mlp_size),
+        num_layers=int(cfg.num_layers),
+    )
+
+
+def find_pi0_action_expert_weights(cfg: Qwen3VLConfig, model_dir: str | epath.Path) -> epath.Path | None:
+    path = epath.Path(model_dir).expanduser() / pi0_action_expert_filename(cfg)
+    return path if path.exists() else None
+
+
+def save_pi0_action_expert_metadata(cfg: Qwen3VLConfig, out_dir: str | epath.Path) -> None:
+    meta = pi0_action_expert_metadata(cfg)
+    if meta is None:
+        return
+    path = epath.Path(out_dir) / PI0_ACTION_EXPERT_CONFIG_FILENAME
+    with path.open("w") as f:
+        json.dump(meta, f, indent=2)
+
+
+def apply_pi0_action_expert_metadata(
+    cfg: Qwen3VLConfig,
+    metadata: dict[str, Any],
+) -> Qwen3VLConfig:
+    if not metadata.get("enabled", False):
+        return cfg
+    num_layers = int(metadata.get("num_layers", cfg.num_layers))
+    if num_layers != cfg.num_layers:
+        raise ValueError(
+            f"pi0 metadata num_layers={num_layers} does not match model num_layers={cfg.num_layers}"
+        )
+    return with_pi0_action_expert(
+        cfg,
+        enabled=True,
+        action_width=int(metadata["action_width"]),
+        action_mlp_size=int(metadata["action_mlp_size"]),
+    )
+
+
+def apply_pi0_action_expert_metadata_from_source(
+    cfg: Qwen3VLConfig,
+    source: str | epath.Path,
+) -> Qwen3VLConfig:
+    """Apply sidecar metadata if ``source`` is a directory containing it."""
+    path = epath.Path(source).expanduser()
+    if path.is_file():
+        path = path.parent
+    meta_path = path / PI0_ACTION_EXPERT_CONFIG_FILENAME
+    if not meta_path.exists():
+        return cfg
+    with meta_path.open() as f:
+        metadata = json.load(f)
+    return apply_pi0_action_expert_metadata(cfg, metadata)

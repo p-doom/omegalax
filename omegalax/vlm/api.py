@@ -20,6 +20,8 @@ from omegalax.models.sharding_runtime import (
 from omegalax.models.qwen3_vl import Qwen3VL, make_vl_config
 from omegalax.models.qwen3_vl.config import (
     Qwen3VLConfig,
+    apply_pi0_action_expert_metadata_from_source,
+    find_pi0_action_expert_weights,
     is_supported_qwen3_vl_model_id,
     list_supported_qwen3_vl_model_ids,
     make_vl_config_from_hf,
@@ -37,6 +39,16 @@ from omegalax.models.params_utils import load_hf_config_from_source
 VLMConfig = Qwen3_5Config | Qwen3VLConfig
 
 
+def _normalize_pi0_action_expert_init_path(path: str | None) -> tuple[str | None, bool]:
+    """Return (path, autodiscovery_disabled) for pi0 action-expert init."""
+    if path is None:
+        return None, False
+    value = str(path).strip()
+    if value.lower() in {"", "none", "disable", "disabled", "random"}:
+        return None, True
+    return value, False
+
+
 def resolve_config(model_or_id: str | VLMConfig) -> VLMConfig:
     """Resolve VLM config from model id (Qwen3.5 or Qwen3-VL) or pass through."""
     if not isinstance(model_or_id, str):
@@ -45,14 +57,18 @@ def resolve_config(model_or_id: str | VLMConfig) -> VLMConfig:
     if is_supported_qwen3_5_model_id(model_or_id):
         return make_qwen3_5_config(model_or_id)
     if is_supported_qwen3_vl_model_id(model_or_id):
-        return make_vl_config(model_or_id)
+        return apply_pi0_action_expert_metadata_from_source(
+            make_vl_config(model_or_id), model_or_id
+        )
 
     hf_cfg = load_hf_config_from_source(model_or_id)
     model_type = hf_cfg.get("model_type")
     if model_type in {"qwen3_5", "qwen3_5_moe"}:
         return make_qwen3_5_config_from_hf(hf_cfg)
     if model_type in {"qwen3_vl", "qwen3_vl_moe"}:
-        return make_vl_config_from_hf(hf_cfg)
+        return apply_pi0_action_expert_metadata_from_source(
+            make_vl_config_from_hf(hf_cfg), model_or_id
+        )
 
     raise ValueError(
         f"Unsupported VLM model/config source '{model_or_id}'. "
@@ -143,6 +159,7 @@ def forward(
     image_grid_thw: jax.Array | None = None,
     vision_cu_seqlens: jax.Array | None = None,
     position_ids_ZBT: jax.Array | None = None,
+    action_expert_mask_BT: jax.Array | None = None,
 ):
     """Forward pass returning hidden states before lm_head, plus aux loss."""
     if attention_mask_BT is None:
@@ -166,6 +183,7 @@ def forward(
             token_ids_BT,
             attention_mask_BT,
             position_ids_ZBT=position_ids_ZBT,
+            action_expert_mask_BT=action_expert_mask_BT,
             pixel_values=pixel_values,
             image_grid_thw=image_grid_thw,
             vision_cu_seqlens=vision_cu_seqlens,
@@ -180,21 +198,39 @@ def load_pretrained(
     tp_size: int | None = None,
     fsdp_size: int | None = None,
     dp_size: int | None = None,
+    cfg_override: VLMConfig | None = None,
+    pi0_action_expert_init_path: str | None = None,
 ) -> tuple[nnx.Module, VLMConfig]:
     """Load a pretrained VLM from HuggingFace safetensors."""
     from huggingface_hub import snapshot_download
+    from pathlib import Path
 
     from omegalax.models.qwen3_5 import create_qwen3_5_from_safetensors
     from omegalax.models.qwen3_vl import create_qwen3_vl_from_safetensors
 
-    local_dir = snapshot_download(model_id)
-    cfg = resolve_config(model_id)
-    # Validates any active mesh matches the requested (tp, fsdp, dp); the loaders
-    # below build their own mesh from these sizes, so the return value is unused.
+    model_path = Path(model_id).expanduser()
+    local_dir = str(model_path) if model_path.exists() else snapshot_download(model_id)
+    cfg = cfg_override or resolve_config(model_id)
     ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size)
     if isinstance(cfg, Qwen3VLConfig):
+        pi0_action_expert_init_path, disable_pi0_init_discovery = (
+            _normalize_pi0_action_expert_init_path(pi0_action_expert_init_path)
+        )
+        if (
+            cfg.pi0_action_expert_enabled
+            and pi0_action_expert_init_path is None
+            and not disable_pi0_init_discovery
+        ):
+            discovered = find_pi0_action_expert_weights(cfg, local_dir)
+            if discovered is not None:
+                pi0_action_expert_init_path = str(discovered)
         model, cfg = create_qwen3_vl_from_safetensors(
-            local_dir, tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size
+            local_dir,
+            tp_size=tp_size,
+            fsdp_size=fsdp_size,
+            dp_size=dp_size,
+            cfg_override=cfg,
+            pi0_action_expert_path=pi0_action_expert_init_path,
         )
         return model, cfg
     if isinstance(cfg, Qwen3_5Config):

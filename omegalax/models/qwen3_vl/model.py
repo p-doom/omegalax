@@ -359,7 +359,12 @@ class TextAttention(nnx.Module):
         object.__setattr__(self, "_attn_backend", "mosaic_gpu")
         object.__setattr__(self, "_attn_kind", "text")
 
-    def __call__(self, hidden_BTD: jax.Array, sin_BTK: jax.Array, cos_BTK: jax.Array) -> jax.Array:
+    def project_qkv(
+        self,
+        hidden_BTD: jax.Array,
+        sin_BTK: jax.Array,
+        cos_BTK: jax.Array,
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
         B, T, _ = hidden_BTD.shape
         q_proj_BTF = self.q_proj(hidden_BTD, out_sharding=self.shd_cfg.act_btf)
         k_proj_BTF = self.k_proj(hidden_BTD, out_sharding=self.shd_cfg.act_btf)
@@ -385,25 +390,134 @@ class TextAttention(nnx.Module):
 
         q_BTHK = apply_rope(q_BTHK, sin_BTK, cos_BTK)
         k_BTGK = apply_rope(k_BTGK, sin_BTK, cos_BTK)
+        return q_BTHK, k_BTGK, v_BTGK
 
+    def attend_qkv(
+        self,
+        q_BTHK: jax.Array,
+        k_BTGK: jax.Array,
+        v_BTGK: jax.Array,
+    ) -> jax.Array:
         # force bfloat16 - tokamax attention only supports fp16/bf16
         attn_in_dtype = q_BTHK.dtype
-        attn_BTHK = dot_product_attention(
-            q_BTHK.astype(jnp.bfloat16),
-            k_BTGK.astype(jnp.bfloat16),
-            v_BTGK.astype(jnp.bfloat16),
-            is_causal=True,
-            scale=self.scale,
-            implementation=self._attn_backend,
+        return dot_product_attention(
+            q_BTHK.astype(jnp.bfloat16), k_BTGK.astype(jnp.bfloat16), v_BTGK.astype(jnp.bfloat16),
+            is_causal=True, scale=self.scale, implementation=self._attn_backend,
             q_sharding=self._q_sharding,
         ).astype(attn_in_dtype)
-        out_BTD = self.o_proj(
-            jax.lax.reshape(
-                attn_BTHK, (B, T, self.num_heads * self.head_dim), out_sharding=self.shd_cfg.act_btf
-            ),
-            out_sharding=self.shd_cfg.act_btd,
-        )
+
+    def project_output(self, attn_BTHK: jax.Array) -> jax.Array:
+        B, T, _, K = attn_BTHK.shape
+        out_BTD = self.o_proj(jax.lax.reshape(attn_BTHK, (B, T, self.num_heads * K), out_sharding=self.shd_cfg.act_btf), out_sharding=self.shd_cfg.act_btd)
         return out_BTD
+
+    def __call__(self, hidden_BTD: jax.Array, sin_BTK: jax.Array, cos_BTK: jax.Array) -> jax.Array:
+        q_BTHK, k_BTGK, v_BTGK = self.project_qkv(hidden_BTD, sin_BTK, cos_BTK)
+        attn_BTHK = self.attend_qkv(q_BTHK, k_BTGK, v_BTGK)
+        return self.project_output(attn_BTHK)
+
+
+class Pi0ActionExpertLayer(nnx.Module):
+    """Narrow decode expert matching SGLang's Qwen3-VL pi0 action expert."""
+
+    def __init__(self, cfg: Qwen3VLConfig, *, rngs: nnx.Rngs):
+        self.shd_cfg = cfg.shd_cfg
+        self.action_width = int(cfg.pi0_action_width)
+        self.action_mlp_size = int(cfg.pi0_action_mlp_size)
+        self.num_heads = cfg.num_heads
+        self.num_kv_heads = cfg.num_kv_heads
+        self.head_dim = cfg.head_dim
+        self.q_size = cfg.num_heads * cfg.head_dim
+        self.kv_size = cfg.num_kv_heads * cfg.head_dim
+
+        self.input_layernorm = RMSNorm(self.action_width, cfg.norm_eps, rngs=rngs)
+        self.post_attention_layernorm = RMSNorm(self.action_width, cfg.norm_eps, rngs=rngs)
+        self.q_norm = RMSNorm(cfg.head_dim, cfg.norm_eps, rngs=rngs, sharding=(None,))
+        self.k_norm = RMSNorm(cfg.head_dim, cfg.norm_eps, rngs=rngs, sharding=(None,))
+
+        self.qkv_proj = nnx.Linear(
+            self.action_width,
+            self.q_size + 2 * self.kv_size,
+            use_bias=False,
+            rngs=rngs,
+            dtype=cfg.dtype,
+            param_dtype=cfg.param_dtype,
+            kernel_init=wp(
+                nnx.initializers.normal(stddev=0.02 / np.sqrt(self.action_width)),
+                ("embed", "heads"),
+            ),
+        )
+        self.o_proj = nnx.Linear(
+            self.q_size,
+            self.action_width,
+            use_bias=False,
+            rngs=rngs,
+            dtype=cfg.dtype,
+            param_dtype=cfg.param_dtype,
+            kernel_init=wp(
+                nnx.initializers.normal(stddev=0.02 / np.sqrt(self.q_size)),
+                ("heads", "embed"),
+            ),
+        )
+        self.gate_up_proj = nnx.Linear(
+            self.action_width,
+            2 * self.action_mlp_size,
+            use_bias=False,
+            rngs=rngs,
+            dtype=cfg.dtype,
+            param_dtype=cfg.param_dtype,
+            kernel_init=wp(
+                nnx.initializers.normal(stddev=0.02 / np.sqrt(self.action_width)),
+                ("embed", "mlp"),
+            ),
+        )
+        self.down_proj = nnx.Linear(
+            self.action_mlp_size,
+            self.action_width,
+            use_bias=False,
+            rngs=rngs,
+            dtype=cfg.dtype,
+            param_dtype=cfg.param_dtype,
+            kernel_init=wp(
+                nnx.initializers.normal(stddev=0.02 / np.sqrt(self.action_mlp_size)),
+                ("mlp", "embed"),
+            ),
+        )
+
+    def project_qkv(
+        self,
+        hidden_BTW: jax.Array,
+        sin_BTK: jax.Array,
+        cos_BTK: jax.Array,
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        B, T, _ = hidden_BTW.shape
+        qkv_BTF = self.qkv_proj(hidden_BTW, out_sharding=self.shd_cfg.act_btf)
+        q_BTF, k_BTF, v_BTF = jnp.split(
+            qkv_BTF,
+            [self.q_size, self.q_size + self.kv_size],
+            axis=-1,
+        )
+        q_BTHK = self.q_norm(jax.lax.reshape(q_BTF, (B, T, self.num_heads, self.head_dim), out_sharding=self.shd_cfg.act_btnh))
+        k_BTGK = self.k_norm(jax.lax.reshape(k_BTF, (B, T, self.num_kv_heads, self.head_dim), out_sharding=self.shd_cfg.act_btnh))
+        v_BTGK = jax.lax.reshape(v_BTF, (B, T, self.num_kv_heads, self.head_dim), out_sharding=self.shd_cfg.act_btnh)
+        q_BTHK = apply_rope(q_BTHK, sin_BTK, cos_BTK)
+        k_BTGK = apply_rope(k_BTGK, sin_BTK, cos_BTK)
+        return q_BTHK, k_BTGK, v_BTGK
+
+    def project_attention_output(self, attn_BTHK: jax.Array) -> jax.Array:
+        B, T, _, K = attn_BTHK.shape
+        attn_BTF = jax.lax.reshape(
+            attn_BTHK,
+            (B, T, self.num_heads * K),
+            out_sharding=self.shd_cfg.act_btf,
+        )
+        return self.o_proj(attn_BTF, out_sharding=self.shd_cfg.act_btd)
+
+    def mlp(self, hidden_BTW: jax.Array) -> jax.Array:
+        gate_up_BTF = self.gate_up_proj(hidden_BTW, out_sharding=self.shd_cfg.act_btf)
+        gate_BTF, up_BTF = jnp.split(gate_up_BTF, 2, axis=-1)
+        hidden_BTF = nnx.silu(gate_BTF) * up_BTF
+        return self.down_proj(hidden_BTF, out_sharding=self.shd_cfg.act_btd)
 
 
 class TextDecoderLayer(nnx.Module):
@@ -414,11 +528,26 @@ class TextDecoderLayer(nnx.Module):
         self.post_attention_layernorm = RMSNorm(cfg.emb_dim, cfg.norm_eps, rngs=rngs)
         self.is_moe = cfg.is_moe_layer(layer_idx)
         self.mlp = TextMoEFeedForward(cfg, rngs=rngs) if self.is_moe else TextMLP(cfg, rngs=rngs)
+        self.action_expert = Pi0ActionExpertLayer(cfg, rngs=rngs) if cfg.pi0_action_expert_enabled else None
 
     @partial(jax.remat, static_argnums=0)
     def __call__(
-        self, hidden_BTD: jax.Array, sin_BTK: jax.Array, cos_BTK: jax.Array
-    ) -> tuple[jax.Array, jax.Array]:
+        self,
+        hidden_BTD: jax.Array,
+        sin_BTK: jax.Array,
+        cos_BTK: jax.Array,
+        action_hidden_BTW: jax.Array | None = None,
+        action_mask_BT: jax.Array | None = None,
+    ):
+        if self.action_expert is not None and action_hidden_BTW is not None and action_mask_BT is not None:
+            return self._forward_with_action_expert(
+                hidden_BTD,
+                action_hidden_BTW,
+                action_mask_BT,
+                sin_BTK,
+                cos_BTK,
+            )
+
         hidden_BTD = hidden_BTD + self.attn(self.input_layernorm(hidden_BTD), sin_BTK, cos_BTK)
         if self.is_moe:
             ff_out_BTD, aux_loss = self.mlp(self.post_attention_layernorm(hidden_BTD))
@@ -427,6 +556,55 @@ class TextDecoderLayer(nnx.Module):
             aux_loss = jnp.array(0.0, dtype=jnp.float32)
         hidden_BTD = hidden_BTD + ff_out_BTD
         return hidden_BTD, aux_loss
+
+    def _forward_with_action_expert(
+        self,
+        hidden_BTD: jax.Array,
+        action_hidden_BTW: jax.Array,
+        action_mask_BT: jax.Array,
+        sin_BTK: jax.Array,
+        cos_BTK: jax.Array,
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        action_mask_B11 = action_mask_BT[:, :, None, None]
+        action_mask_BTD = action_mask_BT[:, :, None]
+
+        backbone_norm_BTD = self.input_layernorm(hidden_BTD)
+        expert_norm_BTW = self.action_expert.input_layernorm(action_hidden_BTW)
+        q_backbone_BTHK, k_backbone_BTGK, v_backbone_BTGK = self.attn.project_qkv(
+            backbone_norm_BTD, sin_BTK, cos_BTK
+        )
+        q_expert_BTHK, k_expert_BTGK, v_expert_BTGK = self.action_expert.project_qkv(
+            expert_norm_BTW, sin_BTK, cos_BTK
+        )
+        q_BTHK = jnp.where(action_mask_B11, q_expert_BTHK, q_backbone_BTHK)
+        k_BTGK = jnp.where(action_mask_B11, k_expert_BTGK, k_backbone_BTGK)
+        v_BTGK = jnp.where(action_mask_B11, v_expert_BTGK, v_backbone_BTGK)
+
+        attn_BTHK = self.attn.attend_qkv(q_BTHK, k_BTGK, v_BTGK)
+        backbone_attn_BTD = self.attn.project_output(attn_BTHK)
+        expert_attn_BTW = self.action_expert.project_attention_output(attn_BTHK)
+        hidden_BTD = jnp.where(action_mask_BTD, hidden_BTD, hidden_BTD + backbone_attn_BTD)
+        action_hidden_BTW = jnp.where(
+            action_mask_BTD,
+            action_hidden_BTW + expert_attn_BTW,
+            action_hidden_BTW,
+        )
+
+        if self.is_moe:
+            backbone_ff_BTD, aux_loss = self.mlp(self.post_attention_layernorm(hidden_BTD))
+        else:
+            backbone_ff_BTD = self.mlp(self.post_attention_layernorm(hidden_BTD))
+            aux_loss = jnp.array(0.0, dtype=jnp.float32)
+        expert_ff_BTW = self.action_expert.mlp(
+            self.action_expert.post_attention_layernorm(action_hidden_BTW)
+        )
+        hidden_BTD = jnp.where(action_mask_BTD, hidden_BTD, hidden_BTD + backbone_ff_BTD)
+        action_hidden_BTW = jnp.where(
+            action_mask_BTD,
+            action_hidden_BTW + expert_ff_BTW,
+            action_hidden_BTW,
+        )
+        return hidden_BTD, action_hidden_BTW, aux_loss
 
 
 class TextModel(nnx.Module):
@@ -445,6 +623,31 @@ class TextModel(nnx.Module):
             [TextDecoderLayer(cfg, layer_idx=i, rngs=rngs) for i in range(cfg.num_layers)]
         )
         self.final_norm = RMSNorm(cfg.emb_dim, cfg.norm_eps, rngs=rngs)
+        if cfg.pi0_action_expert_enabled:
+            self.action_input_proj = nnx.Linear(
+                cfg.emb_dim,
+                cfg.pi0_action_width,
+                use_bias=False,
+                rngs=rngs,
+                dtype=cfg.dtype,
+                param_dtype=cfg.param_dtype,
+                kernel_init=wp(
+                    nnx.initializers.normal(stddev=1.0 / np.sqrt(cfg.emb_dim)),
+                    ("embed", "hidden"),
+                ),
+            )
+            self.action_output_proj = nnx.Linear(
+                cfg.pi0_action_width,
+                cfg.emb_dim,
+                use_bias=False,
+                rngs=rngs,
+                dtype=cfg.dtype,
+                param_dtype=cfg.param_dtype,
+                kernel_init=wp(
+                    nnx.initializers.normal(stddev=1.0 / np.sqrt(cfg.pi0_action_width)),
+                    ("hidden", "embed"),
+                ),
+            )
 
 
 class Qwen3VL(nnx.Module):
@@ -478,6 +681,7 @@ class Qwen3VL(nnx.Module):
         token_ids_BT: jax.Array,
         attention_mask_BT: jax.Array,
         position_ids_ZBT: jax.Array | np.ndarray | None = None,
+        action_expert_mask_BT: jax.Array | None = None,
         pixel_values: jax.Array | None = None,
         image_grid_thw: jax.Array | None = None,
         vision_cu_seqlens: jax.Array | None = None,
@@ -541,9 +745,28 @@ class Qwen3VL(nnx.Module):
         )
 
         hidden_BTD = inputs_embeds_BTD
+        use_action_expert = bool(cfg.pi0_action_expert_enabled) and action_expert_mask_BT is not None
+        if use_action_expert:
+            action_expert_mask_BT = jnp.asarray(action_expert_mask_BT).astype(bool)
+            action_hidden_BTW = self.text.action_input_proj(
+                inputs_embeds_BTD,
+                out_sharding=self.text.out_emb_shd,
+            )
+        else:
+            action_hidden_BTW = None
+
         aux_losses = []
         for layer_idx, layer in enumerate(self.text.layers):
-            hidden_BTD, aux_loss = layer(hidden_BTD, sin_BTK, cos_BTK)
+            if use_action_expert:
+                hidden_BTD, action_hidden_BTW, aux_loss = layer(
+                    hidden_BTD,
+                    sin_BTK,
+                    cos_BTK,
+                    action_hidden_BTW,
+                    action_expert_mask_BT,
+                )
+            else:
+                hidden_BTD, aux_loss = layer(hidden_BTD, sin_BTK, cos_BTK)
             aux_losses.append(aux_loss)
             if deepstack_features is not None and layer_idx < len(deepstack_features):
                 hidden_BTD = _deepstack_process(
@@ -552,6 +775,13 @@ class Qwen3VL(nnx.Module):
                     deepstack_features[layer_idx],
                     out_sharding=self.text.out_emb_shd,
                 )
+
+        if use_action_expert:
+            expert_out_BTD = self.text.action_output_proj(
+                action_hidden_BTW,
+                out_sharding=self.text.out_emb_shd,
+            )
+            hidden_BTD = jnp.where(action_expert_mask_BT[:, :, None], expert_out_BTD, hidden_BTD)
 
         hidden_BTD = self.text.final_norm(hidden_BTD)
         total_aux = (

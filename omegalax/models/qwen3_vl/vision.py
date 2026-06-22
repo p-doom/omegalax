@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import os
 from functools import partial
 
 import jax
 import jax.numpy as jnp
 from flax import nnx
 from jax.sharding import PartitionSpec as P, reshard
+from tokamax import dot_product_attention as _tokamax_dot_product_attention
 
 from jax._src.cudnn.fused_attention_stablehlo import (
     MaskType as _CuDnnMaskType,
@@ -16,6 +18,9 @@ from jax._src.cudnn.fused_attention_stablehlo import (
 
 from omegalax.models.shard_config import ShardConfig
 from .config import Qwen3VLVisionConfig
+
+
+_VISION_ATTN_BACKEND_ENV = "OMEGALAX_QWEN3_VL_VISION_ATTN_BACKEND"
 
 
 def _cudnn_packed_vision_attention_local(
@@ -73,9 +78,11 @@ def _cudnn_packed_vision_attention(
     only its local shards (no explicit sharding inside), matching cuDNN's
     per-device view.
 
-    ``seqlens`` is passed in rather than computed via ``jnp.diff(cu_seqlens)``
-    since ``diff`` would slice a sharded (dp*(M+1),) axis to (dp*(M+1) - 1,),
-    which is not evenly divisible by ``dp``.
+    ``seqlens`` is passed in rather than computed via ``jnp.diff(cu_seqlens)``.
+    In the sharded path, each device receives its local ``seqlens`` slice and
+    reconstructs a local cumulative-offset vector.  Sharding the global
+    ``cu_seqlens`` vector directly is invalid because its length is ``M + 1``,
+    which is not generally divisible by the data-parallel mesh axis.
 
     Args:
         q_NHK, k_NHK, v_NHK: (N, num_heads, head_dim) with N == cu_seqlens[-1].
@@ -98,14 +105,100 @@ def _cudnn_packed_vision_attention(
         )
 
     q_spec = P(dp_axis, None, None)
-    cu_spec = P(dp_axis)
+    seqlens_spec = P(dp_axis)
     return jax.shard_map(
-        lambda q, k, v, cu, sq: _cudnn_packed_vision_attention_local(q, k, v, cu, sq, scale),
+        lambda q, k, v, sq: _cudnn_packed_vision_attention_local(
+            q,
+            k,
+            v,
+            jnp.concatenate(
+                [
+                    jnp.zeros(1, dtype=jnp.int32),
+                    jnp.cumsum(sq.astype(jnp.int32), dtype=jnp.int32),
+                ]
+            ),
+            sq,
+            scale,
+        ),
         mesh=sharding.mesh,
-        in_specs=(q_spec, q_spec, q_spec, cu_spec, cu_spec),
+        in_specs=(q_spec, q_spec, q_spec, seqlens_spec),
         out_specs=q_spec,
         check_vma=False,
-    )(q_NHK, k_NHK, v_NHK, cu_seqlens, seqlens)
+    )(q_NHK, k_NHK, v_NHK, seqlens)
+
+
+def _tokamax_equal_length_vision_attention(
+    q_NHK: jax.Array,
+    k_NHK: jax.Array,
+    v_NHK: jax.Array,
+    seqlens: jax.Array,
+    scale: float,
+    implementation: str,
+) -> jax.Array:
+    """Dense per-image vision attention for equal-length packed segments.
+
+    This is a compatibility fallback for GPUs that cannot lower cuDNN's packed
+    THD layout.  It preserves the same segment isolation by reshaping the
+    packed sequence into ``(num_images, tokens_per_image, heads, head_dim)``.
+    """
+    total_tokens, num_heads, head_dim = q_NHK.shape
+    num_segments = seqlens.shape[0]
+    if num_segments <= 0 or total_tokens % num_segments != 0:
+        raise ValueError(
+            "Qwen3-VL vision attention fallback requires equal-length image segments; "
+            f"got total_tokens={total_tokens}, num_segments={num_segments}."
+        )
+
+    segment_len = total_tokens // num_segments
+    orig_dtype = q_NHK.dtype
+    q_MLHK = q_NHK.reshape(num_segments, segment_len, num_heads, head_dim)
+    k_MLHK = k_NHK.reshape(num_segments, segment_len, num_heads, head_dim)
+    v_MLHK = v_NHK.reshape(num_segments, segment_len, num_heads, head_dim)
+    q_sharding = jax.typeof(q_MLHK).sharding
+    if not getattr(getattr(q_sharding, "mesh", None), "axis_names", ()):
+        q_sharding = None
+
+    attn_MLHK = _tokamax_dot_product_attention(
+        q_MLHK.astype(jnp.bfloat16),
+        k_MLHK.astype(jnp.bfloat16),
+        v_MLHK.astype(jnp.bfloat16),
+        scale=scale,
+        is_causal=False,
+        implementation=implementation,
+        q_sharding=q_sharding,
+    )
+    return attn_MLHK.reshape(total_tokens, num_heads, head_dim).astype(orig_dtype)
+
+
+def _vision_attention_backend() -> str:
+    return os.environ.get(_VISION_ATTN_BACKEND_ENV, "cudnn").strip().lower()
+
+
+def _vision_attention(
+    q_NHK: jax.Array,
+    k_NHK: jax.Array,
+    v_NHK: jax.Array,
+    cu_seqlens: jax.Array,
+    seqlens: jax.Array,
+    scale: float,
+) -> jax.Array:
+    backend = _vision_attention_backend()
+    if backend in ("", "cudnn", "packed_cudnn"):
+        return _cudnn_packed_vision_attention(
+            q_NHK, k_NHK, v_NHK, cu_seqlens, seqlens, scale,
+        )
+    if backend in ("dense", "xla_chunked", "tokamax_xla_chunked"):
+        return _tokamax_equal_length_vision_attention(
+            q_NHK, k_NHK, v_NHK, seqlens, scale, "xla_chunked",
+        )
+    if backend in ("xla", "tokamax_xla"):
+        return _tokamax_equal_length_vision_attention(
+            q_NHK, k_NHK, v_NHK, seqlens, scale, "xla",
+        )
+    raise ValueError(
+        f"Unknown {_VISION_ATTN_BACKEND_ENV}={backend!r}; "
+        "expected cudnn, xla_chunked, or xla."
+    )
 
 
 def _token_spatial_coords(

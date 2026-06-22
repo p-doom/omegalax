@@ -262,6 +262,16 @@ def load_compiled_metadata(path: str | Path) -> dict[str, Any]:
     return json.loads(metadata_path.read_text())
 
 
+def _process_data_parallel_size(dp_size: int | None, fsdp_size: int | None) -> int:
+    dp = int(dp_size or 1)
+    fsdp = int(fsdp_size or 1)
+    if dp <= 0 or fsdp <= 0:
+        raise ValueError(f"dp_size and fsdp_size must be > 0, got dp={dp}, fsdp={fsdp}.")
+    if jax.process_count() == 1:
+        return dp
+    return dp * fsdp
+
+
 def required_epochs_for_batches(
     path: str | Path,
     *,
@@ -277,12 +287,12 @@ def required_epochs_for_batches(
 
     metadata = load_compiled_metadata(path)
     num_records = int(metadata["num_records"])
-    dp = dp_size * fsdp_size
+    dp = _process_data_parallel_size(dp_size, fsdp_size)
     records_per_epoch = num_records // dp
     if records_per_epoch <= 0:
         raise ValueError(
             f"Compiled Grain dataset has {num_records} records, which is too small to shard "
-            f"across data_parallel_size={dp} with drop_remainder=True."
+            f"across data_parallel_processes={dp} with drop_remainder=True."
         )
     required_records = batch_size * num_batches
     return max(1, (required_records + records_per_epoch - 1) // records_per_epoch)
@@ -822,8 +832,9 @@ def make_grain_iterator(
     round-robin. ``num_epochs=None`` repeats each source indefinitely; set a
     finite value (per source) only for validation-style finite iteration.
 
-    Data-parallel sharding spans both axes: ``dp = dp_size * fsdp_size``. The
-    process's slot is ``jax.process_index() % dp``.
+    Across multi-process runs, data sharding spans both axes:
+    ``dp = dp_size * fsdp_size``. In single-process local-FSDP runs, the one
+    process owns all local FSDP devices, so data is sharded only by ``dp_size``.
     """
     if batch_size <= 0:
         raise ValueError("batch_size must be > 0")
@@ -852,7 +863,7 @@ def make_grain_iterator(
 
     mp_options = multiprocessing_options or make_grain_multiprocessing_options()
     read_options = read_options or make_grain_read_options()
-    dp = dp_size * fsdp_size
+    dp = _process_data_parallel_size(dp_size, fsdp_size)
     dp_index = jax.process_index() % dp
 
     per_source: list[grain.MapDataset] = []

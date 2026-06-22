@@ -10,6 +10,16 @@ from omegalax.models.shard_config import ShardConfig
 
 P = PartitionSpec
 
+_REPLICATED_BATCH_KEYS = frozenset(
+    {
+        # Qwen3-VL vision tensors are concatenated over images/patches, not
+        # shaped as (B, ...), so their leading axis is not data parallel.
+        "pixel_values",
+        "image_grid_thw",
+        "vision_cu_seqlens",
+    }
+)
+
 
 def init_model_sharded(
     model_cls: type[nnx.Module],
@@ -71,7 +81,12 @@ def shard_batch_dict(
     batch_axis = shd_cfg.act_btd[0]
     result = {}
     for key, arr in batch.items():
-        if key == "position_ids_ZBT" and arr.ndim == 3:
+        if key in _REPLICATED_BATCH_KEYS:
+            if jax.process_count() > 1 and batch_axis is not None:
+                spec = P(batch_axis, *((None,) * (arr.ndim - 1)))
+            else:
+                spec = P(*((None,) * arr.ndim))
+        elif key == "position_ids_ZBT" and arr.ndim == 3:
             spec = P(None, batch_axis, None)
         else:
             spec = P(batch_axis, *((None,) * (arr.ndim - 1)))

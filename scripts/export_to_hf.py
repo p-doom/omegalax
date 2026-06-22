@@ -88,11 +88,22 @@ def _load_vlm_model():
     # IMPORTANT: vlm_api.init_model() does *random* sharded init, not weight
     # loading. Calling it here produced syntactically-valid safetensors with
     # untrained weights — a silent corruption. Use load_pretrained instead.
+    cfg_override = None
+    pi0_action_expert_init_path = None
+    if FLAGS.checkpoint_path:
+        ckpt = Path(FLAGS.checkpoint_path).expanduser()
+        cfg_override = vlm_api.resolve_config(str(ckpt.parent.resolve()))
+        if getattr(cfg_override, "pi0_action_expert_enabled", False):
+            # The checkpoint restore overwrites every expert parameter. Build
+            # the matching tree without auto-discovering any stale sidecar.
+            pi0_action_expert_init_path = "none"
     model, cfg = vlm_api.load_pretrained(
         FLAGS.model_id,
         tp_size=FLAGS.tp_size,
         fsdp_size=FLAGS.fsdp_size,
         dp_size=FLAGS.dp_size,
+        cfg_override=cfg_override,
+        pi0_action_expert_init_path=pi0_action_expert_init_path,
     )
     return model, cfg
 
@@ -222,7 +233,17 @@ def _restore_trained_weights(model, cfg, checkpoint_path: Path):
 
 
 def main(_) -> None:
-    jax.distributed.initialize()
+    distributed_mode = os.environ.get("OMEGALAX_JAX_DISTRIBUTED", "auto").lower()
+    slurm_ntasks = int(os.environ.get("SLURM_NTASKS", "1") or "1")
+    should_initialize_distributed = (
+        distributed_mode in {"1", "true", "yes", "on"}
+        or (distributed_mode == "auto" and slurm_ntasks > 1)
+    )
+    if should_initialize_distributed:
+        jax.distributed.initialize()
+        print("jax.distributed initialized")
+    else:
+        print("jax.distributed skipped for single-process run")
     model, cfg = load_model()
     if FLAGS.checkpoint_path:
         ckpt = Path(FLAGS.checkpoint_path).expanduser()

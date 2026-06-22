@@ -31,7 +31,11 @@ def required_batch_multiple(batch_spec: PartitionSpec, mesh: Mesh) -> int:
     axis = batch_spec[0]
     if axis is None:
         return 1
-    return int(mesh.shape[axis])
+    axes = (axis,) if isinstance(axis, str) else tuple(axis)
+    multiple = 1
+    for axis_name in axes:
+        multiple *= int(mesh.shape[axis_name])
+    return multiple
 
 
 def process_local_batch_size(global_batch_size: int, dp_size: int, fsdp_size: int) -> int:
@@ -42,6 +46,8 @@ def process_local_batch_size(global_batch_size: int, dp_size: int, fsdp_size: in
         raise ValueError(
             f"Global batch size {global_batch_size} must be divisible by data_parallel_size={dp}."
         )
+    if jax.process_count() == 1:
+        return global_batch_size
     return global_batch_size // dp
 
 

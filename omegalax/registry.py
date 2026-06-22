@@ -28,7 +28,7 @@ def _load_resolved_hf_config(model_id: str) -> dict:
     elif is_supported_qwen3_vl_model_id(model_id):
         source = resolve_qwen3_vl_repo_id(model_id)
     else:
-        raise ValueError(f"Unsupported model id '{model_id}'")
+        source = model_id
     return load_hf_config_from_source(source)
 
 

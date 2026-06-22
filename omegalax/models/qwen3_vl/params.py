@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 from safetensors import numpy as stnp
@@ -20,12 +21,14 @@ from omegalax.models.params_utils import (
     write_moe_experts_to_hf,
 )
 from .config import Qwen3VLConfig
+from .config import pi0_action_expert_filename, save_pi0_action_expert_metadata
 from .loader import _get_non_expert_mapping, create_qwen3_vl_from_safetensors
 from .model import Qwen3VL
 
 __all__ = [
     "create_qwen3_vl_from_safetensors",
     "export_qwen3_vl_to_safetensors",
+    "export_qwen3_vl_pi0_action_expert_to_safetensors",
     "qwen3_vl_to_hf_config_dict",
 ]
 
@@ -75,6 +78,9 @@ def qwen3_vl_to_hf_config_dict(cfg: Qwen3VLConfig) -> dict[str, Any]:
             }
         )
     return {
+        "architectures": [
+            "Qwen3VLMoeForConditionalGeneration" if cfg.num_experts > 0 else "Qwen3VLForConditionalGeneration"
+        ],
         "model_type": model_type,
         "tie_word_embeddings": cfg.tie_word_embeddings,
         "image_token_id": cfg.image_token_id,
@@ -97,6 +103,64 @@ def qwen3_vl_to_hf_config_dict(cfg: Qwen3VLConfig) -> dict[str, Any]:
         },
         "text_config": text_cfg,
     }
+
+
+def _is_pi0_action_expert_state_key(jax_key: str) -> bool:
+    return (
+        jax_key in {"text.action_input_proj.kernel", "text.action_output_proj.kernel"}
+        or ".action_expert." in jax_key
+    )
+
+
+def _device_array(value, dtype=None) -> np.ndarray:
+    arr = jnp.asarray(value)
+    if dtype is not None:
+        arr = arr.astype(dtype)
+    return np.asarray(jax.device_get(arr))
+
+
+def export_qwen3_vl_pi0_action_expert_to_safetensors(
+    model: Qwen3VL,
+    cfg: Qwen3VLConfig,
+    out_dir: str | Path,
+) -> Path:
+    """Export only the SGLang-compatible pi0 action expert safetensors file."""
+    if not cfg.pi0_action_expert_enabled:
+        raise ValueError("Qwen3-VL config does not enable the pi0 action expert")
+
+    out_path = Path(out_dir).expanduser()
+    out_path.mkdir(parents=True, exist_ok=True)
+    tensor_path = out_path / pi0_action_expert_filename(cfg)
+
+    _, abs_state = nnx.split(model)
+    flat_state = flatten_pure_state(nnx.to_pure_dict(abs_state))
+
+    tensors: dict[str, np.ndarray] = {}
+    export_dtype = cfg.dtype
+
+    def _linear(torch_key: str, jax_key: str) -> None:
+        tensors[torch_key] = np.ascontiguousarray(_device_array(flat_state[jax_key], export_dtype).T)
+
+    def _scale(torch_key: str, jax_key: str) -> None:
+        tensors[torch_key] = np.ascontiguousarray(_device_array(flat_state[jax_key], export_dtype))
+
+    _linear("action_input_proj.weight", "text.action_input_proj.kernel")
+    _linear("action_output_proj.weight", "text.action_output_proj.kernel")
+
+    for layer_idx in range(cfg.num_layers):
+        torch_prefix = f"layers.{layer_idx}.action_expert"
+        jax_prefix = f"text.layers.{layer_idx}.action_expert"
+        _scale(f"{torch_prefix}.input_layernorm.weight", f"{jax_prefix}.input_layernorm.scale")
+        _scale(f"{torch_prefix}.post_attention_layernorm.weight", f"{jax_prefix}.post_attention_layernorm.scale")
+        _scale(f"{torch_prefix}.q_norm.weight", f"{jax_prefix}.q_norm.scale")
+        _scale(f"{torch_prefix}.k_norm.weight", f"{jax_prefix}.k_norm.scale")
+        _linear(f"{torch_prefix}.qkv_proj.weight", f"{jax_prefix}.qkv_proj.kernel")
+        _linear(f"{torch_prefix}.o_proj.weight", f"{jax_prefix}.o_proj.kernel")
+        _linear(f"{torch_prefix}.gate_up_proj.weight", f"{jax_prefix}.gate_up_proj.kernel")
+        _linear(f"{torch_prefix}.down_proj.weight", f"{jax_prefix}.down_proj.kernel")
+
+    stnp.save_file(tensors, tensor_path)
+    return tensor_path
 
 
 def export_qwen3_vl_to_safetensors(model: Qwen3VL, cfg: Qwen3VLConfig, out_dir: str | Path) -> Path:
@@ -154,6 +218,8 @@ def export_qwen3_vl_to_safetensors(model: Qwen3VL, cfg: Qwen3VLConfig, out_dir: 
         return False
 
     for jax_key, value in flat_state.items():
+        if _is_pi0_action_expert_state_key(jax_key):
+            continue
         if _handle_special(jax_key, value):
             continue
 
@@ -193,5 +259,8 @@ def export_qwen3_vl_to_safetensors(model: Qwen3VL, cfg: Qwen3VLConfig, out_dir: 
 
     stnp.save_file(hf_tensors, tensor_path)
     save_hf_config(qwen3_vl_to_hf_config_dict(cfg), out_path)
+    if cfg.pi0_action_expert_enabled:
+        export_qwen3_vl_pi0_action_expert_to_safetensors(model, cfg, out_path)
+        save_pi0_action_expert_metadata(cfg, out_path)
 
     return tensor_path

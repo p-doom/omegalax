@@ -16,6 +16,7 @@ from omegalax.models.shard_config import shard_config_for_mesh
 from omegalax.models.sharding_runtime import _finalize_q_shardings
 from omegalax.models.params_utils import (
     Transform,
+    assign_to_state_dict,
     assign_weights_from_eval_shape,
     check_conversion_errors,
     finalize_experts,
@@ -28,6 +29,76 @@ from omegalax.models.params_utils import (
 )
 from .config import Qwen3VLConfig, make_vl_config_from_hf
 from .model import Qwen3VL
+
+
+def _find_qwen3_vl_base_safetensors(file_dir: str | epath.Path) -> list[epath.Path]:
+    """Return HF backbone shards, excluding pi0 sidecar safetensors in the same directory."""
+    path = epath.Path(file_dir).expanduser()
+    files = sorted(
+        f for f in path.glob("model*.safetensors")
+        if f.name == "model.safetensors" or re.fullmatch(r"model-\d{5}-of-\d{5}\.safetensors", f.name)
+    )
+    if files:
+        return files
+    return find_safetensors(file_dir)
+
+
+def _pi0_action_expert_key_mapping(cfg: Qwen3VLConfig) -> dict[str, tuple[str, bool]]:
+    """SGLang action-expert key -> (OmegaLax state key, transpose)."""
+    mapping: dict[str, tuple[str, bool]] = {
+        "action_input_proj.weight": ("text.action_input_proj.kernel", True),
+        "action_output_proj.weight": ("text.action_output_proj.kernel", True),
+    }
+    for layer_idx in range(cfg.num_layers):
+        prefix = f"layers.{layer_idx}.action_expert"
+        jax_prefix = f"text.layers.{layer_idx}.action_expert"
+        mapping[f"{prefix}.input_layernorm.weight"] = (f"{jax_prefix}.input_layernorm.scale", False)
+        mapping[f"{prefix}.post_attention_layernorm.weight"] = (f"{jax_prefix}.post_attention_layernorm.scale", False)
+        mapping[f"{prefix}.q_norm.weight"] = (f"{jax_prefix}.q_norm.scale", False)
+        mapping[f"{prefix}.k_norm.weight"] = (f"{jax_prefix}.k_norm.scale", False)
+        mapping[f"{prefix}.qkv_proj.weight"] = (f"{jax_prefix}.qkv_proj.kernel", True)
+        mapping[f"{prefix}.o_proj.weight"] = (f"{jax_prefix}.o_proj.kernel", True)
+        mapping[f"{prefix}.gate_up_proj.weight"] = (f"{jax_prefix}.gate_up_proj.kernel", True)
+        mapping[f"{prefix}.down_proj.weight"] = (f"{jax_prefix}.down_proj.kernel", True)
+    return mapping
+
+
+def _load_pi0_action_expert_from_safetensors(
+    state_dict: dict[str, Any],
+    cfg: Qwen3VLConfig,
+    path: str | epath.Path,
+) -> None:
+    if not cfg.pi0_action_expert_enabled:
+        raise ValueError("Cannot load pi0 action expert weights unless the config enables the action expert")
+    weight_path = epath.Path(path).expanduser()
+    if not weight_path.exists():
+        raise ValueError(f"pi0 action expert weights not found: {weight_path}")
+
+    mapping = _pi0_action_expert_key_mapping(cfg)
+    expected = set(mapping)
+    loaded: set[str] = set()
+    with safetensors.safe_open(str(weight_path), framework="numpy") as sf:
+        keys = set(sf.keys())
+        missing = sorted(expected - keys)
+        unexpected = sorted(keys - expected)
+        if missing or unexpected:
+            parts = []
+            if missing:
+                parts.append(f"missing={missing[:8]}{'...' if len(missing) > 8 else ''}")
+            if unexpected:
+                parts.append(f"unexpected={unexpected[:8]}{'...' if len(unexpected) > 8 else ''}")
+            raise RuntimeError(f"Invalid pi0 action expert checkpoint {weight_path}: " + ", ".join(parts))
+
+        for torch_key in sorted(expected):
+            jax_key, should_transpose = mapping[torch_key]
+            tensor = sf.get_tensor(torch_key)
+            if should_transpose:
+                tensor = tensor.T
+            assign_to_state_dict(state_dict, jax_key, jnp.asarray(tensor), torch_key)
+            loaded.add(torch_key)
+
+    if loaded != expected:
+        raise RuntimeError(f"Failed to load all pi0 action expert tensors from {weight_path}")
 
 
 def _assert_vl_config(cfg: Qwen3VLConfig, hf_cfg: dict):
@@ -155,15 +226,19 @@ def create_qwen3_vl_from_safetensors(
     tp_size: int | None = None,
     fsdp_size: int | None = None,
     dp_size: int | None = None,
+    cfg_override: Qwen3VLConfig | None = None,
+    pi0_action_expert_path: str | None = None,
 ) -> tuple[Qwen3VL, Qwen3VLConfig]:
     """Load HuggingFace Qwen3-VL safetensors into a JAX Qwen3-VL model."""
     mesh = ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size)
 
     path = epath.Path(file_dir).expanduser()
-    files = find_safetensors(file_dir)
+    files = _find_qwen3_vl_base_safetensors(file_dir)
 
     hf_cfg = load_hf_config(path)
-    cfg = make_vl_config_from_hf(hf_cfg)
+    base_cfg = make_vl_config_from_hf(hf_cfg)
+    _assert_vl_config(base_cfg, hf_cfg)
+    cfg = cfg_override or base_cfg
     _assert_vl_config(cfg, hf_cfg)
     cfg = dataclasses.replace(cfg, shd_cfg=shard_config_for_mesh(cfg.shd_cfg, mesh))
 
@@ -250,6 +325,13 @@ def create_qwen3_vl_from_safetensors(
             jax_layer_prefix="text.layers",
             mesh=mesh,
             pspec_dict=pspec_dict,
+        )
+
+    if pi0_action_expert_path is not None:
+        _load_pi0_action_expert_from_safetensors(
+            state_dict,
+            cfg,
+            pi0_action_expert_path,
         )
 
     check_conversion_errors(unmatched_hf_keys)
