@@ -295,16 +295,16 @@ def num_pretrain_records_usable(
 
 def num_pretrain_positions(
     *,
-    total_samples_per_process: int,
+    epoch_samples_per_process: int,
     num_epochs: int | None,
 ) -> int:
-    if total_samples_per_process <= 0:
-        raise ValueError("total_samples_per_process must be > 0")
+    if epoch_samples_per_process <= 0:
+        raise ValueError("epoch_samples_per_process must be > 0")
     if num_epochs is None:
         return MAX_PRETRAIN_POSITIONS
     if num_epochs <= 0:
         raise ValueError("num_epochs must be > 0")
-    return int(total_samples_per_process) * int(num_epochs)
+    return int(epoch_samples_per_process) * int(num_epochs)
 
 
 class PretrainIndexRecordMap:
@@ -313,7 +313,7 @@ class PretrainIndexRecordMap:
         *,
         index_shard_paths: Sequence[str | Path],
         num_records: int,
-        total_samples_per_process: int,
+        epoch_samples_per_process: int,
         dp_size: int,
         dp_index: int,
         shuffle: bool,
@@ -324,7 +324,7 @@ class PretrainIndexRecordMap:
             str(Path(path).expanduser().resolve()) for path in index_shard_paths
         ]
         self.num_records = int(num_records)
-        self.total_samples_per_process = int(total_samples_per_process)
+        self.epoch_samples_per_process = int(epoch_samples_per_process)
         self.dp_size = int(dp_size)
         self.dp_index = int(dp_index)
         self.shuffle = bool(shuffle)
@@ -338,7 +338,7 @@ class PretrainIndexRecordMap:
         return self._source
 
     def __call__(self, absolute_pos: int) -> dict[str, Any]:
-        epoch, local_pos = divmod(int(absolute_pos), self.total_samples_per_process)
+        epoch, local_pos = divmod(int(absolute_pos), self.epoch_samples_per_process)
         global_pos = self.dp_index + local_pos * self.dp_size
         if self.shuffle:
             index_record_idx = grain.experimental.index_shuffle(
@@ -369,25 +369,25 @@ def make_pretrain_index_record_dataset(
         dp_size=dp_size,
         records_per_local_batch=records_per_local_batch,
     )
-    total_samples_per_process = calculate_samples_per_process(
+    epoch_samples_per_process = calculate_samples_per_process(
         num_records=usable_records,
         dp_size=dp_size,
         dp_index=dp_index,
     )
-    if not total_samples_per_process:
+    if not epoch_samples_per_process:
         raise ValueError(
             f"No complete pretrain batch assigned to dp_index={dp_index} "
             f"with dp_size={dp_size} and records_per_local_batch={records_per_local_batch}"
         )
-    num_positions = num_pretrain_positions(
-        total_samples_per_process=total_samples_per_process,
+    total_samples_per_process = num_pretrain_positions(
+        epoch_samples_per_process=epoch_samples_per_process,
         num_epochs=num_epochs,
     )
-    dataset = grain.MapDataset.range(num_positions).map(
+    index_dataset = grain.MapDataset.range(total_samples_per_process).map(
         PretrainIndexRecordMap(
             index_shard_paths=index_shard_paths,
             num_records=num_records,
-            total_samples_per_process=total_samples_per_process,
+            epoch_samples_per_process=epoch_samples_per_process,
             dp_size=dp_size,
             dp_index=dp_index,
             shuffle=shuffle,
@@ -395,7 +395,7 @@ def make_pretrain_index_record_dataset(
             shuffle_rounds=shuffle_rounds,
         )
     )
-    return dataset, total_samples_per_process
+    return index_dataset, epoch_samples_per_process
 
 
 def write_json_arrayrecord_dataset(

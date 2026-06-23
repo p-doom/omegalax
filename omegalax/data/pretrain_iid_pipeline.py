@@ -262,7 +262,7 @@ def make_iid_iterator(
     if num_records == 0:
         raise ValueError(f"IID chunk index has no records: {index_path}")
 
-    dataset, _ = make_pretrain_index_record_dataset(
+    index_dataset, _ = make_pretrain_index_record_dataset(
         index_shard_paths=index_shard_paths,
         num_records=num_records,
         num_epochs=num_epochs,
@@ -273,7 +273,7 @@ def make_iid_iterator(
         seed=seed,
         shuffle_rounds=IID_INDEX_SHUFFLE_ROUNDS,
     )
-    batched = dataset.batch(
+    batched = index_dataset.batch(
         batch_size=batch_size,
         drop_remainder=True,
         batch_fn=_IIDPretrainBatchBuilder(
