@@ -8,11 +8,11 @@ from omegalax.data.grain_pipeline import (
     make_grain_iterator,
     pop_source_ids,
 )
-from omegalax.data.pretrain_doc_chain import (
+from omegalax.data.pretrain_data_set import (
     BATCH_PRETRAIN_METADATA_KEY,
     DEFAULT_DOC_CHAIN_SPLIT,
     DOC_CHAIN_FORMAT,
-    DocChainReader,
+    DataSetReader,
     DocChainRecord,
     DocPairRef,
     deserialize_doc_chain,
@@ -36,7 +36,7 @@ __all__ = [
     "BATCH_PRETRAIN_METADATA_KEY",
     "DEFAULT_DOC_CHAIN_SPLIT",
     "DOC_CHAIN_FORMAT",
-    "DocChainReader",
+    "DataSetReader",
     "DocChainRecord",
     "DocPairRef",
     "MixSource",

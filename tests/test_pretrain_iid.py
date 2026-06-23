@@ -14,9 +14,10 @@ from absl.testing import absltest
 from array_record.python.array_record_module import ArrayRecordReader, ArrayRecordWriter
 import numpy as np
 
-from omegalax.data.pretrain_doc_chain import (
+from omegalax.data.pretrain_data_set import (
     DOC_CHAIN_BINARY_HEADER,
     DOC_CHAIN_BINARY_MAGIC,
+    DEFAULT_EOS_ID,
     iter_json_arrayrecord_records,
     load_arrayrecord_metadata,
     resolve_doc_chain_buckets,
@@ -90,7 +91,8 @@ class PretrainIidTest(absltest.TestCase):
             bucket_names = self._bucket_names(root, "train")
 
             self.assertEqual(metadata["segment_length"], 4096)
-            self.assertEqual(metadata["doc_chain_root"], str(root.resolve()))
+            self.assertEqual(metadata["eos_id"], DEFAULT_EOS_ID)
+            self.assertEqual(metadata["data_set_root"], str(root.resolve()))
             self.assertEqual(metadata["split"], "train")
             self.assertEqual(metadata["bucket_names"], bucket_names)
             self.assertNotIn("bucket_paths", metadata)
@@ -139,7 +141,7 @@ class PretrainIidTest(absltest.TestCase):
                 np.asarray([0, 1], dtype=np.int32),
             )
 
-    def test_iid_iterator_rewrites_doc_chain_root_to_local_root(self):
+    def test_iid_iterator_rewrites_data_set_root_to_local_root(self):
         with test_temp_dir() as tmp:
             tmpdir = Path(tmp)
             index, root = self._build_real_index(tmpdir)
@@ -277,8 +279,9 @@ class PretrainIidTest(absltest.TestCase):
             )
 
             metadata = load_arrayrecord_metadata(index)
-            self.assertEqual(metadata["doc_chain_root"], str(root.resolve()))
+            self.assertEqual(metadata["data_set_root"], str(root.resolve()))
             self.assertEqual(metadata["split"], "val")
+            self.assertEqual(metadata["eos_id"], DEFAULT_EOS_ID)
             self.assertEqual(metadata["bucket_names"], self._bucket_names(root, "val"))
             self.assertGreater(len(metadata["bucket_names"]), 1)
             self.assertGreater(metadata["num_chunks"], 0)

@@ -11,7 +11,7 @@ from pathlib import Path
 from absl.testing import absltest
 from array_record.python.array_record_module import ArrayRecordReader, ArrayRecordWriter
 
-from omegalax.data.pretrain_doc_chain import (
+from omegalax.data.pretrain_data_set import (
     ARRAY_RECORD_SUFFIX,
     COMPILED_METADATA_FILENAME,
     DOC_CHAIN_BINARY_MAGIC,

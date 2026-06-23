@@ -24,6 +24,7 @@ COMPILED_METADATA_FILENAME = "metadata.json"
 ARRAY_RECORD_SUFFIX = ".array_record"
 DEFAULT_SEGMENT_LENGTH = 4096
 DEFAULT_PAD_ID = 0
+DEFAULT_EOS_ID = 248046  # Qwen/Qwen3.5-0.8B <|im_end|>
 BATCH_PRETRAIN_METADATA_KEY = "metadata"
 DEFAULT_DOC_CHAIN_SPLIT = "train"
 PRETRAIN_SOURCE_ROOT_ENV = "OMEGALAX_PRETRAIN_SOURCE_ROOT"
@@ -188,7 +189,7 @@ def resolve_doc_chain_buckets(
     return bucket_paths
 
 
-def rewrite_doc_chain_root_path(
+def rewrite_data_set_root_path(
     root: str | Path,
     *,
     source_root: str | Path | None = None,
@@ -259,7 +260,7 @@ def iter_json_arrayrecord_records(path: str | Path) -> Iterator[tuple[int, dict[
         yield record_idx, json.loads(source[record_idx])
 
 
-def num_pretrain_records_assigned(
+def calculate_samples_per_process(
     *,
     num_records: int,
     dp_size: int,
@@ -294,16 +295,16 @@ def num_pretrain_records_usable(
 
 def num_pretrain_positions(
     *,
-    num_assigned: int,
+    total_samples_per_process: int,
     num_epochs: int | None,
 ) -> int:
-    if num_assigned <= 0:
-        raise ValueError("num_assigned must be > 0")
+    if total_samples_per_process <= 0:
+        raise ValueError("total_samples_per_process must be > 0")
     if num_epochs is None:
         return MAX_PRETRAIN_POSITIONS
     if num_epochs <= 0:
         raise ValueError("num_epochs must be > 0")
-    return int(num_assigned) * int(num_epochs)
+    return int(total_samples_per_process) * int(num_epochs)
 
 
 class PretrainIndexRecordMap:
@@ -312,7 +313,7 @@ class PretrainIndexRecordMap:
         *,
         index_shard_paths: Sequence[str | Path],
         num_records: int,
-        num_assigned: int,
+        total_samples_per_process: int,
         dp_size: int,
         dp_index: int,
         shuffle: bool,
@@ -323,7 +324,7 @@ class PretrainIndexRecordMap:
             str(Path(path).expanduser().resolve()) for path in index_shard_paths
         ]
         self.num_records = int(num_records)
-        self.num_assigned = int(num_assigned)
+        self.total_samples_per_process = int(total_samples_per_process)
         self.dp_size = int(dp_size)
         self.dp_index = int(dp_index)
         self.shuffle = bool(shuffle)
@@ -337,7 +338,7 @@ class PretrainIndexRecordMap:
         return self._source
 
     def __call__(self, absolute_pos: int) -> dict[str, Any]:
-        epoch, local_pos = divmod(int(absolute_pos), self.num_assigned)
+        epoch, local_pos = divmod(int(absolute_pos), self.total_samples_per_process)
         global_pos = self.dp_index + local_pos * self.dp_size
         if self.shuffle:
             index_record_idx = grain.experimental.index_shuffle(
@@ -368,25 +369,25 @@ def make_pretrain_index_record_dataset(
         dp_size=dp_size,
         records_per_local_batch=records_per_local_batch,
     )
-    num_assigned = num_pretrain_records_assigned(
+    total_samples_per_process = calculate_samples_per_process(
         num_records=usable_records,
         dp_size=dp_size,
         dp_index=dp_index,
     )
-    if not num_assigned:
+    if not total_samples_per_process:
         raise ValueError(
             f"No complete pretrain batch assigned to dp_index={dp_index} "
             f"with dp_size={dp_size} and records_per_local_batch={records_per_local_batch}"
         )
     num_positions = num_pretrain_positions(
-        num_assigned=num_assigned,
+        total_samples_per_process=total_samples_per_process,
         num_epochs=num_epochs,
     )
     dataset = grain.MapDataset.range(num_positions).map(
         PretrainIndexRecordMap(
             index_shard_paths=index_shard_paths,
             num_records=num_records,
-            num_assigned=num_assigned,
+            total_samples_per_process=total_samples_per_process,
             dp_size=dp_size,
             dp_index=dp_index,
             shuffle=shuffle,
@@ -394,7 +395,7 @@ def make_pretrain_index_record_dataset(
             shuffle_rounds=shuffle_rounds,
         )
     )
-    return dataset, num_assigned
+    return dataset, total_samples_per_process
 
 
 def write_json_arrayrecord_dataset(
@@ -460,7 +461,7 @@ def write_json_arrayrecord_dataset(
     return out_dir
 
 
-class DocChainReader:
+class DataSetReader:
     def __init__(
         self,
         root: str | Path,
@@ -511,7 +512,7 @@ def iter_document_pair_refs(
     segment_length: int = DEFAULT_SEGMENT_LENGTH,
     bucket_idx: int = 0,
     record_idx: int = 0,
-    eos_id: int | None = None,
+    eos_id: int | None = DEFAULT_EOS_ID,
 ) -> Iterator[DocPairRef]:
     """Yield retained 2-segment windows for statepassing pretraining."""
 
@@ -567,7 +568,7 @@ def build_chunk_arrays(
     end: int | None = None,
     segment_length: int = DEFAULT_SEGMENT_LENGTH,
     pad_id: int = DEFAULT_PAD_ID,
-    eos_id: int | None = None,
+    eos_id: int | None = DEFAULT_EOS_ID,
     eos_token_idx: int | None = None,
 ) -> dict[str, np.ndarray]:
     if segment_length <= 0:
@@ -611,7 +612,7 @@ def build_pair_arrays(
     *,
     segment_length: int = DEFAULT_SEGMENT_LENGTH,
     pad_id: int = DEFAULT_PAD_ID,
-    eos_id: int | None = None,
+    eos_id: int | None = DEFAULT_EOS_ID,
 ) -> dict[str, np.ndarray]:
     token_ids_ST = []
     attention_mask_ST = []

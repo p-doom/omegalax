@@ -1,4 +1,4 @@
-"""Tests for doc-chain pretraining data helpers against the real corpus."""
+"""Tests for pretraining data-set helpers against the real corpus."""
 
 from __future__ import annotations
 
@@ -12,29 +12,30 @@ os.environ.setdefault("JAX_PLATFORMS", "cpu")
 from absl.testing import absltest
 import numpy as np
 
-from omegalax.data.pretrain_doc_chain import (
+from omegalax.data.pretrain_data_set import (
     DOC_CHAIN_BINARY_HEADER,
     DOC_CHAIN_BINARY_MAGIC,
     DOC_CHAIN_FORMAT,
+    DEFAULT_EOS_ID,
     MAX_PRETRAIN_POSITIONS,
-    DocChainReader,
+    DataSetReader,
     build_chunk_arrays,
+    calculate_samples_per_process,
     deserialize_doc_chain,
     iter_document_pair_refs,
     load_doc_chain_metadata,
     make_pretrain_index_record_dataset,
     num_pretrain_positions,
-    num_pretrain_records_assigned,
     num_pretrain_records_usable,
     resolve_doc_chain_buckets,
     resolve_pretrain_dp,
-    rewrite_doc_chain_root_path,
+    rewrite_data_set_root_path,
     write_json_arrayrecord_dataset,
 )
 from tests.pretrain_real_data_test_utils import require_real_root, test_temp_dir
 
 
-class PretrainDocChainTest(absltest.TestCase):
+class PretrainDataSetTest(absltest.TestCase):
     def test_binary_doc_chain_deserialize(self):
         token_ids = np.asarray([1, 2, 3], dtype=np.int32)
         header = json.dumps(
@@ -110,6 +111,29 @@ class PretrainDocChainTest(absltest.TestCase):
         self.assertEqual(pair_ranges(12), [(0, 4, 8)])
         self.assertEqual(pair_ranges(13), [(0, 4, 8), (8, 12, 13)])
 
+    def test_default_eos_id_marks_retained_end_when_short_tail_is_dropped(self):
+        record = deserialize_doc_chain(
+            {
+                "doc_id": "doc-eos",
+                "token_ids": [1, 2, 3, 4, 5, 6, 7, 8, DEFAULT_EOS_ID],
+                "doc_token_count": 9,
+            }
+        )
+        pair = next(iter_document_pair_refs(record, segment_length=4))
+        arrays = build_chunk_arrays(
+            record.token_ids,
+            start=pair.mid,
+            end=pair.end,
+            segment_length=4,
+            eos_token_idx=pair.eos_token_idx,
+        )
+
+        self.assertEqual(pair.eos_token_idx, 7)
+        np.testing.assert_array_equal(
+            arrays["token_ids_T"],
+            np.asarray([5, 6, 7, DEFAULT_EOS_ID], dtype=np.int32),
+        )
+
     def test_real_leaf_metadata_accepts_dataset_format_alias(self):
         root = require_real_root(self)
         bucket_path = resolve_doc_chain_buckets(root, split="val")[-1]
@@ -157,7 +181,7 @@ class PretrainDocChainTest(absltest.TestCase):
                 os.environ.pop("OMEGALAX_PRETRAIN_SOURCE_ROOT", None)
                 os.environ.pop("OMEGALAX_PRETRAIN_LOCAL_ROOT", None)
 
-                self.assertEqual(rewrite_doc_chain_root_path(root), root.resolve())
+                self.assertEqual(rewrite_data_set_root_path(root), root.resolve())
 
     def test_source_path_rewrite_replaces_source_root(self):
         with test_temp_dir() as tmp:
@@ -170,7 +194,7 @@ class PretrainDocChainTest(absltest.TestCase):
             local_path.mkdir(parents=True)
 
             self.assertEqual(
-                rewrite_doc_chain_root_path(
+                rewrite_data_set_root_path(
                     source_path,
                     source_root=source_root,
                     local_root=local_root,
@@ -190,7 +214,7 @@ class PretrainDocChainTest(absltest.TestCase):
                 os.environ.pop("OMEGALAX_PRETRAIN_LOCAL_ROOT", None)
 
                 with self.assertRaisesRegex(ValueError, "must be set together"):
-                    rewrite_doc_chain_root_path(Path(tmp) / "source")
+                    rewrite_data_set_root_path(Path(tmp) / "source")
 
     def test_source_path_rewrite_rejects_paths_outside_source_root(self):
         with test_temp_dir() as tmp:
@@ -201,7 +225,7 @@ class PretrainDocChainTest(absltest.TestCase):
             local_root.mkdir()
 
             with self.assertRaisesRegex(ValueError, "outside"):
-                rewrite_doc_chain_root_path(
+                rewrite_data_set_root_path(
                     outside_path,
                     source_root=root / "source",
                     local_root=local_root,
@@ -216,7 +240,7 @@ class PretrainDocChainTest(absltest.TestCase):
             local_root.mkdir()
 
             with self.assertRaisesRegex(ValueError, "does not exist"):
-                rewrite_doc_chain_root_path(
+                rewrite_data_set_root_path(
                     source_path,
                     source_root=root / "source",
                     local_root=local_root,
@@ -225,7 +249,7 @@ class PretrainDocChainTest(absltest.TestCase):
     def test_real_reader_loads_from_root_and_split(self):
         root = require_real_root(self)
         expected_bucket_names = [path.name for path in resolve_doc_chain_buckets(root, split="val")]
-        reader = DocChainReader(root, split="val")
+        reader = DataSetReader(root, split="val")
         record = reader.read(0, 0)
 
         self.assertEqual(reader.split, "val")
@@ -244,15 +268,15 @@ class PretrainDocChainTest(absltest.TestCase):
 
     def test_pretrain_dp_assignment_counts_records(self):
         self.assertEqual(
-            num_pretrain_records_assigned(num_records=10, dp_size=3, dp_index=0),
+            calculate_samples_per_process(num_records=10, dp_size=3, dp_index=0),
             4,
         )
         self.assertEqual(
-            num_pretrain_records_assigned(num_records=10, dp_size=3, dp_index=1),
+            calculate_samples_per_process(num_records=10, dp_size=3, dp_index=1),
             3,
         )
         self.assertEqual(
-            num_pretrain_records_assigned(num_records=2, dp_size=4, dp_index=3),
+            calculate_samples_per_process(num_records=2, dp_size=4, dp_index=3),
             0,
         )
 
@@ -275,9 +299,12 @@ class PretrainDocChainTest(absltest.TestCase):
         )
 
     def test_pretrain_position_count_supports_finite_and_infinite_epochs(self):
-        self.assertEqual(num_pretrain_positions(num_assigned=3, num_epochs=2), 6)
         self.assertEqual(
-            num_pretrain_positions(num_assigned=3, num_epochs=None),
+            num_pretrain_positions(total_samples_per_process=3, num_epochs=2),
+            6,
+        )
+        self.assertEqual(
+            num_pretrain_positions(total_samples_per_process=3, num_epochs=None),
             MAX_PRETRAIN_POSITIONS,
         )
 
@@ -290,7 +317,7 @@ class PretrainDocChainTest(absltest.TestCase):
                 overwrite=False,
                 metadata={"format": "test_index"},
             )
-            dataset, num_assigned = make_pretrain_index_record_dataset(
+            dataset, total_samples_per_process = make_pretrain_index_record_dataset(
                 index_shard_paths=sorted(index.glob("*.array_record")),
                 num_records=5,
                 num_epochs=2,
@@ -301,7 +328,7 @@ class PretrainDocChainTest(absltest.TestCase):
                 shuffle_rounds=4,
             )
 
-            self.assertEqual(num_assigned, 2)
+            self.assertEqual(total_samples_per_process, 2)
             self.assertLen(dataset, 4)
             self.assertEqual([dataset[i]["record"] for i in range(4)], [1, 3, 1, 3])
 

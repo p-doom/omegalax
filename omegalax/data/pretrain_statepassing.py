@@ -9,12 +9,13 @@ from typing import Any
 import grain
 import numpy as np
 
-from omegalax.data.pretrain_doc_chain import (
+from omegalax.data.pretrain_data_set import (
     DEFAULT_DOC_CHAIN_SPLIT,
+    DEFAULT_EOS_ID,
     DEFAULT_PAD_ID,
     DEFAULT_SEGMENT_LENGTH,
     BATCH_PRETRAIN_METADATA_KEY,
-    DocChainReader,
+    DataSetReader,
     DocPairRef,
     build_pair_arrays,
     iter_document_pair_refs,
@@ -23,7 +24,7 @@ from omegalax.data.pretrain_doc_chain import (
     pair_ref_to_record,
     resolve_arrayrecord_paths,
     resolve_pretrain_dp,
-    rewrite_doc_chain_root_path,
+    rewrite_data_set_root_path,
     write_json_arrayrecord_dataset,
 )
 
@@ -51,7 +52,7 @@ def build_statepassing_pair_index(
     out_dir: str | Path,
     *,
     segment_length: int = DEFAULT_SEGMENT_LENGTH,
-    eos_id: int | None = None,
+    eos_id: int | None = DEFAULT_EOS_ID,
     split: str = DEFAULT_DOC_CHAIN_SPLIT,
     records_per_shard: int = 100_000,
     overwrite: bool = False,
@@ -59,10 +60,10 @@ def build_statepassing_pair_index(
     if segment_length <= 0:
         raise ValueError("segment_length must be > 0")
 
-    reader = DocChainReader(root, split=split)
+    reader = DataSetReader(root, split=split)
     dynamic_metadata: dict[str, Any] = {
         "format": STATEPASSING_PAIR_INDEX_FORMAT,
-        "doc_chain_root": str(reader.root),
+        "data_set_root": str(reader.root),
         "split": reader.split,
         "bucket_names": list(reader.bucket_names),
         "segment_length": int(segment_length),
@@ -141,7 +142,7 @@ def _single_statepassing_pair_index_path(
 def _make_batch(
     pairs: Sequence[DocPairRef],
     *,
-    reader: DocChainReader,
+    reader: DataSetReader,
     segment_length: int,
     pad_id: int,
     eos_id: int | None,
@@ -207,26 +208,26 @@ class _StatepassingPretrainBatchBuilder:
     def __init__(
         self,
         *,
-        doc_chain_root: str | Path,
+        data_set_root: str | Path,
         split: str,
         bucket_names: Sequence[str],
         segment_length: int,
         pad_id: int,
-        eos_id: int | None = None,
+        eos_id: int | None = DEFAULT_EOS_ID,
     ) -> None:
-        self.doc_chain_root = str(doc_chain_root)
+        self.data_set_root = str(data_set_root)
         self.split = str(split)
         self.bucket_names = list(bucket_names)
         self.segment_length = int(segment_length)
         self.pad_id = int(pad_id)
         self.eos_id = eos_id
-        self.reader: DocChainReader | None = None
+        self.reader: DataSetReader | None = None
 
     def __call__(self, records: Sequence[dict[str, Any]]) -> dict[str, Any]:
         if self.reader is None:
-            reader = DocChainReader(self.doc_chain_root, split=self.split)
+            reader = DataSetReader(self.data_set_root, split=self.split)
             if reader.bucket_names != self.bucket_names:
-                raise ValueError("Statepassing pair index bucket_names do not match doc-chain root")
+                raise ValueError("Statepassing pair index bucket_names do not match data-set root")
             self.reader = reader
         pairs = [_pair_ref_from_record(record) for record in records]
         return _make_batch(
@@ -244,17 +245,17 @@ def make_statepassing_iterator(
     batch_size: int,
     segment_length: int | None = DEFAULT_SEGMENT_LENGTH,
     pad_id: int = DEFAULT_PAD_ID,
-    eos_id: int | None = None,
+    eos_id: int | None = DEFAULT_EOS_ID,
     shuffle: bool = True,
     seed: int = 0,
     num_epochs: int | None = None,
-    dp_size: int = 1,
-    fsdp_size: int = 1,
+    dp_size: int,
+    fsdp_size: int,
     dp_index: int | None = None,
     process_index: int | None = None,
     grain_workers: int = 8,
     grain_worker_buffer_size: int = 1,
-    grain_read_threads: int = 16,
+    grain_read_threads: int = 2,
     grain_read_prefetch_buffer_size: int = 4,
 ) -> Iterator[dict[str, Any]]:
     if batch_size <= 0:
@@ -293,7 +294,10 @@ def make_statepassing_iterator(
     if eos_id != index_eos_id:
         raise ValueError(f"eos_id mismatch: index has {index_eos_id}, loader got {eos_id}")
 
-    doc_chain_root = rewrite_doc_chain_root_path(metadata["doc_chain_root"])
+    metadata_root = metadata.get("data_set_root", metadata.get("doc_chain_root"))
+    if metadata_root is None:
+        raise ValueError("Statepassing pair index metadata is missing data_set_root")
+    data_set_root = rewrite_data_set_root_path(metadata_root)
     split = str(metadata["split"])
     bucket_names = [str(name) for name in metadata["bucket_names"]]
     index_shard_paths = resolve_arrayrecord_paths(index_path)
@@ -317,7 +321,7 @@ def make_statepassing_iterator(
         batch_size=batch_size // 2,
         drop_remainder=True,
         batch_fn=_StatepassingPretrainBatchBuilder(
-            doc_chain_root=doc_chain_root,
+            data_set_root=data_set_root,
             split=split,
             bucket_names=bucket_names,
             segment_length=index_segment_length,

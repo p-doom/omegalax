@@ -13,7 +13,8 @@ os.environ.setdefault("JAX_PLATFORMS", "cpu")
 from absl.testing import absltest
 import numpy as np
 
-from omegalax.data.pretrain_doc_chain import (
+from omegalax.data.pretrain_data_set import (
+    DEFAULT_EOS_ID,
     iter_json_arrayrecord_records,
     load_arrayrecord_metadata,
     pop_pretrain_metadata,
@@ -71,6 +72,8 @@ class PretrainStatepassingTest(absltest.TestCase):
             segment_length=kwargs.pop("segment_length", 4096),
             shuffle=kwargs.pop("shuffle", False),
             num_epochs=kwargs.pop("num_epochs", 1),
+            dp_size=kwargs.pop("dp_size", 1),
+            fsdp_size=kwargs.pop("fsdp_size", 1),
             process_index=kwargs.pop("process_index", 0),
             grain_workers=kwargs.pop("grain_workers", 0),
             **kwargs,
@@ -114,9 +117,10 @@ class PretrainStatepassingTest(absltest.TestCase):
         bucket_names = [path.name for path in self._bucket_paths()]
 
         self.assertEqual(metadata["format"], STATEPASSING_PAIR_INDEX_FORMAT)
-        self.assertEqual(metadata["doc_chain_root"], str(self._root().resolve()))
+        self.assertEqual(metadata["data_set_root"], str(self._root().resolve()))
         self.assertEqual(metadata["split"], "train")
         self.assertEqual(metadata["segment_length"], 4096)
+        self.assertEqual(metadata["eos_id"], DEFAULT_EOS_ID)
         self.assertEqual(metadata["bucket_names"], bucket_names)
         self.assertNotIn("bucket_paths", metadata)
         self.assertGreater(len(metadata["bucket_names"]), 1)
@@ -168,6 +172,8 @@ class PretrainStatepassingTest(absltest.TestCase):
                     segment_length=4096,
                     shuffle=False,
                     num_epochs=1,
+                    dp_size=1,
+                    fsdp_size=1,
                     process_index=0,
                     grain_workers=0,
                 )
@@ -175,8 +181,9 @@ class PretrainStatepassingTest(absltest.TestCase):
 
             metadata = load_arrayrecord_metadata(index)
             self.assertEqual(metadata["format"], STATEPASSING_PAIR_INDEX_FORMAT)
-            self.assertEqual(metadata["doc_chain_root"], str(root.resolve()))
+            self.assertEqual(metadata["data_set_root"], str(root.resolve()))
             self.assertEqual(metadata["split"], "val")
+            self.assertEqual(metadata["eos_id"], DEFAULT_EOS_ID)
             self.assertEqual(
                 metadata["bucket_names"],
                 [path.name for path in resolve_doc_chain_buckets(root, split="val")],
@@ -195,6 +202,8 @@ class PretrainStatepassingTest(absltest.TestCase):
                 segment_length=4096,
                 shuffle=False,
                 num_epochs=1,
+                dp_size=1,
+                fsdp_size=1,
                 process_index=0,
                 grain_workers=0,
             )
@@ -202,7 +211,7 @@ class PretrainStatepassingTest(absltest.TestCase):
 
         self.assertEqual(batch["token_ids_BST"].shape, (1, 2, 4096))
 
-    def test_indexed_iterator_rewrites_doc_chain_root_to_local_root(self):
+    def test_indexed_iterator_rewrites_data_set_root_to_local_root(self):
         with test_temp_dir() as tmp:
             tmpdir = Path(tmp)
             root = write_real_binary_mini_root_dataset(
@@ -236,6 +245,8 @@ class PretrainStatepassingTest(absltest.TestCase):
                     segment_length=4096,
                     shuffle=False,
                     num_epochs=1,
+                    dp_size=1,
+                    fsdp_size=1,
                     process_index=0,
                     grain_workers=0,
                 )
@@ -271,6 +282,8 @@ class PretrainStatepassingTest(absltest.TestCase):
                 segment_length=4096,
                 shuffle=False,
                 num_epochs=1,
+                dp_size=1,
+                fsdp_size=1,
                 process_index=0,
                 grain_workers=0,
             )
@@ -304,6 +317,7 @@ class PretrainStatepassingTest(absltest.TestCase):
                     seed=17,
                     num_epochs=1,
                     dp_size=dp_size,
+                    fsdp_size=1,
                     dp_index=dp_index,
                     process_index=0,
                     grain_workers=0,
@@ -349,6 +363,8 @@ class PretrainStatepassingTest(absltest.TestCase):
                 segment_length=4096,
                 shuffle=False,
                 num_epochs=1,
+                dp_size=1,
+                fsdp_size=1,
                 process_index=0,
                 grain_workers=0,
             )
@@ -361,6 +377,8 @@ class PretrainStatepassingTest(absltest.TestCase):
                 segment_length=4096,
                 shuffle=False,
                 num_epochs=1,
+                dp_size=1,
+                fsdp_size=1,
                 process_index=0,
                 grain_workers=0,
             )
