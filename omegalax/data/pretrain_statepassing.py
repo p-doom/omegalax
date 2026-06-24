@@ -13,15 +13,15 @@ from omegalax.data.pretrain_data_set import (
     DEFAULT_DATA_SET_SPLIT,
     DEFAULT_EOS_ID,
     DEFAULT_PAD_ID,
-    DEFAULT_SEGMENT_LENGTH,
+    DEFAULT_CHUNK_LENGTH,
     BATCH_PRETRAIN_METADATA_KEY,
     DataSetReader,
-    DocPairRef,
+    PairMetadata,
     build_pair_arrays,
-    iter_document_pair_refs,
+    iter_document_pair_metadata,
     load_arrayrecord_metadata,
-    make_pretrain_index_record_dataset,
-    pair_ref_to_record,
+    make_dataset_index,
+    pair_metadata_to_record,
     resolve_arrayrecord_paths,
     resolve_pretrain_dp,
     rewrite_data_set_root_path,
@@ -32,9 +32,9 @@ STATEPASSING_PAIR_INDEX_FORMAT = "omegalax_pretrain_statepassing_pair_index_v1"
 STATEPASSING_INDEX_SHUFFLE_ROUNDS = 4
 
 
-def _pair_ref_from_record(record: dict[str, Any]) -> DocPairRef:
+def _pair_metadata_from_index_record(record: dict[str, Any]) -> PairMetadata:
     eos_token_idx = record.get("eos_token_idx")
-    return DocPairRef(
+    return PairMetadata(
         bucket_idx=int(record["bucket_idx"]),
         record_idx=int(record["record_idx"]),
         doc_id=str(record["doc_id"]),
@@ -51,14 +51,14 @@ def build_statepassing_pair_index(
     root: str | Path,
     out_dir: str | Path,
     *,
-    segment_length: int = DEFAULT_SEGMENT_LENGTH,
+    chunk_length: int = DEFAULT_CHUNK_LENGTH,
     eos_id: int | None = DEFAULT_EOS_ID,
     split: str = DEFAULT_DATA_SET_SPLIT,
     records_per_shard: int = 100_000,
     overwrite: bool = False,
 ) -> Path:
-    if segment_length <= 0:
-        raise ValueError("segment_length must be > 0")
+    if chunk_length <= 0:
+        raise ValueError("chunk_length must be > 0")
 
     reader = DataSetReader(root, split=split)
     dynamic_metadata: dict[str, Any] = {
@@ -66,7 +66,7 @@ def build_statepassing_pair_index(
         "data_set_root": str(reader.root),
         "split": reader.split,
         "bucket_names": list(reader.bucket_names),
-        "segment_length": int(segment_length),
+        "chunk_length": int(chunk_length),
         "eos_id": eos_id,
         "num_pairs": 0,
         "num_bucket_records": 0,
@@ -78,15 +78,15 @@ def build_statepassing_pair_index(
         num_pairs = 0
         for bucket_idx, record_idx, doc in reader.iter_records():
             bucket_record_counts[bucket_idx] += 1
-            for pair in iter_document_pair_refs(
+            for pair_metadata in iter_document_pair_metadata(
                 doc,
-                segment_length=segment_length,
+                chunk_length=chunk_length,
                 bucket_idx=bucket_idx,
                 record_idx=record_idx,
                 eos_id=eos_id,
             ):
                 num_pairs += 1
-                yield pair_ref_to_record(pair)
+                yield pair_metadata_to_record(pair_metadata)
         dynamic_metadata["num_pairs"] = num_pairs
         dynamic_metadata["num_bucket_records"] = sum(bucket_record_counts)
         dynamic_metadata["bucket_record_counts"] = bucket_record_counts
@@ -102,17 +102,16 @@ def build_statepassing_pair_index(
 
 def _load_pair_index_metadata(
     index_path: str | Path,
-    segment_length: int | None,
+    chunk_length: int | None,
 ) -> dict[str, Any]:
     metadata = load_arrayrecord_metadata(index_path)
     fmt = metadata.get("format")
     if fmt != STATEPASSING_PAIR_INDEX_FORMAT:
         raise ValueError(f"Expected {STATEPASSING_PAIR_INDEX_FORMAT} dataset, got format={fmt}")
-    index_segment_length = int(metadata["segment_length"])
-    if segment_length is not None and int(segment_length) != index_segment_length:
+    index_chunk_length = int(metadata["chunk_length"])
+    if chunk_length is not None and int(chunk_length) != index_chunk_length:
         raise ValueError(
-            f"segment_length mismatch: index has {index_segment_length}, "
-            f"loader got {segment_length}"
+            f"chunk_length mismatch: index has {index_chunk_length}, loader got {chunk_length}"
         )
     return metadata
 
@@ -140,10 +139,10 @@ def _single_statepassing_pair_index_path(
 
 
 def _make_batch(
-    pairs: Sequence[DocPairRef],
+    pair_metadata_batch: Sequence[PairMetadata],
     *,
     reader: DataSetReader,
-    segment_length: int,
+    chunk_length: int,
     pad_id: int,
     eos_id: int | None,
 ) -> dict[str, Any]:
@@ -159,42 +158,45 @@ def _make_batch(
     pair_indices = []
     doc_cache = {}
 
-    for pair in pairs:
-        doc_key = (pair.bucket_idx, pair.record_idx)
+    for pair_metadata in pair_metadata_batch:
+        doc_key = (pair_metadata.bucket_idx, pair_metadata.record_idx)
         doc = doc_cache.get(doc_key)
         if doc is None:
-            doc = reader.read(pair.bucket_idx, pair.record_idx)
+            doc = reader.read(pair_metadata.bucket_idx, pair_metadata.record_idx)
             doc_cache[doc_key] = doc
-        if doc.doc_id != pair.doc_id or doc.doc_token_count != pair.doc_token_count:
+        if (
+            doc.doc_id != pair_metadata.doc_id
+            or doc.doc_token_count != pair_metadata.doc_token_count
+        ):
             raise ValueError(
                 "Statepassing pair index does not match bucket record "
-                f"bucket_idx={pair.bucket_idx}, record_idx={pair.record_idx}"
+                f"bucket_idx={pair_metadata.bucket_idx}, record_idx={pair_metadata.record_idx}"
             )
         arrays = build_pair_arrays(
             doc.token_ids,
-            pair,
-            segment_length=segment_length,
+            pair_metadata,
+            chunk_length=chunk_length,
             pad_id=pad_id,
             eos_id=eos_id,
         )
-        token_ids.append(arrays["token_ids_ST"])
-        attention_masks.append(arrays["attention_mask_ST"])
-        loss_masks.append(arrays["loss_mask_ST"])
-        chunk_indices.append(arrays["chunk_idx_S"])
-        reset_states.append(arrays["reset_state_S"])
-        last_chunk_flags.append(arrays["is_last_chunk_S"])
-        doc_ids.append(pair.doc_id)
-        bucket_indices.append(pair.bucket_idx)
-        record_indices.append(pair.record_idx)
-        pair_indices.append(pair.pair_idx)
+        token_ids.append(arrays["token_ids_CT"])
+        attention_masks.append(arrays["attention_mask_CT"])
+        loss_masks.append(arrays["loss_mask_CT"])
+        chunk_indices.append(arrays["chunk_idx_C"])
+        reset_states.append(arrays["reset_state_C"])
+        last_chunk_flags.append(arrays["is_last_chunk_C"])
+        doc_ids.append(pair_metadata.doc_id)
+        bucket_indices.append(pair_metadata.bucket_idx)
+        record_indices.append(pair_metadata.record_idx)
+        pair_indices.append(pair_metadata.pair_idx)
 
     return {
-        "token_ids_BST": np.stack(token_ids).astype(np.int32, copy=False),
-        "attention_mask_BST": np.stack(attention_masks).astype(np.int32, copy=False),
-        "loss_mask_BST": np.stack(loss_masks).astype(np.int32, copy=False),
-        "chunk_idx_BS": np.stack(chunk_indices).astype(np.int32, copy=False),
-        "reset_state_BS": np.stack(reset_states).astype(np.bool_, copy=False),
-        "is_last_chunk_BS": np.stack(last_chunk_flags).astype(np.bool_, copy=False),
+        "token_ids_BCT": np.stack(token_ids).astype(np.int32, copy=False),
+        "attention_mask_BCT": np.stack(attention_masks).astype(np.int32, copy=False),
+        "loss_mask_BCT": np.stack(loss_masks).astype(np.int32, copy=False),
+        "chunk_idx_BC": np.stack(chunk_indices).astype(np.int32, copy=False),
+        "reset_state_BC": np.stack(reset_states).astype(np.bool_, copy=False),
+        "is_last_chunk_BC": np.stack(last_chunk_flags).astype(np.bool_, copy=False),
         BATCH_PRETRAIN_METADATA_KEY: {
             "doc_ids": doc_ids,
             "bucket_idx_B": np.asarray(bucket_indices, dtype=np.int32),
@@ -211,29 +213,29 @@ class _StatepassingPretrainBatchBuilder:
         data_set_root: str | Path,
         split: str,
         bucket_names: Sequence[str],
-        segment_length: int,
+        chunk_length: int,
         pad_id: int,
         eos_id: int | None = DEFAULT_EOS_ID,
     ) -> None:
         self.data_set_root = str(data_set_root)
         self.split = str(split)
         self.bucket_names = list(bucket_names)
-        self.segment_length = int(segment_length)
+        self.chunk_length = int(chunk_length)
         self.pad_id = int(pad_id)
         self.eos_id = eos_id
         self.reader: DataSetReader | None = None
 
-    def __call__(self, records: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    def __call__(self, index_records: Sequence[dict[str, Any]]) -> dict[str, Any]:
         if self.reader is None:
             reader = DataSetReader(self.data_set_root, split=self.split)
             if reader.bucket_names != self.bucket_names:
                 raise ValueError("Statepassing pair index bucket_names do not match data-set root")
             self.reader = reader
-        pairs = [_pair_ref_from_record(record) for record in records]
+        pair_metadata_batch = [_pair_metadata_from_index_record(record) for record in index_records]
         return _make_batch(
-            pairs,
+            pair_metadata_batch,
             reader=self.reader,
-            segment_length=self.segment_length,
+            chunk_length=self.chunk_length,
             pad_id=self.pad_id,
             eos_id=self.eos_id,
         )
@@ -243,7 +245,7 @@ def make_statepassing_iterator(
     indexes: str | Path | Sequence[str | Path],
     *,
     batch_size: int,
-    segment_length: int | None = DEFAULT_SEGMENT_LENGTH,
+    chunk_length: int | None = DEFAULT_CHUNK_LENGTH,
     pad_id: int = DEFAULT_PAD_ID,
     eos_id: int | None = DEFAULT_EOS_ID,
     shuffle: bool = True,
@@ -261,7 +263,7 @@ def make_statepassing_iterator(
     if batch_size <= 0:
         raise ValueError("batch_size must be > 0")
     if batch_size % 2:
-        raise ValueError("batch_size must be even for 2-segment statepassing samples")
+        raise ValueError("batch_size must be even for 2-chunk statepassing samples")
     if grain_workers < 0:
         raise ValueError("grain_workers must be >= 0")
     if grain_worker_buffer_size <= 0:
@@ -288,8 +290,8 @@ def make_statepassing_iterator(
     if resolved_dp_index < 0 or resolved_dp_index >= effective_dp_size:
         raise ValueError(f"dp_index must be in [0, {effective_dp_size}), got {resolved_dp_index}")
 
-    index_metadata = _load_pair_index_metadata(index_path, segment_length)
-    index_segment_length = int(index_metadata["segment_length"])
+    index_metadata = _load_pair_index_metadata(index_path, chunk_length)
+    index_chunk_length = int(index_metadata["chunk_length"])
     index_eos_id = index_metadata.get("eos_id")
     if eos_id != index_eos_id:
         raise ValueError(f"eos_id mismatch: index has {index_eos_id}, loader got {eos_id}")
@@ -306,7 +308,7 @@ def make_statepassing_iterator(
     if num_records == 0:
         raise ValueError(f"Statepassing pair index has no records: {index_path}")
 
-    pair_index_dataset, _ = make_pretrain_index_record_dataset(
+    dataset_index, _ = make_dataset_index(
         index_shard_paths=index_shard_paths,
         num_records=num_records,
         num_epochs=num_epochs,
@@ -317,14 +319,14 @@ def make_statepassing_iterator(
         seed=seed,
         shuffle_rounds=STATEPASSING_INDEX_SHUFFLE_ROUNDS,
     )
-    batched = pair_index_dataset.batch(
+    batched = dataset_index.batch(
         batch_size=batch_size // 2,
         drop_remainder=True,
         batch_fn=_StatepassingPretrainBatchBuilder(
             data_set_root=data_set_root,
             split=split,
             bucket_names=bucket_names,
-            segment_length=index_segment_length,
+            chunk_length=index_chunk_length,
             pad_id=pad_id,
             eos_id=eos_id,
         ),

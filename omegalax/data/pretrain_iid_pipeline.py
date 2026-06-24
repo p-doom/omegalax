@@ -13,14 +13,14 @@ from omegalax.data.pretrain_data_set import (
     DEFAULT_EOS_ID,
     DEFAULT_PAD_ID,
     DEFAULT_DATA_SET_SPLIT,
-    DEFAULT_SEGMENT_LENGTH,
+    DEFAULT_CHUNK_LENGTH,
     BATCH_PRETRAIN_METADATA_KEY,
     DataSetReader,
     build_chunk_arrays,
-    flatten_pair_ref,
-    iter_document_pair_refs,
+    flatten_pair_metadata,
+    iter_document_pair_metadata,
     load_arrayrecord_metadata,
-    make_pretrain_index_record_dataset,
+    make_dataset_index,
     resolve_arrayrecord_paths,
     resolve_pretrain_dp,
     rewrite_data_set_root_path,
@@ -35,14 +35,14 @@ def build_iid_chunk_index(
     root: str | Path,
     out_dir: str | Path,
     *,
-    segment_length: int = DEFAULT_SEGMENT_LENGTH,
+    chunk_length: int = DEFAULT_CHUNK_LENGTH,
     eos_id: int | None = DEFAULT_EOS_ID,
     split: str = DEFAULT_DATA_SET_SPLIT,
     records_per_shard: int = 100_000,
     overwrite: bool = False,
 ) -> Path:
-    if segment_length <= 0:
-        raise ValueError("segment_length must be > 0")
+    if chunk_length <= 0:
+        raise ValueError("chunk_length must be > 0")
 
     reader = DataSetReader(root, split=split)
     dynamic_metadata: dict[str, Any] = {
@@ -50,7 +50,7 @@ def build_iid_chunk_index(
         "data_set_root": str(reader.root),
         "split": reader.split,
         "bucket_names": list(reader.bucket_names),
-        "segment_length": int(segment_length),
+        "chunk_length": int(chunk_length),
         "eos_id": eos_id,
         "num_chunks": 0,
         "num_pairs": 0,
@@ -64,15 +64,15 @@ def build_iid_chunk_index(
         num_pairs = 0
         for bucket_idx, record_idx, doc in reader.iter_records():
             bucket_record_counts[bucket_idx] += 1
-            for pair in iter_document_pair_refs(
+            for pair_metadata in iter_document_pair_metadata(
                 doc,
-                segment_length=segment_length,
+                chunk_length=chunk_length,
                 bucket_idx=bucket_idx,
                 record_idx=record_idx,
                 eos_id=eos_id,
             ):
                 num_pairs += 1
-                for chunk in flatten_pair_ref(pair):
+                for chunk in flatten_pair_metadata(pair_metadata):
                     num_chunks += 1
                     yield chunk
         dynamic_metadata["num_chunks"] = num_chunks
@@ -89,16 +89,15 @@ def build_iid_chunk_index(
     )
 
 
-def _load_index_metadata(index_path: str | Path, segment_length: int | None) -> dict[str, Any]:
+def _load_index_metadata(index_path: str | Path, chunk_length: int | None) -> dict[str, Any]:
     metadata = load_arrayrecord_metadata(index_path)
     fmt = metadata.get("format")
     if fmt != IID_CHUNK_INDEX_FORMAT:
         raise ValueError(f"Expected {IID_CHUNK_INDEX_FORMAT} dataset, got format={fmt}")
-    index_segment_length = int(metadata["segment_length"])
-    if segment_length is not None and int(segment_length) != index_segment_length:
+    index_chunk_length = int(metadata["chunk_length"])
+    if chunk_length is not None and int(chunk_length) != index_chunk_length:
         raise ValueError(
-            f"segment_length mismatch: index has {index_segment_length}, "
-            f"loader got {segment_length}"
+            f"chunk_length mismatch: index has {index_chunk_length}, loader got {chunk_length}"
         )
     return metadata
 
@@ -107,7 +106,7 @@ def _make_batch(
     entries: Sequence[dict[str, Any]],
     *,
     reader: DataSetReader,
-    segment_length: int,
+    chunk_length: int,
     pad_id: int,
     eos_id: int | None,
 ) -> dict[str, Any]:
@@ -119,7 +118,7 @@ def _make_batch(
     bucket_indices = []
     record_indices = []
     pair_indices = []
-    segments_in_pair = []
+    chunks_in_pair = []
     doc_cache = {}
 
     for entry in entries:
@@ -139,7 +138,7 @@ def _make_batch(
             doc.token_ids,
             start=int(entry["start"]),
             end=int(entry["end"]),
-            segment_length=segment_length,
+            chunk_length=chunk_length,
             pad_id=pad_id,
             eos_id=eos_id,
             eos_token_idx=entry.get("eos_token_idx"),
@@ -152,7 +151,7 @@ def _make_batch(
         bucket_indices.append(bucket_idx)
         record_indices.append(record_idx)
         pair_indices.append(int(entry["pair_idx"]))
-        segments_in_pair.append(int(entry["segment_in_pair"]))
+        chunks_in_pair.append(int(entry["chunk_in_pair"]))
 
     return {
         "token_ids_BT": np.stack(token_ids).astype(np.int32, copy=False),
@@ -164,7 +163,7 @@ def _make_batch(
             "bucket_idx_B": np.asarray(bucket_indices, dtype=np.int32),
             "record_idx_B": np.asarray(record_indices, dtype=np.int32),
             "pair_idx_B": np.asarray(pair_indices, dtype=np.int32),
-            "segment_in_pair_B": np.asarray(segments_in_pair, dtype=np.int32),
+            "chunk_in_pair_B": np.asarray(chunks_in_pair, dtype=np.int32),
         },
     }
 
@@ -176,14 +175,14 @@ class _IIDPretrainBatchBuilder:
         data_set_root: str | Path,
         split: str,
         bucket_names: Sequence[str],
-        segment_length: int,
+        chunk_length: int,
         pad_id: int,
         eos_id: int | None,
     ) -> None:
         self.data_set_root = str(data_set_root)
         self.split = str(split)
         self.bucket_names = list(bucket_names)
-        self.segment_length = int(segment_length)
+        self.chunk_length = int(chunk_length)
         self.pad_id = int(pad_id)
         self.eos_id = eos_id
         self.reader: DataSetReader | None = None
@@ -197,7 +196,7 @@ class _IIDPretrainBatchBuilder:
         return _make_batch(
             entries,
             reader=self.reader,
-            segment_length=self.segment_length,
+            chunk_length=self.chunk_length,
             pad_id=self.pad_id,
             eos_id=self.eos_id,
         )
@@ -207,7 +206,7 @@ def make_iid_iterator(
     index_path: str | Path,
     *,
     batch_size: int,
-    segment_length: int | None = DEFAULT_SEGMENT_LENGTH,
+    chunk_length: int | None = DEFAULT_CHUNK_LENGTH,
     pad_id: int = DEFAULT_PAD_ID,
     eos_id: int | None = DEFAULT_EOS_ID,
     shuffle: bool = True,
@@ -244,8 +243,8 @@ def make_iid_iterator(
         raise ValueError(f"dp_index must be in [0, {effective_dp_size}), got {resolved_dp_index}")
 
     index_path = Path(index_path).expanduser().resolve()
-    metadata = _load_index_metadata(index_path, segment_length)
-    index_segment_length = int(metadata["segment_length"])
+    metadata = _load_index_metadata(index_path, chunk_length)
+    index_chunk_length = int(metadata["chunk_length"])
     index_eos_id = metadata.get("eos_id")
     if eos_id != index_eos_id:
         raise ValueError(f"eos_id mismatch: index has {index_eos_id}, loader got {eos_id}")
@@ -262,7 +261,7 @@ def make_iid_iterator(
     if num_records == 0:
         raise ValueError(f"IID chunk index has no records: {index_path}")
 
-    index_dataset, _ = make_pretrain_index_record_dataset(
+    dataset_index, _ = make_dataset_index(
         index_shard_paths=index_shard_paths,
         num_records=num_records,
         num_epochs=num_epochs,
@@ -273,14 +272,14 @@ def make_iid_iterator(
         seed=seed,
         shuffle_rounds=IID_INDEX_SHUFFLE_ROUNDS,
     )
-    batched = index_dataset.batch(
+    batched = dataset_index.batch(
         batch_size=batch_size,
         drop_remainder=True,
         batch_fn=_IIDPretrainBatchBuilder(
             data_set_root=data_set_root,
             split=split,
             bucket_names=bucket_names,
-            segment_length=index_segment_length,
+            chunk_length=index_chunk_length,
             pad_id=pad_id,
             eos_id=eos_id,
         ),

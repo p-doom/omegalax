@@ -22,7 +22,7 @@ DOC_CHAIN_BINARY_MAGIC = b"OMXDC01\n"
 DOC_CHAIN_BINARY_HEADER = struct.Struct("<QQ")
 COMPILED_METADATA_FILENAME = "metadata.json"
 ARRAY_RECORD_SUFFIX = ".array_record"
-DEFAULT_SEGMENT_LENGTH = 4096
+DEFAULT_CHUNK_LENGTH = 4096
 DEFAULT_PAD_ID = 0
 DEFAULT_EOS_ID = 248046  # Qwen/Qwen3.5-0.8B <|im_end|>
 BATCH_PRETRAIN_METADATA_KEY = "metadata"
@@ -41,7 +41,7 @@ class DataSetRecord:
 
 
 @dataclass(frozen=True)
-class DocPairRef:
+class PairMetadata:
     bucket_idx: int
     record_idx: int
     doc_id: str
@@ -309,7 +309,7 @@ def num_pretrain_positions(
     return int(epoch_samples_per_process) * int(num_epochs)
 
 
-class PretrainIndexRecordMap:
+class IndexRecordLookup:
     def __init__(
         self,
         *,
@@ -354,7 +354,7 @@ class PretrainIndexRecordMap:
         return json.loads(self._index_source()[index_record_idx])
 
 
-def make_pretrain_index_record_dataset(
+def make_dataset_index(
     *,
     index_shard_paths: Sequence[str | Path],
     num_records: int,
@@ -385,8 +385,8 @@ def make_pretrain_index_record_dataset(
         epoch_samples_per_process=epoch_samples_per_process,
         num_epochs=num_epochs,
     )
-    index_dataset = grain.MapDataset.range(total_samples_per_process).map(
-        PretrainIndexRecordMap(
+    dataset_index = grain.MapDataset.range(total_samples_per_process).map(
+        IndexRecordLookup(
             index_shard_paths=index_shard_paths,
             num_records=num_records,
             epoch_samples_per_process=epoch_samples_per_process,
@@ -397,7 +397,7 @@ def make_pretrain_index_record_dataset(
             shuffle_rounds=shuffle_rounds,
         )
     )
-    return index_dataset, epoch_samples_per_process
+    return dataset_index, epoch_samples_per_process
 
 
 def write_json_arrayrecord_dataset(
@@ -508,24 +508,24 @@ class DataSetReader:
                 yield bucket_idx, record_idx, deserialize_data_set_record(bucket[record_idx])
 
 
-def iter_document_pair_refs(
+def iter_document_pair_metadata(
     doc: DataSetRecord,
     *,
-    segment_length: int = DEFAULT_SEGMENT_LENGTH,
+    chunk_length: int = DEFAULT_CHUNK_LENGTH,
     bucket_idx: int = 0,
     record_idx: int = 0,
     eos_id: int | None = DEFAULT_EOS_ID,
-) -> Iterator[DocPairRef]:
-    """Yield retained 2-segment windows for statepassing pretraining."""
+) -> Iterator[PairMetadata]:
+    """Yield retained 2-chunk windows for statepassing pretraining."""
 
-    if segment_length <= 0:
-        raise ValueError("segment_length must be > 0")
-    if doc.doc_token_count <= segment_length:
+    if chunk_length <= 0:
+        raise ValueError("chunk_length must be > 0")
+    if doc.doc_token_count <= chunk_length:
         return
 
-    pair_length = 2 * segment_length
+    pair_length = 2 * chunk_length
     num_full_pairs, tail = divmod(doc.doc_token_count, pair_length)
-    keep_tail_pair = tail > segment_length
+    keep_tail_pair = tail > chunk_length
     num_pairs = num_full_pairs + int(keep_tail_pair)
     if num_pairs == 0:
         return
@@ -538,7 +538,7 @@ def iter_document_pair_refs(
     if (
         eos_id is not None
         and tail > 0
-        and tail <= segment_length
+        and tail <= chunk_length
         and retained_end > 0
         and int(doc.token_ids[-1]) == int(eos_id)
     ):
@@ -550,13 +550,13 @@ def iter_document_pair_refs(
         pair_eos_idx = (
             eos_token_idx if eos_token_idx is not None and start <= eos_token_idx < end else None
         )
-        yield DocPairRef(
+        yield PairMetadata(
             bucket_idx=bucket_idx,
             record_idx=record_idx,
             doc_id=doc.doc_id,
             pair_idx=pair_idx,
             start=start,
-            mid=start + segment_length,
+            mid=start + chunk_length,
             end=end,
             doc_token_count=doc.doc_token_count,
             eos_token_idx=pair_eos_idx,
@@ -568,13 +568,13 @@ def build_chunk_arrays(
     *,
     start: int = 0,
     end: int | None = None,
-    segment_length: int = DEFAULT_SEGMENT_LENGTH,
+    chunk_length: int = DEFAULT_CHUNK_LENGTH,
     pad_id: int = DEFAULT_PAD_ID,
     eos_id: int | None = DEFAULT_EOS_ID,
     eos_token_idx: int | None = None,
 ) -> dict[str, np.ndarray]:
-    if segment_length <= 0:
-        raise ValueError("segment_length must be > 0")
+    if chunk_length <= 0:
+        raise ValueError("chunk_length must be > 0")
 
     ids = np.asarray(token_ids, dtype=np.int32)
     end = int(ids.shape[0] if end is None else end)
@@ -583,11 +583,11 @@ def build_chunk_arrays(
         raise ValueError(f"Invalid chunk range start={start}, end={end}, length={ids.shape[0]}")
 
     real_length = end - start
-    if real_length > segment_length:
-        raise ValueError(f"Chunk length {real_length} exceeds segment_length={segment_length}")
+    if real_length > chunk_length:
+        raise ValueError(f"Chunk length {real_length} exceeds chunk_length={chunk_length}")
 
-    token_ids_T = np.full((segment_length,), int(pad_id), dtype=np.int32)
-    attention_mask_T = np.zeros((segment_length,), dtype=np.int32)
+    token_ids_T = np.full((chunk_length,), int(pad_id), dtype=np.int32)
+    attention_mask_T = np.zeros((chunk_length,), dtype=np.int32)
     if real_length:
         token_ids_T[:real_length] = ids[start:end]
         if eos_token_idx is not None:
@@ -610,84 +610,90 @@ def build_chunk_arrays(
 
 def build_pair_arrays(
     token_ids: Sequence[int] | np.ndarray,
-    pair: DocPairRef,
+    pair_metadata: PairMetadata,
     *,
-    segment_length: int = DEFAULT_SEGMENT_LENGTH,
+    chunk_length: int = DEFAULT_CHUNK_LENGTH,
     pad_id: int = DEFAULT_PAD_ID,
     eos_id: int | None = DEFAULT_EOS_ID,
 ) -> dict[str, np.ndarray]:
-    token_ids_ST = []
-    attention_mask_ST = []
-    loss_mask_ST = []
-    chunk_idx_S = []
-    is_last_chunk_S = []
+    token_ids_CT = []
+    attention_mask_CT = []
+    loss_mask_CT = []
+    chunk_idx_C = []
+    is_last_chunk_C = []
 
-    for segment_in_pair, start, end, eos_token_idx in _iter_pair_segments(pair):
+    for chunk_in_pair, start, end, eos_token_idx in _iter_pair_metadata_chunks(pair_metadata):
         arrays = build_chunk_arrays(
             token_ids,
             start=start,
             end=end,
-            segment_length=segment_length,
+            chunk_length=chunk_length,
             pad_id=pad_id,
             eos_id=eos_id,
             eos_token_idx=eos_token_idx,
         )
-        token_ids_ST.append(arrays["token_ids_T"])
-        attention_mask_ST.append(arrays["attention_mask_T"])
-        loss_mask_ST.append(arrays["loss_mask_T"])
-        chunk_idx_S.append(pair.pair_idx * 2 + segment_in_pair)
-        is_last_chunk_S.append(end >= pair.doc_token_count)
+        token_ids_CT.append(arrays["token_ids_T"])
+        attention_mask_CT.append(arrays["attention_mask_T"])
+        loss_mask_CT.append(arrays["loss_mask_T"])
+        chunk_idx_C.append(pair_metadata.pair_idx * 2 + chunk_in_pair)
+        is_last_chunk_C.append(end >= pair_metadata.doc_token_count)
 
     return {
-        "token_ids_ST": np.stack(token_ids_ST).astype(np.int32),
-        "attention_mask_ST": np.stack(attention_mask_ST).astype(np.int32),
-        "loss_mask_ST": np.stack(loss_mask_ST).astype(np.int32),
-        "chunk_idx_S": np.asarray(chunk_idx_S, dtype=np.int32),
-        "reset_state_S": np.asarray([True, False], dtype=np.bool_),
-        "is_last_chunk_S": np.asarray(is_last_chunk_S, dtype=np.bool_),
+        "token_ids_CT": np.stack(token_ids_CT).astype(np.int32),
+        "attention_mask_CT": np.stack(attention_mask_CT).astype(np.int32),
+        "loss_mask_CT": np.stack(loss_mask_CT).astype(np.int32),
+        "chunk_idx_C": np.asarray(chunk_idx_C, dtype=np.int32),
+        "reset_state_C": np.asarray([True, False], dtype=np.bool_),
+        "is_last_chunk_C": np.asarray(is_last_chunk_C, dtype=np.bool_),
     }
 
 
-def _iter_pair_segments(pair: DocPairRef) -> Iterator[tuple[int, int, int, int | None]]:
-    for segment_in_pair, (start, end) in enumerate(
-        ((pair.start, min(pair.mid, pair.end)), (pair.mid, pair.end))
+def _iter_pair_metadata_chunks(
+    pair_metadata: PairMetadata,
+) -> Iterator[tuple[int, int, int, int | None]]:
+    for chunk_in_pair, (start, end) in enumerate(
+        (
+            (pair_metadata.start, min(pair_metadata.mid, pair_metadata.end)),
+            (pair_metadata.mid, pair_metadata.end),
+        )
     ):
         eos_token_idx = (
-            pair.eos_token_idx
-            if pair.eos_token_idx is not None and start <= pair.eos_token_idx < end
+            pair_metadata.eos_token_idx
+            if pair_metadata.eos_token_idx is not None
+            and start <= pair_metadata.eos_token_idx < end
             else None
         )
-        yield segment_in_pair, start, end, eos_token_idx
+        yield chunk_in_pair, start, end, eos_token_idx
 
 
-def flatten_pair_ref(pair: DocPairRef) -> list[dict[str, Any]]:
+def flatten_pair_metadata(pair_metadata: PairMetadata) -> list[dict[str, Any]]:
     return [
         {
-            "bucket_idx": pair.bucket_idx,
-            "record_idx": pair.record_idx,
-            "doc_id": pair.doc_id,
-            "pair_idx": pair.pair_idx,
-            "segment_in_pair": segment_in_pair,
-            "chunk_idx": pair.pair_idx * 2 + segment_in_pair,
+            "bucket_idx": pair_metadata.bucket_idx,
+            "record_idx": pair_metadata.record_idx,
+            "doc_id": pair_metadata.doc_id,
+            "pair_idx": pair_metadata.pair_idx,
+            "chunk_in_pair": chunk_in_pair,
+            "chunk_idx": pair_metadata.pair_idx * 2 + chunk_in_pair,
             "start": start,
             "end": end,
             "eos_token_idx": eos_token_idx,
         }
-        for segment_in_pair, start, end, eos_token_idx in _iter_pair_segments(pair)
+        for chunk_in_pair, start, end, eos_token_idx in _iter_pair_metadata_chunks(pair_metadata)
     ]
 
 
-def pair_ref_to_record(pair: DocPairRef) -> dict[str, Any]:
+def pair_metadata_to_record(pair_metadata: PairMetadata) -> dict[str, Any]:
     return {
-        "bucket_idx": pair.bucket_idx,
-        "record_idx": pair.record_idx,
-        "doc_id": pair.doc_id,
-        "pair_idx": pair.pair_idx,
-        "start": pair.start,
-        "mid": pair.mid,
-        "end": pair.end,
-        "doc_token_count": pair.doc_token_count,
-        "eos_token_idx": pair.eos_token_idx,
+        "bucket_idx": pair_metadata.bucket_idx,
+        "record_idx": pair_metadata.record_idx,
+        "doc_id": pair_metadata.doc_id,
+        "pair_idx": pair_metadata.pair_idx,
+        "start": pair_metadata.start,
+        "mid": pair_metadata.mid,
+        "end": pair_metadata.end,
+        "doc_token_count": pair_metadata.doc_token_count,
+        "eos_token_idx": pair_metadata.eos_token_idx,
     }
 
 

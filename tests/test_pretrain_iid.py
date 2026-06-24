@@ -33,7 +33,7 @@ class PretrainIidTest(absltest.TestCase):
     def _bucket_names(self, root: Path, split: str) -> list[str]:
         return [path.name for path in resolve_data_set_buckets(root, split=split)]
 
-    def _build_real_index(self, tmpdir: Path, *, segment_length: int = 4096) -> tuple[Path, Path]:
+    def _build_real_index(self, tmpdir: Path, *, chunk_length: int = 4096) -> tuple[Path, Path]:
         root = write_real_binary_mini_root_dataset(
             self,
             tmpdir / "docs",
@@ -43,7 +43,7 @@ class PretrainIidTest(absltest.TestCase):
         index = build_iid_chunk_index(
             root,
             tmpdir / "index",
-            segment_length=segment_length,
+            chunk_length=chunk_length,
             split="train",
             records_per_shard=1000,
         )
@@ -90,7 +90,7 @@ class PretrainIidTest(absltest.TestCase):
             records = self._read_index_records(index)
             bucket_names = self._bucket_names(root, "train")
 
-            self.assertEqual(metadata["segment_length"], 4096)
+            self.assertEqual(metadata["chunk_length"], 4096)
             self.assertEqual(metadata["eos_id"], DEFAULT_EOS_ID)
             self.assertEqual(metadata["data_set_root"], str(root.resolve()))
             self.assertEqual(metadata["split"], "train")
@@ -108,7 +108,7 @@ class PretrainIidTest(absltest.TestCase):
             first = records[0]
             self.assertEqual(first["bucket_idx"], 0)
             self.assertEqual(first["record_idx"], 0)
-            self.assertEqual(first["segment_in_pair"], 0)
+            self.assertEqual(first["chunk_in_pair"], 0)
             self.assertEqual(first["chunk_idx"], 0)
             self.assertEqual(first["start"], 0)
             self.assertEqual(first["end"], 4096)
@@ -120,7 +120,7 @@ class PretrainIidTest(absltest.TestCase):
                 make_iid_iterator(
                     index,
                     batch_size=2,
-                    segment_length=4096,
+                    chunk_length=4096,
                     shuffle=False,
                     num_epochs=1,
                     process_index=0,
@@ -137,7 +137,7 @@ class PretrainIidTest(absltest.TestCase):
                 np.asarray([0, 0], dtype=np.int32),
             )
             np.testing.assert_array_equal(
-                batch["metadata"]["segment_in_pair_B"],
+                batch["metadata"]["chunk_in_pair_B"],
                 np.asarray([0, 1], dtype=np.int32),
             )
 
@@ -160,7 +160,7 @@ class PretrainIidTest(absltest.TestCase):
                 iterator = make_iid_iterator(
                     index,
                     batch_size=2,
-                    segment_length=4096,
+                    chunk_length=4096,
                     shuffle=False,
                     num_epochs=1,
                     process_index=0,
@@ -220,7 +220,7 @@ class PretrainIidTest(absltest.TestCase):
                 iterator = make_iid_iterator(
                     index,
                     batch_size=2,
-                    segment_length=4096,
+                    chunk_length=4096,
                     shuffle=False,
                     num_epochs=1,
                     process_index=0,
@@ -241,7 +241,7 @@ class PretrainIidTest(absltest.TestCase):
             iterator = make_iid_iterator(
                 index,
                 batch_size=2,
-                segment_length=4096,
+                chunk_length=4096,
                 shuffle=False,
                 num_epochs=1,
                 process_index=0,
@@ -262,7 +262,7 @@ class PretrainIidTest(absltest.TestCase):
             index = build_iid_chunk_index(
                 root,
                 tmpdir / "binary_index",
-                segment_length=4096,
+                chunk_length=4096,
                 split="val",
                 records_per_shard=1000,
             )
@@ -270,7 +270,7 @@ class PretrainIidTest(absltest.TestCase):
                 make_iid_iterator(
                     index,
                     batch_size=2,
-                    segment_length=4096,
+                    chunk_length=4096,
                     shuffle=False,
                     num_epochs=1,
                     process_index=0,
@@ -291,11 +291,11 @@ class PretrainIidTest(absltest.TestCase):
 
     def test_real_iid_shuffle_is_deterministic(self):
         with test_temp_dir() as tmp:
-            index, _ = self._build_real_index(Path(tmp), segment_length=4096)
+            index, _ = self._build_real_index(Path(tmp), chunk_length=4096)
             it0 = make_iid_iterator(
                 index,
                 batch_size=1,
-                segment_length=4096,
+                chunk_length=4096,
                 shuffle=True,
                 seed=0,
                 num_epochs=1,
@@ -305,7 +305,7 @@ class PretrainIidTest(absltest.TestCase):
             it1 = make_iid_iterator(
                 index,
                 batch_size=1,
-                segment_length=4096,
+                chunk_length=4096,
                 shuffle=True,
                 seed=0,
                 num_epochs=1,
@@ -319,11 +319,11 @@ class PretrainIidTest(absltest.TestCase):
 
     def test_real_iid_infinite_epochs_are_deterministic(self):
         with test_temp_dir() as tmp:
-            index, _ = self._build_real_index(Path(tmp), segment_length=4096)
+            index, _ = self._build_real_index(Path(tmp), chunk_length=4096)
             it0 = make_iid_iterator(
                 index,
                 batch_size=2,
-                segment_length=4096,
+                chunk_length=4096,
                 shuffle=True,
                 seed=11,
                 num_epochs=None,
@@ -333,7 +333,7 @@ class PretrainIidTest(absltest.TestCase):
             it1 = make_iid_iterator(
                 index,
                 batch_size=2,
-                segment_length=4096,
+                chunk_length=4096,
                 shuffle=True,
                 seed=11,
                 num_epochs=None,
@@ -348,7 +348,7 @@ class PretrainIidTest(absltest.TestCase):
 
     def test_iid_index_shuffle_covers_usable_dp_shards_without_overlap(self):
         with test_temp_dir() as tmp:
-            index, _ = self._build_real_index(Path(tmp), segment_length=4096)
+            index, _ = self._build_real_index(Path(tmp), chunk_length=4096)
             records = self._read_index_records(index)
             expected = {
                 (record["bucket_idx"], record["record_idx"], record["chunk_idx"])
@@ -365,7 +365,7 @@ class PretrainIidTest(absltest.TestCase):
                     make_iid_iterator(
                         index,
                         batch_size=batch_size,
-                        segment_length=4096,
+                        chunk_length=4096,
                         shuffle=True,
                         seed=17,
                         num_epochs=1,
@@ -388,7 +388,7 @@ class PretrainIidTest(absltest.TestCase):
 
     def test_iid_index_shuffle_covers_all_records_for_single_rank(self):
         with test_temp_dir() as tmp:
-            index, _ = self._build_real_index(Path(tmp), segment_length=4096)
+            index, _ = self._build_real_index(Path(tmp), chunk_length=4096)
             records = self._read_index_records(index)
             expected = {
                 (record["bucket_idx"], record["record_idx"], record["chunk_idx"])
@@ -399,7 +399,7 @@ class PretrainIidTest(absltest.TestCase):
                 make_iid_iterator(
                     index,
                     batch_size=1,
-                    segment_length=4096,
+                    chunk_length=4096,
                     shuffle=True,
                     seed=17,
                     num_epochs=1,

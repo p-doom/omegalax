@@ -55,7 +55,7 @@ class PretrainStatepassingTest(absltest.TestCase):
             index = build_statepassing_pair_index(
                 self._root(),
                 Path(tmp) / "statepassing_pair_index",
-                segment_length=4096,
+                chunk_length=4096,
                 split="train",
                 records_per_shard=1000,
             )
@@ -69,7 +69,7 @@ class PretrainStatepassingTest(absltest.TestCase):
         return make_statepassing_iterator(
             self._index(),
             batch_size=kwargs.pop("batch_size", 2),
-            segment_length=kwargs.pop("segment_length", 4096),
+            chunk_length=kwargs.pop("chunk_length", 4096),
             shuffle=kwargs.pop("shuffle", False),
             num_epochs=kwargs.pop("num_epochs", 1),
             dp_size=kwargs.pop("dp_size", 1),
@@ -83,7 +83,7 @@ class PretrainStatepassingTest(absltest.TestCase):
         return (
             list(batch["metadata"]["doc_ids"]),
             batch["metadata"]["pair_idx_B"].tolist(),
-            batch["chunk_idx_BS"].tolist(),
+            batch["chunk_idx_BC"].tolist(),
         )
 
     def _pair_keys(self, iterator) -> set[tuple[int, int, int]]:
@@ -119,7 +119,7 @@ class PretrainStatepassingTest(absltest.TestCase):
         self.assertEqual(metadata["format"], STATEPASSING_PAIR_INDEX_FORMAT)
         self.assertEqual(metadata["data_set_root"], str(self._root().resolve()))
         self.assertEqual(metadata["split"], "train")
-        self.assertEqual(metadata["segment_length"], 4096)
+        self.assertEqual(metadata["chunk_length"], 4096)
         self.assertEqual(metadata["eos_id"], DEFAULT_EOS_ID)
         self.assertEqual(metadata["bucket_names"], bucket_names)
         self.assertNotIn("bucket_paths", metadata)
@@ -139,15 +139,15 @@ class PretrainStatepassingTest(absltest.TestCase):
         self.assertEqual(first["mid"], 4096)
         self.assertGreater(first["end"], first["mid"])
 
-    def test_real_batch_is_pair_by_two_segments_by_t(self):
+    def test_real_batch_is_pair_by_two_chunks_by_t(self):
         batch = next(self._iterator())
 
         self.assertNotIn("token_ids_BT", batch)
-        self.assertEqual(batch["token_ids_BST"].shape, (1, 2, 4096))
-        self.assertEqual(batch["attention_mask_BST"].shape, (1, 2, 4096))
-        self.assertEqual(batch["loss_mask_BST"].shape, (1, 2, 4096))
-        self.assertEqual(batch["chunk_idx_BS"].shape, (1, 2))
-        self.assertEqual(batch["reset_state_BS"].tolist(), [[True, False]])
+        self.assertEqual(batch["token_ids_BCT"].shape, (1, 2, 4096))
+        self.assertEqual(batch["attention_mask_BCT"].shape, (1, 2, 4096))
+        self.assertEqual(batch["loss_mask_BCT"].shape, (1, 2, 4096))
+        self.assertEqual(batch["chunk_idx_BC"].shape, (1, 2))
+        self.assertEqual(batch["reset_state_BC"].tolist(), [[True, False]])
         self.assertLen(batch["metadata"]["doc_ids"], 1)
 
     def test_real_binary_statepassing_index_and_iterator_match_training_path(self):
@@ -161,7 +161,7 @@ class PretrainStatepassingTest(absltest.TestCase):
             index = build_statepassing_pair_index(
                 root,
                 tmpdir / "binary_statepassing_pair_index",
-                segment_length=4096,
+                chunk_length=4096,
                 split="val",
                 records_per_shard=1000,
             )
@@ -169,7 +169,7 @@ class PretrainStatepassingTest(absltest.TestCase):
                 make_statepassing_iterator(
                     index,
                     batch_size=2,
-                    segment_length=4096,
+                    chunk_length=4096,
                     shuffle=False,
                     num_epochs=1,
                     dp_size=1,
@@ -190,16 +190,16 @@ class PretrainStatepassingTest(absltest.TestCase):
             )
             self.assertGreater(len(metadata["bucket_names"]), 1)
             self.assertGreater(metadata["num_pairs"], 0)
-            self.assertEqual(batch["token_ids_BST"].shape, (1, 2, 4096))
-            self.assertEqual(batch["reset_state_BS"].tolist(), [[True, False]])
-            self.assertGreater(int(np.asarray(batch["attention_mask_BST"]).sum()), 0)
+            self.assertEqual(batch["token_ids_BCT"].shape, (1, 2, 4096))
+            self.assertEqual(batch["reset_state_BC"].tolist(), [[True, False]])
+            self.assertGreater(int(np.asarray(batch["attention_mask_BCT"]).sum()), 0)
 
     def test_single_item_index_sequence_uses_indexed_iterator(self):
         batch = next(
             make_statepassing_iterator(
                 [self._index()],
                 batch_size=2,
-                segment_length=4096,
+                chunk_length=4096,
                 shuffle=False,
                 num_epochs=1,
                 dp_size=1,
@@ -209,7 +209,7 @@ class PretrainStatepassingTest(absltest.TestCase):
             )
         )
 
-        self.assertEqual(batch["token_ids_BST"].shape, (1, 2, 4096))
+        self.assertEqual(batch["token_ids_BCT"].shape, (1, 2, 4096))
 
     def test_indexed_iterator_rewrites_data_set_root_to_local_root(self):
         with test_temp_dir() as tmp:
@@ -223,7 +223,7 @@ class PretrainStatepassingTest(absltest.TestCase):
             index = build_statepassing_pair_index(
                 root,
                 tmpdir / "statepassing_pair_index",
-                segment_length=4096,
+                chunk_length=4096,
                 split="train",
                 records_per_shard=1000,
             )
@@ -242,7 +242,7 @@ class PretrainStatepassingTest(absltest.TestCase):
                 iterator = make_statepassing_iterator(
                     index,
                     batch_size=2,
-                    segment_length=4096,
+                    chunk_length=4096,
                     shuffle=False,
                     num_epochs=1,
                     dp_size=1,
@@ -252,7 +252,7 @@ class PretrainStatepassingTest(absltest.TestCase):
                 )
 
             batch = next(iterator)
-            self.assertEqual(batch["token_ids_BST"].shape, (1, 2, 4096))
+            self.assertEqual(batch["token_ids_BCT"].shape, (1, 2, 4096))
             self.assertLen(batch["metadata"]["doc_ids"], 1)
 
     def test_indexed_iterator_rejects_bucket_name_mismatch(self):
@@ -267,7 +267,7 @@ class PretrainStatepassingTest(absltest.TestCase):
             index = build_statepassing_pair_index(
                 root,
                 tmpdir / "statepassing_pair_index",
-                segment_length=4096,
+                chunk_length=4096,
                 split="train",
                 records_per_shard=1000,
             )
@@ -279,7 +279,7 @@ class PretrainStatepassingTest(absltest.TestCase):
             iterator = make_statepassing_iterator(
                 index,
                 batch_size=2,
-                segment_length=4096,
+                chunk_length=4096,
                 shuffle=False,
                 num_epochs=1,
                 dp_size=1,
@@ -312,7 +312,7 @@ class PretrainStatepassingTest(absltest.TestCase):
                 make_statepassing_iterator(
                     self._index(),
                     batch_size=batch_size,
-                    segment_length=4096,
+                    chunk_length=4096,
                     shuffle=True,
                     seed=17,
                     num_epochs=1,
@@ -334,11 +334,11 @@ class PretrainStatepassingTest(absltest.TestCase):
                 self.assertEmpty(keys & other_keys)
         self.assertLen(union, usable_records)
 
-    def test_real_batch_size_counts_segments_but_batches_pairs(self):
+    def test_real_batch_size_counts_chunks_but_batches_pairs(self):
         batch = next(self._iterator(batch_size=4))
 
-        self.assertEqual(batch["token_ids_BST"].shape, (2, 2, 4096))
-        self.assertEqual(batch["chunk_idx_BS"].shape, (2, 2))
+        self.assertEqual(batch["token_ids_BCT"].shape, (2, 2, 4096))
+        self.assertEqual(batch["chunk_idx_BC"].shape, (2, 2))
         self.assertLen(batch["metadata"]["doc_ids"], 2)
         self.assertTrue(all(pair_idx >= 0 for pair_idx in batch["metadata"]["pair_idx_B"]))
 
@@ -351,7 +351,7 @@ class PretrainStatepassingTest(absltest.TestCase):
         for value in batch.values():
             self.assertTrue(hasattr(value, "ndim"))
 
-    def test_odd_segment_batch_size_is_rejected(self):
+    def test_odd_chunk_batch_size_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "batch_size must be even"):
             self._iterator(batch_size=3)
 
@@ -360,7 +360,7 @@ class PretrainStatepassingTest(absltest.TestCase):
             make_statepassing_iterator(
                 self._root(),
                 batch_size=2,
-                segment_length=4096,
+                chunk_length=4096,
                 shuffle=False,
                 num_epochs=1,
                 dp_size=1,
@@ -374,7 +374,7 @@ class PretrainStatepassingTest(absltest.TestCase):
             make_statepassing_iterator(
                 self._bucket_paths()[0] / "part-00000.array_record",
                 batch_size=2,
-                segment_length=4096,
+                chunk_length=4096,
                 shuffle=False,
                 num_epochs=1,
                 dp_size=1,
@@ -395,8 +395,8 @@ class PretrainStatepassingTest(absltest.TestCase):
     def test_real_attention_mask_has_tokens(self):
         batch = next(self._iterator())
 
-        self.assertGreater(int(np.asarray(batch["attention_mask_BST"]).sum()), 0)
-        np.testing.assert_array_equal(batch["loss_mask_BST"], batch["attention_mask_BST"])
+        self.assertGreater(int(np.asarray(batch["attention_mask_BCT"]).sum()), 0)
+        np.testing.assert_array_equal(batch["loss_mask_BCT"], batch["attention_mask_BCT"])
 
 
 if __name__ == "__main__":

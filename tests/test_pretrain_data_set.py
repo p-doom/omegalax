@@ -22,9 +22,9 @@ from omegalax.data.pretrain_data_set import (
     build_chunk_arrays,
     calculate_samples_per_process,
     deserialize_data_set_record,
-    iter_document_pair_refs,
+    iter_document_pair_metadata,
     load_data_set_metadata,
-    make_pretrain_index_record_dataset,
+    make_dataset_index,
     num_pretrain_positions,
     num_pretrain_records_usable,
     resolve_data_set_buckets,
@@ -77,7 +77,7 @@ class PretrainDataSetTest(absltest.TestCase):
     def test_padding_and_masks_cover_only_real_tokens(self):
         arrays = build_chunk_arrays(
             np.asarray([7, 8, 9], dtype=np.int32),
-            segment_length=5,
+            chunk_length=5,
             pad_id=0,
         )
 
@@ -100,8 +100,8 @@ class PretrainDataSetTest(absltest.TestCase):
             }
             record = deserialize_data_set_record(payload)
             return [
-                (pair.start, pair.mid, pair.end)
-                for pair in iter_document_pair_refs(record, segment_length=4)
+                (pair_metadata.start, pair_metadata.mid, pair_metadata.end)
+                for pair_metadata in iter_document_pair_metadata(record, chunk_length=4)
             ]
 
         self.assertEqual(pair_ranges(4), [])
@@ -119,16 +119,16 @@ class PretrainDataSetTest(absltest.TestCase):
                 "doc_token_count": 9,
             }
         )
-        pair = next(iter_document_pair_refs(record, segment_length=4))
+        pair_metadata = next(iter_document_pair_metadata(record, chunk_length=4))
         arrays = build_chunk_arrays(
             record.token_ids,
-            start=pair.mid,
-            end=pair.end,
-            segment_length=4,
-            eos_token_idx=pair.eos_token_idx,
+            start=pair_metadata.mid,
+            end=pair_metadata.end,
+            chunk_length=4,
+            eos_token_idx=pair_metadata.eos_token_idx,
         )
 
-        self.assertEqual(pair.eos_token_idx, 7)
+        self.assertEqual(pair_metadata.eos_token_idx, 7)
         np.testing.assert_array_equal(
             arrays["token_ids_T"],
             np.asarray([5, 6, 7, DEFAULT_EOS_ID], dtype=np.int32),
@@ -317,7 +317,7 @@ class PretrainDataSetTest(absltest.TestCase):
                 overwrite=False,
                 metadata={"format": "test_index"},
             )
-            dataset, total_samples_per_process = make_pretrain_index_record_dataset(
+            dataset_index, total_samples_per_process = make_dataset_index(
                 index_shard_paths=sorted(index.glob("*.array_record")),
                 num_records=5,
                 num_epochs=2,
@@ -329,8 +329,8 @@ class PretrainDataSetTest(absltest.TestCase):
             )
 
             self.assertEqual(total_samples_per_process, 2)
-            self.assertLen(dataset, 4)
-            self.assertEqual([dataset[i]["record"] for i in range(4)], [1, 3, 1, 3])
+            self.assertLen(dataset_index, 4)
+            self.assertEqual([dataset_index[i]["record"] for i in range(4)], [1, 3, 1, 3])
 
 
 if __name__ == "__main__":
