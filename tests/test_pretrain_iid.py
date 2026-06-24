@@ -20,7 +20,7 @@ from omegalax.data.pretrain_data_set import (
     DEFAULT_EOS_ID,
     iter_json_arrayrecord_records,
     load_arrayrecord_metadata,
-    resolve_doc_chain_buckets,
+    resolve_data_set_buckets,
 )
 from omegalax.data.pretrain_iid_pipeline import build_iid_chunk_index, make_iid_iterator
 from tests.pretrain_real_data_test_utils import (
@@ -31,7 +31,7 @@ from tests.pretrain_real_data_test_utils import (
 
 class PretrainIidTest(absltest.TestCase):
     def _bucket_names(self, root: Path, split: str) -> list[str]:
-        return [path.name for path in resolve_doc_chain_buckets(root, split=split)]
+        return [path.name for path in resolve_data_set_buckets(root, split=split)]
 
     def _build_real_index(self, tmpdir: Path, *, segment_length: int = 4096) -> tuple[Path, Path]:
         root = write_real_binary_mini_root_dataset(
@@ -171,7 +171,7 @@ class PretrainIidTest(absltest.TestCase):
             self.assertEqual(batch["token_ids_BT"].shape, (2, 4096))
             self.assertLen(batch["metadata"]["doc_ids"], 2)
 
-    def test_iid_iterator_rejects_doc_chain_record_doc_id_mismatch(self):
+    def test_iid_iterator_rejects_data_set_record_doc_id_mismatch(self):
         with test_temp_dir() as tmp:
             tmpdir = Path(tmp)
             index, root = self._build_real_index(tmpdir)

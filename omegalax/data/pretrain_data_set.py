@@ -26,14 +26,14 @@ DEFAULT_SEGMENT_LENGTH = 4096
 DEFAULT_PAD_ID = 0
 DEFAULT_EOS_ID = 248046  # Qwen/Qwen3.5-0.8B <|im_end|>
 BATCH_PRETRAIN_METADATA_KEY = "metadata"
-DEFAULT_DOC_CHAIN_SPLIT = "train"
+DEFAULT_DATA_SET_SPLIT = "train"
 PRETRAIN_SOURCE_ROOT_ENV = "OMEGALAX_PRETRAIN_SOURCE_ROOT"
 PRETRAIN_LOCAL_ROOT_ENV = "OMEGALAX_PRETRAIN_LOCAL_ROOT"
 MAX_PRETRAIN_POSITIONS = 2**63 - 1
 
 
 @dataclass(frozen=True)
-class DocChainRecord:
+class DataSetRecord:
     doc_id: str
     token_ids: np.ndarray
     doc_token_count: int
@@ -62,7 +62,7 @@ def _json_payload(payload: bytes | str | dict[str, Any]) -> dict[str, Any]:
         return json.loads(payload)
     if isinstance(payload, dict):
         return dict(payload)
-    raise TypeError(f"Unsupported doc-chain payload type: {type(payload).__name__}")
+    raise TypeError(f"Unsupported data-set payload type: {type(payload).__name__}")
 
 
 def _binary_payload(payload: bytes) -> dict[str, Any]:
@@ -87,8 +87,10 @@ def _binary_payload(payload: bytes) -> dict[str, Any]:
     return header
 
 
-def deserialize_doc_chain(payload: DocChainRecord | bytes | str | dict[str, Any]) -> DocChainRecord:
-    if isinstance(payload, DocChainRecord):
+def deserialize_data_set_record(
+    payload: DataSetRecord | bytes | str | dict[str, Any],
+) -> DataSetRecord:
+    if isinstance(payload, DataSetRecord):
         return payload
     raw = _json_payload(payload)
     fmt = (
@@ -99,7 +101,7 @@ def deserialize_doc_chain(payload: DocChainRecord | bytes | str | dict[str, Any]
 
     doc_id = raw.get("doc_id", raw.get("id"))
     if doc_id is None:
-        raise ValueError("Doc-chain record is missing doc_id")
+        raise ValueError("Data-set record is missing doc_id")
 
     raw_tokens = None
     for key in ("token_ids", "tokens", "input_ids"):
@@ -107,7 +109,7 @@ def deserialize_doc_chain(payload: DocChainRecord | bytes | str | dict[str, Any]
             raw_tokens = raw[key]
             break
     if raw_tokens is None:
-        raise ValueError("Doc-chain record is missing token_ids")
+        raise ValueError("Data-set record is missing token_ids")
 
     token_ids = np.asarray(raw_tokens, dtype=np.int32)
     doc_token_count = int(raw.get("doc_token_count", token_ids.shape[0]))
@@ -130,7 +132,7 @@ def deserialize_doc_chain(payload: DocChainRecord | bytes | str | dict[str, Any]
         if key not in core_keys:
             metadata[key] = value
 
-    return DocChainRecord(
+    return DataSetRecord(
         doc_id=str(doc_id),
         token_ids=token_ids,
         doc_token_count=doc_token_count,
@@ -146,7 +148,7 @@ def load_arrayrecord_metadata(path: str | Path) -> dict[str, Any]:
     return json.loads(metadata_path.read_text())
 
 
-def load_doc_chain_metadata(path: str | Path) -> dict[str, Any]:
+def load_data_set_metadata(path: str | Path) -> dict[str, Any]:
     metadata = load_arrayrecord_metadata(path)
     fmt = metadata.get("format") or metadata.get("dataset_format")
     if fmt != DOC_CHAIN_FORMAT:
@@ -167,15 +169,15 @@ def _bucket_sort_key(path: Path) -> tuple[int, int, str]:
     return (0, value, path.name)
 
 
-def resolve_doc_chain_buckets(
+def resolve_data_set_buckets(
     root: str | Path,
     *,
-    split: str = DEFAULT_DOC_CHAIN_SPLIT,
+    split: str = DEFAULT_DATA_SET_SPLIT,
 ) -> list[Path]:
     root = Path(root).expanduser().resolve()
     split_path = root / split
     if not split_path.is_dir():
-        raise ValueError(f"Doc-chain split directory does not exist: {split_path}")
+        raise ValueError(f"Data-set split directory does not exist: {split_path}")
     bucket_paths = sorted(
         (
             child.resolve()
@@ -185,7 +187,7 @@ def resolve_doc_chain_buckets(
         key=_bucket_sort_key,
     )
     if not bucket_paths:
-        raise ValueError(f"No doc-chain dataset buckets found under: {split_path}")
+        raise ValueError(f"No data-set buckets found under: {split_path}")
     return bucket_paths
 
 
@@ -212,19 +214,19 @@ def rewrite_data_set_root_path(
         rel_path = root_path.relative_to(resolved_source_root)
     except ValueError as exc:
         raise ValueError(
-            f"Cannot rewrite doc-chain root path outside {PRETRAIN_SOURCE_ROOT_ENV}: "
+            f"Cannot rewrite data-set root path outside {PRETRAIN_SOURCE_ROOT_ENV}: "
             f"{root_path} is not under {resolved_source_root}"
         ) from exc
 
     rewritten_path = resolved_local_root / rel_path
     if not rewritten_path.exists():
-        raise ValueError(f"Rewritten doc-chain root path does not exist: {rewritten_path}")
+        raise ValueError(f"Rewritten data-set root path does not exist: {rewritten_path}")
     return rewritten_path
 
 
-def _resolve_doc_chain_bucket_shards(bucket_path: str | Path) -> list[Path]:
+def _resolve_data_set_bucket_shards(bucket_path: str | Path) -> list[Path]:
     bucket_path = Path(bucket_path).expanduser().resolve()
-    metadata = load_doc_chain_metadata(bucket_path)
+    metadata = load_data_set_metadata(bucket_path)
     shard_paths = [bucket_path / rel for rel in metadata["shard_paths"]]
     if not shard_paths:
         raise ValueError(f"No ArrayRecord shards found under: {bucket_path}")
@@ -466,13 +468,13 @@ class DataSetReader:
         self,
         root: str | Path,
         *,
-        split: str = DEFAULT_DOC_CHAIN_SPLIT,
+        split: str = DEFAULT_DATA_SET_SPLIT,
     ) -> None:
         self.root = Path(root).expanduser().resolve()
         self.split = str(split)
-        self.bucket_paths = resolve_doc_chain_buckets(self.root, split=self.split)
+        self.bucket_paths = resolve_data_set_buckets(self.root, split=self.split)
         self.bucket_names = [path.name for path in self.bucket_paths]
-        self._shard_paths = [_resolve_doc_chain_bucket_shards(path) for path in self.bucket_paths]
+        self._shard_paths = [_resolve_data_set_bucket_shards(path) for path in self.bucket_paths]
         self._buckets: list[grain.sources.ArrayRecordDataSource | None] = [
             None for _ in self.bucket_paths
         ]
@@ -495,19 +497,19 @@ class DataSetReader:
     def num_records(self, bucket_idx: int) -> int:
         return len(self._bucket(bucket_idx))
 
-    def read(self, bucket_idx: int, record_idx: int) -> DocChainRecord:
+    def read(self, bucket_idx: int, record_idx: int) -> DataSetRecord:
         bucket = self._bucket(bucket_idx)
-        return deserialize_doc_chain(bucket[record_idx])
+        return deserialize_data_set_record(bucket[record_idx])
 
-    def iter_records(self) -> Iterator[tuple[int, int, DocChainRecord]]:
+    def iter_records(self) -> Iterator[tuple[int, int, DataSetRecord]]:
         for bucket_idx in range(self.num_buckets):
             bucket = self._bucket(bucket_idx)
             for record_idx in range(len(bucket)):
-                yield bucket_idx, record_idx, deserialize_doc_chain(bucket[record_idx])
+                yield bucket_idx, record_idx, deserialize_data_set_record(bucket[record_idx])
 
 
 def iter_document_pair_refs(
-    doc: DocChainRecord,
+    doc: DataSetRecord,
     *,
     segment_length: int = DEFAULT_SEGMENT_LENGTH,
     bucket_idx: int = 0,

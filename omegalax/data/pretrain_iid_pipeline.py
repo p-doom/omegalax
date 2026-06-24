@@ -12,7 +12,7 @@ import numpy as np
 from omegalax.data.pretrain_data_set import (
     DEFAULT_EOS_ID,
     DEFAULT_PAD_ID,
-    DEFAULT_DOC_CHAIN_SPLIT,
+    DEFAULT_DATA_SET_SPLIT,
     DEFAULT_SEGMENT_LENGTH,
     BATCH_PRETRAIN_METADATA_KEY,
     DataSetReader,
@@ -37,7 +37,7 @@ def build_iid_chunk_index(
     *,
     segment_length: int = DEFAULT_SEGMENT_LENGTH,
     eos_id: int | None = DEFAULT_EOS_ID,
-    split: str = DEFAULT_DOC_CHAIN_SPLIT,
+    split: str = DEFAULT_DATA_SET_SPLIT,
     records_per_shard: int = 100_000,
     overwrite: bool = False,
 ) -> Path:
@@ -250,10 +250,10 @@ def make_iid_iterator(
     if eos_id != index_eos_id:
         raise ValueError(f"eos_id mismatch: index has {index_eos_id}, loader got {eos_id}")
 
-    metadata_root = metadata.get("data_set_root", metadata.get("doc_chain_root"))
-    if metadata_root is None:
+    raw_dataset_root = metadata.get("data_set_root")
+    if raw_dataset_root is None:
         raise ValueError("IID chunk index metadata is missing data_set_root")
-    data_set_root = rewrite_data_set_root_path(metadata_root)
+    data_set_root = rewrite_data_set_root_path(raw_dataset_root)
     split = str(metadata["split"])
     bucket_names = [str(name) for name in metadata["bucket_names"]]
     index_shard_paths = resolve_arrayrecord_paths(index_path)

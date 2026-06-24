@@ -10,7 +10,7 @@ import grain
 import numpy as np
 
 from omegalax.data.pretrain_data_set import (
-    DEFAULT_DOC_CHAIN_SPLIT,
+    DEFAULT_DATA_SET_SPLIT,
     DEFAULT_EOS_ID,
     DEFAULT_PAD_ID,
     DEFAULT_SEGMENT_LENGTH,
@@ -53,7 +53,7 @@ def build_statepassing_pair_index(
     *,
     segment_length: int = DEFAULT_SEGMENT_LENGTH,
     eos_id: int | None = DEFAULT_EOS_ID,
-    split: str = DEFAULT_DOC_CHAIN_SPLIT,
+    split: str = DEFAULT_DATA_SET_SPLIT,
     records_per_shard: int = 100_000,
     overwrite: bool = False,
 ) -> Path:
@@ -288,18 +288,18 @@ def make_statepassing_iterator(
     if resolved_dp_index < 0 or resolved_dp_index >= effective_dp_size:
         raise ValueError(f"dp_index must be in [0, {effective_dp_size}), got {resolved_dp_index}")
 
-    metadata = _load_pair_index_metadata(index_path, segment_length)
-    index_segment_length = int(metadata["segment_length"])
-    index_eos_id = metadata.get("eos_id")
+    index_metadata = _load_pair_index_metadata(index_path, segment_length)
+    index_segment_length = int(index_metadata["segment_length"])
+    index_eos_id = index_metadata.get("eos_id")
     if eos_id != index_eos_id:
         raise ValueError(f"eos_id mismatch: index has {index_eos_id}, loader got {eos_id}")
 
-    metadata_root = metadata.get("data_set_root", metadata.get("doc_chain_root"))
-    if metadata_root is None:
+    raw_dataset_root = index_metadata.get("data_set_root")
+    if raw_dataset_root is None:
         raise ValueError("Statepassing pair index metadata is missing data_set_root")
-    data_set_root = rewrite_data_set_root_path(metadata_root)
-    split = str(metadata["split"])
-    bucket_names = [str(name) for name in metadata["bucket_names"]]
+    data_set_root = rewrite_data_set_root_path(raw_dataset_root)
+    split = str(index_metadata["split"])
+    bucket_names = [str(name) for name in index_metadata["bucket_names"]]
     index_shard_paths = resolve_arrayrecord_paths(index_path)
     index_source = grain.sources.ArrayRecordDataSource([str(path) for path in index_shard_paths])
     num_records = len(index_source)

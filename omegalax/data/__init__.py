@@ -10,16 +10,16 @@ from omegalax.data.grain_pipeline import (
 )
 from omegalax.data.pretrain_data_set import (
     BATCH_PRETRAIN_METADATA_KEY,
-    DEFAULT_DOC_CHAIN_SPLIT,
+    DEFAULT_DATA_SET_SPLIT,
     DOC_CHAIN_FORMAT,
     DataSetReader,
-    DocChainRecord,
     DocPairRef,
-    deserialize_doc_chain,
+    DataSetRecord,
+    deserialize_data_set_record,
     iter_document_pair_refs,
-    load_doc_chain_metadata,
+    load_data_set_metadata,
     pop_pretrain_metadata,
-    resolve_doc_chain_buckets,
+    resolve_data_set_buckets,
     resolve_pretrain_dp,
 )
 from omegalax.data.pretrain_iid_pipeline import (
@@ -34,11 +34,11 @@ from omegalax.data.pretrain_statepassing import (
 
 __all__ = [
     "BATCH_PRETRAIN_METADATA_KEY",
-    "DEFAULT_DOC_CHAIN_SPLIT",
+    "DEFAULT_DATA_SET_SPLIT",
     "DOC_CHAIN_FORMAT",
     "DataSetReader",
-    "DocChainRecord",
     "DocPairRef",
+    "DataSetRecord",
     "MixSource",
     "STATEPASSING_PAIR_INDEX_FORMAT",
     "TextSFTCollator",
@@ -47,14 +47,14 @@ __all__ = [
     "build_iid_chunk_index",
     "build_statepassing_pair_index",
     "compile_jsonl_to_arrayrecord",
-    "deserialize_doc_chain",
+    "deserialize_data_set_record",
     "iter_document_pair_refs",
-    "load_doc_chain_metadata",
+    "load_data_set_metadata",
     "make_grain_iterator",
     "make_iid_iterator",
     "make_statepassing_iterator",
     "pop_pretrain_metadata",
     "pop_source_ids",
-    "resolve_doc_chain_buckets",
+    "resolve_data_set_buckets",
     "resolve_pretrain_dp",
 ]

@@ -18,7 +18,7 @@ from omegalax.data.pretrain_data_set import (
     iter_json_arrayrecord_records,
     load_arrayrecord_metadata,
     pop_pretrain_metadata,
-    resolve_doc_chain_buckets,
+    resolve_data_set_buckets,
 )
 from omegalax.data.pretrain_statepassing import (
     STATEPASSING_PAIR_INDEX_FORMAT,
@@ -46,7 +46,7 @@ class PretrainStatepassingTest(absltest.TestCase):
         return root
 
     def _bucket_paths(self, split: str = "train") -> list[Path]:
-        return resolve_doc_chain_buckets(self._root(), split=split)
+        return resolve_data_set_buckets(self._root(), split=split)
 
     def _index(self) -> Path:
         index = getattr(self, "_statepassing_pair_index", None)
@@ -186,7 +186,7 @@ class PretrainStatepassingTest(absltest.TestCase):
             self.assertEqual(metadata["eos_id"], DEFAULT_EOS_ID)
             self.assertEqual(
                 metadata["bucket_names"],
-                [path.name for path in resolve_doc_chain_buckets(root, split="val")],
+                [path.name for path in resolve_data_set_buckets(root, split="val")],
             )
             self.assertGreater(len(metadata["bucket_names"]), 1)
             self.assertGreater(metadata["num_pairs"], 0)

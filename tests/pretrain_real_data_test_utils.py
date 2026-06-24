@@ -1,4 +1,4 @@
-"""Helpers for pretraining tests that sample the real FineWeb doc-chain data."""
+"""Helpers for pretraining tests that sample the real FineWeb pretraining data."""
 
 from __future__ import annotations
 
@@ -43,7 +43,7 @@ def require_real_split_leaves(testcase: absltest.TestCase, split: str) -> list[P
         if child.is_dir() and (child / COMPILED_METADATA_FILENAME).exists()
     )
     if not leaves:
-        testcase.skipTest(f"real pretrain split has no doc-chain leaves: {split_dir}")
+        testcase.skipTest(f"real pretrain split has no data-set leaves: {split_dir}")
     return leaves
 
 

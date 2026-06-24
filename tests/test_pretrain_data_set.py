@@ -21,13 +21,13 @@ from omegalax.data.pretrain_data_set import (
     DataSetReader,
     build_chunk_arrays,
     calculate_samples_per_process,
-    deserialize_doc_chain,
+    deserialize_data_set_record,
     iter_document_pair_refs,
-    load_doc_chain_metadata,
+    load_data_set_metadata,
     make_pretrain_index_record_dataset,
     num_pretrain_positions,
     num_pretrain_records_usable,
-    resolve_doc_chain_buckets,
+    resolve_data_set_buckets,
     resolve_pretrain_dp,
     rewrite_data_set_root_path,
     write_json_arrayrecord_dataset,
@@ -36,7 +36,7 @@ from tests.pretrain_real_data_test_utils import require_real_root, test_temp_dir
 
 
 class PretrainDataSetTest(absltest.TestCase):
-    def test_binary_doc_chain_deserialize(self):
+    def test_binary_data_set_record_deserialize(self):
         token_ids = np.asarray([1, 2, 3], dtype=np.int32)
         header = json.dumps(
             {
@@ -55,7 +55,7 @@ class PretrainDataSetTest(absltest.TestCase):
             + token_ids.tobytes()
         )
 
-        record = deserialize_doc_chain(payload)
+        record = deserialize_data_set_record(payload)
 
         self.assertEqual(record.doc_id, "doc-bin")
         self.assertEqual(record.doc_token_count, 3)
@@ -65,9 +65,9 @@ class PretrainDataSetTest(absltest.TestCase):
 
     def test_bad_dataset_format_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "Unsupported doc-chain format"):
-            deserialize_doc_chain(
+            deserialize_data_set_record(
                 {
-                    "dataset_format": "not_doc_chain",
+                    "dataset_format": "not_data_set",
                     "doc_id": "bad",
                     "token_ids": [1, 2, 3],
                     "doc_token_count": 3,
@@ -98,7 +98,7 @@ class PretrainDataSetTest(absltest.TestCase):
                 "token_ids": list(range(length)),
                 "doc_token_count": length,
             }
-            record = deserialize_doc_chain(payload)
+            record = deserialize_data_set_record(payload)
             return [
                 (pair.start, pair.mid, pair.end)
                 for pair in iter_document_pair_refs(record, segment_length=4)
@@ -112,7 +112,7 @@ class PretrainDataSetTest(absltest.TestCase):
         self.assertEqual(pair_ranges(13), [(0, 4, 8), (8, 12, 13)])
 
     def test_default_eos_id_marks_retained_end_when_short_tail_is_dropped(self):
-        record = deserialize_doc_chain(
+        record = deserialize_data_set_record(
             {
                 "doc_id": "doc-eos",
                 "token_ids": [1, 2, 3, 4, 5, 6, 7, 8, DEFAULT_EOS_ID],
@@ -136,8 +136,8 @@ class PretrainDataSetTest(absltest.TestCase):
 
     def test_real_leaf_metadata_accepts_dataset_format_alias(self):
         root = require_real_root(self)
-        bucket_path = resolve_doc_chain_buckets(root, split="val")[-1]
-        metadata = load_doc_chain_metadata(bucket_path)
+        bucket_path = resolve_data_set_buckets(root, split="val")[-1]
+        metadata = load_data_set_metadata(bucket_path)
 
         self.assertEqual(metadata["dataset_format"], DOC_CHAIN_FORMAT)
         self.assertEqual(metadata["split"], "val")
@@ -158,20 +158,20 @@ class PretrainDataSetTest(absltest.TestCase):
                 key=lambda path: int(path.name.removeprefix("bucket_").removesuffix("k")),
             )
 
-        train_buckets = resolve_doc_chain_buckets(root, split="train")
-        val_buckets = resolve_doc_chain_buckets(root, split="val")
+        train_buckets = resolve_data_set_buckets(root, split="train")
+        val_buckets = resolve_data_set_buckets(root, split="val")
 
         self.assertEqual(train_buckets, expected_bucket_paths("train"))
         self.assertEqual(val_buckets, expected_bucket_paths("val"))
         self.assertGreater(len(train_buckets), 1)
         self.assertGreater(len(val_buckets), 1)
 
-    def test_direct_leaf_path_is_not_a_doc_chain_root(self):
+    def test_direct_leaf_path_is_not_a_data_set_root(self):
         root = require_real_root(self)
-        bucket_path = resolve_doc_chain_buckets(root, split="val")[0]
+        bucket_path = resolve_data_set_buckets(root, split="val")[0]
 
         with self.assertRaisesRegex(ValueError, "split directory"):
-            resolve_doc_chain_buckets(bucket_path)
+            resolve_data_set_buckets(bucket_path)
 
     def test_source_path_rewrite_is_noop_without_env(self):
         with test_temp_dir() as tmp:
@@ -248,7 +248,7 @@ class PretrainDataSetTest(absltest.TestCase):
 
     def test_real_reader_loads_from_root_and_split(self):
         root = require_real_root(self)
-        expected_bucket_names = [path.name for path in resolve_doc_chain_buckets(root, split="val")]
+        expected_bucket_names = [path.name for path in resolve_data_set_buckets(root, split="val")]
         reader = DataSetReader(root, split="val")
         record = reader.read(0, 0)
 
@@ -300,11 +300,11 @@ class PretrainDataSetTest(absltest.TestCase):
 
     def test_pretrain_position_count_supports_finite_and_infinite_epochs(self):
         self.assertEqual(
-            num_pretrain_positions(total_samples_per_process=3, num_epochs=2),
+            num_pretrain_positions(epoch_samples_per_process=3, num_epochs=2),
             6,
         )
         self.assertEqual(
-            num_pretrain_positions(total_samples_per_process=3, num_epochs=None),
+            num_pretrain_positions(epoch_samples_per_process=3, num_epochs=None),
             MAX_PRETRAIN_POSITIONS,
         )
 
