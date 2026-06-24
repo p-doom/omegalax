@@ -218,7 +218,7 @@ def make_iid_iterator(
     process_index: int | None = None,
     grain_workers: int = 8,
     grain_worker_buffer_size: int = 1,
-    grain_read_threads: int = 16,
+    grain_read_threads: int = 2,
     grain_read_prefetch_buffer_size: int = 4,
 ) -> Iterator[dict[str, Any]]:
     if batch_size <= 0:
