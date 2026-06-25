@@ -206,7 +206,7 @@ class DecoderLayer(nnx.Module):
         self.input_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, rngs=rngs)
         self.post_attention_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, rngs=rngs)
 
-    @partial(jax.remat, static_argnums=0)
+    @partial(jax.remat, static_argnums=(0, 8))
     def __call__(
         self,
         hidden_BTD: jax.Array,
@@ -215,14 +215,25 @@ class DecoderLayer(nnx.Module):
         segment_ids_BT: jax.Array,
         position_ids_BT: jax.Array,
         attention_mask_BT: jax.Array | None = None,
-    ) -> tuple[jax.Array, jax.Array]:
+        gdn_initial_state_BHAU: jax.Array | None = None,
+        return_gdn_state: bool = False,
+    ) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array | None]:
         residual_BTD = hidden_BTD
         normed_BTD = self.input_layernorm(hidden_BTD)
+        gdn_final_state_BHAU = None
 
         if self.layer_type == "full_attention":
             attn_out_BTD = self.attn(normed_BTD, cos_BTK, sin_BTK, segment_ids_BT, position_ids_BT)
         else:
-            attn_out_BTD = self.linear_attn(normed_BTD, attention_mask_BT)
+            if return_gdn_state or gdn_initial_state_BHAU is not None:
+                attn_out_BTD, gdn_final_state_BHAU = self.linear_attn(
+                    normed_BTD,
+                    attention_mask_BT,
+                    gdn_initial_state_BHAU,
+                    return_final_state=True,
+                )
+            else:
+                attn_out_BTD = self.linear_attn(normed_BTD, attention_mask_BT)
 
         hidden_BTD = residual_BTD + attn_out_BTD
 
@@ -235,6 +246,8 @@ class DecoderLayer(nnx.Module):
             aux_loss = jnp.array(0.0, dtype=jnp.float32)
         hidden_BTD = residual_BTD + ff_out_BTD
 
+        if return_gdn_state:
+            return hidden_BTD, aux_loss, gdn_final_state_BHAU
         return hidden_BTD, aux_loss
 
 
@@ -265,7 +278,10 @@ class TextModel(nnx.Module):
         inputs_embeds_BTD: jax.Array | None = None,
         segment_ids_BT: jax.Array | None = None,
         position_ids_ZBT: jax.Array | None = None,
-    ) -> tuple[jax.Array, jax.Array]:
+        gdn_initial_states: tuple[jax.Array, ...] | None = None,
+        *,
+        return_gdn_states: bool = False,
+    ) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, tuple[jax.Array, ...]]:
         cfg = self.cfg
 
         if inputs_embeds_BTD is None:
@@ -302,19 +318,61 @@ class TextModel(nnx.Module):
         text_position_ids_BT = position_ids_ZBT[0]
 
         aux_losses = []
-        for layer in self.layers:
-            hidden_BTD, aux = layer(
-                hidden_BTD,
-                cos_BTK,
-                sin_BTK,
-                segment_ids_BT,
-                text_position_ids_BT,
-                attention_mask_BT,
+        gdn_final_states = []
+        linear_layer_count = sum(
+            1 for layer_type in cfg.layer_types if layer_type != "full_attention"
+        )
+        if gdn_initial_states is not None and len(gdn_initial_states) != linear_layer_count:
+            raise ValueError(
+                f"Expected {linear_layer_count} GDN initial states, got {len(gdn_initial_states)}"
             )
+        gdn_state_idx = 0
+        for layer in self.layers:
+            if layer.layer_type == "full_attention":
+                hidden_BTD, aux = layer(
+                    hidden_BTD,
+                    cos_BTK,
+                    sin_BTK,
+                    segment_ids_BT,
+                    text_position_ids_BT,
+                    attention_mask_BT,
+                    None,
+                    False,
+                )
+            else:
+                init_state = (
+                    None if gdn_initial_states is None else gdn_initial_states[gdn_state_idx]
+                )
+                if return_gdn_states or init_state is not None:
+                    hidden_BTD, aux, final_state = layer(
+                        hidden_BTD,
+                        cos_BTK,
+                        sin_BTK,
+                        segment_ids_BT,
+                        text_position_ids_BT,
+                        attention_mask_BT,
+                        init_state,
+                        True,
+                    )
+                    gdn_final_states.append(final_state)
+                else:
+                    hidden_BTD, aux = layer(
+                        hidden_BTD,
+                        cos_BTK,
+                        sin_BTK,
+                        segment_ids_BT,
+                        text_position_ids_BT,
+                        attention_mask_BT,
+                        None,
+                        False,
+                    )
+                gdn_state_idx += 1
             aux_losses.append(aux)
 
         hidden_BTD = self.final_norm(hidden_BTD)
         total_aux = jnp.sum(jnp.stack(aux_losses)) if aux_losses else jnp.array(0.0)
+        if return_gdn_states:
+            return hidden_BTD, total_aux, tuple(gdn_final_states)
         return hidden_BTD, total_aux
 
 
@@ -335,9 +393,23 @@ class Qwen3_5ForCausalLM(nnx.Module):
             kernel_init=wp(lm_head_init, ("embed", "vocab")),
         )
 
-    def __call__(self, token_ids_BT, segment_ids_BT, cache, num_right_pads):
+    def __call__(
+        self,
+        token_ids_BT,
+        segment_ids_BT,
+        cache,
+        num_right_pads,
+        gdn_initial_states=None,
+        *,
+        return_gdn_states: bool = False,
+    ):
         del cache, num_right_pads
-        return self.text(token_ids_BT=token_ids_BT, segment_ids_BT=segment_ids_BT)
+        return self.text(
+            token_ids_BT=token_ids_BT,
+            segment_ids_BT=segment_ids_BT,
+            gdn_initial_states=gdn_initial_states,
+            return_gdn_states=return_gdn_states,
+        )
 
 
 # VLM

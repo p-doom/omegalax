@@ -49,13 +49,34 @@ def chunk_gated_delta_rule(
     g_BTH,
     beta_BTH,
     chunk_size: int = 64,
+    initial_state_BHAU=None,
+    *,
+    return_final_state: bool = False,
 ):
     """Dispatcher. Late-binds the backend so env-var changes take effect per process."""
     backend = _resolve_backend()
     if backend == "xla":
-        return chunk_gated_delta_rule_xla(q_BTHA, k_BTHA, v_BTHU, g_BTH, beta_BTH, chunk_size)
+        return chunk_gated_delta_rule_xla(
+            q_BTHA,
+            k_BTHA,
+            v_BTHU,
+            g_BTH,
+            beta_BTH,
+            chunk_size,
+            initial_state_BHAU,
+            return_final_state=return_final_state,
+        )
     if backend == "pallas":
         from .pallas_triton import chunk_gated_delta_rule_pallas
 
-        return chunk_gated_delta_rule_pallas(q_BTHA, k_BTHA, v_BTHU, g_BTH, beta_BTH, chunk_size)
+        return chunk_gated_delta_rule_pallas(
+            q_BTHA,
+            k_BTHA,
+            v_BTHU,
+            g_BTH,
+            beta_BTH,
+            chunk_size,
+            initial_state_BHAU,
+            return_final_state=return_final_state,
+        )
     raise ValueError(f"Unknown OMEGALAX_DELTANET_KERNEL={backend!r}. Use 'xla' or 'pallas'.")

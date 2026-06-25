@@ -13,7 +13,7 @@ from omegalax.models.qwen3_vl.params import (
     export_qwen3_vl_to_safetensors,
     qwen3_vl_to_hf_config_dict,
 )
-from omegalax.models.qwen3_5.config import Qwen3_5Config
+from omegalax.models.qwen3_5.config import Qwen3_5Config, Qwen3_5TextConfig
 from omegalax.models.qwen3_5.model import Qwen3_5ForConditionalGeneration
 from omegalax.models.qwen3_5.params import export_qwen3_5_to_safetensors, qwen3_5_to_hf_config_dict
 from omegalax.trainers.lora import merge_lora_into_base
@@ -55,4 +55,6 @@ def model_config_to_hf_dict(cfg) -> dict:
         return qwen3_vl_to_hf_config_dict(cfg)
     if isinstance(cfg, Qwen3_5Config):
         return qwen3_5_to_hf_config_dict(cfg)
+    if isinstance(cfg, Qwen3_5TextConfig):
+        return qwen3_5_to_hf_config_dict(Qwen3_5Config(text_config=cfg))
     raise ValueError(f"Unsupported config type for HF serialization: {type(cfg)}")

@@ -54,6 +54,9 @@ class TrainConfig:
     lr_end_factor: float = 0.0
     lr_stable_fraction: float = 0.8
     max_grad_norm: float = 0.0
+    adam_beta1: float = 0.9
+    adam_beta2: float = 0.999
+    adam_eps: float = 1e-8
     grad_accum_steps: int = 1
     print_every: int = 1
 
@@ -83,7 +86,15 @@ def build_optimizer(model: nnx.Module, train_cfg: TrainConfig) -> MixedPrecision
     chain = []
     if train_cfg.max_grad_norm > 0:
         chain.append(optax.clip_by_global_norm(train_cfg.max_grad_norm))
-    chain.append(optax.adamw(lr, weight_decay=train_cfg.weight_decay))
+    chain.append(
+        optax.adamw(
+            lr,
+            b1=train_cfg.adam_beta1,
+            b2=train_cfg.adam_beta2,
+            eps=train_cfg.adam_eps,
+            weight_decay=train_cfg.weight_decay,
+        )
+    )
     tx = optax.chain(*chain)
     if train_cfg.grad_accum_steps > 1:
         tx = optax.MultiSteps(tx, every_k_schedule=train_cfg.grad_accum_steps)
@@ -175,10 +186,13 @@ def make_sft_train_step(cfg, pad_id: int = 0):
     @nnx.jit(donate_argnums=0)
     def sft_train_step(optimizer: MixedPrecisionOptimizer, batch: dict[str, jax.Array]):
         token_ids_BT = batch["token_ids_BT"]
+        attention_mask_BT = batch.get("attention_mask_BT")
         loss_mask_BT = batch["loss_mask_BT"]
 
         def loss_fn(model):
-            hidden_BTD, aux_loss = text_api.forward(model, token_ids_BT, pad_id, cfg)
+            hidden_BTD, aux_loss = text_api.forward(
+                model, token_ids_BT, pad_id, cfg, attention_mask_BT=attention_mask_BT
+            )
             lm_weight = model.lm_head.kernel[...]
             loss = (
                 chunked_cross_entropy_loss(
@@ -214,9 +228,12 @@ def make_sft_eval_step(cfg, pad_id: int = 0):
     @nnx.jit
     def sft_eval_step(model: nnx.Module, batch: dict[str, jax.Array]):
         token_ids_BT = batch["token_ids_BT"]
+        attention_mask_BT = batch.get("attention_mask_BT")
         loss_mask_BT = batch["loss_mask_BT"]
 
-        hidden_BTD, aux_loss = text_api.forward(model, token_ids_BT, pad_id, cfg)
+        hidden_BTD, aux_loss = text_api.forward(
+            model, token_ids_BT, pad_id, cfg, attention_mask_BT=attention_mask_BT
+        )
         lm_weight = model.lm_head.kernel[...]
         loss = (
             chunked_cross_entropy_loss(

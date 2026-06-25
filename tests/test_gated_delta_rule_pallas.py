@@ -25,6 +25,13 @@ from omegalax.models.qwen3_5.kernels.xla_reference import (
 )
 
 
+def _has_cuda_device() -> bool:
+    try:
+        return any(device.platform == "gpu" for device in jax.devices())
+    except Exception:
+        return False
+
+
 def _make_inputs(B, T, H, A, U, dtype=jnp.bfloat16, seed=0):
     rng = np.random.RandomState(seed)
     q = jnp.asarray(rng.randn(B, T, H, A).astype(np.float32) * 0.1, dtype=dtype)
@@ -38,6 +45,7 @@ def _make_inputs(B, T, H, A, U, dtype=jnp.bfloat16, seed=0):
     return q, k, v, g, beta
 
 
+@absltest.skipIf(not _has_cuda_device(), "requires CUDA GPU")
 class ForwardEquivalenceTest(parameterized.TestCase):
     @parameterized.parameters(
         # (B, T, H, A, U, name)
@@ -62,6 +70,7 @@ class ForwardEquivalenceTest(parameterized.TestCase):
         )
 
 
+@absltest.skipIf(not _has_cuda_device(), "requires CUDA GPU")
 class TestSeqLenNotMultipleOfChunk(absltest.TestCase):
     def test_padding_path(self):
         # T=2049 forces internal padding to 2112 (chunk=64) then trim to 2049.
@@ -70,6 +79,41 @@ class TestSeqLenNotMultipleOfChunk(absltest.TestCase):
         out = chunk_gated_delta_rule_pallas(q, k, v, g, beta)
         np.testing.assert_array_less(
             np.abs(np.asarray(out, dtype=np.float32) - np.asarray(ref, dtype=np.float32)).max(),
+            5e-2,
+        )
+
+
+@absltest.skipIf(not _has_cuda_device(), "requires CUDA GPU")
+class StatefulForwardEquivalenceTest(absltest.TestCase):
+    def test_stateful_forward_and_final_state_match_xla(self):
+        q, k, v, g, beta = _make_inputs(2, 128, 3, 64, 32)
+        initial_state = jnp.ones((2, 3, 64, 32), dtype=jnp.float32) * 0.01
+        ref_out, ref_state = chunk_gated_delta_rule_xla(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            initial_state_BHAU=initial_state,
+            return_final_state=True,
+        )
+        out, state = chunk_gated_delta_rule_pallas(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            initial_state_BHAU=initial_state,
+            return_final_state=True,
+        )
+        np.testing.assert_array_less(
+            np.abs(np.asarray(out, dtype=np.float32) - np.asarray(ref_out, dtype=np.float32)).max(),
+            5e-2,
+        )
+        np.testing.assert_array_less(
+            np.abs(
+                np.asarray(state, dtype=np.float32) - np.asarray(ref_state, dtype=np.float32)
+            ).max(),
             5e-2,
         )
 

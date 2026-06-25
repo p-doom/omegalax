@@ -23,13 +23,20 @@ def chunk_gated_delta_rule_xla(
     g_BTH: jax.Array,
     beta_BTH: jax.Array,
     chunk_size: int = 64,
-) -> jax.Array:
+    initial_state_BHAU: jax.Array | None = None,
+    *,
+    return_final_state: bool = False,
+) -> jax.Array | tuple[jax.Array, jax.Array]:
     """Chunked gated delta rule (XLA reference).
 
     Inputs:
         q_BTHA, k_BTHA: (B, T, H, A)
         v_BTHU:         (B, T, H, U)
         g_BTH, beta_BTH: (B, T, H)
+    Args:
+        initial_state_BHAU: Optional recurrent state, shape ``(B, H, A, U)``.
+        return_final_state: If true, return ``(out_BTHU, final_state_BHAU)``.
+
     Returns:
         out_BTHU: (B, T, H, U)
 
@@ -92,7 +99,10 @@ def chunk_gated_delta_rule_xla(
         "BHJLM,BHJMA->BHJLA", attn_BHJLM, kb_BHJLA * jnp.exp(g_BHJL)[..., None]
     )
 
-    state_BHAU = jnp.zeros((B, H, A, U), dtype=jnp.float32)
+    if initial_state_BHAU is None:
+        state_BHAU = jnp.zeros((B, H, A, U), dtype=jnp.float32)
+    else:
+        state_BHAU = initial_state_BHAU.astype(jnp.float32)
     upper_mask_1_LM = jnp.triu(jnp.ones((chunk_size, chunk_size), dtype=jnp.bool_), k=1)
 
     def chunk_step(carry, chunk_idx):
@@ -128,7 +138,10 @@ def chunk_gated_delta_rule_xla(
 
         return new_st_BHAU, chunk_out_BHLU
 
-    state_BHAU, core_out_chunks = jax.lax.scan(chunk_step, state_BHAU, jnp.arange(J))
+    final_state_BHAU, core_out_chunks = jax.lax.scan(chunk_step, state_BHAU, jnp.arange(J))
     core_out_BHJLU = core_out_chunks.transpose(1, 2, 0, 3, 4)
     core_out_BHTU = core_out_BHJLU.reshape(B, H, -1, U)[:, :, :T, :]
-    return core_out_BHTU.transpose(0, 2, 1, 3)
+    out_BTHU = core_out_BHTU.transpose(0, 2, 1, 3)
+    if return_final_state:
+        return out_BTHU, final_state_BHAU
+    return out_BTHU

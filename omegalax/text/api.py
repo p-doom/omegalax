@@ -115,14 +115,71 @@ def init_model(
     raise ValueError(f"Unsupported text config type: {type(cfg)}")
 
 
-def forward(model: nnx.Module, token_ids_BT: jax.Array, pad_id: int, cfg: TextConfig):
+def segment_ids_from_inputs(
+    token_ids_BT: jax.Array,
+    pad_id: int,
+    *,
+    attention_mask_BT: jax.Array | None = None,
+    segment_ids_BT: jax.Array | None = None,
+) -> jax.Array:
+    if segment_ids_BT is not None:
+        return segment_ids_BT.astype(jnp.int32)
+    if attention_mask_BT is not None:
+        return attention_mask_BT.astype(jnp.int32)
+    return 1 * (token_ids_BT != pad_id)
+
+
+def forward(
+    model: nnx.Module,
+    token_ids_BT: jax.Array,
+    pad_id: int,
+    cfg: TextConfig,
+    *,
+    attention_mask_BT: jax.Array | None = None,
+    segment_ids_BT: jax.Array | None = None,
+):
     """Forward pass returning hidden states before lm_head, plus aux loss."""
-    segment_ids_BT = 1 * (token_ids_BT != pad_id)
+    segment_ids_BT = segment_ids_from_inputs(
+        token_ids_BT,
+        pad_id,
+        attention_mask_BT=attention_mask_BT,
+        segment_ids_BT=segment_ids_BT,
+    )
 
     if isinstance(model, (Qwen3, Qwen3_5ForCausalLM)):
         return model(token_ids_BT, segment_ids_BT, None, jnp.array(0, dtype=jnp.int32))
 
     raise ValueError(f"Unsupported text model type: {type(model)}")
+
+
+def forward_with_gdn_state(
+    model: nnx.Module,
+    token_ids_BT: jax.Array,
+    pad_id: int,
+    cfg: TextConfig,
+    *,
+    attention_mask_BT: jax.Array | None = None,
+    segment_ids_BT: jax.Array | None = None,
+    initial_gdn_states: tuple[jax.Array, ...] | None = None,
+) -> tuple[jax.Array, jax.Array, tuple[jax.Array, ...]]:
+    """Qwen3.5 forward pass that returns one final GDN state per linear layer."""
+    segment_ids_BT = segment_ids_from_inputs(
+        token_ids_BT,
+        pad_id,
+        attention_mask_BT=attention_mask_BT,
+        segment_ids_BT=segment_ids_BT,
+    )
+
+    if isinstance(model, Qwen3_5ForCausalLM):
+        return model(
+            token_ids_BT,
+            segment_ids_BT,
+            None,
+            jnp.array(0, dtype=jnp.int32),
+            gdn_initial_states=initial_gdn_states,
+            return_gdn_states=True,
+        )
+    raise ValueError("GDN state forwarding is only supported for Qwen3.5 text models.")
 
 
 def decode(model: nnx.Module, cache: Cache, token_ids_BT: jax.Array, pad_id: int, cfg: TextConfig):

@@ -31,6 +31,11 @@ def required_batch_multiple(batch_spec: PartitionSpec, mesh: Mesh) -> int:
     axis = batch_spec[0]
     if axis is None:
         return 1
+    if isinstance(axis, tuple):
+        multiple = 1
+        for item in axis:
+            multiple *= int(mesh.shape[item])
+        return multiple
     return int(mesh.shape[axis])
 
 
