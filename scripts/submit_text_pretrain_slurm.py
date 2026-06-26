@@ -4,14 +4,13 @@ from __future__ import annotations
 
 import dataclasses
 import datetime as dt
+import enum
 from pathlib import Path
 import re
 import shlex
 import subprocess
 
 from absl import app, flags
-
-from omegalax.trainers.pretrain import PretrainMode
 
 FLAGS = flags.FLAGS
 
@@ -21,10 +20,18 @@ _INDEX_ROOT = _SOURCE_ROOT / "pretrain_indexes" / "fineweb_edu_dedup_30b_8kto32k
 _SAVE_ROOT = _SOURCE_ROOT / "runs" / "statepassing_pretrain"
 _LOG_DIR = _SOURCE_ROOT / "logs" / "statepassing_pretrain"
 _JAX_CACHE_ROOT = _SOURCE_ROOT / "jax_cache" / "statepassing_pretrain"
+_DEFAULT_PRETRAIN_HIDDEN_SIZE = 768
 _WIKI_PROGRESS_PATH = Path(
     "/fast/home/salan.isaqzoi/gh_projects/salanobp/codex-setup/Wiki/documentation/"
     "statepassing_pretrain_experiment_progress.md"
 )
+
+
+class PretrainMode(enum.StrEnum):
+    IID_BASELINE = "iid_baseline"
+    STATEPASSING_NO_BPTT = "statepassing_no_bptt"
+    STATEPASSING_BPTT = "statepassing_bptt"
+
 
 flags.DEFINE_string("submit_run_id", None, "Run id used for jobs/checkpoints/logs.")
 flags.DEFINE_string("submit_dataset_root", str(_DATASET_ROOT), "Doc-chain dataset root.")
@@ -153,10 +160,20 @@ def any_index_metadata_exists(index_root: str | Path) -> bool:
     return False
 
 
-def validate_submit_shape(*, batch_size: int, nodes: int, gpus_per_node: int) -> int:
+def validate_submit_shape(
+    *,
+    batch_size: int,
+    nodes: int,
+    gpus_per_node: int,
+    single_process_per_run: bool = False,
+) -> int:
     total_tasks = int(nodes) * int(gpus_per_node)
     if total_tasks <= 0:
         raise ValueError("Total training tasks must be positive.")
+    if not single_process_per_run and _DEFAULT_PRETRAIN_HIDDEN_SIZE % total_tasks != 0:
+        raise ValueError(
+            f"fsdp_size={total_tasks} must divide hidden_size={_DEFAULT_PRETRAIN_HIDDEN_SIZE}."
+        )
     if batch_size % (2 * total_tasks) != 0:
         raise ValueError(
             f"Statepassing batch_size={batch_size} must be divisible by "
@@ -172,6 +189,7 @@ def parse_run_specs(
     default_gpus_per_node: int,
     default_batch_size: int,
     default_grad_accum_steps: int,
+    single_process_per_run: bool = False,
 ) -> list[RunSpec]:
     if not raw_shapes:
         specs = [
@@ -221,6 +239,7 @@ def parse_run_specs(
             batch_size=spec.batch_size,
             nodes=spec.nodes,
             gpus_per_node=spec.gpus_per_node,
+            single_process_per_run=single_process_per_run,
         )
     return specs
 
@@ -324,6 +343,8 @@ def _train_flags(
     grad_accum_steps: int,
     single_process_per_run: bool,
 ) -> list[str]:
+    fsdp_size = 1 if single_process_per_run else total_tasks
+    dp_size = total_tasks if single_process_per_run else 1
     flags_out = [
         f"--pretrain_mode={mode.value}",
         f"--train_index_path=${{TRAIN_INDEX_ROOT}}/train/{mode.value}",
@@ -343,8 +364,8 @@ def _train_flags(
         f"--grad_accum_steps={grad_accum_steps}",
         f"--seed={_flag_value('submit_seed')}",
         "--tp_size=1",
-        f"--fsdp_size={total_tasks}",
-        "--dp_size=1",
+        f"--fsdp_size={fsdp_size}",
+        f"--dp_size={dp_size}",
         f"--save_dir={save_root / run_id / mode.value}",
         f"--jax_cache_dir={jax_cache_root / run_id / mode.value}",
         f"--save_every={_flag_value('submit_save_every')}",
@@ -424,7 +445,11 @@ def render_train_sbatch(
     launch_tasks = 1 if single_process_per_run else total_tasks
     launch_ntasks_per_node = 1 if single_process_per_run else gpus_per_node
     jax_local_device_ids = _local_device_ids(gpus_per_node) if single_process_per_run else "0"
-    gpu_bind = "" if single_process_per_run else " --gpus-per-task=1 --gpu-bind=single:1"
+    step_gpu_args = (
+        f" --gres=gpu:{gpus_per_node}"
+        if single_process_per_run
+        else " --gpus-per-task=1 --gpu-bind=single:1"
+    )
     flags_text = _train_flags_text(
         _train_flags(
             mode=mode,
@@ -457,6 +482,7 @@ export TRAIN_INDEX_ROOT="${{LOCAL_INDEX_ROOT}}"
         pallas_block = """
 srun --nodes=1 --ntasks=1 --gpus-per-task=1 --gpu-bind=single:1 bash -lc 'set -euo pipefail
 export JAX_PLATFORMS=cuda
+export JAX_LOCAL_DEVICE_IDS=0
 export OMEGALAX_DELTANET_KERNEL=pallas
 uv run python -m pytest tests/test_gated_delta_rule_pallas.py tests/test_gated_delta_rule_pallas_bwd.py -q
 '
@@ -479,6 +505,7 @@ set -euo pipefail
 cd {_quote(repo_root)}
 source .venv/bin/activate
 export PYTHONUNBUFFERED=1
+export JAX_PLATFORMS=cuda
 export XLA_PYTHON_CLIENT_MEM_FRACTION=0.95
 export JAX_LOCAL_DEVICE_IDS={jax_local_device_ids}
 export OMEGALAX_DELTANET_KERNEL=pallas
@@ -495,7 +522,7 @@ nvidia-smi
 {stage_block}
 {pallas_block}
 srun --ntasks={launch_tasks} --ntasks-per-node={launch_ntasks_per_node}{
-        gpu_bind
+        step_gpu_args
     } bash -lc 'set -euo pipefail
 uv run python scripts/train_text_pretrain.py \\
   {flags_text}
@@ -569,6 +596,7 @@ def main(_) -> None:
         default_gpus_per_node=FLAGS.submit_gpus_per_node,
         default_batch_size=FLAGS.submit_batch_size,
         default_grad_accum_steps=FLAGS.submit_grad_accum_steps,
+        single_process_per_run=FLAGS.submit_single_process_per_run,
     )
 
     index_root = Path(FLAGS.submit_index_root).expanduser().resolve()

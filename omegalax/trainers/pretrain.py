@@ -7,6 +7,7 @@ import datetime
 import enum
 import gc
 import math
+import numpy as np
 import subprocess
 import time
 from pathlib import Path
@@ -61,6 +62,7 @@ class PretrainMode(enum.StrEnum):
 @dataclasses.dataclass(frozen=True)
 class StatepassingTargetMasks:
     total: jax.Array
+    iid_comparable: jax.Array
     segment0: jax.Array
     boundary: jax.Array
     segment1: jax.Array
@@ -128,6 +130,7 @@ def statepassing_target_masks(
     segment1_BT = segment1_BT.at[:, T + 1 :].set(loss_mask_BCT[:, 1, 1:])
     return StatepassingTargetMasks(
         total=total_BT,
+        iid_comparable=segment0_BT + segment1_BT,
         segment0=segment0_BT,
         boundary=boundary_BT,
         segment1=segment1_BT,
@@ -224,7 +227,10 @@ def _statepassing_loss_stats(
     hidden_BT_D = jnp.concatenate([hidden0_BTD, hidden1_BTD], axis=1)
     token_ids_BT = token_ids_BCT.reshape(token_ids_BCT.shape[0], -1)
     masks = statepassing_target_masks(loss_mask_BCT, reset_state_BC)
-    mask_stack = jnp.stack([masks.total, masks.segment0, masks.boundary, masks.segment1], axis=0)
+    mask_stack = jnp.stack(
+        [masks.total, masks.iid_comparable, masks.segment0, masks.boundary, masks.segment1],
+        axis=0,
+    )
     nll_sums, token_counts = chunked_cross_entropy_multi_stats(
         hidden_BT_D,
         model.lm_head.kernel[...],
@@ -244,9 +250,10 @@ def _statepassing_loss_stats(
         "aux_loss": aux_loss,
         "nll_sum": nll_sums[0],
         "supervised_tokens": token_counts[0],
-        **_metrics_from_nll("segment0", nll_sums[1], token_counts[1]),
-        **_metrics_from_nll("boundary", nll_sums[2], token_counts[2]),
-        **_metrics_from_nll("segment1", nll_sums[3], token_counts[3]),
+        **_metrics_from_nll("iid_comparable", nll_sums[1], token_counts[1]),
+        **_metrics_from_nll("segment0", nll_sums[2], token_counts[2]),
+        **_metrics_from_nll("boundary", nll_sums[3], token_counts[3]),
+        **_metrics_from_nll("segment1", nll_sums[4], token_counts[4]),
     }
     return loss, metrics
 
@@ -311,6 +318,10 @@ def _gpu_util_snapshot() -> dict[str, float]:
 
 
 def _host_float(value) -> float:
+    if isinstance(value, jax.Array):
+        local_value = value.addressable_data(0)
+        local_value.block_until_ready()
+        return float(np.asarray(local_value))
     return float(value)
 
 
@@ -321,7 +332,7 @@ def _accumulate_metric_sums(acc: dict[str, float], metrics: dict[str, Any]) -> N
     )
     acc["aux_loss"] = acc.get("aux_loss", 0.0) + _host_float(metrics.get("aux_loss", 0.0))
     acc["steps"] = acc.get("steps", 0.0) + 1.0
-    for prefix in ("segment0", "boundary", "segment1"):
+    for prefix in ("iid_comparable", "segment0", "boundary", "segment1"):
         sum_key = f"{prefix}_nll"
         tok_key = f"{prefix}_tokens"
         if sum_key in metrics and tok_key in metrics:
@@ -344,7 +355,7 @@ def _finalize_accumulated_metrics(acc: dict[str, float]) -> dict[str, float]:
         "supervised_tokens": tokens,
         "nll_sum": acc.get("nll_sum", 0.0),
     }
-    for prefix in ("segment0", "boundary", "segment1"):
+    for prefix in ("iid_comparable", "segment0", "boundary", "segment1"):
         tokens_key = f"{prefix}_tokens"
         tokens_value = acc.get(tokens_key)
         if tokens_value is None:

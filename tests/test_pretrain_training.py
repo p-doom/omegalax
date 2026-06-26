@@ -120,6 +120,7 @@ class PretrainMaskAndLossTest(absltest.TestCase):
         masks = pretrain_trainer.statepassing_target_masks(loss_mask)
 
         self.assertEqual(float(jnp.sum(masks.total[:, 1:])), 7.0)
+        self.assertEqual(float(jnp.sum(masks.iid_comparable[:, 1:])), 6.0)
         self.assertEqual(float(jnp.sum(masks.segment0[:, 1:])), 3.0)
         self.assertEqual(float(jnp.sum(masks.boundary[:, 1:])), 1.0)
         self.assertEqual(float(jnp.sum(masks.segment1[:, 1:])), 3.0)
@@ -130,6 +131,7 @@ class PretrainMaskAndLossTest(absltest.TestCase):
         masks = pretrain_trainer.statepassing_target_masks(loss_mask)
 
         self.assertEqual(float(jnp.sum(masks.total[:, 1:])), 6.0)
+        self.assertEqual(float(jnp.sum(masks.iid_comparable[:, 1:])), 6.0)
         self.assertEqual(float(jnp.sum(masks.boundary[:, 1:])), 0.0)
 
     def test_statepassing_boundary_mask_respects_reset_state(self):
@@ -138,6 +140,7 @@ class PretrainMaskAndLossTest(absltest.TestCase):
         masks = pretrain_trainer.statepassing_target_masks(loss_mask, reset_state)
 
         self.assertEqual(float(jnp.sum(masks.total[:, 1:])), 6.0)
+        self.assertEqual(float(jnp.sum(masks.iid_comparable[:, 1:])), 6.0)
         self.assertEqual(float(jnp.sum(masks.boundary[:, 1:])), 0.0)
 
     def test_boundary_target_alignment_is_segment0_last_to_segment1_first(self):
@@ -153,13 +156,17 @@ class PretrainMaskAndLossTest(absltest.TestCase):
             hidden_BTD,
             lm_head,
             token_ids_BCT.reshape(1, 8),
-            jnp.stack([masks.total, masks.segment0, masks.boundary, masks.segment1], axis=0),
+            jnp.stack(
+                [masks.total, masks.iid_comparable, masks.segment0, masks.boundary, masks.segment1],
+                axis=0,
+            ),
             num_tiles=1,
         )
 
         expected_boundary = -jax.nn.log_softmax(hidden_BTD[0, 3])[4]
-        np.testing.assert_allclose(nll_sums[2], expected_boundary, rtol=1e-6, atol=1e-6)
-        self.assertEqual(float(counts[2]), 1.0)
+        np.testing.assert_allclose(nll_sums[3], expected_boundary, rtol=1e-6, atol=1e-6)
+        self.assertEqual(float(counts[1]), 6.0)
+        self.assertEqual(float(counts[3]), 1.0)
 
     def test_no_bptt_stops_gradient_through_carried_state(self):
         state = jnp.ones((1, 2, 4, 4), dtype=jnp.float32)
@@ -315,7 +322,9 @@ class PretrainTrainingSmokeTest(absltest.TestCase):
         self.assertIn("segment0_nll", metrics)
         self.assertIn("segment1_nll", metrics)
         self.assertIn("boundary_nll", metrics)
+        self.assertIn("iid_comparable_nll", metrics)
         self.assertEqual(metrics["supervised_tokens"], 15.0)
+        self.assertEqual(metrics["iid_comparable_tokens"], 14.0)
 
 
 class GatedDeltaNetMaskStateTest(absltest.TestCase):

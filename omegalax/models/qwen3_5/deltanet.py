@@ -148,6 +148,10 @@ class GatedDeltaNet(nnx.Module):
                 (B, self.num_v_heads, self.head_k_dim, self.head_v_dim),
                 dtype=jnp.float32,
             )
+        mesh = jax.sharding.get_abstract_mesh()
+        initial_state_BHAU = jax.sharding.reshard(
+            initial_state_BHAU, jax.sharding.NamedSharding(mesh, self.scan_state_shd)
+        )
 
         heads_shd = self.shd_cfg.act_btnh
         batch_axis = heads_shd[0]
@@ -189,7 +193,6 @@ class GatedDeltaNet(nnx.Module):
 
         from jax.experimental.shard_map import shard_map
 
-        mesh = jax.sharding.get_abstract_mesh()
         beta_BTH = jax.nn.sigmoid(b_BTH)
         A_H = -jnp.exp(self.A_log[...].astype(jnp.float32))
         g_BTH = A_H * jax.nn.softplus(a_BTH.astype(jnp.float32) + self.dt_bias[...])

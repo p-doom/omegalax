@@ -116,6 +116,12 @@ def _default_save_dir(pretrain_mode: pretrain_trainer.PretrainMode) -> Path:
     return Path("runs") / "text_pretrain" / pretrain_mode.value
 
 
+def _validate_model_sharding(model_source) -> None:
+    hidden_size = getattr(model_source, "hidden_size", None)
+    if hidden_size is not None and FLAGS.fsdp_size and hidden_size % FLAGS.fsdp_size != 0:
+        raise ValueError(f"fsdp_size={FLAGS.fsdp_size} must divide hidden_size={hidden_size}.")
+
+
 def _num_steps_and_warmup() -> tuple[int, int]:
     tokens_per_step = FLAGS.batch_size * FLAGS.seq_len * FLAGS.grad_accum_steps
     if tokens_per_step <= 0:
@@ -177,6 +183,7 @@ def main(_) -> None:
         else None
     )
     model_source = FLAGS.model_id or _default_pretrain_config()
+    _validate_model_sharding(model_source)
     train_cfg = pretrain_trainer.TrainConfig(
         seed=FLAGS.seed,
         batch_size=FLAGS.batch_size,

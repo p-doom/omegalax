@@ -131,6 +131,23 @@ class SubmitTextPretrainSlurmScriptTest(absltest.TestCase):
             2,
         )
 
+    def test_validate_submit_shape_rejects_fsdp_that_does_not_divide_hidden_size(self):
+        with self.assertRaisesRegex(ValueError, "must divide hidden_size"):
+            submit_text_pretrain_slurm.validate_submit_shape(
+                batch_size=60, nodes=1, gpus_per_node=5
+            )
+
+    def test_validate_submit_shape_allows_single_process_dp_non_fsdp_divisor(self):
+        self.assertEqual(
+            submit_text_pretrain_slurm.validate_submit_shape(
+                batch_size=60,
+                nodes=1,
+                gpus_per_node=5,
+                single_process_per_run=True,
+            ),
+            5,
+        )
+
     def test_parse_run_specs_validates_default_shape(self):
         with self.assertRaisesRegex(ValueError, "must be divisible"):
             submit_text_pretrain_slurm.parse_run_specs(
@@ -204,6 +221,7 @@ class SubmitTextPretrainSlurmScriptTest(absltest.TestCase):
         self.assertIn("#SBATCH --gres=gpu:8", script)
         self.assertIn("#SBATCH --qos=low", script)
         self.assertIn("#SBATCH --ntasks-per-node=8", script)
+        self.assertIn("JAX_PLATFORMS=cuda", script)
         self.assertIn('--fsdp_size="8"', script)
         self.assertIn('--pretrain_mode="statepassing_bptt"', script)
         self.assertIn('--adam_beta2="0.95"', script)
@@ -279,8 +297,9 @@ class SubmitTextPretrainSlurmScriptTest(absltest.TestCase):
 
         self.assertIn("#SBATCH --ntasks-per-node=1", script)
         self.assertIn("JAX_LOCAL_DEVICE_IDS=0,1,2,3,4", script)
-        self.assertIn("srun --ntasks=1 --ntasks-per-node=1 bash", script)
-        self.assertIn('--fsdp_size="5"', script)
+        self.assertIn("srun --ntasks=1 --ntasks-per-node=1 --gres=gpu:5 bash", script)
+        self.assertIn('--fsdp_size="1"', script)
+        self.assertIn('--dp_size="5"', script)
         self.assertIn('--iterator_fsdp_size="1"', script)
         self.assertIn('--iterator_dp_size="1"', script)
         self.assertNotIn("--gpus-per-task=1", script)
