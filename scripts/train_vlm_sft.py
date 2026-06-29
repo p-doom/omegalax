@@ -11,9 +11,6 @@ import jax
 import wandb
 from transformers import AutoImageProcessor, AutoTokenizer
 
-# Relax JAX's Hopper-only gate on cuDNN packed/THD attention so the vision
-# encoder's packed kernel runs on Ampere (sm80) with cuDNN >= 9.18.1. Must be
-# imported before any cuDNN attention is traced (applies a monkeypatch on import).
 import omegalax.compat.cudnn_ampere_packed  # noqa: F401
 
 from omegalax.data.collator_qwen3 import VLMSFTCollator
