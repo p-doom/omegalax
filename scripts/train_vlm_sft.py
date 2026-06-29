@@ -11,6 +11,8 @@ import jax
 import wandb
 from transformers import AutoImageProcessor, AutoTokenizer
 
+import omegalax.compat.cudnn_ampere_packed  # noqa: F401
+
 from omegalax.data.collator_qwen3 import VLMSFTCollator
 from omegalax.data.grain_pipeline import (
     MixSource,

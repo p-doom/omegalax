@@ -15,6 +15,7 @@ dependencies = [
   "flax>0.12.0",
   "jax[cuda12]",
   "jax-triton",
+  "nvidia-cudnn-cu12==9.18.1.3",
   "jaxtyping",
   "optax",
   "orbax-checkpoint",
@@ -32,6 +33,9 @@ dependencies = [
 torch-tests = [
   "torch==2.10.* ; platform_system == \"Linux\"",
 ]
+
+[tool.uv]
+override-dependencies = ["nvidia-cudnn-cu12==9.18.1.3"]
 
 [tool.hatch.metadata]
 allow-direct-references = true
