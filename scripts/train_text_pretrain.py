@@ -70,6 +70,8 @@ flags.DEFINE_string("wandb_project", None, "Weights & Biases project name.")
 flags.DEFINE_string("wandb_group", None, "Weights & Biases run group.")
 flags.DEFINE_string("wandb_name", None, "Weights & Biases run name.")
 flags.DEFINE_list("wandb_tags", [], "Comma-separated Weights & Biases tags.")
+flags.DEFINE_string("wandb_id", None, "Optional stable Weights & Biases run id for resume.")
+flags.DEFINE_string("wandb_resume", None, "Optional Weights & Biases resume policy.")
 flags.DEFINE_integer("val_every", None, "Run validation every N steps.")
 flags.DEFINE_integer("val_steps", 10, "Validation batches per validation run.")
 flags.DEFINE_integer("grain_read_threads", 2, "Grain read threads.")
@@ -216,19 +218,24 @@ def main(_) -> None:
 
     wandb_run = None
     if FLAGS.wandb_project and jax.process_index() == 0:
-        wandb_run = wandb.init(
-            entity=FLAGS.wandb_entity,
-            project=FLAGS.wandb_project,
-            group=FLAGS.wandb_group,
-            name=FLAGS.wandb_name,
-            tags=FLAGS.wandb_tags or None,
-            config=flags.FLAGS.flag_values_dict()
+        wandb_kwargs = {
+            "entity": FLAGS.wandb_entity,
+            "project": FLAGS.wandb_project,
+            "group": FLAGS.wandb_group,
+            "name": FLAGS.wandb_name,
+            "tags": FLAGS.wandb_tags or None,
+            "config": flags.FLAGS.flag_values_dict()
             | {
                 "derived_num_steps": num_steps,
                 "derived_warmup_steps": warmup_steps,
                 "tokenizer": FLAGS.tokenizer,
             },
-        )
+        }
+        if FLAGS.wandb_id:
+            wandb_kwargs["id"] = FLAGS.wandb_id
+        if FLAGS.wandb_resume:
+            wandb_kwargs["resume"] = FLAGS.wandb_resume
+        wandb_run = wandb.init(**wandb_kwargs)
     if FLAGS.gc_period:
         gc.disable()
 

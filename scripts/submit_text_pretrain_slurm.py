@@ -63,7 +63,8 @@ flags.DEFINE_bool(
     "Run one JAX process per Slurm job with all allocated GPUs visible locally.",
 )
 flags.DEFINE_integer("submit_index_cpus", 32, "CPUs for the index-build job.")
-flags.DEFINE_integer("submit_batch_size", 128, "Global number of 4096-token segments.")
+flags.DEFINE_integer("submit_seq_len", 4096, "Segment length for index building and training.")
+flags.DEFINE_integer("submit_batch_size", 128, "Global number of submit_seq_len-token segments.")
 flags.DEFINE_integer("submit_grad_accum_steps", 4, "Gradient accumulation steps.")
 flags.DEFINE_integer("submit_max_tokens", 15_000_000_000, "Total token budget.")
 flags.DEFINE_integer("submit_warmup_tokens", 150_000_000, "Warmup token budget.")
@@ -91,6 +92,12 @@ flags.DEFINE_string("submit_wandb_entity", "pdoom", "W&B entity; empty disables 
 flags.DEFINE_string("submit_wandb_project", "omegalax", "W&B project; empty disables W&B.")
 flags.DEFINE_string("submit_wandb_group", None, "W&B group; defaults to run id.")
 flags.DEFINE_string("submit_wandb_tags", "statepassing,pretrain", "Comma-separated W&B tags.")
+flags.DEFINE_multi_string(
+    "submit_wandb_resume_id",
+    [],
+    "Optional per-mode W&B resume id as mode:run_id. Repeat once per resumed mode.",
+)
+flags.DEFINE_string("submit_wandb_resume", None, "Optional W&B resume policy.")
 flags.DEFINE_bool("submit_dry_run", False, "Write scripts and print sbatch commands only.")
 flags.DEFINE_bool("submit_monitor", True, "Submit a lightweight monitor job.")
 flags.DEFINE_bool(
@@ -244,6 +251,19 @@ def parse_run_specs(
     return specs
 
 
+def parse_wandb_resume_ids(raw_ids: list[str]) -> dict[PretrainMode, str]:
+    ids_by_mode: dict[PretrainMode, str] = {}
+    for raw in raw_ids:
+        parts = raw.split(":", 1)
+        if len(parts) != 2:
+            raise ValueError("--submit_wandb_resume_id must be mode:run_id")
+        mode = PretrainMode(parts[0])
+        if mode in ids_by_mode:
+            raise ValueError(f"Duplicate W&B resume id for mode {mode.value}")
+        ids_by_mode[mode] = parts[1]
+    return ids_by_mode
+
+
 def _path_under(path: Path, root: Path) -> str:
     return str(path.expanduser().resolve().relative_to(root.expanduser().resolve()))
 
@@ -324,7 +344,7 @@ uv run python scripts/build_pretrain_indexes.py \\
   --out_dir={_quote(index_root)} \\
   {modes} \\
   {splits} \\
-  --chunk_length=4096 \\
+  --chunk_length={_flag_value("submit_seq_len")} \\
   --eos_id=248046 \\
   --records_per_shard={records_per_shard} \\
   --eos_check_records={eos_check_records} \\
@@ -342,6 +362,7 @@ def _train_flags(
     batch_size: int,
     grad_accum_steps: int,
     single_process_per_run: bool,
+    wandb_resume_id: str | None = None,
 ) -> list[str]:
     fsdp_size = 1 if single_process_per_run else total_tasks
     dp_size = total_tasks if single_process_per_run else 1
@@ -349,7 +370,7 @@ def _train_flags(
         f"--pretrain_mode={mode.value}",
         f"--train_index_path=${{TRAIN_INDEX_ROOT}}/train/{mode.value}",
         f"--val_index_path=${{TRAIN_INDEX_ROOT}}/val/{mode.value}",
-        "--seq_len=4096",
+        f"--seq_len={_flag_value('submit_seq_len')}",
         f"--batch_size={batch_size}",
         f"--max_tokens={_flag_value('submit_max_tokens')}",
         f"--warmup_tokens={_flag_value('submit_warmup_tokens')}",
@@ -392,6 +413,11 @@ def _train_flags(
                 f"--wandb_tags={_flag_value('submit_wandb_tags')}",
             ]
         )
+        if wandb_resume_id:
+            flags_out.append(f"--wandb_id={wandb_resume_id}")
+        wandb_resume = _flag_value("submit_wandb_resume")
+        if wandb_resume:
+            flags_out.append(f"--wandb_resume={wandb_resume}")
     return flags_out
 
 
@@ -435,6 +461,7 @@ def render_train_sbatch(
     stage_to_scratch: bool,
     run_pallas_tests: bool,
     single_process_per_run: bool,
+    wandb_resume_id: str | None = None,
 ) -> str:
     source_root = Path(source_root).expanduser().resolve()
     dataset_root = Path(dataset_root).expanduser().resolve()
@@ -456,6 +483,7 @@ def render_train_sbatch(
             save_root=Path(save_root),
             jax_cache_root=Path(jax_cache_root),
             run_id=run_id,
+            wandb_resume_id=wandb_resume_id,
             total_tasks=total_tasks,
             batch_size=batch_size,
             grad_accum_steps=grad_accum_steps,
@@ -484,6 +512,7 @@ srun --nodes=1 --ntasks=1 --gpus-per-task=1 --gpu-bind=single:1 bash -lc 'set -e
 export JAX_PLATFORMS=cuda
 export JAX_LOCAL_DEVICE_IDS=0
 export OMEGALAX_DELTANET_KERNEL=pallas
+export WANDB_MODE=disabled
 uv run python -m pytest tests/test_gated_delta_rule_pallas.py tests/test_gated_delta_rule_pallas_bwd.py -q
 '
 """
@@ -598,6 +627,7 @@ def main(_) -> None:
         default_grad_accum_steps=FLAGS.submit_grad_accum_steps,
         single_process_per_run=FLAGS.submit_single_process_per_run,
     )
+    wandb_resume_ids = parse_wandb_resume_ids(FLAGS.submit_wandb_resume_id)
 
     index_root = Path(FLAGS.submit_index_root).expanduser().resolve()
     index_job_id = None
@@ -657,6 +687,7 @@ def main(_) -> None:
                 stage_to_scratch=FLAGS.submit_stage_to_scratch,
                 run_pallas_tests=FLAGS.submit_run_pallas_tests,
                 single_process_per_run=FLAGS.submit_single_process_per_run,
+                wandb_resume_id=wandb_resume_ids.get(spec.mode),
             )
         )
         train_job_id = _submit(train_script, dependency=dependency, dry_run=FLAGS.submit_dry_run)

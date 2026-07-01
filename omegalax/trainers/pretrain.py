@@ -559,7 +559,7 @@ def run_pretrain(
     if checkpoint_manager is not None:
         if last_metrics and (not save_every or last_metrics["step"] % save_every != 0):
             _save_sft_checkpoint(
-                checkpoint_manager, optimizer, rng, int(last_metrics["step"]), data_iter
+                checkpoint_manager, optimizer, rng, int(last_metrics["step"]), data_iter, force=True
             )
         checkpoint_manager.wait_until_finished()
         checkpoint_manager.close()

@@ -147,10 +147,12 @@ def _save_sft_checkpoint(
     rng: jax.Array,
     step: int,
     input_iter: checkpoint_utils.GrainIterator,
+    *,
+    force: bool = False,
 ) -> None:
     train_state = _train_state(optimizer, rng)
     save_args = checkpoint_utils.make_grain_save_args(train_state, input_iter)
-    checkpoint_manager.save(step, args=save_args)
+    checkpoint_manager.save(step, args=save_args, force=force)
 
 
 def _restore_sft_checkpoint(

@@ -189,6 +189,37 @@ class SubmitTextPretrainSlurmScriptTest(absltest.TestCase):
                 default_grad_accum_steps=4,
             )
 
+    def test_submit_seq_len_controls_index_and_train_flags(self):
+        with flagsaver.flagsaver(submit_seq_len=2048):
+            index_script = submit_text_pretrain_slurm.render_index_sbatch(
+                repo_root="/repo",
+                dataset_root="/data",
+                index_root="/idx",
+                log_dir="/logs",
+                run_id="run",
+                partition="standard",
+                qos=None,
+                time_limit="12:00:00",
+                cpus_per_task=12,
+                records_per_shard=100,
+                eos_check_records=10,
+                min_eos_fraction=0.95,
+                overwrite=False,
+            )
+            train_flags = submit_text_pretrain_slurm._train_flags(
+                mode=PretrainMode.IID_BASELINE,
+                save_root=Path("/runs"),
+                jax_cache_root=Path("/jax_cache"),
+                run_id="run",
+                total_tasks=8,
+                batch_size=128,
+                grad_accum_steps=4,
+                single_process_per_run=False,
+            )
+
+        self.assertIn("--chunk_length=2048", index_script)
+        self.assertIn("--seq_len=2048", train_flags)
+
     def test_render_train_sbatch_requests_gpus_mesh_and_preflight(self):
         script = submit_text_pretrain_slurm.render_train_sbatch(
             repo_root="/repo",
@@ -230,6 +261,7 @@ class SubmitTextPretrainSlurmScriptTest(absltest.TestCase):
         self.assertIn("WANDB_MODE=online", script)
         self.assertIn("WANDB_DIR=", script)
         self.assertIn("pytest tests/test_gated_delta_rule_pallas.py", script)
+        self.assertIn("WANDB_MODE=disabled", script)
         self.assertIn("--gpus-per-task=1", script)
         self.assertNotIn('CUDA_VISIBLE_DEVICES="${SLURM_LOCALID}"', script)
 
@@ -320,6 +352,23 @@ class SubmitTextPretrainSlurmScriptTest(absltest.TestCase):
 
         self.assertIn("--wandb_project=omegalax", train_flags)
         self.assertFalse(any(flag.startswith("--wandb_entity") for flag in train_flags))
+
+    def test_train_flags_can_resume_existing_wandb_run(self):
+        with flagsaver.flagsaver(submit_wandb_project="omegalax", submit_wandb_resume="allow"):
+            train_flags = submit_text_pretrain_slurm._train_flags(
+                mode=PretrainMode.IID_BASELINE,
+                save_root=Path("/runs"),
+                jax_cache_root=Path("/jax_cache"),
+                run_id="run",
+                total_tasks=8,
+                batch_size=128,
+                grad_accum_steps=4,
+                single_process_per_run=False,
+                wandb_resume_id="abc123",
+            )
+
+        self.assertIn("--wandb_id=abc123", train_flags)
+        self.assertIn("--wandb_resume=allow", train_flags)
 
     def test_render_monitor_sbatch_records_jobs_and_wiki_path(self):
         script = submit_text_pretrain_slurm.render_monitor_sbatch(
