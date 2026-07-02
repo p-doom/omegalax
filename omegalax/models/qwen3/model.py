@@ -7,6 +7,7 @@ import jax.numpy as jnp
 from flax import nnx
 from jax.sharding import PartitionSpec as P, reshard
 from omegalax.models.moe_grouped import grouped_moe, grouped_moe_ep
+from omegalax.models.remat_policy import resolve_remat_policy
 from .attention import Attention
 from .config import Qwen3Config
 from .norms import RMSNorm
@@ -171,8 +172,18 @@ class DecoderLayer(nnx.Module):
         else:
             self.mlp = MLP(cfg=cfg, rngs=rngs)
 
-    @partial(jax.remat, static_argnums=0)
+        self._remat_policy = resolve_remat_policy(cfg.remat_policy)
+
     def __call__(self, hidden_BTD: jax.Array, cache, segment_ids_BT: jax.Array):
+        # Inline nnx.remat on the UNBOUND method (no static_argnums): nnx
+        # functionalizes ``self`` via split/merge, so it must not be static.
+        # Building the transform inline keeps graphdefs equal across fresh
+        # instances (stable hash -> one trace, not one per instance).
+        return nnx.remat(type(self)._impl, policy=self._remat_policy)(
+            self, hidden_BTD, cache, segment_ids_BT
+        )
+
+    def _impl(self, hidden_BTD: jax.Array, cache, segment_ids_BT: jax.Array):
         normed_BTD = self.input_layernorm(hidden_BTD)
         attn_out_BTD = hidden_BTD + self.attn(normed_BTD, cache, segment_ids_BT)
         post_norm_BTD = self.post_attention_layernorm(attn_out_BTD)

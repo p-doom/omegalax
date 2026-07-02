@@ -9,6 +9,7 @@ import jax.numpy as jnp
 from etils import epath
 
 from omegalax.models.params_utils import load_hf_config_from_source
+from omegalax.models.remat_policy import DEFAULT_REMAT_POLICY
 from omegalax.models.shard_config import ShardConfig
 
 
@@ -42,6 +43,9 @@ class Qwen3Config:
     # "grouped" (dropless grouped-GEMM + expert-parallel ragged all-to-all).
     # Default "dense" keeps existing behavior unchanged for side-by-side diffing.
     moe_backend: str = "dense"
+    # Activation checkpointing (rematerialization) policy for decoder layers.
+    # See omegalax.models.remat_policy for the name -> policy mapping.
+    remat_policy: str = DEFAULT_REMAT_POLICY
 
     shd_cfg: ShardConfig = dataclasses.field(default_factory=ShardConfig.default)
     dtype: Any = jnp.bfloat16

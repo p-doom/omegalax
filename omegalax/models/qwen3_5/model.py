@@ -8,6 +8,7 @@ from flax import nnx
 from jax.sharding import PartitionSpec, reshard
 
 from omegalax.models.moe_grouped import grouped_moe, grouped_moe_ep
+from omegalax.models.remat_policy import resolve_remat_policy
 from omegalax.models.shard_config import ShardConfig
 from .attention import Attention
 from .config import Qwen3_5Config, Qwen3_5TextConfig
@@ -227,8 +228,32 @@ class DecoderLayer(nnx.Module):
         self.input_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, rngs=rngs)
         self.post_attention_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, rngs=rngs)
 
-    @partial(jax.remat, static_argnums=0)
+        self._remat_policy = resolve_remat_policy(cfg.remat_policy)
+
     def __call__(
+        self,
+        hidden_BTD: jax.Array,
+        cos_BTK: jax.Array,
+        sin_BTK: jax.Array,
+        segment_ids_BT: jax.Array,
+        position_ids_BT: jax.Array,
+        attention_mask_BT: jax.Array | None = None,
+    ) -> tuple[jax.Array, jax.Array]:
+        # Inline nnx.remat on the UNBOUND method (no static_argnums): nnx
+        # functionalizes ``self`` via split/merge, so it must not be static.
+        # Building the transform inline keeps graphdefs equal across fresh
+        # instances (stable hash -> one trace, not one per instance).
+        return nnx.remat(type(self)._impl, policy=self._remat_policy)(
+            self,
+            hidden_BTD,
+            cos_BTK,
+            sin_BTK,
+            segment_ids_BT,
+            position_ids_BT,
+            attention_mask_BT,
+        )
+
+    def _impl(
         self,
         hidden_BTD: jax.Array,
         cos_BTK: jax.Array,

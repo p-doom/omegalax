@@ -9,6 +9,7 @@ import jax.numpy as jnp
 from etils import epath
 
 from omegalax.models.params_utils import load_hf_config_from_source
+from omegalax.models.remat_policy import DEFAULT_REMAT_POLICY
 from omegalax.models.shard_config import ShardConfig
 
 
@@ -24,6 +25,8 @@ class Qwen3_5VisionConfig:
     in_channels: int = 3
     out_hidden_size: int = 4096
     num_position_embeddings: int = 2304
+    # Activation checkpointing policy for vision blocks (see remat_policy.py).
+    remat_policy: str = DEFAULT_REMAT_POLICY
     dtype: Any = jnp.bfloat16
 
 
@@ -64,6 +67,8 @@ class Qwen3_5TextConfig:
     # MoE compute backend: "dense" (reference einsum) or "grouped"/"grouped_ep"
     # (dropless grouped-GEMM). Default "dense" keeps existing behavior.
     moe_backend: str = "dense"
+    # Activation checkpointing policy for decoder layers (see remat_policy.py).
+    remat_policy: str = DEFAULT_REMAT_POLICY
     shd_cfg: ShardConfig = dataclasses.field(default_factory=ShardConfig.default)
     dtype: Any = jnp.bfloat16
 

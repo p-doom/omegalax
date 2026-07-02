@@ -12,6 +12,7 @@ from jax.sharding import PartitionSpec, reshard
 from tokamax import dot_product_attention
 
 from omegalax.models.moe_grouped import grouped_moe, grouped_moe_ep
+from omegalax.models.remat_policy import resolve_remat_policy
 from .config import Qwen3VLConfig
 from .vision import VisionModel
 
@@ -433,8 +434,20 @@ class TextDecoderLayer(nnx.Module):
         self.is_moe = cfg.is_moe_layer(layer_idx)
         self.mlp = TextMoEFeedForward(cfg, rngs=rngs) if self.is_moe else TextMLP(cfg, rngs=rngs)
 
-    @partial(jax.remat, static_argnums=0)
+        self._remat_policy = resolve_remat_policy(cfg.remat_policy)
+
     def __call__(
+        self, hidden_BTD: jax.Array, sin_BTK: jax.Array, cos_BTK: jax.Array
+    ) -> tuple[jax.Array, jax.Array]:
+        # Inline nnx.remat on the UNBOUND method (no static_argnums): nnx
+        # functionalizes ``self`` via split/merge, so it must not be static.
+        # Building the transform inline keeps graphdefs equal across fresh
+        # instances (stable hash -> one trace, not one per instance).
+        return nnx.remat(type(self)._impl, policy=self._remat_policy)(
+            self, hidden_BTD, sin_BTK, cos_BTK
+        )
+
+    def _impl(
         self, hidden_BTD: jax.Array, sin_BTK: jax.Array, cos_BTK: jax.Array
     ) -> tuple[jax.Array, jax.Array]:
         hidden_BTD = hidden_BTD + self.attn(self.input_layernorm(hidden_BTD), sin_BTK, cos_BTK)
