@@ -218,6 +218,15 @@ class TextMLP(nnx.Module):
 class TextMoEFeedForward(nnx.Module):
     """Sparse MoE MLP mirroring the Qwen3 MoE structure."""
 
+    # Logical sharding of the expert-stacked projections, consumed by
+    # ``omegalax.trainers.lora.inject_lora`` to attach per-expert LoRA
+    # adapters (mirrors the ``nnx.Param`` sharding tuples below).
+    _EXPERT_LORA_SHARDING = {
+        "gate_proj": (None, "embed", "mlp"),
+        "up_proj": (None, "embed", "mlp"),
+        "down_proj": (None, "mlp", "embed"),
+    }
+
     def __init__(self, cfg: Qwen3VLConfig, *, rngs: nnx.Rngs):
         self.cfg = cfg
         self.shd_cfg = cfg.shd_cfg
@@ -235,6 +244,13 @@ class TextMoEFeedForward(nnx.Module):
             init(rngs.params(), (E, F, D), dtype=cfg.param_dtype),
             sharding=(None, "mlp", "embed"),
         )
+        # Optional per-expert LoRA adapters, populated by inject_lora. When
+        # None (default) the expert einsums below are numerically unchanged.
+        # nnx.data(None) marks these as data slots so a LoRAMoEExperts module
+        # can be assigned in later (a plain None would be a static attribute).
+        self.gate_proj_lora = nnx.data(None)
+        self.up_proj_lora = nnx.data(None)
+        self.down_proj_lora = nnx.data(None)
         # Router math is fp32 for stable expert selection
         self.router = nnx.Linear(
             D,
@@ -268,25 +284,41 @@ class TextMoEFeedForward(nnx.Module):
         down_proj_EFD = self.down_proj[...].astype(cfg.dtype)
 
         dense_hidden_BTD = reshard(hidden_BTD, P(batch_axis, None, None))
+        ff_sharding = P(batch_axis, None, None, ff_axis)
+        hidden_sharding = P(batch_axis, None, None, hidden_axis)
         gate_BTEF = jnp.einsum(
             "BTD,EDF->BTEF",
             dense_hidden_BTD,
             gate_proj_EDF,
-            out_sharding=P(batch_axis, None, None, ff_axis),
+            out_sharding=ff_sharding,
         )
         up_BTEF = jnp.einsum(
             "BTD,EDF->BTEF",
             dense_hidden_BTD,
             up_proj_EDF,
-            out_sharding=P(batch_axis, None, None, ff_axis),
+            out_sharding=ff_sharding,
         )
+        # Per-expert LoRA on gate/up (added inside the expert map, before the
+        # nonlinearity and top-k gather). No-op when adapters are unattached.
+        if self.gate_proj_lora is not None:
+            gate_BTEF += self.gate_proj_lora.delta_shared(
+                dense_hidden_BTD, out_sharding=ff_sharding
+            )
+        if self.up_proj_lora is not None:
+            up_BTEF += self.up_proj_lora.delta_shared(
+                dense_hidden_BTD, out_sharding=ff_sharding
+            )
         expert_hidden_BTEF = nnx.silu(gate_BTEF) * up_BTEF
         expert_out_BTED = jnp.einsum(
             "BTEF,EFD->BTED",
             expert_hidden_BTEF,
             down_proj_EFD,
-            out_sharding=P(batch_axis, None, None, hidden_axis),
+            out_sharding=hidden_sharding,
         )
+        if self.down_proj_lora is not None:
+            expert_out_BTED += self.down_proj_lora.delta_per_expert(
+                expert_hidden_BTEF, out_sharding=hidden_sharding
+            )
 
         B, T = hidden_BTD.shape[:2]
         flat_out = expert_out_BTED.reshape(B * T, cfg.num_experts, cfg.emb_dim)
