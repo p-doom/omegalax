@@ -7,6 +7,7 @@ import jax.numpy as jnp
 from flax import nnx
 from jax.sharding import PartitionSpec, reshard
 
+from omegalax.models.moe_grouped import grouped_moe, grouped_moe_ep
 from omegalax.models.shard_config import ShardConfig
 from .attention import Attention
 from .config import Qwen3_5Config, Qwen3_5TextConfig
@@ -129,42 +130,62 @@ class MoEFeedForward(nnx.Module):
         up_proj = jnp.astype(self.up_proj[...], compute_dtype)
         down_proj = jnp.astype(self.down_proj[...], compute_dtype)
 
-        dense_hidden_BTD = reshard(hidden_BTD, P(batch_axis, None, None))
-        gate_BTEF = jnp.einsum(
-            "BTD,EDF->BTEF",
-            dense_hidden_BTD,
-            gate_proj,
-            out_sharding=P(batch_axis, None, None, ff_axis),
-        )
-        up_BTEF = jnp.einsum(
-            "BTD,EDF->BTEF",
-            dense_hidden_BTD,
-            up_proj,
-            out_sharding=P(batch_axis, None, None, ff_axis),
-        )
-        expert_hidden_BTEF = nnx.silu(gate_BTEF) * up_BTEF
-        expert_out_BTED = jnp.einsum(
-            "BTEF,EFD->BTED",
-            expert_hidden_BTEF,
-            down_proj,
-            out_sharding=P(batch_axis, None, None, hidden_axis),
-        )
+        if cfg.moe_backend == "dense":
+            dense_hidden_BTD = reshard(hidden_BTD, P(batch_axis, None, None))
+            gate_BTEF = jnp.einsum(
+                "BTD,EDF->BTEF",
+                dense_hidden_BTD,
+                gate_proj,
+                out_sharding=P(batch_axis, None, None, ff_axis),
+            )
+            up_BTEF = jnp.einsum(
+                "BTD,EDF->BTEF",
+                dense_hidden_BTD,
+                up_proj,
+                out_sharding=P(batch_axis, None, None, ff_axis),
+            )
+            expert_hidden_BTEF = nnx.silu(gate_BTEF) * up_BTEF
+            expert_out_BTED = jnp.einsum(
+                "BTEF,EFD->BTED",
+                expert_hidden_BTEF,
+                down_proj,
+                out_sharding=P(batch_axis, None, None, hidden_axis),
+            )
 
-        flat_out = jax.lax.reshape(
-            expert_out_BTED,
-            (B * T, cfg.num_experts, cfg.hidden_size),
-            out_sharding=P(batch_axis, None, None),
-        )
-        flat_idx = topk_idx_BTk.reshape(B * T, cfg.num_experts_per_tok)
-        gathered = jnp.take_along_axis(flat_out, flat_idx[..., None], axis=1)
-        gathered = jax.lax.reshape(
-            gathered,
-            (B, T, cfg.num_experts_per_tok, cfg.hidden_size),
-            out_sharding=P(batch_axis, None, None, None),
-        )
-        moe_out_BTD = reshard(
-            jnp.sum(gathered * topk_weights_BTk[..., None], axis=-2), self.shd_cfg.act_btd
-        )
+            flat_out = jax.lax.reshape(
+                expert_out_BTED,
+                (B * T, cfg.num_experts, cfg.hidden_size),
+                out_sharding=P(batch_axis, None, None),
+            )
+            flat_idx = topk_idx_BTk.reshape(B * T, cfg.num_experts_per_tok)
+            gathered = jnp.take_along_axis(flat_out, flat_idx[..., None], axis=1)
+            gathered = jax.lax.reshape(
+                gathered,
+                (B, T, cfg.num_experts_per_tok, cfg.hidden_size),
+                out_sharding=P(batch_axis, None, None, None),
+            )
+            moe_out_BTD = reshard(
+                jnp.sum(gathered * topk_weights_BTk[..., None], axis=-2), self.shd_cfg.act_btd
+            )
+        else:
+            # Dropless grouped-GEMM path for the routed experts. The shared expert /
+            # shared-expert gate below are computed separately and unchanged.
+            flat_hidden_ND = hidden_BTD.reshape(B * T, cfg.hidden_size)
+            flat_idx_Nk = topk_idx_BTk.reshape(B * T, cfg.num_experts_per_tok)
+            flat_w_Nk = topk_weights_BTk.reshape(B * T, cfg.num_experts_per_tok)
+            moe_fn = grouped_moe_ep if cfg.moe_backend == "grouped_ep" else grouped_moe
+            moe_out_ND = moe_fn(
+                flat_hidden_ND,
+                flat_idx_Nk,
+                flat_w_Nk,
+                gate_proj,
+                up_proj,
+                down_proj,
+                num_experts=cfg.num_experts,
+            )
+            moe_out_BTD = reshard(
+                moe_out_ND.reshape(B, T, cfg.hidden_size), self.shd_cfg.act_btd
+            )
 
         shared_out_BTD = self.shared_expert(hidden_BTD)
         shared_gate = jax.nn.sigmoid(

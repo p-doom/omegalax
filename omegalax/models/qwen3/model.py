@@ -6,6 +6,7 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 from jax.sharding import PartitionSpec as P, reshard
+from omegalax.models.moe_grouped import grouped_moe, grouped_moe_ep
 from .attention import Attention
 from .config import Qwen3Config
 from .norms import RMSNorm
@@ -93,43 +94,60 @@ class MoEFeedForward(nnx.Module):
         batch_axis = self.shd_cfg.act_btd[0]
         hidden_axis = self.shd_cfg.act_btd[2]
         ff_axis = self.shd_cfg.act_btf[2]
-
-        dense_hidden_BTD = reshard(hidden_BTD, P(self.shd_cfg.act_btd[0], None, None))
-        gate_BTEF = jnp.einsum(
-            "BTD,EDF->BTEF",
-            dense_hidden_BTD,
-            gate_proj_EDF,
-            out_sharding=P(batch_axis, None, None, ff_axis),
-        )
-        up_BTEF = jnp.einsum(
-            "BTD,EDF->BTEF",
-            dense_hidden_BTD,
-            up_proj_EDF,
-            out_sharding=P(batch_axis, None, None, ff_axis),
-        )
-        expert_hidden_BTEF = nnx.silu(gate_BTEF) * up_BTEF
-        expert_out_BTED = jnp.einsum(
-            "BTEF,EFD->BTED",
-            expert_hidden_BTEF,
-            down_proj_EFD,
-            out_sharding=P(batch_axis, None, None, hidden_axis),
-        )
-
         B, T = hidden_BTD.shape[:2]
-        flat_out = jax.lax.reshape(
-            expert_out_BTED,
-            (B * T, cfg.num_experts, cfg.emb_dim),
-            out_sharding=P(batch_axis, None, hidden_axis),
-        )
-        flat_idx = topk_idx_BTk.reshape(B * T, cfg.num_experts_per_tok)
-        gathered = jnp.take_along_axis(flat_out, flat_idx[..., None], axis=1)
-        gathered = jax.lax.reshape(
-            gathered,
-            (B, T, cfg.num_experts_per_tok, cfg.emb_dim),
-            out_sharding=P(batch_axis, None, None, hidden_axis),
-        )
-        merged_BTD = jnp.sum(gathered * topk_weights_BTk[..., None], axis=-2)
-        merged_BTD = reshard(merged_BTD, self.shd_cfg.act_btd)
+
+        if cfg.moe_backend == "dense":
+            dense_hidden_BTD = reshard(hidden_BTD, P(self.shd_cfg.act_btd[0], None, None))
+            gate_BTEF = jnp.einsum(
+                "BTD,EDF->BTEF",
+                dense_hidden_BTD,
+                gate_proj_EDF,
+                out_sharding=P(batch_axis, None, None, ff_axis),
+            )
+            up_BTEF = jnp.einsum(
+                "BTD,EDF->BTEF",
+                dense_hidden_BTD,
+                up_proj_EDF,
+                out_sharding=P(batch_axis, None, None, ff_axis),
+            )
+            expert_hidden_BTEF = nnx.silu(gate_BTEF) * up_BTEF
+            expert_out_BTED = jnp.einsum(
+                "BTEF,EFD->BTED",
+                expert_hidden_BTEF,
+                down_proj_EFD,
+                out_sharding=P(batch_axis, None, None, hidden_axis),
+            )
+
+            flat_out = jax.lax.reshape(
+                expert_out_BTED,
+                (B * T, cfg.num_experts, cfg.emb_dim),
+                out_sharding=P(batch_axis, None, hidden_axis),
+            )
+            flat_idx = topk_idx_BTk.reshape(B * T, cfg.num_experts_per_tok)
+            gathered = jnp.take_along_axis(flat_out, flat_idx[..., None], axis=1)
+            gathered = jax.lax.reshape(
+                gathered,
+                (B, T, cfg.num_experts_per_tok, cfg.emb_dim),
+                out_sharding=P(batch_axis, None, None, hidden_axis),
+            )
+            merged_BTD = jnp.sum(gathered * topk_weights_BTk[..., None], axis=-2)
+            merged_BTD = reshard(merged_BTD, self.shd_cfg.act_btd)
+        else:
+            # Dropless grouped-GEMM path (EP=1 or EP via ragged all-to-all).
+            flat_hidden_ND = hidden_BTD.reshape(B * T, cfg.emb_dim)
+            flat_idx_Nk = topk_idx_BTk.reshape(B * T, cfg.num_experts_per_tok)
+            flat_w_Nk = topk_weights_BTk.reshape(B * T, cfg.num_experts_per_tok)
+            moe_fn = grouped_moe_ep if cfg.moe_backend == "grouped_ep" else grouped_moe
+            merged_ND = moe_fn(
+                flat_hidden_ND,
+                flat_idx_Nk,
+                flat_w_Nk,
+                gate_proj_EDF,
+                up_proj_EDF,
+                down_proj_EFD,
+                num_experts=cfg.num_experts,
+            )
+            merged_BTD = reshard(merged_ND.reshape(B, T, cfg.emb_dim), self.shd_cfg.act_btd)
 
         expert_mask_BTkE = jax.nn.one_hot(topk_idx_BTk, cfg.num_experts, dtype=probs_BTE.dtype)
         tokens_per_expert = jnp.mean(expert_mask_BTkE, axis=(0, 1))

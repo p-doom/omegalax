@@ -61,6 +61,9 @@ class Qwen3_5TextConfig:
     num_experts: int = 0
     num_experts_per_tok: int = 0
     router_aux_loss_coef: float = 0.001
+    # MoE compute backend: "dense" (reference einsum) or "grouped"/"grouped_ep"
+    # (dropless grouped-GEMM). Default "dense" keeps existing behavior.
+    moe_backend: str = "dense"
     shd_cfg: ShardConfig = dataclasses.field(default_factory=ShardConfig.default)
     dtype: Any = jnp.bfloat16
 

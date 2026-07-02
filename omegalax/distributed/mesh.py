@@ -108,6 +108,41 @@ def mesh_rules(mesh: Mesh) -> Iterator[Mesh]:
         yield mesh
 
 
+# --- Expert parallelism (MoE grouped-GEMM + ragged all-to-all) ---------------
+# Self-contained helper added for the `feat/moe-ep-grouped-gemm` branch. It builds
+# a dedicated 1-D `('expert',)` mesh for the expert-parallel MoE path (used by
+# omegalax.models.moe_grouped.grouped_moe_ep), independent of the flat
+# `('tp','fsdp','dp')` training mesh above.
+#
+# MERGE NOTE: the separate `feat/topology-aware-mesh` branch is reworking mesh
+# construction. At merge, the `'expert'` axis should be folded into the unified
+# mesh factory / DEFAULT_AXIS_RULES (see shard_config.py, where the "experts"
+# logical rule is currently mapped to None) rather than living as this standalone
+# builder. Kept minimal here to avoid conflicting with that rework.
+_EXPERT_AXIS = "expert"
+
+
+def make_expert_mesh(ep_size: int, axis_name: str = _EXPERT_AXIS) -> Mesh:
+    """Build a 1-D expert-parallel mesh over ``ep_size`` devices.
+
+    The stacked expert weights are sharded on ``axis_name`` (each device owns
+    ``E / ep_size`` experts) and the token axis is likewise sharded, so
+    ``grouped_moe_ep`` can dispatch each token to the device owning its expert via
+    ``ragged_all_to_all``. Requires ``jax.device_count() % ep_size == 0``; uses the
+    first ``ep_size`` devices.
+    """
+    ndev = jax.device_count()
+    if ep_size <= 0 or ndev % ep_size != 0:
+        raise ValueError(
+            f"expert-parallel size {ep_size} must divide device_count={ndev} and be > 0."
+        )
+    import numpy as np
+    from jax.sharding import AxisType
+
+    devices = np.array(jax.devices()[:ep_size]).reshape(ep_size)
+    return Mesh(devices, (axis_name,), axis_types=(AxisType.Explicit,))
+
+
 @contextmanager
 def mesh_rules_for(tp_size: int, fsdp_size: int, dp_size: int) -> Iterator[Mesh]:
     """Resolve a mesh and activate mesh + logical axis rules for a scoped block."""
