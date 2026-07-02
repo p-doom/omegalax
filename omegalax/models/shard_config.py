@@ -9,6 +9,12 @@ ShardingSpec: TypeAlias = PartitionSpec
 # Logical axis names for parameter sharding, mapped to device mesh axes.
 # Used with nnx.logical_axis_rules() so model code can annotate with semantic names.
 # Tuple of (logical_name, device_axis_name); None = replicated.
+#
+# Physical placement (see omegalax.distributed.mesh): the mesh axes are laid out
+# hierarchically -- "tp" (and part of "fsdp") ride the intra-node NVLink domain
+# (ICI), while "dp" (and any "fsdp" spill) ride the inter-node data-center
+# network (DCN). The axis *names* below are unchanged; only device placement is
+# topology-aware, so these rules and all downstream NamedShardings are unaffected.
 DEFAULT_AXIS_RULES: tuple[tuple[str, str | None], ...] = (
     ("batch", ("dp", "fsdp")),
     ("vocab", "tp"),
