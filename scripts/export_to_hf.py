@@ -32,6 +32,7 @@ from flax import nnx
 from omegalax import export as export_lib
 from omegalax import registry
 from omegalax.distributed.mesh import ensure_mesh, mesh_rules
+from omegalax.distributed.xla_flags import configure_gpu_xla_flags
 from omegalax.vlm import api as vlm_api
 
 FLAGS = flags.FLAGS
@@ -71,6 +72,13 @@ flags.DEFINE_integer("num_steps", 200000, "LR-schedule total steps (not saved)."
 flags.DEFINE_string("lr_schedule", "wsd", "LR schedule kind (not saved).")
 flags.DEFINE_float("lr_stable_fraction", 0.9, "LR-schedule stable fraction (not saved).")
 flags.DEFINE_float("lr_end_factor", 0.0, "LR-schedule end factor (not saved).")
+flags.DEFINE_bool(
+    "gpu_xla_perf_flags",
+    True,
+    "Enable GPU XLA comm/compute-overlap (latency-hiding) flags. No-op on CPU/TPU. "
+    "Set to false (or export OMEGALAX_DISABLE_XLA_PERF_FLAGS=1) to disable; "
+    "any user-set XLA_FLAGS are preserved and take precedence regardless.",
+)
 
 
 def _load_text_model():
@@ -222,7 +230,13 @@ def _restore_trained_weights(model, cfg, checkpoint_path: Path):
 
 
 def main(_) -> None:
+    # Install GPU comm/compute-overlap XLA flags BEFORE any jax backend is created
+    # (i.e. before jax.distributed.initialize()); XLA reads XLA_FLAGS lazily at backend
+    # init, so this must run first. No-op on CPU/TPU and preserves user XLA_FLAGS.
+    applied_xla_flags = configure_gpu_xla_flags(enable=FLAGS.gpu_xla_perf_flags)
     jax.distributed.initialize()
+    if applied_xla_flags is not None and jax.process_index() == 0:
+        print(f"XLA_FLAGS={applied_xla_flags}")
     model, cfg = load_model()
     if FLAGS.checkpoint_path:
         ckpt = Path(FLAGS.checkpoint_path).expanduser()
