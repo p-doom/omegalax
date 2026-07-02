@@ -209,6 +209,7 @@ class Qwen3(nnx.Module):
         )
         self.out_emb_shd = cfg.shd_cfg.act_btd
         self.logits_shd = P(cfg.shd_cfg.act_btd[0], None, None)
+        self.cfg = cfg
         self.layers = nnx.List(
             [DecoderLayer(cfg=cfg, layer_idx=i, rngs=rngs) for i in range(cfg.num_layers)]
         )
@@ -225,11 +226,23 @@ class Qwen3(nnx.Module):
 
     def __call__(self, token_ids_BT, segment_ids_BT, cache, num_right_pads):
         del num_right_pads
-        aux_losses = []
         hidden_BTD = jnp.astype(
             self.embedder.embedding[...].at[(token_ids_BT,)].get(out_sharding=self.out_emb_shd),
             self.embedder.dtype,
         )
+
+        # Scan path: only for the training/eval forward pass (cache is None) and
+        # homogeneous layer stacks. Decode (cache is not None) and heterogeneous
+        # (mixed dense/MoE) stacks stay on the unrolled loop below.
+        if cache is None and self.cfg.scan_layers and self.cfg.is_homogeneous:
+            hidden_BTD, total_aux = _scan_layers(list(self.layers), hidden_BTD, segment_ids_BT)
+            hidden_BTD = self.final_norm(hidden_BTD)
+            return hidden_BTD, total_aux
+
+        aux_losses = []
+        # Unrolled fallback. Each layer self-remats inside DecoderLayer.__call__
+        # with cfg.remat_policy, so we call it directly (no extra nnx.remat here):
+        # a single, policy-honoring remat level shared with the scan path below.
         for i, layer in enumerate(self.layers):
             layer_cache = None if cache is None else cache[i]
             hidden_BTD, aux = layer(hidden_BTD, layer_cache, segment_ids_BT)
@@ -239,3 +252,43 @@ class Qwen3(nnx.Module):
             jnp.sum(jnp.stack(aux_losses)) if aux_losses else jnp.array(0.0, dtype=jnp.float32)
         )
         return hidden_BTD, total_aux
+
+
+def _scan_layers(
+    layers: list[DecoderLayer], hidden_BTD: jax.Array, segment_ids_BT: jax.Array
+) -> tuple[jax.Array, jax.Array]:
+    """Run homogeneous decoder layers with a single ``nnx.scan`` layer body.
+
+    Stacks each layer's state along a new leading layer axis (replicated, i.e.
+    not in the mesh) and scans over it. The per-layer parameter sharding is
+    preserved because we stack the already-annotated per-layer states; only the
+    leading layer axis is added and it carries no partition spec. Activation
+    checkpointing is NOT applied here: the merged layer self-remats inside
+    ``DecoderLayer.__call__`` with ``cfg.remat_policy``, giving a single,
+    policy-honoring remat level shared with the unrolled path (no double remat).
+    Per-layer aux losses are collected as a scanned output (ys) and summed after
+    the scan, reproducing the unrolled sum.
+
+    ``nnx.scan`` requires the carry dtype to be invariant across the loop. The
+    qwen3/qwen3.5 MoE block returns its output in fp32 (its top-k combine weights
+    ride ``probs`` in fp32), so under a bf16 config a layer can promote the hidden
+    stream bf16 -> fp32; the unrolled Python loop tolerates that drift but a scan
+    carry cannot. We therefore cast the per-step output hidden back to the input
+    carry dtype so the carry type is stable. This is a no-op for fp32 configs (so
+    the scan-vs-unrolled equivalence tests, which use fp32, are unaffected) and a
+    single bf16 round of the residual stream otherwise.
+    """
+    carry_dtype = hidden_BTD.dtype
+    graphdef, _ = nnx.split(layers[0])
+    states = [nnx.split(layer)[1] for layer in layers]
+    stacked_state = jax.tree.map(lambda *xs: jnp.stack(xs, axis=0), *states)
+
+    @nnx.scan(in_axes=(0, nnx.Carry, None), out_axes=(nnx.Carry, 0))
+    def run(layer_state, carry_BTD, seg_BT):
+        layer = nnx.merge(graphdef, layer_state)
+        out_BTD, aux = layer(carry_BTD, None, seg_BT)
+        return out_BTD.astype(carry_dtype), aux
+
+    hidden_BTD, aux_L = run(stacked_state, hidden_BTD, segment_ids_BT)
+    total_aux = jnp.sum(aux_L)
+    return hidden_BTD, total_aux

@@ -46,6 +46,11 @@ class Qwen3Config:
     # Activation checkpointing (rematerialization) policy for decoder layers.
     # See omegalax.models.remat_policy for the name -> policy mapping.
     remat_policy: str = DEFAULT_REMAT_POLICY
+    # Stack homogeneous decoder layers along a leading layer axis and run them
+    # with ``nnx.scan`` (single compiled layer body). Falls back to the unrolled
+    # Python loop automatically for heterogeneous stacks and for the decode
+    # (cache is not None) path. When False, always uses the unrolled loop.
+    scan_layers: bool = True
 
     shd_cfg: ShardConfig = dataclasses.field(default_factory=ShardConfig.default)
     dtype: Any = jnp.bfloat16
@@ -53,6 +58,20 @@ class Qwen3Config:
     @property
     def is_moe(self) -> bool:
         return self.num_experts > 0
+
+    @property
+    def is_homogeneous(self) -> bool:
+        """True when every decoder layer has the same parameter pytree structure.
+
+        Dense models are always homogeneous. MoE models are homogeneous only
+        when the sparse/dense split is uniform across all layers, i.e. every
+        layer is a MoE layer (no ``mlp_only_layers`` and ``decoder_sparse_step``
+        selects all layers). Mixed dense/MoE stacks cannot be stacked into a
+        single ``nnx.scan`` because their MLP params differ.
+        """
+        if not self.is_moe:
+            return True
+        return all(self.is_moe_layer(i) for i in range(self.num_layers))
 
     @property
     def variant(self) -> str:

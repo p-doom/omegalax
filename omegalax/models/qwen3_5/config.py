@@ -69,12 +69,56 @@ class Qwen3_5TextConfig:
     moe_backend: str = "dense"
     # Activation checkpointing policy for decoder layers (see remat_policy.py).
     remat_policy: str = DEFAULT_REMAT_POLICY
+    # Stack homogeneous decoder layers and run them with ``nnx.scan``. Qwen3.5
+    # is HYBRID (linear vs full attention interleaved), so ``is_homogeneous`` is
+    # almost always False and the model stays on the unrolled loop; the flag is
+    # kept for API parity and to enable scan for hypothetical homogeneous stacks.
+    scan_layers: bool = True
     shd_cfg: ShardConfig = dataclasses.field(default_factory=ShardConfig.default)
     dtype: Any = jnp.bfloat16
 
     @property
     def is_moe(self) -> bool:
         return self.num_experts > 0
+
+    @property
+    def is_homogeneous(self) -> bool:
+        """True when every decoder layer has the same parameter pytree structure.
+
+        Qwen3.5 interleaves ``linear_attention`` (Gated DeltaNet) and
+        ``full_attention`` layers, which have DIFFERENT parameter structures and
+        therefore cannot be stacked into a single ``nnx.scan``. Homogeneous only
+        when every layer shares the same ``layer_type``.
+        """
+        return len(set(self.layer_types)) <= 1
+
+    @property
+    def scan_block_period(self) -> int | None:
+        """Smallest period ``p`` such that ``layer_types`` is a repeating block of
+        length ``p`` tiled ``num_hidden_layers // p`` times, else ``None``.
+
+        Qwen3.5's hybrid stack (e.g. ``[linear, linear, linear, full]`` repeated)
+        is scanned as a repeating BLOCK over ``num_blocks = num_layers // p``
+        (MaxText Gemma3 "scannable block" pattern): each of the ``p`` positions is
+        homogeneous across blocks and its params are stacked along the block axis;
+        the scan body applies the ``p`` positions in order. Returns ``None`` when
+        the pattern is irregular or ``num_layers`` is not divisible by any period,
+        forcing the unrolled fallback.
+        """
+        n = len(self.layer_types)
+        if n == 0:
+            return None
+        if n != self.num_hidden_layers:
+            return None
+        # A homogeneous stack has period 1 (handled by the plain single-stack scan
+        # via is_homogeneous); still report 1 for completeness.
+        for p in range(1, n + 1):
+            if n % p != 0:
+                continue
+            block = self.layer_types[:p]
+            if all(self.layer_types[i] == block[i % p] for i in range(n)):
+                return p
+        return None
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
