@@ -7,7 +7,7 @@ import jax.numpy as jnp
 from flax import nnx
 from jax.sharding import PartitionSpec as P, reshard
 from omegalax.models.moe_grouped import grouped_moe, grouped_moe_ep
-from omegalax.models.remat_policy import resolve_remat_policy
+from omegalax.models.remat_policy import resolve_remat_policy, tag_offload_residual
 from .attention import Attention
 from .config import Qwen3Config
 from .norms import RMSNorm
@@ -208,6 +208,10 @@ class DecoderLayer(nnx.Module):
             self.mlp = MLP(cfg=cfg, rngs=rngs)
 
         self._remat_policy = resolve_remat_policy(cfg.remat_policy)
+        # Kept for the name-based activation-offload policy, which tags the
+        # residual stream so it can be offloaded to host (no-op for every other
+        # policy). Stored as a static string so the graphdef stays stable.
+        self._remat_policy_name = cfg.remat_policy
 
     def __call__(self, hidden_BTD: jax.Array, cache, segment_ids_BT: jax.Array,
                  position_ids_BT: jax.Array | None = None):
@@ -229,7 +233,11 @@ class DecoderLayer(nnx.Module):
         else:
             ff_out_BTD = self.mlp(post_norm_BTD)
             aux_loss = jnp.array(0.0, dtype=jnp.float32)
-        return attn_out_BTD + ff_out_BTD, aux_loss
+        # Tag the layer's output residual for the name-based offload policy.
+        # Identity (strict no-op) under every other policy; skipped entirely so
+        # the traced jaxpr is unchanged from trunk when offload is off.
+        out_BTD = tag_offload_residual(attn_out_BTD + ff_out_BTD, self._remat_policy_name)
+        return out_BTD, aux_loss
 
 
 class Qwen3(nnx.Module):

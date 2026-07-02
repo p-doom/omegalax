@@ -23,6 +23,7 @@ from omegalax.text import api as text_api
 from omegalax.trainers import checkpoint_utils
 from omegalax.trainers.loss import chunked_cross_entropy_loss
 from omegalax.trainers.lr_schedule import build_lr_schedule
+from omegalax.trainers.offload import resolve_offload_enabled
 from omegalax.trainers.optim import MixedPrecisionOptimizer
 from omegalax.trainers.perf import (
     maybe_log_step_metrics,
@@ -56,6 +57,13 @@ class TrainConfig:
     max_grad_norm: float = 0.0
     grad_accum_steps: int = 1
     print_every: int = 1
+    # Host/CPU offload of the fp32 optimizer moments (Adam mu/nu) between steps.
+    # ``False`` (default) is a strict no-op; ``True`` forces it on any platform
+    # (transfer-bound on PCIe A100/H100 — mechanism, not payoff); ``"auto"``
+    # enables it only on a coherent-host platform (GH200). See
+    # omegalax.trainers.offload. Activation offload is configured separately via
+    # the model config's ``remat_policy`` (an ``"offload*"`` policy name).
+    offload_optimizer: bool | str = False
 
 
 def init_model(
@@ -88,6 +96,13 @@ def build_optimizer(model: nnx.Module, train_cfg: TrainConfig) -> MixedPrecision
     if train_cfg.grad_accum_steps > 1:
         tx = optax.MultiSteps(tx, every_k_schedule=train_cfg.grad_accum_steps)
     opt = MixedPrecisionOptimizer(model, tx)
+    # Resolve host-offload of optimizer state. "auto" enables it only on a
+    # coherent-host platform (GH200); explicit True/False is honored verbatim.
+    # Applied BEFORE any checkpoint restore so restored shardings (which carry
+    # memory_kind) match the host-resident state. Default False -> strict no-op.
+    if resolve_offload_enabled(train_cfg.offload_optimizer):
+        opt.enable_state_offload()
+        startup_log("optimizer-state host offload ENABLED (moments on pinned_host)")
     return opt
 
 
@@ -156,7 +171,14 @@ def _restore_sft_checkpoint(
     restore_args = checkpoint_utils.make_grain_restore_args(abstract_state, input_iter)
     restored = checkpoint_manager.restore(latest_step, args=restore_args)
     train_state = restored["train_state"]
+    was_offloaded = optimizer.offload_optimizer_state
     nnx.update(optimizer, train_state["optimizer"])
+    # Orbax restores the opt_state onto ``device`` (it repopulates shardings from
+    # the sharding file, dropping the ``pinned_host`` memory kind), so re-apply
+    # the host placement after restore to keep the moments off HBM. Idempotent;
+    # re-captures the device shardings from the restored on-device state.
+    if was_offloaded:
+        optimizer.enable_state_offload()
     return (
         optimizer,
         int(latest_step),
