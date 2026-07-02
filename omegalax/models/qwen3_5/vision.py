@@ -5,8 +5,6 @@ rotary position embeddings, spatial merge, and bilinear position
 embedding interpolation.
 """
 
-from functools import partial
-
 import jax
 import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P, reshard
@@ -17,6 +15,7 @@ from jax._src.cudnn.fused_attention_stablehlo import (
     dot_product_attention as _cudnn_dot_product_attention,
 )
 
+from omegalax.models.remat_policy import resolve_remat_policy
 from omegalax.models.shard_config import ShardConfig
 from .config import Qwen3_5VisionConfig
 from .norms import LayerNorm
@@ -230,8 +229,18 @@ class VisionBlock(nnx.Module):
         self.mlp = VisionMLP(cfg, hidden_shd=hidden_shd, ff_shd=ff_shd, rngs=rngs)
         self.hidden_shd = hidden_shd
 
-    @partial(jax.remat, static_argnums=0)
+        self._remat_policy = resolve_remat_policy(cfg.remat_policy)
+
     def __call__(self, hidden_ND, cu_seqlens, cos_NK, sin_NK):
+        # Inline nnx.remat on the UNBOUND method (no static_argnums): nnx
+        # functionalizes ``self`` via split/merge, so it must not be static.
+        # Building the transform inline keeps graphdefs equal across fresh
+        # instances (stable hash -> one trace, not one per instance).
+        return nnx.remat(type(self)._impl, policy=self._remat_policy)(
+            self, hidden_ND, cu_seqlens, cos_NK, sin_NK
+        )
+
+    def _impl(self, hidden_ND, cu_seqlens, cos_NK, sin_NK):
         hidden_ND = hidden_ND + self.attn(self.norm1(hidden_ND), cu_seqlens, cos_NK, sin_NK)
         hidden_ND = hidden_ND + self.mlp(self.norm2(hidden_ND))
         return hidden_ND

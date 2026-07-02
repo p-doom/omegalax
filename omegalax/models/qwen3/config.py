@@ -9,6 +9,7 @@ import jax.numpy as jnp
 from etils import epath
 
 from omegalax.models.params_utils import load_hf_config_from_source
+from omegalax.models.remat_policy import DEFAULT_REMAT_POLICY
 from omegalax.models.shard_config import ShardConfig
 
 
@@ -37,6 +38,10 @@ class Qwen3Config:
     decoder_sparse_step: int = 1
     norm_topk_prob: bool = True
     aux_loss_coef: float = 0.0
+
+    # Activation checkpointing (rematerialization) policy for decoder layers.
+    # See omegalax.models.remat_policy for the name -> policy mapping.
+    remat_policy: str = DEFAULT_REMAT_POLICY
 
     shd_cfg: ShardConfig = dataclasses.field(default_factory=ShardConfig.default)
     dtype: Any = jnp.bfloat16
