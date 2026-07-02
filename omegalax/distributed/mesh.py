@@ -2,11 +2,13 @@
 
 Topology-aware device placement
 ================================
-The device mesh keeps the logical axis names ``('tp', 'fsdp', 'dp')`` (ordered
-comm-heaviest-first) so that :mod:`omegalax.models.shard_config`,
+The device mesh keeps the logical axis names ``('tp', 'cp', 'fsdp', 'dp')``
+(ordered comm-heaviest-first) so that :mod:`omegalax.models.shard_config`,
 :mod:`omegalax.distributed.sharding_runtime`, :func:`ensure_mesh` validation and
 Orbax ``NamedSharding`` are all unaffected. Only the *physical device
-placement* underneath those axis names changes.
+placement* underneath those axis names changes. ``cp`` is context / sequence
+parallelism (the per-layer all-gather-KV attention path); it rides the NVLink
+domain next to ``tp`` and is a strict no-op when ``cp_size == 1``.
 
 On GPU, ``jax.make_mesh`` -> ``mesh_utils.create_device_mesh`` takes a plain
 row-major reshape (topology-aware reordering is TPU-only). Because
@@ -56,49 +58,67 @@ from omegalax.models.shard_config import axis_rules_for_mesh
 
 logger = logging.getLogger(__name__)
 
-_AXES = ("tp", "fsdp", "dp")
+# Axis order is comm-heaviest-first. ``cp`` (context / sequence parallelism)
+# sits next to ``tp``: both ride the intra-node NVLink domain (ICI) because the
+# per-layer CP all-gather-KV collective is comm-heavy (like the TP all-reduce),
+# so it must stay off the data-center network. ``cp_size == 1`` is a strict
+# no-op: the size-1 axis is dropped from every partition spec by
+# :func:`omegalax.models.shard_config._filter_axis`, so all pre-CP behavior
+# (and every existing test) is unchanged.
+_AXES = ("tp", "cp", "fsdp", "dp")
 
-# A per-axis-type parallelism triple, always in comm-heaviest-first order
-# matching ``_AXES``: (tp, fsdp, dp).
-Triple = tuple[int, int, int]
+# A per-axis-type parallelism quadruple, always in comm-heaviest-first order
+# matching ``_AXES``: (tp, cp, fsdp, dp).
+Quad = tuple[int, int, int, int]
+
+# Backwards-compatible alias (some callers may still refer to a "triple").
+Triple = Quad
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class ParallelismConfig:
     """Explicit ICI/DCN parallelism degrees, comm-heaviest-first per axis type.
 
-    The six degrees fully specify the hierarchical mesh. ``ici_*`` degrees ride
+    The eight degrees fully specify the hierarchical mesh. ``ici_*`` degrees ride
     the NVLink domain (one node); ``dcn_*`` degrees ride the data-center network
-    (across nodes). The legacy three-arg interface (``tp_size``, ``fsdp_size``,
-    ``dp_size``) is derived into this via :func:`derive_ici_dcn`; callers may
-    also pass an explicit :class:`ParallelismConfig` to override the split.
+    (across nodes). The legacy four-arg interface (``tp_size``, ``cp_size``,
+    ``fsdp_size``, ``dp_size``) is derived into this via :func:`derive_ici_dcn`;
+    callers may also pass an explicit :class:`ParallelismConfig` to override the
+    split.
 
     Invariants (checked by :func:`make_hierarchical_mesh`):
-      * ``ici_tp * ici_fsdp * ici_dp == local_device_count``
-      * ``dcn_tp * dcn_fsdp * dcn_dp == num_processes``
+      * ``ici_tp * ici_cp * ici_fsdp * ici_dp == local_device_count``
+      * ``dcn_tp * dcn_cp * dcn_fsdp * dcn_dp == num_processes``
       * per-type products (``tp = ici_tp * dcn_tp`` etc.) equal the legacy sizes,
-        preserving ``tp * fsdp * dp == device_count`` (see :func:`_resolve_mesh_shape`)
-        and the data-pipeline invariant ``dp = dp_size * fsdp_size``.
+        preserving ``tp * cp * fsdp * dp == device_count`` (see
+        :func:`_resolve_mesh_shape`) and the data-pipeline invariant
+        ``dp = dp_size * fsdp_size``.
     """
 
     ici_tp: int
+    ici_cp: int
     ici_fsdp: int
     ici_dp: int
     dcn_tp: int
+    dcn_cp: int
     dcn_fsdp: int
     dcn_dp: int
 
     @property
-    def ici_shape(self) -> Triple:
-        return (self.ici_tp, self.ici_fsdp, self.ici_dp)
+    def ici_shape(self) -> Quad:
+        return (self.ici_tp, self.ici_cp, self.ici_fsdp, self.ici_dp)
 
     @property
-    def dcn_shape(self) -> Triple:
-        return (self.dcn_tp, self.dcn_fsdp, self.dcn_dp)
+    def dcn_shape(self) -> Quad:
+        return (self.dcn_tp, self.dcn_cp, self.dcn_fsdp, self.dcn_dp)
 
     @property
     def tp_size(self) -> int:
         return self.ici_tp * self.dcn_tp
+
+    @property
+    def cp_size(self) -> int:
+        return self.ici_cp * self.dcn_cp
 
     @property
     def fsdp_size(self) -> int:
@@ -119,17 +139,20 @@ def num_processes() -> int:
     return jax.process_count()
 
 
-def _resolve_mesh_shape(tp_size: int, fsdp_size: int, dp_size: int) -> tuple[int, int, int]:
+def _resolve_mesh_shape(
+    tp_size: int, cp_size: int, fsdp_size: int, dp_size: int
+) -> tuple[int, int, int, int]:
     ndev = jax.device_count()
-    if tp_size <= 0 or fsdp_size <= 0 or dp_size <= 0:
+    if tp_size <= 0 or cp_size <= 0 or fsdp_size <= 0 or dp_size <= 0:
         raise ValueError(
-            f"Mesh axes must be > 0, got tp={tp_size}, fsdp={fsdp_size}, dp={dp_size}."
+            f"Mesh axes must be > 0, got tp={tp_size}, cp={cp_size}, fsdp={fsdp_size}, dp={dp_size}."
         )
-    if tp_size * fsdp_size * dp_size != ndev:
+    if tp_size * cp_size * fsdp_size * dp_size != ndev:
         raise ValueError(
-            f"Mesh shape ({tp_size}, {fsdp_size}, {dp_size}) does not match device_count={ndev}."
+            f"Mesh shape (tp={tp_size}, cp={cp_size}, fsdp={fsdp_size}, dp={dp_size}) "
+            f"does not match device_count={ndev}."
         )
-    return tp_size, fsdp_size, dp_size
+    return tp_size, cp_size, fsdp_size, dp_size
 
 
 def derive_ici_dcn(
@@ -138,35 +161,44 @@ def derive_ici_dcn(
     dp_size: int,
     local_device_count: int,
     num_processes: int,
+    cp_size: int = 1,
 ) -> ParallelismConfig:
-    """Map legacy (tp, fsdp, dp) sizes onto a hierarchical ICI/DCN split.
+    """Map legacy (tp, cp, fsdp, dp) sizes onto a hierarchical ICI/DCN split.
 
     MaxText-style capacity-filling placement. The ICI domain (one node, size
     ``local_device_count``) is filled in comm-heaviest-first priority order --
-    TP, then FSDP, then DP -- and whatever does not fit spills to the DCN
-    (``num_processes`` granules). Concretely:
+    TP, then CP, then FSDP, then DP -- and whatever does not fit spills to the
+    DCN (``num_processes`` granules). Concretely:
 
     * **TP -> ICI only.** ``ici_tp = tp_size``, ``dcn_tp = 1``. TP is the
       comm-heaviest collective and MUST fit inside the NVLink domain, so we
       require ``tp_size <= local_device_count`` and
       ``local_device_count % tp_size == 0`` (the correctness guardrail).
+    * **CP -> ICI only.** ``ici_cp = cp_size``, ``dcn_cp = 1``. Context
+      parallelism's per-layer all-gather-KV collective is comm-heavy, so CP
+      rides NVLink alongside TP. Guardrail: ``tp_size * cp_size <=
+      local_device_count`` and ``local_device_count % (tp_size * cp_size) == 0``
+      -- the TP*CP block must tile the NVLink domain evenly. ``cp_size == 1`` is
+      a strict no-op (``ici_cp == dcn_cp == 1``; the size-1 axis is dropped
+      downstream), so all pre-CP layouts are unchanged.
     * **FSDP fills the rest of the node first, then spills to DCN.**
-      ``ici_fsdp = min(fsdp_size, local_device_count // ici_tp)``;
+      ``ici_fsdp = min(fsdp_size, local_device_count // (ici_tp*ici_cp))``;
       ``dcn_fsdp = fsdp_size // ici_fsdp`` (must divide evenly).
-    * **DP fills any node room left after TP+FSDP, then spills to DCN.** In the
-      multi-node target case a full node is already consumed by TP (+FSDP), so
-      DP lands entirely in the DCN (``dcn_dp = dp_size``, ``ici_dp = 1``) -- the
-      intended layout that keeps the DP all-reduce off NVLink and the TP
-      collective on it. On a *single node* (``num_processes == 1``) there is no
+    * **DP fills any node room left after TP+CP+FSDP, then spills to DCN.** In
+      the multi-node target case a full node is already consumed by TP (+CP
+      +FSDP), so DP lands entirely in the DCN (``dcn_dp = dp_size``,
+      ``ici_dp = 1``). On a *single node* (``num_processes == 1``) there is no
       DCN, so DP (and FSDP) must fit inside the ICI; this branch handles that so
       single-node runs keep working unchanged.
 
     Pure function (no JAX calls); ``local_device_count`` and ``num_processes``
-    are passed in so it is unit-testable on CPU.
+    are passed in so it is unit-testable on CPU. ``cp_size`` is keyword-optional
+    and defaults to 1 to preserve the legacy 5-positional-arg call sites.
     """
-    if tp_size <= 0 or fsdp_size <= 0 or dp_size <= 0:
+    if tp_size <= 0 or cp_size <= 0 or fsdp_size <= 0 or dp_size <= 0:
         raise ValueError(
-            f"Parallelism sizes must be > 0, got tp={tp_size}, fsdp={fsdp_size}, dp={dp_size}."
+            f"Parallelism sizes must be > 0, got tp={tp_size}, cp={cp_size}, "
+            f"fsdp={fsdp_size}, dp={dp_size}."
         )
     if local_device_count <= 0 or num_processes <= 0:
         raise ValueError(
@@ -174,82 +206,90 @@ def derive_ici_dcn(
             f"local_device_count={local_device_count}, num_processes={num_processes}."
         )
 
-    # TP -> ICI only. Guardrail: TP must fit within the NVLink domain.
-    if tp_size > local_device_count:
+    # TP+CP -> ICI only. Guardrail: the TP*CP block must fit within the NVLink
+    # domain (both are comm-heavy per-layer collectives).
+    tpcp = tp_size * cp_size
+    if tpcp > local_device_count:
         raise ValueError(
-            f"tp_size={tp_size} exceeds local_device_count={local_device_count}: "
-            "tensor-parallel groups must fit within a single NVLink domain (node). "
-            "Reduce tp_size or use fewer/larger axes so that TP <= GPUs-per-node."
+            f"tp_size*cp_size={tpcp} (tp={tp_size}, cp={cp_size}) exceeds "
+            f"local_device_count={local_device_count}: tensor- and context-parallel groups "
+            "must jointly fit within a single NVLink domain (node). "
+            "Reduce tp_size/cp_size so that TP*CP <= GPUs-per-node."
         )
-    if local_device_count % tp_size != 0:
+    if local_device_count % tpcp != 0:
         raise ValueError(
-            f"local_device_count={local_device_count} is not divisible by tp_size={tp_size}; "
-            "TP must tile the NVLink domain evenly."
+            f"local_device_count={local_device_count} is not divisible by tp_size*cp_size={tpcp} "
+            f"(tp={tp_size}, cp={cp_size}); TP*CP must tile the NVLink domain evenly."
         )
     ici_tp, dcn_tp = tp_size, 1
+    ici_cp, dcn_cp = cp_size, 1
 
     # FSDP fills the remaining GPUs of the node first, then spills to DCN.
-    ici_slots = local_device_count // ici_tp
+    ici_slots = local_device_count // (ici_tp * ici_cp)
     ici_fsdp = min(fsdp_size, ici_slots)
     if fsdp_size % ici_fsdp != 0:
         raise ValueError(
             f"fsdp_size={fsdp_size} is not divisible by its intra-node share "
-            f"ici_fsdp={ici_fsdp} (local_device_count={local_device_count}, tp_size={tp_size}); "
-            "FSDP must split evenly between the NVLink domain and the data-center network."
+            f"ici_fsdp={ici_fsdp} (local_device_count={local_device_count}, tp_size={tp_size}, "
+            f"cp_size={cp_size}); FSDP must split evenly between the NVLink domain and the "
+            "data-center network."
         )
     dcn_fsdp = fsdp_size // ici_fsdp
 
     # DP fills any leftover node room (only nonzero once FSDP did NOT spill, i.e.
-    # dcn_fsdp == 1), then spills to DCN. In the multi-node target case TP(+FSDP)
-    # already fill the node so ici_dp == 1 and DP is DCN-only.
-    ici_slots_left = ici_slots // ici_fsdp  # == local_device_count // (ici_tp*ici_fsdp)
+    # dcn_fsdp == 1), then spills to DCN. In the multi-node target case TP(+CP
+    # +FSDP) already fill the node so ici_dp == 1 and DP is DCN-only.
+    ici_slots_left = ici_slots // ici_fsdp  # == ldc // (ici_tp*ici_cp*ici_fsdp)
     ici_dp = min(dp_size, ici_slots_left)
     if dp_size % ici_dp != 0:
         raise ValueError(
             f"dp_size={dp_size} is not divisible by its intra-node share "
             f"ici_dp={ici_dp} (local_device_count={local_device_count}, tp_size={tp_size}, "
-            f"fsdp_size={fsdp_size}); DP must split evenly between the NVLink domain and the "
-            "data-center network."
+            f"cp_size={cp_size}, fsdp_size={fsdp_size}); DP must split evenly between the "
+            "NVLink domain and the data-center network."
         )
     dcn_dp = dp_size // ici_dp
 
     cfg = ParallelismConfig(
         ici_tp=ici_tp,
+        ici_cp=ici_cp,
         ici_fsdp=ici_fsdp,
         ici_dp=ici_dp,
         dcn_tp=dcn_tp,
+        dcn_cp=dcn_cp,
         dcn_fsdp=dcn_fsdp,
         dcn_dp=dcn_dp,
     )
 
     # ICI axes must exactly tile one node; DCN axes must exactly tile the nodes.
-    ici_prod = ici_tp * ici_fsdp * ici_dp
-    dcn_prod = dcn_tp * dcn_fsdp * dcn_dp
+    ici_prod = ici_tp * ici_cp * ici_fsdp * ici_dp
+    dcn_prod = dcn_tp * dcn_cp * dcn_fsdp * dcn_dp
     if ici_prod != local_device_count:
         raise ValueError(
             f"ICI shape {cfg.ici_shape} product {ici_prod} != local_device_count="
-            f"{local_device_count}. Requested (tp={tp_size}, fsdp={fsdp_size}, dp={dp_size}) "
-            "cannot be laid out with one process per node; the intra-node axes "
-            "(tp * fsdp-share) do not fill the NVLink domain exactly."
+            f"{local_device_count}. Requested (tp={tp_size}, cp={cp_size}, fsdp={fsdp_size}, "
+            f"dp={dp_size}) cannot be laid out with one process per node; the intra-node axes "
+            "(tp * cp * fsdp-share) do not fill the NVLink domain exactly."
         )
     if dcn_prod != num_processes:
         raise ValueError(
             f"DCN shape {cfg.dcn_shape} product {dcn_prod} != num_processes="
-            f"{num_processes}. Requested (tp={tp_size}, fsdp={fsdp_size}, dp={dp_size}) "
-            "cannot be laid out across the available nodes; the inter-node axes "
+            f"{num_processes}. Requested (tp={tp_size}, cp={cp_size}, fsdp={fsdp_size}, "
+            f"dp={dp_size}) cannot be laid out across the available nodes; the inter-node axes "
             "(fsdp-spill * dp) do not tile the node count exactly."
         )
-    # Per-type products preserved -> tp*fsdp*dp and dp=dp_size*fsdp_size unchanged.
+    # Per-type products preserved -> tp*cp*fsdp*dp and dp=dp_size*fsdp_size unchanged.
     assert cfg.tp_size == tp_size
+    assert cfg.cp_size == cp_size
     assert cfg.fsdp_size == fsdp_size
     assert cfg.dp_size == dp_size
     return cfg
 
 
 def make_hierarchical_mesh(ici_shape: Sequence[int], dcn_shape: Sequence[int]) -> Mesh:
-    """Build a topology-aware ``('tp', 'fsdp', 'dp')`` mesh.
+    """Build a topology-aware ``('tp', 'cp', 'fsdp', 'dp')`` mesh.
 
-    ``ici_shape`` and ``dcn_shape`` are ``(tp, fsdp, dp)`` triples in
+    ``ici_shape`` and ``dcn_shape`` are ``(tp, cp, fsdp, dp)`` quadruples in
     comm-heaviest-first order. ICI axes ride the NVLink domain (one node); DCN
     axes ride the data-center network (across nodes).
 
@@ -264,9 +304,9 @@ def make_hierarchical_mesh(ici_shape: Sequence[int], dcn_shape: Sequence[int]) -
     """
     ici_shape = tuple(int(x) for x in ici_shape)
     dcn_shape = tuple(int(x) for x in dcn_shape)
-    if len(ici_shape) != 3 or len(dcn_shape) != 3:
+    if len(ici_shape) != len(_AXES) or len(dcn_shape) != len(_AXES):
         raise ValueError(
-            f"ici_shape and dcn_shape must be (tp, fsdp, dp) triples, got "
+            f"ici_shape and dcn_shape must be (tp, cp, fsdp, dp) quadruples, got "
             f"ici_shape={ici_shape}, dcn_shape={dcn_shape}."
         )
 
@@ -351,30 +391,41 @@ def make_mesh(
     fsdp_size: int,
     dp_size: int,
     *,
+    cp_size: int = 1,
     parallelism: ParallelismConfig | None = None,
 ) -> Mesh:
-    """Build a topology-aware ``('tp', 'fsdp', 'dp')`` mesh.
+    """Build a topology-aware ``('tp', 'cp', 'fsdp', 'dp')`` mesh.
 
-    Public 3-arg interface preserved: given legacy (tp, fsdp, dp) sizes, the
-    ICI/DCN split is derived via :func:`derive_ici_dcn` and materialized with
-    :func:`make_hierarchical_mesh`. Callers may optionally pass an explicit
-    :class:`ParallelismConfig` via ``parallelism`` to override the split; when
-    given, its per-type products must match the three sizes.
+    Public interface: given (tp, fsdp, dp) sizes plus an optional ``cp_size``
+    (context parallelism, default 1 == no-op), the ICI/DCN split is derived via
+    :func:`derive_ici_dcn` and materialized with :func:`make_hierarchical_mesh`.
+    Callers may optionally pass an explicit :class:`ParallelismConfig` via
+    ``parallelism`` to override the split; when given, its per-type products must
+    match the four sizes.
     """
-    tp, fsdp, dp = _resolve_mesh_shape(tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size)
+    tp, cp, fsdp, dp = _resolve_mesh_shape(
+        tp_size=tp_size, cp_size=cp_size, fsdp_size=fsdp_size, dp_size=dp_size
+    )
     if parallelism is None:
         parallelism = derive_ici_dcn(
             tp_size=tp,
+            cp_size=cp,
             fsdp_size=fsdp,
             dp_size=dp,
             local_device_count=local_device_count(),
             num_processes=num_processes(),
         )
-    elif (parallelism.tp_size, parallelism.fsdp_size, parallelism.dp_size) != (tp, fsdp, dp):
+    elif (parallelism.tp_size, parallelism.cp_size, parallelism.fsdp_size, parallelism.dp_size) != (
+        tp,
+        cp,
+        fsdp,
+        dp,
+    ):
         raise ValueError(
             f"Explicit ParallelismConfig per-type products "
-            f"(tp={parallelism.tp_size}, fsdp={parallelism.fsdp_size}, dp={parallelism.dp_size}) "
-            f"conflict with requested sizes (tp={tp}, fsdp={fsdp}, dp={dp})."
+            f"(tp={parallelism.tp_size}, cp={parallelism.cp_size}, "
+            f"fsdp={parallelism.fsdp_size}, dp={parallelism.dp_size}) "
+            f"conflict with requested sizes (tp={tp}, cp={cp}, fsdp={fsdp}, dp={dp})."
         )
     return make_hierarchical_mesh(parallelism.ici_shape, parallelism.dcn_shape)
 
@@ -384,10 +435,15 @@ def set_default_mesh(
     fsdp_size: int,
     dp_size: int,
     *,
+    cp_size: int = 1,
     parallelism: ParallelismConfig | None = None,
 ) -> Mesh:
     mesh = make_mesh(
-        tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size, parallelism=parallelism
+        tp_size=tp_size,
+        fsdp_size=fsdp_size,
+        dp_size=dp_size,
+        cp_size=cp_size,
+        parallelism=parallelism,
     )
     jax.set_mesh(mesh)
     return mesh
@@ -398,15 +454,16 @@ def ensure_mesh(
     fsdp_size: int | None = None,
     dp_size: int | None = None,
     *,
+    cp_size: int = 1,
     parallelism: ParallelismConfig | None = None,
 ) -> Mesh:
     current_mesh = get_mesh()
     abstract_mesh = get_abstract_mesh()
     has_active_mesh = not abstract_mesh.empty
-    has_active_3axis_mesh = has_active_mesh and tuple(abstract_mesh.axis_names) == _AXES
+    has_active_cp_mesh = has_active_mesh and tuple(abstract_mesh.axis_names) == _AXES
 
     if tp_size is None and fsdp_size is None and dp_size is None:
-        if has_active_3axis_mesh:
+        if has_active_cp_mesh:
             return current_mesh
         if has_active_mesh:
             raise ValueError(
@@ -422,14 +479,21 @@ def ensure_mesh(
             f"No active {_AXES} mesh found. Please provide tp_size, fsdp_size, and dp_size explicitly."
         )
 
-    if has_active_3axis_mesh:
+    if has_active_cp_mesh:
         active_tp = int(abstract_mesh.shape["tp"])
+        active_cp = int(abstract_mesh.shape["cp"])
         active_fsdp = int(abstract_mesh.shape["fsdp"])
         active_dp = int(abstract_mesh.shape["dp"])
-        if tp_size != active_tp or fsdp_size != active_fsdp or dp_size != active_dp:
+        if (
+            tp_size != active_tp
+            or cp_size != active_cp
+            or fsdp_size != active_fsdp
+            or dp_size != active_dp
+        ):
             raise ValueError(
-                f"Requested mesh ({tp_size}, {fsdp_size}, {dp_size}) conflicts with active mesh "
-                f"({active_tp}, {active_fsdp}, {active_dp}). Refusing to override active mesh."
+                f"Requested mesh (tp={tp_size}, cp={cp_size}, fsdp={fsdp_size}, dp={dp_size}) "
+                f"conflicts with active mesh (tp={active_tp}, cp={active_cp}, "
+                f"fsdp={active_fsdp}, dp={active_dp}). Refusing to override active mesh."
             )
         return current_mesh
 
@@ -440,7 +504,7 @@ def ensure_mesh(
         )
 
     return set_default_mesh(
-        tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size, parallelism=parallelism
+        tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size, cp_size=cp_size, parallelism=parallelism
     )
 
 
@@ -454,27 +518,29 @@ def mesh_rules(mesh: Mesh) -> Iterator[Mesh]:
 # --- Expert parallelism (MoE grouped-GEMM + ragged all-to-all) ---------------
 # Dedicated 1-D ``('expert',)`` mesh for the expert-parallel MoE path (consumed by
 # omegalax.models.moe_grouped.grouped_moe_ep), deliberately SEPARATE from the flat
-# ``('tp', 'fsdp', 'dp')`` hierarchical training mesh built above.
+# ``('tp', 'cp', 'fsdp', 'dp')`` hierarchical training mesh built above.
 #
-# MERGE RECONCILIATION (feat/moe-ep-grouped-gemm x feat/topology-aware-mesh):
+# MERGE RECONCILIATION (feat/moe-ep-grouped-gemm x feat/topology-aware-mesh x
+# feat/context-parallelism):
 # The moe-ep branch's original MERGE NOTE suggested folding ``'expert'`` into the
-# unified mesh factory / axis rules. That fold was evaluated and deliberately NOT
-# done, because it would be semantically wrong here:
+# unified mesh factory / axis rules. That fold is STILL deliberately NOT done,
+# and the reasoning is unchanged by adding ``'cp'``:
 #   * The topology-aware factory (make_mesh/make_hierarchical_mesh) is a fixed
-#     3-axis ``_AXES = ('tp','fsdp','dp')`` design whose ICI/DCN invariants
-#     (ici_tp*ici_fsdp*ici_dp == local_device_count, the ensure_mesh _AXES
-#     equality check, and all of test_topology_mesh) assume exactly those 3 axes.
-#     Adding a 4th ``'expert'`` axis to _AXES/ParallelismConfig would break those
-#     invariants and the topology test suite.
+#     ``_AXES = ('tp','cp','fsdp','dp')`` design whose ICI/DCN invariants
+#     (ici_tp*ici_cp*ici_fsdp*ici_dp == local_device_count, the ensure_mesh _AXES
+#     equality check, and all of test_topology_mesh) assume exactly those axes.
+#     ``'cp'`` was added here because context parallelism COMPOSES with tp/fsdp/dp
+#     inside a single training forward pass (the per-layer CP all-gather-KV rides
+#     the same mesh as the TP collective). ``'expert'`` does NOT compose that way:
 #   * grouped_moe_ep does not COMPOSE expert parallelism with the training mesh:
 #     it reads a standalone ``'expert'`` axis off the active abstract mesh and runs
-#     its own shard_map. No caller in-tree wires EP into the (tp,fsdp,dp) mesh.
+#     its own shard_map. No caller in-tree wires EP into the (tp,cp,fsdp,dp) mesh.
 # So ``make_expert_mesh`` is kept as a separate helper, made CONSISTENT with the
 # hierarchical factory: it builds its device grid via ``mesh_utils.create_device_mesh``
 # (same primitive make_hierarchical_mesh uses) and stamps ``AxisType.Explicit``
 # (matching _AXES's axis types) rather than hand-rolling a numpy reshape + bare Mesh.
 # A future unified expert+training mesh (composing 'expert' onto the ICI domain
-# alongside 'tp') is left for later, when a caller actually needs the composition.
+# alongside 'tp'/'cp') is left for later, when a caller actually needs the composition.
 _EXPERT_AXIS = "expert"
 
 
@@ -502,8 +568,10 @@ def make_expert_mesh(ep_size: int, axis_name: str = _EXPERT_AXIS) -> Mesh:
 
 
 @contextmanager
-def mesh_rules_for(tp_size: int, fsdp_size: int, dp_size: int) -> Iterator[Mesh]:
+def mesh_rules_for(
+    tp_size: int, fsdp_size: int, dp_size: int, *, cp_size: int = 1
+) -> Iterator[Mesh]:
     """Resolve a mesh and activate mesh + logical axis rules for a scoped block."""
-    mesh = ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size)
+    mesh = ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size, cp_size=cp_size)
     with mesh_rules(mesh):
         yield mesh

@@ -502,9 +502,17 @@ class Qwen3_5ForCausalLM(nnx.Module):
             kernel_init=wp(lm_head_init, ("embed", "vocab")),
         )
 
-    def __call__(self, token_ids_BT, segment_ids_BT, cache, num_right_pads):
+    def __call__(self, token_ids_BT, segment_ids_BT, cache, num_right_pads,
+                 position_ids_BT=None):
         del cache, num_right_pads
-        return self.text(token_ids_BT=token_ids_BT, segment_ids_BT=segment_ids_BT)
+        # position_ids_BT (used for zig-zag CP) carries each token's ORIGINAL
+        # index; broadcast the 1-D text positions across the 3 MRoPE sections.
+        position_ids_ZBT = None if position_ids_BT is None else position_ids_BT
+        return self.text(
+            token_ids_BT=token_ids_BT,
+            segment_ids_BT=segment_ids_BT,
+            position_ids_ZBT=position_ids_ZBT,
+        )
 
 
 # VLM

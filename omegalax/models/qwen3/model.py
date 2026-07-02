@@ -209,18 +209,20 @@ class DecoderLayer(nnx.Module):
 
         self._remat_policy = resolve_remat_policy(cfg.remat_policy)
 
-    def __call__(self, hidden_BTD: jax.Array, cache, segment_ids_BT: jax.Array):
+    def __call__(self, hidden_BTD: jax.Array, cache, segment_ids_BT: jax.Array,
+                 position_ids_BT: jax.Array | None = None):
         # Inline nnx.remat on the UNBOUND method (no static_argnums): nnx
         # functionalizes ``self`` via split/merge, so it must not be static.
         # Building the transform inline keeps graphdefs equal across fresh
         # instances (stable hash -> one trace, not one per instance).
         return nnx.remat(type(self)._impl, policy=self._remat_policy)(
-            self, hidden_BTD, cache, segment_ids_BT
+            self, hidden_BTD, cache, segment_ids_BT, position_ids_BT
         )
 
-    def _impl(self, hidden_BTD: jax.Array, cache, segment_ids_BT: jax.Array):
+    def _impl(self, hidden_BTD: jax.Array, cache, segment_ids_BT: jax.Array,
+              position_ids_BT: jax.Array | None = None):
         normed_BTD = self.input_layernorm(hidden_BTD)
-        attn_out_BTD = hidden_BTD + self.attn(normed_BTD, cache, segment_ids_BT)
+        attn_out_BTD = hidden_BTD + self.attn(normed_BTD, cache, segment_ids_BT, position_ids_BT)
         post_norm_BTD = self.post_attention_layernorm(attn_out_BTD)
         if self.is_moe:
             ff_out_BTD, aux_loss = self.mlp(post_norm_BTD)
@@ -259,7 +261,8 @@ class Qwen3(nnx.Module):
             kernel_init=wp(lm_head_init, ("embed", "vocab")),
         )
 
-    def __call__(self, token_ids_BT, segment_ids_BT, cache, num_right_pads):
+    def __call__(self, token_ids_BT, segment_ids_BT, cache, num_right_pads,
+                 position_ids_BT=None):
         del num_right_pads
         hidden_BTD = jnp.astype(
             self.embedder.embedding[...].at[(token_ids_BT,)].get(out_sharding=self.out_emb_shd),
@@ -268,9 +271,12 @@ class Qwen3(nnx.Module):
 
         # Scan path: only for the training/eval forward pass (cache is None) and
         # homogeneous layer stacks. Decode (cache is not None) and heterogeneous
-        # (mixed dense/MoE) stacks stay on the unrolled loop below.
+        # (mixed dense/MoE) stacks stay on the unrolled loop below. ``position_ids``
+        # (used only for zig-zag CP) is broadcast to every layer.
         if cache is None and self.cfg.scan_layers and self.cfg.is_homogeneous:
-            hidden_BTD, total_aux = _scan_layers(list(self.layers), hidden_BTD, segment_ids_BT)
+            hidden_BTD, total_aux = _scan_layers(
+                list(self.layers), hidden_BTD, segment_ids_BT, position_ids_BT
+            )
             hidden_BTD = self.final_norm(hidden_BTD)
             return hidden_BTD, total_aux
 
@@ -280,7 +286,7 @@ class Qwen3(nnx.Module):
         # a single, policy-honoring remat level shared with the scan path below.
         for i, layer in enumerate(self.layers):
             layer_cache = None if cache is None else cache[i]
-            hidden_BTD, aux = layer(hidden_BTD, layer_cache, segment_ids_BT)
+            hidden_BTD, aux = layer(hidden_BTD, layer_cache, segment_ids_BT, position_ids_BT)
             aux_losses.append(aux)
         hidden_BTD = self.final_norm(hidden_BTD)
         total_aux = (
@@ -290,7 +296,8 @@ class Qwen3(nnx.Module):
 
 
 def _scan_layers(
-    layers: list[DecoderLayer], hidden_BTD: jax.Array, segment_ids_BT: jax.Array
+    layers: list[DecoderLayer], hidden_BTD: jax.Array, segment_ids_BT: jax.Array,
+    position_ids_BT: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Run homogeneous decoder layers with a single ``nnx.scan`` layer body.
 
@@ -318,12 +325,12 @@ def _scan_layers(
     states = [nnx.split(layer)[1] for layer in layers]
     stacked_state = jax.tree.map(lambda *xs: jnp.stack(xs, axis=0), *states)
 
-    @nnx.scan(in_axes=(0, nnx.Carry, None), out_axes=(nnx.Carry, 0))
-    def run(layer_state, carry_BTD, seg_BT):
+    @nnx.scan(in_axes=(0, nnx.Carry, None, None), out_axes=(nnx.Carry, 0))
+    def run(layer_state, carry_BTD, seg_BT, pos_BT):
         layer = nnx.merge(graphdef, layer_state)
-        out_BTD, aux = layer(carry_BTD, None, seg_BT)
+        out_BTD, aux = layer(carry_BTD, None, seg_BT, pos_BT)
         return out_BTD.astype(carry_dtype), aux
 
-    hidden_BTD, aux_L = run(stacked_state, hidden_BTD, segment_ids_BT)
+    hidden_BTD, aux_L = run(stacked_state, hidden_BTD, segment_ids_BT, position_ids_BT)
     total_aux = jnp.sum(aux_L)
     return hidden_BTD, total_aux

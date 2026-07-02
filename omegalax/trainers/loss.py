@@ -15,6 +15,41 @@ import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
 
 
+def shift_for_next_token(
+    token_ids_BT: jax.Array,
+    loss_mask_BT: jax.Array,
+    pad_id: int = 0,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Shift-BEFORE-shard next-token alignment for context parallelism.
+
+    The next-token loss pairs hidden state at position ``t`` with target token at
+    position ``t+1``. That shift crosses shard boundaries once the token (T) axis
+    is sequence-sharded on ``cp``, so under CP it must be applied on the FULL
+    sequence *before* sharding (see :mod:`omegalax.distributed.mesh`), producing
+    per-position-aligned arrays where each rank then holds a self-contained
+    ``(inputs_local, targets_local, mask_local)`` slice.
+
+    Returns arrays of the SAME ``(B, T)`` length as the input (no length change,
+    so the T axis stays evenly cp-divisible):
+
+      * ``inputs_BT``  = ``token_ids_BT`` (fed to the model as-is),
+      * ``targets_BT`` = ``token_ids`` rolled left by one (``target[t] =
+        token[t+1]``); the last position wraps and is masked out,
+      * ``loss_mask_BT`` = ``loss_mask`` rolled left by one, with the final
+        position forced to 0 (no valid next token). This reproduces the
+        ``mask[:, 1:]`` supervised-token count of the non-CP internal shift.
+
+    The paired ``(inputs[t], targets[t], mask[t])`` are position-aligned, so the
+    CP loss consumes them WITHOUT any further (cross-shard) shift.
+    """
+    del pad_id  # masking is driven by loss_mask, not pad_id, matching the trainer.
+    targets_BT = jnp.roll(token_ids_BT, shift=-1, axis=1)
+    mask_shifted_BT = jnp.roll(loss_mask_BT, shift=-1, axis=1)
+    # Final position has no next token: force its mask to 0.
+    mask_shifted_BT = mask_shifted_BT.at[:, -1].set(0)
+    return token_ids_BT, targets_BT, mask_shifted_BT
+
+
 def _cross_entropy_with_logits(
     logits_NV: jax.Array,
     targets_N: jax.Array,
@@ -42,6 +77,9 @@ def chunked_cross_entropy_loss(
     mask_BT: jax.Array,
     num_tiles: int = 8,
     logits_out_sharding: P | None = None,
+    *,
+    shift: bool = True,
+    cp_axis: str | None = None,
 ) -> jax.Array:
     """Memory-efficient cross-entropy that never materializes the full logit tensor.
 
@@ -56,20 +94,49 @@ def chunked_cross_entropy_loss(
         mask_BT: Loss mask, shape ``(B, T)``, int32/float32.
         num_tiles: Number of tiles to split B*T into. Higher = less memory.
             Must evenly divide ``B * T``.
+        shift: If True (default, non-CP path), apply the next-token shift INSIDE
+            the loss (``hidden[:, :-1]`` vs ``targets[:, 1:]``) -- the historical
+            behavior, byte-for-byte unchanged. If False, ``hidden``/``targets``/
+            ``mask`` are already position-aligned (``target[t]`` predicted from
+            ``hidden[t]``); no internal shift is applied. Context parallelism uses
+            ``shift=False`` because the +1 shift crosses cp shard boundaries and
+            must be applied shift-BEFORE-shard (see :func:`shift_for_next_token`).
+        cp_axis: If set, the token (T) axis is sequence-sharded on this mesh axis
+            (context parallelism). Under CP the ``(loss_sum, mask_sum)`` reduction
+            is over the sequence axis, which is GLOBAL across ``cp_axis``: this
+            loss runs in the outer JIT under an Explicit-sharding mesh, where
+            ``jnp.sum`` over a cp-sharded axis already inserts the all-reduce (a
+            manual ``psum`` would double-count), so the resulting mean is over the
+            whole sequence and the padding/normalization is global. Passing
+            ``cp_axis`` also disables the within-sequence vocab tiling (the tiling
+            reshape would resplit the cp-sharded T axis), which is a pure
+            memory/perf knob orthogonal to CP correctness. ``None`` (default)
+            leaves everything unchanged.
 
     Returns:
         Scalar masked mean cross-entropy loss.
     """
     B, T, D = hidden_BTD.shape
 
-    # For next-token prediction: predict position t from hidden at t-1.
-    # Keep B separate (may be FSDP-sharded). Tile only within each sequence.
-    hidden_BTD = hidden_BTD[:, :-1, :]
-    targets_BT = targets_BT[:, 1:]
-    mask_BT = mask_BT[:, 1:]
-    T1 = T - 1
+    if shift:
+        # For next-token prediction: predict position t from hidden at t-1.
+        # Keep B separate (may be FSDP-sharded). Tile only within each sequence.
+        # NOTE: this cross-shard slice is only valid when T is NOT cp-sharded;
+        # under CP the caller passes shift=False with shift-before-shard arrays.
+        hidden_BTD = hidden_BTD[:, :-1, :]
+        targets_BT = targets_BT[:, 1:]
+        mask_BT = mask_BT[:, 1:]
+        T1 = T - 1
+    else:
+        # Position-aligned: hidden[t] predicts targets[t]. No length change, so
+        # the T axis stays evenly cp-divisible.
+        T1 = T
 
-    if num_tiles <= 1 or T1 < num_tiles:
+    # Under CP, ``loss_sum``/``mask_sum`` sum over the cp-sharded sequence axis;
+    # in Explicit-sharding mode that sum is ALREADY a global all-reduce across cp,
+    # so ``loss_sum / mask_sum`` is the correct global mean with NO manual psum.
+    # We also skip vocab tiling under CP (its reshape would resplit the sharded T).
+    if cp_axis is not None or num_tiles <= 1 or T1 < num_tiles:
         logits_BTV = jnp.einsum(
             "BTD,DV->BTV", hidden_BTD, lm_head_kernel_DV, out_sharding=logits_out_sharding
         )

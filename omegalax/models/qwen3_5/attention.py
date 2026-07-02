@@ -13,6 +13,7 @@ from flax import nnx
 from jax.sharding import PartitionSpec
 from tokamax import dot_product_attention
 
+from omegalax.attention import context_parallel_attention
 from .config import Qwen3_5TextConfig
 from .norms import RMSNorm
 from .rope import apply_text_rope
@@ -77,6 +78,11 @@ class Attention(nnx.Module):
         object.__setattr__(self, "_q_sharding_spec", P(*cfg.shd_cfg.act_btnh))
         object.__setattr__(self, "_attn_backend", "mosaic_gpu")
         object.__setattr__(self, "_attn_kind", "text")
+        # When True and running under CP, apply the block-diagonal document mask
+        # (segment_ids) so packed multi-doc sequences don't attend across a
+        # document boundary. Default False keeps CP causal-only == the non-CP
+        # tokamax path (the CP equivalence bar). Toggle via set_cp_document_mask.
+        object.__setattr__(self, "_cp_document_mask", False)
 
     @jax.named_scope("attention")
     def __call__(
@@ -116,15 +122,40 @@ class Attention(nnx.Module):
 
         q_BTHK, k_BTGK = apply_text_rope(q_BTHK, k_BTGK, cos_BTK, sin_BTK)
 
-        attn_BTHK = dot_product_attention(
-            q_BTHK,
-            k_BTGK,
-            v_BTGK,
-            is_causal=True,
-            scale=self.scale,
-            implementation=self._attn_backend,
-            q_sharding=self._q_sharding,
-        )
+        # Context parallelism: when the sequence (T) axis is sharded on "cp"
+        # (cp_size > 1), tokamax cannot do seq-sharded KV, so we run the
+        # all-gather-KV shard_map path (RoPE above is positionwise, so shard-local
+        # cos/sin from seq-sharded position_ids are already correct -- no change).
+        # Otherwise fall back to the existing (TP head-sharded) tokamax path.
+        cp_axis = heads_shd[1]
+        mesh = jax.sharding.get_abstract_mesh()
+        if cp_axis is not None and mesh.shape[cp_axis] > 1:
+            # position_ids_BT carries the GLOBAL/original positions (permuted under
+            # zig-zag), so the causal mask is layout-agnostic. segment_ids_BT adds
+            # the block-diagonal document mask (no cross-document attention).
+            seq_spec = P(heads_shd[0], cp_axis)
+            attn_BTHK = context_parallel_attention(
+                q_BTHK,
+                k_BTGK,
+                v_BTGK,
+                position_ids_BT,
+                cp_axis=cp_axis,
+                scale=self.scale,
+                heads_spec=P(*heads_shd),
+                seq_spec=seq_spec,
+                q_segment_ids_BT=segment_ids_BT if self._cp_document_mask else None,
+                implementation=self._attn_backend,
+            )
+        else:
+            attn_BTHK = dot_product_attention(
+                q_BTHK,
+                k_BTGK,
+                v_BTGK,
+                is_causal=True,
+                scale=self.scale,
+                implementation=self._attn_backend,
+                q_sharding=self._q_sharding,
+            )
         attn_out_BTD = jax.lax.reshape(
             attn_BTHK, (B, T, self.num_heads * self.head_dim), out_sharding=self.shd_cfg.act_btf
         )
