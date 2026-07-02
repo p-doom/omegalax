@@ -496,9 +496,12 @@ class Qwen3VL(nnx.Module):
                 pixel_values, image_grid_thw, vision_cu_seqlens
             )
 
-        embedding_VD = jnp.astype(self.text.embedder.embedding[...], self.text.embedder.dtype)
-        embedding_VD = reshard(embedding_VD, P())
-        inputs_embeds_BTD = embedding_VD.at[(token_ids_BT,)].get(out_sharding=self.text.out_emb_shd)
+        inputs_embeds_BTD = jnp.astype(
+            self.text.embedder.embedding[...]
+            .at[(token_ids_BT,)]
+            .get(out_sharding=self.text.out_emb_shd),
+            self.text.embedder.dtype,
+        )
 
         if image_features_ND is not None:
             image_mask_BT = token_ids_BT == cfg.image_token_id
