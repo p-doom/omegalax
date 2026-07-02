@@ -46,6 +46,8 @@ over the ``E`` axis), i.e. ~fp epsilon, identical in fp32.
 
 from __future__ import annotations
 
+import os
+
 import jax
 import jax.numpy as jnp
 
@@ -55,6 +57,12 @@ try:  # tokamax is the GPU-perf grouped-GEMM path; it falls back to XLA on CPU.
     _HAS_TOKAMAX = True
 except Exception:  # pragma: no cover - tokamax always installed in this repo
     _HAS_TOKAMAX = False
+
+# Force fp32 accumulation inside the grouped GEMM (see _ragged_dot docstring).
+# Default ON: required for a finite bf16 backward through tokamax's ragged_dot VJP.
+# Escape hatch ``OMEGALAX_MOE_F32_ACC=0`` restores raw-dtype accumulation (unstable
+# in bf16 backward) — kept only for debugging / A-B numerical comparison.
+_F32_ACC = os.environ.get("OMEGALAX_MOE_F32_ACC", "1") != "0"
 
 
 def _unshard(x):
@@ -120,12 +128,26 @@ def _ragged_dot(lhs, rhs, group_sizes, primitive: str, *, group_offset=None):
     contiguous block of experts as ``rhs`` of size ``E/EP`` and calls ragged_dot
     with the default offset over its local experts, so no GPU group_offset is
     required.
+
+    NUMERICAL STABILITY (bf16 backward): tokamax's ``PallasTritonRaggedDot`` VJP is
+    numerically unstable in bf16 (its backward can produce NaN in the down_proj
+    expert gradient under realistic bf16 + split-rng training, even though the
+    forward is finite). We therefore force **fp32 accumulation**: cast ``lhs``/``rhs``
+    to fp32, run the grouped GEMM in fp32 (so both the forward matmul and the VJP
+    differentiate an fp32 op), then cast the output back to the inputs' dtype. This
+    is the standard matmul-stability pattern; it costs a modest amount of extra
+    arithmetic but keeps the k/E FLOP win (no extra experts are computed). The int
+    ``group_sizes`` are untouched.
     """
+    out_dtype = jnp.result_type(lhs, rhs)
+    if _F32_ACC:
+        lhs = lhs.astype(jnp.float32)
+        rhs = rhs.astype(jnp.float32)
     if primitive == "tokamax" and _HAS_TOKAMAX:
-        return tokamax.ragged_dot(
-            lhs, rhs, group_sizes, group_offset=group_offset
-        )
-    return jax.lax.ragged_dot(lhs, rhs, group_sizes, group_offset=group_offset)
+        out = tokamax.ragged_dot(lhs, rhs, group_sizes, group_offset=group_offset)
+    else:
+        out = jax.lax.ragged_dot(lhs, rhs, group_sizes, group_offset=group_offset)
+    return out.astype(out_dtype)
 
 
 # ``jax.lax.ragged_all_to_all`` lowers to an HLO that XLA:CPU does not implement
