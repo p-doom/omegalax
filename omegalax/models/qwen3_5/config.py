@@ -74,6 +74,11 @@ class Qwen3_5TextConfig:
     # almost always False and the model stays on the unrolled loop; the flag is
     # kept for API parity and to enable scan for hypothetical homogeneous stacks.
     scan_layers: bool = True
+    # fp8 training (Hopper-only; strict no-op on A100/CPU). ``fp8`` is the master
+    # gate (default off); ``fp8_recipe`` selects the qwix recipe ("off",
+    # "e4m3_dynamic", "blockwise_128"). See ``omegalax.quant.detect.fp8_active``.
+    fp8: bool = False
+    fp8_recipe: str = "e4m3_dynamic"
     shd_cfg: ShardConfig = dataclasses.field(default_factory=ShardConfig.default)
     dtype: Any = jnp.bfloat16
 
@@ -139,6 +144,16 @@ class Qwen3_5Config:
         go through ``text_config.shd_cfg`` (e.g., ``align_config_to_mesh``).
         """
         return self.text_config.shd_cfg
+
+    @property
+    def fp8(self) -> bool:
+        """Top-level fp8 gate view = the text decoder's ``fp8`` (see text_config)."""
+        return self.text_config.fp8
+
+    @property
+    def fp8_recipe(self) -> str:
+        """Top-level fp8 recipe view = the text decoder's ``fp8_recipe``."""
+        return self.text_config.fp8_recipe
 
 
 _SMOKE_VISION = {
@@ -350,6 +365,9 @@ def make_config_from_hf(hf_cfg: dict[str, Any]) -> Qwen3_5Config:
         "linear_num_key_heads": _required(txt, "linear_num_key_heads", "hf_cfg['text_config']"),
         "linear_num_value_heads": _required(txt, "linear_num_value_heads", "hf_cfg['text_config']"),
         "linear_value_head_dim": _required(txt, "linear_value_head_dim", "hf_cfg['text_config']"),
+        # fp8 training knob (omegalax-side, additive, default off).
+        "fp8": bool(txt.get("fp8", hf_cfg.get("fp8", False))),
+        "fp8_recipe": str(txt.get("fp8_recipe", hf_cfg.get("fp8_recipe", "e4m3_dynamic"))),
         "dtype": text_dtype,
     }
 
