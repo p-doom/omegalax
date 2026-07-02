@@ -71,8 +71,21 @@ class GatedDeltaNet(nnx.Module):
         init = nnx.initializers.lecun_normal()
 
         in_proj_init = wp(init, ("embed", "mlp"))
-        self.in_proj_qkv = nnx.Linear(
-            D, conv_dim, use_bias=False, rngs=rngs, dtype=cfg.dtype, kernel_init=in_proj_init
+        # q/k/v are projected separately (rather than as one fused ``in_proj_qkv``)
+        # so each projection can emit its output already head-sharded on ``tp``
+        # (via a free ``act_btf`` -> ``act_btnh`` reshape). A single fused
+        # projection would tp-shard the concatenated ``conv_dim`` contiguously,
+        # forcing collective-permute reshards when it is split into per-head
+        # q/k/v. The fused HF ``in_proj_qkv`` checkpoint weight is sliced into
+        # these three kernels at load time (loader ``_handle_linear_attn_specials``).
+        self.in_proj_q = nnx.Linear(
+            D, self.key_dim, use_bias=False, rngs=rngs, dtype=cfg.dtype, kernel_init=in_proj_init
+        )
+        self.in_proj_k = nnx.Linear(
+            D, self.key_dim, use_bias=False, rngs=rngs, dtype=cfg.dtype, kernel_init=in_proj_init
+        )
+        self.in_proj_v = nnx.Linear(
+            D, self.value_dim, use_bias=False, rngs=rngs, dtype=cfg.dtype, kernel_init=in_proj_init
         )
         self.in_proj_z = nnx.Linear(
             D, self.value_dim, use_bias=False, rngs=rngs, dtype=cfg.dtype, kernel_init=in_proj_init
@@ -84,9 +97,21 @@ class GatedDeltaNet(nnx.Module):
             D, self.num_v_heads, use_bias=False, rngs=rngs, dtype=cfg.dtype, kernel_init=in_proj_init
         )
 
-        self.conv_weight = nnx.Param(
-            init(rngs.params(), (conv_dim, self.conv_kernel_size)),
-            sharding=(None, None),
+        # Depthwise conv weights, one contiguous slice of the fused conv kernel
+        # per q/k/v segment. The channel axis is tp-sharded so it lines up with
+        # the head-sharded activations (channels are laid out head-major, so a
+        # contiguous tp split of the channel axis is exactly a head tp split).
+        self.conv_weight_q = nnx.Param(
+            init(rngs.params(), (self.key_dim, self.conv_kernel_size)),
+            sharding=("mlp", None),
+        )
+        self.conv_weight_k = nnx.Param(
+            init(rngs.params(), (self.key_dim, self.conv_kernel_size)),
+            sharding=("mlp", None),
+        )
+        self.conv_weight_v = nnx.Param(
+            init(rngs.params(), (self.value_dim, self.conv_kernel_size)),
+            sharding=("mlp", None),
         )
 
         self.dt_bias = nnx.Param(jnp.ones(self.num_v_heads), sharding=(None,))
@@ -133,7 +158,37 @@ class GatedDeltaNet(nnx.Module):
         batch_axis = heads_shd[0]
         head_axis = heads_shd[2]
         beta_g_shd = P(batch_axis, None, head_axis)
-        mixed_qkv_BCT = self.in_proj_qkv(hidden_BTD, out_sharding=self.shd_cfg.act_btf).transpose(0, 2, 1)
+
+        def _proj_conv_heads(proj, conv_w, n_heads, head_dim):
+            """Project → reshape to head-sharded → silu(depthwise causal conv1d).
+
+            The projection emits ``act_btf`` (feature = heads·head_dim, tp-sharded);
+            the reshape to ``act_btnh`` (heads on tp) is free because the tp shard of
+            the flat feature maps directly onto the head axis. The conv is per-channel
+            (depthwise), so it stays entirely shard-local — no reshard round-trip.
+            """
+            x_BTF = proj(hidden_BTD, out_sharding=self.shd_cfg.act_btf)
+            x_BTHc = jax.lax.reshape(
+                x_BTF, (B, T, n_heads, head_dim), out_sharding=heads_shd
+            )
+            x_BCT = x_BTHc.reshape(B, T, n_heads * head_dim).transpose(0, 2, 1)
+            x_BCT = _causal_depthwise_conv1d(x_BCT, conv_w[...].astype(x_BCT.dtype))
+            x_BCT = nnx.silu(x_BCT)
+            return jax.lax.reshape(
+                x_BCT.transpose(0, 2, 1),
+                (B, T, n_heads, head_dim),
+                out_sharding=heads_shd,
+            )
+
+        q_BTHA = _proj_conv_heads(
+            self.in_proj_q, self.conv_weight_q, self.num_k_heads, self.head_k_dim
+        )
+        k_BTHA = _proj_conv_heads(
+            self.in_proj_k, self.conv_weight_k, self.num_k_heads, self.head_k_dim
+        )
+        v_BTHU = _proj_conv_heads(
+            self.in_proj_v, self.conv_weight_v, self.num_v_heads, self.head_v_dim
+        )
         z_BTHU = jax.lax.reshape(
             self.in_proj_z(hidden_BTD, out_sharding=self.shd_cfg.act_btf),
             (B, T, self.num_v_heads, self.head_v_dim),
@@ -141,25 +196,6 @@ class GatedDeltaNet(nnx.Module):
         )
         b_BTH = self.in_proj_b(hidden_BTD, out_sharding=beta_g_shd)
         a_BTH = self.in_proj_a(hidden_BTD, out_sharding=beta_g_shd)
-
-        mixed_qkv_BCT = nnx.silu(_causal_depthwise_conv1d(mixed_qkv_BCT, self.conv_weight[...].astype(mixed_qkv_BCT.dtype)))
-        mixed_qkv_BTC = mixed_qkv_BCT.transpose(0, 2, 1)
-        q_BTP, k_BTP, v_BTO = jnp.split(mixed_qkv_BTC, [self.key_dim, self.key_dim * 2], axis=-1)
-        q_BTHA = jax.lax.reshape(
-            q_BTP,
-            (B, T, self.num_k_heads, self.head_k_dim),
-            out_sharding=heads_shd,
-        )
-        k_BTHA = jax.lax.reshape(
-            k_BTP,
-            (B, T, self.num_k_heads, self.head_k_dim),
-            out_sharding=heads_shd,
-        )
-        v_BTHU = jax.lax.reshape(
-            v_BTO,
-            (B, T, self.num_v_heads, self.head_v_dim),
-            out_sharding=heads_shd,
-        )
 
         from jax.experimental.shard_map import shard_map
         mesh = jax.sharding.get_abstract_mesh()
