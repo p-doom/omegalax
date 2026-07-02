@@ -349,6 +349,7 @@ class TextAttention(nnx.Module):
         )
         self.q_norm = RMSNorm(cfg.head_dim, cfg.norm_eps, rngs=rngs, sharding=(None,))
         self.k_norm = RMSNorm(cfg.head_dim, cfg.norm_eps, rngs=rngs, sharding=(None,))
+        self.dtype = cfg.dtype
         self.n_rep = cfg.num_heads // cfg.num_kv_heads
         self.scale = cfg.head_dim**-0.5
         self.head_dim = cfg.head_dim
@@ -386,17 +387,33 @@ class TextAttention(nnx.Module):
         q_BTHK = apply_rope(q_BTHK, sin_BTK, cos_BTK)
         k_BTGK = apply_rope(k_BTGK, sin_BTK, cos_BTK)
 
-        # force bfloat16 - tokamax attention only supports fp16/bf16
+        # The tokamax GPU attention kernels (mosaic_gpu/cudnn) only run in
+        # fp16/bf16, so a bf16 compute dtype must be cast to bf16 for them. In
+        # fp32 we must NOT silently downcast: route to the fp32-capable "xla"
+        # backend (pure-jax einsum+softmax) so an fp32-configured model actually
+        # runs attention in fp32. Any precision reduction is thus explicit and
+        # gated on the compute dtype rather than unconditional.
         attn_in_dtype = q_BTHK.dtype
-        attn_BTHK = dot_product_attention(
-            q_BTHK.astype(jnp.bfloat16),
-            k_BTGK.astype(jnp.bfloat16),
-            v_BTGK.astype(jnp.bfloat16),
-            is_causal=True,
-            scale=self.scale,
-            implementation=self._attn_backend,
-            q_sharding=self._q_sharding,
-        ).astype(attn_in_dtype)
+        if attn_in_dtype == jnp.float32:
+            attn_BTHK = dot_product_attention(
+                q_BTHK,
+                k_BTGK,
+                v_BTGK,
+                is_causal=True,
+                scale=self.scale,
+                implementation="xla",
+                q_sharding=self._q_sharding,
+            )
+        else:
+            attn_BTHK = dot_product_attention(
+                q_BTHK.astype(jnp.bfloat16),
+                k_BTGK.astype(jnp.bfloat16),
+                v_BTGK.astype(jnp.bfloat16),
+                is_causal=True,
+                scale=self.scale,
+                implementation=self._attn_backend,
+                q_sharding=self._q_sharding,
+            ).astype(attn_in_dtype)
         out_BTD = self.o_proj(
             jax.lax.reshape(
                 attn_BTHK, (B, T, self.num_heads * self.head_dim), out_sharding=self.shd_cfg.act_btf

@@ -18,6 +18,36 @@ from omegalax.models.shard_config import ShardConfig
 from .config import Qwen3VLVisionConfig
 
 
+def _xla_packed_vision_attention_local(
+    q_NHK: jax.Array,
+    k_NHK: jax.Array,
+    v_NHK: jax.Array,
+    cu_seqlens: jax.Array,
+    scale: float,
+) -> jax.Array:
+    """fp32-capable reference for packed vision attention.
+
+    cuDNN flash attention only runs in fp16/bf16/fp8, so an fp32 vision config
+    has no fp32 kernel available here. Rather than silently downcasting q/k/v to
+    bf16, fp32 is routed through this pure-jax einsum+softmax implementation so
+    the precision contract is honored. It builds a block-diagonal segment mask
+    from ``cu_seqlens`` (bidirectional attention within each image segment,
+    matching the cuDNN ``NO_MASK`` packed layout) and computes attention in the
+    input dtype with fp32 softmax accumulation.
+    """
+    N = q_NHK.shape[0]
+    cu = cu_seqlens.astype(jnp.int32)
+    # Per-token segment id, then a block-diagonal (same-segment) mask.
+    seg_id_N = jnp.searchsorted(cu[1:], jnp.arange(N, dtype=jnp.int32), side="right")
+    same_seg_NS = seg_id_N[:, None] == seg_id_N[None, :]
+
+    logits_HNS = jnp.einsum("nhk,shk->hns", q_NHK, k_NHK) * scale
+    mask_value = jnp.finfo(logits_HNS.dtype).min
+    logits_HNS = jnp.where(same_seg_NS[None], logits_HNS, mask_value)
+    weights_HNS = jax.nn.softmax(logits_HNS.astype(jnp.float32), axis=-1).astype(logits_HNS.dtype)
+    return jnp.einsum("hns,shk->nhk", weights_HNS, v_NHK)
+
+
 def _cudnn_packed_vision_attention_local(
     q_NHK: jax.Array,
     k_NHK: jax.Array,
@@ -26,6 +56,12 @@ def _cudnn_packed_vision_attention_local(
     seqlens: jax.Array,
     scale: float,
 ) -> jax.Array:
+    # No fp32 cuDNN flash kernel exists (fp16/bf16/fp8 only). In fp32, avoid a
+    # silent bf16 downcast by using the fp32-capable pure-jax reference; the
+    # bf16 cast below then only ever happens for a bf16/fp16 compute dtype.
+    if q_NHK.dtype == jnp.float32:
+        return _xla_packed_vision_attention_local(q_NHK, k_NHK, v_NHK, cu_seqlens, scale)
+
     cu = cu_seqlens.astype(jnp.int32)
     q_offsets = cu[None]
     kv_offsets = cu[None]
