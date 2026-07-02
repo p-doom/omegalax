@@ -36,6 +36,7 @@ from omegalax.trainers.perf import (
     per_device_flops_per_step,
     StepTimer,
 )
+from omegalax.trainers.offload import resolve_offload_enabled
 from omegalax.trainers.optim import MixedPrecisionOptimizer
 from omegalax.trainers.lora import LoRAParam, inject_lora
 from omegalax.trainers.text import startup_log
@@ -79,6 +80,13 @@ class TrainConfig:
     lora_alpha: float = 32.0
     freeze_vision_tower: bool = False
     num_loss_tiles: int = 4
+    # Host/CPU offload of the fp32 optimizer moments (Adam mu/nu) between steps.
+    # ``False`` (default) is a strict no-op; ``True`` forces it on any platform
+    # (transfer-bound on PCIe A100/H100 — mechanism, not payoff); ``"auto"``
+    # enables it only on a coherent-host platform (GH200). See
+    # omegalax.trainers.offload. Activation offload is configured separately via
+    # the model config's ``remat_policy`` (an ``"offload*"`` policy name).
+    offload_optimizer: bool | str = False
 
 
 def init_model(
@@ -115,6 +123,13 @@ def build_optimizer(
     if train_cfg.grad_accum_steps > 1:
         tx = optax.MultiSteps(tx, every_k_schedule=train_cfg.grad_accum_steps)
     opt = MixedPrecisionOptimizer(model, tx, wrt=wrt)
+    # Resolve host-offload of optimizer state. "auto" enables it only on a
+    # coherent-host platform (GH200); explicit True/False is honored verbatim.
+    # Applied BEFORE any checkpoint restore so restored shardings (which carry
+    # memory_kind) match the host-resident state. Default False -> strict no-op.
+    if resolve_offload_enabled(train_cfg.offload_optimizer):
+        opt.enable_state_offload()
+        startup_log("optimizer-state host offload ENABLED (moments on pinned_host)")
     return opt
 
 
