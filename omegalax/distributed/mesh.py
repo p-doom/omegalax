@@ -31,10 +31,12 @@ Assumptions (asserted / documented below):
   launched one-process-per-GPU, ``local_device_count == 1`` and the ICI domain
   collapses; :func:`make_hierarchical_mesh` warns in that case.
 * ``process_is_granule=True`` is **mandatory** on this GPU cluster: we launch
-  with a bare ``jax.distributed.initialize()`` (no ``JAX_PARTITION_INDEX``), so
-  every device reports a uniform ``slice_index`` and the slice-based granule
-  detection would collapse to a single granule. ``process_is_granule=True``
-  groups DCN granules by ``process_index`` (== node), keeping ICI axes on NVLink.
+  via :func:`omegalax.distributed.launch.init_distributed`, which for the
+  multi-node path calls ``jax.distributed.initialize()`` without a partition
+  index, so every device reports a uniform ``slice_index`` and the slice-based
+  granule detection would collapse to a single granule.
+  ``process_is_granule=True`` groups DCN granules by ``process_index`` (== node),
+  keeping ICI axes on NVLink.
 """
 
 from __future__ import annotations
@@ -313,7 +315,8 @@ def make_hierarchical_mesh(ici_shape: Sequence[int], dcn_shape: Sequence[int]) -
         return Mesh(device_grid, _AXES, axis_types=axis_types)
 
     # Multi node: hybrid ICI/DCN placement. process_is_granule=True is mandatory
-    # here (uniform slice_index under bare jax.distributed.initialize()).
+    # here (uniform slice_index under init_distributed()'s multi-node
+    # jax.distributed.initialize(), which sets no partition index).
     device_grid = mesh_utils.create_hybrid_device_mesh(
         ici_shape,
         dcn_shape,
