@@ -49,13 +49,40 @@ def chunk_gated_delta_rule(
     g_BTH,
     beta_BTH,
     chunk_size: int = 64,
+    state_init_BHAU=None,
+    return_final_state: bool = False,
 ):
-    """Dispatcher. Late-binds the backend so env-var changes take effect per process."""
+    """Dispatcher. Late-binds the backend so env-var changes take effect per process.
+
+    ``state_init_BHAU`` / ``return_final_state`` thread the context-parallelism
+    boundary state through either backend (see the kernel docstrings): a segment
+    can start from an incoming state ``S_in`` and return its outgoing state for
+    cross-rank chaining. Both default to the non-CP behavior (zeros / no extra
+    return).
+    """
     backend = _resolve_backend()
     if backend == "xla":
-        return chunk_gated_delta_rule_xla(q_BTHA, k_BTHA, v_BTHU, g_BTH, beta_BTH, chunk_size)
+        return chunk_gated_delta_rule_xla(
+            q_BTHA,
+            k_BTHA,
+            v_BTHU,
+            g_BTH,
+            beta_BTH,
+            chunk_size,
+            state_init_BHAU=state_init_BHAU,
+            return_final_state=return_final_state,
+        )
     if backend == "pallas":
         from .pallas_triton import chunk_gated_delta_rule_pallas
 
-        return chunk_gated_delta_rule_pallas(q_BTHA, k_BTHA, v_BTHU, g_BTH, beta_BTH, chunk_size)
+        return chunk_gated_delta_rule_pallas(
+            q_BTHA,
+            k_BTHA,
+            v_BTHU,
+            g_BTH,
+            beta_BTH,
+            chunk_size,
+            state_init_BHAU=state_init_BHAU,
+            return_final_state=return_final_state,
+        )
     raise ValueError(f"Unknown OMEGALAX_DELTANET_KERNEL={backend!r}. Use 'xla' or 'pallas'.")

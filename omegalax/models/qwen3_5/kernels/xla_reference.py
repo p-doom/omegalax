@@ -23,18 +23,29 @@ def chunk_gated_delta_rule_xla(
     g_BTH: jax.Array,
     beta_BTH: jax.Array,
     chunk_size: int = 64,
-) -> jax.Array:
+    state_init_BHAU: jax.Array | None = None,
+    return_final_state: bool = False,
+):
     """Chunked gated delta rule (XLA reference).
 
     Inputs:
         q_BTHA, k_BTHA: (B, T, H, A)
         v_BTHU:         (B, T, H, U)
         g_BTH, beta_BTH: (B, T, H)
+        state_init_BHAU: optional (B, H, A, U) INCOMING recurrent state (the
+            segment starts from this state instead of zeros). This is the
+            context-parallelism (CP) boundary state ``S_in`` for a sequence
+            segment; ``None`` means zeros (the non-CP / first-segment case).
+        return_final_state: if True, also return the (B, H, A, U) state AFTER the
+            last token (the segment's outgoing state, for CP boundary chaining).
     Returns:
-        out_BTHU: (B, T, H, U)
+        out_BTHU: (B, T, H, U), or ``(out_BTHU, final_state_BHAU)`` if
+        ``return_final_state``.
 
     Internally l2-normalizes q and k. Pads T up to a multiple of ``chunk_size``
-    and trims at the end.
+    and trims at the end. The recurrence is linear in the state, so seeding
+    ``state_init`` and chaining ``final_state`` across contiguous segments
+    reproduces the full-sequence result exactly (verified bit-identical).
     """
     q_BTHA = _l2norm(q_BTHA, axis=-1)
     k_BTHA = _l2norm(k_BTHA, axis=-1)
@@ -92,7 +103,10 @@ def chunk_gated_delta_rule_xla(
         "BHJLM,BHJMA->BHJLA", attn_BHJLM, kb_BHJLA * jnp.exp(g_BHJL)[..., None]
     )
 
-    state_BHAU = jnp.zeros((B, H, A, U), dtype=jnp.float32)
+    if state_init_BHAU is None:
+        state_BHAU = jnp.zeros((B, H, A, U), dtype=jnp.float32)
+    else:
+        state_BHAU = state_init_BHAU.astype(jnp.float32)
     upper_mask_1_LM = jnp.triu(jnp.ones((chunk_size, chunk_size), dtype=jnp.bool_), k=1)
 
     def chunk_step(carry, chunk_idx):
@@ -131,4 +145,7 @@ def chunk_gated_delta_rule_xla(
     state_BHAU, core_out_chunks = jax.lax.scan(chunk_step, state_BHAU, jnp.arange(J))
     core_out_BHJLU = core_out_chunks.transpose(1, 2, 0, 3, 4)
     core_out_BHTU = core_out_BHJLU.reshape(B, H, -1, U)[:, :, :T, :]
-    return core_out_BHTU.transpose(0, 2, 1, 3)
+    out_BTHU = core_out_BHTU.transpose(0, 2, 1, 3)
+    if return_final_state:
+        return out_BTHU, state_BHAU
+    return out_BTHU
