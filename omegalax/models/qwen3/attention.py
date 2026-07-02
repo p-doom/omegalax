@@ -67,9 +67,18 @@ class Attention(nnx.Module):
         object.__setattr__(self, "_q_sharding_spec", P(*cfg.shd_cfg.act_btnh))
         object.__setattr__(self, "_attn_backend", "mosaic_gpu")
         object.__setattr__(self, "_attn_kind", "text")
+        # Block-diagonal document mask under CP (see qwen3_5/attention.py). Default
+        # off keeps CP causal-only == the non-CP path. Toggle via set_cp_document_mask.
+        object.__setattr__(self, "_cp_document_mask", False)
 
     @jax.named_scope("attention")
-    def __call__(self, hidden_BTD: jax.Array, cache, segment_ids_BT: jax.Array) -> jax.Array:
+    def __call__(
+        self,
+        hidden_BTD: jax.Array,
+        cache,
+        segment_ids_BT: jax.Array,
+        position_ids_BT: jax.Array | None = None,
+    ) -> jax.Array:
         q_proj_BTF = self.q_proj(hidden_BTD, out_sharding=self.shd_cfg.act_btf)
         k_proj_BTF = self.k_proj(hidden_BTD, out_sharding=self.shd_cfg.act_btf)
         v_proj_BTF = self.v_proj(hidden_BTD, out_sharding=self.shd_cfg.act_btf)
@@ -93,7 +102,15 @@ class Attention(nnx.Module):
         )
 
         if cache is None:
-            positions_BT = compute_positions_from_segment_ids(segment_ids_BT)
+            # Positions for RoPE + the causal mask. Under zig-zag CP the true
+            # (original) positions are passed in explicitly (the local shard holds
+            # a permuted slice, so an arange over segment_ids would be wrong);
+            # otherwise they are derived from segment_ids as before (contiguous CP
+            # gives globally-correct arange positions, non-CP unchanged).
+            if position_ids_BT is None:
+                positions_BT = compute_positions_from_segment_ids(segment_ids_BT)
+            else:
+                positions_BT = position_ids_BT
             sin_BTK, cos_BTK = generate_pos_embeddings(positions_BT, self.head_dim)
             sin_BTK = sin_BTK.astype(self.dtype)
             cos_BTK = cos_BTK.astype(self.dtype)
@@ -111,13 +128,17 @@ class Attention(nnx.Module):
             cp_axis = heads_shd[1]
             mesh = jax.sharding.get_abstract_mesh()
             if cp_axis is not None and mesh.shape[cp_axis] > 1:
+                seq_spec = P(heads_shd[0], cp_axis)
                 attn_BTHK = context_parallel_attention(
                     q_BTHK,
                     k_BTGK,
                     v_BTGK,
+                    positions_BT,
                     cp_axis=cp_axis,
                     scale=self.scale,
                     heads_spec=P(*heads_shd),
+                    seq_spec=seq_spec,
+                    q_segment_ids_BT=segment_ids_BT if self._cp_document_mask else None,
                     implementation=self._attn_backend,
                 )
             else:

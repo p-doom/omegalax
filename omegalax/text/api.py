@@ -84,10 +84,36 @@ def shard_batch(token_ids_BT: jax.Array, cfg: TextConfig, mesh: Mesh) -> jax.Arr
     raise TypeError(f"Unsupported text config type: {type(cfg)}")
 
 
+def cp_load_balance_ok(cfg: TextConfig) -> bool:
+    """Whether zig-zag CP load-balancing (Stage 1b) is CORRECT for this config.
+
+    Zig-zag permutes the sequence layout to balance the causal-attention triangle
+    across cp ranks. This is numerically invisible for FULL attention (which masks
+    by position, so any layout works), but it BREAKS linear-attention / DeltaNet
+    layers, whose chunked recurrence is order-dependent and must see the true
+    sequence order (Stage 2 CP relies on contiguous in-order segments). So zig-zag
+    is only enabled for all-full-attention stacks:
+      * Qwen3 dense: always full attention -> OK.
+      * Qwen3.5 text: OK only if NO layer is ``linear_attention``.
+    """
+    if isinstance(cfg, qwen3_registry.Qwen3Config):
+        return True  # dense/MoE Qwen3 has no linear-attention layers.
+    if isinstance(cfg, Qwen3_5TextConfig):
+        return all(lt == "full_attention" for lt in cfg.layer_types)
+    return False
+
+
 def shard_batch_dict(batch: dict, cfg: TextConfig, mesh: Mesh) -> dict[str, jax.Array]:
-    """Shard every array in a batch dict (batch dim sharded, rest replicated)."""
+    """Shard every array in a batch dict (batch dim sharded, rest replicated).
+
+    Enables zig-zag CP load-balancing only when it is correct for ``cfg`` (see
+    :func:`cp_load_balance_ok`): full-attention stacks yes, hybrids no (DeltaNet
+    is order-dependent).
+    """
     if isinstance(cfg, (qwen3_registry.Qwen3Config, Qwen3_5TextConfig)):
-        return runtime_shard_batch_dict(batch, cfg.shd_cfg, mesh)
+        return runtime_shard_batch_dict(
+            batch, cfg.shd_cfg, mesh, cp_load_balance=cp_load_balance_ok(cfg)
+        )
     raise TypeError(f"Unsupported text config type: {type(cfg)}")
 
 
@@ -115,12 +141,33 @@ def init_model(
     raise ValueError(f"Unsupported text config type: {type(cfg)}")
 
 
-def forward(model: nnx.Module, token_ids_BT: jax.Array, pad_id: int, cfg: TextConfig):
-    """Forward pass returning hidden states before lm_head, plus aux loss."""
-    segment_ids_BT = 1 * (token_ids_BT != pad_id)
+def forward(
+    model: nnx.Module,
+    token_ids_BT: jax.Array,
+    pad_id: int,
+    cfg: TextConfig,
+    position_ids_BT: jax.Array | None = None,
+    segment_ids_BT: jax.Array | None = None,
+):
+    """Forward pass returning hidden states before lm_head, plus aux loss.
+
+    ``position_ids_BT`` (each token's ORIGINAL index) and ``segment_ids_BT`` are
+    optional; when zig-zag context parallelism permuted the sequence, the trainer
+    passes the batch's ``position_ids_BT`` so RoPE / the causal mask use true
+    positions. Both default to the pre-CP behavior (positions from arange inside
+    the model; segment ids from ``token_ids != pad_id``).
+    """
+    if segment_ids_BT is None:
+        segment_ids_BT = 1 * (token_ids_BT != pad_id)
 
     if isinstance(model, (Qwen3, Qwen3_5ForCausalLM)):
-        return model(token_ids_BT, segment_ids_BT, None, jnp.array(0, dtype=jnp.int32))
+        return model(
+            token_ids_BT,
+            segment_ids_BT,
+            None,
+            jnp.array(0, dtype=jnp.int32),
+            position_ids_BT=position_ids_BT,
+        )
 
     raise ValueError(f"Unsupported text model type: {type(model)}")
 

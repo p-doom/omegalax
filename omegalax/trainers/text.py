@@ -185,11 +185,15 @@ def make_sft_train_step(cfg, pad_id: int = 0):
         token_ids_BT = batch["token_ids_BT"]
         loss_mask_BT = batch["loss_mask_BT"]
         # Under CP, targets are the shift-before-shard next tokens; otherwise the
-        # loss shifts token_ids internally (targets == inputs).
+        # loss shifts token_ids internally (targets == inputs). position_ids_BT is
+        # present only when zig-zag CP permuted the sequence (carries true positions).
         targets_BT = batch["targets_BT"] if cp_axis is not None else token_ids_BT
+        position_ids_BT = batch.get("position_ids_BT")
 
         def loss_fn(model):
-            hidden_BTD, aux_loss = text_api.forward(model, token_ids_BT, pad_id, cfg)
+            hidden_BTD, aux_loss = text_api.forward(
+                model, token_ids_BT, pad_id, cfg, position_ids_BT=position_ids_BT
+            )
             lm_weight = model.lm_head.kernel[...]
             loss = (
                 chunked_cross_entropy_loss(
@@ -235,8 +239,11 @@ def make_sft_eval_step(cfg, pad_id: int = 0):
         token_ids_BT = batch["token_ids_BT"]
         loss_mask_BT = batch["loss_mask_BT"]
         targets_BT = batch["targets_BT"] if cp_axis is not None else token_ids_BT
+        position_ids_BT = batch.get("position_ids_BT")
 
-        hidden_BTD, aux_loss = text_api.forward(model, token_ids_BT, pad_id, cfg)
+        hidden_BTD, aux_loss = text_api.forward(
+            model, token_ids_BT, pad_id, cfg, position_ids_BT=position_ids_BT
+        )
         lm_weight = model.lm_head.kernel[...]
         loss = (
             chunked_cross_entropy_loss(

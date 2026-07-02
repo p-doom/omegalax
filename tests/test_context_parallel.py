@@ -36,7 +36,9 @@ import numpy as np  # noqa: E402
 from absl.testing import absltest, parameterized  # noqa: E402
 from flax import nnx  # noqa: E402
 
+from omegalax.attention import context_parallel_attention  # noqa: E402
 from omegalax.distributed.mesh import make_mesh, mesh_rules  # noqa: E402
+from omegalax.distributed.zigzag import zigzag_permutation, is_identity  # noqa: E402
 from omegalax.models.qwen3.config import make_config as make_qwen3_config  # noqa: E402
 from omegalax.models.qwen3.model import Qwen3  # noqa: E402
 from omegalax.models.qwen3_5.config import Qwen3_5TextConfig  # noqa: E402
@@ -52,8 +54,11 @@ from omegalax.models.shard_config import (  # noqa: E402
 from omegalax.models.sharding_runtime import (  # noqa: E402
     init_model_sharded,
     set_attn_backend,
+    set_cp_document_mask,
     shard_batch_dict,
 )
+from jax.sharding import NamedSharding, PartitionSpec as _P  # noqa: E402
+from tokamax import dot_product_attention as _dpa  # noqa: E402
 import optax  # noqa: E402
 
 from omegalax.trainers import text as text_trainer  # noqa: E402
@@ -130,27 +135,33 @@ def _forward_and_grad(model, cfg, batch):
 
     Mirrors the trainer: the shift-before-shard ``targets_BT`` is produced by
     ``shard_batch_dict`` under CP; here we read it back (and pass shift=False /
-    cp_axis). Non-CP reads token_ids as targets and shifts internally.
+    cp_axis). ``position_ids_BT`` (present only under zig-zag CP) carries each
+    token's original index. Non-CP reads token_ids as targets and shifts internally.
     """
     cp_axis = cfg.shd_cfg.act_btd[1]
     token_ids_BT = batch["token_ids_BT"]
     loss_mask_BT = batch["loss_mask_BT"]
     targets_BT = batch["targets_BT"] if cp_axis is not None else token_ids_BT
+    position_ids_BT = batch.get("position_ids_BT")
 
     segment_ids_BT = (token_ids_BT != 0).astype(jnp.int32)
     gd, state = nnx.split(model)
 
-    def _fwd(state):
+    def _run(state):
         m = nnx.merge(gd, state)
-        hidden_BTD, _ = m(token_ids_BT, segment_ids_BT, None, jnp.array(0, dtype=jnp.int32))
-        return hidden_BTD
+        return m(
+            token_ids_BT, segment_ids_BT, None, jnp.array(0, dtype=jnp.int32),
+            position_ids_BT=position_ids_BT,
+        )[0]
+
+    def _fwd(state):
+        return _run(state)
 
     def _loss(state):
-        m = nnx.merge(gd, state)
-        hidden_BTD, _ = m(token_ids_BT, segment_ids_BT, None, jnp.array(0, dtype=jnp.int32))
+        hidden_BTD = _run(state)
         return chunked_cross_entropy_loss(
             hidden_BTD,
-            m.lm_head.kernel[...],
+            nnx.merge(gd, state).lm_head.kernel[...],
             targets_BT,
             loss_mask_BT,
             num_tiles=1,
@@ -240,7 +251,8 @@ class CpEquivalenceTest(parameterized.TestCase):
         with mesh_rules(cls.mesh1):
             model1, cfg1 = _make_model(cls.cfg, cls.mesh1)
             batch1 = shard_batch_dict(
-                {"token_ids_BT": cls.tokens, "loss_mask_BT": cls.mask}, cfg1.shd_cfg, cls.mesh1
+                {"token_ids_BT": cls.tokens, "loss_mask_BT": cls.mask}, cfg1.shd_cfg, cls.mesh1,
+                cp_load_balance=False,  # contiguous CP; zig-zag tested separately
             )
             cls.hidden1, cls.loss1, cls.grads1 = _forward_and_grad(model1, cfg1, batch1)
 
@@ -256,6 +268,7 @@ class CpEquivalenceTest(parameterized.TestCase):
                 {"token_ids_BT": self.tokens, "loss_mask_BT": self.mask},
                 cfg_m.shd_cfg,
                 mesh,
+                cp_load_balance=False,  # contiguous CP; zig-zag tested separately
             )
             hidden, loss, grads = _forward_and_grad(model, cfg_m, batch)
 
@@ -306,7 +319,8 @@ class CpTrainStepTest(absltest.TestCase):
             )
             step = text_trainer.make_sft_train_step(cfg_m, pad_id=0)
             batch = shard_batch_dict(
-                {"token_ids_BT": tokens, "loss_mask_BT": mask}, cfg_m.shd_cfg, mesh
+                {"token_ids_BT": tokens, "loss_mask_BT": mask}, cfg_m.shd_cfg, mesh,
+                cp_load_balance=False,
             )
             loss, metrics = step(opt, batch)
         self.assertTrue(np.isfinite(float(loss)), f"CP train-step loss not finite: {loss}")
@@ -349,7 +363,8 @@ class CpHybridEquivalenceTest(parameterized.TestCase):
             with mesh_rules(mesh1):
                 model, cfg_m = _make_qwen35(cfg, mesh1)
                 batch = shard_batch_dict(
-                    {"token_ids_BT": cls.tokens, "loss_mask_BT": cls.mask}, cfg_m.shd_cfg, mesh1
+                    {"token_ids_BT": cls.tokens, "loss_mask_BT": cls.mask}, cfg_m.shd_cfg, mesh1,
+                    cp_load_balance=False,
                 )
                 cls.baseline[kind] = (cfg, *_forward_and_grad(model, cfg_m, batch))
 
@@ -367,7 +382,8 @@ class CpHybridEquivalenceTest(parameterized.TestCase):
             model, cfg_m = _make_qwen35(cfg_cp, mesh)
             self.assertEqual(cfg_m.shd_cfg.act_btd[1], "cp")
             batch = shard_batch_dict(
-                {"token_ids_BT": self.tokens, "loss_mask_BT": self.mask}, cfg_m.shd_cfg, mesh
+                {"token_ids_BT": self.tokens, "loss_mask_BT": self.mask}, cfg_m.shd_cfg, mesh,
+                cp_load_balance=False,
             )
             hidden, loss, grads = _forward_and_grad(model, cfg_m, batch)
 
@@ -459,6 +475,176 @@ class DeltaNetStatePassKernelTest(parameterized.TestCase):
                                                  return_final_state=True)
         pred = jnp.einsum("BHXY,BHYU->BHXU", A_seg, si) + B_seg
         np.testing.assert_allclose(np.asarray(pred), np.asarray(final_si), rtol=0, atol=1e-5)
+
+
+class CpZigZagInvarianceTest(parameterized.TestCase):
+    """Stage 1b: zig-zag load-balancing is NUMERICALLY INVISIBLE for full attn.
+
+    Zig-zag permutes the sequence layout to balance the causal-attention triangle
+    across cp ranks. Because CP attention masks over GLOBAL positions (not local
+    arange), the permutation must not change the loss/grads at all (up to fp
+    reduction order). Verified vs the non-CP baseline for full-attention stacks
+    (Qwen3 dense + all-``full_attention`` Qwen3.5). Zig-zag is intentionally NOT
+    applied to hybrids: the DeltaNet recurrence is order-dependent, so
+    text_api.cp_load_balance_ok() disables it there (a separate structural test).
+    """
+
+    def _baseline(self, cfg, ctor, make):
+        mesh1 = make_mesh(tp_size=1, fsdp_size=1, dp_size=4, cp_size=1)
+        with mesh_rules(mesh1):
+            model, cfg_m = make(cfg, mesh1)
+            batch = shard_batch_dict(
+                {"token_ids_BT": self.tokens, "loss_mask_BT": self.mask},
+                cfg_m.shd_cfg, mesh1, cp_load_balance=False,
+            )
+            return _forward_and_grad(model, cfg_m, batch)
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.B, cls.T = 4, 32
+        rng = np.random.RandomState(0)
+        cls.tokens = rng.randint(1, 256, size=(cls.B, cls.T)).astype(np.int32)
+        cls.mask = np.ones((cls.B, cls.T), dtype=np.float32)
+
+    @parameterized.named_parameters(
+        ("dense_cp2", "dense", 2), ("dense_cp4", "dense", 4),
+        ("qwen35_full_cp2", "qwen35_full", 2), ("qwen35_full_cp4", "qwen35_full", 4),
+    )
+    def test_zigzag_invariance(self, kind, cp):
+        if kind == "dense":
+            cfg = _dense_cfg()
+            ctor, make = Qwen3, _make_model
+        else:
+            cfg = _qwen35_cfg(("full_attention", "full_attention"))
+            ctor, make = Qwen3_5ForCausalLM, _make_qwen35
+
+        hidden1, loss1, grads1 = self._baseline(cfg, ctor, make)
+
+        mesh = make_mesh(tp_size=1, fsdp_size=1, dp_size=4 // cp, cp_size=cp)
+        with mesh_rules(mesh):
+            cfg_cp = dataclasses.replace(cfg, shd_cfg=ShardConfig.context_parallel())
+            model, cfg_m = make(cfg_cp, mesh)
+            # zig-zag ON (cp_load_balance=True) -> the batch is permuted + carries
+            # position_ids_BT (true original positions).
+            batch = shard_batch_dict(
+                {"token_ids_BT": self.tokens, "loss_mask_BT": self.mask},
+                cfg_m.shd_cfg, mesh, cp_load_balance=True,
+            )
+            self.assertIn("position_ids_BT", batch)  # zig-zag actually engaged
+            hidden, loss, grads = _forward_and_grad(model, cfg_m, batch)
+
+        # Loss/grads must be invariant to the permutation (hidden is permuted, so
+        # only compare loss + grads which are layout-invariant scalars/params).
+        np.testing.assert_allclose(loss, loss1, rtol=2e-5, atol=1e-5)
+        g_cp, g_ref = _flat_grads(grads), _flat_grads(grads1)
+        self.assertEqual(set(g_cp), set(g_ref))
+        worst = 0.0
+        for k in g_ref:
+            a, b = g_cp[k], g_ref[k]
+            self.assertTrue(np.isfinite(a).all(), f"non-finite grad at {k}")
+            worst = max(worst, float(np.abs(a - b).max()) / max(float(np.abs(b).max()), 1e-6))
+        self.assertLess(worst, 2e-4, f"[{kind}] zig-zag grad rel diff {worst}")
+
+    def test_zigzag_disabled_for_hybrid(self):
+        # Structural guard: hybrids must NOT zig-zag (DeltaNet is order-dependent).
+        from omegalax.text import api as text_api
+        self.assertFalse(
+            text_api.cp_load_balance_ok(
+                _qwen35_cfg(("linear_attention", "full_attention"))
+            )
+        )
+        self.assertTrue(
+            text_api.cp_load_balance_ok(_qwen35_cfg(("full_attention", "full_attention")))
+        )
+        self.assertTrue(text_api.cp_load_balance_ok(_dense_cfg()))
+
+    def test_permutation_is_balanced_and_identity_at_cp1(self):
+        self.assertTrue(is_identity(zigzag_permutation(32, 1)))
+        perm = zigzag_permutation(32, 4)
+        self.assertEqual(sorted(perm.tolist()), list(range(32)))  # valid permutation
+        # rank r owns contiguous slice [2r*cs, (2r+2)*cs) = zig-zag pair {r, 2cp-1-r}
+        cs = 32 // 8
+        for r in range(4):
+            lo = 2 * r * cs
+            chunks = {int(perm[lo + i]) // cs for i in range(2 * cs)}
+            self.assertEqual(chunks, {r, 7 - r})
+
+
+class CpDocumentMaskTest(absltest.TestCase):
+    """Block-diagonal document masking under CP: no cross-document attention.
+
+    Packed multi-document sequences must not attend across a document boundary.
+    Verified two ways on a packed 2-document batch with cp>1:
+      1. the CP attention output == a DENSE reference (causal AND same-segment);
+      2. document-1's output is INVARIANT to document-2's values (proof that no
+         token attends across the boundary).
+    Single-document behavior is unchanged (doc mask is a no-op when all tokens
+    share one segment).
+    """
+
+    def _run_cp(self, q, k, v, pos, seg, cp, use_seg):
+        # Fill all 4 faked devices: cp*dp == 4 (batch is size 1 but dp only
+        # replicates it here; the doc mask is per-(B) so dp is harmless).
+        mesh = make_mesh(tp_size=1, fsdp_size=1, dp_size=4 // cp, cp_size=cp)
+        hs = _P(("dp", "fsdp"), "cp", "tp", None)
+        ss = _P(("dp", "fsdp"), "cp")
+        with mesh_rules(mesh):
+            qs = jax.device_put(q, NamedSharding(mesh, hs))
+            ks = jax.device_put(k, NamedSharding(mesh, hs))
+            vs = jax.device_put(v, NamedSharding(mesh, hs))
+            ps = jax.device_put(pos, NamedSharding(mesh, ss))
+            sg = jax.device_put(seg, NamedSharding(mesh, ss))
+
+            def f(q, k, v, p, s):
+                return context_parallel_attention(
+                    q, k, v, p, cp_axis="cp", scale=q.shape[-1] ** -0.5,
+                    heads_spec=hs, seq_spec=ss,
+                    q_segment_ids_BT=(s if use_seg else None), implementation="xla",
+                )
+
+            return np.asarray(jax.device_get(jax.jit(f)(qs, ks, vs, ps, sg)))
+
+    def test_no_cross_document_attention(self):
+        # B=4 fills every dp = 4 // cp (batch shards cleanly on dp).
+        B, T, H, K = 4, 16, 2, 8
+        rng = jax.random.key(0)
+        q = jax.random.normal(rng, (B, T, H, K))
+        k = jax.random.normal(jax.random.key(1), (B, T, H, K))
+        v = jax.random.normal(jax.random.key(2), (B, T, H, K))
+        # 2 docs: seg 1 on [0,8), seg 2 on [8,16); positions restart per doc.
+        seg = jnp.asarray(np.concatenate([np.ones(8), 2 * np.ones(8)])[None].astype(np.int32))
+        pos = jnp.asarray(np.concatenate([np.arange(8), np.arange(8)])[None].astype(np.int32))
+        pos = jnp.broadcast_to(pos, (B, T))
+        seg = jnp.broadcast_to(seg, (B, T))
+
+        # Dense reference: causal AND same-segment.
+        qpos, kpos = pos[:, None, :, None], pos[:, None, None, :]
+        qseg, kseg = seg[:, None, :, None], seg[:, None, None, :]
+        ref = _dpa(q, k, v, mask=(qpos >= kpos) & (qseg == kseg),
+                   is_causal=False, implementation="xla")
+
+        for cp in (2, 4):
+            out = self._run_cp(q, k, v, pos, seg, cp, use_seg=True)
+            np.testing.assert_allclose(out, np.asarray(ref), rtol=0, atol=1e-5)
+            # doc-1 output invariant to doc-2 values -> no cross-doc attention.
+            v2 = v.at[:, 8:].set(999.0)
+            out2 = self._run_cp(q, k, v2, pos, seg, cp, use_seg=True)
+            np.testing.assert_allclose(out[:, :8], out2[:, :8], rtol=0, atol=1e-5)
+
+    def test_single_document_unchanged(self):
+        # With one segment everywhere, the doc mask is a no-op == plain causal.
+        B, T, H, K = 4, 16, 2, 8
+        rng = jax.random.key(3)
+        q = jax.random.normal(rng, (B, T, H, K))
+        k = jax.random.normal(jax.random.key(4), (B, T, H, K))
+        v = jax.random.normal(jax.random.key(5), (B, T, H, K))
+        pos = jnp.broadcast_to(jnp.arange(T, dtype=jnp.int32)[None], (B, T))
+        seg = jnp.ones((B, T), dtype=jnp.int32)
+        causal_ref = _dpa(q, k, v, is_causal=True, implementation="xla")
+        for cp in (2, 4):
+            out_seg = self._run_cp(q, k, v, pos, seg, cp, use_seg=True)
+            np.testing.assert_allclose(out_seg, np.asarray(causal_ref), rtol=0, atol=1e-5)
 
 
 if __name__ == "__main__":

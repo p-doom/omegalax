@@ -78,6 +78,11 @@ class Attention(nnx.Module):
         object.__setattr__(self, "_q_sharding_spec", P(*cfg.shd_cfg.act_btnh))
         object.__setattr__(self, "_attn_backend", "mosaic_gpu")
         object.__setattr__(self, "_attn_kind", "text")
+        # When True and running under CP, apply the block-diagonal document mask
+        # (segment_ids) so packed multi-doc sequences don't attend across a
+        # document boundary. Default False keeps CP causal-only == the non-CP
+        # tokamax path (the CP equivalence bar). Toggle via set_cp_document_mask.
+        object.__setattr__(self, "_cp_document_mask", False)
 
     @jax.named_scope("attention")
     def __call__(
@@ -125,13 +130,20 @@ class Attention(nnx.Module):
         cp_axis = heads_shd[1]
         mesh = jax.sharding.get_abstract_mesh()
         if cp_axis is not None and mesh.shape[cp_axis] > 1:
+            # position_ids_BT carries the GLOBAL/original positions (permuted under
+            # zig-zag), so the causal mask is layout-agnostic. segment_ids_BT adds
+            # the block-diagonal document mask (no cross-document attention).
+            seq_spec = P(heads_shd[0], cp_axis)
             attn_BTHK = context_parallel_attention(
                 q_BTHK,
                 k_BTGK,
                 v_BTGK,
+                position_ids_BT,
                 cp_axis=cp_axis,
                 scale=self.scale,
                 heads_spec=P(*heads_shd),
+                seq_spec=seq_spec,
+                q_segment_ids_BT=segment_ids_BT if self._cp_document_mask else None,
                 implementation=self._attn_backend,
             )
         else:
