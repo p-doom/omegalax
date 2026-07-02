@@ -54,6 +54,9 @@ class Qwen3VLConfig:
     mlp_only_layers: tuple[int, ...] = dataclasses.field(default_factory=tuple)
     decoder_sparse_step: int = 1
     norm_topk_prob: bool = True
+    # Stack homogeneous text-decoder layers and run them with ``nnx.scan``.
+    # Falls back to the unrolled loop for heterogeneous (mixed dense/MoE) stacks.
+    scan_layers: bool = True
     shd_cfg: ShardConfig = dataclasses.field(default_factory=ShardConfig.default)
     dtype: Any = jnp.bfloat16
     param_dtype: Any = jnp.float32
@@ -64,6 +67,18 @@ class Qwen3VLConfig:
             and layer_idx not in self.mlp_only_layers
             and (layer_idx + 1) % self.decoder_sparse_step == 0
         )
+
+    @property
+    def is_homogeneous(self) -> bool:
+        """True when every text-decoder layer has the same parameter structure.
+
+        Dense (num_experts == 0) is always homogeneous. MoE is homogeneous only
+        when every layer is a MoE layer. Mixed dense/MoE stacks cannot be
+        stacked into a single ``nnx.scan``.
+        """
+        if self.num_experts == 0:
+            return True
+        return all(self.is_moe_layer(i) for i in range(self.num_layers))
 
 
 _QWEN3_VL_SMOKE_SPECS: dict[str, dict[str, Any]] = {

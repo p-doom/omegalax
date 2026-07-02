@@ -415,7 +415,6 @@ class TextDecoderLayer(nnx.Module):
         self.is_moe = cfg.is_moe_layer(layer_idx)
         self.mlp = TextMoEFeedForward(cfg, rngs=rngs) if self.is_moe else TextMLP(cfg, rngs=rngs)
 
-    @partial(jax.remat, static_argnums=0)
     def __call__(
         self, hidden_BTD: jax.Array, sin_BTK: jax.Array, cos_BTK: jax.Array
     ) -> tuple[jax.Array, jax.Array]:
@@ -541,9 +540,23 @@ class Qwen3VL(nnx.Module):
         )
 
         hidden_BTD = inputs_embeds_BTD
+
+        # Scan path: training/eval text-only forward on a homogeneous layer stack.
+        # DeepStack injects visual features BETWEEN specific layers, which breaks
+        # the single-body assumption, so we only scan when there are no deepstack
+        # features (i.e. no images) and the stack is homogeneous. Heterogeneous
+        # (mixed dense/MoE) stacks and the deepstack path use the unrolled loop.
+        if deepstack_features is None and cfg.scan_layers and cfg.is_homogeneous:
+            hidden_BTD, total_aux = _scan_text_layers(
+                list(self.text.layers), hidden_BTD, sin_BTK, cos_BTK
+            )
+            hidden_BTD = self.text.final_norm(hidden_BTD)
+            return hidden_BTD, total_aux
+
         aux_losses = []
+        remat_layer = nnx.remat(TextDecoderLayer.__call__)
         for layer_idx, layer in enumerate(self.text.layers):
-            hidden_BTD, aux_loss = layer(hidden_BTD, sin_BTK, cos_BTK)
+            hidden_BTD, aux_loss = remat_layer(layer, hidden_BTD, sin_BTK, cos_BTK)
             aux_losses.append(aux_loss)
             if deepstack_features is not None and layer_idx < len(deepstack_features):
                 hidden_BTD = _deepstack_process(
@@ -558,6 +571,37 @@ class Qwen3VL(nnx.Module):
             jnp.sum(jnp.stack(aux_losses)) if aux_losses else jnp.array(0.0, dtype=jnp.float32)
         )
         return hidden_BTD, total_aux
+
+
+def _scan_text_layers(
+    layers: list[TextDecoderLayer],
+    hidden_BTD: jax.Array,
+    sin_BTK: jax.Array,
+    cos_BTK: jax.Array,
+) -> tuple[jax.Array, jax.Array]:
+    """Run homogeneous Qwen3-VL text-decoder layers with a single ``nnx.scan``.
+
+    Stacks per-layer state along a new (replicated) leading layer axis so XLA
+    compiles one layer body. Per-layer sharding is preserved (only the leading
+    layer axis is added, unsharded). ``nnx.remat`` inside the body matches the
+    unrolled activation checkpointing. Per-layer aux losses are scanned outputs
+    summed after the scan.
+    """
+    graphdef, _ = nnx.split(layers[0])
+    states = [nnx.split(layer)[1] for layer in layers]
+    stacked_state = jax.tree.map(lambda *xs: jnp.stack(xs, axis=0), *states)
+
+    @nnx.scan(in_axes=(0, nnx.Carry, None, None), out_axes=(nnx.Carry, 0))
+    def run(layer_state, carry_BTD, sin_BTK, cos_BTK):
+        @nnx.remat
+        def body(layer_state, carry_BTD, sin_BTK, cos_BTK):
+            layer = nnx.merge(graphdef, layer_state)
+            return layer(carry_BTD, sin_BTK, cos_BTK)
+
+        return body(layer_state, carry_BTD, sin_BTK, cos_BTK)
+
+    hidden_BTD, aux_L = run(stacked_state, hidden_BTD, sin_BTK, cos_BTK)
+    return hidden_BTD, jnp.sum(aux_L)
 
 
 def _deepstack_process(

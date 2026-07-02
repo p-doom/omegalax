@@ -206,7 +206,6 @@ class DecoderLayer(nnx.Module):
         self.input_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, rngs=rngs)
         self.post_attention_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, rngs=rngs)
 
-    @partial(jax.remat, static_argnums=0)
     def __call__(
         self,
         hidden_BTD: jax.Array,
@@ -301,21 +300,99 @@ class TextModel(nnx.Module):
         attention_mask_BT = (segment_ids_BT != 0).astype(jnp.float32)
         text_position_ids_BT = position_ids_ZBT[0]
 
-        aux_losses = []
-        for layer in self.layers:
-            hidden_BTD, aux = layer(
-                hidden_BTD,
-                cos_BTK,
-                sin_BTK,
-                segment_ids_BT,
-                text_position_ids_BT,
-                attention_mask_BT,
+        layer_args = (cos_BTK, sin_BTK, segment_ids_BT, text_position_ids_BT, attention_mask_BT)
+
+        # Block-scan path (training/eval forward): Qwen3.5 interleaves
+        # linear_attention (Gated DeltaNet) and full_attention layers with
+        # DIFFERENT param pytrees, so they cannot be stacked into ONE scan.
+        # Instead we scan the repeating BLOCK (period p, e.g. [lin,lin,lin,full])
+        # over num_blocks = num_layers // p, following MaxText's Gemma3 scannable
+        # block pattern: each of the p positions is homogeneous across blocks and
+        # its params are stacked along the block axis; the block body applies the
+        # p positions in original order. Falls back to the unrolled loop for
+        # irregular patterns (scan_block_period is None) or when disabled.
+        period = cfg.scan_block_period
+        # Only scan when there are >= 2 blocks (period < num_layers); otherwise the
+        # single "block" is the whole irregular stack and a scan buys nothing, so
+        # we drop to the unrolled loop below.
+        if cfg.scan_layers and period is not None and period < len(self.layers):
+            hidden_BTD, total_aux = _scan_hybrid_blocks(
+                list(self.layers), period, hidden_BTD, layer_args
             )
+            hidden_BTD = self.final_norm(hidden_BTD)
+            return hidden_BTD, total_aux
+
+        aux_losses = []
+        remat_layer = nnx.remat(DecoderLayer.__call__)
+        for layer in self.layers:
+            hidden_BTD, aux = remat_layer(layer, hidden_BTD, *layer_args)
             aux_losses.append(aux)
 
         hidden_BTD = self.final_norm(hidden_BTD)
         total_aux = jnp.sum(jnp.stack(aux_losses)) if aux_losses else jnp.array(0.0)
         return hidden_BTD, total_aux
+
+
+def _scan_hybrid_blocks(
+    layers: list[DecoderLayer],
+    period: int,
+    hidden_BTD: jax.Array,
+    layer_args: tuple,
+) -> tuple[jax.Array, jax.Array]:
+    """Scan the repeating hybrid block over ``num_blocks = len(layers) // period``.
+
+    Each of the ``period`` positions is homogeneous across blocks (all
+    ``linear_attention`` or all ``full_attention`` with the same MLP/MoE), so we
+    stack that position's per-layer state along a new leading block axis
+    (replicated, i.e. NOT in the mesh) — giving ``period`` separate stacked-state
+    arrays plus their graphdefs. The scan carries ``hidden`` over the blocks; the
+    body applies the ``period`` positions in original order (a small Python unroll
+    inside one scan step), each wrapped in ``nnx.remat`` to match the unrolled
+    activation-checkpointing exactly. Per-layer aux losses are summed within the
+    block and the per-block totals are a scanned output, summed after the scan,
+    reproducing the unrolled sum. Per-layer parameter sharding is preserved
+    because we stack already-annotated per-layer states; only the leading block
+    axis is added and it carries no partition spec.
+    """
+    n = len(layers)
+    num_blocks = n // period
+
+    # One (graphdef, stacked_state) per position within the block.
+    pos_graphdefs = []
+    pos_stacked = []
+    for pos in range(period):
+        pos_layers = [layers[b * period + pos] for b in range(num_blocks)]
+        graphdef, _ = nnx.split(pos_layers[0])
+        states = [nnx.split(layer)[1] for layer in pos_layers]
+        stacked = jax.tree.map(lambda *xs: jnp.stack(xs, axis=0), *states)
+        pos_graphdefs.append(graphdef)
+        pos_stacked.append(stacked)
+
+    # in_axes: one stacked state per position (block axis 0), Carry for hidden,
+    # None (broadcast) for the shared per-step layer args.
+    in_axes = (*([0] * period), nnx.Carry, *([None] * len(layer_args)))
+
+    @nnx.scan(in_axes=in_axes, out_axes=(nnx.Carry, 0))
+    def run(*args):
+        block_states = args[:period]
+        carry_BTD = args[period]
+        step_args = args[period + 1 :]
+
+        block_aux = jnp.array(0.0, dtype=jnp.float32)
+        for pos in range(period):
+            graphdef = pos_graphdefs[pos]
+
+            @nnx.remat
+            def body(layer_state, carry_BTD, step_args, _graphdef=graphdef):
+                layer = nnx.merge(_graphdef, layer_state)
+                return layer(carry_BTD, *step_args)
+
+            carry_BTD, aux = body(block_states[pos], carry_BTD, step_args)
+            block_aux = block_aux + aux
+        return carry_BTD, block_aux
+
+    hidden_BTD, block_aux_L = run(*pos_stacked, hidden_BTD, *layer_args)
+    return hidden_BTD, jnp.sum(block_aux_L)
 
 
 # Causal LM

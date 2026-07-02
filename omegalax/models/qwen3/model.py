@@ -153,7 +153,6 @@ class DecoderLayer(nnx.Module):
         else:
             self.mlp = MLP(cfg=cfg, rngs=rngs)
 
-    @partial(jax.remat, static_argnums=0)
     def __call__(self, hidden_BTD: jax.Array, cache, segment_ids_BT: jax.Array):
         normed_BTD = self.input_layernorm(hidden_BTD)
         attn_out_BTD = hidden_BTD + self.attn(normed_BTD, cache, segment_ids_BT)
@@ -180,6 +179,7 @@ class Qwen3(nnx.Module):
         )
         self.out_emb_shd = cfg.shd_cfg.act_btd
         self.logits_shd = P(cfg.shd_cfg.act_btd[0], None, None)
+        self.cfg = cfg
         self.layers = nnx.List(
             [DecoderLayer(cfg=cfg, layer_idx=i, rngs=rngs) for i in range(cfg.num_layers)]
         )
@@ -196,17 +196,58 @@ class Qwen3(nnx.Module):
 
     def __call__(self, token_ids_BT, segment_ids_BT, cache, num_right_pads):
         del num_right_pads
-        aux_losses = []
         hidden_BTD = jnp.astype(
             self.embedder.embedding[...].at[(token_ids_BT,)].get(out_sharding=self.out_emb_shd),
             self.embedder.dtype,
         )
+
+        # Scan path: only for the training/eval forward pass (cache is None) and
+        # homogeneous layer stacks. Decode (cache is not None) and heterogeneous
+        # (mixed dense/MoE) stacks stay on the unrolled loop below.
+        if cache is None and self.cfg.scan_layers and self.cfg.is_homogeneous:
+            hidden_BTD, total_aux = _scan_layers(list(self.layers), hidden_BTD, segment_ids_BT)
+            hidden_BTD = self.final_norm(hidden_BTD)
+            return hidden_BTD, total_aux
+
+        aux_losses = []
+        remat_layer = nnx.remat(DecoderLayer.__call__)
         for i, layer in enumerate(self.layers):
             layer_cache = None if cache is None else cache[i]
-            hidden_BTD, aux = layer(hidden_BTD, layer_cache, segment_ids_BT)
+            hidden_BTD, aux = remat_layer(layer, hidden_BTD, layer_cache, segment_ids_BT)
             aux_losses.append(aux)
         hidden_BTD = self.final_norm(hidden_BTD)
         total_aux = (
             jnp.sum(jnp.stack(aux_losses)) if aux_losses else jnp.array(0.0, dtype=jnp.float32)
         )
         return hidden_BTD, total_aux
+
+
+def _scan_layers(
+    layers: list[DecoderLayer], hidden_BTD: jax.Array, segment_ids_BT: jax.Array
+) -> tuple[jax.Array, jax.Array]:
+    """Run homogeneous decoder layers with a single ``nnx.scan`` layer body.
+
+    Stacks each layer's state along a new leading layer axis (replicated, i.e.
+    not in the mesh) and scans over it. The per-layer parameter sharding is
+    preserved because we stack the already-annotated per-layer states; only the
+    leading layer axis is added and it carries no partition spec. Activation
+    checkpointing is applied via ``nnx.remat`` inside the scan body to match the
+    unrolled path exactly. Per-layer aux losses are collected as a scanned
+    output (ys) and summed after the scan, reproducing the unrolled sum.
+    """
+    graphdef, _ = nnx.split(layers[0])
+    states = [nnx.split(layer)[1] for layer in layers]
+    stacked_state = jax.tree.map(lambda *xs: jnp.stack(xs, axis=0), *states)
+
+    @nnx.scan(in_axes=(0, nnx.Carry, None), out_axes=(nnx.Carry, 0))
+    def run(layer_state, carry_BTD, seg_BT):
+        @nnx.remat
+        def body(layer_state, carry_BTD, seg_BT):
+            layer = nnx.merge(graphdef, layer_state)
+            return layer(carry_BTD, None, seg_BT)
+
+        return body(layer_state, carry_BTD, seg_BT)
+
+    hidden_BTD, aux_L = run(stacked_state, hidden_BTD, segment_ids_BT)
+    total_aux = jnp.sum(aux_L)
+    return hidden_BTD, total_aux
