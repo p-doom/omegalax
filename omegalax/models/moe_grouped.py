@@ -210,6 +210,66 @@ def _sort_tokens_by_expert(topk_idx_Nk: jax.Array, num_experts: int):
     return sort_perm, inv_perm, group_sizes, flat_expert
 
 
+# ---------------------------------------------------------------------------
+# Per-expert LoRA on the grouped path.
+# ---------------------------------------------------------------------------
+#
+# The dense MoE path adds, per expert e and per token x, the low-rank correction
+# ``scaling * (x @ A[e]) @ B[e]`` INSIDE the expert einsum (before SiLU/top-k for
+# gate/up; on the activation for down). See LoRAMoEExperts.delta_shared /
+# delta_per_expert in omegalax/trainers/lora.py.
+#
+# In the grouped path the rows are already permuted into per-expert contiguous
+# groups with ``group_sizes``, so the SAME per-expert delta is exactly two extra
+# grouped GEMMs: ``ragged_dot(sorted_rows, A, group_sizes)`` then
+# ``ragged_dot(mid, B, group_sizes)`` (A[e] then B[e] applied to each group),
+# scaled and added to the corresponding base grouped output. This is
+# algebraically identical to the dense per-expert LoRA (same operands, same
+# per-expert matmuls), so grouped-LoRA == dense-LoRA up to fp reduction order.
+#
+# ``_lora_arrays`` pulls the raw (A, B, scaling) out of a ``LoRAMoEExperts``
+# module BEFORE entering the auto/shard_map transformed core, so the core only
+# ever sees plain JAX arrays (never an nnx.Module).
+
+
+def _lora_arrays(adapter, dtype):
+    """Return ``(A, B, scaling)`` cast to ``dtype`` for a LoRAMoEExperts adapter,
+    or ``None`` when no adapter is attached. A: (E, in, r); B: (E, r, out)."""
+    if adapter is None:
+        return None
+    a = adapter.lora_A[...].astype(dtype)
+    b = adapter.lora_B[...].astype(dtype)
+    return a, b, float(adapter.scaling)
+
+
+def _unshard_lora(lora):
+    """Gather a ``(A, B, scaling)`` LoRA tuple to replicated (matching the base
+    weights) so it is consistent inside the auto-sharding grouped core. No-op for
+    ``None``."""
+    if lora is None:
+        return None
+    a, b, scaling = lora
+    return _unshard(a), _unshard(b), scaling
+
+
+def _grouped_lora_delta(sorted_in, lora, group_sizes):
+    """Per-expert LoRA delta for grouped rows: ``scaling * (X @ A[e]) @ B[e]``,
+    applied per group. ``sorted_in`` is (N, in); returns (N, out) or 0.0.
+
+    The two low-rank grouped GEMMs always use the ``jax`` primitive
+    (``jax.lax.ragged_dot``, the CPU-correct reference) regardless of the base
+    path's ``primitive``: tokamax's ``ragged_dot`` custom kernel does not compose
+    with the auto-sharding intermediate produced by the first (A) grouped GEMM.
+    The adapters are rank-r (tiny), so the perf cost of the jax path is
+    negligible and the delta is numerically identical."""
+    if lora is None:
+        return 0.0
+    a, b, scaling = lora
+    mid = _ragged_dot(sorted_in, a, group_sizes, "jax")  # (N, r)
+    delta = _ragged_dot(mid, b, group_sizes, "jax")  # (N, out)
+    return delta * scaling
+
+
 def grouped_moe(
     hidden_ND: jax.Array,
     topk_idx_Nk: jax.Array,
@@ -220,6 +280,9 @@ def grouped_moe(
     *,
     num_experts: int,
     primitive: str = "tokamax",
+    gate_lora=None,
+    up_lora=None,
+    down_lora=None,
 ) -> jax.Array:
     """Grouped-GEMM dropless MoE, EP=1 (single logical expert shard).
 
@@ -231,6 +294,9 @@ def grouped_moe(
       down_EFD:       (E, F, D) stacked expert out-projection.
       num_experts:    E.
       primitive:      "tokamax" (default, GPU-perf) or "jax" (reference).
+      gate_lora/up_lora/down_lora: optional ``LoRAMoEExperts`` adapters whose
+        per-expert low-rank delta is applied to the matching grouped output,
+        matching the dense path's per-expert LoRA (no-op when None).
 
     Returns:
       (N, D) combined MoE output, equivalent to the dense gather path.
@@ -238,6 +304,23 @@ def grouped_moe(
     N, D = hidden_ND.shape
     k = topk_idx_Nk.shape[1]
     compute_dtype = hidden_ND.dtype
+
+    # Pull raw (A, B, scaling) out of the adapter modules here, so the transformed
+    # core only sees plain arrays. None when no adapter is attached. Unshard A/B to
+    # replicated just like the base weights so the auto-sharding core is consistent.
+    gate_lora_a = _unshard_lora(_lora_arrays(gate_lora, compute_dtype))
+    up_lora_a = _unshard_lora(_lora_arrays(up_lora, compute_dtype))
+    down_lora_a = _unshard_lora(_lora_arrays(down_lora, compute_dtype))
+
+    # When LoRA is attached, run the WHOLE grouped core on the jax ragged_dot
+    # reference (both base and adapter GEMMs). The base and adapter GEMMs share
+    # intermediates inside one auto-sharding region, and mixing tokamax's custom
+    # ragged_dot kernel with the jax reference there produces an Auto/Explicit
+    # mesh-type mismatch. LoRA is a fine-tuning (not perf-critical pretraining)
+    # path, so the reference primitive throughout is the correct, consistent
+    # choice; numerically identical to tokamax up to fp reduction order.
+    if gate_lora_a is not None:
+        primitive = "jax"
 
     # Gather to replicated so the sort/grouped-GEMM core (auto-sharding region) sees
     # unsharded operands; the caller reshards the replicated result afterwards.
@@ -248,7 +331,26 @@ def grouped_moe(
     up_EDF = _unshard(up_EDF)
     down_EFD = _unshard(down_EFD)
 
-    def _core(hidden_ND, topk_idx_Nk, topk_weights_Nk, gate_EDF, up_EDF, down_EFD):
+    # Pass the LoRA A/B *arrays* as explicit ``_core`` operands (not closure
+    # captures) so ``_auto``/``auto_axes`` converts them to Auto mode along with
+    # the base weights — a closure-captured Explicit-mesh array would clash with
+    # the auto-sharding core's mesh type inside tokamax's ragged_dot. Scaling is a
+    # static float, kept as a closure constant. ``lora_arrays`` is a flat tuple of
+    # 0 or 6 arrays (gate_A, gate_B, up_A, up_B, down_A, down_B).
+    if gate_lora_a is not None:
+        lora_arrays = (
+            gate_lora_a[0], gate_lora_a[1],
+            up_lora_a[0], up_lora_a[1],
+            down_lora_a[0], down_lora_a[1],
+        )
+        gate_scaling, up_scaling, down_scaling = (
+            gate_lora_a[2], up_lora_a[2], down_lora_a[2]
+        )
+    else:
+        lora_arrays = ()
+        gate_scaling = up_scaling = down_scaling = 1.0
+
+    def _core(hidden_ND, topk_idx_Nk, topk_weights_Nk, gate_EDF, up_EDF, down_EFD, *lora):
         sort_perm, inv_perm, group_sizes, _ = _sort_tokens_by_expert(
             topk_idx_Nk, num_experts
         )
@@ -261,8 +363,22 @@ def grouped_moe(
         # Grouped GEMM: gate & up (D->F), SiLU-gate, then down (F->D).
         gate_out = _ragged_dot(sorted_rows_ND, gate_EDF, group_sizes, primitive)
         up_out = _ragged_dot(sorted_rows_ND, up_EDF, group_sizes, primitive)
+        act_pre = None
+        if lora:
+            gA, gB, uA, uB, dA, dB = lora
+            # Per-expert LoRA on gate/up: same per-expert delta as the dense path.
+            gate_out = gate_out + _grouped_lora_delta(
+                sorted_rows_ND, (gA, gB, gate_scaling), group_sizes
+            )
+            up_out = up_out + _grouped_lora_delta(
+                sorted_rows_ND, (uA, uB, up_scaling), group_sizes
+            )
         act = jax.nn.silu(gate_out) * up_out  # (N*k, F)
         down_out = _ragged_dot(act, down_EFD, group_sizes, primitive)  # (N*k, D)
+        if lora:
+            down_out = down_out + _grouped_lora_delta(
+                act, (dA, dB, down_scaling), group_sizes
+            )
 
         # Unpermute back to flattened (token, slot) order, weight, sum over k.
         unsorted = down_out[inv_perm]  # (N*k, D)
@@ -270,7 +386,7 @@ def grouped_moe(
         return weighted.reshape(N, k, D).sum(axis=1)
 
     return _auto(_core)(
-        hidden_ND, topk_idx_Nk, topk_weights_Nk, gate_EDF, up_EDF, down_EFD
+        hidden_ND, topk_idx_Nk, topk_weights_Nk, gate_EDF, up_EDF, down_EFD, *lora_arrays
     )
 
 
@@ -297,6 +413,20 @@ def grouped_moe(
 # (token,slot) row to the device owning its expert; combine sends the result back.
 
 
+def _lora_ep_delta(sorted_in, a_pad, b_pad, scaling, gs_padded):
+    """Per-(local-)expert LoRA delta on the EP device-local grouped rows:
+    ``scaling * (X @ A[e]) @ B[e]`` applied per padded local-expert group. Returns
+    0.0 when the adapter is absent. ``a_pad``/``b_pad`` are the local expert A/B
+    stacks padded with a trailing zero dummy expert (matching ``gs_padded``)."""
+    if a_pad is None:
+        return 0.0
+    # Use the jax ragged_dot reference for the low-rank LoRA GEMMs (see
+    # _grouped_lora_delta); the EP path already defaults primitive="jax" anyway.
+    mid = _ragged_dot(sorted_in, a_pad, gs_padded, "jax")  # (cap, r)
+    delta = _ragged_dot(mid, b_pad, gs_padded, "jax")  # (cap, out)
+    return delta * scaling
+
+
 def grouped_moe_ep(
     hidden_ND: jax.Array,
     topk_idx_Nk: jax.Array,
@@ -309,6 +439,9 @@ def grouped_moe_ep(
     expert_axis: str = "expert",
     capacity_factor: float = 4.0,
     primitive: str = "jax",
+    gate_lora=None,
+    up_lora=None,
+    down_lora=None,
 ) -> jax.Array:
     """Expert-parallel dropless MoE.
 
@@ -345,6 +478,7 @@ def grouped_moe_ep(
             hidden_ND, topk_idx_Nk, topk_weights_Nk,
             gate_EDF, up_EDF, down_EFD,
             num_experts=num_experts, primitive=primitive,
+            gate_lora=gate_lora, up_lora=up_lora, down_lora=down_lora,
         )
 
     assert num_experts % ep == 0, f"E={num_experts} not divisible by EP={ep}"
@@ -355,11 +489,23 @@ def grouped_moe_ep(
     n_local = N // ep  # tokens per device
     local_Nk = n_local * k  # expanded rows produced per device
     compute_dtype = hidden_ND.dtype
+
+    # Pull raw (A, B, scaling) out of the adapters. The stacked A/B ride the
+    # expert axis exactly like the base gate/up/down weights (P(expert_axis,...)),
+    # so shard_map hands each device its own local expert block. ``None`` => no
+    # adapter (identity). We pass A/B as extra shard_map operands (or a zero-sized
+    # placeholder when absent, since shard_map operands must be concrete arrays).
+    _has_lora = any(x is not None for x in (gate_lora, up_lora, down_lora))
+    gate_lora_a = _lora_arrays(gate_lora, compute_dtype)
+    up_lora_a = _lora_arrays(up_lora, compute_dtype)
+    down_lora_a = _lora_arrays(down_lora, compute_dtype)
     # Per-device receive capacity (static). Padding is a compile-time requirement of
     # ragged_all_to_all; unused rows stay zero and are never combined back.
     cap = int(-(-int(capacity_factor * N * k) // ep))
 
-    def per_device(hidden_nd, idx_nk, w_nk, gate_w, up_w, down_w):
+    def per_device(hidden_nd, idx_nk, w_nk, gate_w, up_w, down_w, *lora_ops):
+        # lora_ops (when present) = (gate_A, gate_B, up_A, up_B, down_A, down_B),
+        # each the device-local expert block of the corresponding stacked adapter.
         # --- expand this device's local tokens into (token, slot) rows ---
         token_of_row = jnp.arange(local_Nk, dtype=jnp.int32) // k
         rows = hidden_nd[token_of_row]  # (local_Nk, D)
@@ -423,11 +569,28 @@ def grouped_moe_ep(
         up_pad = jnp.concatenate([up_w, jnp.zeros_like(up_w[:1])], axis=0)
         down_pad = jnp.concatenate([down_w, jnp.zeros_like(down_w[:1])], axis=0)
 
+        # Pad each local LoRA A/B stack with the same trailing zero dummy expert so
+        # padding rows contribute a zero delta (matches gate_pad/up_pad/down_pad).
+        def _pad_expert(w):
+            return jnp.concatenate([w, jnp.zeros_like(w[:1])], axis=0)
+
+        if lora_ops:
+            gA, gB, uA, uB, dA, dB = lora_ops
+            gate_lora_pad = (_pad_expert(gA), _pad_expert(gB), gate_scaling)
+            up_lora_pad = (_pad_expert(uA), _pad_expert(uB), up_scaling)
+            down_lora_pad = (_pad_expert(dA), _pad_expert(dB), down_scaling)
+        else:
+            gate_lora_pad = up_lora_pad = down_lora_pad = (None, None, None)
+
         # --- grouped GEMM over LOCAL experts ---
         g_out = _ragged_dot(rows_local, gate_pad, gs_padded, primitive)
         u_out = _ragged_dot(rows_local, up_pad, gs_padded, primitive)
+        # Per-local-expert LoRA on gate/up (same per-expert delta as the dense path).
+        g_out = g_out + _lora_ep_delta(rows_local, *gate_lora_pad, gs_padded)
+        u_out = u_out + _lora_ep_delta(rows_local, *up_lora_pad, gs_padded)
         act = jax.nn.silu(g_out) * u_out
         d_out = _ragged_dot(act, down_pad, gs_padded, primitive)  # (cap, D)
+        d_out = d_out + _lora_ep_delta(act, *down_lora_pad, gs_padded)
 
         # Undo local reorder, then combine (inverse all-to-all) back to the source.
         d_unreordered = d_out[inv_reorder]  # arrival order (source-major, at recv_starts)
@@ -445,20 +608,43 @@ def grouped_moe_ep(
         out_sorted = combined[inv_perm] * flat_w.reshape(local_Nk, 1)
         return out_sorted.reshape(n_local, k, D).sum(axis=1)  # (n_local, D)
 
+    base_operands = (hidden_ND, topk_idx_Nk, topk_weights_Nk, gate_EDF, up_EDF, down_EFD)
+    base_specs = (
+        P(expert_axis, None),  # hidden tokens sharded on expert axis
+        P(expert_axis, None),  # topk idx
+        P(expert_axis, None),  # topk weights
+        P(expert_axis, None, None),  # gate experts sharded
+        P(expert_axis, None, None),  # up
+        P(expert_axis, None, None),  # down
+    )
+    if _has_lora:
+        # Each adapter MUST be attached when any is (the model always injects all
+        # three together); assert to avoid a silent shape mismatch.
+        assert (
+            gate_lora_a is not None and up_lora_a is not None and down_lora_a is not None
+        ), "grouped_moe_ep: LoRA must be attached to all of gate/up/down or none."
+        gate_scaling, up_scaling, down_scaling = (
+            gate_lora_a[2], up_lora_a[2], down_lora_a[2]
+        )
+        # A: (E, in, r) sharded on the expert axis; B: (E, r, out) likewise.
+        lora_operands = (
+            gate_lora_a[0], gate_lora_a[1],
+            up_lora_a[0], up_lora_a[1],
+            down_lora_a[0], down_lora_a[1],
+        )
+        lora_specs = (P(expert_axis, None, None),) * 6
+    else:
+        gate_scaling = up_scaling = down_scaling = 1.0
+        lora_operands = ()
+        lora_specs = ()
+
     out = shard_map(
         per_device,
         mesh=mesh,
-        in_specs=(
-            P(expert_axis, None),  # hidden tokens sharded on expert axis
-            P(expert_axis, None),  # topk idx
-            P(expert_axis, None),  # topk weights
-            P(expert_axis, None, None),  # gate experts sharded
-            P(expert_axis, None, None),  # up
-            P(expert_axis, None, None),  # down
-        ),
+        in_specs=(*base_specs, *lora_specs),
         out_specs=P(expert_axis, None),  # output tokens sharded on expert axis
         check_vma=False,
-    )(hidden_ND, topk_idx_Nk, topk_weights_Nk, gate_EDF, up_EDF, down_EFD)
+    )(*base_operands, *lora_operands)
     return out
 
 
