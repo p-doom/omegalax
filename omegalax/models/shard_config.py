@@ -17,6 +17,10 @@ ShardingSpec: TypeAlias = PartitionSpec
 # topology-aware, so these rules and all downstream NamedShardings are unaffected.
 DEFAULT_AXIS_RULES: tuple[tuple[str, str | None], ...] = (
     ("batch", ("dp", "fsdp")),
+    # Context / sequence parallelism: the token (T) axis is sharded on "cp".
+    # When cp_size == 1 this rule is dropped by _filter_axis (strict no-op), so
+    # the T axis is replicated exactly as before. See omegalax.distributed.mesh.
+    ("seq", "cp"),
     ("vocab", "tp"),
     ("embed", "fsdp"),
     ("hidden", None),
@@ -45,7 +49,14 @@ def axis_rules_for_mesh(mesh: Mesh) -> tuple[tuple[str, str | None], ...]:
 
 @dataclasses.dataclass(slots=True, frozen=True)
 class ShardConfig:
-    """Activation sharding layout for forward passes (device-axis PartitionSpecs)."""
+    """Activation sharding layout for forward passes (device-axis PartitionSpecs).
+
+    The T (token / sequence) axis of the ``act_bt*`` specs is where context
+    parallelism (CP) lives: :meth:`context_parallel` shards it on ``"cp"``. When
+    ``cp_size == 1`` the ``"cp"`` entry is dropped by :func:`shard_config_for_mesh`
+    (via :func:`_filter_axis`), so a CP config collapses to exactly the non-CP
+    ``default`` layout -- CP is a strict no-op at cp_size==1.
+    """
 
     act_btd: ShardingSpec
     act_btf: ShardingSpec
@@ -53,8 +64,14 @@ class ShardConfig:
 
     @property
     def logits_btv(self) -> ShardingSpec:
-        """Logits sharding: (batch, seq, vocab), batch from act_btd, vocab from act_btf (TP)."""
-        return P(self.act_btd[0], None, self.act_btf[2])
+        """Logits sharding: (batch, seq, vocab).
+
+        batch from ``act_btd`` (axis 0), seq (T) from ``act_btd`` (axis 1) so the
+        CP sequence sharding carries through to the logits einsum, and vocab from
+        ``act_btf`` (TP). Under the non-CP ``default``/``no_sharding`` configs the
+        seq axis is ``None`` (unchanged); under a CP config it is ``"cp"``.
+        """
+        return P(self.act_btd[0], self.act_btd[1], self.act_btf[2])
 
     @staticmethod
     def no_sharding():
@@ -71,6 +88,22 @@ class ShardConfig:
             act_btd=P(("dp", "fsdp"), None, None),
             act_btf=P(("dp", "fsdp"), None, "tp"),
             act_btnh=P(("dp", "fsdp"), None, "tp", None),
+        )
+
+    @staticmethod
+    def context_parallel():
+        """Sharding layout with the T (sequence) axis sharded on ``"cp"``.
+
+        Identical to :meth:`default` except the token axis (axis 1 of the
+        ``act_bt*`` specs) carries the ``"cp"`` mesh axis, so activations are
+        sequence-sharded for context parallelism. Composed with TP head sharding
+        (``"tp"`` on the head axis) as usual. At ``cp_size == 1`` this is a strict
+        no-op (the ``"cp"`` axis is filtered out and it becomes :meth:`default`).
+        """
+        return ShardConfig(
+            act_btd=P(("dp", "fsdp"), "cp", None),
+            act_btf=P(("dp", "fsdp"), "cp", "tp"),
+            act_btnh=P(("dp", "fsdp"), "cp", "tp", None),
         )
 
 

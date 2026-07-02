@@ -4,6 +4,7 @@ from flax import nnx
 from jax.sharding import PartitionSpec as P, reshard
 from tokamax import dot_product_attention
 
+from omegalax.attention import context_parallel_attention
 from .norms import RMSNorm
 from .rope import apply_rope, generate_pos_embeddings
 from .utils import compute_positions_from_segment_ids, count_left_pads
@@ -101,15 +102,34 @@ class Attention(nnx.Module):
             k_BTGK = apply_rope(k_BTGK, sin_BTK, cos_BTK)
 
             B, T, H, K = q_BTHK.shape
-            attn_BTHK = dot_product_attention(
-                q_BTHK,
-                k_BTGK,
-                v_BTGK,
-                is_causal=True,
-                scale=self.scale,
-                implementation=self._attn_backend,
-                q_sharding=self._q_sharding,
-            )
+            # Context parallelism: when the T axis is sharded on "cp" (cp_size >
+            # 1), run the all-gather-KV shard_map path (tokamax cannot do
+            # seq-sharded KV). RoPE above is positionwise so shard-local sin/cos
+            # from seq-sharded positions are already correct. Else the existing
+            # (TP head-sharded) tokamax path.
+            heads_shd = self.shd_cfg.act_btnh
+            cp_axis = heads_shd[1]
+            mesh = jax.sharding.get_abstract_mesh()
+            if cp_axis is not None and mesh.shape[cp_axis] > 1:
+                attn_BTHK = context_parallel_attention(
+                    q_BTHK,
+                    k_BTGK,
+                    v_BTGK,
+                    cp_axis=cp_axis,
+                    scale=self.scale,
+                    heads_spec=P(*heads_shd),
+                    implementation=self._attn_backend,
+                )
+            else:
+                attn_BTHK = dot_product_attention(
+                    q_BTHK,
+                    k_BTGK,
+                    v_BTGK,
+                    is_causal=True,
+                    scale=self.scale,
+                    implementation=self._attn_backend,
+                    q_sharding=self._q_sharding,
+                )
             out_BTD = self.o_proj(
                 jax.lax.reshape(
                     attn_BTHK, (B, T, self.num_heads * K), out_sharding=self.shd_cfg.act_btf

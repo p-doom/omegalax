@@ -13,6 +13,7 @@ from flax import nnx
 from jax.sharding import PartitionSpec
 from tokamax import dot_product_attention
 
+from omegalax.attention import context_parallel_attention
 from .config import Qwen3_5TextConfig
 from .norms import RMSNorm
 from .rope import apply_text_rope
@@ -116,15 +117,33 @@ class Attention(nnx.Module):
 
         q_BTHK, k_BTGK = apply_text_rope(q_BTHK, k_BTGK, cos_BTK, sin_BTK)
 
-        attn_BTHK = dot_product_attention(
-            q_BTHK,
-            k_BTGK,
-            v_BTGK,
-            is_causal=True,
-            scale=self.scale,
-            implementation=self._attn_backend,
-            q_sharding=self._q_sharding,
-        )
+        # Context parallelism: when the sequence (T) axis is sharded on "cp"
+        # (cp_size > 1), tokamax cannot do seq-sharded KV, so we run the
+        # all-gather-KV shard_map path (RoPE above is positionwise, so shard-local
+        # cos/sin from seq-sharded position_ids are already correct -- no change).
+        # Otherwise fall back to the existing (TP head-sharded) tokamax path.
+        cp_axis = heads_shd[1]
+        mesh = jax.sharding.get_abstract_mesh()
+        if cp_axis is not None and mesh.shape[cp_axis] > 1:
+            attn_BTHK = context_parallel_attention(
+                q_BTHK,
+                k_BTGK,
+                v_BTGK,
+                cp_axis=cp_axis,
+                scale=self.scale,
+                heads_spec=P(*heads_shd),
+                implementation=self._attn_backend,
+            )
+        else:
+            attn_BTHK = dot_product_attention(
+                q_BTHK,
+                k_BTGK,
+                v_BTGK,
+                is_causal=True,
+                scale=self.scale,
+                implementation=self._attn_backend,
+                q_sharding=self._q_sharding,
+            )
         attn_out_BTD = jax.lax.reshape(
             attn_BTHK, (B, T, self.num_heads * self.head_dim), out_sharding=self.shd_cfg.act_btf
         )

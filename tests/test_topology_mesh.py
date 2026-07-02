@@ -30,14 +30,21 @@ from omegalax.distributed.mesh import (  # noqa: E402
     make_mesh,
 )
 
-_AXES = ("tp", "fsdp", "dp")
+_AXES = ("tp", "cp", "fsdp", "dp")
 
 
 class DeriveIciDcnTest(parameterized.TestCase):
-    """Pure-function tests of the legacy (tp, fsdp, dp) -> ICI/DCN mapping."""
+    """Pure-function tests of the legacy (tp, cp, fsdp, dp) -> ICI/DCN mapping.
+
+    Context parallelism (``cp``) rides the NVLink domain next to ``tp``. When
+    ``cp=1`` (the default), the mapping is a strict no-op relative to the pre-CP
+    behavior: ``ici_cp == dcn_cp == 1`` and the tp/fsdp/dp split is unchanged.
+    """
 
     @parameterized.named_parameters(
-        # name, tp, fsdp, dp, ldc, nproc, expected (ici_tp,ici_fsdp,ici_dp,dcn_tp,dcn_fsdp,dcn_dp)
+        # name, tp, fsdp, dp, ldc, nproc, expected
+        #   expected = (ici_tp,ici_fsdp,ici_dp,dcn_tp,dcn_fsdp,dcn_dp) -- CP degrees
+        #   are all 1 here (cp defaults to 1), so they are asserted separately.
         # --- single node (nproc=1): everything lands in ICI ---
         ("single_node_tp_only", 8, 1, 1, 8, 1, (8, 1, 1, 1, 1, 1)),
         ("single_node_tp_fsdp", 2, 4, 1, 8, 1, (2, 4, 1, 1, 1, 1)),
@@ -57,11 +64,16 @@ class DeriveIciDcnTest(parameterized.TestCase):
         ("combined_spill", 2, 8, 2, 8, 4, (2, 4, 1, 1, 2, 2)),
     )
     def test_split(self, tp, fsdp, dp, ldc, nproc, expected):
+        # cp defaults to 1 -> strict no-op relative to the pre-CP mapping.
         cfg = derive_ici_dcn(tp, fsdp, dp, local_device_count=ldc, num_processes=nproc)
         self.assertEqual(
             (cfg.ici_tp, cfg.ici_fsdp, cfg.ici_dp, cfg.dcn_tp, cfg.dcn_fsdp, cfg.dcn_dp),
             expected,
         )
+        # CP is a size-1 no-op here.
+        self.assertEqual(cfg.ici_cp, 1)
+        self.assertEqual(cfg.dcn_cp, 1)
+        self.assertEqual(cfg.cp_size, 1)
         # TP is ICI-only; DP is DCN-only.
         self.assertEqual(cfg.dcn_tp, 1)
         self.assertEqual(cfg.ici_dp, 1)
@@ -70,8 +82,49 @@ class DeriveIciDcnTest(parameterized.TestCase):
         self.assertEqual(cfg.fsdp_size, fsdp)
         self.assertEqual(cfg.dp_size, dp)
         # ICI tiles one node exactly; DCN tiles the node count exactly.
-        self.assertEqual(cfg.ici_tp * cfg.ici_fsdp * cfg.ici_dp, ldc)
-        self.assertEqual(cfg.dcn_tp * cfg.dcn_fsdp * cfg.dcn_dp, nproc)
+        self.assertEqual(cfg.ici_tp * cfg.ici_cp * cfg.ici_fsdp * cfg.ici_dp, ldc)
+        self.assertEqual(cfg.dcn_tp * cfg.dcn_cp * cfg.dcn_fsdp * cfg.dcn_dp, nproc)
+
+    @parameterized.named_parameters(
+        # name, tp, cp, fsdp, dp, ldc, nproc, expected 8-tuple
+        #   (ici_tp,ici_cp,ici_fsdp,ici_dp, dcn_tp,dcn_cp,dcn_fsdp,dcn_dp)
+        # --- CP rides ICI next to TP (single node: prod(ici) must == ldc) ---
+        ("cp_only", 1, 8, 1, 1, 8, 1, (1, 8, 1, 1, 1, 1, 1, 1)),
+        ("tp2_cp4", 2, 4, 1, 1, 8, 1, (2, 4, 1, 1, 1, 1, 1, 1)),
+        # tp*cp fill part of the node, fsdp fills the rest (ici)
+        ("tp2_cp2_fsdp2", 2, 2, 2, 1, 8, 1, (2, 2, 2, 1, 1, 1, 1, 1)),
+        # tp*cp fill the node, dp -> DCN (multi-node)
+        ("tp2_cp4_dp2_dcn", 2, 4, 1, 2, 8, 2, (2, 4, 1, 1, 1, 1, 1, 2)),
+    )
+    def test_cp_split(self, tp, cp, fsdp, dp, ldc, nproc, expected):
+        cfg = derive_ici_dcn(tp, fsdp, dp, local_device_count=ldc, num_processes=nproc, cp_size=cp)
+        self.assertEqual(
+            (
+                cfg.ici_tp,
+                cfg.ici_cp,
+                cfg.ici_fsdp,
+                cfg.ici_dp,
+                cfg.dcn_tp,
+                cfg.dcn_cp,
+                cfg.dcn_fsdp,
+                cfg.dcn_dp,
+            ),
+            expected,
+        )
+        # TP and CP are ICI-only.
+        self.assertEqual(cfg.dcn_tp, 1)
+        self.assertEqual(cfg.dcn_cp, 1)
+        self.assertEqual(cfg.tp_size, tp)
+        self.assertEqual(cfg.cp_size, cp)
+        self.assertEqual(cfg.fsdp_size, fsdp)
+        self.assertEqual(cfg.dp_size, dp)
+        self.assertEqual(cfg.ici_tp * cfg.ici_cp * cfg.ici_fsdp * cfg.ici_dp, ldc)
+        self.assertEqual(cfg.dcn_tp * cfg.dcn_cp * cfg.dcn_fsdp * cfg.dcn_dp, nproc)
+
+    def test_tpcp_exceeds_local_device_count_raises(self):
+        # The correctness guardrail: TP*CP must jointly fit within the NVLink domain.
+        with self.assertRaisesRegex(ValueError, "exceeds local_device_count"):
+            derive_ici_dcn(4, 1, 1, local_device_count=8, num_processes=2, cp_size=4)
 
     def test_tp_exceeds_local_device_count_raises(self):
         # The correctness guardrail: TP must fit within the NVLink domain.
@@ -97,14 +150,17 @@ class DeriveIciDcnTest(parameterized.TestCase):
             derive_ici_dcn(0, 1, 1, local_device_count=8, num_processes=1)
         with self.assertRaisesRegex(ValueError, "must be > 0"):
             derive_ici_dcn(1, 1, 1, local_device_count=0, num_processes=1)
+        with self.assertRaisesRegex(ValueError, "must be > 0"):
+            derive_ici_dcn(1, 1, 1, local_device_count=8, num_processes=1, cp_size=0)
 
     def test_parallelism_config_properties(self):
         cfg = ParallelismConfig(
-            ici_tp=2, ici_fsdp=4, ici_dp=1, dcn_tp=1, dcn_fsdp=2, dcn_dp=3
+            ici_tp=2, ici_cp=1, ici_fsdp=4, ici_dp=1, dcn_tp=1, dcn_cp=1, dcn_fsdp=2, dcn_dp=3
         )
-        self.assertEqual(cfg.ici_shape, (2, 4, 1))
-        self.assertEqual(cfg.dcn_shape, (1, 2, 3))
+        self.assertEqual(cfg.ici_shape, (2, 1, 4, 1))
+        self.assertEqual(cfg.dcn_shape, (1, 1, 2, 3))
         self.assertEqual(cfg.tp_size, 2)
+        self.assertEqual(cfg.cp_size, 1)
         self.assertEqual(cfg.fsdp_size, 8)
         self.assertEqual(cfg.dp_size, 3)
 
@@ -117,23 +173,30 @@ class FakedDeviceMeshTest(parameterized.TestCase):
         self.assertEqual(jax.process_count(), 1)
 
     @parameterized.named_parameters(
-        ("tp8", 8, 1, 1),
-        ("fsdp8", 1, 8, 1),
-        ("dp8", 1, 1, 8),
-        ("tp2_fsdp4", 2, 4, 1),
-        ("tp2_fsdp2_dp2", 2, 2, 2),
-        ("tp4_dp2", 4, 1, 2),
+        # (tp, cp, fsdp, dp) -- product must equal 8
+        ("tp8", 8, 1, 1, 1),
+        ("fsdp8", 1, 1, 8, 1),
+        ("dp8", 1, 1, 1, 8),
+        ("tp2_fsdp4", 2, 1, 4, 1),
+        ("tp2_fsdp2_dp2", 2, 1, 2, 2),
+        ("tp4_dp2", 4, 1, 1, 2),
+        # --- CP variants (cp rides ICI next to tp) ---
+        ("cp8", 1, 8, 1, 1),
+        ("tp2_cp2_fsdp2", 2, 2, 2, 1),
+        ("cp2_dp4", 1, 2, 1, 4),
+        ("tp2_cp4", 2, 4, 1, 1),
     )
-    def test_make_mesh_shape_and_axes(self, tp, fsdp, dp):
-        mesh = make_mesh(tp_size=tp, fsdp_size=fsdp, dp_size=dp)
+    def test_make_mesh_shape_and_axes(self, tp, cp, fsdp, dp):
+        mesh = make_mesh(tp_size=tp, fsdp_size=fsdp, dp_size=dp, cp_size=cp)
         self.assertIsInstance(mesh, Mesh)
         self.assertEqual(tuple(mesh.axis_names), _AXES)
         self.assertEqual(mesh.shape["tp"], tp)
+        self.assertEqual(mesh.shape["cp"], cp)
         self.assertEqual(mesh.shape["fsdp"], fsdp)
         self.assertEqual(mesh.shape["dp"], dp)
         # Axis types must be Explicit to match jax.make_mesh's default; the model
         # code relies on Explicit-typed axes for out_sharding= in .at[].get().
-        self.assertEqual(tuple(mesh.axis_types), (AxisType.Explicit,) * 3)
+        self.assertEqual(tuple(mesh.axis_types), (AxisType.Explicit,) * len(_AXES))
         # All 8 devices used exactly once.
         ids = sorted(d.id for d in mesh.devices.flatten())
         self.assertEqual(ids, list(range(8)))
@@ -142,23 +205,29 @@ class FakedDeviceMeshTest(parameterized.TestCase):
         # Single-process path: create_device_mesh reshape; every device present once.
         mesh = make_mesh(tp_size=2, fsdp_size=2, dp_size=2)
         grid = np.vectorize(lambda d: d.id)(mesh.devices)
-        self.assertEqual(grid.shape, (2, 2, 2))
+        self.assertEqual(grid.shape, (2, 1, 2, 2))  # (tp, cp, fsdp, dp), cp=1
+        self.assertEqual(sorted(grid.flatten().tolist()), list(range(8)))
+
+    def test_cp_placement_uses_all_devices(self):
+        mesh = make_mesh(tp_size=2, fsdp_size=1, dp_size=1, cp_size=4)
+        grid = np.vectorize(lambda d: d.id)(mesh.devices)
+        self.assertEqual(grid.shape, (2, 4, 1, 1))  # (tp, cp, fsdp, dp)
         self.assertEqual(sorted(grid.flatten().tolist()), list(range(8)))
 
     def test_make_hierarchical_mesh_single_process(self):
         # nproc==1 so dcn_shape must be all-ones and prod(ici)==device_count.
-        mesh = make_hierarchical_mesh((2, 2, 2), (1, 1, 1))
+        mesh = make_hierarchical_mesh((2, 1, 2, 2), (1, 1, 1, 1))
         self.assertEqual(tuple(mesh.axis_names), _AXES)
         self.assertEqual(mesh.shape["tp"], 2)
 
     def test_hierarchical_ici_product_mismatch_raises(self):
         with self.assertRaisesRegex(ValueError, "!= local_device_count"):
-            make_hierarchical_mesh((2, 2, 1), (1, 1, 1))  # prod ici = 4 != 8
+            make_hierarchical_mesh((2, 1, 2, 1), (1, 1, 1, 1))  # prod ici = 4 != 8
 
     def test_hierarchical_dcn_product_mismatch_raises(self):
         # prod(dcn)=2 but nproc==1.
         with self.assertRaisesRegex(ValueError, "!= num_processes"):
-            make_hierarchical_mesh((2, 2, 2), (1, 1, 2))
+            make_hierarchical_mesh((2, 1, 2, 2), (1, 1, 1, 2))
 
     def test_make_mesh_bad_device_count_raises(self):
         with self.assertRaisesRegex(ValueError, "does not match device_count"):
@@ -172,16 +241,17 @@ class FakedDeviceMeshTest(parameterized.TestCase):
 
     def test_explicit_parallelism_config_override(self):
         cfg = ParallelismConfig(
-            ici_tp=2, ici_fsdp=2, ici_dp=2, dcn_tp=1, dcn_fsdp=1, dcn_dp=1
+            ici_tp=2, ici_cp=1, ici_fsdp=2, ici_dp=2, dcn_tp=1, dcn_cp=1, dcn_fsdp=1, dcn_dp=1
         )
         mesh = make_mesh(tp_size=2, fsdp_size=2, dp_size=2, parallelism=cfg)
         self.assertEqual(mesh.shape["tp"], 2)
+        self.assertEqual(mesh.shape["cp"], 1)
         self.assertEqual(mesh.shape["fsdp"], 2)
         self.assertEqual(mesh.shape["dp"], 2)
 
     def test_explicit_parallelism_config_conflict_raises(self):
         cfg = ParallelismConfig(
-            ici_tp=2, ici_fsdp=2, ici_dp=2, dcn_tp=1, dcn_fsdp=1, dcn_dp=1
+            ici_tp=2, ici_cp=1, ici_fsdp=2, ici_dp=2, dcn_tp=1, dcn_cp=1, dcn_fsdp=1, dcn_dp=1
         )
         with self.assertRaisesRegex(ValueError, "conflict with requested sizes"):
             make_mesh(tp_size=4, fsdp_size=1, dp_size=2, parallelism=cfg)
