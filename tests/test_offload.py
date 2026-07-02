@@ -195,6 +195,53 @@ class OptimizerOffloadPlacementTest(absltest.TestCase):
         # Every moment buffer now lives in host memory.
         self.assertEqual(_opt_state_memory_kinds(opt), {HOST_MEMORY_KIND})
 
+    def test_stored_device_shardings_structure_matches_opt_state(self):
+        # Regression guard for the staging fix: the device-sharding pytree
+        # captured at enable_state_offload() must map 1:1 onto the SAME structure
+        # ``update`` feeds to / gets back from optax (``nnx.pure(self.opt_state)``
+        # and the ``tx.update`` output). A mismatch would raise "Expected tuple,
+        # got State" inside the jitted step on the accelerator. We can't run the
+        # host<->device step on CPU, but we CAN assert the tree structures match,
+        # which is what the fix hinges on.
+        mesh = ensure_mesh(tp_size=1, fsdp_size=1, dp_size=1)
+        model, _ = _build_model(_fp32_cfg())
+        with mesh_rules(mesh):
+            opt = build_optimizer(model, TrainConfig(offload_optimizer=True))
+        stored = opt._opt_state_device_shardings
+        opt_state_pure = nnx.pure(opt.opt_state)
+        self.assertEqual(
+            jax.tree_util.tree_structure(stored),
+            jax.tree_util.tree_structure(opt_state_pure),
+            "stored device-sharding tree structure diverged from nnx.pure(opt_state); "
+            "the in-jit staging map would fail.",
+        )
+        # Every stored sharding carries the DEVICE memory kind (staging target).
+        for shd in jax.tree_util.tree_leaves(
+            stored, is_leaf=lambda x: x is None or hasattr(x, "memory_kind")
+        ):
+            if shd is not None:
+                self.assertEqual(shd.memory_kind, DEVICE_MEMORY_KIND)
+
+    def test_stage_opt_state_preserves_structure_and_values(self):
+        # _stage_opt_state must return the same tree structure and (on CPU's
+        # single memory kind) the same values -- exercising the map that fires
+        # inside the jitted step, minus the host<->device transfer.
+        mesh = ensure_mesh(tp_size=1, fsdp_size=1, dp_size=1)
+        model, _ = _build_model(_fp32_cfg())
+        with mesh_rules(mesh):
+            opt = build_optimizer(model, TrainConfig(offload_optimizer=True))
+        opt_state_pure = nnx.pure(opt.opt_state)
+        staged = opt._stage_opt_state(opt_state_pure, DEVICE_MEMORY_KIND)
+        self.assertEqual(
+            jax.tree_util.tree_structure(staged),
+            jax.tree_util.tree_structure(opt_state_pure),
+        )
+        for a, b in zip(
+            jax.tree_util.tree_leaves(opt_state_pure),
+            jax.tree_util.tree_leaves(staged),
+        ):
+            np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+
     def test_place_tree_roundtrip(self):
         mesh = ensure_mesh(tp_size=1, fsdp_size=1, dp_size=1)
         model, _ = _build_model(_fp32_cfg())

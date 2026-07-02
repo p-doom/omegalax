@@ -171,7 +171,14 @@ def _restore_sft_checkpoint(
     restore_args = checkpoint_utils.make_grain_restore_args(abstract_state, input_iter)
     restored = checkpoint_manager.restore(latest_step, args=restore_args)
     train_state = restored["train_state"]
+    was_offloaded = optimizer.offload_optimizer_state
     nnx.update(optimizer, train_state["optimizer"])
+    # Orbax restores the opt_state onto ``device`` (it repopulates shardings from
+    # the sharding file, dropping the ``pinned_host`` memory kind), so re-apply
+    # the host placement after restore to keep the moments off HBM. Idempotent;
+    # re-captures the device shardings from the restored on-device state.
+    if was_offloaded:
+        optimizer.enable_state_offload()
     return (
         optimizer,
         int(latest_step),
