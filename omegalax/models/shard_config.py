@@ -34,11 +34,20 @@ DEFAULT_AXIS_RULES: tuple[tuple[str, str | None], ...] = (
 
 
 def _filter_axis(axis, mesh: Mesh):
-    """Drop mesh axes with size 1 from a single axis spec or tuple of axis specs."""
+    """Drop mesh axes with size 1 (or absent from the mesh) from a single axis
+    spec or tuple of axis specs.
+
+    An axis that is not one of ``mesh.axis_names`` (e.g. ``"cp"`` on a plain
+    ``('tp','fsdp','dp')`` training mesh, or on the dedicated ``('expert',)`` MoE
+    expert-parallel mesh) is treated exactly like a size-1 axis: there is nothing
+    to shard on, so the rule is dropped. This is the "strict no-op when cp_size
+    == 1" guarantee (see ``DEFAULT_AXIS_RULES`` / ``ShardConfig``) extended to the
+    case where the axis is entirely absent -- without it, ``mesh.shape[a]`` would
+    raise ``KeyError`` on any mesh that omits the axis."""
     if axis is None:
         return None
     axes = (axis,) if isinstance(axis, str) else axis
-    kept = tuple(a for a in axes if mesh.shape[a] > 1)
+    kept = tuple(a for a in axes if a in mesh.shape and mesh.shape[a] > 1)
     return kept[0] if len(kept) == 1 else (kept or None)
 
 
