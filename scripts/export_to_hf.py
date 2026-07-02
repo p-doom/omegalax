@@ -31,6 +31,7 @@ from flax import nnx
 
 from omegalax import export as export_lib
 from omegalax import registry
+from omegalax.distributed.launch import init_distributed
 from omegalax.distributed.mesh import ensure_mesh, mesh_rules
 from omegalax.distributed.xla_flags import configure_gpu_xla_flags
 from omegalax.vlm import api as vlm_api
@@ -234,7 +235,7 @@ def main(_) -> None:
     # (i.e. before jax.distributed.initialize()); XLA reads XLA_FLAGS lazily at backend
     # init, so this must run first. No-op on CPU/TPU and preserves user XLA_FLAGS.
     applied_xla_flags = configure_gpu_xla_flags(enable=FLAGS.gpu_xla_perf_flags)
-    jax.distributed.initialize()
+    init_distributed()
     if applied_xla_flags is not None and jax.process_index() == 0:
         print(f"XLA_FLAGS={applied_xla_flags}")
     model, cfg = load_model()

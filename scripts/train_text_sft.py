@@ -19,6 +19,7 @@ from omegalax.data.grain_pipeline import (
     make_grain_read_options,
     required_epochs_for_batches,
 )
+from omegalax.distributed.launch import init_distributed
 from omegalax.distributed.mesh import process_local_batch_size
 from omegalax.distributed.xla_flags import configure_gpu_xla_flags
 from omegalax.registry import resolve_hf_repo_id
@@ -189,9 +190,9 @@ def main(_) -> None:
     # init, so this must run first. No-op on CPU/TPU and preserves user XLA_FLAGS.
     applied_xla_flags = configure_gpu_xla_flags(enable=FLAGS.gpu_xla_perf_flags)
     jax.config.update("jax_compilation_cache_dir", FLAGS.jax_cache_dir)
-    jax.distributed.initialize()
+    launch_info = init_distributed()
     startup_log(f"jax_compilation_cache_dir={FLAGS.jax_cache_dir}")
-    startup_log("jax.distributed initialized")
+    startup_log(f"launch mode={launch_info.mode.value}: {launch_info.reason}")
     if applied_xla_flags is not None:
         startup_log(f"XLA_FLAGS={applied_xla_flags}")
 
