@@ -125,8 +125,31 @@ def export_qwen3_5_to_safetensors(
 
     hf_tensors: dict[str, np.ndarray] = {}
     unmatched: list[str] = []
+    # Buffers for re-fusing the per-q/k/v DeltaNet projections and conv weights
+    # back into the single fused HF tensors. keyed by (layer_idx, part).
+    qkv_kernel_buf: dict[tuple[str, str], np.ndarray] = {}
+    conv_weight_buf: dict[tuple[str, str], np.ndarray] = {}
 
     def _handle_special(jax_key: str, value) -> bool:
+        # DeltaNet per-q/k/v input projections: buffer, fuse after the loop.
+        m = re.fullmatch(
+            r"text\.layers\.([0-9]+)\.linear_attn\.in_proj_([qkv])\.kernel", jax_key
+        )
+        if m:
+            layer_idx, part = m.group(1), m.group(2)
+            # JAX kernel (D, out) -> HF weight (out, D) via .T (Transform.LINEAR).
+            qkv_kernel_buf[(layer_idx, part)] = np.asarray(jax.device_get(value)).T
+            return True
+
+        # DeltaNet per-q/k/v conv weights: buffer, fuse after the loop.
+        m = re.fullmatch(
+            r"text\.layers\.([0-9]+)\.linear_attn\.conv_weight_([qkv])", jax_key
+        )
+        if m:
+            layer_idx, part = m.group(1), m.group(2)
+            conv_weight_buf[(layer_idx, part)] = np.asarray(jax.device_get(value))
+            return True
+
         if jax_key == "lm_head.kernel" and cfg.text_config.tie_word_embeddings:
             return True
 
@@ -151,16 +174,6 @@ def export_qwen3_5_to_safetensors(
         if jax_key == "vision.merger.norm.weight":
             arr = np.asarray(jax.device_get(value))
             hf_tensors["model.visual.merger.norm.weight"] = arr.astype(np.float32)
-            return True
-
-        # Linear attention conv1d weight: (C, K) -> (C, 1, K)
-        m = re.fullmatch(r"text\.layers\.([0-9]+)\.linear_attn\.conv_weight", jax_key)
-        if m:
-            layer_idx = m.group(1)
-            arr = np.asarray(jax.device_get(value))
-            hf_tensors[f"model.language_model.layers.{layer_idx}.linear_attn.conv1d.weight"] = arr[
-                :, None, :
-            ].astype(np.float32)
             return True
 
         # dt_bias
@@ -246,6 +259,20 @@ def export_qwen3_5_to_safetensors(
             break
         if not matched:
             unmatched.append(jax_key)
+
+    # Re-fuse the per-q/k/v DeltaNet projection and conv weights into the single
+    # fused HF tensors (inverse of the split done in the loader).
+    for layer_idx in sorted({k[0] for k in qkv_kernel_buf}):
+        parts = [qkv_kernel_buf[(layer_idx, p)] for p in ("q", "k", "v")]
+        hf_tensors[
+            f"model.language_model.layers.{layer_idx}.linear_attn.in_proj_qkv.weight"
+        ] = np.concatenate(parts, axis=0).astype(np.float32)
+    for layer_idx in sorted({k[0] for k in conv_weight_buf}):
+        parts = [conv_weight_buf[(layer_idx, p)] for p in ("q", "k", "v")]
+        fused_CK = np.concatenate(parts, axis=0)
+        hf_tensors[
+            f"model.language_model.layers.{layer_idx}.linear_attn.conv1d.weight"
+        ] = fused_CK[:, None, :].astype(np.float32)
 
     if unmatched:
         raise RuntimeError(
