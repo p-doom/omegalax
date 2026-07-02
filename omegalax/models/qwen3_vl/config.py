@@ -54,6 +54,8 @@ class Qwen3VLConfig:
     mlp_only_layers: tuple[int, ...] = dataclasses.field(default_factory=tuple)
     decoder_sparse_step: int = 1
     norm_topk_prob: bool = True
+    # MoE compute backend: "dense" (reference einsum) or "grouped"/"grouped_ep".
+    moe_backend: str = "dense"
     shd_cfg: ShardConfig = dataclasses.field(default_factory=ShardConfig.default)
     dtype: Any = jnp.bfloat16
     param_dtype: Any = jnp.float32

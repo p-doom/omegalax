@@ -448,6 +448,56 @@ def mesh_rules(mesh: Mesh) -> Iterator[Mesh]:
         yield mesh
 
 
+# --- Expert parallelism (MoE grouped-GEMM + ragged all-to-all) ---------------
+# Dedicated 1-D ``('expert',)`` mesh for the expert-parallel MoE path (consumed by
+# omegalax.models.moe_grouped.grouped_moe_ep), deliberately SEPARATE from the flat
+# ``('tp', 'fsdp', 'dp')`` hierarchical training mesh built above.
+#
+# MERGE RECONCILIATION (feat/moe-ep-grouped-gemm x feat/topology-aware-mesh):
+# The moe-ep branch's original MERGE NOTE suggested folding ``'expert'`` into the
+# unified mesh factory / axis rules. That fold was evaluated and deliberately NOT
+# done, because it would be semantically wrong here:
+#   * The topology-aware factory (make_mesh/make_hierarchical_mesh) is a fixed
+#     3-axis ``_AXES = ('tp','fsdp','dp')`` design whose ICI/DCN invariants
+#     (ici_tp*ici_fsdp*ici_dp == local_device_count, the ensure_mesh _AXES
+#     equality check, and all of test_topology_mesh) assume exactly those 3 axes.
+#     Adding a 4th ``'expert'`` axis to _AXES/ParallelismConfig would break those
+#     invariants and the topology test suite.
+#   * grouped_moe_ep does not COMPOSE expert parallelism with the training mesh:
+#     it reads a standalone ``'expert'`` axis off the active abstract mesh and runs
+#     its own shard_map. No caller in-tree wires EP into the (tp,fsdp,dp) mesh.
+# So ``make_expert_mesh`` is kept as a separate helper, made CONSISTENT with the
+# hierarchical factory: it builds its device grid via ``mesh_utils.create_device_mesh``
+# (same primitive make_hierarchical_mesh uses) and stamps ``AxisType.Explicit``
+# (matching _AXES's axis types) rather than hand-rolling a numpy reshape + bare Mesh.
+# A future unified expert+training mesh (composing 'expert' onto the ICI domain
+# alongside 'tp') is left for later, when a caller actually needs the composition.
+_EXPERT_AXIS = "expert"
+
+
+def make_expert_mesh(ep_size: int, axis_name: str = _EXPERT_AXIS) -> Mesh:
+    """Build a 1-D expert-parallel mesh over ``ep_size`` devices.
+
+    The stacked expert weights are sharded on ``axis_name`` (each device owns
+    ``E / ep_size`` experts) and the token axis is likewise sharded, so
+    ``grouped_moe_ep`` can dispatch each token to the device owning its expert via
+    ``ragged_all_to_all``. Requires ``jax.device_count() % ep_size == 0``; uses the
+    first ``ep_size`` devices.
+
+    Consistent with :func:`make_hierarchical_mesh`: the device grid is built with
+    ``mesh_utils.create_device_mesh`` and the axis is stamped ``AxisType.Explicit``
+    (matching the ``_AXES`` mesh), so downstream Explicit-sharding code behaves the
+    same on the expert mesh as on the training mesh.
+    """
+    ndev = jax.device_count()
+    if ep_size <= 0 or ndev % ep_size != 0:
+        raise ValueError(
+            f"expert-parallel size {ep_size} must divide device_count={ndev} and be > 0."
+        )
+    device_grid = mesh_utils.create_device_mesh((ep_size,), jax.devices()[:ep_size])
+    return Mesh(device_grid, (axis_name,), axis_types=(AxisType.Explicit,))
+
+
 @contextmanager
 def mesh_rules_for(tp_size: int, fsdp_size: int, dp_size: int) -> Iterator[Mesh]:
     """Resolve a mesh and activate mesh + logical axis rules for a scoped block."""

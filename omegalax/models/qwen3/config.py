@@ -38,6 +38,11 @@ class Qwen3Config:
     norm_topk_prob: bool = True
     aux_loss_coef: float = 0.0
 
+    # MoE compute backend: "dense" (reference, compute-every-expert einsum) or
+    # "grouped" (dropless grouped-GEMM + expert-parallel ragged all-to-all).
+    # Default "dense" keeps existing behavior unchanged for side-by-side diffing.
+    moe_backend: str = "dense"
+
     shd_cfg: ShardConfig = dataclasses.field(default_factory=ShardConfig.default)
     dtype: Any = jnp.bfloat16
 
