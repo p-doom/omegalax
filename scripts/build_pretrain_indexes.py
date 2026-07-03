@@ -1,4 +1,4 @@
-"""Build reusable pretraining indexes for IID and statepassing experiments."""
+"""Build reusable fixed-window pretraining indexes."""
 
 from __future__ import annotations
 
@@ -7,22 +7,15 @@ from pathlib import Path
 from absl import app, flags
 
 from omegalax.data.pretrain_data_set import DEFAULT_CHUNK_LENGTH, DEFAULT_EOS_ID, DataSetReader
-from omegalax.data.pretrain_iid_pipeline import build_iid_chunk_index
-from omegalax.data.pretrain_statepassing import build_statepassing_pair_index
-from omegalax.trainers.pretrain import PretrainMode
+from omegalax.data.pretrain_statepassing import build_statepassing_window_index
 
 FLAGS = flags.FLAGS
 
 flags.DEFINE_string("root", None, "Doc-chain dataset root.", required=True)
 flags.DEFINE_string("out_dir", None, "Output root for index directories.", required=True)
-flags.DEFINE_multi_enum(
-    "pretrain_mode",
-    [mode.value for mode in PretrainMode],
-    [mode.value for mode in PretrainMode],
-    "Modes to build indexes for.",
-)
 flags.DEFINE_multi_string("split", ["train", "val"], "Dataset splits to index.")
 flags.DEFINE_integer("chunk_length", DEFAULT_CHUNK_LENGTH, "Segment length.")
+flags.DEFINE_integer("num_segments", 2, "Fixed number of chunks per statepassing window.")
 flags.DEFINE_integer("eos_id", DEFAULT_EOS_ID, "EOS id used for retained-tail repair.")
 flags.DEFINE_integer("records_per_shard", 100_000, "Records per output shard.")
 flags.DEFINE_bool("overwrite", False, "Overwrite existing output directories.")
@@ -84,29 +77,19 @@ def build_pretrain_index(
     *,
     root: str | Path,
     out_dir: str | Path,
-    pretrain_mode: PretrainMode | str,
     split: str,
     chunk_length: int = DEFAULT_CHUNK_LENGTH,
+    num_segments: int = 2,
     eos_id: int | None = DEFAULT_EOS_ID,
     records_per_shard: int = 100_000,
     overwrite: bool = False,
 ) -> Path:
-    mode = PretrainMode(pretrain_mode)
-    out_path = Path(out_dir).expanduser().resolve() / split / mode.value
-    if mode is PretrainMode.IID_BASELINE:
-        return build_iid_chunk_index(
-            root,
-            out_path,
-            chunk_length=chunk_length,
-            eos_id=eos_id,
-            split=split,
-            records_per_shard=records_per_shard,
-            overwrite=overwrite,
-        )
-    return build_statepassing_pair_index(
+    out_path = Path(out_dir).expanduser().resolve() / split
+    return build_statepassing_window_index(
         root,
         out_path,
         chunk_length=chunk_length,
+        num_segments=num_segments,
         eos_id=eos_id,
         split=split,
         records_per_shard=records_per_shard,
@@ -129,18 +112,17 @@ def main(_) -> None:
             print(f"eos_stats split={split}: {stats}")
 
     for split in FLAGS.split:
-        for mode in FLAGS.pretrain_mode:
-            out = build_pretrain_index(
-                root=FLAGS.root,
-                out_dir=FLAGS.out_dir,
-                pretrain_mode=mode,
-                split=split,
-                chunk_length=FLAGS.chunk_length,
-                eos_id=FLAGS.eos_id,
-                records_per_shard=FLAGS.records_per_shard,
-                overwrite=FLAGS.overwrite,
-            )
-            print(out)
+        out = build_pretrain_index(
+            root=FLAGS.root,
+            out_dir=FLAGS.out_dir,
+            split=split,
+            chunk_length=FLAGS.chunk_length,
+            num_segments=FLAGS.num_segments,
+            eos_id=FLAGS.eos_id,
+            records_per_shard=FLAGS.records_per_shard,
+            overwrite=FLAGS.overwrite,
+        )
+        print(out)
 
 
 if __name__ == "__main__":

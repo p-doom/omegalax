@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
+import subprocess
+import sys
 from unittest import mock
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
@@ -20,57 +23,152 @@ from omegalax.trainers.pretrain import PretrainMode
 
 
 class BuildPretrainIndexScriptTest(absltest.TestCase):
-    def test_iid_mode_calls_iid_builder_with_forwarded_args(self):
-        with mock.patch.object(build_pretrain_indexes, "build_iid_chunk_index") as iid_builder:
-            with mock.patch.object(
-                build_pretrain_indexes, "build_statepassing_pair_index"
-            ) as statepassing_builder:
-                iid_builder.return_value = Path("/tmp/index")
-                out = build_pretrain_indexes.build_pretrain_index(
-                    root="/data/root",
-                    out_dir="/indexes",
-                    pretrain_mode="iid_baseline",
-                    split="train",
-                    chunk_length=123,
-                    eos_id=456,
-                    records_per_shard=789,
-                    overwrite=True,
-                )
+    def test_calls_window_builder_with_forwarded_args(self):
+        with mock.patch.object(
+            build_pretrain_indexes, "build_statepassing_window_index"
+        ) as window_builder:
+            window_builder.return_value = Path("/tmp/index")
+            out = build_pretrain_indexes.build_pretrain_index(
+                root="/data/root",
+                out_dir="/indexes",
+                split="train",
+                chunk_length=123,
+                num_segments=6,
+                eos_id=456,
+                records_per_shard=789,
+                overwrite=True,
+            )
 
         self.assertEqual(out, Path("/tmp/index"))
-        statepassing_builder.assert_not_called()
-        iid_builder.assert_called_once()
-        _, kwargs = iid_builder.call_args
+        window_builder.assert_called_once()
+        args, kwargs = window_builder.call_args
+        self.assertEqual(args[0], "/data/root")
+        self.assertEqual(args[1], Path("/indexes").resolve() / "train")
         self.assertEqual(kwargs["chunk_length"], 123)
+        self.assertEqual(kwargs["num_segments"], 6)
         self.assertEqual(kwargs["eos_id"], 456)
         self.assertEqual(kwargs["split"], "train")
         self.assertEqual(kwargs["records_per_shard"], 789)
         self.assertTrue(kwargs["overwrite"])
 
-    def test_statepassing_modes_call_statepassing_builder(self):
-        with mock.patch.object(build_pretrain_indexes, "build_iid_chunk_index") as iid_builder:
-            with mock.patch.object(
-                build_pretrain_indexes, "build_statepassing_pair_index"
-            ) as statepassing_builder:
-                statepassing_builder.return_value = Path("/tmp/statepassing")
-                out = build_pretrain_indexes.build_pretrain_index(
-                    root="/data/root",
-                    out_dir="/indexes",
-                    pretrain_mode="statepassing_bptt",
-                    split="val",
-                    chunk_length=4096,
-                    eos_id=248046,
-                    records_per_shard=1000,
-                    overwrite=False,
-                )
+    def test_val_split_uses_val_index_dir(self):
+        with mock.patch.object(
+            build_pretrain_indexes, "build_statepassing_window_index"
+        ) as statepassing_builder:
+            statepassing_builder.return_value = Path("/tmp/statepassing")
+            out = build_pretrain_indexes.build_pretrain_index(
+                root="/data/root",
+                out_dir="/indexes",
+                split="val",
+                chunk_length=4096,
+                num_segments=6,
+                eos_id=248046,
+                records_per_shard=1000,
+                overwrite=False,
+            )
 
         self.assertEqual(out, Path("/tmp/statepassing"))
-        iid_builder.assert_not_called()
         statepassing_builder.assert_called_once()
         args, kwargs = statepassing_builder.call_args
         self.assertEqual(args[0], "/data/root")
-        self.assertEqual(args[1], Path("/indexes").resolve() / "val" / "statepassing_bptt")
+        self.assertEqual(args[1], Path("/indexes").resolve() / "val")
         self.assertEqual(kwargs["split"], "val")
+        self.assertEqual(kwargs["num_segments"], 6)
+
+
+class TrainTextPretrainScriptTest(absltest.TestCase):
+    def _run_train_script_probe(self, body: str) -> dict[str, object]:
+        result = subprocess.run(
+            [sys.executable, "-c", body],
+            cwd=Path(__file__).resolve().parents[1],
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        return json.loads(result.stdout)
+
+    def test_make_statepassing_iterator_uses_runtime_flags_and_batch(self):
+        output = self._run_train_script_probe(
+            """
+import json
+from unittest import mock
+from absl.testing import flagsaver
+from scripts import train_text_pretrain
+from omegalax.trainers.pretrain import PretrainMode
+
+train_text_pretrain.FLAGS(["probe", "--train_index_path=/idx"])
+
+with flagsaver.flagsaver(
+    seq_len=2048,
+    pad_id=0,
+    eos_id=248046,
+    seed=123,
+    iterator_dp_size=None,
+    iterator_fsdp_size=None,
+    dp_size=2,
+    fsdp_size=4,
+    grain_workers=3,
+    grain_worker_buffer_size=5,
+    grain_read_threads=7,
+    grain_read_prefetch_buffer_size=11,
+):
+    with mock.patch.object(train_text_pretrain, "make_statepassing_iterator") as iterator:
+        iterator.return_value = object()
+        train_text_pretrain._make_iterator(
+            "/idx", PretrainMode.STATEPASSING_BPTT, 12, shuffle=True
+        )
+        args, kwargs = iterator.call_args
+
+print(json.dumps({
+    "index_path": args[0],
+    "batch_size": kwargs["batch_size"],
+    "chunk_length": kwargs["chunk_length"],
+    "seed": kwargs["seed"],
+    "dp_size": kwargs["dp_size"],
+    "fsdp_size": kwargs["fsdp_size"],
+    "grain_workers": kwargs["grain_workers"],
+    "shuffle": kwargs["shuffle"],
+}))
+"""
+        )
+
+        self.assertEqual(output["index_path"], "/idx")
+        self.assertEqual(output["batch_size"], 12)
+        self.assertEqual(output["chunk_length"], 2048)
+        self.assertEqual(output["seed"], 123)
+        self.assertEqual(output["dp_size"], 2)
+        self.assertEqual(output["fsdp_size"], 4)
+        self.assertEqual(output["grain_workers"], 3)
+        self.assertTrue(output["shuffle"])
+
+    def test_runtime_kwargs_forward_statepassing_flags(self):
+        output = self._run_train_script_probe(
+            """
+import json
+from absl.testing import flagsaver
+from scripts import train_text_pretrain
+
+train_text_pretrain.FLAGS(["probe", "--train_index_path=/idx"])
+
+with flagsaver.flagsaver(
+    bptt_chunks=4,
+    pass_gdn_state=False,
+    gdn_layer_limit=1,
+    pass_rope_positions=True,
+    pass_conv_state=True,
+):
+    kwargs = train_text_pretrain._runtime_kwargs()
+
+print(json.dumps(kwargs))
+"""
+        )
+
+        self.assertEqual(output["bptt_chunks"], 4)
+        self.assertFalse(output["pass_gdn_state"])
+        self.assertEqual(output["gdn_layer_limit"], 1)
+        self.assertTrue(output["pass_rope_positions"])
+        self.assertTrue(output["pass_conv_state"])
 
     def test_eos_validation_rejects_wrong_dominant_id(self):
         with self.assertRaisesRegex(ValueError, "EOS sanity check failed"):
@@ -111,8 +209,8 @@ class LaunchTextPretrainExperimentsScriptTest(absltest.TestCase):
             self.assertIn("--tp_size=1", command)
             self.assertIn("--fsdp_size=1", command)
             self.assertIn("--dp_size=1", command)
-            self.assertIn("--train_index_path=", command)
-            self.assertIn("--val_index_path=", command)
+            self.assertIn(f"--train_index_path={Path('/idx').resolve() / 'train'}", command)
+            self.assertIn(f"--val_index_path={Path('/idx').resolve() / 'val'}", command)
             self.assertIn("--save_dir=", command)
 
 
@@ -190,7 +288,15 @@ class SubmitTextPretrainSlurmScriptTest(absltest.TestCase):
             )
 
     def test_submit_seq_len_controls_index_and_train_flags(self):
-        with flagsaver.flagsaver(submit_seq_len=2048):
+        with flagsaver.flagsaver(
+            submit_seq_len=2048,
+            submit_num_segments=6,
+            submit_bptt_chunks=4,
+            submit_pass_gdn_state=False,
+            submit_gdn_layer_limit=1,
+            submit_pass_rope_positions=True,
+            submit_pass_conv_state=True,
+        ):
             index_script = submit_text_pretrain_slurm.render_index_sbatch(
                 repo_root="/repo",
                 dataset_root="/data",
@@ -218,7 +324,26 @@ class SubmitTextPretrainSlurmScriptTest(absltest.TestCase):
             )
 
         self.assertIn("--chunk_length=2048", index_script)
+        self.assertIn("--num_segments=6", index_script)
+        self.assertNotIn("--pretrain_mode=", index_script)
         self.assertIn("--seq_len=2048", train_flags)
+        self.assertNotIn("--num_segments=6", train_flags)
+        self.assertIn("--train_index_path=${TRAIN_INDEX_ROOT}/train", train_flags)
+        self.assertIn("--val_index_path=${TRAIN_INDEX_ROOT}/val", train_flags)
+        self.assertIn("--bptt_chunks=4", train_flags)
+        self.assertIn("--pass_gdn_state=False", train_flags)
+        self.assertIn("--gdn_layer_limit=1", train_flags)
+        self.assertIn("--pass_rope_positions=True", train_flags)
+        self.assertIn("--pass_conv_state=True", train_flags)
+
+    def test_validate_submit_shape_respects_num_segments(self):
+        with self.assertRaisesRegex(ValueError, "num_segments"):
+            submit_text_pretrain_slurm.validate_submit_shape(
+                batch_size=40,
+                nodes=1,
+                gpus_per_node=4,
+                num_segments=6,
+            )
 
     def test_render_train_sbatch_requests_gpus_mesh_and_preflight(self):
         script = submit_text_pretrain_slurm.render_train_sbatch(

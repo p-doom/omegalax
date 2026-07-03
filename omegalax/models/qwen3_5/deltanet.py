@@ -34,7 +34,14 @@ P = PartitionSpec
 wp = nnx.with_partitioning
 
 
-def _causal_depthwise_conv1d(x_BCT: jax.Array, weight_CK: jax.Array) -> jax.Array:
+def _causal_depthwise_conv1d(
+    x_BCT: jax.Array,
+    weight_CK: jax.Array,
+    initial_state_BCS: jax.Array | None = None,
+    attention_mask_BT: jax.Array | None = None,
+    *,
+    return_final_state: bool = False,
+) -> jax.Array | tuple[jax.Array, jax.Array]:
     """Depthwise causal conv1d.
 
     Args:
@@ -43,12 +50,36 @@ def _causal_depthwise_conv1d(x_BCT: jax.Array, weight_CK: jax.Array) -> jax.Arra
     Returns:
         (B, C, T)
     """
+    B, C, T = x_BCT.shape
     K = weight_CK.shape[1]
-    T = x_BCT.shape[2]
-    x_padded = jnp.pad(x_BCT, ((0, 0), (0, 0), (K - 1, 0)))
+    state_len = K - 1
+    if initial_state_BCS is None:
+        if state_len == 0:
+            initial_state_BCS = jnp.zeros((B, C, 0), dtype=x_BCT.dtype)
+        else:
+            initial_state_BCS = jnp.zeros_like(jnp.broadcast_to(x_BCT[:, :, :1], (B, C, state_len)))
+    elif initial_state_BCS.shape != (B, C, state_len):
+        raise ValueError(
+            f"Expected conv initial state shape {(B, C, state_len)}, got {initial_state_BCS.shape}"
+        )
+    else:
+        initial_state_BCS = initial_state_BCS.astype(x_BCT.dtype)
+    x_padded = jnp.concatenate([initial_state_BCS, x_BCT], axis=2)
     result = jnp.zeros_like(x_BCT)
     for k in range(K):
         result = result + weight_CK[None, :, k : k + 1] * x_padded[:, :, k : k + T]
+    if return_final_state:
+        if state_len == 0:
+            return result, jnp.zeros((B, C, 0), dtype=x_BCT.dtype)
+        if attention_mask_BT is None:
+            return result, x_padded[:, :, -state_len:]
+        valid_len_B = jnp.sum(attention_mask_BT.astype(jnp.int32), axis=1)
+        gather_start_B = jnp.maximum(valid_len_B, 0)
+        history = []
+        for offset in range(state_len):
+            idx_B = gather_start_B + offset
+            history.append(jnp.take_along_axis(x_padded, idx_B[:, None, None], axis=2))
+        return result, jnp.concatenate(history, axis=2)
     return result
 
 
@@ -136,9 +167,11 @@ class GatedDeltaNet(nnx.Module):
         hidden_BTD: jax.Array,
         attention_mask_BT: jax.Array | None = None,
         initial_state_BHAU: jax.Array | None = None,
+        initial_conv_state_BCS: jax.Array | None = None,
         *,
         return_final_state: bool = False,
-    ) -> jax.Array | tuple[jax.Array, jax.Array]:
+        return_conv_state: bool = False,
+    ) -> jax.Array | tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
         if attention_mask_BT is not None and attention_mask_BT.shape[1] > 1:
             hidden_BTD = hidden_BTD * attention_mask_BT[:, :, None]
 
@@ -168,11 +201,19 @@ class GatedDeltaNet(nnx.Module):
         b_BTH = self.in_proj_b(hidden_BTD, out_sharding=beta_g_shd)
         a_BTH = self.in_proj_a(hidden_BTD, out_sharding=beta_g_shd)
 
-        mixed_qkv_BCT = nnx.silu(
-            _causal_depthwise_conv1d(
-                mixed_qkv_BCT, self.conv_weight[...].astype(mixed_qkv_BCT.dtype)
-            )
+        conv_result = _causal_depthwise_conv1d(
+            mixed_qkv_BCT,
+            self.conv_weight[...].astype(mixed_qkv_BCT.dtype),
+            initial_state_BCS=initial_conv_state_BCS,
+            attention_mask_BT=attention_mask_BT,
+            return_final_state=return_conv_state,
         )
+        if return_conv_state:
+            mixed_qkv_BCT, final_conv_state_BCS = conv_result
+        else:
+            final_conv_state_BCS = None
+            mixed_qkv_BCT = conv_result
+        mixed_qkv_BCT = nnx.silu(mixed_qkv_BCT)
         mixed_qkv_BTC = mixed_qkv_BCT.transpose(0, 2, 1)
         q_BTP, k_BTP, v_BTO = jnp.split(mixed_qkv_BTC, [self.key_dim, self.key_dim * 2], axis=-1)
         q_BTHA = jax.lax.reshape(
@@ -267,6 +308,10 @@ class GatedDeltaNet(nnx.Module):
         )(q_BTHA, k_BTHA, v_BTHU, z_BTHU, g_BTH, beta_BTH, initial_state_BHAU, norm_w)
 
         out_BTD = self.out_proj(normed_BTD, out_sharding=self.shd_cfg.act_btd)
+        if return_final_state and return_conv_state:
+            return out_BTD, final_state_BHAU, final_conv_state_BCS
         if return_final_state:
             return out_BTD, final_state_BHAU
+        if return_conv_state:
+            return out_BTD, final_conv_state_BCS
         return out_BTD

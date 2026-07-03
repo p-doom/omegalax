@@ -206,7 +206,7 @@ class DecoderLayer(nnx.Module):
         self.input_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, rngs=rngs)
         self.post_attention_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, rngs=rngs)
 
-    @partial(jax.remat, static_argnums=(0, 8))
+    @partial(jax.remat, static_argnums=(0, 8, 10))
     def __call__(
         self,
         hidden_BTD: jax.Array,
@@ -217,21 +217,40 @@ class DecoderLayer(nnx.Module):
         attention_mask_BT: jax.Array | None = None,
         gdn_initial_state_BHAU: jax.Array | None = None,
         return_gdn_state: bool = False,
-    ) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array | None]:
+        conv_initial_state_BCS: jax.Array | None = None,
+        return_conv_state: bool = False,
+    ) -> (
+        tuple[jax.Array, jax.Array]
+        | tuple[jax.Array, jax.Array, jax.Array | None]
+        | tuple[jax.Array, jax.Array, jax.Array | None, jax.Array | None]
+    ):
         residual_BTD = hidden_BTD
         normed_BTD = self.input_layernorm(hidden_BTD)
         gdn_final_state_BHAU = None
+        conv_final_state_BCS = None
 
         if self.layer_type == "full_attention":
             attn_out_BTD = self.attn(normed_BTD, cos_BTK, sin_BTK, segment_ids_BT, position_ids_BT)
         else:
-            if return_gdn_state or gdn_initial_state_BHAU is not None:
-                attn_out_BTD, gdn_final_state_BHAU = self.linear_attn(
+            needs_stateful_call = (
+                return_gdn_state
+                or gdn_initial_state_BHAU is not None
+                or return_conv_state
+                or conv_initial_state_BCS is not None
+            )
+            if needs_stateful_call:
+                linear_result = self.linear_attn(
                     normed_BTD,
                     attention_mask_BT,
                     gdn_initial_state_BHAU,
+                    initial_conv_state_BCS=conv_initial_state_BCS,
                     return_final_state=True,
+                    return_conv_state=return_conv_state or conv_initial_state_BCS is not None,
                 )
+                if return_conv_state or conv_initial_state_BCS is not None:
+                    attn_out_BTD, gdn_final_state_BHAU, conv_final_state_BCS = linear_result
+                else:
+                    attn_out_BTD, gdn_final_state_BHAU = linear_result
             else:
                 attn_out_BTD = self.linear_attn(normed_BTD, attention_mask_BT)
 
@@ -246,8 +265,12 @@ class DecoderLayer(nnx.Module):
             aux_loss = jnp.array(0.0, dtype=jnp.float32)
         hidden_BTD = residual_BTD + ff_out_BTD
 
+        if return_gdn_state and return_conv_state:
+            return hidden_BTD, aux_loss, gdn_final_state_BHAU, conv_final_state_BCS
         if return_gdn_state:
             return hidden_BTD, aux_loss, gdn_final_state_BHAU
+        if return_conv_state:
+            return hidden_BTD, aux_loss, conv_final_state_BCS
         return hidden_BTD, aux_loss
 
 
@@ -279,9 +302,15 @@ class TextModel(nnx.Module):
         segment_ids_BT: jax.Array | None = None,
         position_ids_ZBT: jax.Array | None = None,
         gdn_initial_states: tuple[jax.Array, ...] | None = None,
+        conv_initial_states: tuple[jax.Array, ...] | None = None,
         *,
         return_gdn_states: bool = False,
-    ) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, tuple[jax.Array, ...]]:
+        return_conv_states: bool = False,
+    ) -> (
+        tuple[jax.Array, jax.Array]
+        | tuple[jax.Array, jax.Array, tuple[jax.Array, ...]]
+        | tuple[jax.Array, jax.Array, tuple[jax.Array, ...], tuple[jax.Array, ...]]
+    ):
         cfg = self.cfg
 
         if inputs_embeds_BTD is None:
@@ -319,12 +348,17 @@ class TextModel(nnx.Module):
 
         aux_losses = []
         gdn_final_states = []
+        conv_final_states = []
         linear_layer_count = sum(
             1 for layer_type in cfg.layer_types if layer_type != "full_attention"
         )
         if gdn_initial_states is not None and len(gdn_initial_states) != linear_layer_count:
             raise ValueError(
                 f"Expected {linear_layer_count} GDN initial states, got {len(gdn_initial_states)}"
+            )
+        if conv_initial_states is not None and len(conv_initial_states) != linear_layer_count:
+            raise ValueError(
+                f"Expected {linear_layer_count} conv initial states, got {len(conv_initial_states)}"
             )
         gdn_state_idx = 0
         for layer in self.layers:
@@ -338,13 +372,20 @@ class TextModel(nnx.Module):
                     attention_mask_BT,
                     None,
                     False,
+                    None,
+                    False,
                 )
             else:
                 init_state = (
                     None if gdn_initial_states is None else gdn_initial_states[gdn_state_idx]
                 )
-                if return_gdn_states or init_state is not None:
-                    hidden_BTD, aux, final_state = layer(
+                init_conv_state = (
+                    None if conv_initial_states is None else conv_initial_states[gdn_state_idx]
+                )
+                want_gdn_state = return_gdn_states or init_state is not None
+                want_conv_state = return_conv_states or init_conv_state is not None
+                if want_gdn_state or want_conv_state:
+                    layer_result = layer(
                         hidden_BTD,
                         cos_BTK,
                         sin_BTK,
@@ -352,9 +393,22 @@ class TextModel(nnx.Module):
                         text_position_ids_BT,
                         attention_mask_BT,
                         init_state,
-                        True,
+                        want_gdn_state,
+                        init_conv_state,
+                        want_conv_state,
                     )
-                    gdn_final_states.append(final_state)
+                    if want_gdn_state and want_conv_state:
+                        hidden_BTD, aux, final_state, final_conv_state = layer_result
+                    elif want_gdn_state:
+                        hidden_BTD, aux, final_state = layer_result
+                        final_conv_state = None
+                    else:
+                        hidden_BTD, aux, final_conv_state = layer_result
+                        final_state = None
+                    if want_gdn_state:
+                        gdn_final_states.append(final_state)
+                    if want_conv_state:
+                        conv_final_states.append(final_conv_state)
                 else:
                     hidden_BTD, aux = layer(
                         hidden_BTD,
@@ -365,14 +419,20 @@ class TextModel(nnx.Module):
                         attention_mask_BT,
                         None,
                         False,
+                        None,
+                        False,
                     )
                 gdn_state_idx += 1
             aux_losses.append(aux)
 
         hidden_BTD = self.final_norm(hidden_BTD)
         total_aux = jnp.sum(jnp.stack(aux_losses)) if aux_losses else jnp.array(0.0)
+        if return_gdn_states and return_conv_states:
+            return hidden_BTD, total_aux, tuple(gdn_final_states), tuple(conv_final_states)
         if return_gdn_states:
             return hidden_BTD, total_aux, tuple(gdn_final_states)
+        if return_conv_states:
+            return hidden_BTD, total_aux, tuple(conv_final_states)
         return hidden_BTD, total_aux
 
 
@@ -400,15 +460,21 @@ class Qwen3_5ForCausalLM(nnx.Module):
         cache,
         num_right_pads,
         gdn_initial_states=None,
+        conv_initial_states=None,
         *,
+        position_ids_ZBT: jax.Array | None = None,
         return_gdn_states: bool = False,
+        return_conv_states: bool = False,
     ):
         del cache, num_right_pads
         return self.text(
             token_ids_BT=token_ids_BT,
             segment_ids_BT=segment_ids_BT,
+            position_ids_ZBT=position_ids_ZBT,
             gdn_initial_states=gdn_initial_states,
+            conv_initial_states=conv_initial_states,
             return_gdn_states=return_gdn_states,
+            return_conv_states=return_conv_states,
         )
 
 

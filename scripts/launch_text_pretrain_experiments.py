@@ -58,8 +58,8 @@ def build_commands(
             sys.executable,
             str(script),
             f"--pretrain_mode={mode.value}",
-            f"--train_index_path={index_root / 'train' / mode.value}",
-            f"--val_index_path={index_root / 'val' / mode.value}",
+            f"--train_index_path={index_root / 'train'}",
+            f"--val_index_path={index_root / 'val'}",
             f"--save_dir={save_root / mode.value}",
         ]
         if tp_size is not None:

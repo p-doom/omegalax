@@ -63,7 +63,8 @@ flags.DEFINE_bool(
     "Run one JAX process per Slurm job with all allocated GPUs visible locally.",
 )
 flags.DEFINE_integer("submit_index_cpus", 32, "CPUs for the index-build job.")
-flags.DEFINE_integer("submit_seq_len", 4096, "Segment length for index building and training.")
+flags.DEFINE_integer("submit_seq_len", 2048, "Segment length for index building and training.")
+flags.DEFINE_integer("submit_num_segments", 2, "Fixed chunks per statepassing window.")
 flags.DEFINE_integer("submit_batch_size", 128, "Global number of submit_seq_len-token segments.")
 flags.DEFINE_integer("submit_grad_accum_steps", 4, "Gradient accumulation steps.")
 flags.DEFINE_integer("submit_max_tokens", 15_000_000_000, "Total token budget.")
@@ -79,6 +80,11 @@ flags.DEFINE_integer("submit_save_every", 1000, "Checkpoint every N optimizer st
 flags.DEFINE_integer("submit_log_every", 10, "Log every N optimizer steps.")
 flags.DEFINE_integer("submit_val_every", 500, "Validate every N optimizer steps.")
 flags.DEFINE_integer("submit_val_steps", 10, "Validation batches.")
+flags.DEFINE_integer("submit_bptt_chunks", None, "BPTT span in chunks for statepassing.")
+flags.DEFINE_bool("submit_pass_gdn_state", True, "Pass GDN recurrent state between chunks.")
+flags.DEFINE_integer("submit_gdn_layer_limit", None, "Only pass state for first N GDN layers.")
+flags.DEFINE_bool("submit_pass_rope_positions", False, "Pass chunk-aware RoPE position ids.")
+flags.DEFINE_bool("submit_pass_conv_state", False, "Pass 1D conv state between chunks.")
 flags.DEFINE_integer("submit_records_per_shard", 100_000, "Index records per shard.")
 flags.DEFINE_integer("submit_eos_check_records", 1000, "Records sampled for EOS sanity.")
 flags.DEFINE_float("submit_min_eos_fraction", 0.95, "Required dominant EOS fraction.")
@@ -152,18 +158,16 @@ class RunSpec:
 def indexes_ready(index_root: str | Path) -> bool:
     root = Path(index_root).expanduser().resolve()
     for split in ("train", "val"):
-        for mode in _all_modes():
-            if not (root / split / mode.value / "metadata.json").exists():
-                return False
+        if not (root / split / "metadata.json").exists():
+            return False
     return True
 
 
 def any_index_metadata_exists(index_root: str | Path) -> bool:
     root = Path(index_root).expanduser().resolve()
     for split in ("train", "val"):
-        for mode in _all_modes():
-            if (root / split / mode.value / "metadata.json").exists():
-                return True
+        if (root / split / "metadata.json").exists():
+            return True
     return False
 
 
@@ -172,6 +176,7 @@ def validate_submit_shape(
     batch_size: int,
     nodes: int,
     gpus_per_node: int,
+    num_segments: int = 2,
     single_process_per_run: bool = False,
 ) -> int:
     total_tasks = int(nodes) * int(gpus_per_node)
@@ -181,10 +186,11 @@ def validate_submit_shape(
         raise ValueError(
             f"fsdp_size={total_tasks} must divide hidden_size={_DEFAULT_PRETRAIN_HIDDEN_SIZE}."
         )
-    if batch_size % (2 * total_tasks) != 0:
+    divisor = int(num_segments) * total_tasks
+    if batch_size % divisor != 0:
         raise ValueError(
             f"Statepassing batch_size={batch_size} must be divisible by "
-            f"2 * total_tasks={2 * total_tasks}."
+            f"num_segments * total_tasks={divisor}."
         )
     return total_tasks
 
@@ -246,6 +252,7 @@ def parse_run_specs(
             batch_size=spec.batch_size,
             nodes=spec.nodes,
             gpus_per_node=spec.gpus_per_node,
+            num_segments=_flag_value("submit_num_segments"),
             single_process_per_run=single_process_per_run,
         )
     return specs
@@ -317,7 +324,6 @@ def render_index_sbatch(
     min_eos_fraction: float,
     overwrite: bool,
 ) -> str:
-    modes = " ".join(f"--pretrain_mode={mode.value}" for mode in _all_modes())
     splits = "--split=train --split=val"
     overwrite_flag = " --overwrite" if overwrite else ""
     return f"""{
@@ -342,9 +348,9 @@ cat "$0"
 uv run python scripts/build_pretrain_indexes.py \\
   --root={_quote(dataset_root)} \\
   --out_dir={_quote(index_root)} \\
-  {modes} \\
   {splits} \\
   --chunk_length={_flag_value("submit_seq_len")} \\
+  --num_segments={_flag_value("submit_num_segments")} \\
   --eos_id=248046 \\
   --records_per_shard={records_per_shard} \\
   --eos_check_records={eos_check_records} \\
@@ -368,8 +374,8 @@ def _train_flags(
     dp_size = total_tasks if single_process_per_run else 1
     flags_out = [
         f"--pretrain_mode={mode.value}",
-        f"--train_index_path=${{TRAIN_INDEX_ROOT}}/train/{mode.value}",
-        f"--val_index_path=${{TRAIN_INDEX_ROOT}}/val/{mode.value}",
+        "--train_index_path=${TRAIN_INDEX_ROOT}/train",
+        "--val_index_path=${TRAIN_INDEX_ROOT}/val",
         f"--seq_len={_flag_value('submit_seq_len')}",
         f"--batch_size={batch_size}",
         f"--max_tokens={_flag_value('submit_max_tokens')}",
@@ -396,7 +402,16 @@ def _train_flags(
         "--peak_tflops=h100_sxm",
         "--resume=if_present",
         "--text_attn_backend=mosaic_gpu",
+        f"--pass_gdn_state={_flag_value('submit_pass_gdn_state')}",
+        f"--pass_rope_positions={_flag_value('submit_pass_rope_positions')}",
+        f"--pass_conv_state={_flag_value('submit_pass_conv_state')}",
     ]
+    bptt_chunks = _flag_value("submit_bptt_chunks")
+    if bptt_chunks is not None:
+        flags_out.append(f"--bptt_chunks={bptt_chunks}")
+    gdn_layer_limit = _flag_value("submit_gdn_layer_limit")
+    if gdn_layer_limit is not None:
+        flags_out.append(f"--gdn_layer_limit={gdn_layer_limit}")
     if single_process_per_run:
         flags_out.extend(["--iterator_fsdp_size=1", "--iterator_dp_size=1"])
     wandb_project = _flag_value("submit_wandb_project")

@@ -112,7 +112,11 @@ class Qwen3_5TextRopeDtypeTest(_RopeDtypeTestBase):
         from omegalax.models.qwen3_5 import rope as rope_mod
 
         cfg = make_config("qwen3.5-smoke")
-        text_cfg = dataclasses.replace(cfg.text_config, dtype=MODEL_DTYPE)
+        text_cfg = dataclasses.replace(
+            cfg.text_config,
+            dtype=MODEL_DTYPE,
+            layer_types=("linear_attention",) * cfg.text_config.num_hidden_layers,
+        )
         model = model_mod.Qwen3_5ForCausalLM(text_cfg, rngs=nnx.Rngs(0))
 
         gen_calls = []
@@ -122,9 +126,33 @@ class Qwen3_5TextRopeDtypeTest(_RopeDtypeTestBase):
         layer_calls = []
         orig_layer_call = model_mod.DecoderLayer.__call__
 
-        def layer_spy(self_layer, hidden, cos_BTK, sin_BTK, seg, pos, attn_mask=None):
+        def layer_spy(
+            self_layer,
+            hidden,
+            cos_BTK,
+            sin_BTK,
+            seg,
+            pos,
+            attn_mask=None,
+            gdn_initial_state=None,
+            return_gdn_state=False,
+            conv_initial_state=None,
+            return_conv_state=False,
+        ):
             layer_calls.append({"cos": cos_BTK.dtype, "sin": sin_BTK.dtype})
-            return orig_layer_call(self_layer, hidden, cos_BTK, sin_BTK, seg, pos, attn_mask)
+            return orig_layer_call(
+                self_layer,
+                hidden,
+                cos_BTK,
+                sin_BTK,
+                seg,
+                pos,
+                attn_mask,
+                gdn_initial_state,
+                return_gdn_state,
+                conv_initial_state,
+                return_conv_state,
+            )
 
         B, T = 1, 8
         tokens = jnp.ones((B, T), dtype=jnp.int32)

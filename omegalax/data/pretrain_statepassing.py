@@ -1,4 +1,4 @@
-"""Pair-sampled pretraining iterators for state passing."""
+"""Fixed-window pretraining iterators for state passing."""
 
 from __future__ import annotations
 
@@ -16,42 +16,43 @@ from omegalax.data.pretrain_data_set import (
     DEFAULT_CHUNK_LENGTH,
     BATCH_PRETRAIN_METADATA_KEY,
     DataSetReader,
-    PairMetadata,
-    build_pair_arrays,
-    iter_document_pair_metadata,
+    WindowMetadata,
+    build_window_arrays,
+    iter_document_window_metadata,
     load_arrayrecord_metadata,
     make_dataset_index,
-    pair_metadata_to_record,
     resolve_arrayrecord_paths,
     resolve_pretrain_dp,
     rewrite_data_set_root_path,
+    window_metadata_to_record,
     write_json_arrayrecord_dataset,
 )
 
-STATEPASSING_PAIR_INDEX_FORMAT = "omegalax_pretrain_statepassing_pair_index_v1"
+STATEPASSING_WINDOW_INDEX_FORMAT = "omegalax_pretrain_statepassing_window_index_v1"
 STATEPASSING_INDEX_SHUFFLE_ROUNDS = 4
 
 
-def _pair_metadata_from_index_record(record: dict[str, Any]) -> PairMetadata:
+def _window_metadata_from_index_record(record: dict[str, Any]) -> WindowMetadata:
     eos_token_idx = record.get("eos_token_idx")
-    return PairMetadata(
+    return WindowMetadata(
         bucket_idx=int(record["bucket_idx"]),
         record_idx=int(record["record_idx"]),
         doc_id=str(record["doc_id"]),
-        pair_idx=int(record["pair_idx"]),
-        start=int(record["start"]),
-        mid=int(record["mid"]),
-        end=int(record["end"]),
+        window_idx=int(record["window_idx"]),
+        start_chunk=int(record["start_chunk"]),
+        num_segments=int(record["num_segments"]),
         doc_token_count=int(record["doc_token_count"]),
+        doc_num_chunks=int(record["doc_num_chunks"]),
         eos_token_idx=None if eos_token_idx is None else int(eos_token_idx),
     )
 
 
-def build_statepassing_pair_index(
+def build_statepassing_window_index(
     root: str | Path,
     out_dir: str | Path,
     *,
     chunk_length: int = DEFAULT_CHUNK_LENGTH,
+    num_segments: int,
     eos_id: int | None = DEFAULT_EOS_ID,
     split: str = DEFAULT_DATA_SET_SPLIT,
     records_per_shard: int = 100_000,
@@ -59,35 +60,44 @@ def build_statepassing_pair_index(
 ) -> Path:
     if chunk_length <= 0:
         raise ValueError("chunk_length must be > 0")
+    if num_segments <= 0:
+        raise ValueError("num_segments must be > 0")
 
     reader = DataSetReader(root, split=split)
     dynamic_metadata: dict[str, Any] = {
-        "format": STATEPASSING_PAIR_INDEX_FORMAT,
+        "format": STATEPASSING_WINDOW_INDEX_FORMAT,
         "data_set_root": str(reader.root),
         "split": reader.split,
         "bucket_names": list(reader.bucket_names),
         "chunk_length": int(chunk_length),
+        "num_segments": int(num_segments),
         "eos_id": eos_id,
-        "num_pairs": 0,
+        "num_windows": 0,
+        "num_residual_chunks": 0,
         "num_bucket_records": 0,
         "bucket_record_counts": [],
     }
 
     def _iter_index_records() -> Iterator[dict[str, Any]]:
         bucket_record_counts = [0 for _ in reader.bucket_paths]
-        num_pairs = 0
+        num_windows = 0
+        num_residual_chunks = 0
         for bucket_idx, record_idx, doc in reader.iter_records():
             bucket_record_counts[bucket_idx] += 1
-            for pair_metadata in iter_document_pair_metadata(
+            doc_num_chunks = (doc.doc_token_count + chunk_length - 1) // chunk_length
+            num_residual_chunks += doc_num_chunks % int(num_segments)
+            for window_metadata in iter_document_window_metadata(
                 doc,
                 chunk_length=chunk_length,
+                num_segments=num_segments,
                 bucket_idx=bucket_idx,
                 record_idx=record_idx,
                 eos_id=eos_id,
             ):
-                num_pairs += 1
-                yield pair_metadata_to_record(pair_metadata)
-        dynamic_metadata["num_pairs"] = num_pairs
+                num_windows += 1
+                yield window_metadata_to_record(window_metadata)
+        dynamic_metadata["num_windows"] = num_windows
+        dynamic_metadata["num_residual_chunks"] = num_residual_chunks
         dynamic_metadata["num_bucket_records"] = sum(bucket_record_counts)
         dynamic_metadata["bucket_record_counts"] = bucket_record_counts
 
@@ -100,14 +110,14 @@ def build_statepassing_pair_index(
     )
 
 
-def _load_pair_index_metadata(
+def _load_window_index_metadata(
     index_path: str | Path,
     chunk_length: int | None,
 ) -> dict[str, Any]:
     metadata = load_arrayrecord_metadata(index_path)
     fmt = metadata.get("format")
-    if fmt != STATEPASSING_PAIR_INDEX_FORMAT:
-        raise ValueError(f"Expected {STATEPASSING_PAIR_INDEX_FORMAT} dataset, got format={fmt}")
+    if fmt != STATEPASSING_WINDOW_INDEX_FORMAT:
+        raise ValueError(f"Expected {STATEPASSING_WINDOW_INDEX_FORMAT} dataset, got format={fmt}")
     index_chunk_length = int(metadata["chunk_length"])
     if chunk_length is not None and int(chunk_length) != index_chunk_length:
         raise ValueError(
@@ -116,30 +126,30 @@ def _load_pair_index_metadata(
     return metadata
 
 
-def _is_statepassing_pair_index(path: str | Path) -> bool:
+def _is_statepassing_window_index(path: str | Path) -> bool:
     path = Path(path).expanduser().resolve()
     if not path.is_dir():
         return False
     try:
-        return load_arrayrecord_metadata(path).get("format") == STATEPASSING_PAIR_INDEX_FORMAT
+        return load_arrayrecord_metadata(path).get("format") == STATEPASSING_WINDOW_INDEX_FORMAT
     except ValueError:
         return False
 
 
-def _single_statepassing_pair_index_path(
+def _single_statepassing_window_index_path(
     indexes: str | Path | Sequence[str | Path],
 ) -> Path | None:
     if isinstance(indexes, (str, Path)):
         path = Path(indexes).expanduser().resolve()
-        return path if _is_statepassing_pair_index(path) else None
+        return path if _is_statepassing_window_index(path) else None
     if isinstance(indexes, Sequence) and len(indexes) == 1:
         path = Path(indexes[0]).expanduser().resolve()
-        return path if _is_statepassing_pair_index(path) else None
+        return path if _is_statepassing_window_index(path) else None
     return None
 
 
-def _make_batch(
-    pair_metadata_batch: Sequence[PairMetadata],
+def _make_window_batch(
+    window_metadata_batch: Sequence[WindowMetadata],
     *,
     reader: DataSetReader,
     chunk_length: int,
@@ -151,30 +161,29 @@ def _make_batch(
     loss_masks = []
     chunk_indices = []
     reset_states = []
-    last_chunk_flags = []
     doc_ids = []
     bucket_indices = []
     record_indices = []
-    pair_indices = []
+    window_indices = []
     doc_cache = {}
 
-    for pair_metadata in pair_metadata_batch:
-        doc_key = (pair_metadata.bucket_idx, pair_metadata.record_idx)
+    for window_metadata in window_metadata_batch:
+        doc_key = (window_metadata.bucket_idx, window_metadata.record_idx)
         doc = doc_cache.get(doc_key)
         if doc is None:
-            doc = reader.read(pair_metadata.bucket_idx, pair_metadata.record_idx)
+            doc = reader.read(window_metadata.bucket_idx, window_metadata.record_idx)
             doc_cache[doc_key] = doc
         if (
-            doc.doc_id != pair_metadata.doc_id
-            or doc.doc_token_count != pair_metadata.doc_token_count
+            doc.doc_id != window_metadata.doc_id
+            or doc.doc_token_count != window_metadata.doc_token_count
         ):
             raise ValueError(
-                "Statepassing pair index does not match bucket record "
-                f"bucket_idx={pair_metadata.bucket_idx}, record_idx={pair_metadata.record_idx}"
+                "Statepassing window index does not match bucket record "
+                f"bucket_idx={window_metadata.bucket_idx}, record_idx={window_metadata.record_idx}"
             )
-        arrays = build_pair_arrays(
+        arrays = build_window_arrays(
             doc.token_ids,
-            pair_metadata,
+            window_metadata,
             chunk_length=chunk_length,
             pad_id=pad_id,
             eos_id=eos_id,
@@ -184,11 +193,10 @@ def _make_batch(
         loss_masks.append(arrays["loss_mask_CT"])
         chunk_indices.append(arrays["chunk_idx_C"])
         reset_states.append(arrays["reset_state_C"])
-        last_chunk_flags.append(arrays["is_last_chunk_C"])
-        doc_ids.append(pair_metadata.doc_id)
-        bucket_indices.append(pair_metadata.bucket_idx)
-        record_indices.append(pair_metadata.record_idx)
-        pair_indices.append(pair_metadata.pair_idx)
+        doc_ids.append(window_metadata.doc_id)
+        bucket_indices.append(window_metadata.bucket_idx)
+        record_indices.append(window_metadata.record_idx)
+        window_indices.append(window_metadata.window_idx)
 
     return {
         "token_ids_BCT": np.stack(token_ids).astype(np.int32, copy=False),
@@ -196,17 +204,16 @@ def _make_batch(
         "loss_mask_BCT": np.stack(loss_masks).astype(np.int32, copy=False),
         "chunk_idx_BC": np.stack(chunk_indices).astype(np.int32, copy=False),
         "reset_state_BC": np.stack(reset_states).astype(np.bool_, copy=False),
-        "is_last_chunk_BC": np.stack(last_chunk_flags).astype(np.bool_, copy=False),
         BATCH_PRETRAIN_METADATA_KEY: {
             "doc_ids": doc_ids,
             "bucket_idx_B": np.asarray(bucket_indices, dtype=np.int32),
             "record_idx_B": np.asarray(record_indices, dtype=np.int32),
-            "pair_idx_B": np.asarray(pair_indices, dtype=np.int32),
+            "window_idx_B": np.asarray(window_indices, dtype=np.int32),
         },
     }
 
 
-class _StatepassingPretrainBatchBuilder:
+class _StatepassingWindowPretrainBatchBuilder:
     def __init__(
         self,
         *,
@@ -229,11 +236,15 @@ class _StatepassingPretrainBatchBuilder:
         if self.reader is None:
             reader = DataSetReader(self.data_set_root, split=self.split)
             if reader.bucket_names != self.bucket_names:
-                raise ValueError("Statepassing pair index bucket_names do not match data-set root")
+                raise ValueError(
+                    "Statepassing window index bucket_names do not match data-set root"
+                )
             self.reader = reader
-        pair_metadata_batch = [_pair_metadata_from_index_record(record) for record in index_records]
-        return _make_batch(
-            pair_metadata_batch,
+        window_metadata_batch = [
+            _window_metadata_from_index_record(record) for record in index_records
+        ]
+        return _make_window_batch(
+            window_metadata_batch,
             reader=self.reader,
             chunk_length=self.chunk_length,
             pad_id=self.pad_id,
@@ -262,8 +273,6 @@ def make_statepassing_iterator(
 ) -> Iterator[dict[str, Any]]:
     if batch_size <= 0:
         raise ValueError("batch_size must be > 0")
-    if batch_size % 2:
-        raise ValueError("batch_size must be even for 2-chunk statepassing samples")
     if grain_workers < 0:
         raise ValueError("grain_workers must be >= 0")
     if grain_worker_buffer_size <= 0:
@@ -273,11 +282,11 @@ def make_statepassing_iterator(
     if grain_read_prefetch_buffer_size <= 0:
         raise ValueError("grain_read_prefetch_buffer_size must be > 0")
 
-    index_path = _single_statepassing_pair_index_path(indexes)
-    if index_path is None:
+    window_index_path = _single_statepassing_window_index_path(indexes)
+    if window_index_path is None:
         raise ValueError(
-            "Statepassing pretraining requires a statepassing pair index; "
-            "call build_statepassing_pair_index first."
+            "Statepassing pretraining requires a statepassing window index; "
+            "call build_statepassing_window_index first."
         )
 
     effective_dp_size, resolved_dp_index = resolve_pretrain_dp(
@@ -290,7 +299,13 @@ def make_statepassing_iterator(
     if resolved_dp_index < 0 or resolved_dp_index >= effective_dp_size:
         raise ValueError(f"dp_index must be in [0, {effective_dp_size}), got {resolved_dp_index}")
 
-    index_metadata = _load_pair_index_metadata(index_path, chunk_length)
+    index_path = window_index_path
+    index_metadata = _load_window_index_metadata(index_path, chunk_length)
+    index_num_segments = int(index_metadata["num_segments"])
+    if batch_size % index_num_segments:
+        raise ValueError("batch_size must be divisible by num_segments")
+    records_per_local_batch = batch_size // index_num_segments
+
     index_chunk_length = int(index_metadata["chunk_length"])
     index_eos_id = index_metadata.get("eos_id")
     if eos_id != index_eos_id:
@@ -298,7 +313,7 @@ def make_statepassing_iterator(
 
     raw_dataset_root = index_metadata.get("data_set_root")
     if raw_dataset_root is None:
-        raise ValueError("Statepassing pair index metadata is missing data_set_root")
+        raise ValueError("Statepassing window index metadata is missing data_set_root")
     data_set_root = rewrite_data_set_root_path(raw_dataset_root)
     split = str(index_metadata["split"])
     bucket_names = [str(name) for name in index_metadata["bucket_names"]]
@@ -306,7 +321,7 @@ def make_statepassing_iterator(
     index_source = grain.sources.ArrayRecordDataSource([str(path) for path in index_shard_paths])
     num_records = len(index_source)
     if num_records == 0:
-        raise ValueError(f"Statepassing pair index has no records: {index_path}")
+        raise ValueError(f"Statepassing window index has no records: {index_path}")
 
     dataset_index, _ = make_dataset_index(
         index_shard_paths=index_shard_paths,
@@ -314,15 +329,15 @@ def make_statepassing_iterator(
         num_epochs=num_epochs,
         dp_size=effective_dp_size,
         dp_index=resolved_dp_index,
-        records_per_local_batch=batch_size // 2,
+        records_per_local_batch=records_per_local_batch,
         shuffle=shuffle,
         seed=seed,
         shuffle_rounds=STATEPASSING_INDEX_SHUFFLE_ROUNDS,
     )
     batched = dataset_index.batch(
-        batch_size=batch_size // 2,
+        batch_size=records_per_local_batch,
         drop_remainder=True,
-        batch_fn=_StatepassingPretrainBatchBuilder(
+        batch_fn=_StatepassingWindowPretrainBatchBuilder(
             data_set_root=data_set_root,
             split=split,
             bucket_names=bucket_names,

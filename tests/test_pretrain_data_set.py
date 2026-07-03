@@ -19,10 +19,11 @@ from omegalax.data.pretrain_data_set import (
     DEFAULT_EOS_ID,
     MAX_PRETRAIN_POSITIONS,
     DataSetReader,
+    build_window_arrays,
     build_chunk_arrays,
     calculate_samples_per_process,
     deserialize_data_set_record,
-    iter_document_pair_metadata,
+    iter_document_window_metadata,
     load_data_set_metadata,
     make_dataset_index,
     num_pretrain_positions,
@@ -91,46 +92,129 @@ class PretrainDataSetTest(absltest.TestCase):
         )
         np.testing.assert_array_equal(arrays["loss_mask_T"], arrays["attention_mask_T"])
 
-    def test_pair_retention_drops_short_tail_and_keeps_long_tail(self):
-        def pair_ranges(length: int) -> list[tuple[int, int, int]]:
-            payload = {
-                "doc_id": f"doc-{length}",
-                "token_ids": list(range(length)),
-                "doc_token_count": length,
-            }
-            record = deserialize_data_set_record(payload)
-            return [
-                (pair_metadata.start, pair_metadata.mid, pair_metadata.end)
-                for pair_metadata in iter_document_pair_metadata(record, chunk_length=4)
-            ]
-
-        self.assertEqual(pair_ranges(4), [])
-        self.assertEqual(pair_ranges(5), [(0, 4, 5)])
-        self.assertEqual(pair_ranges(8), [(0, 4, 8)])
-        self.assertEqual(pair_ranges(9), [(0, 4, 8)])
-        self.assertEqual(pair_ranges(12), [(0, 4, 8)])
-        self.assertEqual(pair_ranges(13), [(0, 4, 8), (8, 12, 13)])
-
-    def test_default_eos_id_marks_retained_end_when_short_tail_is_dropped(self):
+    def test_window_metadata_uses_full_fixed_c_windows(self):
         record = deserialize_data_set_record(
             {
-                "doc_id": "doc-eos",
+                "doc_id": "doc-window",
+                "token_ids": list(range(18)),
+                "doc_token_count": 18,
+            }
+        )
+
+        windows = list(iter_document_window_metadata(record, chunk_length=4, num_segments=4))
+
+        self.assertLen(windows, 1)
+        self.assertEqual(windows[0].window_idx, 0)
+        self.assertEqual(windows[0].start_chunk, 0)
+        self.assertEqual(windows[0].num_segments, 4)
+        self.assertEqual(windows[0].doc_num_chunks, 5)
+
+    def test_window_metadata_uses_multiple_non_overlapping_windows(self):
+        record = deserialize_data_set_record(
+            {
+                "doc_id": "doc-multi-window",
+                "token_ids": list(range(40)),
+                "doc_token_count": 40,
+            }
+        )
+
+        windows = list(iter_document_window_metadata(record, chunk_length=4, num_segments=3))
+
+        self.assertLen(windows, 3)
+        self.assertEqual([window.window_idx for window in windows], [0, 1, 2])
+        self.assertEqual([window.start_chunk for window in windows], [0, 3, 6])
+        self.assertEqual([window.doc_num_chunks for window in windows], [10, 10, 10])
+
+    def test_window_metadata_drops_docs_shorter_than_fixed_c(self):
+        record = deserialize_data_set_record(
+            {
+                "doc_id": "doc-short",
+                "token_ids": list(range(7)),
+                "doc_token_count": 7,
+            }
+        )
+
+        windows = list(iter_document_window_metadata(record, chunk_length=4, num_segments=3))
+
+        self.assertEmpty(windows)
+
+    def test_build_window_arrays_handles_partial_last_chunk(self):
+        record = deserialize_data_set_record(
+            {
+                "doc_id": "doc-partial",
+                "token_ids": list(range(18)),
+                "doc_token_count": 18,
+            }
+        )
+        window = next(iter_document_window_metadata(record, chunk_length=4, num_segments=5))
+
+        arrays = build_window_arrays(record.token_ids, window, chunk_length=4, pad_id=0)
+
+        self.assertEqual(arrays["token_ids_CT"].shape, (5, 4))
+        np.testing.assert_array_equal(
+            arrays["attention_mask_CT"][-1],
+            np.asarray([1, 1, 0, 0], dtype=np.int32),
+        )
+        np.testing.assert_array_equal(
+            arrays["chunk_idx_C"],
+            np.asarray([0, 1, 2, 3, 4], dtype=np.int32),
+        )
+        np.testing.assert_array_equal(
+            arrays["reset_state_C"],
+            np.asarray([True, False, False, False, False], dtype=np.bool_),
+        )
+
+    def test_build_window_arrays_handles_nonzero_start_chunk(self):
+        record = deserialize_data_set_record(
+            {
+                "doc_id": "doc-later-window",
+                "token_ids": list(range(40)),
+                "doc_token_count": 40,
+            }
+        )
+        windows = list(iter_document_window_metadata(record, chunk_length=4, num_segments=3))
+
+        arrays = build_window_arrays(record.token_ids, windows[1], chunk_length=4, pad_id=0)
+
+        np.testing.assert_array_equal(
+            arrays["token_ids_CT"],
+            np.asarray(
+                [
+                    [12, 13, 14, 15],
+                    [16, 17, 18, 19],
+                    [20, 21, 22, 23],
+                ],
+                dtype=np.int32,
+            ),
+        )
+        np.testing.assert_array_equal(
+            arrays["attention_mask_CT"],
+            np.ones((3, 4), dtype=np.int32),
+        )
+        np.testing.assert_array_equal(
+            arrays["chunk_idx_C"],
+            np.asarray([3, 4, 5], dtype=np.int32),
+        )
+        np.testing.assert_array_equal(
+            arrays["reset_state_C"],
+            np.asarray([True, False, False], dtype=np.bool_),
+        )
+
+    def test_window_eos_repair_marks_retained_end_when_residual_is_dropped(self):
+        record = deserialize_data_set_record(
+            {
+                "doc_id": "doc-window-eos",
                 "token_ids": [1, 2, 3, 4, 5, 6, 7, 8, DEFAULT_EOS_ID],
                 "doc_token_count": 9,
             }
         )
-        pair_metadata = next(iter_document_pair_metadata(record, chunk_length=4))
-        arrays = build_chunk_arrays(
-            record.token_ids,
-            start=pair_metadata.mid,
-            end=pair_metadata.end,
-            chunk_length=4,
-            eos_token_idx=pair_metadata.eos_token_idx,
-        )
+        window = next(iter_document_window_metadata(record, chunk_length=4, num_segments=2))
 
-        self.assertEqual(pair_metadata.eos_token_idx, 7)
+        arrays = build_window_arrays(record.token_ids, window, chunk_length=4)
+
+        self.assertEqual(window.eos_token_idx, 7)
         np.testing.assert_array_equal(
-            arrays["token_ids_T"],
+            arrays["token_ids_CT"][1],
             np.asarray([5, 6, 7, DEFAULT_EOS_ID], dtype=np.int32),
         )
 

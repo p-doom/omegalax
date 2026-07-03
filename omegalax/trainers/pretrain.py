@@ -1,4 +1,4 @@
-"""Text pretraining helpers for IID and 2-segment statepassing experiments."""
+"""Text pretraining helpers for IID and fixed-window statepassing experiments."""
 
 from __future__ import annotations
 
@@ -63,9 +63,8 @@ class PretrainMode(enum.StrEnum):
 class StatepassingTargetMasks:
     total: jax.Array
     iid_comparable: jax.Array
-    segment0: jax.Array
     boundary: jax.Array
-    segment1: jax.Array
+    segments: tuple[jax.Array, ...]
 
 
 def _nll(sum_value: jax.Array, count: jax.Array) -> jax.Array:
@@ -89,13 +88,81 @@ def _metrics_from_nll(
     }
 
 
-def prepare_carried_states(
-    states: tuple[jax.Array, ...],
+def _resolve_bptt_chunks(
     pretrain_mode: PretrainMode,
+    *,
+    num_segments: int,
+    bptt_chunks: int | None,
+) -> int:
+    if bptt_chunks is None:
+        return 0 if pretrain_mode is PretrainMode.STATEPASSING_NO_BPTT else int(num_segments)
+    bptt_chunks = int(bptt_chunks)
+    if bptt_chunks < 0 or bptt_chunks > num_segments:
+        raise ValueError(f"bptt_chunks must be in [0, {num_segments}], got {bptt_chunks}")
+    return bptt_chunks
+
+
+def _prepare_carried_states_for_segment(
+    states: tuple[jax.Array, ...],
+    *,
+    segment_idx: int,
+    bptt_chunks: int,
 ) -> tuple[jax.Array, ...]:
-    if pretrain_mode is PretrainMode.STATEPASSING_NO_BPTT:
+    if segment_idx == 0:
+        return states
+    if bptt_chunks <= 1 or segment_idx % bptt_chunks == 0:
         return tuple(jax.lax.stop_gradient(state) for state in states)
     return states
+
+
+def _select_gdn_states_for_carry(
+    states: tuple[jax.Array, ...],
+    *,
+    pass_gdn_state: bool,
+    gdn_layer_limit: int | None,
+) -> tuple[jax.Array, ...] | None:
+    return _select_layer_states_for_carry(
+        states,
+        pass_state=pass_gdn_state,
+        layer_limit=gdn_layer_limit,
+        limit_name="gdn_layer_limit",
+    )
+
+
+def _select_conv_states_for_carry(
+    states: tuple[jax.Array, ...],
+    *,
+    pass_conv_state: bool,
+    gdn_layer_limit: int | None,
+) -> tuple[jax.Array, ...] | None:
+    return _select_layer_states_for_carry(
+        states,
+        pass_state=pass_conv_state,
+        layer_limit=gdn_layer_limit,
+        limit_name="gdn_layer_limit",
+    )
+
+
+def _select_layer_states_for_carry(
+    states: tuple[jax.Array, ...],
+    *,
+    pass_state: bool,
+    layer_limit: int | None,
+    limit_name: str,
+) -> tuple[jax.Array, ...] | None:
+    if not pass_state:
+        return None
+    if layer_limit is None:
+        return states
+    layer_limit = int(layer_limit)
+    if layer_limit < 0 or layer_limit > len(states):
+        raise ValueError(f"{limit_name} must be in [0, {len(states)}], got {layer_limit}")
+    if layer_limit == 0:
+        return None
+    return tuple(
+        state if state_idx < layer_limit else jnp.zeros_like(state)
+        for state_idx, state in enumerate(states)
+    )
 
 
 def apply_state_reset(
@@ -104,36 +171,59 @@ def apply_state_reset(
 ) -> tuple[jax.Array, ...]:
     reset = reset_B.astype(jnp.bool_)
     return tuple(
-        jnp.where(reset[:, None, None, None], jnp.zeros_like(state), state) for state in states
+        jnp.where(
+            reset.reshape((reset.shape[0],) + (1,) * (state.ndim - 1)),
+            jnp.zeros_like(state),
+            state,
+        )
+        for state in states
     )
+
+
+def _position_ids_zbt_from_chunk_idx(chunk_idx_B: Any, seq_len: int) -> jax.Array:
+    chunk_idx_B = jnp.asarray(chunk_idx_B, dtype=jnp.int32)
+    token_pos_T = jnp.arange(seq_len, dtype=jnp.int32)
+    position_ids_BT = chunk_idx_B[:, None] * jnp.asarray(seq_len, dtype=jnp.int32) + token_pos_T
+    return jnp.stack([position_ids_BT] * 3, axis=0)
 
 
 def statepassing_target_masks(
     loss_mask_BCT: jax.Array,
     reset_state_BC: jax.Array | None = None,
+    bptt_chunks: int | None = None,
 ) -> StatepassingTargetMasks:
-    if loss_mask_BCT.shape[1] != 2:
-        raise ValueError(f"Statepassing pretraining requires C=2, got {loss_mask_BCT.shape[1]}")
-
     B, C, T = loss_mask_BCT.shape
+    if bptt_chunks is not None and (bptt_chunks < 0 or bptt_chunks > C):
+        raise ValueError(f"bptt_chunks must be in [0, {C}], got {bptt_chunks}")
     total_BT = loss_mask_BCT.reshape(B, C * T)
-    segment0_BT = jnp.zeros_like(total_BT)
     boundary_BT = jnp.zeros_like(total_BT)
-    segment1_BT = jnp.zeros_like(total_BT)
+    iid_comparable_BT = jnp.zeros_like(total_BT)
+    segment_masks = []
 
-    segment0_BT = segment0_BT.at[:, 1:T].set(loss_mask_BCT[:, 0, 1:])
-    boundary_mask_B = loss_mask_BCT[:, 1, 0]
-    if reset_state_BC is not None:
-        boundary_mask_B = boundary_mask_B * (1 - reset_state_BC[:, 1].astype(boundary_mask_B.dtype))
-        total_BT = total_BT.at[:, T].set(boundary_mask_B)
-    boundary_BT = boundary_BT.at[:, T].set(boundary_mask_B)
-    segment1_BT = segment1_BT.at[:, T + 1 :].set(loss_mask_BCT[:, 1, 1:])
+    for segment_idx in range(C):
+        start = segment_idx * T
+        segment_BT = jnp.zeros_like(total_BT)
+        segment_BT = segment_BT.at[:, start + 1 : start + T].set(loss_mask_BCT[:, segment_idx, 1:])
+        segment_masks.append(segment_BT)
+        iid_comparable_BT = iid_comparable_BT + segment_BT
+
+    for segment_idx in range(1, C):
+        boundary_pos = segment_idx * T
+        boundary_mask_B = loss_mask_BCT[:, segment_idx, 0]
+        if bptt_chunks is not None and (bptt_chunks <= 1 or segment_idx % bptt_chunks == 0):
+            boundary_mask_B = jnp.zeros_like(boundary_mask_B)
+        if reset_state_BC is not None:
+            boundary_mask_B = boundary_mask_B * (
+                1 - reset_state_BC[:, segment_idx].astype(boundary_mask_B.dtype)
+            )
+            total_BT = total_BT.at[:, boundary_pos].set(boundary_mask_B)
+        boundary_BT = boundary_BT.at[:, boundary_pos].set(boundary_mask_B)
+
     return StatepassingTargetMasks(
         total=total_BT,
-        iid_comparable=segment0_BT + segment1_BT,
-        segment0=segment0_BT,
+        iid_comparable=iid_comparable_BT,
         boundary=boundary_BT,
-        segment1=segment1_BT,
+        segments=tuple(segment_masks),
     )
 
 
@@ -142,12 +232,15 @@ def prepare_pretrain_batch(
     pretrain_mode: PretrainMode,
     model_cfg: text_api.TextConfig,
     mesh,
+    *,
+    pass_rope_positions: bool = False,
 ) -> tuple[dict[str, jax.Array], dict[str, Any] | None, dict[str, Any]]:
     metadata = pop_pretrain_metadata(batch)
+    chunk_idx_B = batch.pop("chunk_idx_B", None)
+    chunk_idx_BC = batch.pop("chunk_idx_BC", None)
     debug = {
-        "chunk_idx_B": batch.pop("chunk_idx_B", None),
-        "chunk_idx_BC": batch.pop("chunk_idx_BC", None),
-        "is_last_chunk_BC": batch.pop("is_last_chunk_BC", None),
+        "chunk_idx_B": chunk_idx_B,
+        "chunk_idx_BC": chunk_idx_BC,
     }
 
     if pretrain_mode is PretrainMode.IID_BASELINE:
@@ -157,8 +250,30 @@ def prepare_pretrain_batch(
     missing = [key for key in required if key not in batch]
     if missing:
         raise KeyError(f"Missing required pretrain batch keys for {pretrain_mode}: {missing}")
+    if pretrain_mode.is_statepassing:
+        batch_multiple = required_batch_multiple(text_api.batch_partition_spec(model_cfg), mesh)
+        window_batch = int(batch["token_ids_BCT"].shape[0])
+        if window_batch % batch_multiple != 0:
+            raise ValueError(
+                f"Statepassing window batch size {window_batch} must be divisible by "
+                f"batch sharding multiple {batch_multiple}."
+            )
 
     device_batch = {key: batch[key] for key in required}
+    if pass_rope_positions:
+        if pretrain_mode is PretrainMode.IID_BASELINE:
+            if chunk_idx_B is None:
+                raise KeyError("pass_rope_positions=True requires chunk_idx_B in IID batches")
+            device_batch["position_ids_ZBT"] = _position_ids_zbt_from_chunk_idx(
+                chunk_idx_B,
+                int(device_batch["token_ids_BT"].shape[1]),
+            )
+        else:
+            if chunk_idx_BC is None:
+                raise KeyError(
+                    "pass_rope_positions=True requires chunk_idx_BC in statepassing batches"
+                )
+            device_batch["chunk_idx_BC"] = chunk_idx_BC
     return text_api.shard_batch_dict(device_batch, model_cfg, mesh), metadata, debug
 
 
@@ -168,7 +283,12 @@ def _iid_loss_stats(model, batch: dict[str, jax.Array], cfg, pad_id: int):
     loss_mask_BT = batch["loss_mask_BT"]
 
     hidden_BTD, aux_loss = text_api.forward(
-        model, token_ids_BT, pad_id, cfg, attention_mask_BT=attention_mask_BT
+        model,
+        token_ids_BT,
+        pad_id,
+        cfg,
+        attention_mask_BT=attention_mask_BT,
+        position_ids_ZBT=batch.get("position_ids_ZBT"),
     )
     nll_sum, token_count = chunked_cross_entropy_stats(
         hidden_BTD,
@@ -197,38 +317,90 @@ def _statepassing_loss_stats(
     cfg,
     pad_id: int,
     pretrain_mode: PretrainMode,
+    bptt_chunks: int | None = None,
+    pass_gdn_state: bool = True,
+    gdn_layer_limit: int | None = None,
+    pass_rope_positions: bool = False,
+    pass_conv_state: bool = False,
 ):
     token_ids_BCT = batch["token_ids_BCT"]
     attention_mask_BCT = batch["attention_mask_BCT"]
     loss_mask_BCT = batch["loss_mask_BCT"]
     reset_state_BC = batch["reset_state_BC"]
-    if token_ids_BCT.shape[1] != 2:
-        raise ValueError(f"Statepassing pretraining requires C=2, got {token_ids_BCT.shape[1]}")
-
-    hidden0_BTD, aux0, state0 = text_api.forward_with_gdn_state(
-        model,
-        token_ids_BCT[:, 0, :],
-        pad_id,
-        cfg,
-        attention_mask_BT=attention_mask_BCT[:, 0, :],
-        initial_gdn_states=None,
-    )
-    state0 = prepare_carried_states(state0, pretrain_mode)
-    state0 = apply_state_reset(state0, reset_state_BC[:, 1])
-    hidden1_BTD, aux1, _ = text_api.forward_with_gdn_state(
-        model,
-        token_ids_BCT[:, 1, :],
-        pad_id,
-        cfg,
-        attention_mask_BT=attention_mask_BCT[:, 1, :],
-        initial_gdn_states=state0,
+    C = token_ids_BCT.shape[1]
+    chunk_idx_BC = batch.get("chunk_idx_BC")
+    if pass_rope_positions and chunk_idx_BC is None:
+        raise KeyError("pass_rope_positions=True requires chunk_idx_BC in statepassing batches")
+    resolved_bptt_chunks = _resolve_bptt_chunks(
+        pretrain_mode, num_segments=C, bptt_chunks=bptt_chunks
     )
 
-    hidden_BT_D = jnp.concatenate([hidden0_BTD, hidden1_BTD], axis=1)
+    hidden_segments = []
+    aux_losses = []
+    carried_states = None
+    carried_conv_states = None
+    for segment_idx in range(C):
+        if carried_states is not None:
+            carried_states = _prepare_carried_states_for_segment(
+                carried_states,
+                segment_idx=segment_idx,
+                bptt_chunks=resolved_bptt_chunks,
+            )
+            carried_states = apply_state_reset(carried_states, reset_state_BC[:, segment_idx])
+        if carried_conv_states is not None:
+            carried_conv_states = _prepare_carried_states_for_segment(
+                carried_conv_states,
+                segment_idx=segment_idx,
+                bptt_chunks=resolved_bptt_chunks,
+            )
+            carried_conv_states = apply_state_reset(
+                carried_conv_states, reset_state_BC[:, segment_idx]
+            )
+        forward_kwargs = {
+            "attention_mask_BT": attention_mask_BCT[:, segment_idx, :],
+            "initial_gdn_states": carried_states,
+        }
+        if pass_conv_state:
+            forward_kwargs["initial_conv_states"] = carried_conv_states
+            forward_kwargs["return_conv_states"] = True
+        if pass_rope_positions:
+            forward_kwargs["position_ids_ZBT"] = _position_ids_zbt_from_chunk_idx(
+                chunk_idx_BC[:, segment_idx],
+                int(token_ids_BCT.shape[2]),
+            )
+        forward_result = text_api.forward_with_gdn_state(
+            model,
+            token_ids_BCT[:, segment_idx, :],
+            pad_id,
+            cfg,
+            **forward_kwargs,
+        )
+        if pass_conv_state:
+            hidden_BTD, aux_loss, final_states, final_conv_states = forward_result
+        else:
+            hidden_BTD, aux_loss, final_states = forward_result
+        carried_states = _select_gdn_states_for_carry(
+            final_states,
+            pass_gdn_state=pass_gdn_state,
+            gdn_layer_limit=gdn_layer_limit,
+        )
+        if pass_conv_state:
+            carried_conv_states = _select_conv_states_for_carry(
+                final_conv_states,
+                pass_conv_state=pass_conv_state,
+                gdn_layer_limit=gdn_layer_limit,
+            )
+        hidden_segments.append(hidden_BTD)
+        aux_losses.append(aux_loss)
+
+    hidden_BT_D = jnp.concatenate(hidden_segments, axis=1)
     token_ids_BT = token_ids_BCT.reshape(token_ids_BCT.shape[0], -1)
-    masks = statepassing_target_masks(loss_mask_BCT, reset_state_BC)
+    masks = statepassing_target_masks(loss_mask_BCT, reset_state_BC, bptt_chunks=bptt_chunks)
+    mask_names = ("total", "iid_comparable", "boundary") + tuple(
+        f"segment{idx}" for idx in range(C)
+    )
     mask_stack = jnp.stack(
-        [masks.total, masks.iid_comparable, masks.segment0, masks.boundary, masks.segment1],
+        [masks.total, masks.iid_comparable, masks.boundary, *masks.segments],
         axis=0,
     )
     nll_sums, token_counts = chunked_cross_entropy_multi_stats(
@@ -241,7 +413,7 @@ def _statepassing_loss_stats(
     )
 
     total_nll = _nll(nll_sums[0], token_counts[0])
-    aux_loss = 0.5 * (aux0 + aux1)
+    aux_loss = jnp.sum(jnp.stack(aux_losses)) / float(C)
     loss = total_nll + aux_loss
     metrics = {
         "loss": loss,
@@ -250,21 +422,39 @@ def _statepassing_loss_stats(
         "aux_loss": aux_loss,
         "nll_sum": nll_sums[0],
         "supervised_tokens": token_counts[0],
-        **_metrics_from_nll("iid_comparable", nll_sums[1], token_counts[1]),
-        **_metrics_from_nll("segment0", nll_sums[2], token_counts[2]),
-        **_metrics_from_nll("boundary", nll_sums[3], token_counts[3]),
-        **_metrics_from_nll("segment1", nll_sums[4], token_counts[4]),
     }
+    for mask_idx, name in enumerate(mask_names[1:], start=1):
+        metrics.update(_metrics_from_nll(name, nll_sums[mask_idx], token_counts[mask_idx]))
     return loss, metrics
 
 
-def make_pretrain_train_step(pretrain_mode: PretrainMode, cfg, pad_id: int = 0):
+def make_pretrain_train_step(
+    pretrain_mode: PretrainMode,
+    cfg,
+    pad_id: int = 0,
+    bptt_chunks: int | None = None,
+    pass_gdn_state: bool = True,
+    gdn_layer_limit: int | None = None,
+    pass_rope_positions: bool = False,
+    pass_conv_state: bool = False,
+):
     @nnx.jit(donate_argnums=0)
     def pretrain_train_step(optimizer: MixedPrecisionOptimizer, batch: dict[str, jax.Array]):
         def loss_fn(model):
             if pretrain_mode is PretrainMode.IID_BASELINE:
                 return _iid_loss_stats(model, batch, cfg, pad_id)
-            return _statepassing_loss_stats(model, batch, cfg, pad_id, pretrain_mode)
+            return _statepassing_loss_stats(
+                model,
+                batch,
+                cfg,
+                pad_id,
+                pretrain_mode,
+                bptt_chunks=bptt_chunks,
+                pass_gdn_state=pass_gdn_state,
+                gdn_layer_limit=gdn_layer_limit,
+                pass_rope_positions=pass_rope_positions,
+                pass_conv_state=pass_conv_state,
+            )
 
         (loss, aux_metrics), grads = nnx.value_and_grad(loss_fn, has_aux=True)(optimizer.model)
         optimizer.update(grads)
@@ -275,13 +465,33 @@ def make_pretrain_train_step(pretrain_mode: PretrainMode, cfg, pad_id: int = 0):
     return pretrain_train_step
 
 
-def make_pretrain_eval_step(pretrain_mode: PretrainMode, cfg, pad_id: int = 0):
+def make_pretrain_eval_step(
+    pretrain_mode: PretrainMode,
+    cfg,
+    pad_id: int = 0,
+    bptt_chunks: int | None = None,
+    pass_gdn_state: bool = True,
+    gdn_layer_limit: int | None = None,
+    pass_rope_positions: bool = False,
+    pass_conv_state: bool = False,
+):
     @nnx.jit
     def pretrain_eval_step(model: nnx.Module, batch: dict[str, jax.Array]):
         if pretrain_mode is PretrainMode.IID_BASELINE:
             _, metrics = _iid_loss_stats(model, batch, cfg, pad_id)
         else:
-            _, metrics = _statepassing_loss_stats(model, batch, cfg, pad_id, pretrain_mode)
+            _, metrics = _statepassing_loss_stats(
+                model,
+                batch,
+                cfg,
+                pad_id,
+                pretrain_mode,
+                bptt_chunks=bptt_chunks,
+                pass_gdn_state=pass_gdn_state,
+                gdn_layer_limit=gdn_layer_limit,
+                pass_rope_positions=pass_rope_positions,
+                pass_conv_state=pass_conv_state,
+            )
         return metrics
 
     return pretrain_eval_step
@@ -332,15 +542,18 @@ def _accumulate_metric_sums(acc: dict[str, float], metrics: dict[str, Any]) -> N
     )
     acc["aux_loss"] = acc.get("aux_loss", 0.0) + _host_float(metrics.get("aux_loss", 0.0))
     acc["steps"] = acc.get("steps", 0.0) + 1.0
-    for prefix in ("iid_comparable", "segment0", "boundary", "segment1"):
-        sum_key = f"{prefix}_nll"
-        tok_key = f"{prefix}_tokens"
-        if sum_key in metrics and tok_key in metrics:
-            tokens = _host_float(metrics[tok_key])
-            acc[f"{prefix}_nll_sum"] = acc.get(f"{prefix}_nll_sum", 0.0) + (
-                _host_float(metrics[sum_key]) * tokens
-            )
-            acc[tok_key] = acc.get(tok_key, 0.0) + tokens
+    for tok_key in sorted(key for key in metrics if key.endswith("_tokens")):
+        if tok_key == "supervised_tokens":
+            continue
+        prefix = tok_key[: -len("_tokens")]
+        nll_key = f"{prefix}_nll"
+        if nll_key not in metrics:
+            continue
+        tokens = _host_float(metrics[tok_key])
+        acc[f"{prefix}_nll_sum"] = acc.get(f"{prefix}_nll_sum", 0.0) + (
+            _host_float(metrics[nll_key]) * tokens
+        )
+        acc[tok_key] = acc.get(tok_key, 0.0) + tokens
 
 
 def _finalize_accumulated_metrics(acc: dict[str, float]) -> dict[str, float]:
@@ -355,11 +568,11 @@ def _finalize_accumulated_metrics(acc: dict[str, float]) -> dict[str, float]:
         "supervised_tokens": tokens,
         "nll_sum": acc.get("nll_sum", 0.0),
     }
-    for prefix in ("iid_comparable", "segment0", "boundary", "segment1"):
-        tokens_key = f"{prefix}_tokens"
-        tokens_value = acc.get(tokens_key)
-        if tokens_value is None:
+    for tokens_key in sorted(key for key in acc if key.endswith("_tokens")):
+        if tokens_key == "supervised_tokens":
             continue
+        prefix = tokens_key[: -len("_tokens")]
+        tokens_value = acc[tokens_key]
         prefix_nll = acc.get(f"{prefix}_nll_sum", 0.0) / max(tokens_value, 1.0)
         out[f"{prefix}_nll"] = prefix_nll
         out[f"{prefix}_ppl"] = math.exp(min(prefix_nll, 20.0))
@@ -388,6 +601,11 @@ def run_pretrain(
     val_steps: int = 10,
     text_attn_backend: str = "mosaic_gpu",
     gc_period: int = 0,
+    bptt_chunks: int | None = None,
+    pass_gdn_state: bool = True,
+    gdn_layer_limit: int | None = None,
+    pass_rope_positions: bool = False,
+    pass_conv_state: bool = False,
 ) -> tuple[MixedPrecisionOptimizer, dict[str, float]]:
     pretrain_mode = PretrainMode(pretrain_mode)
     save_path = Path(save_dir).expanduser().resolve() if save_dir is not None else None
@@ -417,12 +635,6 @@ def run_pretrain(
         raise ValueError(
             f"Global batch size {train_cfg.batch_size} must be divisible by {batch_multiple}."
         )
-    if pretrain_mode.is_statepassing and train_cfg.batch_size % (2 * batch_multiple) != 0:
-        raise ValueError(
-            f"Statepassing global batch size {train_cfg.batch_size} must leave an even "
-            f"per-shard segment batch after batch sharding multiple {batch_multiple}."
-        )
-
     replicated_rng_sharding = NamedSharding(mesh, P())
     root_rng = jax.device_put(jax.random.key(train_cfg.seed), replicated_rng_sharding)
     init_rng, rng = jax.random.split(root_rng)
@@ -447,8 +659,26 @@ def run_pretrain(
         end_factor=train_cfg.lr_end_factor,
         stable_fraction=train_cfg.lr_stable_fraction,
     )
-    train_step = make_pretrain_train_step(pretrain_mode, model_cfg, pad_id=pad_id)
-    eval_step = make_pretrain_eval_step(pretrain_mode, model_cfg, pad_id=pad_id)
+    train_step = make_pretrain_train_step(
+        pretrain_mode,
+        model_cfg,
+        pad_id=pad_id,
+        bptt_chunks=bptt_chunks,
+        pass_gdn_state=pass_gdn_state,
+        gdn_layer_limit=gdn_layer_limit,
+        pass_rope_positions=pass_rope_positions,
+        pass_conv_state=pass_conv_state,
+    )
+    eval_step = make_pretrain_eval_step(
+        pretrain_mode,
+        model_cfg,
+        pad_id=pad_id,
+        bptt_chunks=bptt_chunks,
+        pass_gdn_state=pass_gdn_state,
+        gdn_layer_limit=gdn_layer_limit,
+        pass_rope_positions=pass_rope_positions,
+        pass_conv_state=pass_conv_state,
+    )
 
     if checkpoint_manager is not None and not will_resume:
         _write_checkpoint_config(save_path, model_cfg)
@@ -500,7 +730,13 @@ def run_pretrain(
             wait_start = time.perf_counter()
             raw_batch = next(data_iter)
             accum_data_wait_s += time.perf_counter() - wait_start
-            batch, _, _ = prepare_pretrain_batch(raw_batch, pretrain_mode, model_cfg, mesh)
+            batch, _, _ = prepare_pretrain_batch(
+                raw_batch,
+                pretrain_mode,
+                model_cfg,
+                mesh,
+                pass_rope_positions=pass_rope_positions,
+            )
             micro_flops = per_device_flops_per_step(
                 model_cfg,
                 train_cfg.seq_len,
@@ -546,7 +782,11 @@ def run_pretrain(
             for _ in range(val_steps):
                 raw_val_batch = next(val_data_iter)
                 val_batch, _, _ = prepare_pretrain_batch(
-                    raw_val_batch, pretrain_mode, model_cfg, mesh
+                    raw_val_batch,
+                    pretrain_mode,
+                    model_cfg,
+                    mesh,
+                    pass_rope_positions=pass_rope_positions,
                 )
                 val_metrics = eval_step(optimizer.model, val_batch)
                 _accumulate_metric_sums(val_acc, val_metrics)

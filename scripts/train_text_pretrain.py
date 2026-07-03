@@ -1,4 +1,4 @@
-"""Run IID or 2-segment statepassing text pretraining."""
+"""Run IID or fixed-window statepassing text pretraining."""
 
 from __future__ import annotations
 
@@ -74,6 +74,11 @@ flags.DEFINE_string("wandb_id", None, "Optional stable Weights & Biases run id f
 flags.DEFINE_string("wandb_resume", None, "Optional Weights & Biases resume policy.")
 flags.DEFINE_integer("val_every", None, "Run validation every N steps.")
 flags.DEFINE_integer("val_steps", 10, "Validation batches per validation run.")
+flags.DEFINE_integer("bptt_chunks", None, "Backpropagation span in chunks for statepassing.")
+flags.DEFINE_bool("pass_gdn_state", True, "Pass GDN recurrent state between chunks.")
+flags.DEFINE_integer("gdn_layer_limit", None, "Only pass state for the first N GDN layers.")
+flags.DEFINE_bool("pass_rope_positions", False, "Pass chunk-aware RoPE position ids.")
+flags.DEFINE_bool("pass_conv_state", False, "Pass 1D conv state between chunks.")
 flags.DEFINE_integer("grain_read_threads", 2, "Grain read threads.")
 flags.DEFINE_integer("grain_read_prefetch_buffer_size", 4, "Grain read prefetch buffer size.")
 flags.DEFINE_integer("grain_workers", 8, "Grain multiprocessing workers.")
@@ -159,6 +164,16 @@ def _make_iterator(
     return make_statepassing_iterator(index_path, **common)
 
 
+def _runtime_kwargs() -> dict[str, object]:
+    return {
+        "bptt_chunks": FLAGS.bptt_chunks,
+        "pass_gdn_state": FLAGS.pass_gdn_state,
+        "gdn_layer_limit": FLAGS.gdn_layer_limit,
+        "pass_rope_positions": FLAGS.pass_rope_positions,
+        "pass_conv_state": FLAGS.pass_conv_state,
+    }
+
+
 def main(_) -> None:
     pretrain_mode = pretrain_trainer.PretrainMode(FLAGS.pretrain_mode)
     jax.config.update("jax_compilation_cache_dir", FLAGS.jax_cache_dir)
@@ -172,9 +187,6 @@ def main(_) -> None:
             f"process_count={jax.process_count()}."
         )
     per_process_batch = FLAGS.batch_size // jax.process_count()
-    if pretrain_mode.is_statepassing and per_process_batch % 2:
-        raise ValueError("Per-process segment batch size must be even for statepassing.")
-
     num_steps, warmup_steps = _num_steps_and_warmup()
     train_iter = _make_iterator(
         FLAGS.train_index_path, pretrain_mode, per_process_batch, shuffle=True
@@ -260,6 +272,7 @@ def main(_) -> None:
             val_steps=FLAGS.val_steps,
             text_attn_backend=FLAGS.text_attn_backend,
             gc_period=FLAGS.gc_period,
+            **_runtime_kwargs(),
         )
     finally:
         if FLAGS.gc_period:

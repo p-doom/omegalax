@@ -137,6 +137,7 @@ def forward(
     *,
     attention_mask_BT: jax.Array | None = None,
     segment_ids_BT: jax.Array | None = None,
+    position_ids_ZBT: jax.Array | None = None,
 ):
     """Forward pass returning hidden states before lm_head, plus aux loss."""
     segment_ids_BT = segment_ids_from_inputs(
@@ -146,7 +147,19 @@ def forward(
         segment_ids_BT=segment_ids_BT,
     )
 
-    if isinstance(model, (Qwen3, Qwen3_5ForCausalLM)):
+    if isinstance(model, Qwen3_5ForCausalLM):
+        return model(
+            token_ids_BT,
+            segment_ids_BT,
+            None,
+            jnp.array(0, dtype=jnp.int32),
+            position_ids_ZBT=position_ids_ZBT,
+        )
+    if isinstance(model, Qwen3):
+        if position_ids_ZBT is not None:
+            raise ValueError(
+                "Explicit position_ids_ZBT are only supported for Qwen3.5 text models."
+            )
         return model(token_ids_BT, segment_ids_BT, None, jnp.array(0, dtype=jnp.int32))
 
     raise ValueError(f"Unsupported text model type: {type(model)}")
@@ -161,7 +174,13 @@ def forward_with_gdn_state(
     attention_mask_BT: jax.Array | None = None,
     segment_ids_BT: jax.Array | None = None,
     initial_gdn_states: tuple[jax.Array, ...] | None = None,
-) -> tuple[jax.Array, jax.Array, tuple[jax.Array, ...]]:
+    initial_conv_states: tuple[jax.Array, ...] | None = None,
+    position_ids_ZBT: jax.Array | None = None,
+    return_conv_states: bool = False,
+) -> (
+    tuple[jax.Array, jax.Array, tuple[jax.Array, ...]]
+    | tuple[jax.Array, jax.Array, tuple[jax.Array, ...], tuple[jax.Array, ...]]
+):
     """Qwen3.5 forward pass that returns one final GDN state per linear layer."""
     segment_ids_BT = segment_ids_from_inputs(
         token_ids_BT,
@@ -177,7 +196,10 @@ def forward_with_gdn_state(
             None,
             jnp.array(0, dtype=jnp.int32),
             gdn_initial_states=initial_gdn_states,
+            conv_initial_states=initial_conv_states,
+            position_ids_ZBT=position_ids_ZBT,
             return_gdn_states=True,
+            return_conv_states=return_conv_states,
         )
     raise ValueError("GDN state forwarding is only supported for Qwen3.5 text models.")
 
