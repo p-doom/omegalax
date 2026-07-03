@@ -142,7 +142,11 @@ def _forward_and_grad(model, cfg, batch):
     targets_BT = batch["targets_BT"] if cp_axis is not None else token_ids_BT
     position_ids_BT = batch.get("position_ids_BT")
 
-    segment_ids_BT = (token_ids_BT != 0).astype(jnp.int32)
+    # Packed batches carry explicit multi-document segment ids; else a single
+    # segment from (token_ids != 0), matching the trainer / text_api.forward.
+    segment_ids_BT = batch.get("segment_ids_BT")
+    if segment_ids_BT is None:
+        segment_ids_BT = (token_ids_BT != 0).astype(jnp.int32)
     gd, state = nnx.split(model)
 
     def _run(state):
@@ -643,6 +647,69 @@ class CpDocumentMaskTest(absltest.TestCase):
         for cp in (2, 4):
             out_seg = self._run_cp(q, k, v, pos, seg, cp, use_seg=True)
             np.testing.assert_allclose(out_seg, np.asarray(causal_ref), rtol=0, atol=1e-5)
+
+
+class CpPackedEquivalenceTest(parameterized.TestCase):
+    """Full-model cp>1 == cp=1 for a PACKED multi-document batch.
+
+    The batch carries two documents per row (distinct segment ids, per-document
+    RESET positions), so the block-diagonal document mask is ACTIVE on both paths:
+    non-CP goes through ``document_causal_attention`` (k_start), CP through
+    ``context_parallel_attention`` (q_seg == k_seg). Matching forward + loss + grads
+    proves the two document-mask implementations agree; combined with the
+    packed==standalone equivalence in test_packing this transitively proves packed
+    CP training == training each document alone.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.cfg = _dense_cfg()
+        cls.B, cls.T = 4, 16  # B divides every dp; T divides every cp
+        rng = np.random.RandomState(0)
+        cls.tokens = rng.randint(1, cls.cfg.vocab_size, size=(cls.B, cls.T)).astype(np.int32)
+        # Two documents per row: lengths 7 + 9, positions reset per document.
+        seg = np.concatenate([np.ones(7), 2 * np.ones(9)]).astype(np.int32)
+        pos = np.concatenate([np.arange(7), np.arange(9)]).astype(np.int32)
+        cls.seg = np.broadcast_to(seg[None], (cls.B, cls.T)).copy()
+        cls.pos = np.broadcast_to(pos[None], (cls.B, cls.T)).copy()
+        cls.mask = np.ones((cls.B, cls.T), dtype=np.float32)
+
+        cls.mesh1 = make_mesh(tp_size=1, fsdp_size=1, dp_size=4, cp_size=1)
+        with mesh_rules(cls.mesh1):
+            model1, cfg1 = _make_model(cls.cfg, cls.mesh1)
+            batch1 = shard_batch_dict(cls._batch(), cfg1.shd_cfg, cls.mesh1, cp_load_balance=False)
+            cls.hidden1, cls.loss1, cls.grads1 = _forward_and_grad(model1, cfg1, batch1)
+
+    @classmethod
+    def _batch(cls):
+        return {
+            "token_ids_BT": cls.tokens,
+            "segment_ids_BT": cls.seg,
+            "position_ids_BT": cls.pos,
+            "loss_mask_BT": cls.mask,
+        }
+
+    @parameterized.named_parameters(("cp2", 2), ("cp4", 4))
+    def test_cp_matches_non_cp_packed(self, cp):
+        mesh = make_mesh(tp_size=1, fsdp_size=1, dp_size=4 // cp, cp_size=cp)
+        with mesh_rules(mesh):
+            cfg_cp = dataclasses.replace(self.cfg, shd_cfg=ShardConfig.context_parallel())
+            model, cfg_m = _make_model(cfg_cp, mesh)
+            self.assertEqual(cfg_m.shd_cfg.act_btd[1], "cp")  # CP active
+            batch = shard_batch_dict(self._batch(), cfg_m.shd_cfg, mesh, cp_load_balance=False)
+            hidden, loss, grads = _forward_and_grad(model, cfg_m, batch)
+
+        fwd_rel = float(np.abs(hidden - self.hidden1).max()) / max(float(np.abs(self.hidden1).max()), 1e-6)
+        self.assertLess(fwd_rel, 2e-5, f"packed forward rel diff {fwd_rel}")
+        np.testing.assert_allclose(loss, self.loss1, rtol=2e-5, atol=1e-5)
+        g_cp, g_ref = _flat_grads(grads), _flat_grads(self.grads1)
+        self.assertEqual(set(g_cp), set(g_ref))
+        worst = max(
+            float(np.abs(g_cp[k] - g_ref[k]).max()) / max(float(np.abs(g_ref[k]).max()), 1e-6)
+            for k in g_ref
+        )
+        self.assertLess(worst, 2e-4, f"packed grad rel diff {worst}")
 
 
 if __name__ == "__main__":
