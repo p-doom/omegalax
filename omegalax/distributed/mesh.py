@@ -1,44 +1,12 @@
 """Mesh construction and global mesh setup.
 
-Topology-aware device placement
-================================
-The device mesh keeps the logical axis names ``('tp', 'cp', 'fsdp', 'dp')``
-(ordered comm-heaviest-first) so that :mod:`omegalax.models.shard_config`,
-:mod:`omegalax.distributed.sharding_runtime`, :func:`ensure_mesh` validation and
-Orbax ``NamedSharding`` are all unaffected. Only the *physical device
-placement* underneath those axis names changes. ``cp`` is context / sequence
-parallelism (the per-layer all-gather-KV attention path); it rides the NVLink
-domain next to ``tp`` and is a strict no-op when ``cp_size == 1``.
-
-On GPU, ``jax.make_mesh`` -> ``mesh_utils.create_device_mesh`` takes a plain
-row-major reshape (topology-aware reordering is TPU-only). Because
-``jax.devices()`` is process-major (each node's GPUs are contiguous) and ``tp``
-is the *major* (most-strided) axis, a flat ``(tp, fsdp, dp)`` mesh scatters the
-TP communication group across nodes (one GPU per node) for any multi-node run
-with ``tp_size > 1``. That forces the highest-frequency collective (per-layer TP
-all-reduce/all-gather) onto InfiniBand instead of NVLink.
-
-The fix is a *hierarchical* (hybrid ICI/DCN) mesh:
-
-* **ICI** (Inter-Chip Interconnect = NVLink domain = one node) carries the
-  comm-heavy ``tp`` axis (and ``fsdp`` up to the size of the node).
-* **DCN** (Data-Center Network = InfiniBand) carries the comm-light ``dp`` axis
-  (and any ``fsdp`` that spills past a single node).
-
-Assumptions (asserted / documented below):
-
-* **One process per node.** ``jax.local_device_count()`` is then the number of
-  GPUs per node == the NVLink/ICI domain size, and ``jax.process_count()`` is
-  the number of nodes == the number of DCN granules. If omegalax is instead
-  launched one-process-per-GPU, ``local_device_count == 1`` and the ICI domain
-  collapses; :func:`make_hierarchical_mesh` warns in that case.
-* ``process_is_granule=True`` is **mandatory** on this GPU cluster: we launch
-  via :func:`omegalax.distributed.init_distributed`, which for the
-  multi-node path calls ``jax.distributed.initialize()`` without a partition
-  index, so every device reports a uniform ``slice_index`` and the slice-based
-  granule detection would collapse to a single granule.
-  ``process_is_granule=True`` groups DCN granules by ``process_index`` (== node),
-  keeping ICI axes on NVLink.
+Topology-aware ``('tp', 'cp', 'fsdp', 'dp')`` mesh (comm-heaviest axis first).
+The comm-heavy axes (``tp``, ``cp``, ``fsdp`` up to a node) ride the intra-node
+NVLink domain (ICI); ``dp`` and any ``fsdp`` spill ride the data-center network
+(DCN). Without this a flat multi-node mesh scatters the per-layer TP collective
+across nodes onto InfiniBand. Assumes ONE process per node, so
+``local_device_count`` == GPUs/node == ICI size and ``process_count`` == nodes
+== DCN granules; :func:`make_hierarchical_mesh` warns otherwise.
 """
 
 from __future__ import annotations
@@ -58,41 +26,24 @@ from omegalax.models.shard_config import axis_rules_for_mesh
 
 logger = logging.getLogger(__name__)
 
-# Axis order is comm-heaviest-first. ``cp`` (context / sequence parallelism)
-# sits next to ``tp``: both ride the intra-node NVLink domain (ICI) because the
-# per-layer CP all-gather-KV collective is comm-heavy (like the TP all-reduce),
-# so it must stay off the data-center network. ``cp_size == 1`` is a strict
-# no-op: the size-1 axis is dropped from every partition spec by
-# :func:`omegalax.models.shard_config._filter_axis`, so all pre-CP behavior
-# (and every existing test) is unchanged.
+# Comm-heaviest-first. tp and cp ride the intra-node NVLink domain (both are
+# comm-heavy per-layer collectives); cp_size==1 is a strict no-op (size-1 axis
+# dropped downstream by shard_config._filter_axis).
 _AXES = ("tp", "cp", "fsdp", "dp")
 
-# A per-axis-type parallelism quadruple, always in comm-heaviest-first order
-# matching ``_AXES``: (tp, cp, fsdp, dp).
+# Per-axis-type parallelism quadruple, comm-heaviest-first: (tp, cp, fsdp, dp).
 Quad = tuple[int, int, int, int]
-
-# Backwards-compatible alias (some callers may still refer to a "triple").
-Triple = Quad
+Triple = Quad  # backwards-compatible alias
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class ParallelismConfig:
-    """Explicit ICI/DCN parallelism degrees, comm-heaviest-first per axis type.
+    """Explicit ICI/DCN parallelism degrees per axis type (comm-heaviest-first).
 
-    The eight degrees fully specify the hierarchical mesh. ``ici_*`` degrees ride
-    the NVLink domain (one node); ``dcn_*`` degrees ride the data-center network
-    (across nodes). The legacy four-arg interface (``tp_size``, ``cp_size``,
-    ``fsdp_size``, ``dp_size``) is derived into this via :func:`derive_ici_dcn`;
-    callers may also pass an explicit :class:`ParallelismConfig` to override the
-    split.
-
-    Invariants (checked by :func:`make_hierarchical_mesh`):
-      * ``ici_tp * ici_cp * ici_fsdp * ici_dp == local_device_count``
-      * ``dcn_tp * dcn_cp * dcn_fsdp * dcn_dp == num_processes``
-      * per-type products (``tp = ici_tp * dcn_tp`` etc.) equal the legacy sizes,
-        preserving ``tp * cp * fsdp * dp == device_count`` (see
-        :func:`_resolve_mesh_shape`) and the data-pipeline invariant
-        ``dp = dp_size * fsdp_size``.
+    ``ici_*`` ride the NVLink domain (one node), ``dcn_*`` the data-center network
+    (across nodes). Derived from the legacy (tp, cp, fsdp, dp) sizes by
+    :func:`derive_ici_dcn`; per-type products (``tp == ici_tp * dcn_tp`` etc.)
+    equal those sizes.
     """
 
     ici_tp: int
@@ -165,35 +116,14 @@ def derive_ici_dcn(
 ) -> ParallelismConfig:
     """Map legacy (tp, cp, fsdp, dp) sizes onto a hierarchical ICI/DCN split.
 
-    MaxText-style capacity-filling placement. The ICI domain (one node, size
-    ``local_device_count``) is filled in comm-heaviest-first priority order --
-    TP, then CP, then FSDP, then DP -- and whatever does not fit spills to the
-    DCN (``num_processes`` granules). Concretely:
+    MaxText-style capacity-filling: fill the ICI domain (one node) comm-heaviest
+    first -- TP, then CP, then FSDP, then DP -- spilling the remainder to the DCN
+    (``num_processes`` granules). TP and CP are ICI-only and MUST jointly fit and
+    tile one node (the correctness guardrail asserted below); on a single node
+    (``num_processes == 1``) everything stays ICI.
 
-    * **TP -> ICI only.** ``ici_tp = tp_size``, ``dcn_tp = 1``. TP is the
-      comm-heaviest collective and MUST fit inside the NVLink domain, so we
-      require ``tp_size <= local_device_count`` and
-      ``local_device_count % tp_size == 0`` (the correctness guardrail).
-    * **CP -> ICI only.** ``ici_cp = cp_size``, ``dcn_cp = 1``. Context
-      parallelism's per-layer all-gather-KV collective is comm-heavy, so CP
-      rides NVLink alongside TP. Guardrail: ``tp_size * cp_size <=
-      local_device_count`` and ``local_device_count % (tp_size * cp_size) == 0``
-      -- the TP*CP block must tile the NVLink domain evenly. ``cp_size == 1`` is
-      a strict no-op (``ici_cp == dcn_cp == 1``; the size-1 axis is dropped
-      downstream), so all pre-CP layouts are unchanged.
-    * **FSDP fills the rest of the node first, then spills to DCN.**
-      ``ici_fsdp = min(fsdp_size, local_device_count // (ici_tp*ici_cp))``;
-      ``dcn_fsdp = fsdp_size // ici_fsdp`` (must divide evenly).
-    * **DP fills any node room left after TP+CP+FSDP, then spills to DCN.** In
-      the multi-node target case a full node is already consumed by TP (+CP
-      +FSDP), so DP lands entirely in the DCN (``dcn_dp = dp_size``,
-      ``ici_dp = 1``). On a *single node* (``num_processes == 1``) there is no
-      DCN, so DP (and FSDP) must fit inside the ICI; this branch handles that so
-      single-node runs keep working unchanged.
-
-    Pure function (no JAX calls); ``local_device_count`` and ``num_processes``
-    are passed in so it is unit-testable on CPU. ``cp_size`` is keyword-optional
-    and defaults to 1 to preserve the legacy 5-positional-arg call sites.
+    Pure (no JAX calls) so it is CPU-unit-testable; ``cp_size`` is keyword-optional
+    (default 1, a strict no-op) to preserve legacy call sites.
     """
     if tp_size <= 0 or cp_size <= 0 or fsdp_size <= 0 or dp_size <= 0:
         raise ValueError(
@@ -206,8 +136,8 @@ def derive_ici_dcn(
             f"local_device_count={local_device_count}, num_processes={num_processes}."
         )
 
-    # TP+CP -> ICI only. Guardrail: the TP*CP block must fit within the NVLink
-    # domain (both are comm-heavy per-layer collectives).
+    # TP*CP -> ICI only, and MUST fit + tile one NVLink domain (both are
+    # comm-heavy per-layer collectives that must stay off the DCN).
     tpcp = tp_size * cp_size
     if tpcp > local_device_count:
         raise ValueError(
@@ -224,7 +154,7 @@ def derive_ici_dcn(
     ici_tp, dcn_tp = tp_size, 1
     ici_cp, dcn_cp = cp_size, 1
 
-    # FSDP fills the remaining GPUs of the node first, then spills to DCN.
+    # FSDP fills the rest of the node, then spills to DCN.
     ici_slots = local_device_count // (ici_tp * ici_cp)
     ici_fsdp = min(fsdp_size, ici_slots)
     if fsdp_size % ici_fsdp != 0:
@@ -236,9 +166,7 @@ def derive_ici_dcn(
         )
     dcn_fsdp = fsdp_size // ici_fsdp
 
-    # DP fills any leftover node room (only nonzero once FSDP did NOT spill, i.e.
-    # dcn_fsdp == 1), then spills to DCN. In the multi-node target case TP(+CP
-    # +FSDP) already fill the node so ici_dp == 1 and DP is DCN-only.
+    # DP fills any leftover node room, then spills to DCN.
     ici_slots_left = ici_slots // ici_fsdp  # == ldc // (ici_tp*ici_cp*ici_fsdp)
     ici_dp = min(dp_size, ici_slots_left)
     if dp_size % ici_dp != 0:
@@ -261,7 +189,6 @@ def derive_ici_dcn(
         dcn_dp=dcn_dp,
     )
 
-    # ICI axes must exactly tile one node; DCN axes must exactly tile the nodes.
     ici_prod = ici_tp * ici_cp * ici_fsdp * ici_dp
     dcn_prod = dcn_tp * dcn_cp * dcn_fsdp * dcn_dp
     if ici_prod != local_device_count:
@@ -278,7 +205,6 @@ def derive_ici_dcn(
             f"dp={dp_size}) cannot be laid out across the available nodes; the inter-node axes "
             "(fsdp-spill * dp) do not tile the node count exactly."
         )
-    # Per-type products preserved -> tp*cp*fsdp*dp and dp=dp_size*fsdp_size unchanged.
     assert cfg.tp_size == tp_size
     assert cfg.cp_size == cp_size
     assert cfg.fsdp_size == fsdp_size
@@ -287,20 +213,13 @@ def derive_ici_dcn(
 
 
 def make_hierarchical_mesh(ici_shape: Sequence[int], dcn_shape: Sequence[int]) -> Mesh:
-    """Build a topology-aware ``('tp', 'cp', 'fsdp', 'dp')`` mesh.
+    """Build a topology-aware ``('tp', 'cp', 'fsdp', 'dp')`` mesh from ICI/DCN
+    ``(tp, cp, fsdp, dp)`` quadruples (ICI rides NVLink, DCN the data-center net).
 
-    ``ici_shape`` and ``dcn_shape`` are ``(tp, cp, fsdp, dp)`` quadruples in
-    comm-heaviest-first order. ICI axes ride the NVLink domain (one node); DCN
-    axes ride the data-center network (across nodes).
-
-    * Single process (``num_processes == 1``): a plain row-major reshape of the
-      node's devices is fine because the whole node is one NVLink domain. We use
-      ``mesh_utils.create_device_mesh(ici_shape, devices)``.
-    * Multi process: ``mesh_utils.create_hybrid_device_mesh`` with
-      ``process_is_granule=True`` groups granules by ``process_index`` (node) so
-      ICI axes stay within a node. We wrap the returned ndarray in
-      :class:`jax.sharding.Mesh` directly -- routing back through
-      ``jax.make_mesh`` would re-reshape and destroy the hybrid layout.
+    Single process: plain row-major reshape (the whole node is one NVLink domain).
+    Multi process: ``create_hybrid_device_mesh`` with ``process_is_granule=True``;
+    the returned ndarray is wrapped in :class:`Mesh` directly (routing through
+    ``jax.make_mesh`` would re-reshape and destroy the hybrid layout).
     """
     ici_shape = tuple(int(x) for x in ici_shape)
     dcn_shape = tuple(int(x) for x in dcn_shape)
@@ -317,8 +236,8 @@ def make_hierarchical_mesh(ici_shape: Sequence[int], dcn_shape: Sequence[int]) -
     ici_prod = math.prod(ici_shape)
     dcn_prod = math.prod(dcn_shape)
 
-    # ICI/DCN per-axis validation lives in derive_ici_dcn (the sole caller); here we
-    # only guard that the shapes tile all devices.
+    # Per-axis validation lives in derive_ici_dcn (the sole caller); here just
+    # guard that the shapes tile all devices.
     if ici_prod * dcn_prod != len(devices):
         raise ValueError(
             f"prod(ici_shape)*prod(dcn_shape)={ici_prod * dcn_prod} != device_count="
@@ -334,20 +253,17 @@ def make_hierarchical_mesh(ici_shape: Sequence[int], dcn_shape: Sequence[int]) -
             nproc,
         )
 
-    # Match jax.make_mesh's default axis types (Explicit sharding) so downstream
-    # code that relies on Explicit-typed axes -- e.g. out_sharding= in
-    # .at[...].get() (omegalax/models/qwen3/model.py) -- keeps working. A bare
-    # jax.sharding.Mesh(...) would default axes to AxisType.Auto and regress.
+    # Explicit axis types (matching jax.make_mesh): downstream out_sharding= code
+    # relies on them; a bare Mesh(...) defaults to AxisType.Auto and regresses.
     axis_types = (AxisType.Explicit,) * len(_AXES)
 
     if nproc == 1:
-        # Single node: plain reshape is fine intra-node (whole node is NVLink).
         device_grid = mesh_utils.create_device_mesh(ici_shape, devices)
         return Mesh(device_grid, _AXES, axis_types=axis_types)
 
-    # Multi node: hybrid ICI/DCN placement. process_is_granule=True is mandatory
-    # here (uniform slice_index under init_distributed()'s multi-node
-    # jax.distributed.initialize(), which sets no partition index).
+    # process_is_granule=True is mandatory: under init_distributed()'s multi-node
+    # jax.distributed.initialize() every device reports a uniform slice_index, so
+    # granules must be grouped by process_index (node) to keep ICI axes on NVLink.
     device_grid = mesh_utils.create_hybrid_device_mesh(
         ici_shape,
         dcn_shape,
@@ -355,7 +271,6 @@ def make_hierarchical_mesh(ici_shape: Sequence[int], dcn_shape: Sequence[int]) -
         process_is_granule=True,
         allow_split_physical_axes=False,
     )
-    # Wrap the hybrid ndarray directly -- do NOT route through jax.make_mesh.
     return Mesh(device_grid, _AXES, axis_types=axis_types)
 
 
@@ -384,12 +299,8 @@ def make_mesh(
     *,
     cp_size: int = 1,
 ) -> Mesh:
-    """Build a topology-aware ``('tp', 'cp', 'fsdp', 'dp')`` mesh.
-
-    Given (tp, fsdp, dp) sizes plus an optional ``cp_size`` (context parallelism,
-    default 1 == no-op), the ICI/DCN split is derived via :func:`derive_ici_dcn`
-    and materialized with :func:`make_hierarchical_mesh`.
-    """
+    """Build the ``('tp', 'cp', 'fsdp', 'dp')`` mesh for the given sizes (``cp_size``
+    default 1 == no-op), deriving the ICI/DCN split via :func:`derive_ici_dcn`."""
     tp, cp, fsdp, dp = _resolve_mesh_shape(
         tp_size=tp_size, cp_size=cp_size, fsdp_size=fsdp_size, dp_size=dp_size
     )
@@ -479,26 +390,16 @@ def mesh_rules(mesh: Mesh) -> Iterator[Mesh]:
         yield mesh
 
 
-# Dedicated 1-D ``('expert',)`` mesh for the expert-parallel MoE path (consumed by
-# grouped_moe_ep), deliberately SEPARATE from the ``('tp','cp','fsdp','dp')`` training
-# mesh: grouped_moe_ep reads a standalone ``'expert'`` axis and runs its own shard_map;
-# no caller composes EP with the training mesh.
+# Dedicated 1-D ``('expert',)`` mesh for grouped_moe_ep, SEPARATE from the
+# ``('tp','cp','fsdp','dp')`` training mesh: no caller composes EP with training.
 _EXPERT_AXIS = "expert"
 
 
 def make_expert_mesh(ep_size: int, axis_name: str = _EXPERT_AXIS) -> Mesh:
-    """Build a 1-D expert-parallel mesh over ``ep_size`` devices.
+    """Build a 1-D expert-parallel mesh over the first ``ep_size`` devices.
 
-    The stacked expert weights are sharded on ``axis_name`` (each device owns
-    ``E / ep_size`` experts) and the token axis is likewise sharded, so
-    ``grouped_moe_ep`` can dispatch each token to the device owning its expert via
-    ``ragged_all_to_all``. Requires ``jax.device_count() % ep_size == 0``; uses the
-    first ``ep_size`` devices.
-
-    Consistent with :func:`make_hierarchical_mesh`: the device grid is built with
-    ``mesh_utils.create_device_mesh`` and the axis is stamped ``AxisType.Explicit``
-    (matching the ``_AXES`` mesh), so downstream Explicit-sharding code behaves the
-    same on the expert mesh as on the training mesh.
+    ``AxisType.Explicit`` (matching the ``_AXES`` mesh) so Explicit-sharding code
+    behaves the same here. Requires ``jax.device_count() % ep_size == 0``.
     """
     ndev = jax.device_count()
     if ep_size <= 0 or ndev % ep_size != 0:

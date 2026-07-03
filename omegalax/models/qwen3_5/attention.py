@@ -78,10 +78,8 @@ class Attention(nnx.Module):
         object.__setattr__(self, "_q_sharding_spec", P(*cfg.shd_cfg.act_btnh))
         object.__setattr__(self, "_attn_backend", "mosaic_gpu")
         object.__setattr__(self, "_attn_kind", "text")
-        # When True and running under CP, apply the block-diagonal document mask
-        # (segment_ids) so packed multi-doc sequences don't attend across a
-        # document boundary. Default False keeps CP causal-only == the non-CP
-        # tokamax path (the CP equivalence bar). Toggle via set_cp_document_mask.
+        # CP block-diagonal document mask; default off keeps CP causal-only ==
+        # the non-CP path. Toggle via set_cp_document_mask.
         object.__setattr__(self, "_cp_document_mask", False)
 
     @jax.named_scope("attention")
@@ -122,17 +120,14 @@ class Attention(nnx.Module):
 
         q_BTHK, k_BTGK = apply_text_rope(q_BTHK, k_BTGK, cos_BTK, sin_BTK)
 
-        # Context parallelism: when the sequence (T) axis is sharded on "cp"
-        # (cp_size > 1), tokamax cannot do seq-sharded KV, so we run the
-        # all-gather-KV shard_map path (RoPE above is positionwise, so shard-local
-        # cos/sin from seq-sharded position_ids are already correct -- no change).
-        # Otherwise fall back to the existing (TP head-sharded) tokamax path.
+        # Under CP (T sharded on "cp", cp_size > 1) use the all-gather-KV shard_map
+        # path (tokamax cannot do seq-sharded KV); else the TP head-sharded tokamax
+        # path. RoPE above is positionwise, so CP-safe.
         cp_axis = heads_shd[1]
         mesh = jax.sharding.get_abstract_mesh()
         if cp_axis is not None and mesh.shape[cp_axis] > 1:
-            # position_ids_BT carries the GLOBAL/original positions (permuted under
-            # zig-zag), so the causal mask is layout-agnostic. segment_ids_BT adds
-            # the block-diagonal document mask (no cross-document attention).
+            # position_ids_BT are GLOBAL/original positions (permuted under zig-zag),
+            # so the mask is layout-agnostic; segment_ids_BT adds the document mask.
             seq_spec = P(heads_shd[0], cp_axis)
             attn_BTHK = context_parallel_attention(
                 q_BTHK,

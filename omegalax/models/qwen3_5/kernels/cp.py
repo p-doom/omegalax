@@ -1,30 +1,12 @@
 """Context-Parallel (CP Stage 2) gated-delta-rule over contiguous seq segments.
 
-The gated-delta recurrence is LINEAR in the recurrent state, which is what makes
-sequence-sharded (context-parallel) DeltaNet exact rather than approximate.
-Splitting a sequence into contiguous per-cp-rank segments, each rank's local
-chunked scan is an affine map on the incoming boundary state:
-
-    state_final[r] = A_r @ S_in[r] + B_r
-
-where ``(A_r, B_r)`` is the segment's AGGREGATE transition (``A_r`` a per-head
-(A,A) matrix, ``B_r`` = the (A,U) final state started from zero). The incoming
-boundary states chain across the cp ring:
-
-    S_in[0] = 0,   S_in[r] = A_{r-1} @ S_in[r-1] + B_{r-1}
-
-i.e. ``S_in[r]`` is the affine composition of segments 0..r-1 applied to 0. Since
-affine composition ``(A2,B2)∘(A1,B1) = (A2@A1, A2@B1+B2)`` is associative, the
-cross-rank resolution is an ``all_gather`` of ``(A_r, B_r)`` over ``cp`` followed
-by an ``associative_scan`` (exclusive prefix) — cheap because ``cp`` is small
-(<= ~8). Each rank then runs its LOCAL output kernel seeded with ``S_in[r]``.
-
-This is bit-identical to the full-sequence result (verified) because nothing is
-approximated: the affine algebra is exact and the per-segment kernel is the same
-one used non-CP, just started from ``S_in`` instead of zeros.
-
-Stage-2 scope note: contiguous sequence sharding (Stage 1a layout). Zig-zag
-causal load-balancing (Stage 1b) and full document masking remain follow-ons.
+The gated-delta recurrence is LINEAR in the recurrent state, so each cp rank's
+local chunked scan is an affine map ``state_final[r] = A_r @ S_in[r] + B_r`` on the
+incoming boundary state. Affine composition ``(A2,B2)∘(A1,B1) = (A2@A1, A2@B1+B2)``
+is associative, so the cross-rank boundary states resolve as an ``all_gather`` of
+``(A_r, B_r)`` over ``cp`` + an exclusive ``associative_scan`` (cheap: cp is small);
+each rank then runs its LOCAL kernel seeded with ``S_in[r]``. Bit-identical to the
+full-sequence result -- nothing is approximated. Contiguous sequence sharding only.
 """
 
 from __future__ import annotations
@@ -43,20 +25,12 @@ def _segment_state_transition(
     beta_BTH: jax.Array,
     chunk_size: int,
 ) -> tuple[jax.Array, jax.Array]:
-    """Aggregate affine state transition ``(A_seg, B_seg)`` of one seq segment.
+    """Aggregate affine state transition of one seq segment: ``state_final =
+    A_seg @ state_init + B_seg`` for ANY ``state_init`` (``B_seg`` == final state
+    from zero). Returns ``A_seg`` (B, H, A, A) and ``B_seg`` (B, H, A, U).
 
-    ``state_final = A_seg @ state_init + B_seg`` for ANY incoming ``state_init``
-    (verified bit-identical against seeding the kernel with ``state_init``).
-    ``B_seg`` equals the final state started from zero.
-
-    Returns:
-        A_seg: (B, H, A, A) per-head aggregate transition on the key axis.
-        B_seg: (B, H, A, U) per-head aggregate bias (= final state from zero).
-
-    Uses the same WY/UT prep as the kernel, then folds the per-chunk affine maps
-    ``M[j] = df[j]*I - k_dec[j].T @ kcd[j]`` / ``b[j] = k_dec[j].T @ u_pre[j]``
-    into the segment aggregate via a J-scan. Pure XLA (differentiable); cp is
-    small so this runs once per segment and is cheap vs the output kernel.
+    Uses the kernel's WY/UT prep, then folds the per-chunk affine maps into the
+    segment aggregate via a J-scan. Pure XLA (differentiable), cheap vs the kernel.
     """
     q_BTHA = _l2norm(q_BTHA, axis=-1)
     k_BTHA = _l2norm(k_BTHA, axis=-1)
@@ -123,17 +97,12 @@ def _exclusive_prefix_S_in(
     B_r_BHAU: jax.Array,
     cp_axis: str,
 ) -> jax.Array:
-    """Resolve this rank's incoming boundary state ``S_in`` across the cp ring.
+    """Resolve this rank's incoming boundary state ``S_in`` across the cp ring:
+    ``all_gather`` the per-rank ``(A_r, B_r)`` then take the EXCLUSIVE affine prefix.
+    Applied to the zero state, so only the accumulated bias matters (the ``A`` part
+    multiplies zero) -- we take the inclusive-scan bias shifted by one rank.
 
-    ``all_gather`` the per-rank ``(A_r, B_r)`` over ``cp`` (small axis), then take
-    the EXCLUSIVE affine prefix so ``S_in[r]`` is the composition of segments
-    0..r-1 applied to zero (``S_in[0] = 0``). Because the prefix is applied to the
-    zero state, ``S_in[r]`` is exactly the accumulated bias of segments 0..r-1
-    (the ``A`` part multiplies zero), so we only need the bias channel of the
-    inclusive scan, shifted by one rank.
-
-    Must be called INSIDE a shard_map over ``cp`` (uses ``jax.lax.all_gather`` /
-    ``axis_index``). Returns this rank's ``S_in`` of shape ``(B, H, A, U)``.
+    Must run INSIDE a shard_map over ``cp``. Returns ``S_in`` of shape (B, H, A, U).
     """
     # Gather all ranks' (A_r, B_r) along a new leading cp axis: (cp, B, H, A, A/U).
     A_all = jax.lax.all_gather(A_r_BHAA, cp_axis, axis=0, tiled=False)

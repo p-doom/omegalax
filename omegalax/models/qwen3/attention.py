@@ -67,8 +67,8 @@ class Attention(nnx.Module):
         object.__setattr__(self, "_q_sharding_spec", P(*cfg.shd_cfg.act_btnh))
         object.__setattr__(self, "_attn_backend", "mosaic_gpu")
         object.__setattr__(self, "_attn_kind", "text")
-        # Block-diagonal document mask under CP (see qwen3_5/attention.py). Default
-        # off keeps CP causal-only == the non-CP path. Toggle via set_cp_document_mask.
+        # CP block-diagonal document mask; default off keeps CP causal-only ==
+        # the non-CP path. Toggle via set_cp_document_mask.
         object.__setattr__(self, "_cp_document_mask", False)
 
     @jax.named_scope("attention")
@@ -102,11 +102,9 @@ class Attention(nnx.Module):
         )
 
         if cache is None:
-            # Positions for RoPE + the causal mask. Under zig-zag CP the true
-            # (original) positions are passed in explicitly (the local shard holds
-            # a permuted slice, so an arange over segment_ids would be wrong);
-            # otherwise they are derived from segment_ids as before (contiguous CP
-            # gives globally-correct arange positions, non-CP unchanged).
+            # Positions for RoPE + causal mask. Under zig-zag CP the true positions
+            # are passed in (the local shard is permuted, so arange over segment_ids
+            # would be wrong); otherwise derive them from segment_ids.
             if position_ids_BT is None:
                 positions_BT = compute_positions_from_segment_ids(segment_ids_BT)
             else:
@@ -119,11 +117,9 @@ class Attention(nnx.Module):
             k_BTGK = apply_rope(k_BTGK, sin_BTK, cos_BTK)
 
             B, T, H, K = q_BTHK.shape
-            # Context parallelism: when the T axis is sharded on "cp" (cp_size >
-            # 1), run the all-gather-KV shard_map path (tokamax cannot do
-            # seq-sharded KV). RoPE above is positionwise so shard-local sin/cos
-            # from seq-sharded positions are already correct. Else the existing
-            # (TP head-sharded) tokamax path.
+            # Under CP (T sharded on "cp", cp_size > 1) use the all-gather-KV
+            # shard_map path (tokamax cannot do seq-sharded KV); else the TP
+            # head-sharded tokamax path. RoPE above is positionwise, so CP-safe.
             heads_shd = self.shd_cfg.act_btnh
             cp_axis = heads_shd[1]
             mesh = jax.sharding.get_abstract_mesh()

@@ -1,7 +1,5 @@
-"""Gated Delta Net for Qwen3.5.
-
-This implements the chunked gated delta rule, a linear-attention variant
-that combines a depthwise causal Conv1D with a recurrent delta-rule update.
+"""Gated Delta Net for Qwen3.5: chunked gated delta rule (linear attention) =
+depthwise causal Conv1D + recurrent delta-rule update.
 
 Module-local dimension key (supplements the global key in models/__init__.py):
 
@@ -36,14 +34,7 @@ wp = nnx.with_partitioning
 
 
 def _causal_depthwise_conv1d(x_BCT: jax.Array, weight_CK: jax.Array) -> jax.Array:
-    """Depthwise causal conv1d.
-
-    Args:
-        x_BCT: (B, C, T)
-        weight_CK: (C, K), per-channel kernel
-    Returns:
-        (B, C, T)
-    """
+    """Depthwise causal conv1d: x (B, C, T), per-channel weight (C, K) -> (B, C, T)."""
     K = weight_CK.shape[1]
     T = x_BCT.shape[2]
     x_padded = jnp.pad(x_BCT, ((0, 0), (0, 0), (K - 1, 0)))
@@ -56,13 +47,10 @@ def _causal_depthwise_conv1d(x_BCT: jax.Array, weight_CK: jax.Array) -> jax.Arra
 def _causal_depthwise_conv1d_cp(
     x_BCT: jax.Array, weight_CK: jax.Array, cp_axis: str, cp_size: int
 ) -> jax.Array:
-    """Depthwise causal conv1d over a cp-sequence-sharded segment (with halo).
-
-    Called INSIDE a shard_map over ``cp``: ``x_BCT`` is this rank's LOCAL segment
-    (T axis already sliced). The causal conv needs the previous ``K-1`` tokens,
-    which live on the LEFT neighbor's segment, so we ``ppermute`` a ``K-1``-token
-    halo from rank r-1 -> r (rank 0's halo is zeros, matching the global left
-    zero-pad). Bit-identical to the full-sequence conv (verified).
+    """Depthwise causal conv1d over a cp-sharded segment (inside a shard_map over
+    ``cp``). The causal conv needs the previous ``K-1`` tokens from the LEFT
+    neighbor, so we ``ppermute`` a ``K-1``-token halo r-1 -> r (rank 0's halo is
+    zeros, matching the global left zero-pad). Bit-identical to the full conv.
     """
     K = weight_CK.shape[1]
     Tloc = x_BCT.shape[2]
@@ -99,13 +87,10 @@ class GatedDeltaNet(nnx.Module):
         init = nnx.initializers.lecun_normal()
 
         in_proj_init = wp(init, ("embed", "mlp"))
-        # q/k/v are projected separately (rather than as one fused ``in_proj_qkv``)
-        # so each projection can emit its output already head-sharded on ``tp``
-        # (via a free ``act_btf`` -> ``act_btnh`` reshape). A single fused
-        # projection would tp-shard the concatenated ``conv_dim`` contiguously,
-        # forcing collective-permute reshards when it is split into per-head
-        # q/k/v. The fused HF ``in_proj_qkv`` checkpoint weight is sliced into
-        # these three kernels at load time (loader ``_handle_linear_attn_specials``).
+        # q/k/v projected separately (not one fused in_proj_qkv) so each emits its
+        # output already head-sharded on tp; a fused projection would tp-shard the
+        # concatenated conv_dim contiguously and force reshards on the per-head
+        # split. The fused HF checkpoint weight is sliced into these at load time.
         self.in_proj_q = nnx.Linear(
             D, self.key_dim, use_bias=False, rngs=rngs, dtype=cfg.dtype, kernel_init=in_proj_init
         )
@@ -125,9 +110,8 @@ class GatedDeltaNet(nnx.Module):
             D, self.num_v_heads, use_bias=False, rngs=rngs, dtype=cfg.dtype, kernel_init=in_proj_init
         )
 
-        # Depthwise conv weights, one contiguous slice of the fused conv kernel
-        # per q/k/v segment. The channel axis is tp-sharded so it lines up with
-        # the head-sharded activations (channels are laid out head-major, so a
+        # Depthwise conv weights, per q/k/v. The channel axis is tp-sharded to line
+        # up with the head-sharded activations (channels are head-major, so a
         # contiguous tp split of the channel axis is exactly a head tp split).
         self.conv_weight_q = nnx.Param(
             init(rngs.params(), (self.key_dim, self.conv_kernel_size)),
@@ -286,10 +270,9 @@ class GatedDeltaNet(nnx.Module):
             return out_BTD
 
         # ---- Context-parallel path (Stage 2): conv-halo + boundary-state ring
-        # nested INSIDE the head shard_map, over the composed (cp, tp) axes. ----
-        # Project WITHOUT conv (conv moves inside the shard_map so its causal halo
-        # can be ppermute'd from the left cp neighbor). Projections are seq-sharded
-        # on cp (act_btf keeps cp on the T axis) and head-sharded on tp.
+        # inside the head shard_map. Project WITHOUT conv (the conv moves inside the
+        # shard_map so its causal halo can be ppermute'd from the left cp neighbor);
+        # projections stay cp-seq-sharded on the T axis and tp head-sharded. ----
         q_pre_BTHA = jax.lax.reshape(
             self.in_proj_q(hidden_BTD, out_sharding=self.shd_cfg.act_btf),
             (B, T, self.num_k_heads, self.head_k_dim), out_sharding=heads_shd,
