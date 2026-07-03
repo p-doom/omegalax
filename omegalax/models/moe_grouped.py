@@ -1,18 +1,12 @@
 """Dropless sparse Mixture-of-Experts via grouped GEMM (+ optional expert parallelism).
 
-Numerically-equivalent replacement for the dense compute-every-expert einsum,
-computing ``y_t = sum_{e in topk(t)} w_{t,e} * down_e(silu(gate_e(x_t)) * up_e(x_t))``
-with only ``k*(B*T)`` expert rows instead of ``E*(B*T)``.
-
-Correctness (grouped == dense up to fp reduction order): routing is done by the
-caller (unchanged); expand tokens into ``N=B*T*k`` (token,expert) rows; a stable
-``argsort(expert)`` is a bijection grouping rows by expert with counts ``group_sizes``;
-``ragged_dot(x_sorted, W, group_sizes)`` applies ``W[e]`` to exactly expert ``e``'s
-rows (same operands/matmul as dense indexing ``W[exp[i]]``); the inverse permutation
-+ weighted top-k sum reproduces the dense gather. Under EP the ``ragged_all_to_all``
-dispatch/combine is a pure bijective reshuffle (moves rows between devices, never
-changes which weight multiplies which row). Dropless: ``group_sizes`` sum to ``N``.
-Differs from dense only by reduction order (~fp epsilon; identical in fp32).
+Numerically-equivalent replacement for the dense compute-every-expert einsum, at
+``k*(B*T)`` expert rows instead of ``E*(B*T)``: expand tokens to ``N=B*T*k``
+(token,expert) rows, a stable ``argsort(expert)`` groups them by expert with counts
+``group_sizes``, ``ragged_dot`` applies each expert's weights to exactly its rows,
+and the inverse permutation + weighted top-k sum reproduces the dense gather. Under
+EP the ``ragged_all_to_all`` dispatch/combine is a pure bijective reshuffle. Differs
+from dense only by fp reduction order (identical in fp32).
 """
 
 from __future__ import annotations
@@ -23,12 +17,8 @@ import tokamax
 
 
 def _unshard(x):
-    """Reshard an array to fully replicated (no sharding along any axis).
-
-    The permute/sort/grouped-GEMM core operates on the flattened token axis, which
-    must be unsharded for ``argsort`` / ``ragged_dot``. Under an all-replicated
-    (single-device) mesh this is a no-op; with data/tensor sharding it gathers.
-    """
+    """Reshard to fully replicated: the sort/grouped-GEMM core needs an unsharded
+    token axis for ``argsort`` / ``ragged_dot`` (no-op on a single-device mesh)."""
     from jax.sharding import PartitionSpec as P, get_abstract_mesh
 
     try:
@@ -42,17 +32,13 @@ def _unshard(x):
 
 
 def _auto(f):
-    """Run ``f`` in full auto-sharding mode when an explicit-sharding mesh is active.
+    """Wrap ``f`` in auto-sharding mode, but ONLY on CPU under an Explicit mesh.
 
-    On CPU, ``jax.lax.ragged_dot_general`` has no explicit-sharding (VMA)
-    propagation rule in JAX 0.9.2, so under an Explicit-axis mesh we must drop the
-    grouped-GEMM core into auto mode. Inputs are already gathered to replicated; the
-    output is returned replicated (``P()``) and the caller reshards it.
-
-    On GPU/TPU we do NOT wrap: the tokamax ragged_dot Pallas kernel (and the native
-    ragged_dot lowering) propagate sharding fine, and wrapping in ``auto_axes``
-    triggers an Auto/Explicit mesh-type mismatch in tokamax's ``GroupSizes``
-    constant creation. Empty mesh (single-device eager) is also a plain call.
+    On CPU ``jax.lax.ragged_dot_general`` has no Explicit-sharding (VMA) rule (JAX
+    0.9.2), so the core must run in auto mode (inputs already replicated, output
+    returned ``P()`` and resharded by the caller). On GPU/TPU we must NOT wrap:
+    tokamax's ragged_dot propagates sharding fine and ``auto_axes`` would trigger an
+    Auto/Explicit mesh-type mismatch in its ``GroupSizes`` constant.
     """
     from jax.sharding import PartitionSpec as P, get_abstract_mesh
 
@@ -69,23 +55,12 @@ def _auto(f):
 
 
 def _ragged_dot(lhs, rhs, group_sizes, primitive: str, *, group_offset=None):
-    """Grouped GEMM dispatch.
+    """Grouped GEMM: lhs (N, K) sorted rows, rhs (E, K, M) stacked weights -> (N, M).
+    ``primitive="tokamax"`` (best backend) or ``"jax"`` (CPU-correct reference).
 
-    lhs: (N, K) sorted rows. rhs: (E, K, M) stacked expert weights.
-    group_sizes: (E,) int32. Returns (N, M).
-
-    ``primitive="tokamax"`` uses ``tokamax.ragged_dot`` (auto-selects the best
-    backend; guaranteed to work on CPU/GPU). ``primitive="jax"`` uses
-    ``jax.lax.ragged_dot`` (the CPU-correct reference).
-
-    NOTE (Phase-2 / GPU caveat): ``group_offset`` lets a device compute only a
-    slice of the experts (needed to *shard* expert compute on-device). It is
-    honored on CPU, but ``jax.lax.ragged_dot``'s ``group_offset`` is currently
-    *unimplemented on GPU*. Our EP path avoids relying on it: each device holds a
-    contiguous block of experts as ``rhs`` of size ``E/EP`` and calls ragged_dot
-    with the default offset over its local experts, so no GPU group_offset is
-    required.
-
+    NOTE (GPU caveat): ``jax.lax.ragged_dot``'s ``group_offset`` is unimplemented
+    on GPU, so the EP path never relies on it (each device holds its own contiguous
+    ``E/EP`` expert block as ``rhs`` and uses the default offset).
     """
     out_dtype = jnp.result_type(lhs, rhs)
     # tokamax's ragged_dot custom VJP stores backward grads at the OPERAND dtype (it
@@ -104,9 +79,8 @@ def _ragged_dot(lhs, rhs, group_sizes, primitive: str, *, group_offset=None):
     return out.astype(out_dtype)
 
 
-# ``jax.lax.ragged_all_to_all`` lowers to an HLO that XLA:CPU does not implement
-# (only GPU/TPU); on CPU we emulate it bit-identically via ``all_gather`` (a pure,
-# bijective data reshuffle) so EP can be exercised in CPU CI.
+# XLA:CPU does not implement ragged_all_to_all (GPU/TPU only), so on CPU we emulate
+# it bit-identically via all_gather so EP can be exercised in CPU CI.
 
 
 def _ragged_all_to_all(
@@ -129,7 +103,6 @@ def _ragged_all_to_all(
     # --- CPU emulation via all_gather (bijective, numerically identical) ---
     ep = jax.lax.psum(1, axis_name)
     src_cap = operand.shape[0]
-    # Gather every sender's operand and metadata; index axis 0 by source shard.
     all_operand = jax.lax.all_gather(operand, axis_name, axis=0, tiled=False)  # (ep, src_cap, ...)
     all_in_off = jax.lax.all_gather(input_offsets, axis_name, axis=0, tiled=False)  # (ep, ep)
     all_send = jax.lax.all_gather(send_sizes, axis_name, axis=0, tiled=False)  # (ep, ep)
@@ -139,15 +112,14 @@ def _ragged_all_to_all(
     out = output
     out_cap = output.shape[0]
     out_rows = jnp.arange(out_cap)
-    # For each source s, copy the block it addressed to ME into my output buffer.
+    # For each source s, copy the block it addressed to ME into my output buffer:
+    # output row r takes source row in_start+(r-out_start) when out_start <= r <
+    # out_start+n, else it is clamped and masked out.
     for s in range(ep):
         in_start = all_in_off[s, me]      # start row in source s's operand
         n = all_send[s, me]               # rows sent from s to me
         out_start = all_out_off[s, me]    # where they go in MY buffer
         src_rows = all_operand[s]         # (src_cap, ...)
-        # Gather rows [in_start : in_start+n] (bounded), aligned to out positions.
-        # Build, for each of my output rows r, the source index (in_start + (r-out_start))
-        # when out_start <= r < out_start+n, else clamp+mask.
         rel = out_rows - out_start
         valid = (rel >= 0) & (rel < n)
         gather_idx = jnp.clip(in_start + rel, 0, src_cap - 1)
@@ -158,47 +130,24 @@ def _ragged_all_to_all(
 
 
 def _sort_tokens_by_expert(topk_idx_Nk: jax.Array, num_experts: int):
-    """Build the permutation that groups (token, expert) rows by expert id.
+    """Group (token, expert) rows by expert id via a stable argsort.
 
-    Args:
-      topk_idx_Nk: (T, k) int expert ids, T = number of tokens.
-      num_experts: E.
-
-    Returns:
-      sort_perm: (T*k,) int32 permutation that sorts flattened rows by expert id
-        (stable, so within an expert rows keep flattened order).
-      inv_perm: (T*k,) int32 inverse permutation.
-      group_sizes: (E,) int32 count of rows per expert (sums to T*k).
-      expert_of_row: (T*k,) int32 expert id of each *flattened* (pre-sort) row.
+    Returns ``(sort_perm, inv_perm, group_sizes, expert_of_row)``: the (T*k,) sort
+    permutation (stable -> preserves flattened order within an expert), its inverse,
+    the (E,) per-expert row counts (sum to T*k), and the pre-sort expert id per row.
     """
     flat_expert = topk_idx_Nk.reshape(-1).astype(jnp.int32)  # (T*k,)
-    # Stable argsort groups rows by expert while preserving order within a group.
     sort_perm = jnp.argsort(flat_expert, stable=True).astype(jnp.int32)
     inv_perm = jnp.argsort(sort_perm).astype(jnp.int32)
     group_sizes = jnp.bincount(flat_expert, length=num_experts).astype(jnp.int32)
     return sort_perm, inv_perm, group_sizes, flat_expert
 
 
-# ---------------------------------------------------------------------------
-# Per-expert LoRA on the grouped path.
-# ---------------------------------------------------------------------------
-#
-# The dense MoE path adds, per expert e and per token x, the low-rank correction
-# ``scaling * (x @ A[e]) @ B[e]`` INSIDE the expert einsum (before SiLU/top-k for
-# gate/up; on the activation for down). See LoRAMoEExperts.delta_shared /
-# delta_per_expert in omegalax/trainers/lora.py.
-#
-# In the grouped path the rows are already permuted into per-expert contiguous
-# groups with ``group_sizes``, so the SAME per-expert delta is exactly two extra
-# grouped GEMMs: ``ragged_dot(sorted_rows, A, group_sizes)`` then
-# ``ragged_dot(mid, B, group_sizes)`` (A[e] then B[e] applied to each group),
-# scaled and added to the corresponding base grouped output. This is
-# algebraically identical to the dense per-expert LoRA (same operands, same
-# per-expert matmuls), so grouped-LoRA == dense-LoRA up to fp reduction order.
-#
-# ``_lora_arrays`` pulls the raw (A, B, scaling) out of a ``LoRAMoEExperts``
-# module BEFORE entering the auto/shard_map transformed core, so the core only
-# ever sees plain JAX arrays (never an nnx.Module).
+# Per-expert LoRA on the grouped path: the dense per-expert delta
+# ``scaling * (x @ A[e]) @ B[e]`` (see LoRAMoEExperts in trainers/lora.py) becomes,
+# on the already-grouped rows, two extra grouped GEMMs per group, so grouped-LoRA ==
+# dense-LoRA up to fp reduction order. ``_lora_arrays`` extracts the raw arrays from
+# the nnx.Module before the transformed core (which sees only plain arrays).
 
 
 def _lora_arrays(adapter, dtype):
@@ -222,15 +171,12 @@ def _unshard_lora(lora):
 
 
 def _grouped_lora_delta(sorted_in, lora, group_sizes):
-    """Per-expert LoRA delta for grouped rows: ``scaling * (X @ A[e]) @ B[e]``,
-    applied per group. ``sorted_in`` is (N, in); returns (N, out) or 0.0.
+    """Per-expert LoRA delta for grouped rows: ``scaling * (X @ A[e]) @ B[e]`` per
+    group. ``sorted_in`` is (N, in); returns (N, out) or 0.0.
 
-    The two low-rank grouped GEMMs always use the ``jax`` primitive
-    (``jax.lax.ragged_dot``, the CPU-correct reference) regardless of the base
-    path's ``primitive``: tokamax's ``ragged_dot`` custom kernel does not compose
-    with the auto-sharding intermediate produced by the first (A) grouped GEMM.
-    The adapters are rank-r (tiny), so the perf cost of the jax path is
-    negligible and the delta is numerically identical."""
+    Always uses the ``jax`` ragged_dot (not the base ``primitive``): tokamax's
+    kernel does not compose with the auto-sharding intermediate from the first (A)
+    GEMM. The adapters are rank-r (tiny), so the perf cost is negligible."""
     if lora is None:
         return 0.0
     a, b, scaling = lora
@@ -255,44 +201,27 @@ def grouped_moe(
 ) -> jax.Array:
     """Grouped-GEMM dropless MoE, EP=1 (single logical expert shard).
 
-    Args:
-      hidden_ND:      (N, D) flattened token hidden states, N = B*T.
-      topk_idx_Nk:    (N, k) selected expert ids per token.
-      topk_weights_Nk:(N, k) combine weights per (token, slot).
-      gate_EDF/up_EDF:(E, D, F) stacked expert in-projections.
-      down_EFD:       (E, F, D) stacked expert out-projection.
-      num_experts:    E.
-      primitive:      "tokamax" (default, GPU-perf) or "jax" (reference).
-      gate_lora/up_lora/down_lora: optional ``LoRAMoEExperts`` adapters whose
-        per-expert low-rank delta is applied to the matching grouped output,
-        matching the dense path's per-expert LoRA (no-op when None).
-
-    Returns:
-      (N, D) combined MoE output, equivalent to the dense gather path.
+    ``hidden_ND`` (N=B*T, D), ``topk_idx_Nk``/``topk_weights_Nk`` (N, k),
+    ``gate_EDF``/``up_EDF`` (E, D, F), ``down_EFD`` (E, F, D). ``primitive`` is
+    "tokamax" (GPU-perf) or "jax" (reference). ``*_lora`` are optional
+    ``LoRAMoEExperts`` adapters (no-op when None). Returns (N, D), equivalent to the
+    dense gather path.
     """
     N, D = hidden_ND.shape
     k = topk_idx_Nk.shape[1]
     compute_dtype = hidden_ND.dtype
 
-    # Pull raw (A, B, scaling) out of the adapter modules here, so the transformed
-    # core only sees plain arrays. None when no adapter is attached. Unshard A/B to
-    # replicated just like the base weights so the auto-sharding core is consistent.
     gate_lora_a = _unshard_lora(_lora_arrays(gate_lora, compute_dtype))
     up_lora_a = _unshard_lora(_lora_arrays(up_lora, compute_dtype))
     down_lora_a = _unshard_lora(_lora_arrays(down_lora, compute_dtype))
 
-    # When LoRA is attached, run the WHOLE grouped core on the jax ragged_dot
-    # reference (both base and adapter GEMMs). The base and adapter GEMMs share
-    # intermediates inside one auto-sharding region, and mixing tokamax's custom
-    # ragged_dot kernel with the jax reference there produces an Auto/Explicit
-    # mesh-type mismatch. LoRA is a fine-tuning (not perf-critical pretraining)
-    # path, so the reference primitive throughout is the correct, consistent
-    # choice; numerically identical to tokamax up to fp reduction order.
+    # With LoRA, force the whole core onto the jax ragged_dot reference: base and
+    # adapter GEMMs share intermediates in one auto-sharding region, and mixing
+    # tokamax's kernel there produces an Auto/Explicit mesh-type mismatch. LoRA is a
+    # fine-tuning path so the ref primitive's perf cost is fine (numerically equal).
     if gate_lora_a is not None:
         primitive = "jax"
 
-    # Gather to replicated so the sort/grouped-GEMM core (auto-sharding region) sees
-    # unsharded operands; the caller reshards the replicated result afterwards.
     hidden_ND = _unshard(hidden_ND)
     topk_idx_Nk = _unshard(topk_idx_Nk)
     topk_weights_Nk = _unshard(topk_weights_Nk)
@@ -300,12 +229,10 @@ def grouped_moe(
     up_EDF = _unshard(up_EDF)
     down_EFD = _unshard(down_EFD)
 
-    # Pass the LoRA A/B *arrays* as explicit ``_core`` operands (not closure
-    # captures) so ``_auto``/``auto_axes`` converts them to Auto mode along with
-    # the base weights — a closure-captured Explicit-mesh array would clash with
-    # the auto-sharding core's mesh type inside tokamax's ragged_dot. Scaling is a
-    # static float, kept as a closure constant. ``lora_arrays`` is a flat tuple of
-    # 0 or 6 arrays (gate_A, gate_B, up_A, up_B, down_A, down_B).
+    # Pass the LoRA A/B arrays as explicit ``_core`` operands (not closure captures)
+    # so ``auto_axes`` converts them to Auto mode with the base weights; a
+    # closure-captured Explicit-mesh array would clash with the core's mesh type.
+    # Scaling stays a static closure float. ``lora_arrays`` is 0 or 6 arrays.
     if gate_lora_a is not None:
         lora_arrays = (
             gate_lora_a[0], gate_lora_a[1],
@@ -323,8 +250,7 @@ def grouped_moe(
         sort_perm, inv_perm, group_sizes, _ = _sort_tokens_by_expert(
             topk_idx_Nk, num_experts
         )
-        # Row i of the expanded (N*k) problem belongs to token (i // k). Gather the
-        # token hidden states for each (token, expert) row, then sort by expert.
+        # Row i of the expanded (N*k) problem belongs to token (i // k).
         token_of_row = jnp.arange(N * k, dtype=jnp.int32) // k  # (N*k,)
         rows_ND = hidden_ND[token_of_row]  # (N*k, D)
         sorted_rows_ND = rows_ND[sort_perm]  # grouped by expert
@@ -335,7 +261,6 @@ def grouped_moe(
         act_pre = None
         if lora:
             gA, gB, uA, uB, dA, dB = lora
-            # Per-expert LoRA on gate/up: same per-expert delta as the dense path.
             gate_out = gate_out + _grouped_lora_delta(
                 sorted_rows_ND, (gA, gB, gate_scaling), group_sizes
             )
@@ -359,27 +284,17 @@ def grouped_moe(
     )
 
 
-# ---------------------------------------------------------------------------
 # Phase 2: expert parallelism via ragged all-to-all.
-# ---------------------------------------------------------------------------
 #
-# jax.lax.ragged_all_to_all(operand, output, input_offsets, send_sizes,
-#                           output_offsets, recv_sizes, *, axis_name):
-#   For the calling shard s (a device along `axis_name` of size EP), and for each
-#   destination shard d in [0, EP):
-#     * send_sizes[d]    : number of rows shard s sends to shard d.
-#     * input_offsets[d] : start row in shard s's `operand` of that block.
-#     * output_offsets[d]: start row **in shard d's `output` buffer** where s's
-#                          block is written (the "transposed"/receiver-side offset).
-#     * recv_sizes[d]    : number of rows shard s receives from shard d.
-#   `output` is a zero-initialized capacity buffer; rows not written by any sender
-#   stay zero. The op is a pure gather/scatter across devices (a bijection on the
-#   dispatched rows), so it changes *where* rows live, never the per-row math.
+# ragged_all_to_all(operand, output, input_offsets, send_sizes, output_offsets,
+# recv_sizes, axis_name): per calling shard s and destination d, s sends
+# send_sizes[d] rows starting at input_offsets[d] in `operand` to output_offsets[d]
+# in d's `output` buffer, and receives recv_sizes[d] rows from d. A pure
+# gather/scatter (bijection on dispatched rows), never changing per-row math.
 #
-# Layout: tokens are sharded across `expert_axis` (each device owns N/EP tokens
-# with all k of their slots), and the stacked expert weights are sharded across
-# `expert_axis` (each device owns E/EP contiguous experts). Dispatch sends each
-# (token,slot) row to the device owning its expert; combine sends the result back.
+# Layout: tokens sharded across `expert_axis` (N/EP per device, all k slots) and
+# stacked expert weights likewise (E/EP contiguous experts each). Dispatch sends
+# each (token,slot) row to the device owning its expert; combine sends it back.
 
 
 def _lora_ep_delta(sorted_in, a_pad, b_pad, scaling, gs_padded):
@@ -407,33 +322,22 @@ def grouped_moe_ep(
     num_experts: int,
     expert_axis: str = "expert",
     capacity_factor: float = 4.0,
-    primitive: str = "jax",
     gate_lora=None,
     up_lora=None,
     down_lora=None,
 ) -> jax.Array:
-    """Expert-parallel dropless MoE.
+    """Expert-parallel dropless MoE, driven by the real ``expert_axis`` mesh size.
 
-    Defaults to ``primitive="jax"``: tokamax's ``ragged_dot`` registers a
-    ``custom_vjp`` whose transpose does not currently compose with ``shard_map``'s
-    backward (it feeds a ``float0`` integer-tangent through the sharded in_specs).
-    ``jax.lax.ragged_dot`` uses standard autodiff and differentiates cleanly under
-    ``shard_map``. The GPU-perf tokamax kernel for the EP path is deferred with the
-    rest of the multi-GPU perf work.
+    With no expert axis (EP == 1) this is the single-device :func:`grouped_moe`.
+    Otherwise it shards the stacked expert weights on ``expert_axis``, dispatches
+    each token to the device owning its expert via ``ragged_all_to_all``, runs the
+    local grouped GEMM, and combines back with the inverse all-to-all.
 
-    When no expert mesh axis is active (size 1), this transparently falls back to
-    the single-device :func:`grouped_moe`. Otherwise it shards the stacked expert
-    weights on ``expert_axis`` and dispatches tokens to the owning device with
-    :func:`jax.lax.ragged_all_to_all`, runs the grouped GEMM locally, and combines
-    the results back with the inverse all-to-all.
-
-    ``capacity_factor`` sizes the fixed per-device receive buffer as
-    ``ceil(capacity_factor * N * k / EP)`` rows. This padding is a *compilation*
-    requirement of ragged_all_to_all (static shapes) and does NOT drop or alter
-    tokens: unused rows are zeros and are never read back (the combine copies back
-    exactly the rows that were dispatched). The MoE remains dropless as long as no
-    single device receives more than the buffer holds; the factor is chosen large
-    enough (default 4x the mean) to cover routing imbalance in tests.
+    ``capacity_factor`` sizes the fixed per-device receive buffer at
+    ``ceil(capacity_factor * N * k / EP)`` rows -- a static-shape requirement of
+    ragged_all_to_all that neither drops nor alters tokens (unused rows are zero and
+    never read back). Dropless as long as no device receives more than the buffer
+    holds; the default 4x-the-mean covers routing imbalance in tests.
     """
     from jax import shard_map
     from jax.sharding import PartitionSpec as P, get_abstract_mesh
@@ -443,13 +347,19 @@ def grouped_moe_ep(
     if not mesh.empty and expert_axis in mesh.axis_names:
         ep = int(mesh.shape[expert_axis])
     if ep == 1:
+        # No EP: single-device grouped_moe with its perf default (tokamax).
         return grouped_moe(
             hidden_ND, topk_idx_Nk, topk_weights_Nk,
             gate_EDF, up_EDF, down_EFD,
-            num_experts=num_experts, primitive=primitive,
+            num_experts=num_experts,
             gate_lora=gate_lora, up_lora=up_lora, down_lora=down_lora,
         )
 
+    # EP path MUST use the jax ragged_dot: tokamax's custom_vjp transpose does not
+    # compose with shard_map's backward (float0 integer-tangent through the sharded
+    # in_specs); jax.lax.ragged_dot differentiates cleanly. GPU-perf tokamax EP
+    # kernel is deferred with the rest of the multi-GPU perf work.
+    primitive = "jax"
     assert num_experts % ep == 0, f"E={num_experts} not divisible by EP={ep}"
     N, D = hidden_ND.shape
     k = topk_idx_Nk.shape[1]

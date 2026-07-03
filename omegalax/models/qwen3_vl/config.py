@@ -57,9 +57,6 @@ class Qwen3VLConfig:
     mlp_only_layers: tuple[int, ...] = dataclasses.field(default_factory=tuple)
     decoder_sparse_step: int = 1
     norm_topk_prob: bool = True
-    # MoE compute backend: "grouped" (dropless grouped-GEMM) or "grouped_ep"
-    # (adds expert parallelism via ragged all-to-all).
-    moe_backend: str = "grouped"
     # Activation checkpointing policy for text decoder layers (see remat_policy.py).
     remat_policy: str = DEFAULT_REMAT_POLICY
     shd_cfg: ShardConfig = dataclasses.field(default_factory=ShardConfig.default)

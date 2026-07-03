@@ -39,9 +39,6 @@ class Qwen3Config:
     norm_topk_prob: bool = True
     aux_loss_coef: float = 0.0
 
-    # MoE compute backend: "grouped" (dropless grouped-GEMM) or "grouped_ep"
-    # (adds expert parallelism via ragged all-to-all).
-    moe_backend: str = "grouped"
     # Activation checkpointing (rematerialization) policy for decoder layers.
     # See omegalax.models.remat_policy for the name -> policy mapping.
     remat_policy: str = DEFAULT_REMAT_POLICY

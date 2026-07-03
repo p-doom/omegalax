@@ -6,7 +6,7 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 from jax.sharding import PartitionSpec as P, reshard
-from omegalax.models.moe_grouped import grouped_moe, grouped_moe_ep
+from omegalax.models.moe_grouped import grouped_moe_ep
 from omegalax.models.remat_policy import resolve_remat_policy, tag_offload_residual
 from .attention import Attention
 from .config import Qwen3Config
@@ -48,9 +48,8 @@ class MLP(nnx.Module):
 class MoEFeedForward(nnx.Module):
     """Sparse MoE block matching the HuggingFace Qwen3MoeSparseMoeBlock architecture."""
 
-    # Logical sharding of the expert-stacked projections, consumed by
-    # ``omegalax.trainers.lora.inject_lora`` to attach per-expert LoRA
-    # adapters (mirrors the ``nnx.Param`` sharding tuples below).
+    # Logical sharding of the expert-stacked projections, read by
+    # trainers.lora.inject_lora to attach per-expert LoRA (mirrors the Params below).
     _EXPERT_LORA_SHARDING = {
         "gate_proj": (None, "embed", "mlp"),
         "up_proj": (None, "embed", "mlp"),
@@ -75,10 +74,9 @@ class MoEFeedForward(nnx.Module):
             init(rngs.params(), (E, F, D)),
             sharding=(None, "mlp", "embed"),
         )
-        # Optional per-expert LoRA adapters, populated by inject_lora. When
-        # None (default) the expert einsums below are numerically unchanged.
-        # nnx.data(None) marks these as data slots so a LoRAMoEExperts module
-        # can be assigned in later (a plain None would be a static attribute).
+        # Optional per-expert LoRA adapters (populated by inject_lora; None = no-op).
+        # nnx.data(None) makes these data slots so a module can be assigned later
+        # (a plain None would be a static attribute).
         self.gate_proj_lora = nnx.data(None)
         self.up_proj_lora = nnx.data(None)
         self.down_proj_lora = nnx.data(None)
@@ -110,12 +108,12 @@ class MoEFeedForward(nnx.Module):
         down_proj_EFD = jnp.astype(self.down_proj[...], hidden_BTD.dtype)
         B, T = hidden_BTD.shape[:2]
 
-        # Dropless grouped-GEMM MoE (EP=1, or EP via ragged all-to-all).
+        # Dropless grouped-GEMM MoE; grouped_moe_ep self-selects EP off the real
+        # expert-axis mesh size (EP=1 == the single-device grouped path).
         flat_hidden_ND = hidden_BTD.reshape(B * T, cfg.emb_dim)
         flat_idx_Nk = topk_idx_BTk.reshape(B * T, cfg.num_experts_per_tok)
         flat_w_Nk = topk_weights_BTk.reshape(B * T, cfg.num_experts_per_tok)
-        moe_fn = grouped_moe_ep if cfg.moe_backend == "grouped_ep" else grouped_moe
-        merged_ND = moe_fn(
+        merged_ND = grouped_moe_ep(
             flat_hidden_ND,
             flat_idx_Nk,
             flat_w_Nk,
@@ -152,17 +150,15 @@ class DecoderLayer(nnx.Module):
             self.mlp = MLP(cfg=cfg, rngs=rngs)
 
         self._remat_policy = resolve_remat_policy(cfg.remat_policy)
-        # Kept for the name-based activation-offload policy, which tags the
-        # residual stream so it can be offloaded to host (no-op for every other
-        # policy). Stored as a static string so the graphdef stays stable.
+        # Static string (keeps the graphdef stable) so the named-offload policy can
+        # tag the residual for host offload; inert under every other policy.
         self._remat_policy_name = cfg.remat_policy
 
     def __call__(self, hidden_BTD: jax.Array, cache, segment_ids_BT: jax.Array,
                  position_ids_BT: jax.Array | None = None):
-        # Inline nnx.remat on the UNBOUND method (no static_argnums): nnx
-        # functionalizes ``self`` via split/merge, so it must not be static.
-        # Building the transform inline keeps graphdefs equal across fresh
-        # instances (stable hash -> one trace, not one per instance).
+        # nnx.remat on the UNBOUND method (no static_argnums): nnx functionalizes
+        # self via split/merge, so it must not be static; building the transform
+        # inline keeps graphdefs equal across instances (one trace, not one each).
         return nnx.remat(type(self)._impl, policy=self._remat_policy)(
             self, hidden_BTD, cache, segment_ids_BT, position_ids_BT
         )
@@ -177,9 +173,7 @@ class DecoderLayer(nnx.Module):
         else:
             ff_out_BTD = self.mlp(post_norm_BTD)
             aux_loss = jnp.array(0.0, dtype=jnp.float32)
-        # Tag the layer's output residual for the name-based offload policy.
-        # Identity (strict no-op) under every other policy; skipped entirely so
-        # the traced jaxpr is unchanged from trunk when offload is off.
+        # Tag the residual for the named-offload policy (no-op otherwise).
         out_BTD = tag_offload_residual(attn_out_BTD + ff_out_BTD, self._remat_policy_name)
         return out_BTD, aux_loss
 
@@ -221,10 +215,8 @@ class Qwen3(nnx.Module):
             self.embedder.dtype,
         )
 
-        # Scan path: only for the training/eval forward pass (cache is None) and
-        # homogeneous layer stacks. Decode (cache is not None) and heterogeneous
-        # (mixed dense/MoE) stacks stay on the unrolled loop below. ``position_ids``
-        # (used only for zig-zag CP) is broadcast to every layer.
+        # Scan path only for the forward pass (cache is None) on a homogeneous
+        # stack; decode and heterogeneous (mixed dense/MoE) stacks use the loop below.
         if cache is None and self.cfg.is_homogeneous:
             hidden_BTD, total_aux = _scan_layers(
                 list(self.layers), hidden_BTD, segment_ids_BT, position_ids_BT
@@ -249,17 +241,12 @@ def _scan_layers(
     layers: list[DecoderLayer], hidden_BTD: jax.Array, segment_ids_BT: jax.Array,
     position_ids_BT: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array]:
-    """Run homogeneous decoder layers with a single ``nnx.scan`` layer body.
+    """Run homogeneous decoder layers with a single ``nnx.scan`` body: stack each
+    layer's state on a new (replicated) layer axis and scan (per-layer sharding
+    preserved; layers self-remat, no double remat; aux losses summed).
 
-    Stacks each layer's state on a new leading (replicated) layer axis and scans;
-    per-layer param sharding is preserved (the layer axis carries no spec). The layer
-    self-remats inside ``__call__`` with ``cfg.remat_policy`` -- one remat level shared
-    with the unrolled path (no double remat). Per-layer aux losses are scanned out and
-    summed.
-
-    ``nnx.scan`` needs an invariant carry dtype: the MoE block can promote the bf16
-    hidden stream to fp32 (top-k weights ride fp32 ``probs``), so we cast the per-step
-    output back to the carry dtype. No-op for fp32 configs.
+    The per-step output is cast back to the carry dtype because ``nnx.scan`` needs an
+    invariant carry and the MoE block can promote bf16 -> fp32 (no-op for fp32).
     """
     carry_dtype = hidden_BTD.dtype
     graphdef, _ = nnx.split(layers[0])

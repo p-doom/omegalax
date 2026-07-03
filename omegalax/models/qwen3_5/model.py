@@ -7,7 +7,7 @@ import jax.numpy as jnp
 from flax import nnx
 from jax.sharding import PartitionSpec, reshard
 
-from omegalax.models.moe_grouped import grouped_moe, grouped_moe_ep
+from omegalax.models.moe_grouped import grouped_moe_ep
 from omegalax.models.remat_policy import resolve_remat_policy
 from omegalax.models.shard_config import ShardConfig
 from .attention import Attention
@@ -65,9 +65,8 @@ class MLP(nnx.Module):
 class MoEFeedForward(nnx.Module):
     """Sparse Mixture-of-Experts block with a shared expert and shared expert gate."""
 
-    # Logical sharding of the expert-stacked projections, consumed by
-    # ``omegalax.trainers.lora.inject_lora`` to attach per-expert LoRA
-    # adapters (mirrors the ``nnx.Param`` sharding tuples below).
+    # Logical sharding of the expert-stacked projections, read by
+    # trainers.lora.inject_lora to attach per-expert LoRA (mirrors the Params below).
     _EXPERT_LORA_SHARDING = {
         "gate_proj": (None, "embed", "mlp"),
         "up_proj": (None, "embed", "mlp"),
@@ -94,10 +93,9 @@ class MoEFeedForward(nnx.Module):
             init(rngs.params(), (E, F_moe, D)),
             sharding=(None, "mlp", "embed"),
         )
-        # Optional per-expert LoRA adapters, populated by inject_lora. When
-        # None (default) the expert einsums below are numerically unchanged.
-        # nnx.data(None) marks these as data slots so a LoRAMoEExperts module
-        # can be assigned in later (a plain None would be a static attribute).
+        # Optional per-expert LoRA adapters (populated by inject_lora; None = no-op).
+        # nnx.data(None) makes these data slots so a module can be assigned later
+        # (a plain None would be a static attribute).
         self.gate_proj_lora = nnx.data(None)
         self.up_proj_lora = nnx.data(None)
         self.down_proj_lora = nnx.data(None)
@@ -145,13 +143,13 @@ class MoEFeedForward(nnx.Module):
         up_proj = jnp.astype(self.up_proj[...], compute_dtype)
         down_proj = jnp.astype(self.down_proj[...], compute_dtype)
 
-        # Dropless grouped-GEMM MoE for the routed experts (EP=1, or EP via ragged
-        # all-to-all). The shared expert / gate below are separate and unchanged.
+        # Dropless grouped-GEMM MoE for the routed experts; grouped_moe_ep
+        # self-selects EP off the real expert-axis mesh size (EP=1 == single-device
+        # grouped path). The shared expert / gate below are separate and unchanged.
         flat_hidden_ND = hidden_BTD.reshape(B * T, cfg.hidden_size)
         flat_idx_Nk = topk_idx_BTk.reshape(B * T, cfg.num_experts_per_tok)
         flat_w_Nk = topk_weights_BTk.reshape(B * T, cfg.num_experts_per_tok)
-        moe_fn = grouped_moe_ep if cfg.moe_backend == "grouped_ep" else grouped_moe
-        moe_out_ND = moe_fn(
+        moe_out_ND = grouped_moe_ep(
             flat_hidden_ND,
             flat_idx_Nk,
             flat_w_Nk,
@@ -216,10 +214,7 @@ class DecoderLayer(nnx.Module):
         position_ids_BT: jax.Array,
         attention_mask_BT: jax.Array | None = None,
     ) -> tuple[jax.Array, jax.Array]:
-        # Inline nnx.remat on the UNBOUND method (no static_argnums): nnx
-        # functionalizes ``self`` via split/merge, so it must not be static.
-        # Building the transform inline keeps graphdefs equal across fresh
-        # instances (stable hash -> one trace, not one per instance).
+        # nnx.remat on the unbound method (no static_argnums); see qwen3/model.py.
         return nnx.remat(type(self)._impl, policy=self._remat_policy)(
             self,
             hidden_BTD,
@@ -326,19 +321,13 @@ class TextModel(nnx.Module):
 
         layer_args = (cos_BTK, sin_BTK, segment_ids_BT, text_position_ids_BT, attention_mask_BT)
 
-        # Block-scan path (training/eval forward): Qwen3.5 interleaves
-        # linear_attention (Gated DeltaNet) and full_attention layers with
-        # DIFFERENT param pytrees, so they cannot be stacked into ONE scan.
-        # Instead we scan the repeating BLOCK (period p, e.g. [lin,lin,lin,full])
-        # over num_blocks = num_layers // p, following MaxText's Gemma3 scannable
-        # block pattern: each of the p positions is homogeneous across blocks and
-        # its params are stacked along the block axis; the block body applies the
-        # p positions in original order. Falls back to the unrolled loop for
-        # irregular patterns (scan_block_period is None) or when disabled.
+        # Block-scan path: Qwen3.5 interleaves linear_attention and full_attention
+        # layers with DIFFERENT param pytrees, so they can't be one scan. Instead
+        # scan the repeating block (period p) over num_layers // p (MaxText Gemma3
+        # pattern): each of the p positions is homogeneous across blocks and stacked
+        # along the block axis. Irregular / disabled patterns use the loop below.
         period = cfg.scan_block_period
-        # Only scan when there are >= 2 blocks (period < num_layers); otherwise the
-        # single "block" is the whole irregular stack and a scan buys nothing, so
-        # we drop to the unrolled loop below.
+        # Need >= 2 blocks for a scan to buy anything.
         if period is not None and period < len(self.layers):
             hidden_BTD, total_aux = _scan_hybrid_blocks(
                 list(self.layers), period, hidden_BTD, layer_args
@@ -363,18 +352,13 @@ def _scan_hybrid_blocks(
     hidden_BTD: jax.Array,
     layer_args: tuple,
 ) -> tuple[jax.Array, jax.Array]:
-    """Scan the repeating hybrid block over ``num_blocks = len(layers) // period``.
+    """Scan the repeating hybrid block over ``num_blocks = len(layers) // period``:
+    stack each of the ``period`` positions' per-layer state on a (replicated) block
+    axis; the scan body applies the ``period`` positions in order (a Python unroll).
+    Layers self-remat (no double remat); sharding preserved; aux losses summed.
 
-    Each of the ``period`` positions is homogeneous across blocks, so we stack that
-    position's per-layer state on a new leading (replicated) block axis; the scan
-    body applies the ``period`` positions in order (a small Python unroll inside one
-    scan step). Each layer self-remats with ``cfg.remat_policy`` (no double remat);
-    per-layer sharding is preserved (block axis carries no spec); aux losses are
-    scanned out and summed.
-
-    ``nnx.scan`` needs an invariant carry dtype: the MoE block can promote the bf16
-    hidden stream to fp32 (top-k weights ride fp32 ``probs``), so we cast the block
-    output back to the carry dtype. No-op for fp32 configs.
+    The block output is cast back to the carry dtype (``nnx.scan`` needs an invariant
+    carry and the MoE block can promote bf16 -> fp32; no-op for fp32).
     """
     carry_dtype = hidden_BTD.dtype
     n = len(layers)
@@ -432,8 +416,8 @@ class Qwen3_5ForCausalLM(nnx.Module):
     def __call__(self, token_ids_BT, segment_ids_BT, cache, num_right_pads,
                  position_ids_BT=None):
         del cache, num_right_pads
-        # position_ids_BT (used for zig-zag CP) carries each token's ORIGINAL
-        # index; broadcast the 1-D text positions across the 3 MRoPE sections.
+        # position_ids_BT (zig-zag CP: each token's original index) broadcast across
+        # the 3 MRoPE sections downstream.
         position_ids_ZBT = None if position_ids_BT is None else position_ids_BT
         return self.text(
             token_ids_BT=token_ids_BT,

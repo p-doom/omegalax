@@ -64,9 +64,6 @@ class Qwen3_5TextConfig:
     num_experts: int = 0
     num_experts_per_tok: int = 0
     router_aux_loss_coef: float = 0.001
-    # MoE compute backend: "grouped" (dropless grouped-GEMM) or "grouped_ep"
-    # (adds expert parallelism via ragged all-to-all).
-    moe_backend: str = "grouped"
     # Activation checkpointing policy for decoder layers (see remat_policy.py).
     remat_policy: str = DEFAULT_REMAT_POLICY
     shd_cfg: ShardConfig = dataclasses.field(default_factory=ShardConfig.default)
