@@ -62,11 +62,6 @@ class Qwen3VLConfig:
     moe_backend: str = "grouped"
     # Activation checkpointing policy for text decoder layers (see remat_policy.py).
     remat_policy: str = DEFAULT_REMAT_POLICY
-    # fp8 training (Hopper-only; strict no-op on A100/CPU). ``fp8`` is the master
-    # gate (default off); ``fp8_recipe`` selects the qwix recipe ("off",
-    # "e4m3_dynamic", "blockwise_128"). See ``omegalax.quant.detect.fp8_active``.
-    fp8: bool = False
-    fp8_recipe: str = "e4m3_dynamic"
     shd_cfg: ShardConfig = dataclasses.field(default_factory=ShardConfig.default)
     dtype: Any = jnp.bfloat16
     param_dtype: Any = jnp.float32
@@ -328,9 +323,6 @@ def make_vl_config_from_hf(hf_cfg: dict[str, Any]) -> Qwen3VLConfig:
         image_token_id=_required(hf_cfg, "image_token_id", "hf_cfg"),
         video_token_id=_required(hf_cfg, "video_token_id", "hf_cfg"),
         vision_start_token_id=_required(hf_cfg, "vision_start_token_id", "hf_cfg"),
-        # fp8 training knob (omegalax-side, additive, default off).
-        fp8=bool(txt.get("fp8", hf_cfg.get("fp8", False))),
-        fp8_recipe=str(txt.get("fp8_recipe", hf_cfg.get("fp8_recipe", "e4m3_dynamic"))),
         dtype=text_dtype,
         vision=Qwen3VLVisionConfig(
             hidden_size=_required(vis, "hidden_size", "hf_cfg['vision_config']"),

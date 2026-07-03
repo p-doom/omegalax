@@ -46,15 +46,6 @@ class Qwen3Config:
     # See omegalax.models.remat_policy for the name -> policy mapping.
     remat_policy: str = DEFAULT_REMAT_POLICY
 
-    # fp8 training (Hopper-only; strict no-op on A100/CPU). ``fp8`` is the master
-    # gate (default off -> unchanged bf16 path). ``fp8_recipe`` selects the qwix
-    # quantization recipe when enabled: "off" (no quant), "e4m3_dynamic"
-    # (per-tensor dynamic e4m3 fwd / e5m2 bwd) or "blockwise_128" (adds 128-wide
-    # subchannel tiling for the largest flagship). Effective only when the host
-    # is Hopper; see ``omegalax.quant.detect.fp8_active``.
-    fp8: bool = False
-    fp8_recipe: str = "e4m3_dynamic"
-
     shd_cfg: ShardConfig = dataclasses.field(default_factory=ShardConfig.default)
     dtype: Any = jnp.bfloat16
 
@@ -248,10 +239,6 @@ def make_config_from_hf(hf_cfg: dict[str, Any]) -> Qwen3Config:
         decoder_sparse_step=_required(hf_cfg, "decoder_sparse_step", "hf_cfg") if is_moe else 1,
         norm_topk_prob=_required(hf_cfg, "norm_topk_prob", "hf_cfg") if is_moe else True,
         aux_loss_coef=float(hf_cfg.get("router_aux_loss_coef", 0.0)),
-        # fp8 is an omegalax-side training knob, not part of the HF schema; read
-        # it from the config dict when present (additive, default off).
-        fp8=bool(hf_cfg.get("fp8", False)),
-        fp8_recipe=str(hf_cfg.get("fp8_recipe", "e4m3_dynamic")),
         dtype=dtype,
     )
     return dataclasses.replace(cfg, shd_cfg=ShardConfig.default())

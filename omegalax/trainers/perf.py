@@ -33,16 +33,9 @@ RunPerfConfig = Union[Qwen3Config, Qwen3_5TextConfig, Qwen3_5Config, Qwen3VLConf
 TRAINING_FLOP_MULTIPLIER = 3
 
 # Peak bf16 TFLOPS (1e12 FLOP/s) for common GPUs. Used as denominator for MFU.
-#
-# fp8 presets (``*_fp8``) are the dense fp8 (e4m3/e5m2) tensor-core peaks, ~2x
-# the bf16 rate on Hopper (NVIDIA datasheet, sparsity OFF). Select the matching
-# fp8 preset for MFU when running fp8 training so the denominator reflects the
-# fp8 tensor cores rather than bf16. A100 has no fp8 tensor cores.
 PEAK_TFLOPS: dict[str, float] = {
     "h100_sxm": 989.0,
     "h100_pcie": 756.0,
-    "h100_sxm_fp8": 1979.0,
-    "h100_pcie_fp8": 1513.0,
     "a100_sxm_80": 312.0,
     "a100_sxm_40": 312.0,
     "a100_pcie_80": 312.0,

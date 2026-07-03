@@ -21,27 +21,11 @@ def init_model_sharded(
 ) -> nnx.Module:
     """Create a model with params born sharded. jax.jit is mandatory to avoid
     materializing a full unsharded copy (OOM for large models).
-
-    When the config requests fp8 (``cfg.fp8`` / recipe != ``off``) the freshly-built
-    model is wrapped with qwix so the compute-bound GEMMs run in fp8; this asserts
-    a Hopper host. No-op (returns the model unchanged) when fp8 is off.
     """
     with jax.set_mesh(mesh), nnx.logical_axis_rules(axis_rules):
         model = jax.jit(lambda rng: model_cls(cfg, rngs=nnx.Rngs(rng)))(rng)
     _finalize_q_shardings(model, mesh)
-    model = _maybe_wrap_fp8(model, cfg, mesh)
     return model
-
-
-def _maybe_wrap_fp8(model: nnx.Module, cfg: Any, mesh: Mesh) -> nnx.Module:
-    """Apply the fp8 quantization wrap (asserts Hopper). No-op unless fp8 is requested.
-
-    Imported lazily so the quant package (and qwix) is only touched when a
-    model is actually built, keeping import graphs and non-fp8 runs untouched.
-    """
-    from omegalax.quant.apply import maybe_quantize_fp8
-
-    return maybe_quantize_fp8(model, cfg, mesh=mesh)
 
 
 def _finalize_q_shardings(model: nnx.Module, mesh: Mesh) -> None:
