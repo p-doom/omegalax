@@ -233,9 +233,7 @@ class Qwen3(nnx.Module):
             return hidden_BTD, total_aux
 
         aux_losses = []
-        # Unrolled fallback. Each layer self-remats inside DecoderLayer.__call__
-        # with cfg.remat_policy, so we call it directly (no extra nnx.remat here):
-        # a single, policy-honoring remat level shared with the scan path below.
+        # Unrolled fallback: each layer self-remats with cfg.remat_policy (no double remat).
         for i, layer in enumerate(self.layers):
             layer_cache = None if cache is None else cache[i]
             hidden_BTD, aux = layer(hidden_BTD, layer_cache, segment_ids_BT, position_ids_BT)
@@ -253,24 +251,15 @@ def _scan_layers(
 ) -> tuple[jax.Array, jax.Array]:
     """Run homogeneous decoder layers with a single ``nnx.scan`` layer body.
 
-    Stacks each layer's state along a new leading layer axis (replicated, i.e.
-    not in the mesh) and scans over it. The per-layer parameter sharding is
-    preserved because we stack the already-annotated per-layer states; only the
-    leading layer axis is added and it carries no partition spec. Activation
-    checkpointing is NOT applied here: the merged layer self-remats inside
-    ``DecoderLayer.__call__`` with ``cfg.remat_policy``, giving a single,
-    policy-honoring remat level shared with the unrolled path (no double remat).
-    Per-layer aux losses are collected as a scanned output (ys) and summed after
-    the scan, reproducing the unrolled sum.
+    Stacks each layer's state on a new leading (replicated) layer axis and scans;
+    per-layer param sharding is preserved (the layer axis carries no spec). The layer
+    self-remats inside ``__call__`` with ``cfg.remat_policy`` -- one remat level shared
+    with the unrolled path (no double remat). Per-layer aux losses are scanned out and
+    summed.
 
-    ``nnx.scan`` requires the carry dtype to be invariant across the loop. The
-    qwen3/qwen3.5 MoE block returns its output in fp32 (its top-k combine weights
-    ride ``probs`` in fp32), so under a bf16 config a layer can promote the hidden
-    stream bf16 -> fp32; the unrolled Python loop tolerates that drift but a scan
-    carry cannot. We therefore cast the per-step output hidden back to the input
-    carry dtype so the carry type is stable. This is a no-op for fp32 configs (so
-    the scan-vs-unrolled equivalence tests, which use fp32, are unaffected) and a
-    single bf16 round of the residual stream otherwise.
+    ``nnx.scan`` needs an invariant carry dtype: the MoE block can promote the bf16
+    hidden stream to fp32 (top-k weights ride fp32 ``probs``), so we cast the per-step
+    output back to the carry dtype. No-op for fp32 configs.
     """
     carry_dtype = hidden_BTD.dtype
     graphdef, _ = nnx.split(layers[0])

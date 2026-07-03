@@ -79,15 +79,11 @@ _PROJECTION_LEAVES: tuple[str, ...] = (
     "lm_head",
 )
 
-# Module paths that must NEVER be quantized (matched FIRST, weight_qtype=None).
-#   * router / shared_expert_gate: precision-sensitive routing GEMMs.
-#   * lora_A / lora_B and the LoRALinear delta scope: low-rank adapter matmuls.
-#     A LoRA-wrapped ``q_proj`` becomes ``.../q_proj`` (a LoRALinear whose
-#     __call__ runs the delta ``jnp.matmul`` -> dot_general at that path) with
-#     the frozen base at ``.../q_proj/base``. Excluding the ``.../<leaf>``
-#     (non-``/base``) delta scope while still quantizing ``.../<leaf>/base``
-#     keeps fp8 on the base weight only. When LoRA is not injected the plain
-#     ``nnx.Linear`` lives directly at ``.../<leaf>`` and is quantized.
+# Module paths that must NEVER be quantized (matched FIRST, weight_qtype=None):
+# precision-sensitive routing GEMMs (router / shared_expert_gate) and the low-rank
+# LoRA adapter matmuls (lora_A / lora_B / the LoRALinear delta scope). The frozen
+# base under a LoRA-wrapped leaf (``.../q_proj/base``) is still quantized -- see
+# build_provider.
 _EXCLUDE_PATTERNS: tuple[str, ...] = (
     r".*router",
     r".*shared_expert_gate",
@@ -147,15 +143,10 @@ def build_provider(
     expert einsums/ragged_dot, lm_head). First match wins, so the exclusions
     shadow the projection rules for LoRA/router paths.
 
-    ``lora_delta_paths`` are the exact ``/``-joined module paths of any
-    ``LoRALinear`` wrappers in the model (e.g. ``"layers/0/attn/q_proj"``).
-    When LoRA is injected, a wrapped ``q_proj`` becomes a ``LoRALinear`` at
-    ``.../q_proj`` whose ``__call__`` runs the low-rank delta matmuls at THAT
-    path, with the frozen base linear at ``.../q_proj/base``. Passing the
-    LoRALinear paths here adds an exact-path exclusion for each so the delta
-    matmuls stay in bf16 while the base GEMM (``.../q_proj/base``, which does
-    NOT fullmatch the delta path) is still quantized. When LoRA is absent this
-    is empty and the plain ``nnx.Linear`` at ``.../q_proj`` is quantized.
+    ``lora_delta_paths`` are the exact ``/``-joined ``LoRALinear`` paths (e.g.
+    ``"layers/0/attn/q_proj"``); each adds an exact-path exclusion so the low-rank
+    delta matmuls stay bf16 while the frozen base at ``.../q_proj/base`` (which does
+    not fullmatch the delta path) is still quantized. Empty when LoRA is absent.
     """
     if recipe not in SUPPORTED_RECIPES:
         raise ValueError(f"Unsupported fp8_recipe {recipe!r}. Supported: {SUPPORTED_RECIPES}.")
@@ -163,9 +154,7 @@ def build_provider(
         raise ValueError("build_provider called with recipe 'off'; gate on fp8_active first.")
 
     rules: list[qwix.QtRule] = [_exclude_rule(p) for p in _EXCLUDE_PATTERNS]
-    # Exclude each LoRALinear delta scope by its exact path (escaped so regex
-    # metacharacters in a path can't misfire). ``.../q_proj/base`` is a longer
-    # path and does not fullmatch ``.../q_proj``, so the base stays quantized.
+    # Exclude each LoRALinear delta scope by its exact (escaped) path.
     rules.extend(_exclude_rule(re.escape(p)) for p in lora_delta_paths)
 
     # Quantize each base projection leaf, both as a plain nnx.Linear at

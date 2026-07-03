@@ -1,24 +1,11 @@
-"""Resolver mapping remat-policy names to ``jax.checkpoint_policies`` policies.
+"""Resolve remat-policy names to ``jax.checkpoint_policies`` objects.
 
-Activation checkpointing (rematerialization) trades memory for recompute in the
-backward pass. Full remat (``"full"``) saves nothing and recomputes the entire
-layer -- minimal memory, maximal recompute FLOPs. A
-*selective* policy instead saves expensive intermediates (matmul / ``dot_general``
-outputs) and recomputes only the cheap ops, usually a net throughput win.
-
-A third option is *offload*: rather than recompute or keep-in-HBM, stage the
-saved activation to host memory (``pinned_host``) for the forward-to-backward
-gap and stage it back for the backward pass (``"offload_dot"`` /
-``"offload_named"``). Useful on coherent-host platforms (GH200); see
-:mod:`omegalax.trainers.offload`.
-
-Policies are numerically transparent: recompute vs. save vs. offload all yield
-identical math (offload only moves bytes between memory kinds), so choosing a
-policy never changes forward/backward results.
-
-Use :func:`resolve_remat_policy` to turn a config-provided name into the policy
-object passed as the ``policy=`` argument of ``nnx.remat`` (for nnx.Module
-layers) or ``jax.remat`` (for pure functions).
+Activation checkpointing trades memory for backward-pass recompute: ``"full"`` saves
+nothing (max recompute); selective ``dots_saveable`` saves matmul outputs; ``offload_*``
+stages saved activations to host memory (GH200; see :mod:`omegalax.trainers.offload`).
+All are numerically transparent -- the policy never changes forward/backward results.
+:func:`resolve_remat_policy` returns the ``policy=`` argument for ``nnx.remat`` /
+``jax.remat``.
 """
 
 from __future__ import annotations

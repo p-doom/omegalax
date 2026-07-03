@@ -1,47 +1,18 @@
 """Dropless sparse Mixture-of-Experts via grouped GEMM (+ optional expert parallelism).
 
-This module provides a *numerically-equivalent* replacement for the dense
-"compute-every-expert" einsum path used by the ``MoEFeedForward`` blocks in the
-``qwen3``, ``qwen3_5`` and ``qwen3_vl`` model families.
+Numerically-equivalent replacement for the dense compute-every-expert einsum,
+computing ``y_t = sum_{e in topk(t)} w_{t,e} * down_e(silu(gate_e(x_t)) * up_e(x_t))``
+with only ``k*(B*T)`` expert rows instead of ``E*(B*T)``.
 
-The dense reference computes, for every token ``t`` and *every* expert ``e``::
-
-    y_t = sum_{e in topk(t)}  w_{t,e} * down_e( silu(gate_e(x_t)) * up_e(x_t) )
-
-wasting ~E/k of the expert FLOPs (E experts, k active per token). The grouped
-path instead *permutes* the (token, chosen-expert) pairs so that all rows routed
-to a given expert are contiguous, runs a **grouped GEMM** (one dense matmul per
-expert over its own token group via :func:`jax.lax.ragged_dot` /
-``tokamax.ragged_dot``), then *unpermutes* and does the weighted top-k sum. Only
-``k * (B*T)`` rows of expert work are performed instead of ``E * (B*T)``.
-
-Correctness derivation (why grouped == dense, up to fp reduction-order):
-  * Routing (softmax -> top_k -> optional renorm) is done identically by the
-    caller and passed in as ``topk_idx`` / ``topk_weights``; we do NOT change it.
-  * Expand each token into its ``k`` (token, expert) assignments. This yields
-    ``N = B*T*k`` rows, row ``i`` belonging to token ``tok[i]`` and expert
-    ``exp[i]`` with weight ``w[i]``.
-  * ``argsort(exp)`` produces a *permutation* ``perm`` (a bijection on the N
-    rows). Gathering the token hidden states by ``tok[perm]`` groups all rows of
-    expert 0 first, then expert 1, ... The per-expert counts are ``group_sizes``.
-  * ``ragged_dot(x_sorted, W, group_sizes)`` applies expert ``e``'s weight to
-    exactly the rows in its group -> algebraically identical to indexing
-    ``W[exp[i]]`` for each row ``i`` (same operands, same matmul), so grouped ==
-    dense per row.
-  * Scatter the results back with the inverse permutation, multiply by ``w[i]``,
-    and sum the ``k`` rows belonging to each token. This is the same weighted sum
-    as the dense gather path.
-  * Under expert parallelism the ``ragged_all_to_all`` dispatch/combine is a
-    *pure data reshuffle* (a bijection routing each row to the device that owns
-    its expert and back). It moves rows between devices but never changes which
-    weight multiplies which row, so the math is unchanged.
-
-Dropless: every (token, expert) pair is processed; there is no capacity factor
-and no dropped or zero-padded tokens (``group_sizes`` sum to exactly ``N``).
-
-Roundoff: results differ from the dense path only by floating-point
-reduction order (grouped GEMM accumulates over a group; the einsum accumulates
-over the ``E`` axis), i.e. ~fp epsilon, identical in fp32.
+Correctness (grouped == dense up to fp reduction order): routing is done by the
+caller (unchanged); expand tokens into ``N=B*T*k`` (token,expert) rows; a stable
+``argsort(expert)`` is a bijection grouping rows by expert with counts ``group_sizes``;
+``ragged_dot(x_sorted, W, group_sizes)`` applies ``W[e]`` to exactly expert ``e``'s
+rows (same operands/matmul as dense indexing ``W[exp[i]]``); the inverse permutation
++ weighted top-k sum reproduces the dense gather. Under EP the ``ragged_all_to_all``
+dispatch/combine is a pure bijective reshuffle (moves rows between devices, never
+changes which weight multiplies which row). Dropless: ``group_sizes`` sum to ``N``.
+Differs from dense only by reduction order (~fp epsilon; identical in fp32).
 """
 
 from __future__ import annotations
@@ -115,12 +86,15 @@ def _ragged_dot(lhs, rhs, group_sizes, primitive: str, *, group_offset=None):
     with the default offset over its local experts, so no GPU group_offset is
     required.
 
-    fp32 accumulation is mandatory: the bf16 tokamax ``PallasTritonRaggedDot`` VJP
-    overflows the down_proj expert grad to the bf16 ceiling (3.39e38). Verified by
-    adversarial repro 2026-07-03 (53 NaN events across seeds guard-off, 0 guard-on)
-    on tokamax@nested-mask/A100; re-test with a proper multi-seed sweep before dropping.
     """
     out_dtype = jnp.result_type(lhs, rhs)
+    # tokamax's ragged_dot custom VJP stores backward grads at the OPERAND dtype (it
+    # discards the forward preferred_element_type; the accumulator is already fp32). In
+    # bf16 the down_proj weight-grad can land in (bf16_max 3.39e38, fp32_max 3.40e38] and
+    # overflow to inf on the bf16 store while the forward stays finite. preferred_element_type
+    # =f32 / precision=HIGHEST are bit-identically broken (never reach the VJP); only fp32
+    # operands => fp32 grad storage fix it (~1.6-2x on expert GEMMs; real fix is upstream:
+    # decouple tokamax's backward grad-storage dtype from the operand dtype).
     lhs = lhs.astype(jnp.float32)
     rhs = rhs.astype(jnp.float32)
     if primitive == "tokamax":

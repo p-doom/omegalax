@@ -1,34 +1,12 @@
-"""Host/CPU offload of optimizer state (and activation-offload gating).
+"""Host/CPU offload of optimizer state (fp32 Adam moments) to ``pinned_host``.
 
-This module implements the CPU/host side of *coherent-memory offload*, whose
-headline target is the NVIDIA GH200 (Grace + Hopper joined by NVLink-C2C, a
-cache-coherent interconnect). On such a platform the fp32 Adam moments and/or
-saved activations can live in Grace (host) memory and be staged to the GPU only
-for the moment they are needed, freeing HBM for larger models / longer
-sequences. On A100/H100 (PCIe) the same mechanism works but every stage is a
-PCIe copy, so it is transfer-bound and typically *slower* — it demonstrates the
-mechanism, not the payoff. On CPU / TPU there is a single memory kind, so
-offload is a semantic no-op.
-
-Design invariants (mirrors the ``ensure_mesh`` discipline):
-
-* **Default OFF is a strict no-op.** With ``offload_optimizer=False`` (the
-  default) nothing in this module runs and the optimizer/build path is
-  byte-identical to trunk.
-* **Plain on/off.** Offload is correctness-equivalent everywhere (only the
-  memory kind of a buffer changes), so it is a simple config bool -- no platform
-  auto-detection. Off-GH200 it still works but is PCIe transfer-bound.
-* **Arithmetic is untouched.** Offload only changes the *memory kind* of a
-  buffer (``"device"`` vs ``"pinned_host"``); it never changes shapes, dtypes,
-  layouts, or the sequence of arithmetic ops. The optimizer update is therefore
-  bit-identical with offload on vs off.
-
-The actual memory-kind *placement* (``jax.device_put(x, sharding
-.with_memory_kind("pinned_host"))``) works even on the CPU backend in this JAX
-(0.9.2) — it just resolves to the single available memory kind — so the
-plumbing is exercisable on a login node. Peak-memory reduction and C2C overlap
-are GH200-only and are verified there (see ``tests/test_offload.py`` deferred
-recipe).
+Stages moments to host memory between steps, freeing HBM; the headline target is
+GH200 (Grace + NVLink-C2C, where the staging is cheap). A plain on/off config bool:
+correctness-equivalent everywhere (only the buffer's memory kind changes, never
+shapes/dtypes/arithmetic -- so the update is bit-identical on vs off), just
+PCIe-transfer-bound off-GH200. Default off is a strict no-op. The ``pinned_host``
+placement resolves on CPU too, so the plumbing is exercisable on a login node;
+peak-memory reduction / C2C overlap are GH200-only.
 """
 
 from __future__ import annotations

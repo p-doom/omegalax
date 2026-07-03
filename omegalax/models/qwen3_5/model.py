@@ -347,9 +347,7 @@ class TextModel(nnx.Module):
             return hidden_BTD, total_aux
 
         aux_losses = []
-        # Unrolled fallback. Each layer self-remats inside DecoderLayer.__call__
-        # with cfg.remat_policy, so we call it directly (no extra nnx.remat): one
-        # policy-honoring remat level shared with the block-scan path above.
+        # Unrolled fallback: each layer self-remats with cfg.remat_policy (no double remat).
         for layer in self.layers:
             hidden_BTD, aux = layer(hidden_BTD, *layer_args)
             aux_losses.append(aux)
@@ -367,26 +365,16 @@ def _scan_hybrid_blocks(
 ) -> tuple[jax.Array, jax.Array]:
     """Scan the repeating hybrid block over ``num_blocks = len(layers) // period``.
 
-    Each of the ``period`` positions is homogeneous across blocks (all
-    ``linear_attention`` or all ``full_attention`` with the same MLP/MoE), so we
-    stack that position's per-layer state along a new leading block axis
-    (replicated, i.e. NOT in the mesh) — giving ``period`` separate stacked-state
-    arrays plus their graphdefs. The scan carries ``hidden`` over the blocks; the
-    body applies the ``period`` positions in original order (a small Python unroll
-    inside one scan step). Activation checkpointing is NOT applied here: each
-    merged layer self-remats inside ``DecoderLayer.__call__`` with
-    ``cfg.remat_policy``, giving a single policy-honoring remat level shared with
-    the unrolled path (no double remat). Per-layer aux losses are summed within the
-    block and the per-block totals are a scanned output, summed after the scan,
-    reproducing the unrolled sum. Per-layer parameter sharding is preserved
-    because we stack already-annotated per-layer states; only the leading block
-    axis is added and it carries no partition spec.
+    Each of the ``period`` positions is homogeneous across blocks, so we stack that
+    position's per-layer state on a new leading (replicated) block axis; the scan
+    body applies the ``period`` positions in order (a small Python unroll inside one
+    scan step). Each layer self-remats with ``cfg.remat_policy`` (no double remat);
+    per-layer sharding is preserved (block axis carries no spec); aux losses are
+    scanned out and summed.
 
-    ``nnx.scan`` requires the carry dtype to be invariant across blocks. The MoE
-    block returns fp32 (its top-k combine weights ride ``probs`` in fp32), so a
-    bf16 config can promote the hidden stream bf16 -> fp32 within a block; we cast
-    the block-output hidden back to the input carry dtype so the carry type is
-    stable. No-op for fp32 configs (equivalence tests use fp32).
+    ``nnx.scan`` needs an invariant carry dtype: the MoE block can promote the bf16
+    hidden stream to fp32 (top-k weights ride fp32 ``probs``), so we cast the block
+    output back to the carry dtype. No-op for fp32 configs.
     """
     carry_dtype = hidden_BTD.dtype
     n = len(layers)
@@ -415,9 +403,6 @@ def _scan_hybrid_blocks(
 
         block_aux = jnp.array(0.0, dtype=jnp.float32)
         for pos in range(period):
-            # Merge this position's stacked state with its graphdef and call the
-            # layer directly; DecoderLayer.__call__ self-remats with the config
-            # policy (single remat level, no double remat).
             layer = nnx.merge(pos_graphdefs[pos], block_states[pos])
             carry_BTD, aux = layer(carry_BTD, *step_args)
             block_aux = block_aux + aux

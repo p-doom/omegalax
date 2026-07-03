@@ -594,10 +594,8 @@ class Qwen3VL(nnx.Module):
             return hidden_BTD, total_aux
 
         aux_losses = []
-        # Unrolled fallback (deepstack / heterogeneous / scan disabled). Each layer
-        # self-remats inside TextDecoderLayer.__call__ with cfg.remat_policy, so we
-        # call it directly (no extra nnx.remat): one policy-honoring remat level
-        # shared with the scan path above.
+        # Unrolled fallback (deepstack / heterogeneous): each layer self-remats with
+        # cfg.remat_policy (no double remat).
         for layer_idx, layer in enumerate(self.text.layers):
             hidden_BTD, aux_loss = layer(hidden_BTD, sin_BTK, cos_BTK)
             aux_losses.append(aux_loss)
@@ -624,18 +622,11 @@ def _scan_text_layers(
 ) -> tuple[jax.Array, jax.Array]:
     """Run homogeneous Qwen3-VL text-decoder layers with a single ``nnx.scan``.
 
-    Stacks per-layer state along a new (replicated) leading layer axis so XLA
-    compiles one layer body. Per-layer sharding is preserved (only the leading
-    layer axis is added, unsharded). Activation checkpointing is NOT applied
-    here: the merged layer self-remats inside ``TextDecoderLayer.__call__`` with
-    ``cfg.remat_policy``, giving a single policy-honoring remat level shared with
-    the unrolled path (no double remat). Per-layer aux losses are scanned outputs
-    summed after the scan.
-
-    The per-step output hidden is cast back to the input carry dtype so the
-    ``nnx.scan`` carry type stays invariant (guards against a layer promoting the
-    bf16 residual stream to fp32; a no-op when the layer already returns the carry
-    dtype and for fp32 configs, so the equivalence tests are unaffected).
+    Stacks per-layer state on a new (replicated) leading layer axis; per-layer
+    sharding is preserved (layer axis unsharded). Each layer self-remats with
+    ``cfg.remat_policy`` (no double remat); aux losses are scanned out and summed.
+    The per-step output is cast back to the carry dtype so the ``nnx.scan`` carry
+    type stays invariant (MoE can promote bf16->fp32; no-op for fp32 configs).
     """
     carry_dtype = hidden_BTD.dtype
     graphdef, _ = nnx.split(layers[0])
