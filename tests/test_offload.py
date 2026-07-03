@@ -4,9 +4,8 @@ Scope (what CAN be checked on a login-node CPU):
   * **OFF is a strict no-op** — with the default config the optimizer builds
     byte-identically to trunk (moments on ``device``), the offload flag is
     off, and a train step runs and matches the pre-offload behavior.
-  * **Platform gating** — ``is_coherent_host_offload_platform()`` is ``False``
-    on CPU, so ``"auto"`` resolves to OFF; an explicit ``True``/``False`` is
-    honored verbatim (never silently overridden).
+  * **On/off resolution** — offload is a plain config bool resolved once; a
+    non-bool value raises (no platform auto-detection).
   * **Offload remat policies resolve and trace** — the new ``"offload_dot"`` /
     ``"offload_named"`` policies resolve to jax policy objects and a smoke model
     *traces* (``jax.eval_shape``) under them, exercising the policy wiring and
@@ -53,7 +52,6 @@ from omegalax.trainers import offload as offload_lib
 from omegalax.trainers.offload import (
     DEVICE_MEMORY_KIND,
     HOST_MEMORY_KIND,
-    is_coherent_host_offload_platform,
     place_tree_on_memory_kind,
     resolve_offload_enabled,
     sharding_on_memory_kind,
@@ -100,41 +98,16 @@ def _make_batch(vocab_size: int, batch_size: int = 2, seq_len: int = 16, pad_id:
     }
 
 
-class PlatformGatingTest(absltest.TestCase):
-    """The gate must be OFF on CPU and must honor explicit overrides."""
+class OffloadSettingResolveTest(absltest.TestCase):
+    """Offload is a plain on/off bool, resolved once."""
 
-    def test_cpu_is_not_coherent_host_platform(self):
-        self.assertFalse(is_coherent_host_offload_platform())
-
-    def test_auto_resolves_off_on_cpu(self):
-        # "auto" must NOT enable offload on a non-coherent platform.
-        self.assertFalse(resolve_offload_enabled("auto"))
-
-    def test_explicit_true_false_honored_verbatim(self):
-        # Explicit user choice is never silently overridden by the gate.
+    def test_explicit_true_false_honored(self):
         self.assertTrue(resolve_offload_enabled(True))
         self.assertFalse(resolve_offload_enabled(False))
 
-    def test_invalid_setting_raises(self):
+    def test_non_bool_setting_raises(self):
         with self.assertRaises(ValueError):
-            resolve_offload_enabled("sometimes")
-
-    def test_gh200_device_kind_would_gate_on(self):
-        # Simulate a GH200 device_kind without a GPU: the substring match is the
-        # only signal, so a fake device with platform 'gpu' + 'GH200' kind gates on.
-        class _FakeDev:
-            platform = "gpu"
-            device_kind = "NVIDIA GH200 480GB"
-
-        self.assertTrue(is_coherent_host_offload_platform([_FakeDev()]))
-        # A100/H100 do NOT gate on.
-        class _A100:
-            platform = "gpu"
-            device_kind = "NVIDIA A100-SXM4-80GB"
-
-        self.assertFalse(is_coherent_host_offload_platform([_A100()]))
-        self.assertFalse(resolve_offload_enabled("auto", devices=[_A100()]))
-        self.assertTrue(resolve_offload_enabled("auto", devices=[_FakeDev()]))
+            resolve_offload_enabled("auto")
 
 
 class OptimizerOffloadOffIsNoOpTest(absltest.TestCase):
@@ -166,15 +139,6 @@ class OptimizerOffloadOffIsNoOpTest(absltest.TestCase):
             loss.block_until_ready()
         self.assertTrue(np.isfinite(float(loss)))
         # opt_state still device-resident after the step.
-        self.assertEqual(_opt_state_memory_kinds(opt), {DEVICE_MEMORY_KIND})
-
-    def test_auto_on_cpu_is_no_op(self):
-        # offload_optimizer="auto" on CPU must resolve OFF -> moments on device.
-        mesh = ensure_mesh(tp_size=1, fsdp_size=1, dp_size=1)
-        model, _ = _build_model(_fp32_cfg())
-        with mesh_rules(mesh):
-            opt = build_optimizer(model, TrainConfig(offload_optimizer="auto"))
-        self.assertFalse(opt.offload_optimizer_state)
         self.assertEqual(_opt_state_memory_kinds(opt), {DEVICE_MEMORY_KIND})
 
 
@@ -301,11 +265,11 @@ class OffloadRematPolicyTest(parameterized.TestCase):
 
     def test_offload_policies_registered(self):
         names = available_remat_policies()
-        for n in ("offload_dot", "offload_named", "offload", "offload_dots"):
+        for n in ("offload_dot", "offload_named"):
             self.assertIn(n, names)
 
     def test_offload_policies_resolve(self):
-        for n in ("offload_dot", "offload_named", "offload", "offload_dots"):
+        for n in ("offload_dot", "offload_named"):
             self.assertIsNotNone(resolve_remat_policy(n))
 
     def test_only_named_policy_uses_tag(self):

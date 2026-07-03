@@ -1,10 +1,10 @@
 """Equivalence tests for scan-based (stacked) decoder layers vs the unrolled loop.
 
 For every supported model family/config we build one smoke model, then run a
-forward+backward pass twice under IDENTICAL weights and inputs: once with
-``scan_layers=False`` (unrolled Python loop) and once with ``scan_layers=True``
-(single ``nnx.scan`` layer body). We assert that the loss, the aux_loss (for
-MoE) and every gradient match to floating-point tolerance.
+forward+backward pass twice under IDENTICAL weights and inputs: once forced onto
+the unrolled Python loop (``_force_unrolled`` patches the scan-eligibility
+property) and once on the default single ``nnx.scan`` layer body. We assert that
+the loss, the aux_loss (for MoE) and every gradient match to fp tolerance.
 
 We also assert the compile-time win: ``jax.make_jaxpr`` of the scanned forward
 contains a ``scan`` primitive and has far fewer equations than the unrolled
@@ -13,12 +13,12 @@ forward, which grows linearly in ``num_layers``.
 Runs on CPU, torch-free.
 """
 
+import contextlib
 import dataclasses
 import os
+import unittest.mock as mock
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
-
-import contextlib
 
 import jax
 import jax.numpy as jnp
@@ -28,6 +28,18 @@ from flax import nnx
 
 from omegalax.distributed.mesh import make_mesh, mesh_rules
 from omegalax.models.sharding_runtime import set_attn_backend
+
+
+def _force_unrolled(cfg):
+    """Force the model onto the unrolled layer loop (the scan_layers opt-out was removed).
+
+    qwen3.5's hybrid dispatch keys on ``scan_block_period`` (None -> unrolled); the
+    homogeneous qwen3 / qwen3-vl dispatch keys on ``is_homogeneous`` (False -> unrolled).
+    """
+    cls = type(cfg)
+    if hasattr(cls, "scan_block_period"):
+        return mock.patch.object(cls, "scan_block_period", property(lambda self: None))
+    return mock.patch.object(cls, "is_homogeneous", property(lambda self: False))
 
 
 @contextlib.contextmanager
@@ -101,12 +113,11 @@ def _assert_grads_match(test, g_ref, g_scan, atol, rtol, prefix=""):
 # Qwen3 (dense + MoE)
 # ----------------------------------------------------------------------------
 class Qwen3ScanEquivalenceTest(absltest.TestCase):
-    def _build_pair(self, cfg_scan):
+    def _build_pair(self, cfg):
         from omegalax.models.qwen3.model import Qwen3
 
-        cfg_unrolled = dataclasses.replace(cfg_scan, scan_layers=False)
-        m_unrolled = Qwen3(cfg_unrolled, rngs=nnx.Rngs(0))
-        m_scan = Qwen3(cfg_scan, rngs=nnx.Rngs(0))
+        m_unrolled = Qwen3(cfg, rngs=nnx.Rngs(0))
+        m_scan = Qwen3(cfg, rngs=nnx.Rngs(0))
         m_scan = _copy_weights(m_unrolled, m_scan)
         set_attn_backend(m_unrolled, text_backend="xla")
         set_attn_backend(m_scan, text_backend="xla")
@@ -134,7 +145,6 @@ class Qwen3ScanEquivalenceTest(absltest.TestCase):
             tie_word_embeddings=False,
             shd_cfg=ShardConfig.no_sharding(),
             dtype=jnp.float32,
-            scan_layers=True,
         )
 
     def _moe_cfg(self, num_layers=12):
@@ -163,17 +173,16 @@ class Qwen3ScanEquivalenceTest(absltest.TestCase):
             aux_loss_coef=0.01,
             shd_cfg=ShardConfig.no_sharding(),
             dtype=jnp.float32,
-            scan_layers=True,
         )
 
-    def _run_case(self, cfg_scan, atol=1e-5, rtol=1e-5):
+    def _run_case(self, cfg, atol=1e-5, rtol=1e-5):
         with self._mesh():
-            m_unrolled, m_scan = self._build_pair(cfg_scan)
+            m_unrolled, m_scan = self._build_pair(cfg)
 
             rng = np.random.RandomState(0)
             B, T = 2, 12
             token_ids_BT = jnp.asarray(
-                rng.randint(1, cfg_scan.vocab_size, size=(B, T)).astype(np.int32)
+                rng.randint(1, cfg.vocab_size, size=(B, T)).astype(np.int32)
             )
             segment_ids_BT = jnp.ones((B, T), dtype=jnp.int32)
 
@@ -182,7 +191,8 @@ class Qwen3ScanEquivalenceTest(absltest.TestCase):
                 logits = model.lm_head(hidden_BTD)
                 return jnp.mean(logits**2) + aux, aux
 
-            (loss_ref, aux_ref), g_ref = nnx.value_and_grad(loss_fn, has_aux=True)(m_unrolled)
+            with _force_unrolled(cfg):
+                (loss_ref, aux_ref), g_ref = nnx.value_and_grad(loss_fn, has_aux=True)(m_unrolled)
             (loss_scan, aux_scan), g_scan = nnx.value_and_grad(loss_fn, has_aux=True)(m_scan)
 
         np.testing.assert_allclose(
@@ -213,8 +223,7 @@ class Qwen3ScanEquivalenceTest(absltest.TestCase):
         # decoder_sparse_step=2 -> only odd (0-indexed even) layers are MoE -> mixed
         cfg = dataclasses.replace(self._moe_cfg(num_layers=12), decoder_sparse_step=2)
         self.assertFalse(cfg.is_homogeneous)
-        # scan_layers True but heterogeneous: model must still run (via unrolled path)
-        # and match a forced-unrolled run.
+        # Heterogeneous stack: the default dispatch already takes the unrolled path.
         loss_ref, loss_scan, aux_ref, aux_scan, max_g = self._run_case(cfg)
         print(
             f"[qwen3-moe-hetero L={cfg.num_layers}] heterogeneous -> unrolled fallback; "
@@ -228,23 +237,32 @@ class Qwen3ScanEquivalenceTest(absltest.TestCase):
         B, T = 2, 12
         results = {}
         with single_device_mesh():
-            for scan in (False, True):
-                cfg = dataclasses.replace(self._dense_cfg(num_layers=16), scan_layers=scan)
-                model = Qwen3(cfg, rngs=nnx.Rngs(0))
-                set_attn_backend(model, text_backend="xla")
-                token_ids_BT = jnp.asarray(
-                    rng.randint(1, cfg.vocab_size, size=(B, T)).astype(np.int32)
-                )
-                segment_ids_BT = jnp.ones((B, T), dtype=jnp.int32)
-                graphdef, state = nnx.split(model)
+            cfg = self._dense_cfg(num_layers=16)
+            model = Qwen3(cfg, rngs=nnx.Rngs(0))
+            set_attn_backend(model, text_backend="xla")
+            token_ids_BT = jnp.asarray(
+                rng.randint(1, cfg.vocab_size, size=(B, T)).astype(np.int32)
+            )
+            segment_ids_BT = jnp.ones((B, T), dtype=jnp.int32)
+            graphdef, state = nnx.split(model)
 
-                def fwd(state, tok, seg):
-                    m = nnx.merge(graphdef, state)
-                    h, aux = m(tok, seg, None, jnp.array(0, jnp.int32))
-                    return jnp.mean(h**2) + aux
+            # Distinct fn objects for the two paths: a single make_jaxpr'd fn caches
+            # its first trace and would reuse the forced-unrolled jaxpr for both.
+            def fwd_unrolled(state, tok, seg):
+                m = nnx.merge(graphdef, state)
+                h, aux = m(tok, seg, None, jnp.array(0, jnp.int32))
+                return jnp.mean(h**2) + aux
 
-                jpr = jax.make_jaxpr(fwd)(state, token_ids_BT, segment_ids_BT)
-                results[scan] = (_count_eqns(jpr.jaxpr), _has_scan(str(jpr)))
+            def fwd_scan(state, tok, seg):
+                m = nnx.merge(graphdef, state)
+                h, aux = m(tok, seg, None, jnp.array(0, jnp.int32))
+                return jnp.mean(h**2) + aux
+
+            with _force_unrolled(cfg):
+                jpr_u = jax.make_jaxpr(fwd_unrolled)(state, token_ids_BT, segment_ids_BT)
+            jpr_s = jax.make_jaxpr(fwd_scan)(state, token_ids_BT, segment_ids_BT)
+            results[False] = (_count_eqns(jpr_u.jaxpr), _has_scan(str(jpr_u)))
+            results[True] = (_count_eqns(jpr_s.jaxpr), _has_scan(str(jpr_s)))
 
         unrolled_eqns, unrolled_scan = results[False]
         scan_eqns, scan_has_scan = results[True]
@@ -304,7 +322,6 @@ class Qwen3VLScanEquivalenceTest(absltest.TestCase):
             shd_cfg=ShardConfig.no_sharding(),
             dtype=jnp.float32,
             param_dtype=jnp.float32,
-            scan_layers=True,
         )
 
     # NOTE on tolerance: Qwen3-VL text attention runs the compute in the model
@@ -334,8 +351,7 @@ class Qwen3VLScanEquivalenceTest(absltest.TestCase):
         from omegalax.models.qwen3_vl.model import Qwen3VL
 
         with single_device_mesh():
-            cfg_unrolled = dataclasses.replace(cfg, scan_layers=False)
-            m_unrolled = Qwen3VL(cfg_unrolled, rngs=nnx.Rngs(0))
+            m_unrolled = Qwen3VL(cfg, rngs=nnx.Rngs(0))
             m_scan = Qwen3VL(cfg, rngs=nnx.Rngs(0))
             m_scan = _copy_weights(m_unrolled, m_scan)
             set_attn_backend(m_unrolled, text_backend="xla")
@@ -349,19 +365,19 @@ class Qwen3VLScanEquivalenceTest(absltest.TestCase):
             )
             attention_mask_BT = jnp.ones((B, T), dtype=jnp.int32)
 
-            # Primary evidence: forward hidden states must be bit-identical
-            # (this is what proves the scan is doing the same math as the loop).
-            h_ref, _ = m_unrolled(token_ids_BT, attention_mask_BT)
-            h_scan, _ = m_scan(token_ids_BT, attention_mask_BT)
-            fwd_max = float(jnp.max(jnp.abs(h_ref - h_scan)))
-
             def loss_fn(model):
                 hidden_BTD, aux = model(token_ids_BT, attention_mask_BT)
                 logits = model.lm_head(hidden_BTD)
                 return jnp.mean(logits**2) + aux, aux
 
-            (loss_ref, aux_ref), g_ref = nnx.value_and_grad(loss_fn, has_aux=True)(m_unrolled)
+            # Primary evidence: forward hidden states must be bit-identical
+            # (this is what proves the scan is doing the same math as the loop).
+            with _force_unrolled(cfg):
+                h_ref, _ = m_unrolled(token_ids_BT, attention_mask_BT)
+                (loss_ref, aux_ref), g_ref = nnx.value_and_grad(loss_fn, has_aux=True)(m_unrolled)
+            h_scan, _ = m_scan(token_ids_BT, attention_mask_BT)
             (loss_scan, aux_scan), g_scan = nnx.value_and_grad(loss_fn, has_aux=True)(m_scan)
+            fwd_max = float(jnp.max(jnp.abs(h_ref - h_scan)))
 
         # Forward hidden states are bit-exact for dense. For MoE the bf16
         # attention cast can flip top-k expert selection, so we allow a small
@@ -496,8 +512,7 @@ class Qwen35BlockScanEquivalenceTest(absltest.TestCase):
         from omegalax.models.qwen3_5.model import Qwen3_5ForCausalLM
 
         with single_device_mesh():
-            cfg_unrolled = dataclasses.replace(text_cfg, scan_layers=False)
-            m_unrolled = Qwen3_5ForCausalLM(cfg_unrolled, rngs=nnx.Rngs(0))
+            m_unrolled = Qwen3_5ForCausalLM(text_cfg, rngs=nnx.Rngs(0))
             m_scan = Qwen3_5ForCausalLM(text_cfg, rngs=nnx.Rngs(0))
             m_scan = _copy_weights(m_unrolled, m_scan)
             set_attn_backend(m_unrolled, text_backend="xla")
@@ -513,29 +528,37 @@ class Qwen35BlockScanEquivalenceTest(absltest.TestCase):
             )
             segment_ids_BT = jnp.ones((B, T), dtype=jnp.int32)
 
-            # The Gated DeltaNet uses shard_map internally, which cannot be
-            # evaluated eagerly inside nnx.remat/nnx.scan; the model always runs
-            # under jit in practice, so we jit the forward/grad here too.
+            def loss_fn(m):
+                hidden_BTD, aux = m(token_ids_BT, segment_ids_BT, None, jnp.array(0, jnp.int32))
+                logits = m.lm_head(hidden_BTD)
+                return jnp.mean(logits**2) + aux, aux
+
+            # The Gated DeltaNet uses shard_map internally, which cannot be evaluated
+            # eagerly inside nnx.remat/nnx.scan; the model always runs under jit, so we
+            # jit here too. Separate jit'd fns for the unrolled vs scan model so their
+            # compilations never alias (identical graphdef -> shared cache otherwise).
             @nnx.jit
-            def fwd(model, tok, seg):
-                return model(tok, seg, None, jnp.array(0, jnp.int32))
-
-            # Primary evidence: forward hidden states match tightly.
-            h_ref, _ = fwd(m_unrolled, token_ids_BT, segment_ids_BT)
-            h_scan, _ = fwd(m_scan, token_ids_BT, segment_ids_BT)
-            fwd_max = float(jnp.max(jnp.abs(h_ref - h_scan)))
+            def fwd_u(model):
+                return model(token_ids_BT, segment_ids_BT, None, jnp.array(0, jnp.int32))
 
             @nnx.jit
-            def grads(model, tok, seg):
-                def loss_fn(m):
-                    hidden_BTD, aux = m(tok, seg, None, jnp.array(0, jnp.int32))
-                    logits = m.lm_head(hidden_BTD)
-                    return jnp.mean(logits**2) + aux, aux
+            def fwd_s(model):
+                return model(token_ids_BT, segment_ids_BT, None, jnp.array(0, jnp.int32))
 
+            @nnx.jit
+            def grads_u(model):
                 return nnx.value_and_grad(loss_fn, has_aux=True)(model)
 
-            (loss_ref, aux_ref), g_ref = grads(m_unrolled, token_ids_BT, segment_ids_BT)
-            (loss_scan, aux_scan), g_scan = grads(m_scan, token_ids_BT, segment_ids_BT)
+            @nnx.jit
+            def grads_s(model):
+                return nnx.value_and_grad(loss_fn, has_aux=True)(model)
+
+            with _force_unrolled(text_cfg):
+                h_ref, _ = fwd_u(m_unrolled)
+                (loss_ref, aux_ref), g_ref = grads_u(m_unrolled)
+            h_scan, _ = fwd_s(m_scan)
+            (loss_scan, aux_scan), g_scan = grads_s(m_scan)
+            fwd_max = float(jnp.max(jnp.abs(h_ref - h_scan)))
 
         np.testing.assert_allclose(np.asarray(loss_ref), np.asarray(loss_scan), atol=atol, rtol=rtol)
         np.testing.assert_allclose(np.asarray(aux_ref), np.asarray(aux_scan), atol=atol, rtol=rtol)
@@ -577,23 +600,32 @@ class Qwen35BlockScanEquivalenceTest(absltest.TestCase):
         B, T = 2, 16
         results = {}
         with single_device_mesh():
-            for scan in (False, True):
-                cfg = dataclasses.replace(self._text_cfg(num_layers=16, moe=True), scan_layers=scan)
-                model = Qwen3_5ForCausalLM(cfg, rngs=nnx.Rngs(0))
-                set_attn_backend(model, text_backend="xla")
-                token_ids_BT = jnp.asarray(
-                    rng.randint(1, cfg.vocab_size, size=(B, T)).astype(np.int32)
-                )
-                segment_ids_BT = jnp.ones((B, T), dtype=jnp.int32)
-                graphdef, state = nnx.split(model)
+            cfg = self._text_cfg(num_layers=16, moe=True)
+            model = Qwen3_5ForCausalLM(cfg, rngs=nnx.Rngs(0))
+            set_attn_backend(model, text_backend="xla")
+            token_ids_BT = jnp.asarray(
+                rng.randint(1, cfg.vocab_size, size=(B, T)).astype(np.int32)
+            )
+            segment_ids_BT = jnp.ones((B, T), dtype=jnp.int32)
+            graphdef, state = nnx.split(model)
 
-                def fwd(state, tok, seg):
-                    m = nnx.merge(graphdef, state)
-                    h, aux = m(tok, seg, None, jnp.array(0, jnp.int32))
-                    return jnp.mean(h**2) + aux
+            # Distinct fn objects for the two paths: a single make_jaxpr'd fn caches
+            # its first trace and would reuse the forced-unrolled jaxpr for both.
+            def fwd_unrolled(state, tok, seg):
+                m = nnx.merge(graphdef, state)
+                h, aux = m(tok, seg, None, jnp.array(0, jnp.int32))
+                return jnp.mean(h**2) + aux
 
-                jpr = jax.make_jaxpr(fwd)(state, token_ids_BT, segment_ids_BT)
-                results[scan] = (_count_eqns(jpr.jaxpr), _has_scan(str(jpr)))
+            def fwd_scan(state, tok, seg):
+                m = nnx.merge(graphdef, state)
+                h, aux = m(tok, seg, None, jnp.array(0, jnp.int32))
+                return jnp.mean(h**2) + aux
+
+            with _force_unrolled(cfg):
+                jpr_u = jax.make_jaxpr(fwd_unrolled)(state, token_ids_BT, segment_ids_BT)
+            jpr_s = jax.make_jaxpr(fwd_scan)(state, token_ids_BT, segment_ids_BT)
+            results[False] = (_count_eqns(jpr_u.jaxpr), _has_scan(str(jpr_u)))
+            results[True] = (_count_eqns(jpr_s.jaxpr), _has_scan(str(jpr_s)))
 
         unrolled_eqns, unrolled_scan = results[False]
         scan_eqns, scan_has_scan = results[True]

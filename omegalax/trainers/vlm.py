@@ -80,13 +80,10 @@ class TrainConfig:
     lora_alpha: float = 32.0
     freeze_vision_tower: bool = False
     num_loss_tiles: int = 4
-    # Host/CPU offload of the fp32 optimizer moments (Adam mu/nu) between steps.
-    # ``False`` (default) is a strict no-op; ``True`` forces it on any platform
-    # (transfer-bound on PCIe A100/H100 — mechanism, not payoff); ``"auto"``
-    # enables it only on a coherent-host platform (GH200). See
-    # omegalax.trainers.offload. Activation offload is configured separately via
-    # the model config's ``remat_policy`` (an ``"offload*"`` policy name).
-    offload_optimizer: bool | str = False
+    # Host/CPU offload of the fp32 optimizer moments (Adam mu/nu). Plain on/off,
+    # correctness-equivalent everywhere (transfer-bound off-GH200); see
+    # omegalax.trainers.offload. Activation offload is separate (remat_policy).
+    offload_optimizer: bool = False
 
 
 def init_model(

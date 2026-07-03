@@ -46,23 +46,9 @@ over the ``E`` axis), i.e. ~fp epsilon, identical in fp32.
 
 from __future__ import annotations
 
-import os
-
 import jax
 import jax.numpy as jnp
-
-try:  # tokamax is the GPU-perf grouped-GEMM path; it falls back to XLA on CPU.
-    import tokamax
-
-    _HAS_TOKAMAX = True
-except Exception:  # pragma: no cover - tokamax always installed in this repo
-    _HAS_TOKAMAX = False
-
-# Force fp32 accumulation inside the grouped GEMM (see _ragged_dot docstring).
-# Default ON: required for a finite bf16 backward through tokamax's ragged_dot VJP.
-# Escape hatch ``OMEGALAX_MOE_F32_ACC=0`` restores raw-dtype accumulation (unstable
-# in bf16 backward) — kept only for debugging / A-B numerical comparison.
-_F32_ACC = os.environ.get("OMEGALAX_MOE_F32_ACC", "1") != "0"
+import tokamax
 
 
 def _unshard(x):
@@ -129,21 +115,15 @@ def _ragged_dot(lhs, rhs, group_sizes, primitive: str, *, group_offset=None):
     with the default offset over its local experts, so no GPU group_offset is
     required.
 
-    NUMERICAL STABILITY (bf16 backward): tokamax's ``PallasTritonRaggedDot`` VJP is
-    numerically unstable in bf16 (its backward can produce NaN in the down_proj
-    expert gradient under realistic bf16 + split-rng training, even though the
-    forward is finite). We therefore force **fp32 accumulation**: cast ``lhs``/``rhs``
-    to fp32, run the grouped GEMM in fp32 (so both the forward matmul and the VJP
-    differentiate an fp32 op), then cast the output back to the inputs' dtype. This
-    is the standard matmul-stability pattern; it costs a modest amount of extra
-    arithmetic but keeps the k/E FLOP win (no extra experts are computed). The int
-    ``group_sizes`` are untouched.
+    fp32 accumulation is mandatory: the bf16 tokamax ``PallasTritonRaggedDot`` VJP
+    overflows the down_proj expert grad to the bf16 ceiling (3.39e38). Verified by
+    adversarial repro 2026-07-03 (53 NaN events across seeds guard-off, 0 guard-on)
+    on tokamax@nested-mask/A100; re-test with a proper multi-seed sweep before dropping.
     """
     out_dtype = jnp.result_type(lhs, rhs)
-    if _F32_ACC:
-        lhs = lhs.astype(jnp.float32)
-        rhs = rhs.astype(jnp.float32)
-    if primitive == "tokamax" and _HAS_TOKAMAX:
+    lhs = lhs.astype(jnp.float32)
+    rhs = rhs.astype(jnp.float32)
+    if primitive == "tokamax":
         out = tokamax.ragged_dot(lhs, rhs, group_sizes, group_offset=group_offset)
     else:
         out = jax.lax.ragged_dot(lhs, rhs, group_sizes, group_offset=group_offset)
@@ -151,12 +131,8 @@ def _ragged_dot(lhs, rhs, group_sizes, primitive: str, *, group_offset=None):
 
 
 # ``jax.lax.ragged_all_to_all`` lowers to an HLO that XLA:CPU does not implement
-# (only GPU/TPU). For CPU equivalence testing we provide a bit-identical emulation
-# built from ``all_gather`` (a pure, bijective data reshuffle). Set the env var
-# ``OMEGALAX_MOE_A2A=native`` to force the real primitive (GPU/TPU).
-import os as _os
-
-_A2A_MODE = _os.environ.get("OMEGALAX_MOE_A2A", "auto")
+# (only GPU/TPU); on CPU we emulate it bit-identically via ``all_gather`` (a pure,
+# bijective data reshuffle) so EP can be exercised in CPU CI.
 
 
 def _ragged_all_to_all(
@@ -170,10 +146,7 @@ def _ragged_all_to_all(
       recv_sizes[d]                   : rows s receives from d.
     Rows of ``output`` not written by any sender stay at their initial (0) value.
     """
-    use_native = _A2A_MODE == "native" or (
-        _A2A_MODE == "auto" and jax.default_backend() != "cpu"
-    )
-    if use_native:
+    if jax.default_backend() != "cpu":
         return jax.lax.ragged_all_to_all(
             operand, output, input_offsets, send_sizes, output_offsets, recv_sizes,
             axis_name=axis_name,

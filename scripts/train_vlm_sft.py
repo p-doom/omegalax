@@ -21,9 +21,8 @@ from omegalax.data.grain_pipeline import (
     make_grain_read_options,
     required_epochs_for_batches,
 )
-from omegalax.distributed.launch import init_distributed
+from omegalax.distributed import configure_gpu_xla_flags, init_distributed
 from omegalax.distributed.mesh import process_local_batch_size
-from omegalax.distributed.xla_flags import configure_gpu_xla_flags
 from omegalax.trainers import vlm as vlm_trainer
 from omegalax.trainers.checkpoint_utils import ResumeMode
 from omegalax.registry import resolve_hf_repo_id
@@ -177,13 +176,6 @@ _ATTN_BACKENDS = [
 ]
 flags.DEFINE_enum(
     "text_attn_backend", None, _ATTN_BACKENDS, "Attention backend for the text decoder."
-)
-flags.DEFINE_bool(
-    "gpu_xla_perf_flags",
-    True,
-    "Enable GPU XLA comm/compute-overlap (latency-hiding) flags. No-op on CPU/TPU. "
-    "Set to false (or export OMEGALAX_DISABLE_XLA_PERF_FLAGS=1) to disable; "
-    "any user-set XLA_FLAGS are preserved and take precedence regardless.",
 )
 
 _REQUIRED = [
@@ -340,17 +332,11 @@ def _grain_iter(
 
 
 def main(_) -> None:
-    # Install GPU comm/compute-overlap XLA flags BEFORE any jax backend is created
-    # (i.e. before jax.distributed.initialize()); XLA reads XLA_FLAGS lazily at backend
-    # init, so this must run first. No-op on CPU/TPU and preserves user XLA_FLAGS.
-    applied_xla_flags = configure_gpu_xla_flags(enable=FLAGS.gpu_xla_perf_flags)
+    configure_gpu_xla_flags()  # must precede any jax backend creation
     _validate_flags()
     jax.config.update("jax_compilation_cache_dir", FLAGS.jax_cache_dir)
-    launch_info = init_distributed()
+    init_distributed()
     startup_log(f"jax_compilation_cache_dir={FLAGS.jax_cache_dir}")
-    startup_log(f"launch mode={launch_info.mode.value}: {launch_info.reason}")
-    if applied_xla_flags is not None:
-        startup_log(f"XLA_FLAGS={applied_xla_flags}")
 
     repo_id = FLAGS.processor or resolve_hf_repo_id(FLAGS.model_id)
     tokenizer = AutoTokenizer.from_pretrained(repo_id)

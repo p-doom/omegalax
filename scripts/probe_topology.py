@@ -49,7 +49,7 @@ from absl import app, flags
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
 # Import lazily-safe: this module only touches placement logic.
-from omegalax.distributed.launch import init_distributed
+from omegalax.distributed import init_distributed
 from omegalax.distributed.mesh import derive_ici_dcn, make_mesh
 
 FLAGS = flags.FLAGS
@@ -131,11 +131,6 @@ def _bench_tp_allreduce(mesh: Mesh, mib: int, iters: int) -> float:
 
 
 def main(_) -> None:
-    # Robust launch: init_distributed() detects single- vs multi-process from the
-    # SLURM env and either skips initialize() (single process -> all local GPUs)
-    # or calls it with an explicitly-derived coordinator/num_processes/process_id
-    # (multi-node -> one process per node). The placement report is meaningful in
-    # both cases (trivially so on one process).
     init_distributed()
     tp, fsdp, dp = FLAGS.tp_size, FLAGS.fsdp_size, FLAGS.dp_size
 

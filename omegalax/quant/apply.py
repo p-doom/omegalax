@@ -1,12 +1,13 @@
-"""Apply fp8 quantization to an NNX model via qwix (Hopper-gated no-op).
+"""Apply fp8 quantization to an NNX model via qwix.
 
 ``maybe_quantize_fp8`` is the single entry point called from the model-build
 path (``init_model`` / ``init_model_sharded``). It:
 
-  1. Checks :func:`omegalax.quant.detect.fp8_active` -- returns the model
-     UNCHANGED when fp8 is off, the recipe is ``off``, or the host is not
-     Hopper (A100/CPU). This is the strict no-op guarantee.
-  2. Otherwise builds the qwix ``QtProvider`` for the recipe and calls
+  1. Returns the model UNCHANGED when the config does not request fp8
+     (``cfg.fp8`` false or recipe ``off``) -- the clean pass-through.
+  2. Otherwise asserts the host is Hopper (fp8 on a non-Hopper device is a
+     misconfiguration, not a silent bf16 fallback), then builds the qwix
+     ``QtProvider`` for the recipe and calls
      ``qwix.quantize_model(model, provider, *dummy_inputs)`` UNDER THE MESH so
      the traced ``__call__`` (which qwix runs once to convert weights and
      create the ``quant_stats`` collection) composes with the pervasive
@@ -81,23 +82,15 @@ def maybe_quantize_fp8(model: nnx.Module, cfg: Any, mesh: Any = None) -> nnx.Mod
     """
     if not detect.fp8_active(cfg):
         return model
+    assert detect.is_hopper(), (
+        f"fp8 requires sm_90+ (Hopper); this device is {jax.devices()[0].device_kind}"
+    )
 
     recipe = getattr(cfg, "fp8_recipe", rules_mod.RECIPE_E4M3_DYNAMIC)
     # Exclude any LoRA low-rank delta matmuls (quantize only the frozen base).
     lora_paths = rules_mod.lora_delta_paths(model)
     provider = rules_mod.build_provider(recipe, lora_delta_paths=lora_paths)
     dummy_inputs = _dummy_inputs_for(model)
-
-    # qwix runs the model's ``__call__`` once to convert weights / create the
-    # quant_stats collection. On a CPU host (only reached under the
-    # OMEGALAX_FORCE_FP8 validation override -- real fp8 is Hopper-only) the
-    # default tokamax ``mosaic_gpu`` attention kernel is unsupported, so force
-    # the CPU-correct ``xla`` attention backend for the trace. On Hopper the
-    # backend is left untouched (``mosaic_gpu``) so the real kernel is traced.
-    if jax.default_backend() == "cpu":
-        from omegalax.models.sharding_runtime import set_attn_backend
-
-        set_attn_backend(model, text_backend="xla")
 
     def _wrap() -> nnx.Module:
         return qwix.quantize_model(model, provider, *dummy_inputs)

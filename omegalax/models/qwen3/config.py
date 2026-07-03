@@ -39,18 +39,12 @@ class Qwen3Config:
     norm_topk_prob: bool = True
     aux_loss_coef: float = 0.0
 
-    # MoE compute backend: "dense" (reference, compute-every-expert einsum) or
-    # "grouped" (dropless grouped-GEMM + expert-parallel ragged all-to-all).
-    # Default "dense" keeps existing behavior unchanged for side-by-side diffing.
-    moe_backend: str = "dense"
+    # MoE compute backend: "grouped" (dropless grouped-GEMM) or "grouped_ep"
+    # (adds expert parallelism via ragged all-to-all).
+    moe_backend: str = "grouped"
     # Activation checkpointing (rematerialization) policy for decoder layers.
     # See omegalax.models.remat_policy for the name -> policy mapping.
     remat_policy: str = DEFAULT_REMAT_POLICY
-    # Stack homogeneous decoder layers along a leading layer axis and run them
-    # with ``nnx.scan`` (single compiled layer body). Falls back to the unrolled
-    # Python loop automatically for heterogeneous stacks and for the decode
-    # (cache is not None) path. When False, always uses the unrolled loop.
-    scan_layers: bool = True
 
     # fp8 training (Hopper-only; strict no-op on A100/CPU). ``fp8`` is the master
     # gate (default off -> unchanged bf16 path). ``fp8_recipe`` selects the qwix

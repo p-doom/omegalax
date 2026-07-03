@@ -64,16 +64,11 @@ class Qwen3_5TextConfig:
     num_experts: int = 0
     num_experts_per_tok: int = 0
     router_aux_loss_coef: float = 0.001
-    # MoE compute backend: "dense" (reference einsum) or "grouped"/"grouped_ep"
-    # (dropless grouped-GEMM). Default "dense" keeps existing behavior.
-    moe_backend: str = "dense"
+    # MoE compute backend: "grouped" (dropless grouped-GEMM) or "grouped_ep"
+    # (adds expert parallelism via ragged all-to-all).
+    moe_backend: str = "grouped"
     # Activation checkpointing policy for decoder layers (see remat_policy.py).
     remat_policy: str = DEFAULT_REMAT_POLICY
-    # Stack homogeneous decoder layers and run them with ``nnx.scan``. Qwen3.5
-    # is HYBRID (linear vs full attention interleaved), so ``is_homogeneous`` is
-    # almost always False and the model stays on the unrolled loop; the flag is
-    # kept for API parity and to enable scan for hypothetical homogeneous stacks.
-    scan_layers: bool = True
     # fp8 training (Hopper-only; strict no-op on A100/CPU). ``fp8`` is the master
     # gate (default off); ``fp8_recipe`` selects the qwix recipe ("off",
     # "e4m3_dynamic", "blockwise_128"). See ``omegalax.quant.detect.fp8_active``.

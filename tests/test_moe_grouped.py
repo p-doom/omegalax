@@ -1,8 +1,10 @@
 """Numerical-equivalence tests for the dropless grouped-GEMM / EP MoE path.
 
-Phase 1 (single device): the ``moe_backend="grouped"`` path in the Qwen3 MoE block
-must match the dense ``"dense"`` einsum reference on forward, backward, and
-aux_loss, up to floating-point reduction-order roundoff.
+Phase 1 (single device): the grouped MoE block (and the ``grouped_moe`` kernel)
+must match a local dense compute-every-expert einsum reference (``_dense_ref`` /
+``_dense_moe_block_output``) on forward and backward, up to fp reduction-order
+roundoff. (The model has a single grouped stream now; the dense einsum lives here
+as the slow reference used to validate the fast kernel.)
 
 Phase 2 (expert parallelism): the ``grouped_moe_ep`` path on *faked* multi-CPU
 devices (EP=2 and EP=4) must match the single-device dense reference on forward
@@ -85,6 +87,42 @@ def _dense_ref(hidden, gate, up, down, router, k):
     return jnp.sum(gathered * w[..., None], axis=1)
 
 
+def _dense_moe_block_output(mlp, hidden_BTD):
+    """Dense-einsum reference for a routed-expert MoE block (relocated from the
+    deleted ``moe_backend="dense"`` path) so the grouped block can be validated
+    against a slow compute-every-expert reference.
+
+    Reproduces the block forward: routing (softmax -> top_k -> optional renorm) +
+    dense expert einsum + top-k gather (+ shared expert / gate when present). fp32
+    reference, no LoRA / sharding; routing matches the grouped block's.
+    """
+    cfg = mlp.cfg
+    B, T, D = hidden_BTD.shape
+    probs = jax.nn.softmax(mlp.router(hidden_BTD).astype(jnp.float32), axis=-1)
+    w, idx = jax.lax.top_k(probs, cfg.num_experts_per_tok)
+    if getattr(cfg, "norm_topk_prob", True):
+        w = w / jnp.clip(jnp.sum(w, -1, keepdims=True), min=1e-9)
+    w = w.astype(hidden_BTD.dtype)
+    gate = mlp.gate_proj[...].astype(hidden_BTD.dtype)
+    up = mlp.up_proj[...].astype(hidden_BTD.dtype)
+    down = mlp.down_proj[...].astype(hidden_BTD.dtype)
+    o = jnp.einsum(
+        "BTEF,EFD->BTED", jax.nn.silu(jnp.einsum("BTD,EDF->BTEF", hidden_BTD, gate))
+        * jnp.einsum("BTD,EDF->BTEF", hidden_BTD, up), down,
+    )
+    flat = o.reshape(B * T, cfg.num_experts, D)
+    fidx = idx.reshape(B * T, cfg.num_experts_per_tok)
+    gathered = jnp.take_along_axis(flat, fidx[..., None], axis=1).reshape(
+        B, T, cfg.num_experts_per_tok, D
+    )
+    merged = jnp.sum(gathered * w[..., None], axis=-2)
+    if hasattr(mlp, "shared_expert"):
+        merged = merged + jax.nn.sigmoid(mlp.shared_expert_gate(hidden_BTD)) * mlp.shared_expert(
+            hidden_BTD
+        )
+    return merged
+
+
 class GroupedMoEPhase1Test(absltest.TestCase):
     """Single-device grouped_moe vs dense einsum (fwd + bwd)."""
 
@@ -140,29 +178,25 @@ class GroupedMoEModelPhase1Test(absltest.TestCase):
         cls._set.__exit__(None, None, None)
         super().tearDownClass()
 
-    def test_forward_and_aux_match(self):
-        self.mlp.cfg = dataclasses.replace(self.cfg, moe_backend="dense")
-        yd, auxd = self.mlp(self.x)
-        self.mlp.cfg = dataclasses.replace(self.cfg, moe_backend="grouped")
-        yg, auxg = self.mlp(self.x)
+    def test_forward_matches_dense_ref(self):
+        yg, aux = self.mlp(self.x)
+        yd = _dense_moe_block_output(self.mlp, self.x)
         self.assertLess(float(jnp.max(jnp.abs(yd - yg))), FWD_TOL)
-        # aux_loss uses only routing (untouched by the backend) -> must be exact.
-        self.assertEqual(float(jnp.abs(auxd - auxg)), 0.0)
+        self.assertTrue(np.isfinite(float(aux)))
 
-    def test_backward_matches(self):
+    def test_backward_matches_dense_ref(self):
         ct = jnp.asarray(np.random.RandomState(3).randn(self.B, self.T, self.cfg.emb_dim).astype(np.float32))
         gdef, state = nnx.split(self.mlp)
 
-        def run(backend):
-            def scalar(state, xx):
-                m = nnx.merge(gdef, state)
-                m.cfg = dataclasses.replace(self.cfg, moe_backend=backend)
-                out, aux = m(xx)
-                return jnp.sum(out * ct) + aux
-            return jax.grad(scalar, argnums=(0, 1))(state, self.x)
+        def grouped(state, xx):
+            out, _ = nnx.merge(gdef, state)(xx)
+            return jnp.sum(out * ct)
 
-        gs_d, gx_d = run("dense")
-        gs_g, gx_g = run("grouped")
+        def dense(state, xx):
+            return jnp.sum(_dense_moe_block_output(nnx.merge(gdef, state), xx) * ct)
+
+        gs_g, gx_g = jax.grad(grouped, argnums=(0, 1))(state, self.x)
+        gs_d, gx_d = jax.grad(dense, argnums=(0, 1))(state, self.x)
         self.assertLess(float(jnp.max(jnp.abs(gx_d - gx_g))), BWD_TOL)
         ld = jax.tree_util.tree_leaves(nnx.to_pure_dict(gs_d))
         lg = jax.tree_util.tree_leaves(nnx.to_pure_dict(gs_g))
@@ -181,44 +215,40 @@ class GroupedMoEFlopTest(absltest.TestCase):
         grouped_flops = per_row * (k * N)
         self.assertAlmostEqual(dense_flops / grouped_flops, E / k, places=5)
 
-    def test_grouped_jaxpr_has_no_all_expert_einsum(self):
+    def test_grouped_jaxpr_uses_ragged_dot(self):
         mesh = _single_device_mesh()
         with jax.set_mesh(mesh), mesh_rules(mesh):
             cfg = dataclasses.replace(make_config("qwen3-smoke-moe"), dtype=jnp.float32)
             mlp = MoEFeedForward(cfg=cfg, rngs=nnx.Rngs(params=0))
             x = jnp.asarray(np.random.RandomState(2).randn(2, 8, cfg.emb_dim).astype(np.float32))
-            mlp.cfg = dataclasses.replace(cfg, moe_backend="grouped")
             jg = str(jax.make_jaxpr(lambda x: mlp(x)[0])(x))
-            mlp.cfg = dataclasses.replace(cfg, moe_backend="dense")
-            jd = str(jax.make_jaxpr(lambda x: mlp(x)[0])(x))
+            jd = str(jax.make_jaxpr(lambda x: _dense_moe_block_output(mlp, x))(x))
+        # Grouped uses the ragged_dot kernel; the dense reference does not.
         self.assertIn("ragged_dot", jg)
         self.assertNotIn("ragged_dot", jd)
 
 
-def _assert_backend_equiv(test, cfg_replace_fn, mlp, D, seed=1):
-    """dense vs grouped fwd/aux/bwd equivalence for any model's MoE block."""
+def _assert_backend_equiv(test, mlp, D, seed=1):
+    """Grouped MoE block vs the local dense-einsum reference (fwd + bwd), any family."""
     B, T = 2, 6
     x = jnp.asarray(np.random.RandomState(seed).randn(B, T, D).astype(np.float32))
-    mlp.cfg = cfg_replace_fn("dense")
-    yd, auxd = mlp(x)
-    mlp.cfg = cfg_replace_fn("grouped")
-    yg, auxg = mlp(x)
+    yg, aux = mlp(x)
+    yd = _dense_moe_block_output(mlp, x)
     test.assertLess(float(jnp.max(jnp.abs(yd - yg))), FWD_TOL)
-    test.assertEqual(float(jnp.abs(auxd - auxg)), 0.0)
+    test.assertTrue(np.isfinite(float(aux)))
 
     ct = jnp.asarray(np.random.RandomState(seed + 1).randn(B, T, D).astype(np.float32))
     gdef, state = nnx.split(mlp)
 
-    def run(backend):
-        def scalar(state, xx):
-            m = nnx.merge(gdef, state)
-            m.cfg = cfg_replace_fn(backend)
-            out, aux = m(xx)
-            return jnp.sum(out * ct) + aux
-        return jax.grad(scalar, argnums=(0, 1))(state, x)
+    def grouped(state, xx):
+        out, _ = nnx.merge(gdef, state)(xx)
+        return jnp.sum(out * ct)
 
-    gs_d, gx_d = run("dense")
-    gs_g, gx_g = run("grouped")
+    def dense(state, xx):
+        return jnp.sum(_dense_moe_block_output(nnx.merge(gdef, state), xx) * ct)
+
+    gs_g, gx_g = jax.grad(grouped, argnums=(0, 1))(state, x)
+    gs_d, gx_d = jax.grad(dense, argnums=(0, 1))(state, x)
     test.assertLess(float(jnp.max(jnp.abs(gx_d - gx_g))), BWD_TOL)
     for a, b in zip(
         jax.tree_util.tree_leaves(nnx.to_pure_dict(gs_d)),
@@ -238,9 +268,7 @@ class Qwen3_5SharedExpertPhase3Test(absltest.TestCase):
         with jax.set_mesh(mesh), mesh_rules(mesh):
             cfg = dataclasses.replace(make_config_5("qwen3.5-smoke").text_config, dtype=jnp.float32)
             mlp = MoE5(cfg=cfg, rngs=nnx.Rngs(params=0))
-            _assert_backend_equiv(
-                self, lambda b: dataclasses.replace(cfg, moe_backend=b), mlp, cfg.hidden_size
-            )
+            _assert_backend_equiv(self, mlp, cfg.hidden_size)
 
 
 class Qwen3VLPhase3Test(absltest.TestCase):
@@ -254,9 +282,7 @@ class Qwen3VLPhase3Test(absltest.TestCase):
         with jax.set_mesh(mesh), mesh_rules(mesh):
             cfg = dataclasses.replace(make_vl_config("qwen3-vl-smoke-moe"), dtype=jnp.float32)
             mlp = MoEVL(cfg=cfg, rngs=nnx.Rngs(params=0))
-            _assert_backend_equiv(
-                self, lambda b: dataclasses.replace(cfg, moe_backend=b), mlp, cfg.emb_dim
-            )
+            _assert_backend_equiv(self, mlp, cfg.emb_dim)
 
 
 class RaggedAllToAllRoundTripTest(absltest.TestCase):

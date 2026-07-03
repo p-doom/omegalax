@@ -15,10 +15,9 @@ Design invariants (mirrors the ``ensure_mesh`` discipline):
 * **Default OFF is a strict no-op.** With ``offload_optimizer=False`` (the
   default) nothing in this module runs and the optimizer/build path is
   byte-identical to trunk.
-* **Never silently override the user.** ``"auto"`` enables offload only on a
-  detected coherent-host platform (GH200); an explicit ``True``/``False`` is
-  always honored verbatim, even if the platform is "wrong" (e.g. forcing it on
-  A100 to exercise the mechanism).
+* **Plain on/off.** Offload is correctness-equivalent everywhere (only the
+  memory kind of a buffer changes), so it is a simple config bool -- no platform
+  auto-detection. Off-GH200 it still works but is PCIe transfer-bound.
 * **Arithmetic is untouched.** Offload only changes the *memory kind* of a
   buffer (``"device"`` vs ``"pinned_host"``); it never changes shapes, dtypes,
   layouts, or the sequence of arithmetic ops. The optimizer update is therefore
@@ -42,70 +41,11 @@ import jax
 DEVICE_MEMORY_KIND = "device"
 HOST_MEMORY_KIND = "pinned_host"
 
-# ``device_kind`` substrings that identify a Grace-Hopper (coherent host)
-# platform. GH200 reports its GPU as a Hopper "GH200"; the Grace CPU is joined
-# by NVLink-C2C, giving cache-coherent host memory that makes ``pinned_host``
-# offload cheap. We match on the GPU device_kind because that is what
-# ``jax.devices()`` exposes for the accelerator.
-_COHERENT_HOST_DEVICE_KIND_SUBSTRINGS = ("gh200", "grace hopper", "gracehopper")
-
-
-def _device_kind(device: jax.Device) -> str:
-    return str(getattr(device, "device_kind", "") or "").lower()
-
-
-def is_coherent_host_offload_platform(devices: list[jax.Device] | None = None) -> bool:
-    """Return ``True`` iff the local accelerator is a coherent-host platform.
-
-    A "coherent-host" platform is one where host (CPU) memory is cache-coherent
-    with the accelerator over a fast link (GH200 Grace + NVLink-C2C), so paging
-    optimizer state / activations to ``pinned_host`` is cheap enough to be a net
-    win. Returns ``False`` on A100/H100 (PCIe-attached, transfer-bound), on CPU
-    and on TPU (single memory kind).
-
-    This is used only to resolve the ``"auto"`` policy; an explicit ``True`` /
-    ``False`` from config is honored without consulting this helper.
-    """
-    if devices is None:
-        try:
-            devices = jax.devices()
-        except Exception:
-            return False
-    if not devices:
-        return False
-    # A GPU platform reports "gpu"/"cuda"; CPU reports "cpu"; TPU reports "tpu".
-    # Only GPU can be a coherent-host platform, and only the GH200 variant.
-    for d in devices:
-        if d.platform not in ("gpu", "cuda"):
-            return False
-        kind = _device_kind(d)
-        if not any(sub in kind for sub in _COHERENT_HOST_DEVICE_KIND_SUBSTRINGS):
-            return False
-    return True
-
-
-def resolve_offload_enabled(
-    setting: bool | str,
-    *,
-    devices: list[jax.Device] | None = None,
-) -> bool:
-    """Resolve a config offload setting (``bool`` or ``"auto"``) to a bool.
-
-    * ``True`` / ``False``  -> honored verbatim (user override is never
-      silently overridden, matching the ``ensure_mesh`` discipline).
-    * ``"auto"``            -> ``True`` only on a coherent-host platform (GH200),
-      ``False`` everywhere else (A100/H100/CPU/TPU).
-
-    Raises ``ValueError`` for any other value so a typo can't silently disable
-    (or enable) offload.
-    """
+def resolve_offload_enabled(setting: bool) -> bool:
+    """Resolve the config offload setting (a plain on/off bool)."""
     if isinstance(setting, bool):
         return setting
-    if isinstance(setting, str) and setting.lower() == "auto":
-        return is_coherent_host_offload_platform(devices)
-    raise ValueError(
-        f"offload setting must be a bool or 'auto', got {setting!r}."
-    )
+    raise ValueError(f"offload_optimizer must be a bool, got {setting!r}.")
 
 
 def _to_memory_kind(x, memory_kind: str):

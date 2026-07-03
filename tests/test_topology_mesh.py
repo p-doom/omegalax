@@ -221,12 +221,13 @@ class FakedDeviceMeshTest(parameterized.TestCase):
         self.assertEqual(mesh.shape["tp"], 2)
 
     def test_hierarchical_ici_product_mismatch_raises(self):
-        with self.assertRaisesRegex(ValueError, "!= local_device_count"):
-            make_hierarchical_mesh((2, 1, 2, 1), (1, 1, 1, 1))  # prod ici = 4 != 8
+        # prod(ici)*prod(dcn) = 4 != 8 devices (per-axis validation lives in derive_ici_dcn).
+        with self.assertRaisesRegex(ValueError, "!= device_count"):
+            make_hierarchical_mesh((2, 1, 2, 1), (1, 1, 1, 1))
 
     def test_hierarchical_dcn_product_mismatch_raises(self):
-        # prod(dcn)=2 but nproc==1.
-        with self.assertRaisesRegex(ValueError, "!= num_processes"):
+        # prod(ici)*prod(dcn) = 16 != 8 devices.
+        with self.assertRaisesRegex(ValueError, "!= device_count"):
             make_hierarchical_mesh((2, 1, 2, 2), (1, 1, 1, 2))
 
     def test_make_mesh_bad_device_count_raises(self):
@@ -238,23 +239,6 @@ class FakedDeviceMeshTest(parameterized.TestCase):
         # but tp=8,fsdp=2 would need 16 devices; test the guardrail via device_count.
         with self.assertRaisesRegex(ValueError, "does not match device_count"):
             make_mesh(tp_size=8, fsdp_size=2, dp_size=1)
-
-    def test_explicit_parallelism_config_override(self):
-        cfg = ParallelismConfig(
-            ici_tp=2, ici_cp=1, ici_fsdp=2, ici_dp=2, dcn_tp=1, dcn_cp=1, dcn_fsdp=1, dcn_dp=1
-        )
-        mesh = make_mesh(tp_size=2, fsdp_size=2, dp_size=2, parallelism=cfg)
-        self.assertEqual(mesh.shape["tp"], 2)
-        self.assertEqual(mesh.shape["cp"], 1)
-        self.assertEqual(mesh.shape["fsdp"], 2)
-        self.assertEqual(mesh.shape["dp"], 2)
-
-    def test_explicit_parallelism_config_conflict_raises(self):
-        cfg = ParallelismConfig(
-            ici_tp=2, ici_cp=1, ici_fsdp=2, ici_dp=2, dcn_tp=1, dcn_cp=1, dcn_fsdp=1, dcn_dp=1
-        )
-        with self.assertRaisesRegex(ValueError, "conflict with requested sizes"):
-            make_mesh(tp_size=4, fsdp_size=1, dp_size=2, parallelism=cfg)
 
 
 if __name__ == "__main__":

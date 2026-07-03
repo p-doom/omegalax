@@ -108,82 +108,26 @@ class MoEFeedForward(nnx.Module):
         gate_proj_EDF = jnp.astype(self.gate_proj[...], hidden_BTD.dtype)
         up_proj_EDF = jnp.astype(self.up_proj[...], hidden_BTD.dtype)
         down_proj_EFD = jnp.astype(self.down_proj[...], hidden_BTD.dtype)
-        batch_axis = self.shd_cfg.act_btd[0]
-        hidden_axis = self.shd_cfg.act_btd[2]
-        ff_axis = self.shd_cfg.act_btf[2]
         B, T = hidden_BTD.shape[:2]
 
-        if cfg.moe_backend == "dense":
-            dense_hidden_BTD = reshard(hidden_BTD, P(self.shd_cfg.act_btd[0], None, None))
-            ff_sharding = P(batch_axis, None, None, ff_axis)
-            hidden_sharding = P(batch_axis, None, None, hidden_axis)
-            gate_BTEF = jnp.einsum(
-                "BTD,EDF->BTEF",
-                dense_hidden_BTD,
-                gate_proj_EDF,
-                out_sharding=ff_sharding,
-            )
-            up_BTEF = jnp.einsum(
-                "BTD,EDF->BTEF",
-                dense_hidden_BTD,
-                up_proj_EDF,
-                out_sharding=ff_sharding,
-            )
-            # Per-expert LoRA on gate/up (added inside the expert map, before the
-            # nonlinearity and top-k gather). No-op when adapters are unattached.
-            if self.gate_proj_lora is not None:
-                gate_BTEF += self.gate_proj_lora.delta_shared(
-                    dense_hidden_BTD, out_sharding=ff_sharding
-                )
-            if self.up_proj_lora is not None:
-                up_BTEF += self.up_proj_lora.delta_shared(
-                    dense_hidden_BTD, out_sharding=ff_sharding
-                )
-            expert_hidden_BTEF = nnx.silu(gate_BTEF) * up_BTEF
-            expert_out_BTED = jnp.einsum(
-                "BTEF,EFD->BTED",
-                expert_hidden_BTEF,
-                down_proj_EFD,
-                out_sharding=hidden_sharding,
-            )
-            if self.down_proj_lora is not None:
-                expert_out_BTED += self.down_proj_lora.delta_per_expert(
-                    expert_hidden_BTEF, out_sharding=hidden_sharding
-                )
-
-            flat_out = jax.lax.reshape(
-                expert_out_BTED,
-                (B * T, cfg.num_experts, cfg.emb_dim),
-                out_sharding=P(batch_axis, None, hidden_axis),
-            )
-            flat_idx = topk_idx_BTk.reshape(B * T, cfg.num_experts_per_tok)
-            gathered = jnp.take_along_axis(flat_out, flat_idx[..., None], axis=1)
-            gathered = jax.lax.reshape(
-                gathered,
-                (B, T, cfg.num_experts_per_tok, cfg.emb_dim),
-                out_sharding=P(batch_axis, None, None, hidden_axis),
-            )
-            merged_BTD = jnp.sum(gathered * topk_weights_BTk[..., None], axis=-2)
-            merged_BTD = reshard(merged_BTD, self.shd_cfg.act_btd)
-        else:
-            # Dropless grouped-GEMM path (EP=1 or EP via ragged all-to-all).
-            flat_hidden_ND = hidden_BTD.reshape(B * T, cfg.emb_dim)
-            flat_idx_Nk = topk_idx_BTk.reshape(B * T, cfg.num_experts_per_tok)
-            flat_w_Nk = topk_weights_BTk.reshape(B * T, cfg.num_experts_per_tok)
-            moe_fn = grouped_moe_ep if cfg.moe_backend == "grouped_ep" else grouped_moe
-            merged_ND = moe_fn(
-                flat_hidden_ND,
-                flat_idx_Nk,
-                flat_w_Nk,
-                gate_proj_EDF,
-                up_proj_EDF,
-                down_proj_EFD,
-                num_experts=cfg.num_experts,
-                gate_lora=self.gate_proj_lora,
-                up_lora=self.up_proj_lora,
-                down_lora=self.down_proj_lora,
-            )
-            merged_BTD = reshard(merged_ND.reshape(B, T, cfg.emb_dim), self.shd_cfg.act_btd)
+        # Dropless grouped-GEMM MoE (EP=1, or EP via ragged all-to-all).
+        flat_hidden_ND = hidden_BTD.reshape(B * T, cfg.emb_dim)
+        flat_idx_Nk = topk_idx_BTk.reshape(B * T, cfg.num_experts_per_tok)
+        flat_w_Nk = topk_weights_BTk.reshape(B * T, cfg.num_experts_per_tok)
+        moe_fn = grouped_moe_ep if cfg.moe_backend == "grouped_ep" else grouped_moe
+        merged_ND = moe_fn(
+            flat_hidden_ND,
+            flat_idx_Nk,
+            flat_w_Nk,
+            gate_proj_EDF,
+            up_proj_EDF,
+            down_proj_EFD,
+            num_experts=cfg.num_experts,
+            gate_lora=self.gate_proj_lora,
+            up_lora=self.up_proj_lora,
+            down_lora=self.down_proj_lora,
+        )
+        merged_BTD = reshard(merged_ND.reshape(B, T, cfg.emb_dim), self.shd_cfg.act_btd)
 
         expert_mask_BTkE = jax.nn.one_hot(topk_idx_BTk, cfg.num_experts, dtype=probs_BTE.dtype)
         tokens_per_expert = jnp.mean(expert_mask_BTkE, axis=(0, 1))
@@ -281,7 +225,7 @@ class Qwen3(nnx.Module):
         # homogeneous layer stacks. Decode (cache is not None) and heterogeneous
         # (mixed dense/MoE) stacks stay on the unrolled loop below. ``position_ids``
         # (used only for zig-zag CP) is broadcast to every layer.
-        if cache is None and self.cfg.scan_layers and self.cfg.is_homogeneous:
+        if cache is None and self.cfg.is_homogeneous:
             hidden_BTD, total_aux = _scan_layers(
                 list(self.layers), hidden_BTD, segment_ids_BT, position_ids_BT
             )

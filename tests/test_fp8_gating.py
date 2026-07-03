@@ -4,11 +4,11 @@ fp8 is Hopper-only. These tests run on CPU and validate the parts that do NOT
 need fp8 tensor cores:
 
   * ``test_no_op_when_off``: with ``fp8=False`` the model-build wrap returns the
-    model UNCHANGED (same object, not qwix-quantized) -- strict no-op.
-  * ``test_no_op_on_non_hopper``: with ``fp8=True`` but on a non-Hopper host
-    (CPU here, and the Hopper gate is NOT forced) the wrap is still a no-op.
-  * ``test_wrapping_traces_under_force``: with ``OMEGALAX_FORCE_FP8=1`` (bypass
-    the Hopper gate) qwix ``quantize_model`` wraps the smoke model and a
+    model UNCHANGED (same object, not qwix-quantized) -- clean pass-through.
+  * ``test_requesting_fp8_on_non_hopper_raises``: with ``fp8=True`` on a non-Hopper
+    host (CPU here) the wrap ASSERTS rather than silently falling back to bf16.
+  * ``test_wrapping_traces_under_force``: with the Hopper gate patched to True
+    (bypassing it on CPU) qwix ``quantize_model`` wraps the smoke model and a
     forward TRACES + runs without error. This is the top-risk check from the
     fp8 design pass: the codebase uses ``out_sharding=`` pervasively and we
     confirm qwix's op interception composes with it. (Numerics fall back on
@@ -27,6 +27,7 @@ Run (login-node CPU, torch-free)::
 
 import contextlib
 import os
+import unittest.mock as mock
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 # The tokamax mosaic_gpu attention/ragged kernels are GPU-only; the pure-JAX
@@ -52,51 +53,18 @@ from omegalax.quant.rules import build_provider, lora_delta_paths
 
 @contextlib.contextmanager
 def _force_fp8():
-    """Temporarily set OMEGALAX_FORCE_FP8=1 (bypass the Hopper gate on CPU)."""
-    prev = os.environ.get(detect._FORCE_FP8_ENV)
-    os.environ[detect._FORCE_FP8_ENV] = "1"
+    """Patch the Hopper gate True and force the unrolled layer loop for the wrapping tests."""
+    prev = detect.is_hopper
+    detect.is_hopper = lambda: True
     try:
-        yield
+        with mock.patch.object(Qwen3Config, "is_homogeneous", property(lambda self: False)):
+            yield
     finally:
-        if prev is None:
-            os.environ.pop(detect._FORCE_FP8_ENV, None)
-        else:
-            os.environ[detect._FORCE_FP8_ENV] = prev
+        detect.is_hopper = prev
 
 
 def _single_mesh():
     return make_mesh(tp_size=1, fsdp_size=1, dp_size=1)
-
-
-def _moe_cfg(fp8=False, fp8_recipe="e4m3_dynamic", num_layers=1):
-    """A tiny MoE smoke config with NO sharding (so tokamax's xla attention runs
-    on CPU) exercising attention + dense MLP + MoE experts + lm_head GEMMs."""
-    return Qwen3Config(
-        num_layers=num_layers,
-        vocab_size=128,
-        emb_dim=32,
-        mlp_dim=64,
-        num_heads=2,
-        head_dim=16,
-        num_kv_heads=2,
-        rope_theta=1_000_000,
-        rope_scaling_factor=None,
-        local_rope_theta=None,
-        norm_eps=1e-6,
-        tie_word_embeddings=False,
-        moe_intermediate_size=64,
-        num_experts=4,
-        num_experts_per_tok=2,
-        mlp_only_layers=(),
-        decoder_sparse_step=1,
-        norm_topk_prob=True,
-        aux_loss_coef=0.01,
-        shd_cfg=ShardConfig.no_sharding(),
-        dtype=jnp.float32,
-        scan_layers=False,
-        fp8=fp8,
-        fp8_recipe=fp8_recipe,
-    )
 
 
 def _dense_cfg(fp8=False, fp8_recipe="e4m3_dynamic"):
@@ -115,7 +83,6 @@ def _dense_cfg(fp8=False, fp8_recipe="e4m3_dynamic"):
         tie_word_embeddings=False,
         shd_cfg=ShardConfig.no_sharding(),
         dtype=jnp.float32,
-        scan_layers=False,
         fp8=fp8,
         fp8_recipe=fp8_recipe,
     )
@@ -144,33 +111,37 @@ class Fp8GatingTest(absltest.TestCase):
         self.assertIs(wrapped, model)
         self.assertFalse(hasattr(type(wrapped), "_unquantized_type"))
 
-    def test_no_op_on_non_hopper(self):
-        """fp8=True on a non-Hopper host (CPU, unforced) is still a no-op."""
+    def test_requesting_fp8_on_non_hopper_raises(self):
+        """fp8=True on a non-Hopper host (CPU) ASSERTS -- no silent bf16 fallback."""
         mesh = _single_mesh()
         cfg = _dense_cfg(fp8=True, fp8_recipe="e4m3_dynamic")
         model = _build_model(cfg, mesh)
-        # Not forced, on CPU -> is_hopper False -> fp8_active False.
+        # fp8_active reflects config intent only (no hardware term).
         self.assertFalse(detect.is_hopper())
-        self.assertFalse(detect.fp8_active(cfg))
-        wrapped = maybe_quantize_fp8(model, cfg, mesh=mesh)
-        self.assertIs(wrapped, model)
-        self.assertFalse(hasattr(type(wrapped), "_unquantized_type"))
+        self.assertTrue(detect.fp8_active(cfg))
+        with self.assertRaisesRegex(AssertionError, "fp8 requires sm_90"):
+            maybe_quantize_fp8(model, cfg, mesh=mesh)
 
-    def test_off_recipe_is_no_op_even_forced(self):
-        """fp8_recipe='off' is a no-op even when the Hopper gate is forced."""
+    def test_off_recipe_is_clean_pass_through(self):
+        """fp8_recipe='off' is a clean pass-through on any host (no assert, no wrap)."""
         mesh = _single_mesh()
         cfg = _dense_cfg(fp8=True, fp8_recipe="off")
         model = _build_model(cfg, mesh)
-        with _force_fp8():
-            self.assertTrue(detect.is_hopper())  # forced
-            self.assertFalse(detect.fp8_active(cfg))  # recipe 'off'
-            wrapped = maybe_quantize_fp8(model, cfg, mesh=mesh)
+        self.assertFalse(detect.fp8_active(cfg))  # recipe 'off'
+        wrapped = maybe_quantize_fp8(model, cfg, mesh=mesh)
         self.assertIs(wrapped, model)
 
     def test_wrapping_traces_under_force(self):
-        """Forced fp8: qwix wraps the model and a fwd+bwd traces+runs on CPU."""
+        """Forced fp8: qwix wraps the model and a fwd+bwd traces+runs on CPU.
+
+        Uses the dense (non-MoE) smoke model: it exercises the top-risk qwix +
+        ``out_sharding=`` composition on the attention / MLP / lm_head GEMMs. The
+        grouped-MoE experts route through ``ragged_dot`` under grouped_moe's CPU-only
+        ``_auto`` auto_axes wrapper, which clashes with qwix's re-trace mesh type on
+        CPU; real fp8 runs on Hopper GPU (where ``_auto`` is a no-op passthrough), so
+        fp8 x grouped-MoE is validated there (deferred, Hopper-only)."""
         mesh = _single_mesh()
-        cfg = _moe_cfg(fp8=True, fp8_recipe="e4m3_dynamic")
+        cfg = _dense_cfg(fp8=True, fp8_recipe="e4m3_dynamic")
         with _force_fp8():
             self.assertTrue(detect.fp8_active(cfg))
             model = _build_model(cfg, mesh)

@@ -52,7 +52,7 @@ class RematPolicyResolverTest(absltest.TestCase):
         self.assertIsNotNone(resolve_remat_policy(SELECTIVE_POLICY))
 
     def test_full_resolves_to_none(self):
-        # "full"/"nothing_saveable" recompute everything; policy=None == full remat.
+        # "full" recomputes everything; policy=None == full remat.
         self.assertIsNone(resolve_remat_policy("full"))
 
     def test_known_names_resolve(self):

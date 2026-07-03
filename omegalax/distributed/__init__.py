@@ -1,12 +1,5 @@
 """Distributed runtime helpers."""
 
-from .launch import (
-    LaunchInfo,
-    LaunchMode,
-    detect_mode,
-    init_distributed,
-    parse_nodelist_first_host,
-)
 from .mesh import (
     ParallelismConfig,
     derive_ici_dcn,
@@ -16,16 +9,23 @@ from .mesh import (
     make_mesh,
     set_default_mesh,
 )
-from .xla_flags import build_gpu_xla_flags, configure_gpu_xla_flags
+from .xla_flags import configure_gpu_xla_flags
+
+
+def init_distributed():
+    """Init JAX distributed for one-process-per-GPU launches (the multi-node convention)."""
+    import jax
+
+    jax.distributed.initialize()
+    assert jax.local_device_count() == 1, (
+        f"launch one process per GPU; this process sees {jax.local_device_count()} "
+        "local devices -- use srun --ntasks-per-node=<gpus_per_node>"
+    )
+
 
 __all__ = [
-    "build_gpu_xla_flags",
     "configure_gpu_xla_flags",
-    "detect_mode",
     "init_distributed",
-    "LaunchInfo",
-    "LaunchMode",
-    "parse_nodelist_first_host",
     "ParallelismConfig",
     "derive_ici_dcn",
     "ensure_mesh",

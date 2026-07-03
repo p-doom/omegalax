@@ -57,13 +57,11 @@ class Qwen3VLConfig:
     mlp_only_layers: tuple[int, ...] = dataclasses.field(default_factory=tuple)
     decoder_sparse_step: int = 1
     norm_topk_prob: bool = True
-    # MoE compute backend: "dense" (reference einsum) or "grouped"/"grouped_ep".
-    moe_backend: str = "dense"
+    # MoE compute backend: "grouped" (dropless grouped-GEMM) or "grouped_ep"
+    # (adds expert parallelism via ragged all-to-all).
+    moe_backend: str = "grouped"
     # Activation checkpointing policy for text decoder layers (see remat_policy.py).
     remat_policy: str = DEFAULT_REMAT_POLICY
-    # Stack homogeneous text-decoder layers and run them with ``nnx.scan``.
-    # Falls back to the unrolled loop for heterogeneous (mixed dense/MoE) stacks.
-    scan_layers: bool = True
     # fp8 training (Hopper-only; strict no-op on A100/CPU). ``fp8`` is the master
     # gate (default off); ``fp8_recipe`` selects the qwix recipe ("off",
     # "e4m3_dynamic", "blockwise_128"). See ``omegalax.quant.detect.fp8_active``.

@@ -33,7 +33,7 @@ Assumptions (asserted / documented below):
   launched one-process-per-GPU, ``local_device_count == 1`` and the ICI domain
   collapses; :func:`make_hierarchical_mesh` warns in that case.
 * ``process_is_granule=True`` is **mandatory** on this GPU cluster: we launch
-  via :func:`omegalax.distributed.launch.init_distributed`, which for the
+  via :func:`omegalax.distributed.init_distributed`, which for the
   multi-node path calls ``jax.distributed.initialize()`` without a partition
   index, so every device reports a uniform ``slice_index`` and the slice-based
   granule detection would collapse to a single granule.
@@ -317,17 +317,8 @@ def make_hierarchical_mesh(ici_shape: Sequence[int], dcn_shape: Sequence[int]) -
     ici_prod = math.prod(ici_shape)
     dcn_prod = math.prod(dcn_shape)
 
-    # Validation: ICI tiles one node, DCN tiles the nodes, total tiles all devices.
-    if ici_prod != ldc:
-        raise ValueError(
-            f"prod(ici_shape)={ici_prod} (ici_shape={ici_shape}) != local_device_count={ldc}. "
-            "The ICI axes must exactly fill one NVLink domain (GPUs per node)."
-        )
-    if dcn_prod != nproc:
-        raise ValueError(
-            f"prod(dcn_shape)={dcn_prod} (dcn_shape={dcn_shape}) != num_processes={nproc}. "
-            "The DCN axes must exactly tile the process (node) count."
-        )
+    # ICI/DCN per-axis validation lives in derive_ici_dcn (the sole caller); here we
+    # only guard that the shapes tile all devices.
     if ici_prod * dcn_prod != len(devices):
         raise ValueError(
             f"prod(ici_shape)*prod(dcn_shape)={ici_prod * dcn_prod} != device_count="
@@ -392,41 +383,24 @@ def make_mesh(
     dp_size: int,
     *,
     cp_size: int = 1,
-    parallelism: ParallelismConfig | None = None,
 ) -> Mesh:
     """Build a topology-aware ``('tp', 'cp', 'fsdp', 'dp')`` mesh.
 
-    Public interface: given (tp, fsdp, dp) sizes plus an optional ``cp_size``
-    (context parallelism, default 1 == no-op), the ICI/DCN split is derived via
-    :func:`derive_ici_dcn` and materialized with :func:`make_hierarchical_mesh`.
-    Callers may optionally pass an explicit :class:`ParallelismConfig` via
-    ``parallelism`` to override the split; when given, its per-type products must
-    match the four sizes.
+    Given (tp, fsdp, dp) sizes plus an optional ``cp_size`` (context parallelism,
+    default 1 == no-op), the ICI/DCN split is derived via :func:`derive_ici_dcn`
+    and materialized with :func:`make_hierarchical_mesh`.
     """
     tp, cp, fsdp, dp = _resolve_mesh_shape(
         tp_size=tp_size, cp_size=cp_size, fsdp_size=fsdp_size, dp_size=dp_size
     )
-    if parallelism is None:
-        parallelism = derive_ici_dcn(
-            tp_size=tp,
-            cp_size=cp,
-            fsdp_size=fsdp,
-            dp_size=dp,
-            local_device_count=local_device_count(),
-            num_processes=num_processes(),
-        )
-    elif (parallelism.tp_size, parallelism.cp_size, parallelism.fsdp_size, parallelism.dp_size) != (
-        tp,
-        cp,
-        fsdp,
-        dp,
-    ):
-        raise ValueError(
-            f"Explicit ParallelismConfig per-type products "
-            f"(tp={parallelism.tp_size}, cp={parallelism.cp_size}, "
-            f"fsdp={parallelism.fsdp_size}, dp={parallelism.dp_size}) "
-            f"conflict with requested sizes (tp={tp}, cp={cp}, fsdp={fsdp}, dp={dp})."
-        )
+    parallelism = derive_ici_dcn(
+        tp_size=tp,
+        cp_size=cp,
+        fsdp_size=fsdp,
+        dp_size=dp,
+        local_device_count=local_device_count(),
+        num_processes=num_processes(),
+    )
     return make_hierarchical_mesh(parallelism.ici_shape, parallelism.dcn_shape)
 
 
@@ -436,15 +410,8 @@ def set_default_mesh(
     dp_size: int,
     *,
     cp_size: int = 1,
-    parallelism: ParallelismConfig | None = None,
 ) -> Mesh:
-    mesh = make_mesh(
-        tp_size=tp_size,
-        fsdp_size=fsdp_size,
-        dp_size=dp_size,
-        cp_size=cp_size,
-        parallelism=parallelism,
-    )
+    mesh = make_mesh(tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size, cp_size=cp_size)
     jax.set_mesh(mesh)
     return mesh
 
@@ -455,7 +422,6 @@ def ensure_mesh(
     dp_size: int | None = None,
     *,
     cp_size: int = 1,
-    parallelism: ParallelismConfig | None = None,
 ) -> Mesh:
     current_mesh = get_mesh()
     abstract_mesh = get_abstract_mesh()
@@ -503,9 +469,7 @@ def ensure_mesh(
             "Refusing to override active mesh."
         )
 
-    return set_default_mesh(
-        tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size, cp_size=cp_size, parallelism=parallelism
-    )
+    return set_default_mesh(tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size, cp_size=cp_size)
 
 
 @contextmanager
@@ -515,32 +479,10 @@ def mesh_rules(mesh: Mesh) -> Iterator[Mesh]:
         yield mesh
 
 
-# --- Expert parallelism (MoE grouped-GEMM + ragged all-to-all) ---------------
 # Dedicated 1-D ``('expert',)`` mesh for the expert-parallel MoE path (consumed by
-# omegalax.models.moe_grouped.grouped_moe_ep), deliberately SEPARATE from the flat
-# ``('tp', 'cp', 'fsdp', 'dp')`` hierarchical training mesh built above.
-#
-# MERGE RECONCILIATION (feat/moe-ep-grouped-gemm x feat/topology-aware-mesh x
-# feat/context-parallelism):
-# The moe-ep branch's original MERGE NOTE suggested folding ``'expert'`` into the
-# unified mesh factory / axis rules. That fold is STILL deliberately NOT done,
-# and the reasoning is unchanged by adding ``'cp'``:
-#   * The topology-aware factory (make_mesh/make_hierarchical_mesh) is a fixed
-#     ``_AXES = ('tp','cp','fsdp','dp')`` design whose ICI/DCN invariants
-#     (ici_tp*ici_cp*ici_fsdp*ici_dp == local_device_count, the ensure_mesh _AXES
-#     equality check, and all of test_topology_mesh) assume exactly those axes.
-#     ``'cp'`` was added here because context parallelism COMPOSES with tp/fsdp/dp
-#     inside a single training forward pass (the per-layer CP all-gather-KV rides
-#     the same mesh as the TP collective). ``'expert'`` does NOT compose that way:
-#   * grouped_moe_ep does not COMPOSE expert parallelism with the training mesh:
-#     it reads a standalone ``'expert'`` axis off the active abstract mesh and runs
-#     its own shard_map. No caller in-tree wires EP into the (tp,cp,fsdp,dp) mesh.
-# So ``make_expert_mesh`` is kept as a separate helper, made CONSISTENT with the
-# hierarchical factory: it builds its device grid via ``mesh_utils.create_device_mesh``
-# (same primitive make_hierarchical_mesh uses) and stamps ``AxisType.Explicit``
-# (matching _AXES's axis types) rather than hand-rolling a numpy reshape + bare Mesh.
-# A future unified expert+training mesh (composing 'expert' onto the ICI domain
-# alongside 'tp'/'cp') is left for later, when a caller actually needs the composition.
+# grouped_moe_ep), deliberately SEPARATE from the ``('tp','cp','fsdp','dp')`` training
+# mesh: grouped_moe_ep reads a standalone ``'expert'`` axis and runs its own shard_map;
+# no caller composes EP with the training mesh.
 _EXPERT_AXIS = "expert"
 
 

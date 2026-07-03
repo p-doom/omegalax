@@ -1,8 +1,8 @@
 """Resolver mapping remat-policy names to ``jax.checkpoint_policies`` policies.
 
 Activation checkpointing (rematerialization) trades memory for recompute in the
-backward pass. Full remat (``"full"`` / ``"nothing_saveable"``) saves nothing and
-recomputes the entire layer -- minimal memory, maximal recompute FLOPs. A
+backward pass. Full remat (``"full"``) saves nothing and recomputes the entire
+layer -- minimal memory, maximal recompute FLOPs. A
 *selective* policy instead saves expensive intermediates (matmul / ``dot_general``
 outputs) and recomputes only the cheap ops, usually a net throughput win.
 
@@ -80,16 +80,11 @@ def _offload_named_policy():
 _POLICY_FACTORIES: dict[str, Callable[[], object | None]] = {
     # Full remat: recompute the entire layer, save nothing. Minimal memory.
     "full": lambda: None,
-    "nothing_saveable": lambda: jax.checkpoint_policies.nothing_saveable,
     # Selective: save matmul / dot_general outputs, recompute cheap ops.
     "dots_saveable": lambda: jax.checkpoint_policies.dots_saveable,
-    "checkpoint_dots": lambda: jax.checkpoint_policies.dots_saveable,
     # Selective, more aggressive: only save dots whose operands have no batch
     # dims (contraction-heavy matmuls), recompute batched dots too.
     "dots_with_no_batch_dims_saveable": (
-        lambda: jax.checkpoint_policies.dots_with_no_batch_dims_saveable
-    ),
-    "checkpoint_dots_with_no_batch_dims": (
         lambda: jax.checkpoint_policies.dots_with_no_batch_dims_saveable
     ),
     # No remat: save every intermediate. Maximal memory, zero recompute.
@@ -97,8 +92,6 @@ _POLICY_FACTORIES: dict[str, Callable[[], object | None]] = {
     # --- Offload policies (activations -> host memory) -----------------------
     # Offload no-batch-dim dot outputs to host instead of recomputing them.
     "offload_dot": _offload_dot_policy,
-    "offload": _offload_dot_policy,  # alias (back-compat)
-    "offload_dots": _offload_dot_policy,  # alias (back-compat)
     # Offload the ``checkpoint_name``-tagged residual stream to host. Requires
     # the layer to tag its residual via :func:`tag_offload_residual`.
     "offload_named": _offload_named_policy,
@@ -137,9 +130,8 @@ def available_remat_policies() -> tuple[str, ...]:
 def resolve_remat_policy(name: str | None):
     """Resolve a policy name to a ``jax`` remat policy object.
 
-    Returns ``None`` for ``"full"`` / ``"nothing_saveable"`` semantics of
-    recomputing everything (``jax.remat`` with ``policy=None`` is classic full
-    remat). Any other name maps to a selective / offload policy callable.
+    Returns ``None`` for ``"full"`` (``jax.remat`` with ``policy=None`` is classic
+    full remat). Any other name maps to a selective / offload policy callable.
 
     Raises ``ValueError`` for unknown names.
     """

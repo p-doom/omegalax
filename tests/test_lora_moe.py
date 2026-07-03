@@ -17,7 +17,9 @@ Linear. Validate:
 
 from __future__ import annotations
 
+import contextlib
 import os
+import unittest.mock as mock
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
@@ -27,6 +29,15 @@ import jax.numpy as jnp
 from flax import nnx
 import numpy as np
 import optax
+
+
+@contextlib.contextmanager
+def _force_unrolled_qwen3():
+    """Force the qwen3 unrolled layer loop (the scan_layers opt-out was removed)."""
+    from omegalax.models.qwen3.config import Qwen3Config
+
+    with mock.patch.object(Qwen3Config, "is_homogeneous", property(lambda self: False)):
+        yield
 
 from omegalax.trainers.lora import (
     LoRAParam,
@@ -300,19 +311,57 @@ class LoRAMoETest(absltest.TestCase):
                 )
 
 
+def _dense_moe_call(self, hidden_BTD):
+    """Dense compute-every-expert reference for the qwen3 MoEFeedForward block
+    (the deleted moe_backend='dense' path, relocated here). Patched onto
+    ``MoEFeedForward.__call__`` for the reference run; includes per-expert LoRA."""
+    cfg = self.cfg
+    B, T = hidden_BTD.shape[:2]
+    probs = jax.nn.softmax(self.router(hidden_BTD).astype(jnp.float32), axis=-1)
+    w, idx = jax.lax.top_k(probs, cfg.num_experts_per_tok)
+    if cfg.norm_topk_prob:
+        w = w / jnp.clip(jnp.sum(w, -1, keepdims=True), min=1e-9)
+    w = w.astype(probs.dtype)
+    gate = self.gate_proj[...].astype(hidden_BTD.dtype)
+    up = self.up_proj[...].astype(hidden_BTD.dtype)
+    down = self.down_proj[...].astype(hidden_BTD.dtype)
+    gate_BTEF = jnp.einsum("BTD,EDF->BTEF", hidden_BTD, gate)
+    up_BTEF = jnp.einsum("BTD,EDF->BTEF", hidden_BTD, up)
+    if self.gate_proj_lora is not None:
+        gate_BTEF = gate_BTEF + self.gate_proj_lora.delta_shared(hidden_BTD)
+    if self.up_proj_lora is not None:
+        up_BTEF = up_BTEF + self.up_proj_lora.delta_shared(hidden_BTD)
+    h = nnx.silu(gate_BTEF) * up_BTEF
+    out_BTED = jnp.einsum("BTEF,EFD->BTED", h, down)
+    if self.down_proj_lora is not None:
+        out_BTED = out_BTED + self.down_proj_lora.delta_per_expert(h)
+    flat = out_BTED.reshape(B * T, cfg.num_experts, cfg.emb_dim)
+    fidx = idx.reshape(B * T, cfg.num_experts_per_tok)
+    gathered = jnp.take_along_axis(flat, fidx[..., None], axis=1).reshape(
+        B, T, cfg.num_experts_per_tok, cfg.emb_dim
+    )
+    merged = jnp.sum(gathered * w[..., None], axis=-2)
+    mask = jax.nn.one_hot(idx, cfg.num_experts, dtype=probs.dtype)
+    aux = (
+        cfg.aux_loss_coef
+        * jnp.sum(jnp.mean(mask, axis=(0, 1)) * jnp.mean(probs, axis=(0, 1))[None, :])
+        * cfg.num_experts
+    )
+    return merged, aux
+
+
 class LoRAGroupedVsDenseTest(absltest.TestCase):
-    """LoRA-on-grouped-experts equivalence: with the SAME injected adapters and
-    weights, the grouped-GEMM MoE path (moe_backend="grouped") must produce the
-    same forward output and the same per-expert LoRA gradients as the dense
-    einsum path (moe_backend="dense"), up to fp reduction order. Also checks that
-    the grouped-path expert-adapter grads are finite/nonzero and that the base
-    grouped expert weights stay frozen under wrt=LoRAParam.
+    """LoRA-on-grouped-experts equivalence: the grouped-GEMM MoE path must produce
+    the same forward output and per-expert LoRA gradients as a local dense-einsum
+    reference (``_dense_moe_call`` patched onto the block), up to fp reduction
+    order. Also checks the grouped adapter grads are finite/nonzero and the base
+    expert weights stay frozen under wrt=LoRAParam.
 
     Uses the real qwen3 MoE model under a 1x1x1 mesh (the grouped path needs an
     active mesh for its ragged-GEMM sharding machinery).
     """
 
-    def _cfg(self, backend):
+    def _cfg(self):
         import jax.numpy as jnp
 
         from omegalax.models.qwen3.config import Qwen3Config
@@ -340,69 +389,66 @@ class LoRAGroupedVsDenseTest(absltest.TestCase):
             aux_loss_coef=0.01,
             shd_cfg=ShardConfig.no_sharding(),
             dtype=jnp.float32,
-            scan_layers=False,
-            moe_backend=backend,
         )
 
-    def _build_pair(self):
-        """Dense + grouped qwen3 sharing identical weights AND identical injected
-        LoRA adapters (with a nonzero B so the delta actually fires)."""
+    def _build_model(self):
+        """Grouped qwen3 with injected LoRA (nonzero B so the delta actually fires)."""
         from flax import nnx
 
         from omegalax.models.qwen3.model import Qwen3
         from omegalax.models.sharding_runtime import set_attn_backend
 
-        m_dense = Qwen3(self._cfg("dense"), rngs=nnx.Rngs(0))
-        inject_lora(m_dense, r=8, alpha=16, rngs=nnx.Rngs(1), dtype=jnp.float32)
-        # Perturb every adapter B away from zero so LoRA is non-trivial.
-        for _, mod in nnx.iter_modules(m_dense):
+        m = Qwen3(self._cfg(), rngs=nnx.Rngs(0))
+        inject_lora(m, r=8, alpha=16, rngs=nnx.Rngs(1), dtype=jnp.float32)
+        for _, mod in nnx.iter_modules(m):
             if isinstance(mod, LoRAMoEExperts):
                 mod.lora_B[...] = (
-                    jax.random.normal(jax.random.key(7), mod.lora_B[...].shape, jnp.float32)
-                    * 0.1
+                    jax.random.normal(jax.random.key(7), mod.lora_B[...].shape, jnp.float32) * 0.1
                 )
-        # Grouped model gets dense's exact weights + adapters.
-        m_grp = Qwen3(self._cfg("grouped"), rngs=nnx.Rngs(0))
-        inject_lora(m_grp, r=8, alpha=16, rngs=nnx.Rngs(1), dtype=jnp.float32)
-        grp_graphdef, _ = nnx.split(m_grp)
-        _, dense_state = nnx.split(m_dense)
-        m_grp = nnx.merge(grp_graphdef, dense_state)
-
-        set_attn_backend(m_dense, text_backend="xla")
-        set_attn_backend(m_grp, text_backend="xla")
-        return m_dense, m_grp
+        set_attn_backend(m, text_backend="xla")
+        return m
 
     def test_grouped_matches_dense_fwd_bwd(self):
         from flax import nnx
 
         from omegalax.distributed.mesh import make_mesh, mesh_rules
+        from omegalax.models.qwen3.model import MoEFeedForward
 
-        with mesh_rules(make_mesh(tp_size=1, fsdp_size=1, dp_size=1)):
-            m_dense, m_grp = self._build_pair()
+        with _force_unrolled_qwen3(), mesh_rules(make_mesh(tp_size=1, fsdp_size=1, dp_size=1)):
+            m = self._build_model()
 
             rng = np.random.RandomState(0)
             tok = jnp.asarray(rng.randint(1, 128, size=(2, 12)).astype(np.int32))
             seg = jnp.ones((2, 12), dtype=jnp.int32)
 
-            @nnx.jit
-            def fwd(m, tok, seg):
-                h, aux = m(tok, seg, None, jnp.array(0, jnp.int32))
-                return h
-
-            h_dense = np.asarray(fwd(m_dense, tok, seg))
-            h_grp = np.asarray(fwd(m_grp, tok, seg))
-            fwd_max = float(np.max(np.abs(h_dense - h_grp)))
-
             def loss_fn(m):
                 h, aux = m(tok, seg, None, jnp.array(0, jnp.int32))
                 return jnp.sum(h**2) + aux
 
+            # Distinct jit'd fns per path so the patched (dense) trace is not cached
+            # and reused for the grouped call.
             @nnx.jit
-            def grads(m):
+            def fwd_grouped(m):
+                return m(tok, seg, None, jnp.array(0, jnp.int32))[0]
+
+            @nnx.jit
+            def fwd_dense(m):
+                return m(tok, seg, None, jnp.array(0, jnp.int32))[0]
+
+            @nnx.jit
+            def grads_grouped(m):
                 return nnx.grad(loss_fn, argnums=nnx.DiffState(0, LoRAParam))(m)
 
-            g_dense = grads(m_dense)
-            g_grp = grads(m_grp)
+            @nnx.jit
+            def grads_dense(m):
+                return nnx.grad(loss_fn, argnums=nnx.DiffState(0, LoRAParam))(m)
+
+            with mock.patch.object(MoEFeedForward, "__call__", _dense_moe_call):
+                h_dense = np.asarray(fwd_dense(m))
+                g_dense = grads_dense(m)
+            h_grp = np.asarray(fwd_grouped(m))
+            g_grp = grads_grouped(m)
+            fwd_max = float(np.max(np.abs(h_dense - h_grp)))
 
         ld = jax.tree.leaves(nnx.pure(nnx.state(g_dense, LoRAParam)))
         lg = jax.tree.leaves(nnx.pure(nnx.state(g_grp, LoRAParam)))

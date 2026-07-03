@@ -99,7 +99,6 @@ def _qwen35_cfg(layer_types):
         linear_value_head_dim=16,
         intermediate_size=128,
         dtype=jnp.float32,
-        scan_layers=True,
     )
 
 
