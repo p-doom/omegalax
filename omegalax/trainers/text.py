@@ -208,10 +208,18 @@ def make_sft_train_step(cfg, pad_id: int = 0):
         # present only when zig-zag CP permuted the sequence (carries true positions).
         targets_BT = batch["targets_BT"] if cp_axis is not None else token_ids_BT
         position_ids_BT = batch.get("position_ids_BT")
+        # Present only for packed batches; drives the block-diagonal document mask.
+        # Absent -> forward derives a single segment from (token_ids != pad_id).
+        segment_ids_BT = batch.get("segment_ids_BT")
 
         def loss_fn(model):
             hidden_BTD, aux_loss = text_api.forward(
-                model, token_ids_BT, pad_id, cfg, position_ids_BT=position_ids_BT
+                model,
+                token_ids_BT,
+                pad_id,
+                cfg,
+                position_ids_BT=position_ids_BT,
+                segment_ids_BT=segment_ids_BT,
             )
             lm_weight = model.lm_head.kernel[...]
             loss = (
@@ -259,9 +267,15 @@ def make_sft_eval_step(cfg, pad_id: int = 0):
         loss_mask_BT = batch["loss_mask_BT"]
         targets_BT = batch["targets_BT"] if cp_axis is not None else token_ids_BT
         position_ids_BT = batch.get("position_ids_BT")
+        segment_ids_BT = batch.get("segment_ids_BT")
 
         hidden_BTD, aux_loss = text_api.forward(
-            model, token_ids_BT, pad_id, cfg, position_ids_BT=position_ids_BT
+            model,
+            token_ids_BT,
+            pad_id,
+            cfg,
+            position_ids_BT=position_ids_BT,
+            segment_ids_BT=segment_ids_BT,
         )
         lm_weight = model.lm_head.kernel[...]
         loss = (

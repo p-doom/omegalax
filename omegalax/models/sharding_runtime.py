@@ -49,19 +49,6 @@ def set_attn_backend(
             object.__setattr__(module, "_attn_backend", text_backend)
 
 
-def set_cp_document_mask(model: nnx.Module, enabled: bool = True) -> None:
-    """Enable/disable the CP block-diagonal document mask on text attention.
-
-    When enabled AND under CP (cp_size > 1), the all-gather-KV attention adds
-    ``q_seg == k_seg`` so packed sequences don't attend across a document boundary.
-    Default disabled keeps CP causal-only, matching the (also causal-only) non-CP
-    tokamax path. Only affects the CP path.
-    """
-    for _, module in nnx.iter_modules(model):
-        if getattr(module, "_attn_kind", None) == "text":
-            object.__setattr__(module, "_cp_document_mask", enabled)
-
-
 def batch_partition_spec(shd_cfg: ShardConfig) -> PartitionSpec:
     return P(shd_cfg.act_btd[0], None)
 

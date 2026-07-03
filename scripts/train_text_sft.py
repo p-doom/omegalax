@@ -12,6 +12,7 @@ import wandb
 from transformers import AutoTokenizer
 
 from omegalax.data.collator_qwen3 import TextSFTCollator
+from omegalax.data.packing import PackingTextSFTCollator
 from omegalax.data.grain_pipeline import (
     MixSource,
     make_grain_iterator,
@@ -40,6 +41,20 @@ flags.DEFINE_string(
 )
 flags.DEFINE_string("tokenizer", None, "HF tokenizer name/path (defaults to --model_id).")
 flags.DEFINE_integer("max_length", 512, "Maximum sequence length.")
+flags.DEFINE_bool(
+    "pack_sequences",
+    False,
+    "Pack multiple documents per sequence (block-diagonal document mask + per-document "
+    "reset positions) instead of padding each sample to max_length. Default off keeps the "
+    "one-sample-per-row behavior. --batch_size stays the packed-row count.",
+)
+flags.DEFINE_integer(
+    "pack_group_factor",
+    4,
+    "When --pack_sequences: read this many raw examples per packed row before binning "
+    "(grain group = per_process_batch * pack_group_factor). Larger fills rows denser but "
+    "drops more overflow; size it near the average documents-per-row for your data.",
+)
 flags.DEFINE_integer("num_steps", 100, "Number of training steps.")
 flags.DEFINE_integer("batch_size", 8, "Global batch size across all JAX processes.")
 flags.DEFINE_float("learning_rate", 2e-5, "Learning rate.")
@@ -188,14 +203,27 @@ def main(_) -> None:
     assert FLAGS.max_length <= tokenizer.model_max_length, (
         f"--max_length={FLAGS.max_length} exceeds tokenizer.model_max_length={tokenizer.model_max_length}"
     )
-    collator = TextSFTCollator(tokenizer, max_length=FLAGS.max_length)
-    startup_log("built TextSFTCollator")
     train_sources = _resolve_train_sources()
     per_process_batch = process_local_batch_size(
         FLAGS.batch_size,
         dp_size=FLAGS.dp_size,
         fsdp_size=FLAGS.fsdp_size,
     )
+    # --batch_size is the packed-ROW count; grain reads pack_group_factor raw
+    # examples per row and the collator bins them into per_process_batch rows.
+    if FLAGS.pack_sequences:
+        collator = PackingTextSFTCollator(
+            tokenizer, max_length=FLAGS.max_length, num_packed_rows=per_process_batch
+        )
+        grain_group_size = per_process_batch * FLAGS.pack_group_factor
+        startup_log(
+            f"built PackingTextSFTCollator (rows={per_process_batch}, "
+            f"group={grain_group_size})"
+        )
+    else:
+        collator = TextSFTCollator(tokenizer, max_length=FLAGS.max_length)
+        grain_group_size = per_process_batch
+        startup_log("built TextSFTCollator")
     sources_repr = ", ".join(f"{s.path}@{s.weight:g}" for s in train_sources)
     startup_log(
         f"model_id={FLAGS.model_id!r} data_sources=[{sources_repr}] "
@@ -212,7 +240,7 @@ def main(_) -> None:
     data_iter = _grain_iter(
         train_sources,
         collator,
-        per_process_batch,
+        grain_group_size,
         shuffle=True,
         seed=FLAGS.seed,
         num_batches=total_micro_batches,
@@ -226,7 +254,7 @@ def main(_) -> None:
         val_data_iter = _grain_iter(
             [MixSource(path=FLAGS.val_data_path, weight=1.0)],
             collator,
-            per_process_batch,
+            grain_group_size,
             shuffle=False,
             seed=FLAGS.seed,
             num_batches=max(

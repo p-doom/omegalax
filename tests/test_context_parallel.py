@@ -54,7 +54,6 @@ from omegalax.models.shard_config import (  # noqa: E402
 from omegalax.models.sharding_runtime import (  # noqa: E402
     init_model_sharded,
     set_attn_backend,
-    set_cp_document_mask,
     shard_batch_dict,
 )
 from jax.sharding import NamedSharding, PartitionSpec as _P  # noqa: E402

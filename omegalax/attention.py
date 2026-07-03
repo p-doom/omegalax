@@ -20,6 +20,8 @@ import jax.numpy as jnp
 from jax.experimental.shard_map import shard_map
 from jax.sharding import PartitionSpec as P, reshard
 from tokamax import dot_product_attention
+from tokamax._src.ops.attention import base as tokamax_base
+from tokamax._src.ops.attention.api import IMPLEMENTATIONS as _TOKAMAX_IMPLEMENTATIONS
 
 
 def segment_ids_to_kstart(segment_ids_BT: jax.Array) -> jax.Array:
@@ -27,15 +29,16 @@ def segment_ids_to_kstart(segment_ids_BT: jax.Array) -> jax.Array:
 
     ``segment_ids_BT``: (B, T), 0=padding, 1+=document id. Returns (B, T) k_start.
     """
-    B, T = segment_ids_BT.shape
-    pos = jnp.arange(T)[None, :]
-    changes = jnp.concatenate(
-        [
-            jnp.ones((B, 1), dtype=jnp.bool_),
-            segment_ids_BT[:, 1:] != segment_ids_BT[:, :-1],
-        ],
-        axis=1,
-    )
+    T = segment_ids_BT.shape[1]
+    pos = jnp.arange(T, dtype=jnp.int32)[None, :]
+    # Boundary where the segment id differs from the previous token (the first
+    # token is always a boundary). The shifted-previous array is built from SLICES
+    # of ``segment_ids_BT`` (``first - 1`` forces the first token to differ) so it
+    # inherits the SAME layout -- a replicated ``ones`` column would clash with a
+    # batch-sharded ``segment_ids_BT`` under an explicit-sharding mesh.
+    first_col = segment_ids_BT[:, :1]
+    prev_BT = jnp.concatenate([first_col - 1, segment_ids_BT[:, :-1]], axis=1)
+    changes = segment_ids_BT != prev_BT
     boundary_positions = jnp.where(changes, pos, 0)
     return jax.lax.cummax(boundary_positions, axis=1)
 
@@ -45,6 +48,61 @@ def cu_seqlens_to_kstart(cu_seqlens: jax.Array, N: int) -> jax.Array:
     (``cu_seqlens``: ``(num_segments + 1,)``, e.g. [0, 100, 250]). Returns (N,)."""
     seg_ids = jnp.searchsorted(cu_seqlens[1:], jnp.arange(N), side="right")
     return cu_seqlens[seg_ids]
+
+
+# --- Non-CP block-diagonal (document) causal attention -----------------------
+
+
+def _resolve_attention_impl(implementation: str):
+    """Resolve a tokamax backend name to its ``Op`` instance.
+
+    Mirrors the private dispatch inside ``tokamax.dot_product_attention``; the
+    PUBLIC wrapper only accepts a boolean ``mask`` and hides ``k_start``/``k_end``,
+    so to feed a per-row ``k_start`` (the nested-mask patch's whole point) we build
+    the ``Mask`` ourselves and call the resolved implementation directly -- exactly
+    what the public wrapper's tail does, just with a ``Mask`` instead of a bool.
+    """
+    if implementation == "mosaic":
+        from jax.extend import backend
+
+        kind = backend.get_default_device().device_kind
+        implementation = "mosaic_gpu" if "NVIDIA" in kind else "mosaic_tpu"
+    try:
+        return _TOKAMAX_IMPLEMENTATIONS[implementation]
+    except KeyError as exc:
+        raise ValueError(f"Unknown tokamax attention implementation: {implementation!r}") from exc
+
+
+def document_causal_attention(
+    q_BTHK: jax.Array,
+    k_BTGK: jax.Array,
+    v_BTGK: jax.Array,
+    segment_ids_BT: jax.Array,
+    *,
+    scale: float,
+    implementation: str = "xla",
+    q_sharding=None,
+) -> jax.Array:
+    """Block-diagonal (per-document) causal attention for packed sequences.
+
+    Builds tokamax's per-row ``k_start`` (each query's segment start, via
+    :func:`segment_ids_to_kstart`) and runs attention with
+    ``Mask(k_start=k_start, is_causal=True)``: query row ``t`` may attend keys in
+    ``[segment_start(t), t]`` -- causal WITHIN its document, nothing across a
+    document boundary. When there is a single segment ``k_start`` is all-zero, so
+    this reduces EXACTLY (bit-identical) to ``is_causal=True``; hence it is applied
+    unconditionally -- the masking is DATA-DRIVEN off ``segment_ids_BT`` with no
+    flag. Padding tokens (segment id 0) form a trailing segment that real queries
+    never reach (they sit past the causal frontier) and whose rows the loss mask
+    discards.
+    """
+    # tokamax's Mask.k_start is ``*#B #h #T``; a bare (B, T) is read as (#h, #T)
+    # (B mistaken for a head axis, which also breaks the sharded shard_map). Insert
+    # an explicit broadcast head axis -> (B, 1, T): per-batch, per-query k_start.
+    k_start_B1T = segment_ids_to_kstart(segment_ids_BT)[:, None, :]
+    impl = _resolve_attention_impl(implementation)
+    mask = tokamax_base.Mask(k_start=k_start_B1T, is_causal=True)
+    return impl(q_BTHK, k_BTGK, v_BTGK, mask=mask, logits_scale=scale, q_sharding=q_sharding)
 
 
 # --- Context-Parallel (CP) all-gather-KV attention ---------------------------

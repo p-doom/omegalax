@@ -11,9 +11,8 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 from jax.sharding import PartitionSpec
-from tokamax import dot_product_attention
 
-from omegalax.attention import context_parallel_attention
+from omegalax.attention import context_parallel_attention, document_causal_attention
 from .config import Qwen3_5TextConfig
 from .norms import RMSNorm
 from .rope import apply_text_rope
@@ -78,9 +77,6 @@ class Attention(nnx.Module):
         object.__setattr__(self, "_q_sharding_spec", P(*cfg.shd_cfg.act_btnh))
         object.__setattr__(self, "_attn_backend", "mosaic_gpu")
         object.__setattr__(self, "_attn_kind", "text")
-        # CP block-diagonal document mask; default off keeps CP causal-only ==
-        # the non-CP path. Toggle via set_cp_document_mask.
-        object.__setattr__(self, "_cp_document_mask", False)
 
     @jax.named_scope("attention")
     def __call__(
@@ -128,6 +124,7 @@ class Attention(nnx.Module):
         if cp_axis is not None and mesh.shape[cp_axis] > 1:
             # position_ids_BT are GLOBAL/original positions (permuted under zig-zag),
             # so the mask is layout-agnostic; segment_ids_BT adds the document mask.
+            # DATA-DRIVEN: always pass segment_ids (single-segment -> pure causal).
             seq_spec = P(heads_shd[0], cp_axis)
             attn_BTHK = context_parallel_attention(
                 q_BTHK,
@@ -138,15 +135,17 @@ class Attention(nnx.Module):
                 scale=self.scale,
                 heads_spec=P(*heads_shd),
                 seq_spec=seq_spec,
-                q_segment_ids_BT=segment_ids_BT if self._cp_document_mask else None,
+                q_segment_ids_BT=segment_ids_BT,
                 implementation=self._attn_backend,
             )
         else:
-            attn_BTHK = dot_product_attention(
+            # Block-diagonal (per-document) causal mask from segment_ids;
+            # reduces bit-exactly to is_causal=True for a single segment.
+            attn_BTHK = document_causal_attention(
                 q_BTHK,
                 k_BTGK,
                 v_BTGK,
-                is_causal=True,
+                segment_ids_BT,
                 scale=self.scale,
                 implementation=self._attn_backend,
                 q_sharding=self._q_sharding,

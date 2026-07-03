@@ -48,11 +48,14 @@ def is_identity(perm: np.ndarray) -> bool:
 def apply_zigzag_to_batch(batch: dict, perm: np.ndarray, seq_keys: frozenset) -> dict:
     """Permute the T axis of the per-token arrays in ``batch`` by ``perm``.
 
-    ``(B, T)`` arrays in ``seq_keys`` are permuted on axis 1; ``position_ids_ZBT``
-    ((3, B, T)) on axis 2. When no ``position_ids_ZBT`` is present, a
-    ``position_ids_BT`` (== ``perm``: the original index of each permuted slot) is
-    ADDED so downstream RoPE / the mask use true positions. No-op for the identity
-    perm; operates on host numpy arrays (called pre-shard in
+    ``(B, T)`` arrays in ``seq_keys`` are permuted on axis 1 (this includes an
+    already-present ``position_ids_BT`` -- e.g. sequence packing's per-document
+    reset positions, which must be permuted WITH the tokens, not overwritten);
+    ``position_ids_ZBT`` ((3, B, T)) on axis 2. When neither a ``position_ids_ZBT``
+    nor a ``position_ids_BT`` is present, a ``position_ids_BT`` (== ``perm``: the
+    original index of each permuted slot) is ADDED so downstream RoPE / the mask use
+    true positions. No-op for the identity perm; operates on host numpy arrays
+    (called pre-shard in
     :func:`omegalax.models.sharding_runtime.shard_batch_dict`).
     """
     if is_identity(perm):
@@ -64,7 +67,7 @@ def apply_zigzag_to_batch(batch: dict, perm: np.ndarray, seq_keys: frozenset) ->
             out[key] = a[:, :, perm]
         elif key in seq_keys and a.ndim >= 2:
             out[key] = a[:, perm]
-    if "position_ids_ZBT" not in batch:
+    if "position_ids_ZBT" not in batch and "position_ids_BT" not in batch:
         B = int(np.asarray(next(iter(batch.values()))).shape[0])
         out["position_ids_BT"] = np.broadcast_to(perm[None, :], (B, perm.shape[0])).astype(
             np.int32

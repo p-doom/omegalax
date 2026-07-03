@@ -2,9 +2,8 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 from jax.sharding import PartitionSpec as P, reshard
-from tokamax import dot_product_attention
 
-from omegalax.attention import context_parallel_attention
+from omegalax.attention import context_parallel_attention, document_causal_attention
 from .norms import RMSNorm
 from .rope import apply_rope, generate_pos_embeddings
 from .utils import compute_positions_from_segment_ids, count_left_pads
@@ -67,9 +66,6 @@ class Attention(nnx.Module):
         object.__setattr__(self, "_q_sharding_spec", P(*cfg.shd_cfg.act_btnh))
         object.__setattr__(self, "_attn_backend", "mosaic_gpu")
         object.__setattr__(self, "_attn_kind", "text")
-        # CP block-diagonal document mask; default off keeps CP causal-only ==
-        # the non-CP path. Toggle via set_cp_document_mask.
-        object.__setattr__(self, "_cp_document_mask", False)
 
     @jax.named_scope("attention")
     def __call__(
@@ -125,6 +121,9 @@ class Attention(nnx.Module):
             mesh = jax.sharding.get_abstract_mesh()
             if cp_axis is not None and mesh.shape[cp_axis] > 1:
                 seq_spec = P(heads_shd[0], cp_axis)
+                # Document mask is DATA-DRIVEN: always pass segment_ids so packed
+                # multi-doc sequences never attend across a boundary. Single-segment
+                # data makes q_seg == k_seg everywhere -> pure causal (no-op).
                 attn_BTHK = context_parallel_attention(
                     q_BTHK,
                     k_BTGK,
@@ -134,15 +133,17 @@ class Attention(nnx.Module):
                     scale=self.scale,
                     heads_spec=P(*heads_shd),
                     seq_spec=seq_spec,
-                    q_segment_ids_BT=segment_ids_BT if self._cp_document_mask else None,
+                    q_segment_ids_BT=segment_ids_BT,
                     implementation=self._attn_backend,
                 )
             else:
-                attn_BTHK = dot_product_attention(
+                # Block-diagonal (per-document) causal mask from segment_ids;
+                # reduces bit-exactly to is_causal=True for a single segment.
+                attn_BTHK = document_causal_attention(
                     q_BTHK,
                     k_BTGK,
                     v_BTGK,
-                    is_causal=True,
+                    segment_ids_BT,
                     scale=self.scale,
                     implementation=self._attn_backend,
                     q_sharding=self._q_sharding,
