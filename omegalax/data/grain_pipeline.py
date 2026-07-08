@@ -21,6 +21,14 @@ import jax
 COMPILED_DATASET_VERSION = 1
 COMPILED_METADATA_FILENAME = "metadata.json"
 TOKEN_STATS_FILENAME = "token_stats.json"
+TRUNCATION_STATS_FILENAME = "truncation_stats.json"
+SEQUENCE_LENGTHS_FILENAME = "sequence_lengths.jsonl"
+# Per-message token-length cache. Keyed by (record_idx, msg_offset), it holds
+# the exact measure_message() output for every message in a payload. This is
+# the only tokenizer-bound product of chunk-index building and is independent
+# of max_length / overflow_mode / system_message, so it can be measured once
+# and reused across every chunk-index build over the same payload + tokenizer.
+MESSAGE_LENGTHS_FILENAME = "message_lengths.jsonl"
 ARRAY_RECORD_SUFFIX = ".array_record"
 
 SOURCE_ID_KEY = "_omegalax_source_id"
@@ -294,23 +302,47 @@ def _iter_indexed_records(path: str | Path):
         yield record_idx, json.loads(source[record_idx])
 
 
+def _measure_init(measure_message):
+    """Pool initializer: install the measure fn in the worker's module global.
+
+    Required because the workers run under the ``spawn`` start method (see
+    ``_compute_message_lengths``), which does not inherit the parent's globals;
+    ``measure_message`` is pickled in via ``initargs`` instead.
+    """
+    global _measure_fn
+    _measure_fn = measure_message
+
+
 def _measure_worker(keyed_message):
     key, message = keyed_message
     return key, _measure_fn(message)
 
 
-def _precompute_message_lengths(payload_path, measure_message, num_workers):
-    global _measure_fn
-    _measure_fn = measure_message
+def _compute_message_lengths(payload_path, measure_message, num_workers):
+    """Tokenize every message in ``payload_path`` once, in parallel.
 
+    Returns ``{(record_idx, msg_offset): measurement}`` where ``measurement`` is
+    whatever ``measure_message`` returns (an ``int`` or a dict with a
+    ``"length"`` key). This is the expensive, tokenizer-bound pass; everything
+    downstream (binning, truncation, stats) is a pure function of its output.
+
+    Workers run under the ``spawn`` start method, not ``fork``. The dataset
+    carries images by reference into a native ArrayRecord store; a forked
+    worker inherits the parent's thread-tainted ArrayRecord runtime and
+    segfaults on its first image read (deadlocking the pool). ``spawn`` starts
+    each worker from a clean interpreter that opens its own readers. Because
+    ``spawn`` does not inherit globals, ``measure_message`` (a picklable
+    ``qwen3_encoding._MessageLengthFn``) is shipped to each worker via the pool
+    initializer.
+    """
     tasks: list[tuple[tuple[int, int], dict[str, Any]]] = []
     for record_idx, block in _iter_indexed_records(payload_path):
         for msg_offset, message in enumerate(block["messages"]):
             tasks.append(((record_idx, msg_offset), message))
 
-    ctx = mp.get_context("fork")
+    ctx = mp.get_context("spawn")
     chunksize = max(1, min(32, len(tasks) // num_workers))
-    with ctx.Pool(num_workers) as pool:
+    with ctx.Pool(num_workers, initializer=_measure_init, initargs=(measure_message,)) as pool:
         results = dict(
             tqdm(
                 pool.imap_unordered(_measure_worker, tasks, chunksize=chunksize),
@@ -319,6 +351,111 @@ def _precompute_message_lengths(payload_path, measure_message, num_workers):
             )
         )
     return results
+
+
+def _write_message_lengths(path: str | Path, results: dict) -> None:
+    """Persist ``_compute_message_lengths`` output as JSONL (one row per
+    message), so it can be reloaded by :func:`_load_message_lengths` to skip
+    re-tokenization on subsequent chunk-index builds."""
+    path = Path(path).expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w") as f:
+        for (record_idx, msg_offset), measurement in sorted(results.items()):
+            f.write(
+                json.dumps(
+                    {
+                        "record_idx": record_idx,
+                        "msg_offset": msg_offset,
+                        "measurement": measurement,
+                    }
+                )
+                + "\n"
+            )
+
+
+def _load_message_lengths(path: str | Path) -> dict:
+    """Inverse of :func:`_write_message_lengths`: reconstruct the
+    ``{(record_idx, msg_offset): measurement}`` map from the JSONL cache."""
+    results: dict[tuple[int, int], Any] = {}
+    with Path(path).expanduser().open() as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            results[(int(row["record_idx"]), int(row["msg_offset"]))] = row["measurement"]
+    return results
+
+
+def _validate_message_lengths(payload_path, results: dict) -> None:
+    """Fail loudly if a cached length map does not match the payload exactly.
+
+    Guards against a stale cache (payload changed, tokenizer/processor changed
+    upstream of the cache, partial write): every payload message must have an
+    entry and the counts must match. Cheap relative to tokenization -- a single
+    metadata pass over the payload, no encoding.
+    """
+    expected = 0
+    missing: list[tuple[int, int]] = []
+    for record_idx, block in _iter_indexed_records(payload_path):
+        for msg_offset in range(len(block["messages"])):
+            expected += 1
+            if (record_idx, msg_offset) not in results:
+                if len(missing) < 5:
+                    missing.append((record_idx, msg_offset))
+    if missing or len(results) != expected:
+        raise ValueError(
+            f"cached message lengths do not match payload {payload_path}: payload has "
+            f"{expected} messages, cache has {len(results)} entries"
+            + (f"; first missing keys: {missing}" if missing else "")
+            + ". The cache is stale for this payload -- delete it and re-measure."
+        )
+
+
+def _resolve_message_lengths(payload_path, measure_message, num_workers, message_lengths_path):
+    """Return the per-message length map, loading from / writing to a cache file
+    when ``message_lengths_path`` is given.
+
+    * cache present  -> load it (skips the tokenizer pass entirely) and validate;
+    * cache requested but absent -> compute, then write it for next time;
+    * no cache path   -> compute, don't persist (legacy behaviour).
+    """
+    if message_lengths_path is not None:
+        cache_path = Path(message_lengths_path).expanduser()
+        if cache_path.exists():
+            print(f"[chunk_index] loading cached message lengths from {cache_path}", flush=True)
+            results = _load_message_lengths(cache_path)
+            _validate_message_lengths(payload_path, results)
+            return results
+
+    results = _compute_message_lengths(payload_path, measure_message, num_workers)
+
+    if message_lengths_path is not None:
+        _write_message_lengths(message_lengths_path, results)
+        print(f"[chunk_index] wrote message-length cache to {message_lengths_path}", flush=True)
+    return results
+
+
+def measure_message_lengths(
+    payload_path: str | Path,
+    out_path: str | Path,
+    *,
+    measure_message,
+    num_workers: int = 2,
+) -> Path:
+    """Tokenize every message in a payload once and write the length cache.
+
+    Standalone entry point for the offline "measure" stage: produces the
+    ``message_lengths.jsonl`` file that :func:`build_chunk_index` consumes via
+    its ``message_lengths_path`` argument, so re-binning at a different
+    ``max_length`` / ``overflow_mode`` never re-tokenizes.
+    """
+    payload_path = Path(payload_path).expanduser().resolve()
+    out_path = Path(out_path).expanduser()
+    results = _compute_message_lengths(payload_path, measure_message, num_workers)
+    _write_message_lengths(out_path, results)
+    print(f"[measure] wrote {len(results)} message lengths to {out_path}", flush=True)
+    return out_path
 
 
 def _compute_distribution(values: list[int]) -> dict[str, int | float]:
@@ -401,6 +538,122 @@ def _emit_token_stats(
     stats_path.write_text(json.dumps(stats, indent=2) + "\n")
 
 
+def _emit_sequence_lengths(
+    out_dir: Path,
+    *,
+    sequence_stats: dict[str, dict[str, int]],
+    effective_max: int,
+) -> None:
+    """Write one JSON object per conversation (session) to
+    ``sequence_lengths.jsonl`` in ``out_dir``: the exact measured token length
+    of the full conversation plus its text/vision breakdown. These are raw
+    per-sequence measurements, independent of ``overflow_mode``; only
+    ``exceeds_max_length`` depends on ``max_length``.
+    """
+    path = out_dir / SEQUENCE_LENGTHS_FILENAME
+    with path.open("w") as f:
+        for session_id, agg in sequence_stats.items():
+            total = agg["total_tokens"]
+            record = {
+                "session_id": session_id,
+                "num_messages": agg["num_messages"],
+                "total_tokens": total,
+                "text_tokens": total - agg["vision_tokens"],
+                "vision_tokens": agg["vision_tokens"],
+                "num_images": agg["num_images"],
+                "max_message_tokens": agg["max_message_tokens"],
+                "exceeds_max_length": total > effective_max,
+                "num_messages_over_budget": agg["num_messages_over_budget"],
+            }
+            f.write(json.dumps(record) + "\n")
+    print(
+        f"[chunk_index] wrote {len(sequence_stats)} per-sequence token lengths to {path.name}",
+        flush=True,
+    )
+
+
+def _emit_truncation_stats(
+    out_dir: Path,
+    *,
+    overflow_mode: str,
+    max_length: int,
+    system_message_length: int,
+    effective_max: int,
+    total_sessions: int,
+    total_message_tokens: int,
+    session_chunk_counts: dict[str, int],
+    prefix_sessions: set[str],
+    overflow_sessions: set[str],
+    dropped_sessions: set[str],
+    dropped_messages: int,
+    dropped_tokens: int,
+) -> None:
+    """Summarise per-session truncation/splitting, print it, and persist it to
+    ``truncation_stats.json`` in ``out_dir``.
+
+    ``prefix_sessions`` lost their tail because a single turn exceeded the
+    budget (``split``/``truncate``); ``overflow_sessions`` lost their tail
+    because packing overflowed (``truncate`` only); ``dropped_sessions`` were
+    discarded wholesale because they did not fit in a single chunk (``drop``
+    only). ``split`` mode never drops accumulation overflow, so its only
+    dropped tokens come from the single-turn-too-big case.
+    """
+    truncated_sessions = prefix_sessions | overflow_sessions
+    num_chunks = sum(session_chunk_counts.values())
+    sessions_with_chunks = len(session_chunk_counts)
+    sessions_split = sum(1 for c in session_chunk_counts.values() if c > 1)
+    sessions_dropped_entirely = total_sessions - sessions_with_chunks
+    kept_tokens = total_message_tokens - dropped_tokens
+
+    summary = {
+        "overflow_mode": overflow_mode,
+        "max_length": max_length,
+        "system_message_length": system_message_length,
+        "effective_max": effective_max,
+        "sessions": {
+            "total": total_sessions,
+            "emitted_at_least_one_chunk": sessions_with_chunks,
+            "split_into_multiple_chunks": sessions_split,
+            "truncated_total": len(truncated_sessions),
+            "truncated_overflow": len(overflow_sessions),
+            "truncated_single_message": len(prefix_sessions),
+            "dropped_whole_session": len(dropped_sessions),
+            "dropped_entirely": sessions_dropped_entirely,
+        },
+        "chunks": {
+            "emitted": num_chunks,
+            "max_per_session": max(session_chunk_counts.values(), default=0),
+        },
+        "messages": {"dropped": dropped_messages},
+        "tokens": {
+            "total_measured": total_message_tokens,
+            "kept": kept_tokens,
+            "dropped": dropped_tokens,
+            "dropped_fraction": (
+                round(dropped_tokens / total_message_tokens, 6) if total_message_tokens else 0.0
+            ),
+        },
+    }
+    (out_dir / TRUNCATION_STATS_FILENAME).write_text(json.dumps(summary, indent=2) + "\n")
+
+    pct = summary["tokens"]["dropped_fraction"] * 100
+    print(
+        "[chunk_index] truncation summary "
+        f"(overflow_mode={overflow_mode}, effective_max={effective_max} "
+        f"= max_length={max_length} - system_tokens={system_message_length}):\n"
+        f"  sessions: total={total_sessions} emitted={sessions_with_chunks} "
+        f"split={sessions_split} truncated={len(truncated_sessions)} "
+        f"(overflow={len(overflow_sessions)}, single_msg={len(prefix_sessions)}) "
+        f"dropped_whole={len(dropped_sessions)} "
+        f"dropped_entirely={sessions_dropped_entirely}\n"
+        f"  chunks_emitted={num_chunks}\n"
+        f"  messages_dropped={dropped_messages}\n"
+        f"  tokens: total={total_message_tokens} kept={kept_tokens} "
+        f"dropped={dropped_tokens} ({pct:.3f}%)",
+        flush=True,
+    )
+
+
 def build_chunk_index(
     payload_path: str | Path,
     out_dir: str | Path,
@@ -412,6 +665,8 @@ def build_chunk_index(
     profile_metadata: dict[str, Any] | None = None,
     num_workers: int = 2,
     system_message: dict[str, Any] | None = None,
+    overflow_mode: str = "split",
+    message_lengths_path: str | Path | None = None,
 ) -> Path:
     """Build an offline chunk index over a canonical payload-block dataset.
 
@@ -426,10 +681,46 @@ def build_chunk_index(
     is measured once with ``measure_message`` and its token count is subtracted
     from the per-chunk budget so ``system_tokens + chunk_content_tokens``
     stays within ``max_length``.
+
+    ``overflow_mode`` controls what happens to a conversation (session) whose
+    turns do not all fit within ``effective_max = max_length - system_tokens``:
+
+    * ``"split"`` (default, legacy behaviour): the session is packed into as
+      many consecutive ≤budget chunks as needed at turn boundaries. No turns
+      are dropped (every chunk is a fresh training sample with no shared
+      history across the split).
+    * ``"truncate"``: only the first ≤budget chunk (the longest prefix of whole
+      turns that fits) is kept; the overflowing turn and the rest of the
+      session are dropped.
+    * ``"drop"``: any conversation that does not fit entirely in a single chunk
+      (``total_tokens > effective_max``) is dropped wholesale; nothing is
+      emitted for it. Only conversations that fit within the budget survive.
+
+    In ``split`` and ``truncate`` a single turn that alone exceeds
+    ``effective_max`` triggers prefix-truncation (the over-length turn and the
+    session tail are dropped); in ``drop`` that whole session is dropped too.
+
+    Truncation accounting (sessions/messages/tokens dropped, sessions split) is
+    printed to stdout and written to ``truncation_stats.json`` next to the
+    index.
+
+    ``message_lengths_path`` enables the per-message length cache. Tokenization
+    (``measure_message`` over every message) is the only step that depends on
+    the tokenizer/processor and not on ``max_length`` / ``overflow_mode`` /
+    ``system_message``. When this path is given and exists, the cache is loaded
+    and the tokenizer pass is skipped; when it is given but absent, lengths are
+    measured and written there for reuse; when ``None`` (default), lengths are
+    measured in-memory and not persisted. Build it once with
+    :func:`measure_message_lengths`, then point every chunk-index build over the
+    same payload at it to avoid re-tokenizing per sequence length.
     """
 
     if max_length <= 0:
         raise ValueError("max_length must be > 0")
+    if overflow_mode not in ("split", "truncate", "drop"):
+        raise ValueError(
+            f"overflow_mode must be 'split', 'truncate', or 'drop', got {overflow_mode!r}"
+        )
 
     payload_path = Path(payload_path).expanduser().resolve()
     out_dir = Path(out_dir).expanduser().resolve()
@@ -452,22 +743,55 @@ def build_chunk_index(
             )
     effective_max = max_length - system_message_length
 
-    precomputed_lengths = _precompute_message_lengths(payload_path, measure_message, num_workers)
+    precomputed_lengths = _resolve_message_lengths(
+        payload_path, measure_message, num_workers, message_lengths_path
+    )
 
-    # Per-session prefix-truncation point: the earliest (record_idx,
-    # msg_offset) of a message exceeding the chunk budget. The binner emits
-    # chunks for the valid prefix and drops the over-length message + tail.
+    # Single prescan pass over every message, accumulating:
+    #  * session_truncate_at: earliest (record_idx, msg_offset) of a message
+    #    exceeding the chunk budget (the binner emits chunks for the valid
+    #    prefix and drops the over-length message + tail);
+    #  * sequence_stats: per-session (= per-conversation) token totals, written
+    #    out verbatim as ``sequence_lengths.jsonl``. A session may span several
+    #    payload blocks; blocks of a session are contiguous, so we accumulate.
     session_truncate_at: dict[str, tuple[int, int]] = {}
+    sequence_stats: dict[str, dict[str, int]] = {}
+    total_message_tokens = 0
     for record_idx, block in _iter_indexed_records(payload_path):
         block_session_id = str(block["session_id"])
-        if block_session_id in session_truncate_at:
-            continue
+        agg = sequence_stats.get(block_session_id)
+        if agg is None:
+            agg = {
+                "num_messages": 0,
+                "total_tokens": 0,
+                "vision_tokens": 0,
+                "num_images": 0,
+                "max_message_tokens": 0,
+                "num_messages_over_budget": 0,
+            }
+            sequence_stats[block_session_id] = agg
         for msg_offset in range(len(block["messages"])):
             result = precomputed_lengths[(record_idx, msg_offset)]
-            msg_length = result["length"] if isinstance(result, dict) else int(result)
+            if isinstance(result, dict):
+                msg_length = int(result["length"])
+                msg_vision_tokens = int(result["vision_tokens"])
+                msg_num_images = int(result["num_images"])
+            else:
+                msg_length = int(result)
+                msg_vision_tokens = 0
+                msg_num_images = 0
+            total_message_tokens += msg_length
+            agg["num_messages"] += 1
+            agg["total_tokens"] += msg_length
+            agg["vision_tokens"] += msg_vision_tokens
+            agg["num_images"] += msg_num_images
+            if msg_length > agg["max_message_tokens"]:
+                agg["max_message_tokens"] = msg_length
             if msg_length > effective_max:
-                session_truncate_at[block_session_id] = (record_idx, msg_offset)
-                break
+                agg["num_messages_over_budget"] += 1
+                if block_session_id not in session_truncate_at:
+                    session_truncate_at[block_session_id] = (record_idx, msg_offset)
+    all_session_ids = set(sequence_stats)
     if session_truncate_at:
         print(
             f"[chunk_index] prefix-truncating {len(session_truncate_at)} session(s) "
@@ -479,6 +803,21 @@ def build_chunk_index(
             flush=True,
         )
 
+    # drop mode: any conversation that doesn't fit in a single chunk is dropped
+    # wholesale (handled at the top of the binner loop). Empty in other modes.
+    drop_sessions: set[str] = set()
+    if overflow_mode == "drop":
+        drop_sessions = {
+            sid for sid, agg in sequence_stats.items() if agg["total_tokens"] > effective_max
+        }
+        if drop_sessions:
+            print(
+                f"[chunk_index] drop mode: dropping {len(drop_sessions)} session(s) whose "
+                f"total length exceeds effective_max={effective_max} "
+                f"(max_length={max_length}, system_tokens={system_message_length})",
+                flush=True,
+            )
+
     # -- token stats accumulators (populated lazily by the generator) ----------
     _msg_lengths: list[int] = []
     _msg_vision_tokens: list[int] = []
@@ -489,6 +828,28 @@ def build_chunk_index(
     _chunk_num_images: list[int] = []
     _chunk_num_messages: list[int] = []
     _image_shape_counts: dict[str, int] = {}
+
+    # -- truncation accounting (populated lazily by the generator) -------------
+    # prefix:   session lost its tail because a single turn exceeded the budget
+    # overflow: session lost its tail because packing overflowed (truncate mode)
+    _trunc: dict[str, Any] = {
+        "prefix_sessions": set(),
+        "overflow_sessions": set(),
+        "dropped_sessions": set(),  # drop mode: whole conversation discarded
+        "dropped_messages": 0,
+        "dropped_tokens": 0,
+    }
+    _session_chunk_counts: dict[str, int] = {}
+
+    def _dropped_range(record_idx: int, block: dict[str, Any], start_offset: int):
+        """Count (messages, tokens) dropped from ``start_offset`` to block end."""
+        n_msgs = 0
+        n_toks = 0
+        for off in range(start_offset, len(block["messages"])):
+            result = precomputed_lengths[(record_idx, off)]
+            n_toks += result["length"] if isinstance(result, dict) else int(result)
+            n_msgs += 1
+        return n_msgs, n_toks
 
     def _iter_chunk_descriptors():
         current_session_id: str | None = None
@@ -529,12 +890,28 @@ def build_chunk_index(
                 _chunk_vision_patches.append(current_vision_patches)
                 _chunk_num_images.append(current_num_images)
                 _chunk_num_messages.append(len(current_messages))
+            _session_chunk_counts[current_session_id] = (
+                _session_chunk_counts.get(current_session_id, 0) + 1
+            )
             return descriptor
 
         truncated_sessions: set[str] = set()
         for record_idx, block in _iter_indexed_records(payload_path):
             block_session_id = str(block["session_id"])
+            if block_session_id in drop_sessions:
+                # drop mode: discard the whole conversation, emit nothing. The
+                # pending keeper session (if any) stays buffered and is emitted
+                # when the next keeper arrives or at the final flush.
+                dm, dt = _dropped_range(record_idx, block, 0)
+                _trunc["dropped_messages"] += dm
+                _trunc["dropped_tokens"] += dt
+                _trunc["dropped_sessions"].add(block_session_id)
+                continue
             if block_session_id in truncated_sessions:
+                # whole remaining block of an already-truncated session is dropped
+                dm, dt = _dropped_range(record_idx, block, 0)
+                _trunc["dropped_messages"] += dm
+                _trunc["dropped_tokens"] += dt
                 continue
             truncate_pos = session_truncate_at.get(block_session_id)
             if current_session_id is None:
@@ -561,6 +938,10 @@ def build_chunk_index(
                     current_vision_patches = 0
                     current_num_images = 0
                     truncated_sessions.add(block_session_id)
+                    _trunc["prefix_sessions"].add(block_session_id)
+                    dm, dt = _dropped_range(record_idx, block, msg_offset)
+                    _trunc["dropped_messages"] += dm
+                    _trunc["dropped_tokens"] += dt
                     break
 
                 result = precomputed_lengths[(record_idx, msg_offset)]
@@ -601,6 +982,15 @@ def build_chunk_index(
                     current_vision_tokens = 0
                     current_vision_patches = 0
                     current_num_images = 0
+                    if overflow_mode == "truncate":
+                        # Keep only the first chunk; drop the overflowing turn
+                        # and the rest of the session.
+                        truncated_sessions.add(block_session_id)
+                        _trunc["overflow_sessions"].add(block_session_id)
+                        dm, dt = _dropped_range(record_idx, block, msg_offset)
+                        _trunc["dropped_messages"] += dm
+                        _trunc["dropped_tokens"] += dt
+                        break
                     start_record_idx = record_idx
                     start_message_offset = msg_offset
 
@@ -625,10 +1015,33 @@ def build_chunk_index(
             "payload_path": str(payload_path),
             "payload_num_records": int(payload_metadata["num_records"]),
             "max_length": max_length,
+            "overflow_mode": overflow_mode,
             "profile_metadata": profile_metadata or {},
             "system_message": system_message,
             "system_message_length": system_message_length,
         },
+    )
+
+    _emit_sequence_lengths(
+        out_dir,
+        sequence_stats=sequence_stats,
+        effective_max=effective_max,
+    )
+
+    _emit_truncation_stats(
+        out_dir,
+        overflow_mode=overflow_mode,
+        max_length=max_length,
+        system_message_length=system_message_length,
+        effective_max=effective_max,
+        total_sessions=len(all_session_ids),
+        total_message_tokens=total_message_tokens,
+        session_chunk_counts=_session_chunk_counts,
+        prefix_sessions=_trunc["prefix_sessions"],
+        overflow_sessions=_trunc["overflow_sessions"],
+        dropped_sessions=_trunc["dropped_sessions"],
+        dropped_messages=_trunc["dropped_messages"],
+        dropped_tokens=_trunc["dropped_tokens"],
     )
 
     if _msg_lengths:

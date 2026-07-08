@@ -43,6 +43,26 @@ flags.DEFINE_string(
     "injects it at resolve time and the per-chunk token budget is reduced "
     "by the system message's measured length.",
 )
+flags.DEFINE_enum(
+    "overflow_mode",
+    "split",
+    ["split", "truncate", "drop"],
+    "How to handle a conversation whose turns exceed the token budget. "
+    "'split': pack into multiple consecutive chunks at turn boundaries "
+    "(no turns dropped). 'truncate': keep only the first fitting chunk and "
+    "drop the overflowing turn plus the rest of the conversation. 'drop': "
+    "discard the whole conversation if it does not fit in a single chunk. "
+    "Truncation stats are written to truncation_stats.json.",
+)
+flags.DEFINE_string(
+    "message_lengths_path",
+    None,
+    "Path to a message_lengths.jsonl cache (see scripts/measure_message_lengths.py). "
+    "If set and present, per-message token lengths are loaded from it and the "
+    "tokenizer pass is skipped; if set and absent, lengths are measured and "
+    "written there. Lets repeated builds over the same payload (different "
+    "max_length / overflow_mode) avoid re-tokenizing.",
+)
 
 
 def main(_) -> None:
@@ -77,6 +97,8 @@ def main(_) -> None:
         overwrite=FLAGS.overwrite,
         num_workers=FLAGS.num_workers,
         system_message=system_message,
+        overflow_mode=FLAGS.overflow_mode,
+        message_lengths_path=FLAGS.message_lengths_path,
         profile_metadata={
             "model_id": FLAGS.model_id,
             "tokenizer": tokenizer_name,

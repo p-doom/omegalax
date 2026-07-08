@@ -155,6 +155,58 @@ def _message_has_images(message: dict[str, Any]) -> bool:
     return any(block.get("type") == "image" for block in content)
 
 
+class _MessageLengthFn:
+    """Picklable ``message -> measurement`` callable (see ``make_message_length_fn``).
+
+    Defined at module scope rather than as a closure so it can be pickled and
+    sent to ``spawn``/``forkserver`` multiprocessing workers. The parallel
+    chunk-index builder uses ``spawn`` (workers must not inherit the parent's
+    thread-tainted native ArrayRecord readers, which segfaults), and ``spawn``
+    re-pickles the measure fn into each worker -- a nested closure cannot cross
+    that boundary, an instance of this class can.
+    """
+
+    def __init__(
+        self,
+        tokenizer: PreTrainedTokenizer,
+        image_processor: BaseImageProcessor | None = None,
+    ) -> None:
+        self.tokenizer = tokenizer
+        self.image_processor = image_processor
+        self.merge_size = int(getattr(image_processor, "merge_size", 1)) if image_processor else 1
+
+    def __call__(self, message: dict[str, Any]) -> int | dict[str, Any]:
+        if self.image_processor is None and _message_has_images(message):
+            raise ValueError(
+                "Encountered image content in message but no image_processor was provided. "
+                "Pass image_processor= to make_message_length_fn."
+            )
+        encoded = encode_qwen_messages(
+            [message],
+            tokenizer=self.tokenizer,
+            image_processor=self.image_processor,
+            include_pixels=False,
+        )
+        length = int(len(encoded["input_ids"]))
+
+        grid_thw = encoded.get("image_grid_thw", np.empty((0, 3), dtype=np.int64))
+        num_images = int(grid_thw.shape[0])
+        vision_tokens = 0
+        vision_patches = 0
+        for row in grid_thw:
+            t, h, w = int(row[0]), int(row[1]), int(row[2])
+            vision_tokens += t * (h // self.merge_size) * (w // self.merge_size)
+            vision_patches += t * h * w
+
+        return {
+            "length": length,
+            "vision_tokens": vision_tokens,
+            "vision_patches": vision_patches,
+            "num_images": num_images,
+            "image_grid_thw": grid_thw.tolist(),
+        }
+
+
 def make_message_length_fn(
     tokenizer: PreTrainedTokenizer,
     image_processor: BaseImageProcessor | None = None,
@@ -167,41 +219,11 @@ def make_message_length_fn(
     per-sequence overhead, so ``sum(lengths)`` equals the full-sequence length
     exactly.  For a different chat template, implement an analogous factory and
     swap it in.
+
+    The returned callable (an :class:`_MessageLengthFn`) is picklable so it can
+    be shipped to ``spawn`` multiprocessing workers.
     """
-    merge_size = int(getattr(image_processor, "merge_size", 1)) if image_processor else 1
-
-    def _measure(message: dict[str, Any]) -> int | dict[str, Any]:
-        if image_processor is None and _message_has_images(message):
-            raise ValueError(
-                "Encountered image content in message but no image_processor was provided. "
-                "Pass image_processor= to make_message_length_fn."
-            )
-        encoded = encode_qwen_messages(
-            [message],
-            tokenizer=tokenizer,
-            image_processor=image_processor,
-            include_pixels=False,
-        )
-        length = int(len(encoded["input_ids"]))
-
-        grid_thw = encoded.get("image_grid_thw", np.empty((0, 3), dtype=np.int64))
-        num_images = int(grid_thw.shape[0])
-        vision_tokens = 0
-        vision_patches = 0
-        for row in grid_thw:
-            t, h, w = int(row[0]), int(row[1]), int(row[2])
-            vision_tokens += t * (h // merge_size) * (w // merge_size)
-            vision_patches += t * h * w
-
-        return {
-            "length": length,
-            "vision_tokens": vision_tokens,
-            "vision_patches": vision_patches,
-            "num_images": num_images,
-            "image_grid_thw": grid_thw.tolist(),
-        }
-
-    return _measure
+    return _MessageLengthFn(tokenizer, image_processor)
 
 
 def encode_qwen_messages(

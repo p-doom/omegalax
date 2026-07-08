@@ -6,6 +6,7 @@ from omegalax.data.grain_pipeline import (
     build_chunk_index,
     compile_jsonl_to_arrayrecord,
     make_grain_iterator,
+    measure_message_lengths,
     pop_source_ids,
 )
 
@@ -16,5 +17,6 @@ __all__ = [
     "build_chunk_index",
     "compile_jsonl_to_arrayrecord",
     "make_grain_iterator",
+    "measure_message_lengths",
     "pop_source_ids",
 ]
