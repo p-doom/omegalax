@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import os
+from pathlib import Path
 from unittest import mock
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
@@ -741,6 +742,58 @@ class PretrainMaskAndLossTest(absltest.TestCase):
 
 
 class PretrainTrainingSmokeTest(absltest.TestCase):
+    def test_lr_schedule_horizon_can_exceed_training_stop(self):
+        train_cfg = pretrain_trainer.TrainConfig(num_steps=12, lr_schedule_steps=42_603)
+
+        self.assertEqual(train_cfg.resolved_lr_schedule_steps, 42_603)
+
+    def test_lr_schedule_horizon_cannot_precede_training_stop(self):
+        train_cfg = pretrain_trainer.TrainConfig(num_steps=12, lr_schedule_steps=11)
+
+        with self.assertRaisesRegex(ValueError, "greater than or equal to num_steps"):
+            _ = train_cfg.resolved_lr_schedule_steps
+
+    def test_pretrain_uses_lr_schedule_horizon_instead_of_training_stop(self):
+        cfg = _tiny_qwen3_5_config()
+        train_cfg = pretrain_trainer.TrainConfig(
+            seed=0,
+            batch_size=1,
+            seq_len=8,
+            num_steps=2,
+            lr_schedule_steps=10,
+            learning_rate=1e-3,
+            weight_decay=0.0,
+            lr_schedule="cosine",
+            lr_end_factor=0.1,
+            print_every=0,
+        )
+        batch = {
+            "token_ids_BT": np.asarray([[1, 2, 3, 4, 5, 6, 7, 8]], dtype=np.int32),
+            "attention_mask_BT": np.ones((1, 8), dtype=np.int32),
+            "loss_mask_BT": np.ones((1, 8), dtype=np.int32),
+            "chunk_idx_B": np.asarray([0], dtype=np.int32),
+            "metadata": {"doc_ids": ["iid"]},
+        }
+
+        _, metrics = pretrain_trainer.run_pretrain(
+            cfg,
+            train_cfg,
+            _batch_iter(batch),
+            pretrain_mode=pretrain_trainer.PretrainMode.IID_BASELINE,
+            log_every=0,
+            tp_size=1,
+            fsdp_size=1,
+            dp_size=1,
+        )
+        schedule = pretrain_trainer.build_lr_schedule(
+            peak_lr=train_cfg.learning_rate,
+            num_steps=train_cfg.lr_schedule_steps,
+            schedule=train_cfg.lr_schedule,
+            end_factor=train_cfg.lr_end_factor,
+        )
+
+        self.assertAlmostEqual(metrics["lr"], float(schedule(1)))
+
     def test_one_step_iid_pretrain(self):
         cfg = _tiny_qwen3_5_config()
         train_cfg = pretrain_trainer.TrainConfig(
@@ -854,6 +907,85 @@ class PretrainTrainingSmokeTest(absltest.TestCase):
         self.assertIn("boundary_nll", metrics)
         self.assertEqual(metrics["supervised_tokens"], 11.0)
         self.assertEqual(metrics["iid_comparable_tokens"], 9.0)
+
+    def test_statepassing_curriculum_crosses_phase_boundary(self):
+        cfg = _tiny_qwen3_5_config()
+        train_cfg = pretrain_trainer.TrainConfig(
+            seed=0,
+            batch_size=6,
+            seq_len=4,
+            num_steps=2,
+            learning_rate=1e-3,
+            weight_decay=0.0,
+            print_every=0,
+        )
+        batches = {
+            2: {
+                "token_ids_BCT": np.arange(24, dtype=np.int32).reshape(3, 2, 4) % 32,
+                "attention_mask_BCT": np.ones((3, 2, 4), dtype=np.int32),
+                "loss_mask_BCT": np.ones((3, 2, 4), dtype=np.int32),
+                "chunk_idx_BC": np.asarray([[0, 1], [2, 3], [4, 5]], dtype=np.int32),
+                "reset_state_BC": np.asarray([[True, False]] * 3, dtype=np.bool_),
+                "metadata": {"doc_ids": ["c2-a", "c2-b", "c2-c"]},
+            },
+            3: {
+                "token_ids_BCT": np.arange(24, dtype=np.int32).reshape(2, 3, 4) % 32,
+                "attention_mask_BCT": np.ones((2, 3, 4), dtype=np.int32),
+                "loss_mask_BCT": np.ones((2, 3, 4), dtype=np.int32),
+                "chunk_idx_BC": np.asarray([[0, 1, 2], [3, 4, 5]], dtype=np.int32),
+                "reset_state_BC": np.asarray([[True, False, False]] * 2, dtype=np.bool_),
+                "metadata": {"doc_ids": ["c3-a", "c3-b"]},
+            },
+        }
+        requested_phases = []
+
+        def phase_iter_factory(num_segments: int):
+            requested_phases.append(num_segments)
+            return _batch_iter(batches[num_segments])
+
+        checkpoint_manager = mock.Mock()
+        checkpoint_manager.latest_step.return_value = None
+        saved_checkpoints = []
+
+        def save_checkpoint(*_args, **kwargs):
+            saved_checkpoints.append(
+                (kwargs["global_step"], kwargs["phase_idx"], kwargs["phase_step"])
+            )
+
+        with (
+            mock.patch.object(
+                pretrain_trainer,
+                "_make_checkpoint_manager",
+                return_value=checkpoint_manager,
+            ),
+            mock.patch.object(pretrain_trainer, "_write_checkpoint_config"),
+            mock.patch.object(
+                pretrain_trainer,
+                "_save_curriculum_checkpoint",
+                side_effect=save_checkpoint,
+            ),
+        ):
+            _, metrics = pretrain_trainer.run_statepassing_curriculum(
+                cfg,
+                train_cfg,
+                phase_iter_factory,
+                train_order=[2, 3],
+                phase_steps={2: 1, 3: 1},
+                pretrain_mode=pretrain_trainer.PretrainMode.STATEPASSING_NO_BPTT,
+                save_dir=Path.cwd(),
+                save_every=1,
+                log_every=0,
+                tp_size=1,
+                fsdp_size=1,
+                dp_size=1,
+            )
+
+        self.assertEqual(requested_phases, [2, 3])
+        self.assertEqual(saved_checkpoints, [(1, 1, 0), (2, 1, 1)])
+        self.assertEqual(metrics["step"], 2)
+        self.assertEqual(metrics["phase_C"], 3)
+        self.assertEqual(metrics["phase_step"], 1)
+        self.assertIn("segment2_nll", metrics)
 
 
 class GatedDeltaNetMaskStateTest(absltest.TestCase):

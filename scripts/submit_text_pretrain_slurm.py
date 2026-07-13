@@ -5,6 +5,8 @@ from __future__ import annotations
 import dataclasses
 import datetime as dt
 import enum
+import json
+import os
 from pathlib import Path
 import re
 import shlex
@@ -15,12 +17,14 @@ from absl import app, flags
 FLAGS = flags.FLAGS
 
 _SOURCE_ROOT = Path("/fast/project/HFMI_SynergyUnit/p-doom_shared/salan")
-_DATASET_ROOT = _SOURCE_ROOT / "datasets" / "fineweb_edu_dedup_30b_8kto32k"
-_INDEX_ROOT = _SOURCE_ROOT / "pretrain_indexes" / "fineweb_edu_dedup_30b_8kto32k_4096_eos248046"
+_DATASET_ROOT = _SOURCE_ROOT / "datasets" / "fineweb_edu_dedup_2048_2kto32k"
+_INDEX_ROOT = _SOURCE_ROOT / "pretrain_indexes" / "fineweb_edu_dedup_2048_2kto32k_2048_eos248046"
 _SAVE_ROOT = _SOURCE_ROOT / "runs" / "statepassing_pretrain"
 _LOG_DIR = _SOURCE_ROOT / "logs" / "statepassing_pretrain"
 _JAX_CACHE_ROOT = _SOURCE_ROOT / "jax_cache" / "statepassing_pretrain"
 _DEFAULT_PRETRAIN_HIDDEN_SIZE = 768
+_STATEPASSING_FIXED_C_INDEX_FORMAT = "omegalax_pretrain_statepassing_fixed_c_index_v1"
+_STATEPASSING_CURRICULUM_INDEX_FORMAT = "omegalax_pretrain_statepassing_curriculum_index_v1"
 _WIKI_PROGRESS_PATH = Path(
     "/fast/home/salan.isaqzoi/gh_projects/salanobp/codex-setup/Wiki/documentation/"
     "statepassing_pretrain_experiment_progress.md"
@@ -34,6 +38,12 @@ class PretrainMode(enum.StrEnum):
 
 
 flags.DEFINE_string("submit_run_id", None, "Run id used for jobs/checkpoints/logs.")
+flags.DEFINE_multi_enum(
+    "submit_experiment_mode",
+    [mode.value for mode in PretrainMode],
+    [mode.value for mode in PretrainMode],
+    "Experiment modes to submit.",
+)
 flags.DEFINE_string("submit_dataset_root", str(_DATASET_ROOT), "Doc-chain dataset root.")
 flags.DEFINE_string("submit_source_root", str(_SOURCE_ROOT), "Shared source root for staging.")
 flags.DEFINE_string("submit_index_root", str(_INDEX_ROOT), "Reusable pretraining index root.")
@@ -65,6 +75,21 @@ flags.DEFINE_bool(
 flags.DEFINE_integer("submit_index_cpus", 32, "CPUs for the index-build job.")
 flags.DEFINE_integer("submit_seq_len", 2048, "Segment length for index building and training.")
 flags.DEFINE_integer("submit_num_segments", 2, "Fixed chunks per statepassing window.")
+flags.DEFINE_string(
+    "submit_curriculum_allocation_order",
+    None,
+    "Comma-separated strictly-descending segment lengths for curriculum index assignment.",
+)
+flags.DEFINE_string(
+    "submit_curriculum_train_order",
+    None,
+    "Comma-separated segment lengths for curriculum training order.",
+)
+flags.DEFINE_multi_string(
+    "submit_curriculum_max_tokens",
+    [],
+    "Optional C:max_tokens caps for curriculum segments; may be repeated or comma-separated.",
+)
 flags.DEFINE_integer("submit_batch_size", 128, "Global number of submit_seq_len-token segments.")
 flags.DEFINE_integer("submit_grad_accum_steps", 4, "Gradient accumulation steps.")
 flags.DEFINE_integer("submit_max_tokens", 15_000_000_000, "Total token budget.")
@@ -113,6 +138,20 @@ flags.DEFINE_bool(
 )
 flags.DEFINE_integer("submit_monitor_poll_seconds", 1200, "Monitor poll interval.")
 flags.DEFINE_string("submit_monitor_time", "24:00:00", "Monitor job time limit.")
+flags.DEFINE_string(
+    "submit_codex_session_id",
+    os.environ.get("CODEX_THREAD_ID"),
+    "Codex session/thread id passed to the monitor for failure and health-check prompts.",
+)
+flags.DEFINE_integer(
+    "submit_monitor_codex_interval_seconds",
+    0,
+    "If >0, monitor prompts Codex every N seconds after any monitored job starts running.",
+)
+flags.DEFINE_bool(
+    "submit_monitor_codex_on_failure", False, "Prompt Codex immediately on monitor failures."
+)
+flags.DEFINE_integer("submit_monitor_codex_timeout_seconds", 1800, "Codex prompt timeout.")
 
 
 def _quote(value: str | Path | int | float) -> str:
@@ -138,6 +177,49 @@ def _all_modes() -> list[PretrainMode]:
     ]
 
 
+def _selected_modes() -> list[PretrainMode]:
+    return [PretrainMode(raw_mode) for raw_mode in _flag_value("submit_experiment_mode")]
+
+
+def _parse_segment_order(value: str | None, *, flag_name: str) -> list[int]:
+    if value is None:
+        return []
+    order = [int(part.strip()) for part in value.split(",") if part.strip()]
+    if not order:
+        raise ValueError(f"--{flag_name} must not be empty")
+    return order
+
+
+def _curriculum_shape_num_segments() -> list[int]:
+    allocation_order = _parse_segment_order(
+        _flag_value("submit_curriculum_allocation_order"),
+        flag_name="submit_curriculum_allocation_order",
+    )
+    train_order = _parse_segment_order(
+        _flag_value("submit_curriculum_train_order"),
+        flag_name="submit_curriculum_train_order",
+    )
+    if bool(allocation_order) != bool(train_order):
+        raise ValueError(
+            "--submit_curriculum_allocation_order and --submit_curriculum_train_order "
+            "must be set together"
+        )
+    return allocation_order or [int(_flag_value("submit_num_segments"))]
+
+
+def _wants_curriculum() -> bool:
+    return bool(
+        _flag_value("submit_curriculum_allocation_order")
+        or _flag_value("submit_curriculum_train_order")
+    )
+
+
+def _index_format_for_flags() -> str:
+    if _wants_curriculum():
+        return _STATEPASSING_CURRICULUM_INDEX_FORMAT
+    return _STATEPASSING_FIXED_C_INDEX_FORMAT
+
+
 @dataclasses.dataclass(frozen=True)
 class RunSpec:
     mode: PretrainMode
@@ -155,18 +237,56 @@ class RunSpec:
         return self.batch_size * self.grad_accum_steps
 
 
-def indexes_ready(index_root: str | Path) -> bool:
+def indexes_ready(index_root: str | Path, *, expected_format: str | None = None) -> bool:
     root = Path(index_root).expanduser().resolve()
+    metadata_path = root / "metadata.json"
+    if not metadata_path.exists():
+        return False
+    try:
+        metadata = json.loads(metadata_path.read_text())
+    except json.JSONDecodeError:
+        return False
+    index_format = metadata.get("format")
+    if expected_format is not None and index_format != expected_format:
+        return False
+    if index_format == _STATEPASSING_CURRICULUM_INDEX_FORMAT:
+        splits = dict(metadata.get("splits") or {})
+        for split in ("train", "val"):
+            split_metadata = dict(splits.get(split) or {})
+            iid_metadata = dict(split_metadata.get("iid") or {})
+            iid_path = iid_metadata.get("path")
+            if iid_path is None or not (root / str(iid_path) / "metadata.json").exists():
+                return False
+            phases = dict(split_metadata.get("phases") or {})
+            if not phases:
+                return False
+            for phase_metadata in phases.values():
+                phase_path = dict(phase_metadata).get("path")
+                if phase_path is None or not (root / str(phase_path) / "metadata.json").exists():
+                    return False
+        return True
+    if index_format != _STATEPASSING_FIXED_C_INDEX_FORMAT:
+        return False
     for split in ("train", "val"):
         if not (root / split / "metadata.json").exists():
+            return False
+        if not (root / "iid" / split / "metadata.json").exists():
             return False
     return True
 
 
 def any_index_metadata_exists(index_root: str | Path) -> bool:
     root = Path(index_root).expanduser().resolve()
+    if (root / "metadata.json").exists():
+        return True
+    if next(root.glob("c*/train/metadata.json"), None) is not None:
+        return True
+    if next(root.glob("c*/val/metadata.json"), None) is not None:
+        return True
     for split in ("train", "val"):
         if (root / split / "metadata.json").exists():
+            return True
+        if (root / "iid" / split / "metadata.json").exists():
             return True
     return False
 
@@ -178,6 +298,7 @@ def validate_submit_shape(
     gpus_per_node: int,
     num_segments: int = 2,
     single_process_per_run: bool = False,
+    require_statepassing_divisibility: bool = True,
 ) -> int:
     total_tasks = int(nodes) * int(gpus_per_node)
     if total_tasks <= 0:
@@ -186,11 +307,16 @@ def validate_submit_shape(
         raise ValueError(
             f"fsdp_size={total_tasks} must divide hidden_size={_DEFAULT_PRETRAIN_HIDDEN_SIZE}."
         )
-    divisor = int(num_segments) * total_tasks
-    if batch_size % divisor != 0:
+    if require_statepassing_divisibility:
+        divisor = int(num_segments) * total_tasks
+        if batch_size % divisor != 0:
+            raise ValueError(
+                f"Statepassing batch_size={batch_size} must be divisible by "
+                f"num_segments * total_tasks={divisor}."
+            )
+    elif batch_size % total_tasks != 0:
         raise ValueError(
-            f"Statepassing batch_size={batch_size} must be divisible by "
-            f"num_segments * total_tasks={divisor}."
+            f"IID batch_size={batch_size} must be divisible by total_tasks={total_tasks}."
         )
     return total_tasks
 
@@ -203,7 +329,9 @@ def parse_run_specs(
     default_batch_size: int,
     default_grad_accum_steps: int,
     single_process_per_run: bool = False,
+    modes: list[PretrainMode] | None = None,
 ) -> list[RunSpec]:
+    modes = list(modes or _all_modes())
     if not raw_shapes:
         specs = [
             RunSpec(
@@ -213,7 +341,7 @@ def parse_run_specs(
                 batch_size=default_batch_size,
                 grad_accum_steps=default_grad_accum_steps,
             )
-            for mode in _all_modes()
+            for mode in modes
         ]
     else:
         specs_by_mode: dict[PretrainMode, RunSpec] = {}
@@ -234,11 +362,15 @@ def parse_run_specs(
                 grad_accum_steps=int(parts[3]),
             )
 
-        missing = [mode.value for mode in _all_modes() if mode not in specs_by_mode]
+        extra = [mode.value for mode in specs_by_mode if mode not in modes]
+        if extra:
+            raise ValueError(f"--submit_mode_shape provided for unselected modes: {extra}")
+
+        missing = [mode.value for mode in modes if mode not in specs_by_mode]
         if missing:
             raise ValueError(f"Missing --submit_mode_shape entries for modes: {missing}")
 
-        specs = [specs_by_mode[mode] for mode in _all_modes()]
+        specs = [specs_by_mode[mode] for mode in modes]
     batch_sizes = {spec.batch_size for spec in specs}
     grad_accum_steps = {spec.grad_accum_steps for spec in specs}
     if len(batch_sizes) != 1 or len(grad_accum_steps) != 1:
@@ -248,13 +380,23 @@ def parse_run_specs(
             f"grad_accum_steps={sorted(grad_accum_steps)}"
         )
     for spec in specs:
-        validate_submit_shape(
-            batch_size=spec.batch_size,
-            nodes=spec.nodes,
-            gpus_per_node=spec.gpus_per_node,
-            num_segments=_flag_value("submit_num_segments"),
-            single_process_per_run=single_process_per_run,
-        )
+        if spec.mode is PretrainMode.IID_BASELINE:
+            validate_submit_shape(
+                batch_size=spec.batch_size,
+                nodes=spec.nodes,
+                gpus_per_node=spec.gpus_per_node,
+                single_process_per_run=single_process_per_run,
+                require_statepassing_divisibility=False,
+            )
+            continue
+        for num_segments in _curriculum_shape_num_segments():
+            validate_submit_shape(
+                batch_size=spec.batch_size,
+                nodes=spec.nodes,
+                gpus_per_node=spec.gpus_per_node,
+                num_segments=num_segments,
+                single_process_per_run=single_process_per_run,
+            )
     return specs
 
 
@@ -323,9 +465,35 @@ def render_index_sbatch(
     eos_check_records: int,
     min_eos_fraction: float,
     overwrite: bool,
+    trim_batch_size: int | None = None,
+    trim_grad_accum_steps: int | None = None,
 ) -> str:
     splits = "--split=train --split=val"
     overwrite_flag = " --overwrite" if overwrite else ""
+    trim_batch_size = (
+        _flag_value("submit_batch_size") if trim_batch_size is None else int(trim_batch_size)
+    )
+    trim_grad_accum_steps = (
+        _flag_value("submit_grad_accum_steps")
+        if trim_grad_accum_steps is None
+        else int(trim_grad_accum_steps)
+    )
+    if _wants_curriculum():
+        index_mode_flags = [
+            f"--curriculum_allocation_order={_quote(_flag_value('submit_curriculum_allocation_order'))}",
+            f"--curriculum_train_order={_quote(_flag_value('submit_curriculum_train_order'))}",
+            f"--curriculum_trim_batch_size={trim_batch_size}",
+            f"--curriculum_trim_grad_accum_steps={trim_grad_accum_steps}",
+        ]
+        for raw_cap in _flag_value("submit_curriculum_max_tokens") or []:
+            index_mode_flags.append(f"--curriculum_max_tokens={_quote(raw_cap)}")
+    else:
+        index_mode_flags = [
+            f"--num_segments={_flag_value('submit_num_segments')}",
+            f"--fixed_trim_batch_size={trim_batch_size}",
+            f"--fixed_trim_grad_accum_steps={trim_grad_accum_steps}",
+        ]
+    index_mode_flags_text = " \\\n  ".join(index_mode_flags)
     return f"""{
         _sbatch_header(
             job_name=f"sp_index_{run_id}",
@@ -350,7 +518,7 @@ uv run python scripts/build_pretrain_indexes.py \\
   --out_dir={_quote(index_root)} \\
   {splits} \\
   --chunk_length={_flag_value("submit_seq_len")} \\
-  --num_segments={_flag_value("submit_num_segments")} \\
+  {index_mode_flags_text} \\
   --eos_id=248046 \\
   --records_per_shard={records_per_shard} \\
   --eos_check_records={eos_check_records} \\
@@ -374,8 +542,7 @@ def _train_flags(
     dp_size = total_tasks if single_process_per_run else 1
     flags_out = [
         f"--pretrain_mode={mode.value}",
-        "--train_index_path=${TRAIN_INDEX_ROOT}/train",
-        "--val_index_path=${TRAIN_INDEX_ROOT}/val",
+        "--train_index_path=${TRAIN_INDEX_ROOT}",
         f"--seq_len={_flag_value('submit_seq_len')}",
         f"--batch_size={batch_size}",
         f"--max_tokens={_flag_value('submit_max_tokens')}",
@@ -585,7 +752,14 @@ def render_monitor_sbatch(
     job_ids: list[str],
     wiki_path: str | Path,
     poll_seconds: int,
+    codex_session_id: str | None = None,
+    codex_interval_seconds: int = 0,
+    codex_on_failure: bool = False,
+    codex_timeout_seconds: int = 1800,
 ) -> str:
+    codex_session_flag = (
+        f" \\\n  --monitor_codex_session_id={_quote(codex_session_id)}" if codex_session_id else ""
+    )
     return f"""{
         _sbatch_header(
             job_name=f"sp_monitor_{run_id}",
@@ -608,7 +782,10 @@ uv run python scripts/monitor_text_pretrain_slurm.py \\
   --monitor_job_ids={_quote(",".join(job_ids))} \\
   --monitor_log_dir={_quote(log_dir)} \\
   --monitor_wiki_path={_quote(wiki_path)} \\
-  --monitor_poll_seconds={poll_seconds}
+  --monitor_poll_seconds={poll_seconds} \\
+  --monitor_codex_interval_seconds={codex_interval_seconds} \\
+  --monitor_codex_on_failure={codex_on_failure} \\
+  --monitor_codex_timeout_seconds={codex_timeout_seconds}{codex_session_flag}
 """
 
 
@@ -634,6 +811,7 @@ def main(_) -> None:
     log_dir = Path(FLAGS.submit_log_dir).expanduser().resolve() / run_id
     job_dir = log_dir / "jobs"
     job_dir.mkdir(parents=True, exist_ok=True)
+    selected_modes = _selected_modes()
     run_specs = parse_run_specs(
         FLAGS.submit_mode_shape,
         nodes_per_run=FLAGS.submit_nodes_per_run,
@@ -641,12 +819,16 @@ def main(_) -> None:
         default_batch_size=FLAGS.submit_batch_size,
         default_grad_accum_steps=FLAGS.submit_grad_accum_steps,
         single_process_per_run=FLAGS.submit_single_process_per_run,
+        modes=selected_modes,
     )
     wandb_resume_ids = parse_wandb_resume_ids(FLAGS.submit_wandb_resume_id)
 
     index_root = Path(FLAGS.submit_index_root).expanduser().resolve()
+    expected_index_format = _index_format_for_flags()
     index_job_id = None
-    if FLAGS.submit_build_indexes and not indexes_ready(index_root):
+    if FLAGS.submit_build_indexes and not indexes_ready(
+        index_root, expected_format=expected_index_format
+    ):
         if any_index_metadata_exists(index_root) and not FLAGS.submit_overwrite_indexes:
             raise ValueError(
                 f"Partial indexes found under {index_root}; rerun with "
@@ -668,10 +850,12 @@ def main(_) -> None:
                 eos_check_records=FLAGS.submit_eos_check_records,
                 min_eos_fraction=FLAGS.submit_min_eos_fraction,
                 overwrite=FLAGS.submit_overwrite_indexes,
+                trim_batch_size=run_specs[0].batch_size,
+                trim_grad_accum_steps=run_specs[0].grad_accum_steps,
             )
         )
         index_job_id = _submit(index_script, dependency=None, dry_run=FLAGS.submit_dry_run)
-    elif not indexes_ready(index_root):
+    elif not indexes_ready(index_root, expected_format=expected_index_format):
         raise ValueError(f"Indexes are not ready and --submit_build_indexes=false: {index_root}")
     else:
         print(f"Indexes already present: {index_root}", flush=True)
@@ -725,6 +909,10 @@ def main(_) -> None:
                 + train_job_ids,
                 wiki_path=FLAGS.submit_wiki_path,
                 poll_seconds=FLAGS.submit_monitor_poll_seconds,
+                codex_session_id=FLAGS.submit_codex_session_id,
+                codex_interval_seconds=FLAGS.submit_monitor_codex_interval_seconds,
+                codex_on_failure=FLAGS.submit_monitor_codex_on_failure,
+                codex_timeout_seconds=FLAGS.submit_monitor_codex_timeout_seconds,
             )
         )
         _submit(monitor_script, dependency=None, dry_run=FLAGS.submit_dry_run)

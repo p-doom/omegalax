@@ -23,7 +23,11 @@ from omegalax.data.pretrain_data_set import (
     write_json_arrayrecord_dataset,
 )
 from omegalax.data.pretrain_statepassing import (
+    STATEPASSING_CURRICULUM_INDEX_FORMAT,
+    STATEPASSING_FIXED_C_INDEX_FORMAT,
     STATEPASSING_WINDOW_INDEX_FORMAT,
+    build_statepassing_curriculum_indexes,
+    build_statepassing_fixed_c_indexes,
     build_statepassing_window_index,
     make_statepassing_iterator,
 )
@@ -67,6 +71,13 @@ class PretrainStatepassingTest(absltest.TestCase):
 
     def _read_index_records(self, index_path: Path) -> list[dict]:
         return [record for _, record in iter_json_arrayrecord_records(index_path)]
+
+    def _chunk_keys(self, records: list[dict]) -> list[tuple[int, int, int]]:
+        return [
+            (int(record["bucket_idx"]), int(record["record_idx"]), int(record["start_chunk"]) + i)
+            for record in records
+            for i in range(int(record["num_segments"]))
+        ]
 
     def _iterator(self, **kwargs):
         return make_statepassing_iterator(
@@ -215,6 +226,331 @@ class PretrainStatepassingTest(absltest.TestCase):
 
             self.assertLen(records, 1)
             self.assertEqual(records[0]["eos_token_idx"], 7)
+
+    def test_fixed_c_bundle_writes_statepassing_and_iid_same_chunks(self):
+        with test_temp_dir() as tmp:
+            tmpdir = Path(tmp)
+            root = tmpdir / "docs"
+            write_json_arrayrecord_dataset(
+                (
+                    {
+                        "dataset_format": DOC_CHAIN_FORMAT,
+                        "doc_id": f"doc-{idx}",
+                        "token_ids": list(range(10)),
+                        "doc_token_count": 10,
+                    }
+                    for idx in range(3)
+                ),
+                root / "train" / "bucket_2k",
+                records_per_shard=100,
+                overwrite=False,
+                metadata={"dataset_format": DOC_CHAIN_FORMAT},
+            )
+
+            index_root = build_statepassing_fixed_c_indexes(
+                root,
+                tmpdir / "fixed",
+                num_segments=3,
+                trim_batch_size=6,
+                trim_grad_accum_steps=1,
+                chunk_length=1,
+                splits=("train",),
+                records_per_shard=100,
+            )
+
+            metadata = load_arrayrecord_metadata(index_root)
+            train_records = self._read_index_records(index_root / "train")
+            iid_records = self._read_index_records(index_root / "iid" / "train")
+
+            self.assertEqual(metadata["format"], STATEPASSING_FIXED_C_INDEX_FORMAT)
+            self.assertEqual(metadata["num_segments"], 3)
+            self.assertEqual(metadata["trim_batch_size"], 6)
+            self.assertEqual(metadata["trim_grad_accum_steps"], 1)
+            self.assertFalse((index_root / "c3").exists())
+            self.assertEqual(load_arrayrecord_metadata(index_root / "train")["num_segments"], 3)
+            self.assertEqual(
+                load_arrayrecord_metadata(index_root / "iid" / "train")["num_segments"], 1
+            )
+            self.assertEqual(metadata["splits"]["train"]["raw_num_windows"], 9)
+            self.assertEqual(metadata["splits"]["train"]["num_windows"], 8)
+            self.assertEqual(metadata["statepassing_steps"], 4)
+            self.assertEqual(metadata["iid_steps"], 4)
+            self.assertEqual(
+                set(self._chunk_keys(iid_records)), set(self._chunk_keys(train_records))
+            )
+            self.assertFalse({(0, 2, 6), (0, 2, 7), (0, 2, 8)} & set(self._chunk_keys(iid_records)))
+
+    def test_fixed_c_bundle_eos_repair_uses_last_retained_chunk_after_trim(self):
+        with test_temp_dir() as tmp:
+            tmpdir = Path(tmp)
+            root = tmpdir / "docs"
+            write_json_arrayrecord_dataset(
+                (
+                    {
+                        "dataset_format": DOC_CHAIN_FORMAT,
+                        "doc_id": "doc-eos",
+                        "token_ids": list(range(19)) + [DEFAULT_EOS_ID],
+                        "doc_token_count": 20,
+                    },
+                ),
+                root / "train" / "bucket_2k",
+                records_per_shard=100,
+                overwrite=False,
+                metadata={"dataset_format": DOC_CHAIN_FORMAT},
+            )
+
+            index_root = build_statepassing_fixed_c_indexes(
+                root,
+                tmpdir / "fixed",
+                num_segments=3,
+                trim_batch_size=6,
+                trim_grad_accum_steps=1,
+                chunk_length=2,
+                splits=("train",),
+                records_per_shard=100,
+            )
+
+            train_records = self._read_index_records(index_root / "train")
+            iid_records = self._read_index_records(index_root / "iid" / "train")
+            repaired_train = [
+                record for record in train_records if record["eos_token_idx"] is not None
+            ]
+            repaired_iid = [record for record in iid_records if record["eos_token_idx"] is not None]
+
+            self.assertEqual([record["start_chunk"] for record in train_records], [0, 3])
+            self.assertEqual(
+                [(record["start_chunk"], record["eos_token_idx"]) for record in repaired_train],
+                [(3, 11)],
+            )
+            self.assertEqual(
+                [(record["start_chunk"], record["eos_token_idx"]) for record in repaired_iid],
+                [(5, 11)],
+            )
+
+    def test_fixed_c_bundle_rejects_invalid_trim_settings(self):
+        with self.assertRaisesRegex(ValueError, "fixed_trim_batch_size"):
+            build_statepassing_fixed_c_indexes(
+                "/missing/root",
+                "/missing/out",
+                num_segments=3,
+                trim_batch_size=5,
+                trim_grad_accum_steps=1,
+                chunk_length=1,
+                splits=("train",),
+            )
+
+    def test_curriculum_index_greedy_assignment_6_4_2_and_iid_same_chunks(self):
+        with test_temp_dir() as tmp:
+            tmpdir = Path(tmp)
+            root = tmpdir / "docs"
+            write_json_arrayrecord_dataset(
+                (
+                    {
+                        "dataset_format": DOC_CHAIN_FORMAT,
+                        "doc_id": f"doc-{idx}",
+                        "token_ids": list(range(20)),
+                        "doc_token_count": 20,
+                    }
+                    for idx in range(6)
+                ),
+                root / "train" / "bucket_2k",
+                records_per_shard=100,
+                overwrite=False,
+                metadata={"dataset_format": DOC_CHAIN_FORMAT},
+            )
+
+            index_root = build_statepassing_curriculum_indexes(
+                root,
+                tmpdir / "curriculum",
+                allocation_order=[6, 4, 2],
+                train_order=[2, 4, 6],
+                trim_batch_size=12,
+                trim_grad_accum_steps=1,
+                chunk_length=1,
+                splits=("train",),
+                records_per_shard=100,
+            )
+
+            metadata = load_arrayrecord_metadata(index_root)
+            c6_records = self._read_index_records(index_root / "c6" / "train")
+            c2_records = self._read_index_records(index_root / "c2" / "train")
+            iid_records = self._read_index_records(index_root / "iid" / "train")
+
+            self.assertEqual(metadata["format"], STATEPASSING_CURRICULUM_INDEX_FORMAT)
+            self.assertEqual(
+                [record["start_chunk"] for record in c6_records[:3]],
+                [0, 6, 12],
+            )
+            self.assertEqual(c2_records[0]["start_chunk"], 18)
+            self.assertEqual(
+                load_arrayrecord_metadata(index_root / "c4" / "train")["num_records"],
+                0,
+            )
+            phase_keys = self._chunk_keys(c6_records) + self._chunk_keys(c2_records)
+            self.assertLen(phase_keys, len(set(phase_keys)))
+            self.assertEqual(set(self._chunk_keys(iid_records)), set(phase_keys))
+
+    def test_curriculum_index_greedy_assignment_16_12_8_4(self):
+        with test_temp_dir() as tmp:
+            tmpdir = Path(tmp)
+            root = tmpdir / "docs"
+            write_json_arrayrecord_dataset(
+                (
+                    {
+                        "dataset_format": DOC_CHAIN_FORMAT,
+                        "doc_id": f"doc-{idx}",
+                        "token_ids": list(range(44)),
+                        "doc_token_count": 44,
+                    }
+                    for idx in range(12)
+                ),
+                root / "train" / "bucket_2k",
+                records_per_shard=100,
+                overwrite=False,
+                metadata={"dataset_format": DOC_CHAIN_FORMAT},
+            )
+
+            index_root = build_statepassing_curriculum_indexes(
+                root,
+                tmpdir / "curriculum",
+                allocation_order=[16, 12, 8, 4],
+                train_order=[4, 8, 12, 16],
+                trim_batch_size=48,
+                trim_grad_accum_steps=1,
+                chunk_length=1,
+                splits=("train",),
+                records_per_shard=100,
+            )
+
+            c16_records = self._read_index_records(index_root / "c16" / "train")
+            c12_records = self._read_index_records(index_root / "c12" / "train")
+
+            self.assertEqual(
+                [record["start_chunk"] for record in c16_records[:2]],
+                [0, 16],
+            )
+            self.assertEqual(c12_records[0]["start_chunk"], 32)
+            self.assertEqual(
+                load_arrayrecord_metadata(index_root / "c8" / "train")["num_records"],
+                0,
+            )
+            self.assertEqual(
+                load_arrayrecord_metadata(index_root / "c4" / "train")["num_records"],
+                0,
+            )
+
+    def test_curriculum_index_applies_caps_and_trims_to_full_steps(self):
+        with test_temp_dir() as tmp:
+            tmpdir = Path(tmp)
+            root = tmpdir / "docs"
+            write_json_arrayrecord_dataset(
+                (
+                    {
+                        "dataset_format": DOC_CHAIN_FORMAT,
+                        "doc_id": f"doc-{idx}",
+                        "token_ids": list(range(20)),
+                        "doc_token_count": 20,
+                    }
+                    for idx in range(7)
+                ),
+                root / "train" / "bucket_2k",
+                records_per_shard=100,
+                overwrite=False,
+                metadata={"dataset_format": DOC_CHAIN_FORMAT},
+            )
+
+            index_root = build_statepassing_curriculum_indexes(
+                root,
+                tmpdir / "curriculum",
+                allocation_order=[6, 4, 2],
+                train_order=[2, 4, 6],
+                max_tokens_by_num_segments={2: 12},
+                trim_batch_size=12,
+                trim_grad_accum_steps=1,
+                chunk_length=1,
+                splits=("train",),
+                records_per_shard=100,
+            )
+
+            split_metadata = load_arrayrecord_metadata(index_root)["splits"]["train"]
+
+            self.assertEqual(split_metadata["phases"]["6"]["raw_num_windows"], 21)
+            self.assertEqual(split_metadata["phases"]["6"]["num_windows"], 20)
+            self.assertEqual(split_metadata["phases"]["6"]["phase_steps"], 10)
+            self.assertEqual(split_metadata["phases"]["2"]["raw_num_windows"], 6)
+            self.assertEqual(split_metadata["phases"]["2"]["num_windows"], 6)
+            self.assertEqual(split_metadata["phases"]["2"]["phase_steps"], 1)
+            self.assertEqual(split_metadata["iid"]["num_chunks"], 132)
+            self.assertEqual(split_metadata["iid"]["iid_steps"], 11)
+
+    def test_curriculum_index_rejects_unusable_trim_batch_size(self):
+        with self.assertRaisesRegex(ValueError, "curriculum_trim_batch_size"):
+            build_statepassing_curriculum_indexes(
+                "/missing/root",
+                "/missing/out",
+                allocation_order=[6, 4, 2],
+                train_order=[2, 4, 6],
+                trim_batch_size=6,
+                trim_grad_accum_steps=2,
+                chunk_length=1,
+                splits=("train",),
+            )
+
+    def test_curriculum_eos_repair_uses_last_retained_chunk_after_trim(self):
+        with test_temp_dir() as tmp:
+            tmpdir = Path(tmp)
+            root = tmpdir / "docs"
+            write_json_arrayrecord_dataset(
+                (
+                    {
+                        "dataset_format": DOC_CHAIN_FORMAT,
+                        "doc_id": f"doc-{idx}",
+                        "token_ids": list(range(39)) + [DEFAULT_EOS_ID],
+                        "doc_token_count": 40,
+                    }
+                    for idx in range(2)
+                ),
+                root / "train" / "bucket_2k",
+                records_per_shard=100,
+                overwrite=False,
+                metadata={"dataset_format": DOC_CHAIN_FORMAT},
+            )
+
+            index_root = build_statepassing_curriculum_indexes(
+                root,
+                tmpdir / "curriculum",
+                allocation_order=[6, 4, 2],
+                train_order=[2, 4, 6],
+                trim_batch_size=12,
+                trim_grad_accum_steps=1,
+                chunk_length=2,
+                splits=("train",),
+                records_per_shard=100,
+            )
+
+            c6_records = self._read_index_records(index_root / "c6" / "train")
+            iid_records = self._read_index_records(index_root / "iid" / "train")
+            repaired_c6 = [record for record in c6_records if record["eos_token_idx"] is not None]
+            repaired_iid = [record for record in iid_records if record["eos_token_idx"] is not None]
+
+            self.assertEqual(
+                load_arrayrecord_metadata(index_root / "c2" / "train")["num_records"],
+                0,
+            )
+            self.assertEqual(
+                [
+                    (record["record_idx"], record["start_chunk"], record["eos_token_idx"])
+                    for record in repaired_c6
+                ],
+                [(0, 12, 35), (1, 12, 35)],
+            )
+            self.assertEqual(
+                [
+                    (record["record_idx"], record["start_chunk"], record["eos_token_idx"])
+                    for record in repaired_iid
+                ],
+                [(0, 17, 35), (1, 17, 35)],
+            )
 
     def test_real_batch_is_window_by_c_chunks_by_t(self):
         batch = next(self._iterator())

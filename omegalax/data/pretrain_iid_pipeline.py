@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import Any
@@ -17,10 +16,8 @@ from omegalax.data.pretrain_data_set import (
     BATCH_PRETRAIN_METADATA_KEY,
     DataSetReader,
     build_chunk_arrays,
-    calculate_samples_per_process,
     load_arrayrecord_metadata,
-    num_pretrain_positions,
-    num_pretrain_records_usable,
+    make_dataset_index,
     resolve_arrayrecord_paths,
     resolve_pretrain_dp,
     rewrite_data_set_root_path,
@@ -41,130 +38,6 @@ def _load_window_index_metadata(index_path: str | Path, chunk_length: int | None
             f"chunk_length mismatch: index has {index_chunk_length}, loader got {chunk_length}"
         )
     return metadata
-
-
-class _WindowChunkRecordLookup:
-    def __init__(
-        self,
-        *,
-        index_shard_paths: Sequence[str | Path],
-        num_windows: int,
-        num_segments: int,
-        chunk_length: int,
-        epoch_samples_per_process: int,
-        dp_size: int,
-        dp_index: int,
-        shuffle: bool,
-        seed: int,
-        shuffle_rounds: int,
-    ) -> None:
-        self.index_shard_paths = [
-            str(Path(path).expanduser().resolve()) for path in index_shard_paths
-        ]
-        self.num_windows = int(num_windows)
-        self.num_segments = int(num_segments)
-        self.chunk_length = int(chunk_length)
-        self.num_records = self.num_windows * self.num_segments
-        self.epoch_samples_per_process = int(epoch_samples_per_process)
-        self.dp_size = int(dp_size)
-        self.dp_index = int(dp_index)
-        self.shuffle = bool(shuffle)
-        self.seed = int(seed)
-        self.shuffle_rounds = int(shuffle_rounds)
-        self._source: grain.sources.ArrayRecordDataSource | None = None
-
-    def _index_source(self) -> grain.sources.ArrayRecordDataSource:
-        if self._source is None:
-            self._source = grain.sources.ArrayRecordDataSource(self.index_shard_paths)
-        return self._source
-
-    def __call__(self, absolute_pos: int) -> dict[str, Any]:
-        epoch, local_pos = divmod(int(absolute_pos), self.epoch_samples_per_process)
-        global_pos = self.dp_index + local_pos * self.dp_size
-        if self.shuffle:
-            virtual_idx = grain.experimental.index_shuffle(
-                global_pos,
-                self.num_records - 1,
-                self.seed + epoch,
-                self.shuffle_rounds,
-            )
-        else:
-            virtual_idx = global_pos
-
-        window_record_idx, chunk_offset = divmod(int(virtual_idx), self.num_segments)
-        window_record = json.loads(self._index_source()[window_record_idx])
-        chunk_idx = int(window_record["start_chunk"]) + chunk_offset
-        start = chunk_idx * self.chunk_length
-        end = min(start + self.chunk_length, int(window_record["doc_token_count"]))
-        eos_token_idx = window_record.get("eos_token_idx")
-        if eos_token_idx is not None:
-            eos_token_idx = int(eos_token_idx)
-            if eos_token_idx < start or eos_token_idx >= end:
-                eos_token_idx = None
-
-        return {
-            "bucket_idx": int(window_record["bucket_idx"]),
-            "record_idx": int(window_record["record_idx"]),
-            "doc_id": str(window_record["doc_id"]),
-            "window_idx": int(window_record["window_idx"]),
-            "chunk_offset": int(chunk_offset),
-            "chunk_idx": int(chunk_idx),
-            "start": int(start),
-            "end": int(end),
-            "doc_token_count": int(window_record["doc_token_count"]),
-            "eos_token_idx": eos_token_idx,
-        }
-
-
-def _make_window_chunk_dataset_index(
-    *,
-    index_shard_paths: Sequence[str | Path],
-    num_windows: int,
-    num_segments: int,
-    chunk_length: int,
-    num_epochs: int | None,
-    dp_size: int,
-    dp_index: int,
-    shuffle: bool,
-    seed: int,
-    shuffle_rounds: int,
-    records_per_local_batch: int,
-) -> tuple[grain.MapDataset, int]:
-    num_records = int(num_windows) * int(num_segments)
-    usable_records = num_pretrain_records_usable(
-        num_records=num_records,
-        dp_size=dp_size,
-        records_per_local_batch=records_per_local_batch,
-    )
-    epoch_samples_per_process = calculate_samples_per_process(
-        num_records=usable_records,
-        dp_size=dp_size,
-        dp_index=dp_index,
-    )
-    if not epoch_samples_per_process:
-        raise ValueError(
-            f"No complete pretrain batch assigned to dp_index={dp_index} "
-            f"with dp_size={dp_size} and records_per_local_batch={records_per_local_batch}"
-        )
-    total_samples_per_process = num_pretrain_positions(
-        epoch_samples_per_process=epoch_samples_per_process,
-        num_epochs=num_epochs,
-    )
-    dataset_index = grain.MapDataset.range(total_samples_per_process).map(
-        _WindowChunkRecordLookup(
-            index_shard_paths=index_shard_paths,
-            num_windows=num_windows,
-            num_segments=num_segments,
-            chunk_length=chunk_length,
-            epoch_samples_per_process=epoch_samples_per_process,
-            dp_size=dp_size,
-            dp_index=dp_index,
-            shuffle=shuffle,
-            seed=seed,
-            shuffle_rounds=shuffle_rounds,
-        )
-    )
-    return dataset_index, epoch_samples_per_process
 
 
 def _make_batch(
@@ -189,6 +62,14 @@ def _make_batch(
     for entry in entries:
         bucket_idx = int(entry["bucket_idx"])
         record_idx = int(entry["record_idx"])
+        chunk_idx = int(entry["start_chunk"])
+        start = chunk_idx * int(chunk_length)
+        end = min(start + int(chunk_length), int(entry["doc_token_count"]))
+        eos_token_idx = entry.get("eos_token_idx")
+        if eos_token_idx is not None:
+            eos_token_idx = int(eos_token_idx)
+            if eos_token_idx < start or eos_token_idx >= end:
+                eos_token_idx = None
         doc_key = (bucket_idx, record_idx)
         doc = doc_cache.get(doc_key)
         if doc is None:
@@ -203,22 +84,22 @@ def _make_batch(
             )
         arrays = build_chunk_arrays(
             doc.token_ids,
-            start=int(entry["start"]),
-            end=int(entry["end"]),
+            start=start,
+            end=end,
             chunk_length=chunk_length,
             pad_id=pad_id,
             eos_id=eos_id,
-            eos_token_idx=entry.get("eos_token_idx"),
+            eos_token_idx=eos_token_idx,
         )
         token_ids.append(arrays["token_ids_T"])
         attention_masks.append(arrays["attention_mask_T"])
         loss_masks.append(arrays["loss_mask_T"])
-        chunk_indices.append(int(entry["chunk_idx"]))
+        chunk_indices.append(chunk_idx)
         doc_ids.append(str(entry["doc_id"]))
         bucket_indices.append(bucket_idx)
         record_indices.append(record_idx)
         window_indices.append(int(entry["window_idx"]))
-        chunk_offsets.append(int(entry["chunk_offset"]))
+        chunk_offsets.append(0)
 
     metadata = {
         "doc_ids": doc_ids,
@@ -314,6 +195,14 @@ def make_iid_iterator(
     index_path = Path(index_path).expanduser().resolve()
     metadata = _load_window_index_metadata(index_path, chunk_length)
     index_chunk_length = int(metadata["chunk_length"])
+    index_num_segments = int(metadata["num_segments"])
+    if index_num_segments != 1:
+        raise ValueError(
+            "IID pretraining requires a physical num_segments=1 index; "
+            "use the bundle's iid/{split} child path instead of a C>1 statepassing "
+            f"index (got num_segments={index_num_segments}). Bundle roots are resolved "
+            "only by scripts/train_text_pretrain.py."
+        )
     index_eos_id = metadata.get("eos_id")
     if eos_id != index_eos_id:
         raise ValueError(f"eos_id mismatch: index has {index_eos_id}, loader got {eos_id}")
@@ -330,18 +219,16 @@ def make_iid_iterator(
     if num_records == 0:
         raise ValueError(f"Pretrain index has no records: {index_path}")
 
-    dataset_index, _ = _make_window_chunk_dataset_index(
+    dataset_index, _ = make_dataset_index(
         index_shard_paths=index_shard_paths,
-        num_windows=num_records,
-        num_segments=int(metadata["num_segments"]),
-        chunk_length=index_chunk_length,
+        num_records=num_records,
         num_epochs=num_epochs,
         dp_size=effective_dp_size,
         dp_index=resolved_dp_index,
-        records_per_local_batch=batch_size,
         shuffle=shuffle,
         seed=seed,
         shuffle_rounds=IID_INDEX_SHUFFLE_ROUNDS,
+        records_per_local_batch=batch_size,
     )
     batched = dataset_index.batch(
         batch_size=batch_size,

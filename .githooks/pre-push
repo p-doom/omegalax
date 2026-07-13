@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# Pre-push hook: if pushed commits change GatedDeltaNet, run the HF/XLA smoke test.
+set -euo pipefail
+
+TARGET="omegalax/models/qwen3_5/deltanet.py"
+TEST_CMD=(uv run python tests/test_qwen3_5_deltanet_xla_hf_smoke.py)
+ZERO_OID="0000000000000000000000000000000000000000"
+
+remote_name="${1:-origin}"
+
+default_remote_ref() {
+  git symbolic-ref -q --short "refs/remotes/${remote_name}/HEAD" 2>/dev/null || true
+}
+
+changed_files_for_push_ref() {
+  local local_oid="$1"
+  local remote_oid="$2"
+  local base_ref base_oid
+
+  if [[ "$local_oid" == "$ZERO_OID" ]]; then
+    return 0
+  fi
+
+  if [[ "$remote_oid" == "$ZERO_OID" ]]; then
+    base_ref="$(default_remote_ref)"
+    if [[ -n "$base_ref" ]]; then
+      base_oid="$(git merge-base "$local_oid" "$base_ref")"
+      git diff --name-only "$base_oid" "$local_oid"
+    else
+      git diff-tree --no-commit-id --name-only -r "$local_oid"
+    fi
+  else
+    git diff --name-only "$remote_oid" "$local_oid"
+  fi
+}
+
+should_run=0
+
+while read -r local_ref local_oid remote_ref remote_oid; do
+  if changed_files_for_push_ref "$local_oid" "$remote_oid" | grep -qx "$TARGET"; then
+    should_run=1
+    break
+  fi
+done
+
+if [[ "$should_run" -eq 0 ]]; then
+  echo "pre-push: ${TARGET} unchanged; skipping DeltaNet HF/XLA smoke test."
+  exit 0
+fi
+
+echo "pre-push: ${TARGET} changed; running DeltaNet HF/XLA smoke test..."
+if "${TEST_CMD[@]}"; then
+  echo "pre-push: DeltaNet HF/XLA smoke test passed; continuing push."
+else
+  status=$?
+  echo "pre-push: DeltaNet HF/XLA smoke test failed; aborting push." >&2
+  exit "$status"
+fi

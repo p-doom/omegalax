@@ -1,0 +1,9 @@
+{
+  "python.defaultInterpreterPath": "/fast/home/salan.isaqzoi/gh_projects/p(doom)/omegalax/.venv/bin/python",
+  "python.analysis.extraPaths": [
+    "/fast/home/salan.isaqzoi/gh_projects/p(doom)/omegalax/.venv/lib/python3.12/site-packages"
+  ],
+  "python.autoComplete.extraPaths": [
+    "/fast/home/salan.isaqzoi/gh_projects/p(doom)/omegalax/.venv/lib/python3.12/site-packages"
+  ]
+}

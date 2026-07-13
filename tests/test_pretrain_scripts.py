@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 from unittest import mock
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
@@ -74,6 +75,88 @@ class BuildPretrainIndexScriptTest(absltest.TestCase):
         self.assertEqual(args[1], Path("/indexes").resolve() / "val")
         self.assertEqual(kwargs["split"], "val")
         self.assertEqual(kwargs["num_segments"], 6)
+
+    def test_calls_curriculum_builder_with_forwarded_args(self):
+        with mock.patch.object(
+            build_pretrain_indexes, "build_statepassing_curriculum_indexes"
+        ) as curriculum_builder:
+            curriculum_builder.return_value = Path("/tmp/curriculum")
+            out = build_pretrain_indexes.build_curriculum_pretrain_indexes(
+                root="/data/root",
+                out_dir="/indexes",
+                splits=["train", "val"],
+                chunk_length=123,
+                allocation_order=[6, 4, 2],
+                train_order=[2, 4, 6],
+                max_tokens_by_num_segments={2: 1000},
+                trim_batch_size=240,
+                trim_grad_accum_steps=4,
+                eos_id=456,
+                records_per_shard=789,
+                overwrite=True,
+            )
+
+        self.assertEqual(out, Path("/tmp/curriculum"))
+        curriculum_builder.assert_called_once()
+        args, kwargs = curriculum_builder.call_args
+        self.assertEqual(args[0], "/data/root")
+        self.assertEqual(args[1], "/indexes")
+        self.assertEqual(kwargs["splits"], ["train", "val"])
+        self.assertEqual(kwargs["chunk_length"], 123)
+        self.assertEqual(kwargs["allocation_order"], [6, 4, 2])
+        self.assertEqual(kwargs["train_order"], [2, 4, 6])
+        self.assertEqual(kwargs["max_tokens_by_num_segments"], {2: 1000})
+        self.assertEqual(kwargs["trim_batch_size"], 240)
+        self.assertEqual(kwargs["trim_grad_accum_steps"], 4)
+        self.assertEqual(kwargs["eos_id"], 456)
+        self.assertEqual(kwargs["records_per_shard"], 789)
+        self.assertTrue(kwargs["overwrite"])
+
+    def test_curriculum_flag_parsers(self):
+        self.assertEqual(
+            build_pretrain_indexes.parse_curriculum_order("16,12,8,4", flag_name="x"),
+            [16, 12, 8, 4],
+        )
+        self.assertEqual(
+            build_pretrain_indexes.parse_curriculum_max_tokens(["2:25", "4:10,8:20"]),
+            {2: 25, 4: 10, 8: 20},
+        )
+
+    def test_curriculum_max_tokens_rejects_duplicates(self):
+        with self.assertRaisesRegex(ValueError, "Duplicate"):
+            build_pretrain_indexes.parse_curriculum_max_tokens(["2:25", "2:30"])
+
+    def test_calls_fixed_c_builder_with_forwarded_args(self):
+        with mock.patch.object(
+            build_pretrain_indexes, "build_statepassing_fixed_c_indexes"
+        ) as fixed_builder:
+            fixed_builder.return_value = Path("/tmp/fixed")
+            out = build_pretrain_indexes.build_fixed_c_pretrain_indexes(
+                root="/data/root",
+                out_dir="/indexes",
+                splits=["train", "val"],
+                chunk_length=123,
+                num_segments=6,
+                trim_batch_size=240,
+                trim_grad_accum_steps=4,
+                eos_id=456,
+                records_per_shard=789,
+                overwrite=True,
+            )
+
+        self.assertEqual(out, Path("/tmp/fixed"))
+        fixed_builder.assert_called_once()
+        args, kwargs = fixed_builder.call_args
+        self.assertEqual(args[0], "/data/root")
+        self.assertEqual(args[1], "/indexes")
+        self.assertEqual(kwargs["splits"], ["train", "val"])
+        self.assertEqual(kwargs["chunk_length"], 123)
+        self.assertEqual(kwargs["num_segments"], 6)
+        self.assertEqual(kwargs["trim_batch_size"], 240)
+        self.assertEqual(kwargs["trim_grad_accum_steps"], 4)
+        self.assertEqual(kwargs["eos_id"], 456)
+        self.assertEqual(kwargs["records_per_shard"], 789)
+        self.assertTrue(kwargs["overwrite"])
 
 
 class TrainTextPretrainScriptTest(absltest.TestCase):
@@ -170,6 +253,112 @@ print(json.dumps(kwargs))
         self.assertTrue(output["pass_rope_positions"])
         self.assertTrue(output["pass_conv_state"])
 
+    def test_curriculum_runtime_config_accepts_matching_shape(self):
+        output = self._run_train_script_probe(
+            """
+import json
+from absl.testing import flagsaver
+from scripts import train_text_pretrain
+
+train_text_pretrain.FLAGS(["probe", "--train_index_path=/idx"])
+
+with flagsaver.flagsaver(batch_size=240, grad_accum_steps=4):
+    train_text_pretrain._validate_curriculum_runtime_config({
+        "trim_batch_size": 240,
+        "trim_grad_accum_steps": 4,
+    })
+
+print(json.dumps({"ok": True}))
+"""
+        )
+
+        self.assertTrue(output["ok"])
+
+    def test_curriculum_runtime_config_rejects_mismatched_shape(self):
+        output = self._run_train_script_probe(
+            """
+import json
+from absl.testing import flagsaver
+from scripts import train_text_pretrain
+
+train_text_pretrain.FLAGS(["probe", "--train_index_path=/idx"])
+
+with flagsaver.flagsaver(batch_size=128, grad_accum_steps=4):
+    try:
+        train_text_pretrain._validate_curriculum_runtime_config({
+            "trim_batch_size": 240,
+            "trim_grad_accum_steps": 4,
+        })
+    except ValueError as exc:
+        print(json.dumps({"error": str(exc)}))
+"""
+        )
+
+        self.assertIn("batch_size=240", output["error"])
+
+    def test_fixed_c_runtime_config_rejects_mismatched_shape(self):
+        output = self._run_train_script_probe(
+            """
+import json
+from absl.testing import flagsaver
+from scripts import train_text_pretrain
+
+train_text_pretrain.FLAGS(["probe", "--train_index_path=/idx"])
+
+with flagsaver.flagsaver(batch_size=240, grad_accum_steps=2):
+    try:
+        train_text_pretrain._validate_trimmed_index_runtime_config(
+            {
+                "trim_batch_size": 240,
+                "trim_grad_accum_steps": 4,
+            },
+            label="Fixed-C",
+        )
+    except ValueError as exc:
+        print(json.dumps({"error": str(exc)}))
+"""
+        )
+
+        self.assertIn("grad_accum_steps=4", output["error"])
+
+    def test_fixed_c_bundle_path_helpers_select_mode_paths_and_steps(self):
+        output = self._run_train_script_probe(
+            """
+import json
+from pathlib import Path
+from scripts import train_text_pretrain
+from omegalax.trainers.pretrain import PretrainMode
+
+train_text_pretrain.FLAGS(["probe", "--train_index_path=/idx"])
+
+split_metadata = {
+    "path": "train",
+    "statepassing_steps": 12,
+    "iid": {"path": "iid/train", "iid_steps": 36},
+}
+root = Path("/bundle")
+print(json.dumps({
+    "statepassing_path": str(train_text_pretrain._fixed_c_index_path(
+        root, split_metadata, PretrainMode.STATEPASSING_BPTT
+    )),
+    "iid_path": str(train_text_pretrain._fixed_c_index_path(
+        root, split_metadata, PretrainMode.IID_BASELINE
+    )),
+    "statepassing_steps": train_text_pretrain._fixed_c_steps(
+        split_metadata, PretrainMode.STATEPASSING_NO_BPTT
+    ),
+    "iid_steps": train_text_pretrain._fixed_c_steps(
+        split_metadata, PretrainMode.IID_BASELINE
+    ),
+}))
+"""
+        )
+
+        self.assertEqual(output["statepassing_path"], "/bundle/train")
+        self.assertEqual(output["iid_path"], "/bundle/iid/train")
+        self.assertEqual(output["statepassing_steps"], 12)
+        self.assertEqual(output["iid_steps"], 36)
+
     def test_eos_validation_rejects_wrong_dominant_id(self):
         with self.assertRaisesRegex(ValueError, "EOS sanity check failed"):
             build_pretrain_indexes.validate_eos_stats(
@@ -209,8 +398,8 @@ class LaunchTextPretrainExperimentsScriptTest(absltest.TestCase):
             self.assertIn("--tp_size=1", command)
             self.assertIn("--fsdp_size=1", command)
             self.assertIn("--dp_size=1", command)
-            self.assertIn(f"--train_index_path={Path('/idx').resolve() / 'train'}", command)
-            self.assertIn(f"--val_index_path={Path('/idx').resolve() / 'val'}", command)
+            self.assertIn(f"--train_index_path={Path('/idx').resolve()}", command)
+            self.assertNotIn("--val_index_path=", command)
             self.assertIn("--save_dir=", command)
 
 
@@ -273,6 +462,64 @@ class SubmitTextPretrainSlurmScriptTest(absltest.TestCase):
         self.assertEqual({spec.batch_size for spec in specs}, {48})
         self.assertEqual({spec.grad_accum_steps for spec in specs}, {11})
 
+    def test_parse_run_specs_allows_selected_single_mode(self):
+        specs = submit_text_pretrain_slurm.parse_run_specs(
+            [],
+            nodes_per_run=1,
+            default_gpus_per_node=8,
+            default_batch_size=192,
+            default_grad_accum_steps=5,
+            single_process_per_run=True,
+            modes=[submit_text_pretrain_slurm.PretrainMode.STATEPASSING_BPTT],
+        )
+
+        self.assertLen(specs, 1)
+        self.assertEqual(specs[0].mode, submit_text_pretrain_slurm.PretrainMode.STATEPASSING_BPTT)
+        self.assertEqual(specs[0].batch_size, 192)
+        self.assertEqual(specs[0].grad_accum_steps, 5)
+
+    def test_parse_run_specs_allows_iid_only_without_statepassing_c_divisibility(self):
+        specs = submit_text_pretrain_slurm.parse_run_specs(
+            [],
+            nodes_per_run=1,
+            default_gpus_per_node=2,
+            default_batch_size=10,
+            default_grad_accum_steps=5,
+            modes=[submit_text_pretrain_slurm.PretrainMode.IID_BASELINE],
+        )
+
+        self.assertLen(specs, 1)
+        self.assertEqual(specs[0].mode, submit_text_pretrain_slurm.PretrainMode.IID_BASELINE)
+        self.assertEqual(specs[0].batch_size, 10)
+
+    def test_parse_run_specs_validates_all_curriculum_segment_lengths(self):
+        with flagsaver.flagsaver(
+            submit_curriculum_allocation_order="12,8,4,2,1",
+            submit_curriculum_train_order="1,2,4,8,12",
+        ):
+            specs = submit_text_pretrain_slurm.parse_run_specs(
+                [],
+                nodes_per_run=1,
+                default_gpus_per_node=8,
+                default_batch_size=192,
+                default_grad_accum_steps=5,
+                single_process_per_run=True,
+                modes=[submit_text_pretrain_slurm.PretrainMode.STATEPASSING_BPTT],
+            )
+
+            self.assertEqual(specs[0].batch_size, 192)
+
+            with self.assertRaisesRegex(ValueError, "num_segments \\* total_tasks=96"):
+                submit_text_pretrain_slurm.parse_run_specs(
+                    [],
+                    nodes_per_run=1,
+                    default_gpus_per_node=8,
+                    default_batch_size=240,
+                    default_grad_accum_steps=4,
+                    single_process_per_run=True,
+                    modes=[submit_text_pretrain_slurm.PretrainMode.STATEPASSING_BPTT],
+                )
+
     def test_parse_run_specs_rejects_unequal_batch_or_accum(self):
         with self.assertRaisesRegex(ValueError, "same batch_size"):
             submit_text_pretrain_slurm.parse_run_specs(
@@ -325,16 +572,107 @@ class SubmitTextPretrainSlurmScriptTest(absltest.TestCase):
 
         self.assertIn("--chunk_length=2048", index_script)
         self.assertIn("--num_segments=6", index_script)
+        self.assertIn("--fixed_trim_batch_size=128", index_script)
+        self.assertIn("--fixed_trim_grad_accum_steps=4", index_script)
         self.assertNotIn("--pretrain_mode=", index_script)
         self.assertIn("--seq_len=2048", train_flags)
         self.assertNotIn("--num_segments=6", train_flags)
-        self.assertIn("--train_index_path=${TRAIN_INDEX_ROOT}/train", train_flags)
-        self.assertIn("--val_index_path=${TRAIN_INDEX_ROOT}/val", train_flags)
+        self.assertIn("--train_index_path=${TRAIN_INDEX_ROOT}", train_flags)
+        self.assertFalse(any(flag.startswith("--val_index_path") for flag in train_flags))
         self.assertIn("--bptt_chunks=4", train_flags)
         self.assertIn("--pass_gdn_state=False", train_flags)
         self.assertIn("--gdn_layer_limit=1", train_flags)
         self.assertIn("--pass_rope_positions=True", train_flags)
         self.assertIn("--pass_conv_state=True", train_flags)
+
+    def test_render_index_sbatch_uses_curriculum_flags(self):
+        with flagsaver.flagsaver(
+            submit_seq_len=2048,
+            submit_num_segments=6,
+            submit_curriculum_allocation_order="12,8,4,2,1",
+            submit_curriculum_train_order="1,2,4,8,12",
+        ):
+            index_script = submit_text_pretrain_slurm.render_index_sbatch(
+                repo_root="/repo",
+                dataset_root="/data",
+                index_root="/idx",
+                log_dir="/logs",
+                run_id="run",
+                partition="standard",
+                qos="normal",
+                time_limit="12:00:00",
+                cpus_per_task=12,
+                records_per_shard=100,
+                eos_check_records=10,
+                min_eos_fraction=0.95,
+                overwrite=False,
+                trim_batch_size=192,
+                trim_grad_accum_steps=5,
+            )
+
+        self.assertIn("--chunk_length=2048", index_script)
+        self.assertIn("--curriculum_allocation_order=12,8,4,2,1", index_script)
+        self.assertIn("--curriculum_train_order=1,2,4,8,12", index_script)
+        self.assertIn("--curriculum_trim_batch_size=192", index_script)
+        self.assertIn("--curriculum_trim_grad_accum_steps=5", index_script)
+        self.assertNotIn("--fixed_trim_batch_size", index_script)
+        self.assertNotIn("--num_segments=6", index_script)
+
+    def test_indexes_ready_accepts_curriculum_bundle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for path in (
+                "c1/train",
+                "c1/val",
+                "c2/train",
+                "c2/val",
+                "iid/train",
+                "iid/val",
+            ):
+                (root / path).mkdir(parents=True)
+                (root / path / "metadata.json").write_text("{}")
+            (root / "metadata.json").write_text(
+                json.dumps(
+                    {
+                        "format": submit_text_pretrain_slurm._STATEPASSING_CURRICULUM_INDEX_FORMAT,
+                        "splits": {
+                            "train": {
+                                "phases": {
+                                    "1": {"path": "c1/train"},
+                                    "2": {"path": "c2/train"},
+                                },
+                                "iid": {"path": "iid/train"},
+                            },
+                            "val": {
+                                "phases": {
+                                    "1": {"path": "c1/val"},
+                                    "2": {"path": "c2/val"},
+                                },
+                                "iid": {"path": "iid/val"},
+                            },
+                        },
+                    }
+                )
+            )
+
+            self.assertTrue(
+                submit_text_pretrain_slurm.indexes_ready(
+                    root,
+                    expected_format=submit_text_pretrain_slurm._STATEPASSING_CURRICULUM_INDEX_FORMAT,
+                )
+            )
+            self.assertFalse(
+                submit_text_pretrain_slurm.indexes_ready(
+                    root,
+                    expected_format=submit_text_pretrain_slurm._STATEPASSING_FIXED_C_INDEX_FORMAT,
+                )
+            )
+
+    def test_submit_defaults_use_current_2048_dataset(self):
+        self.assertIn(
+            "fineweb_edu_dedup_2048_2kto32k", str(submit_text_pretrain_slurm._DATASET_ROOT)
+        )
+        self.assertIn("2048_eos248046", str(submit_text_pretrain_slurm._INDEX_ROOT))
 
     def test_validate_submit_shape_respects_num_segments(self):
         with self.assertRaisesRegex(ValueError, "num_segments"):
@@ -506,15 +844,30 @@ class SubmitTextPretrainSlurmScriptTest(absltest.TestCase):
             job_ids=["1", "2", "3"],
             wiki_path="/wiki/progress.md",
             poll_seconds=1200,
+            codex_session_id="thread-1",
+            codex_interval_seconds=2700,
+            codex_on_failure=True,
         )
 
         self.assertNotIn("#SBATCH --gres=gpu", script)
         self.assertIn("--monitor_job_ids=1,2,3", script)
         self.assertIn("--monitor_wiki_path=/wiki/progress.md", script)
         self.assertIn("--monitor_poll_seconds=1200", script)
+        self.assertIn("--monitor_codex_session_id=thread-1", script)
+        self.assertIn("--monitor_codex_interval_seconds=2700", script)
+        self.assertIn("--monitor_codex_on_failure=True", script)
 
 
 class MonitorTextPretrainSlurmScriptTest(absltest.TestCase):
+    def test_log_paths_include_nested_run_directories(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            log_path = root / "run" / "train_123.log"
+            log_path.parent.mkdir()
+            log_path.write_text("log")
+
+            self.assertEqual(monitor_text_pretrain_slurm._log_paths(root, "123"), [log_path])
+
     def test_job_status_prefers_sacct_rows(self):
         with mock.patch.object(monitor_text_pretrain_slurm, "_run") as run:
             run.side_effect = [
@@ -525,6 +878,28 @@ class MonitorTextPretrainSlurmScriptTest(absltest.TestCase):
 
         self.assertEqual(state, "COMPLETED")
         self.assertEqual(source, "sacct")
+
+    def test_prompt_codex_uses_current_session_resume(self):
+        with mock.patch.object(monitor_text_pretrain_slurm.subprocess, "run") as run:
+            run.return_value = mock.Mock(returncode=0, stdout="ok", stderr="")
+
+            with flagsaver.flagsaver(monitor_codex_session_id="thread-1"):
+                ok, output = monitor_text_pretrain_slurm._prompt_codex(
+                    reason="periodic health check",
+                    job_ids=["123"],
+                    states={"123": "RUNNING"},
+                    log_dir=Path("/logs"),
+                    wiki_path=Path("/wiki/progress.md"),
+                    tail_text="tail",
+                )
+
+        self.assertTrue(ok)
+        self.assertIn("ok", output)
+        args, kwargs = run.call_args
+        self.assertIn("codex", args[0])
+        self.assertIn("exec", args[0])
+        self.assertIn("resume", args[0])
+        self.assertIn("periodic health check", kwargs["input"])
 
 
 class BabysitTextPretrainSlurmScriptTest(absltest.TestCase):

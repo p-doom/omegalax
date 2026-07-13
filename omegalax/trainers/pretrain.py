@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Sequence
 import dataclasses
 import datetime
 import enum
@@ -18,6 +19,7 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import NamedSharding, PartitionSpec
 import optax
+import orbax.checkpoint as ocp
 
 from omegalax.data.pretrain_data_set import pop_pretrain_metadata
 from omegalax.distributed.mesh import ensure_mesh, mesh_rules, required_batch_multiple
@@ -580,6 +582,121 @@ def _finalize_accumulated_metrics(acc: dict[str, float]) -> dict[str, float]:
     return out
 
 
+def _curriculum_train_state(
+    optimizer: MixedPrecisionOptimizer,
+    rng: jax.Array,
+    *,
+    global_step: int,
+    phase_idx: int,
+    phase_step: int,
+) -> dict[str, object]:
+    return {
+        "optimizer": nnx.state(optimizer),
+        "rng": rng,
+        "global_step": jnp.asarray(global_step, dtype=jnp.int32),
+        "phase_idx": jnp.asarray(phase_idx, dtype=jnp.int32),
+        "phase_step": jnp.asarray(phase_step, dtype=jnp.int32),
+    }
+
+
+def _abstract_curriculum_train_state(
+    optimizer: MixedPrecisionOptimizer,
+    rng: jax.Array,
+) -> dict[str, object]:
+    return {
+        "optimizer": jax.tree.map(
+            lambda value: jax.ShapeDtypeStruct(value.shape, value.dtype, sharding=value.sharding),
+            nnx.state(optimizer),
+        ),
+        "rng": jax.ShapeDtypeStruct(rng.shape, rng.dtype, sharding=rng.sharding),
+        "global_step": jax.ShapeDtypeStruct((), jnp.int32),
+        "phase_idx": jax.ShapeDtypeStruct((), jnp.int32),
+        "phase_step": jax.ShapeDtypeStruct((), jnp.int32),
+    }
+
+
+def _save_curriculum_checkpoint(
+    checkpoint_manager,
+    optimizer: MixedPrecisionOptimizer,
+    rng: jax.Array,
+    *,
+    global_step: int,
+    phase_idx: int,
+    phase_step: int,
+    input_iter: checkpoint_utils.GrainIterator,
+    force: bool = False,
+) -> None:
+    train_state = _curriculum_train_state(
+        optimizer,
+        rng,
+        global_step=global_step,
+        phase_idx=phase_idx,
+        phase_step=phase_step,
+    )
+    save_args = checkpoint_utils.make_grain_save_args(train_state, input_iter)
+    checkpoint_manager.save(global_step, args=save_args, force=force)
+
+
+def _restore_curriculum_train_state_only(
+    checkpoint_manager,
+    optimizer: MixedPrecisionOptimizer,
+    rng: jax.Array,
+) -> dict[str, object]:
+    latest_step = checkpoint_manager.latest_step()
+    if latest_step is None:
+        raise ValueError("No checkpoint found to restore.")
+    abstract_state = _abstract_curriculum_train_state(optimizer, rng)
+    restored = checkpoint_manager.restore(
+        latest_step,
+        args=ocp.args.Composite(train_state=ocp.args.PyTreeRestore(abstract_state)),
+    )
+    return restored["train_state"]
+
+
+def _restore_curriculum_checkpoint(
+    checkpoint_manager,
+    optimizer: MixedPrecisionOptimizer,
+    rng: jax.Array,
+    input_iter: checkpoint_utils.GrainIterator,
+) -> tuple[MixedPrecisionOptimizer, int, int, int, jax.Array, checkpoint_utils.GrainIterator]:
+    latest_step = checkpoint_manager.latest_step()
+    if latest_step is None:
+        raise ValueError("No checkpoint found to restore.")
+    abstract_state = _abstract_curriculum_train_state(optimizer, rng)
+    restore_args = checkpoint_utils.make_grain_restore_args(abstract_state, input_iter)
+    restored = checkpoint_manager.restore(latest_step, args=restore_args)
+    train_state = restored["train_state"]
+    nnx.update(optimizer, train_state["optimizer"])
+    return (
+        optimizer,
+        int(np.asarray(train_state["global_step"])),
+        int(np.asarray(train_state["phase_idx"])),
+        int(np.asarray(train_state["phase_step"])),
+        train_state["rng"],
+        checkpoint_utils.restored_input_iter(restored),
+    )
+
+
+def _normalize_phase_steps(
+    train_order: Sequence[int],
+    phase_steps: dict[int | str, int] | Sequence[int],
+) -> dict[int, int]:
+    if isinstance(phase_steps, dict):
+        out = {int(key): int(value) for key, value in phase_steps.items()}
+    else:
+        if len(phase_steps) != len(train_order):
+            raise ValueError("phase_steps must match train_order length")
+        out = {
+            int(num_segments): int(steps) for num_segments, steps in zip(train_order, phase_steps)
+        }
+    missing = [int(num_segments) for num_segments in train_order if int(num_segments) not in out]
+    if missing:
+        raise ValueError(f"phase_steps missing train_order entries: {missing}")
+    if any(value < 0 for value in out.values()):
+        raise ValueError("phase_steps values must be >= 0")
+    return out
+
+
 def run_pretrain(
     model_id_or_cfg,
     train_cfg: TrainConfig,
@@ -653,7 +770,7 @@ def run_pretrain(
 
     lr_schedule_fn = build_lr_schedule(
         peak_lr=train_cfg.learning_rate,
-        num_steps=train_cfg.num_steps,
+        num_steps=train_cfg.resolved_lr_schedule_steps,
         warmup_steps=train_cfg.warmup_steps,
         schedule=train_cfg.lr_schedule,
         end_factor=train_cfg.lr_end_factor,
@@ -800,6 +917,305 @@ def run_pretrain(
         if last_metrics and (not save_every or last_metrics["step"] % save_every != 0):
             _save_sft_checkpoint(
                 checkpoint_manager, optimizer, rng, int(last_metrics["step"]), data_iter, force=True
+            )
+        checkpoint_manager.wait_until_finished()
+        checkpoint_manager.close()
+
+    return optimizer, last_metrics
+
+
+def run_statepassing_curriculum(
+    model_id_or_cfg,
+    train_cfg: TrainConfig,
+    phase_iter_factory: Callable[[int], checkpoint_utils.GrainIterator],
+    *,
+    train_order: Sequence[int],
+    phase_steps: dict[int | str, int] | Sequence[int],
+    pretrain_mode: PretrainMode | str = PretrainMode.STATEPASSING_BPTT,
+    save_dir: str | Path | None = None,
+    save_every: int = 0,
+    log_every: int = 1,
+    resume: checkpoint_utils.ResumeMode = checkpoint_utils.ResumeMode.NEVER,
+    pad_id: int = 0,
+    peak_tflops: float | None = None,
+    tp_size: int | None = None,
+    fsdp_size: int | None = None,
+    dp_size: int | None = None,
+    wandb_run=None,
+    text_attn_backend: str = "mosaic_gpu",
+    gc_period: int = 0,
+    bptt_chunks: int | None = None,
+    pass_gdn_state: bool = True,
+    gdn_layer_limit: int | None = None,
+    pass_rope_positions: bool = False,
+    pass_conv_state: bool = False,
+) -> tuple[MixedPrecisionOptimizer, dict[str, float]]:
+    pretrain_mode = PretrainMode(pretrain_mode)
+    if not pretrain_mode.is_statepassing:
+        raise ValueError("run_statepassing_curriculum requires a statepassing pretrain mode")
+
+    train_order = [int(num_segments) for num_segments in train_order]
+    phase_steps_by_c = _normalize_phase_steps(train_order, phase_steps)
+    total_phase_steps = sum(phase_steps_by_c[num_segments] for num_segments in train_order)
+    if total_phase_steps <= 0:
+        raise ValueError("Curriculum has no training steps")
+    if train_cfg.num_steps != total_phase_steps:
+        train_cfg = dataclasses.replace(train_cfg, num_steps=total_phase_steps)
+
+    save_path = Path(save_dir).expanduser().resolve() if save_dir is not None else None
+    checkpoint_manager = None
+    if save_path is not None:
+        save_path.mkdir(parents=True, exist_ok=True)
+        checkpoint_manager = _make_checkpoint_manager(save_path, save_interval=save_every or None)
+
+    latest_step = checkpoint_manager.latest_step() if checkpoint_manager is not None else None
+    if resume == checkpoint_utils.ResumeMode.REQUIRED and latest_step is None:
+        raise ValueError(f"resume='required' but no checkpoint found at {save_path}")
+    will_resume = (
+        resume in (checkpoint_utils.ResumeMode.IF_PRESENT, checkpoint_utils.ResumeMode.REQUIRED)
+        and latest_step is not None
+    )
+
+    model_cfg = (
+        text_api.resolve_config(str(save_path))
+        if will_resume
+        else text_api.resolve_config(model_id_or_cfg)
+    )
+    mesh = ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size)
+    model_cfg = text_api.align_config_to_mesh(model_cfg, mesh)
+    batch_multiple = required_batch_multiple(text_api.batch_partition_spec(model_cfg), mesh)
+    if train_cfg.batch_size % batch_multiple != 0:
+        raise ValueError(
+            f"Global batch size {train_cfg.batch_size} must be divisible by {batch_multiple}."
+        )
+    replicated_rng_sharding = NamedSharding(mesh, P())
+    root_rng = jax.device_put(jax.random.key(train_cfg.seed), replicated_rng_sharding)
+    init_rng, rng = jax.random.split(root_rng)
+    init_rng = jax.device_put(init_rng, replicated_rng_sharding)
+    rng = jax.device_put(rng, replicated_rng_sharding)
+    is_primary_process = jax.process_index() == 0
+
+    model, model_cfg = init_model(
+        model_cfg, init_rng, tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size
+    )
+    from omegalax.models.sharding_runtime import set_attn_backend
+
+    set_attn_backend(model, text_backend=text_attn_backend)
+    with mesh_rules(mesh):
+        optimizer = build_optimizer(model, train_cfg)
+
+    lr_schedule_fn = build_lr_schedule(
+        peak_lr=train_cfg.learning_rate,
+        num_steps=train_cfg.resolved_lr_schedule_steps,
+        warmup_steps=train_cfg.warmup_steps,
+        schedule=train_cfg.lr_schedule,
+        end_factor=train_cfg.lr_end_factor,
+        stable_fraction=train_cfg.lr_stable_fraction,
+    )
+    if checkpoint_manager is not None and not will_resume:
+        _write_checkpoint_config(save_path, model_cfg)
+
+    def _first_runnable_phase(start_idx: int) -> int:
+        phase_idx = int(start_idx)
+        while phase_idx < len(train_order) and phase_steps_by_c[int(train_order[phase_idx])] == 0:
+            phase_idx += 1
+        return phase_idx
+
+    global_step = 0
+    phase_idx = _first_runnable_phase(0)
+    phase_step = 0
+
+    if will_resume:
+        train_state = _restore_curriculum_train_state_only(checkpoint_manager, optimizer, rng)
+        global_step = int(np.asarray(train_state["global_step"]))
+        phase_idx = _first_runnable_phase(int(np.asarray(train_state["phase_idx"])))
+        phase_step = int(np.asarray(train_state["phase_step"]))
+
+    if phase_idx >= len(train_order):
+        if checkpoint_manager is not None:
+            checkpoint_manager.close()
+        return optimizer, {}
+
+    data_iter = phase_iter_factory(int(train_order[phase_idx]))
+    if will_resume:
+        optimizer, global_step, phase_idx, phase_step, rng, data_iter = (
+            _restore_curriculum_checkpoint(checkpoint_manager, optimizer, rng, data_iter)
+        )
+        rng = jax.device_put(rng, replicated_rng_sharding)
+        phase_idx = _first_runnable_phase(phase_idx)
+
+    accum_steps = train_cfg.grad_accum_steps
+    timer = StepTimer(warmup=2 * accum_steps)
+    global_tokens_per_step = train_cfg.seq_len * train_cfg.batch_size * accum_steps
+    last_metrics: dict[str, float] = {}
+    prev_metrics: tuple[int, dict[str, Any], datetime.timedelta, float] | None = None
+
+    def _log_prev_metrics(force: bool = False) -> None:
+        nonlocal last_metrics
+        if prev_metrics is None:
+            return
+        step_to_log, metrics_to_log, step_delta, step_per_device_flops = prev_metrics
+        result = maybe_log_step_metrics(
+            step_to_log,
+            metrics_to_log,
+            step_delta,
+            is_primary_process=is_primary_process,
+            log_every=log_every,
+            force=force,
+            per_device_flops=step_per_device_flops,
+            global_tokens_per_step=global_tokens_per_step,
+            peak_tflops=peak_tflops,
+            wandb_run=wandb_run,
+            batch_size=train_cfg.batch_size * accum_steps,
+        )
+        if result is not None:
+            last_metrics = result
+
+    startup_log(
+        f"entering statepassing curriculum loop mode={pretrain_mode} train_order={train_order}"
+    )
+    train_steps: dict[int, Any] = {}
+    while phase_idx < len(train_order):
+        num_segments = int(train_order[phase_idx])
+        steps_in_phase = int(phase_steps_by_c[num_segments])
+        if steps_in_phase == 0:
+            phase_idx = _first_runnable_phase(phase_idx + 1)
+            phase_step = 0
+            if phase_idx < len(train_order):
+                data_iter = phase_iter_factory(int(train_order[phase_idx]))
+            continue
+
+        if num_segments not in train_steps:
+            phase_bptt_chunks = (
+                num_segments
+                if pretrain_mode is PretrainMode.STATEPASSING_BPTT and bptt_chunks is None
+                else bptt_chunks
+            )
+            train_steps[num_segments] = make_pretrain_train_step(
+                pretrain_mode,
+                model_cfg,
+                pad_id=pad_id,
+                bptt_chunks=phase_bptt_chunks,
+                pass_gdn_state=pass_gdn_state,
+                gdn_layer_limit=gdn_layer_limit,
+                pass_rope_positions=pass_rope_positions,
+                pass_conv_state=pass_conv_state,
+            )
+        train_step = train_steps[num_segments]
+
+        while phase_step < steps_in_phase:
+            step_idx = global_step
+            step = step_idx + 1
+            accum = {}
+            accum_grad_norm = 0.0
+            accum_flops = 0.0
+            accum_time = datetime.timedelta(0)
+            accum_data_wait_s = 0.0
+
+            for _micro in range(accum_steps):
+                wait_start = time.perf_counter()
+                raw_batch = next(data_iter)
+                accum_data_wait_s += time.perf_counter() - wait_start
+                batch, _, _ = prepare_pretrain_batch(
+                    raw_batch,
+                    pretrain_mode,
+                    model_cfg,
+                    mesh,
+                    pass_rope_positions=pass_rope_positions,
+                )
+                micro_flops = per_device_flops_per_step(
+                    model_cfg,
+                    train_cfg.seq_len,
+                    train_cfg.batch_size,
+                )
+                _, metrics = train_step(optimizer, batch)
+                micro_delta = timer.step()
+
+                _accumulate_metric_sums(accum, metrics)
+                accum_grad_norm = accum_grad_norm + metrics["grad_norm"]
+                accum_flops += micro_flops
+                accum_time += micro_delta
+
+            with jax.default_device("cpu"):
+                current_lr = (
+                    float(lr_schedule_fn(step_idx))
+                    if callable(lr_schedule_fn)
+                    else float(lr_schedule_fn)
+                )
+            window_metrics = _finalize_accumulated_metrics(accum)
+            window_metrics["grad_norm"] = accum_grad_norm / accum_steps
+            window_metrics["lr"] = current_lr
+            window_metrics["total_tokens"] = step * global_tokens_per_step
+            window_metrics["data_wait_s"] = accum_data_wait_s
+            window_metrics["phase_idx"] = phase_idx
+            window_metrics["phase_C"] = num_segments
+            window_metrics["phase_step"] = phase_step + 1
+            step_time_s = accum_time.total_seconds()
+            window_metrics["data_wait_frac"] = (
+                accum_data_wait_s / step_time_s if step_time_s > 0 else 0.0
+            )
+            if is_primary_process:
+                window_metrics.update(_gpu_util_snapshot())
+
+            global_step = step
+            phase_step += 1
+            _log_prev_metrics()
+            prev_metrics = (step, window_metrics, accum_time, accum_flops)
+
+            boundary_save_pending = phase_step >= steps_in_phase and _first_runnable_phase(
+                phase_idx + 1
+            ) < len(train_order)
+            if (
+                checkpoint_manager is not None
+                and save_every
+                and step % save_every == 0
+                and not boundary_save_pending
+            ):
+                _save_curriculum_checkpoint(
+                    checkpoint_manager,
+                    optimizer,
+                    rng,
+                    global_step=global_step,
+                    phase_idx=phase_idx,
+                    phase_step=phase_step,
+                    input_iter=data_iter,
+                )
+
+            if gc_period and step % gc_period == 0:
+                gc.collect()
+
+        next_phase_idx = _first_runnable_phase(phase_idx + 1)
+        if next_phase_idx < len(train_order):
+            data_iter = phase_iter_factory(int(train_order[next_phase_idx]))
+            if checkpoint_manager is not None:
+                _save_curriculum_checkpoint(
+                    checkpoint_manager,
+                    optimizer,
+                    rng,
+                    global_step=global_step,
+                    phase_idx=next_phase_idx,
+                    phase_step=0,
+                    input_iter=data_iter,
+                    force=True,
+                )
+            phase_idx = next_phase_idx
+            phase_step = 0
+        else:
+            break
+
+    _log_prev_metrics(force=True)
+
+    if checkpoint_manager is not None:
+        if global_step and (not save_every or global_step % save_every != 0):
+            _save_curriculum_checkpoint(
+                checkpoint_manager,
+                optimizer,
+                rng,
+                global_step=global_step,
+                phase_idx=phase_idx,
+                phase_step=phase_step,
+                input_iter=data_iter,
+                force=True,
             )
         checkpoint_manager.wait_until_finished()
         checkpoint_manager.close()

@@ -47,6 +47,7 @@ class TrainConfig:
     batch_size: int = 8
     seq_len: int = 64
     num_steps: int = 20
+    lr_schedule_steps: int | None = None
     learning_rate: float = 3e-4
     weight_decay: float = 0.01
     warmup_steps: int = 0
@@ -59,6 +60,18 @@ class TrainConfig:
     adam_eps: float = 1e-8
     grad_accum_steps: int = 1
     print_every: int = 1
+
+    @property
+    def resolved_lr_schedule_steps(self) -> int:
+        schedule_steps = (
+            self.num_steps if self.lr_schedule_steps is None else self.lr_schedule_steps
+        )
+        if schedule_steps < self.num_steps:
+            raise ValueError(
+                "lr_schedule_steps must be greater than or equal to num_steps; "
+                f"got lr_schedule_steps={schedule_steps}, num_steps={self.num_steps}."
+            )
+        return schedule_steps
 
 
 def init_model(
@@ -77,7 +90,7 @@ def init_model(
 def build_optimizer(model: nnx.Module, train_cfg: TrainConfig) -> MixedPrecisionOptimizer:
     lr = build_lr_schedule(
         peak_lr=train_cfg.learning_rate,
-        num_steps=train_cfg.num_steps,
+        num_steps=train_cfg.resolved_lr_schedule_steps,
         warmup_steps=train_cfg.warmup_steps,
         schedule=train_cfg.lr_schedule,
         end_factor=train_cfg.lr_end_factor,
@@ -352,7 +365,7 @@ def run_sft(
     # Init cpu learning rate scheduler function for logging
     lr_schedule_fn = build_lr_schedule(
         peak_lr=train_cfg.learning_rate,
-        num_steps=train_cfg.num_steps,
+        num_steps=train_cfg.resolved_lr_schedule_steps,
         warmup_steps=train_cfg.warmup_steps,
         schedule=train_cfg.lr_schedule,
         end_factor=train_cfg.lr_end_factor,

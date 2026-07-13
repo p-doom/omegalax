@@ -27,6 +27,8 @@ from omegalax.data.pretrain_data_set import (
 from omegalax.data.pretrain_iid_pipeline import make_iid_iterator
 from omegalax.data.pretrain_statepassing import (
     STATEPASSING_WINDOW_INDEX_FORMAT,
+    build_statepassing_curriculum_indexes,
+    build_statepassing_fixed_c_indexes,
     build_statepassing_window_index,
     make_statepassing_iterator,
 )
@@ -40,7 +42,13 @@ class PretrainIidTest(absltest.TestCase):
     def _bucket_names(self, root: Path, split: str) -> list[str]:
         return [path.name for path in resolve_data_set_buckets(root, split=split)]
 
-    def _build_real_index(self, tmpdir: Path, *, chunk_length: int = 4096) -> tuple[Path, Path]:
+    def _build_real_index(
+        self,
+        tmpdir: Path,
+        *,
+        chunk_length: int = 4096,
+        num_segments: int = 1,
+    ) -> tuple[Path, Path]:
         root = write_real_binary_mini_root_dataset(
             self,
             tmpdir / "docs",
@@ -51,7 +59,7 @@ class PretrainIidTest(absltest.TestCase):
             root,
             tmpdir / "index",
             chunk_length=chunk_length,
-            num_segments=2,
+            num_segments=num_segments,
             split="train",
             records_per_shard=1000,
         )
@@ -105,7 +113,7 @@ class PretrainIidTest(absltest.TestCase):
 
     def test_real_window_index_points_to_bucket_ranges(self):
         with test_temp_dir() as tmp:
-            index, root = self._build_real_index(Path(tmp))
+            index, root = self._build_real_index(Path(tmp), num_segments=2)
 
             metadata = load_arrayrecord_metadata(index)
             records = self._read_index_records(index)
@@ -159,14 +167,14 @@ class PretrainIidTest(absltest.TestCase):
             )
             np.testing.assert_array_equal(
                 batch["metadata"]["window_idx_B"],
-                np.asarray([0, 0], dtype=np.int32),
+                np.asarray([0, 1], dtype=np.int32),
             )
             np.testing.assert_array_equal(
                 batch["metadata"]["chunk_offset_B"],
-                np.asarray([0, 1], dtype=np.int32),
+                np.zeros((2,), dtype=np.int32),
             )
 
-    def test_window_index_iid_view_flattens_windows_to_chunks(self):
+    def test_iid_iterator_rejects_c_gt_1_statepassing_index(self):
         with test_temp_dir() as tmp:
             tmpdir = Path(tmp)
             root = tmpdir / "docs"
@@ -193,7 +201,7 @@ class PretrainIidTest(absltest.TestCase):
                 records_per_shard=10,
             )
 
-            batch = next(
+            with self.assertRaisesRegex(ValueError, "physical num_segments=1"):
                 make_iid_iterator(
                     index,
                     batch_size=4,
@@ -203,27 +211,8 @@ class PretrainIidTest(absltest.TestCase):
                     process_index=0,
                     grain_workers=0,
                 )
-            )
 
-            self.assertEqual(batch["token_ids_BT"].shape, (4, 4))
-            np.testing.assert_array_equal(
-                batch["token_ids_BT"][:, 0],
-                np.asarray([0, 4, 8, 12], dtype=np.int32),
-            )
-            np.testing.assert_array_equal(
-                batch["chunk_idx_B"],
-                np.asarray([0, 1, 2, 3], dtype=np.int32),
-            )
-            np.testing.assert_array_equal(
-                batch["metadata"]["window_idx_B"],
-                np.asarray([0, 0, 0, 1], dtype=np.int32),
-            )
-            np.testing.assert_array_equal(
-                batch["metadata"]["chunk_offset_B"],
-                np.asarray([0, 1, 2, 0], dtype=np.int32),
-            )
-
-    def test_window_index_iid_view_matches_flattened_statepassing_tokens(self):
+    def test_fixed_c_iid_index_matches_flattened_statepassing_tokens(self):
         with test_temp_dir() as tmp:
             tmpdir = Path(tmp)
             root = tmpdir / "docs"
@@ -241,18 +230,20 @@ class PretrainIidTest(absltest.TestCase):
                 overwrite=False,
                 metadata={"dataset_format": DOC_CHAIN_FORMAT},
             )
-            index = build_statepassing_window_index(
+            index_root = build_statepassing_fixed_c_indexes(
                 root,
-                tmpdir / "statepassing_window_index",
-                chunk_length=4,
+                tmpdir / "fixed",
                 num_segments=3,
-                split="train",
+                trim_batch_size=6,
+                trim_grad_accum_steps=1,
+                chunk_length=4,
+                splits=("train",),
                 records_per_shard=10,
             )
 
             statepassing_batch = next(
                 make_statepassing_iterator(
-                    index,
+                    index_root / "train",
                     batch_size=6,
                     chunk_length=4,
                     shuffle=False,
@@ -265,7 +256,7 @@ class PretrainIidTest(absltest.TestCase):
             )
             iid_batch = next(
                 make_iid_iterator(
-                    index,
+                    index_root / "iid" / "train",
                     batch_size=6,
                     chunk_length=4,
                     shuffle=False,
@@ -288,7 +279,60 @@ class PretrainIidTest(absltest.TestCase):
                 statepassing_batch["loss_mask_BCT"].reshape(6, 4),
             )
 
-    def test_window_index_iid_view_shuffle_covers_usable_dp_shards_without_overlap(self):
+    def test_curriculum_iid_index_iterates_flat_same_token_chunks(self):
+        with test_temp_dir() as tmp:
+            tmpdir = Path(tmp)
+            root = tmpdir / "docs"
+            write_json_arrayrecord_dataset(
+                (
+                    {
+                        "dataset_format": DOC_CHAIN_FORMAT,
+                        "doc_id": f"doc-{idx}",
+                        "token_ids": list(range(20)),
+                        "doc_token_count": 20,
+                    }
+                    for idx in range(6)
+                ),
+                root / "train" / "bucket_2k",
+                records_per_shard=100,
+                overwrite=False,
+                metadata={"dataset_format": DOC_CHAIN_FORMAT},
+            )
+            index_root = build_statepassing_curriculum_indexes(
+                root,
+                tmpdir / "curriculum",
+                allocation_order=[6, 4, 2],
+                train_order=[2, 4, 6],
+                trim_batch_size=12,
+                trim_grad_accum_steps=1,
+                chunk_length=1,
+                splits=("train",),
+                records_per_shard=100,
+            )
+
+            batch = next(
+                make_iid_iterator(
+                    index_root / "iid" / "train",
+                    batch_size=12,
+                    chunk_length=1,
+                    shuffle=False,
+                    num_epochs=1,
+                    process_index=0,
+                    grain_workers=0,
+                )
+            )
+
+            self.assertEqual(batch["token_ids_BT"].shape, (12, 1))
+            np.testing.assert_array_equal(
+                batch["chunk_idx_B"],
+                np.asarray(list(range(12)), dtype=np.int32),
+            )
+            np.testing.assert_array_equal(
+                batch["metadata"]["chunk_offset_B"],
+                np.zeros((12,), dtype=np.int32),
+            )
+
+    def test_fixed_c_iid_index_shuffle_covers_usable_dp_shards_without_overlap(self):
         with test_temp_dir() as tmp:
             tmpdir = Path(tmp)
             root = tmpdir / "docs"
@@ -306,14 +350,17 @@ class PretrainIidTest(absltest.TestCase):
                 overwrite=False,
                 metadata={"dataset_format": DOC_CHAIN_FORMAT},
             )
-            index = build_statepassing_window_index(
+            index_root = build_statepassing_fixed_c_indexes(
                 root,
-                tmpdir / "statepassing_window_index",
-                chunk_length=4,
+                tmpdir / "fixed",
                 num_segments=3,
-                split="train",
+                trim_batch_size=6,
+                trim_grad_accum_steps=1,
+                chunk_length=4,
+                splits=("train",),
                 records_per_shard=10,
             )
+            index = index_root / "iid" / "train"
             expected = {(0, 0, chunk_idx) for chunk_idx in range(12)}
 
             rank_keys = []
@@ -365,7 +412,7 @@ class PretrainIidTest(absltest.TestCase):
                 root,
                 tmpdir / "statepassing_window_index",
                 chunk_length=4,
-                num_segments=3,
+                num_segments=1,
                 split="train",
                 records_per_shard=10,
             )
@@ -519,7 +566,7 @@ class PretrainIidTest(absltest.TestCase):
                 root,
                 tmpdir / "binary_index",
                 chunk_length=4096,
-                num_segments=2,
+                num_segments=1,
                 split="val",
                 records_per_shard=1000,
             )
