@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Any, TypeAlias, cast
+from typing import Any, Mapping, TypeAlias, cast
 
 import grain
 import orbax.checkpoint as ocp
@@ -45,11 +45,25 @@ def register_grain_iterator_handler(
     )
 
 
-def make_grain_save_args(train_state: Any, input_iter: GrainIterator) -> ocp.args.Composite:
+def register_lr_contract_handler(
+    handler_registry: ocp.handlers.DefaultCheckpointHandlerRegistry,
+) -> None:
+    handler_registry.add("lr_contract", ocp.args.JsonSave, ocp.handlers.JsonCheckpointHandler)
+    handler_registry.add("lr_contract", ocp.args.JsonRestore, ocp.handlers.JsonCheckpointHandler)
+
+
+def make_grain_save_args(
+    train_state: Any,
+    input_iter: GrainIterator,
+    *,
+    lr_contract: Mapping[str, Any] | None = None,
+) -> ocp.args.Composite:
     items: dict[str, Any] = {
         "train_state": ocp.args.PyTreeSave(train_state),
         "input_iter": grain.checkpoint.CheckpointSave(input_iter),
     }
+    if lr_contract is not None:
+        items["lr_contract"] = ocp.args.JsonSave(lr_contract)
     return ocp.args.Composite(**items)
 
 
@@ -65,3 +79,16 @@ def make_grain_restore_args(
 
 def restored_input_iter(restored: Any) -> GrainIterator:
     return restored["input_iter"]
+
+
+def restore_lr_contract(checkpoint_manager: ocp.CheckpointManager, step: int) -> Mapping[str, Any]:
+    try:
+        restored = checkpoint_manager.restore(
+            step,
+            args=ocp.args.Composite(lr_contract=ocp.args.JsonRestore()),
+        )
+        return restored["lr_contract"]
+    except Exception as exc:
+        raise ValueError(
+            f"Checkpoint step {step} has no readable LR contract; a safe resume is not possible."
+        ) from exc

@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import os
 from pathlib import Path
+import tempfile
 from unittest import mock
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
@@ -13,6 +14,7 @@ os.environ["OMEGALAX_DELTANET_KERNEL"] = "xla"
 import jax
 import jax.numpy as jnp
 import numpy as np
+import orbax.checkpoint as ocp
 from absl.testing import absltest
 from flax import nnx
 from jax.sharding import PartitionSpec
@@ -25,7 +27,9 @@ from omegalax.models.qwen3_5.config import Qwen3_5TextConfig
 from omegalax.models.shard_config import ShardConfig
 from omegalax.text import api as text_api
 from omegalax.trainers.loss import chunked_cross_entropy_multi_stats
+from omegalax.trainers import checkpoint_utils
 from omegalax.trainers import pretrain as pretrain_trainer
+from omegalax.trainers import text as text_trainer
 
 
 def _tiny_qwen3_5_config() -> Qwen3_5TextConfig:
@@ -752,6 +756,164 @@ class PretrainTrainingSmokeTest(absltest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "greater than or equal to num_steps"):
             _ = train_cfg.resolved_lr_schedule_steps
+
+    def test_resume_inherits_unspecified_lr_contract_fields(self):
+        original_cfg = pretrain_trainer.TrainConfig(
+            num_steps=8,
+            lr_schedule_steps=10,
+            learning_rate=1e-3,
+            warmup_steps=2,
+            lr_schedule="cosine",
+            lr_end_factor=0.2,
+            lr_stable_fraction=0.7,
+        )
+        resume_cfg = pretrain_trainer.TrainConfig(num_steps=9)
+        stored_contract = text_trainer.lr_contract_from_train_config(original_cfg)
+
+        resolved_cfg, resolved_contract = text_trainer.resolve_train_config_lr_contract(
+            resume_cfg,
+            stored_contract,
+            explicit_fields=(),
+        )
+
+        self.assertEqual(resolved_cfg.num_steps, 9)
+        self.assertEqual(text_trainer.lr_contract_from_train_config(resolved_cfg), stored_contract)
+        self.assertEqual(resolved_contract, stored_contract)
+
+    def test_resume_rejects_each_explicit_lr_contract_mismatch(self):
+        original_cfg = pretrain_trainer.TrainConfig(
+            num_steps=8,
+            lr_schedule_steps=10,
+            learning_rate=1e-3,
+            warmup_steps=2,
+            lr_schedule="cosine",
+            lr_end_factor=0.2,
+            lr_stable_fraction=0.7,
+        )
+        stored_contract = text_trainer.lr_contract_from_train_config(original_cfg)
+        mismatches = {
+            "learning_rate": {"learning_rate": 2e-3},
+            "warmup_steps": {"warmup_steps": 3},
+            "lr_schedule": {"lr_schedule": "linear"},
+            "lr_end_factor": {"lr_end_factor": 0.1},
+            "lr_stable_fraction": {"lr_stable_fraction": 0.8},
+            "lr_schedule_steps": {"lr_schedule_steps": 11},
+        }
+
+        for field, replacements in mismatches.items():
+            with self.subTest(field=field):
+                resume_cfg = dataclasses.replace(
+                    original_cfg,
+                    num_steps=9,
+                    **replacements,
+                )
+                with self.assertRaisesRegex(ValueError, field):
+                    text_trainer.resolve_train_config_lr_contract(
+                        resume_cfg,
+                        stored_contract,
+                        explicit_fields={field},
+                    )
+
+    def test_inherited_lr_horizon_cannot_precede_new_stop(self):
+        original_cfg = pretrain_trainer.TrainConfig(num_steps=8, lr_schedule_steps=10)
+        stored_contract = text_trainer.lr_contract_from_train_config(original_cfg)
+
+        with self.assertRaisesRegex(ValueError, "greater than or equal to num_steps"):
+            text_trainer.resolve_train_config_lr_contract(
+                pretrain_trainer.TrainConfig(num_steps=11),
+                stored_contract,
+                explicit_fields=(),
+            )
+
+    def test_lr_contract_round_trips_as_independent_checkpoint_item(self):
+        contract = text_trainer.lr_contract_from_train_config(
+            pretrain_trainer.TrainConfig(num_steps=8, lr_schedule_steps=10)
+        )
+        with tempfile.TemporaryDirectory(prefix=".lr-contract-test-", dir=Path.cwd()) as tmp:
+            checkpoint_manager = text_trainer._make_checkpoint_manager(
+                Path(tmp), save_interval=None
+            )
+            checkpoint_manager.save(
+                1,
+                args=ocp.args.Composite(lr_contract=ocp.args.JsonSave(contract)),
+                force=True,
+            )
+            checkpoint_manager.wait_until_finished()
+
+            restored = checkpoint_utils.restore_lr_contract(checkpoint_manager, 1)
+
+            checkpoint_manager.close()
+        self.assertEqual(restored, contract)
+
+    def test_lr_contract_mismatch_fails_before_optimizer_build(self):
+        train_cfg = pretrain_trainer.TrainConfig(
+            num_steps=2,
+            lr_schedule_steps=10,
+            learning_rate=2e-3,
+        )
+        stored_contract = text_trainer.lr_contract_from_train_config(
+            dataclasses.replace(train_cfg, learning_rate=1e-3)
+        )
+        checkpoint_manager = mock.Mock()
+        checkpoint_manager.latest_step.return_value = 1
+
+        with (
+            mock.patch.object(
+                pretrain_trainer,
+                "_make_checkpoint_manager",
+                return_value=checkpoint_manager,
+            ),
+            mock.patch.object(
+                checkpoint_utils,
+                "restore_lr_contract",
+                return_value=stored_contract,
+            ),
+            mock.patch.object(pretrain_trainer, "build_optimizer") as build_optimizer,
+            self.assertRaisesRegex(ValueError, "learning_rate"),
+        ):
+            pretrain_trainer.run_pretrain(
+                object(),
+                train_cfg,
+                iter(()),
+                pretrain_mode=pretrain_trainer.PretrainMode.IID_BASELINE,
+                save_dir=Path.cwd(),
+                resume=checkpoint_utils.ResumeMode.REQUIRED,
+                lr_contract_explicit_fields={"learning_rate"},
+            )
+
+        build_optimizer.assert_not_called()
+
+    def test_resume_stop_at_checkpoint_fails_before_optimizer_build(self):
+        train_cfg = pretrain_trainer.TrainConfig(num_steps=2, lr_schedule_steps=10)
+        stored_contract = text_trainer.lr_contract_from_train_config(train_cfg)
+        checkpoint_manager = mock.Mock()
+        checkpoint_manager.latest_step.return_value = 2
+
+        with (
+            mock.patch.object(
+                pretrain_trainer,
+                "_make_checkpoint_manager",
+                return_value=checkpoint_manager,
+            ),
+            mock.patch.object(
+                checkpoint_utils,
+                "restore_lr_contract",
+                return_value=stored_contract,
+            ),
+            mock.patch.object(pretrain_trainer, "build_optimizer") as build_optimizer,
+            self.assertRaisesRegex(ValueError, "greater than the checkpoint step"),
+        ):
+            pretrain_trainer.run_pretrain(
+                object(),
+                train_cfg,
+                iter(()),
+                pretrain_mode=pretrain_trainer.PretrainMode.IID_BASELINE,
+                save_dir=Path.cwd(),
+                resume=checkpoint_utils.ResumeMode.REQUIRED,
+                lr_contract_explicit_fields=(),
+            )
+
+        build_optimizer.assert_not_called()
 
     def test_pretrain_uses_lr_schedule_horizon_instead_of_training_stop(self):
         cfg = _tiny_qwen3_5_config()

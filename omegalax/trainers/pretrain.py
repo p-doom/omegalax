@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 import dataclasses
 import datetime
 import enum
@@ -43,6 +43,7 @@ from omegalax.trainers.text import (
     _write_checkpoint_config,
     build_optimizer,
     init_model,
+    resolve_train_config_lr_contract,
     startup_log,
     TrainConfig,
 )
@@ -624,6 +625,7 @@ def _save_curriculum_checkpoint(
     phase_idx: int,
     phase_step: int,
     input_iter: checkpoint_utils.GrainIterator,
+    lr_contract: Mapping[str, Any],
     force: bool = False,
 ) -> None:
     train_state = _curriculum_train_state(
@@ -633,7 +635,9 @@ def _save_curriculum_checkpoint(
         phase_idx=phase_idx,
         phase_step=phase_step,
     )
-    save_args = checkpoint_utils.make_grain_save_args(train_state, input_iter)
+    save_args = checkpoint_utils.make_grain_save_args(
+        train_state, input_iter, lr_contract=lr_contract
+    )
     checkpoint_manager.save(global_step, args=save_args, force=force)
 
 
@@ -697,6 +701,34 @@ def _normalize_phase_steps(
     return out
 
 
+def _resolve_pretrain_lr_contract(
+    train_cfg: TrainConfig,
+    checkpoint_manager: ocp.CheckpointManager | None,
+    latest_step: int | None,
+    *,
+    will_resume: bool,
+    explicit_fields: Collection[str] | None,
+) -> tuple[TrainConfig, dict[str, Any]]:
+    stored_contract = None
+    if will_resume:
+        if checkpoint_manager is None or latest_step is None:
+            raise ValueError("Cannot load an LR contract without a checkpoint.")
+        stored_contract = checkpoint_utils.restore_lr_contract(checkpoint_manager, int(latest_step))
+
+    train_cfg, lr_contract = resolve_train_config_lr_contract(
+        train_cfg,
+        stored_contract,
+        explicit_fields=explicit_fields,
+    )
+    if will_resume and train_cfg.num_steps <= int(latest_step):
+        raise ValueError(
+            "Resume num_steps must be greater than the checkpoint step; "
+            f"got num_steps={train_cfg.num_steps}, checkpoint_step={latest_step}."
+        )
+    startup_log(f"effective LR contract={lr_contract} train_stop={train_cfg.num_steps}")
+    return train_cfg, lr_contract
+
+
 def run_pretrain(
     model_id_or_cfg,
     train_cfg: TrainConfig,
@@ -723,6 +755,7 @@ def run_pretrain(
     gdn_layer_limit: int | None = None,
     pass_rope_positions: bool = False,
     pass_conv_state: bool = False,
+    lr_contract_explicit_fields: Collection[str] | None = None,
 ) -> tuple[MixedPrecisionOptimizer, dict[str, float]]:
     pretrain_mode = PretrainMode(pretrain_mode)
     save_path = Path(save_dir).expanduser().resolve() if save_dir is not None else None
@@ -738,6 +771,13 @@ def run_pretrain(
     will_resume = (
         resume in (checkpoint_utils.ResumeMode.IF_PRESENT, checkpoint_utils.ResumeMode.REQUIRED)
         and latest_step is not None
+    )
+    train_cfg, lr_contract = _resolve_pretrain_lr_contract(
+        train_cfg,
+        checkpoint_manager,
+        latest_step,
+        will_resume=will_resume,
+        explicit_fields=lr_contract_explicit_fields,
     )
 
     model_cfg = (
@@ -889,7 +929,14 @@ def run_pretrain(
         prev_metrics = (step, window_metrics, accum_time, accum_flops)
 
         if checkpoint_manager is not None and save_every and step % save_every == 0:
-            _save_sft_checkpoint(checkpoint_manager, optimizer, rng, step, data_iter)
+            _save_sft_checkpoint(
+                checkpoint_manager,
+                optimizer,
+                rng,
+                step,
+                data_iter,
+                lr_contract=lr_contract,
+            )
 
         if gc_period and step % gc_period == 0:
             gc.collect()
@@ -916,7 +963,13 @@ def run_pretrain(
     if checkpoint_manager is not None:
         if last_metrics and (not save_every or last_metrics["step"] % save_every != 0):
             _save_sft_checkpoint(
-                checkpoint_manager, optimizer, rng, int(last_metrics["step"]), data_iter, force=True
+                checkpoint_manager,
+                optimizer,
+                rng,
+                int(last_metrics["step"]),
+                data_iter,
+                lr_contract=lr_contract,
+                force=True,
             )
         checkpoint_manager.wait_until_finished()
         checkpoint_manager.close()
@@ -949,6 +1002,7 @@ def run_statepassing_curriculum(
     gdn_layer_limit: int | None = None,
     pass_rope_positions: bool = False,
     pass_conv_state: bool = False,
+    lr_contract_explicit_fields: Collection[str] | None = None,
 ) -> tuple[MixedPrecisionOptimizer, dict[str, float]]:
     pretrain_mode = PretrainMode(pretrain_mode)
     if not pretrain_mode.is_statepassing:
@@ -974,6 +1028,13 @@ def run_statepassing_curriculum(
     will_resume = (
         resume in (checkpoint_utils.ResumeMode.IF_PRESENT, checkpoint_utils.ResumeMode.REQUIRED)
         and latest_step is not None
+    )
+    train_cfg, lr_contract = _resolve_pretrain_lr_contract(
+        train_cfg,
+        checkpoint_manager,
+        latest_step,
+        will_resume=will_resume,
+        explicit_fields=lr_contract_explicit_fields,
     )
 
     model_cfg = (
@@ -1179,6 +1240,7 @@ def run_statepassing_curriculum(
                     phase_idx=phase_idx,
                     phase_step=phase_step,
                     input_iter=data_iter,
+                    lr_contract=lr_contract,
                 )
 
             if gc_period and step % gc_period == 0:
@@ -1196,6 +1258,7 @@ def run_statepassing_curriculum(
                     phase_idx=next_phase_idx,
                     phase_step=0,
                     input_iter=data_iter,
+                    lr_contract=lr_contract,
                     force=True,
                 )
             phase_idx = next_phase_idx
@@ -1215,6 +1278,7 @@ def run_statepassing_curriculum(
                 phase_idx=phase_idx,
                 phase_step=phase_step,
                 input_iter=data_iter,
+                lr_contract=lr_contract,
                 force=True,
             )
         checkpoint_manager.wait_until_finished()

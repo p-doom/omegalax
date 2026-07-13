@@ -150,6 +150,22 @@ def _warmup_steps() -> int:
     return int(warmup_steps)
 
 
+def _explicit_lr_contract_fields() -> frozenset[str]:
+    flag_to_contract_field = {
+        "learning_rate": "learning_rate",
+        "warmup_tokens": "warmup_steps",
+        "lr_schedule": "lr_schedule",
+        "lr_end_factor": "lr_end_factor",
+        "lr_stable_fraction": "lr_stable_fraction",
+        "lr_schedule_steps": "lr_schedule_steps",
+    }
+    return frozenset(
+        contract_field
+        for flag_name, contract_field in flag_to_contract_field.items()
+        if FLAGS[flag_name].present
+    )
+
+
 def _num_steps_and_warmup() -> tuple[int, int]:
     tokens_per_step = FLAGS.batch_size * FLAGS.seq_len * FLAGS.grad_accum_steps
     if tokens_per_step <= 0:
@@ -386,10 +402,11 @@ def main(_) -> None:
         print_every=FLAGS.log_every,
     )
     startup_log(
-        f"resolved train stop={train_cfg.num_steps} "
-        f"lr_schedule_steps={train_cfg.resolved_lr_schedule_steps} "
+        f"requested train stop={train_cfg.num_steps} "
+        f"lr_schedule_steps={train_cfg.lr_schedule_steps!r} "
         f"warmup_steps={train_cfg.warmup_steps}"
     )
+    lr_contract_explicit_fields = _explicit_lr_contract_fields()
     resume_mode = ResumeMode(FLAGS.resume)
     save_dir = (
         Path(FLAGS.save_dir)
@@ -447,6 +464,7 @@ def main(_) -> None:
                 wandb_run=wandb_run,
                 text_attn_backend=FLAGS.text_attn_backend,
                 gc_period=FLAGS.gc_period,
+                lr_contract_explicit_fields=lr_contract_explicit_fields,
                 **_runtime_kwargs(),
             )
         else:
@@ -470,6 +488,7 @@ def main(_) -> None:
                 val_steps=FLAGS.val_steps,
                 text_attn_backend=FLAGS.text_attn_backend,
                 gc_period=FLAGS.gc_period,
+                lr_contract_explicit_fields=lr_contract_explicit_fields,
                 **_runtime_kwargs(),
             )
     finally:

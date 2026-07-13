@@ -6,7 +6,9 @@ import dataclasses
 import datetime
 import gc
 import os
+from collections.abc import Collection, Mapping
 from pathlib import Path
+from typing import Any
 
 from flax import nnx
 import jax
@@ -72,6 +74,98 @@ class TrainConfig:
                 f"got lr_schedule_steps={schedule_steps}, num_steps={self.num_steps}."
             )
         return schedule_steps
+
+
+LR_CONTRACT_FIELDS = (
+    "learning_rate",
+    "warmup_steps",
+    "lr_schedule",
+    "lr_end_factor",
+    "lr_stable_fraction",
+    "lr_schedule_steps",
+)
+
+
+def lr_contract_from_train_config(train_cfg: TrainConfig) -> dict[str, Any]:
+    return {
+        "learning_rate": float(train_cfg.learning_rate),
+        "warmup_steps": int(train_cfg.warmup_steps),
+        "lr_schedule": str(train_cfg.lr_schedule),
+        "lr_end_factor": float(train_cfg.lr_end_factor),
+        "lr_stable_fraction": float(train_cfg.lr_stable_fraction),
+        "lr_schedule_steps": int(train_cfg.resolved_lr_schedule_steps),
+    }
+
+
+def _normalize_lr_contract(lr_contract: Mapping[str, Any]) -> dict[str, Any]:
+    fields = set(lr_contract)
+    expected_fields = set(LR_CONTRACT_FIELDS)
+    if fields != expected_fields:
+        missing = sorted(expected_fields - fields)
+        unexpected = sorted(fields - expected_fields)
+        raise ValueError(
+            "Invalid LR contract fields: "
+            f"missing={missing or 'none'}, unexpected={unexpected or 'none'}."
+        )
+    try:
+        normalized = {
+            "learning_rate": float(lr_contract["learning_rate"]),
+            "warmup_steps": int(lr_contract["warmup_steps"]),
+            "lr_schedule": str(lr_contract["lr_schedule"]),
+            "lr_end_factor": float(lr_contract["lr_end_factor"]),
+            "lr_stable_fraction": float(lr_contract["lr_stable_fraction"]),
+            "lr_schedule_steps": int(lr_contract["lr_schedule_steps"]),
+        }
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid LR contract values: {lr_contract!r}.") from exc
+    if normalized["warmup_steps"] < 0:
+        raise ValueError("Invalid LR contract: warmup_steps must be >= 0.")
+    if normalized["lr_schedule_steps"] <= 0:
+        raise ValueError("Invalid LR contract: lr_schedule_steps must be > 0.")
+    return normalized
+
+
+def resolve_train_config_lr_contract(
+    train_cfg: TrainConfig,
+    stored_lr_contract: Mapping[str, Any] | None = None,
+    *,
+    explicit_fields: Collection[str] | None = None,
+) -> tuple[TrainConfig, dict[str, Any]]:
+    requested_contract = lr_contract_from_train_config(train_cfg)
+    if stored_lr_contract is None:
+        return train_cfg, requested_contract
+
+    stored_contract = _normalize_lr_contract(stored_lr_contract)
+    explicit = set(LR_CONTRACT_FIELDS if explicit_fields is None else explicit_fields)
+    unknown_fields = explicit - set(LR_CONTRACT_FIELDS)
+    if unknown_fields:
+        raise ValueError(f"Unknown explicit LR contract fields: {sorted(unknown_fields)}")
+
+    mismatches = {
+        field: (stored_contract[field], requested_contract[field])
+        for field in explicit
+        if stored_contract[field] != requested_contract[field]
+    }
+    if mismatches:
+        details = ", ".join(
+            f"{field}: checkpoint={checkpoint_value!r}, resume={resume_value!r}"
+            for field, (checkpoint_value, resume_value) in sorted(mismatches.items())
+        )
+        raise ValueError(
+            "LR contract mismatch on resume. Schedule fields cannot change: " + details
+        )
+
+    resolved_cfg = dataclasses.replace(
+        train_cfg,
+        learning_rate=stored_contract["learning_rate"],
+        warmup_steps=stored_contract["warmup_steps"],
+        lr_schedule=stored_contract["lr_schedule"],
+        lr_end_factor=stored_contract["lr_end_factor"],
+        lr_stable_fraction=stored_contract["lr_stable_fraction"],
+        lr_schedule_steps=stored_contract["lr_schedule_steps"],
+    )
+    _ = resolved_cfg.resolved_lr_schedule_steps
+    return resolved_cfg, stored_contract
 
 
 def init_model(
@@ -141,6 +235,7 @@ def _make_checkpoint_manager(save_dir: Path, save_interval: int | None) -> ocp.C
         "train_state", ocp.args.PyTreeRestore, ocp.handlers.PyTreeCheckpointHandler
     )
     checkpoint_utils.register_grain_iterator_handler(handler_registry)
+    checkpoint_utils.register_lr_contract_handler(handler_registry)
     options = ocp.CheckpointManagerOptions(
         save_interval_steps=save_interval,
         max_to_keep=2,
@@ -161,10 +256,13 @@ def _save_sft_checkpoint(
     step: int,
     input_iter: checkpoint_utils.GrainIterator,
     *,
+    lr_contract: Mapping[str, Any] | None = None,
     force: bool = False,
 ) -> None:
     train_state = _train_state(optimizer, rng)
-    save_args = checkpoint_utils.make_grain_save_args(train_state, input_iter)
+    save_args = checkpoint_utils.make_grain_save_args(
+        train_state, input_iter, lr_contract=lr_contract
+    )
     checkpoint_manager.save(step, args=save_args, force=force)
 
 
