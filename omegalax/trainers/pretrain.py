@@ -9,6 +9,8 @@ import enum
 import gc
 import math
 import numpy as np
+import os
+import signal
 import subprocess
 import time
 from pathlib import Path
@@ -50,6 +52,27 @@ from omegalax.trainers.text import (
 
 P = PartitionSpec
 _NUM_LOSS_TILES = 4
+
+
+def _install_requeue_signal_handler() -> Callable[[], bool]:
+    requeue_requested = False
+
+    def _request_requeue(signum, _frame):
+        nonlocal requeue_requested
+        if not requeue_requested:
+            startup_log(f"[signal] received {signum}; will checkpoint after current step")
+        requeue_requested = True
+
+    signal.signal(signal.SIGUSR1, _request_requeue)
+    signal.signal(signal.SIGTERM, _request_requeue)
+    return lambda: requeue_requested
+
+
+def _request_slurm_requeue_if_primary(is_primary_process: bool) -> None:
+    slurm_job_id = os.environ.get("SLURM_JOB_ID")
+    if slurm_job_id and is_primary_process:
+        startup_log(f"[signal] scontrol requeue {slurm_job_id}")
+        subprocess.run(["scontrol", "requeue", slurm_job_id], check=False)
 
 
 class PretrainMode(enum.StrEnum):
@@ -874,6 +897,8 @@ def run_pretrain(
         if result is not None:
             last_metrics = result
 
+    requeue_requested = _install_requeue_signal_handler()
+
     startup_log(f"entering pretrain loop mode={pretrain_mode}")
     for step_idx in range(start_step, train_cfg.num_steps):
         step = step_idx + 1
@@ -957,6 +982,23 @@ def run_pretrain(
             val_host = _finalize_accumulated_metrics(val_acc)
             if wandb_run is not None and is_primary_process:
                 wandb_run.log({f"val/{key}": value for key, value in val_host.items()}, step=step)
+
+        if requeue_requested():
+            startup_log(f"[signal] saving checkpoint at step={step} before requeue")
+            if checkpoint_manager is not None:
+                _save_sft_checkpoint(
+                    checkpoint_manager,
+                    optimizer,
+                    rng,
+                    step,
+                    data_iter,
+                    lr_contract=lr_contract,
+                    force=True,
+                )
+                checkpoint_manager.wait_until_finished()
+                checkpoint_manager.close()
+            _request_slurm_requeue_if_primary(is_primary_process)
+            return optimizer, last_metrics
 
     _log_prev_metrics(force=True)
 
@@ -1135,6 +1177,7 @@ def run_statepassing_curriculum(
     startup_log(
         f"entering statepassing curriculum loop mode={pretrain_mode} train_order={train_order}"
     )
+    requeue_requested = _install_requeue_signal_handler()
     train_steps: dict[int, Any] = {}
     while phase_idx < len(train_order):
         num_segments = int(train_order[phase_idx])
@@ -1245,6 +1288,27 @@ def run_statepassing_curriculum(
 
             if gc_period and step % gc_period == 0:
                 gc.collect()
+
+            if requeue_requested():
+                startup_log(
+                    f"[signal] saving curriculum checkpoint at step={global_step} before requeue"
+                )
+                if checkpoint_manager is not None:
+                    _save_curriculum_checkpoint(
+                        checkpoint_manager,
+                        optimizer,
+                        rng,
+                        global_step=global_step,
+                        phase_idx=phase_idx,
+                        phase_step=phase_step,
+                        input_iter=data_iter,
+                        lr_contract=lr_contract,
+                        force=True,
+                    )
+                    checkpoint_manager.wait_until_finished()
+                    checkpoint_manager.close()
+                _request_slurm_requeue_if_primary(is_primary_process)
+                return optimizer, last_metrics
 
         next_phase_idx = _first_runnable_phase(phase_idx + 1)
         if next_phase_idx < len(train_order):

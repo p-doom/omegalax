@@ -714,6 +714,8 @@ class SubmitTextPretrainSlurmScriptTest(absltest.TestCase):
 
         self.assertIn("#SBATCH --gres=gpu:8", script)
         self.assertIn("#SBATCH --qos=low", script)
+        self.assertIn("#SBATCH --signal=USR1@1800", script)
+        self.assertIn("#SBATCH --requeue", script)
         self.assertIn("#SBATCH --ntasks-per-node=8", script)
         self.assertIn("JAX_PLATFORMS=cuda", script)
         self.assertIn('--fsdp_size="8"', script)

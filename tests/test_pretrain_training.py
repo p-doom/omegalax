@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import os
 from pathlib import Path
+import signal
 import tempfile
 from unittest import mock
 
@@ -19,6 +20,14 @@ from absl.testing import absltest
 from flax import nnx
 from jax.sharding import PartitionSpec
 
+from omegalax.data.pretrain_data_set import (
+    DOC_CHAIN_FORMAT,
+    write_json_arrayrecord_dataset,
+)
+from omegalax.data.pretrain_statepassing import (
+    build_statepassing_window_index,
+    make_statepassing_iterator,
+)
 from omegalax.distributed.mesh import ensure_mesh
 from omegalax.distributed.mesh import mesh_rules_for
 from omegalax.distributed.mesh import required_batch_multiple
@@ -30,6 +39,7 @@ from omegalax.trainers.loss import chunked_cross_entropy_multi_stats
 from omegalax.trainers import checkpoint_utils
 from omegalax.trainers import pretrain as pretrain_trainer
 from omegalax.trainers import text as text_trainer
+from tests.pretrain_real_data_test_utils import test_temp_dir
 
 
 def _tiny_qwen3_5_config() -> Qwen3_5TextConfig:
@@ -744,6 +754,83 @@ class PretrainMaskAndLossTest(absltest.TestCase):
             np.zeros((1, 3, 2), dtype=np.float32),
         )
 
+    def test_gdn_only_full_bptt_matches_single_forward_loss_and_gradients(self):
+        cfg = dataclasses.replace(
+            _tiny_qwen3_5_config(),
+            num_hidden_layers=2,
+            layer_types=("linear_attention", "linear_attention"),
+        )
+        token_ids_BT = jnp.arange(1, 13, dtype=jnp.int32)[None, :]
+        full_batch = {
+            "token_ids_BT": token_ids_BT,
+            "attention_mask_BT": jnp.ones_like(token_ids_BT),
+            "loss_mask_BT": jnp.ones_like(token_ids_BT),
+            "position_ids_ZBT": jnp.broadcast_to(
+                jnp.arange(12, dtype=jnp.int32)[None, None, :], (3, 1, 12)
+            ),
+        }
+        statepassing_batch = {
+            "token_ids_BCT": token_ids_BT.reshape(1, 3, 4),
+            "attention_mask_BCT": jnp.ones((1, 3, 4), dtype=jnp.int32),
+            "loss_mask_BCT": jnp.ones((1, 3, 4), dtype=jnp.int32),
+            "chunk_idx_BC": jnp.asarray([[0, 1, 2]], dtype=jnp.int32),
+            "reset_state_BC": jnp.asarray([[True, False, False]], dtype=jnp.bool_),
+        }
+        full_model, _ = text_api.init_model(
+            cfg, jax.random.PRNGKey(0), tp_size=1, fsdp_size=1, dp_size=1
+        )
+        statepassing_model, _ = text_api.init_model(
+            cfg, jax.random.PRNGKey(0), tp_size=1, fsdp_size=1, dp_size=1
+        )
+
+        @nnx.jit
+        def full_value_and_grad(model):
+            def loss_fn(inner_model):
+                return pretrain_trainer._iid_loss_stats(inner_model, full_batch, cfg, 0)
+
+            return nnx.value_and_grad(loss_fn, has_aux=True)(model)
+
+        @nnx.jit
+        def statepassing_value_and_grad(model):
+            def loss_fn(inner_model):
+                return pretrain_trainer._statepassing_loss_stats(
+                    inner_model,
+                    statepassing_batch,
+                    cfg,
+                    0,
+                    pretrain_trainer.PretrainMode.STATEPASSING_BPTT,
+                    bptt_chunks=3,
+                    pass_gdn_state=True,
+                    pass_rope_positions=True,
+                    pass_conv_state=True,
+                )
+
+            return nnx.value_and_grad(loss_fn, has_aux=True)(model)
+
+        with mesh_rules_for(tp_size=1, fsdp_size=1, dp_size=1):
+            (full_loss, full_metrics), full_grads = full_value_and_grad(full_model)
+            (statepassing_loss, statepassing_metrics), statepassing_grads = (
+                statepassing_value_and_grad(statepassing_model)
+            )
+
+        np.testing.assert_allclose(full_loss, statepassing_loss, rtol=1e-6, atol=1e-6)
+        self.assertEqual(
+            float(full_metrics["supervised_tokens"]),
+            float(statepassing_metrics["supervised_tokens"]),
+        )
+        self.assertEqual(jax.tree.structure(full_grads), jax.tree.structure(statepassing_grads))
+        for full_grad, statepassing_grad in zip(
+            jax.tree.leaves(full_grads),
+            jax.tree.leaves(statepassing_grads),
+            strict=True,
+        ):
+            np.testing.assert_allclose(
+                np.asarray(full_grad),
+                np.asarray(statepassing_grad),
+                rtol=2e-4,
+                atol=2e-5,
+            )
+
 
 class PretrainTrainingSmokeTest(absltest.TestCase):
     def test_lr_schedule_horizon_can_exceed_training_stop(self):
@@ -955,6 +1042,145 @@ class PretrainTrainingSmokeTest(absltest.TestCase):
         )
 
         self.assertAlmostEqual(metrics["lr"], float(schedule(1)))
+
+    def test_signal_checkpoint_resume_matches_uninterrupted_statepassing(self):
+        cfg = _tiny_qwen3_5_config()
+        train_cfg = pretrain_trainer.TrainConfig(
+            seed=0,
+            batch_size=2,
+            seq_len=4,
+            num_steps=4,
+            lr_schedule_steps=4,
+            learning_rate=1e-3,
+            weight_decay=0.0,
+            warmup_steps=1,
+            lr_schedule="cosine",
+            lr_end_factor=0.25,
+            print_every=0,
+        )
+
+        with test_temp_dir() as tmp:
+            tmpdir = Path(tmp)
+            data_root = tmpdir / "docs"
+            token_ids = [index % 63 + 1 for index in range(48)]
+            write_json_arrayrecord_dataset(
+                (
+                    {
+                        "dataset_format": DOC_CHAIN_FORMAT,
+                        "doc_id": "resume-doc",
+                        "token_ids": token_ids,
+                        "doc_token_count": len(token_ids),
+                    },
+                ),
+                data_root / "train" / "bucket_2k",
+                records_per_shard=16,
+                overwrite=False,
+                metadata={"dataset_format": DOC_CHAIN_FORMAT},
+            )
+            index_path = build_statepassing_window_index(
+                data_root,
+                tmpdir / "index",
+                chunk_length=4,
+                num_segments=2,
+                split="train",
+                records_per_shard=16,
+            )
+
+            def make_iterator():
+                return make_statepassing_iterator(
+                    index_path,
+                    batch_size=2,
+                    chunk_length=4,
+                    shuffle=True,
+                    seed=17,
+                    num_epochs=1,
+                    dp_size=1,
+                    fsdp_size=1,
+                    process_index=0,
+                    grain_workers=0,
+                    grain_read_threads=1,
+                    grain_read_prefetch_buffer_size=1,
+                )
+
+            run_kwargs = {
+                "pretrain_mode": pretrain_trainer.PretrainMode.STATEPASSING_BPTT,
+                "log_every": 0,
+                "tp_size": 1,
+                "fsdp_size": 1,
+                "dp_size": 1,
+                "bptt_chunks": 2,
+                "pass_gdn_state": True,
+                "pass_rope_positions": True,
+                "pass_conv_state": True,
+            }
+            previous_usr1 = signal.getsignal(signal.SIGUSR1)
+            previous_term = signal.getsignal(signal.SIGTERM)
+            try:
+                uninterrupted_optimizer, uninterrupted_metrics = pretrain_trainer.run_pretrain(
+                    cfg,
+                    train_cfg,
+                    make_iterator(),
+                    **run_kwargs,
+                )
+
+                checkpoint_dir = tmpdir / "checkpoint"
+                install_handler = pretrain_trainer._install_requeue_signal_handler
+
+                def install_handler_and_request_requeue():
+                    requeue_requested = install_handler()
+                    os.kill(os.getpid(), signal.SIGUSR1)
+                    return requeue_requested
+
+                with (
+                    mock.patch.object(
+                        pretrain_trainer,
+                        "_install_requeue_signal_handler",
+                        side_effect=install_handler_and_request_requeue,
+                    ),
+                    mock.patch.object(
+                        pretrain_trainer, "_request_slurm_requeue_if_primary"
+                    ) as request_requeue,
+                ):
+                    pretrain_trainer.run_pretrain(
+                        cfg,
+                        train_cfg,
+                        make_iterator(),
+                        save_dir=checkpoint_dir,
+                        resume=checkpoint_utils.ResumeMode.NEVER,
+                        **run_kwargs,
+                    )
+
+                request_requeue.assert_called_once_with(True)
+                self.assertTrue((checkpoint_dir / "000001").is_dir())
+
+                resumed_optimizer, resumed_metrics = pretrain_trainer.run_pretrain(
+                    cfg,
+                    train_cfg,
+                    make_iterator(),
+                    save_dir=checkpoint_dir,
+                    resume=checkpoint_utils.ResumeMode.REQUIRED,
+                    **run_kwargs,
+                )
+            finally:
+                signal.signal(signal.SIGUSR1, previous_usr1)
+                signal.signal(signal.SIGTERM, previous_term)
+
+        self.assertEqual(uninterrupted_metrics["step"], 4)
+        self.assertEqual(resumed_metrics["step"], 4)
+        self.assertAlmostEqual(uninterrupted_metrics["lr"], resumed_metrics["lr"])
+        self.assertAlmostEqual(uninterrupted_metrics["nll"], resumed_metrics["nll"], places=6)
+        uninterrupted_state = nnx.state(uninterrupted_optimizer)
+        resumed_state = nnx.state(resumed_optimizer)
+        self.assertEqual(jax.tree.structure(uninterrupted_state), jax.tree.structure(resumed_state))
+        for uninterrupted_leaf, resumed_leaf in zip(
+            jax.tree.leaves(uninterrupted_state),
+            jax.tree.leaves(resumed_state),
+            strict=True,
+        ):
+            np.testing.assert_array_equal(
+                np.asarray(uninterrupted_leaf),
+                np.asarray(resumed_leaf),
+            )
 
     def test_one_step_iid_pretrain(self):
         cfg = _tiny_qwen3_5_config()

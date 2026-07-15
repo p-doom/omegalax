@@ -428,6 +428,8 @@ def _sbatch_header(
     ntasks_per_node: int | None = None,
     cpus_per_task: int,
     gres_gpu: int | None = None,
+    signal_before_timeout: str | None = None,
+    requeue: bool = False,
 ) -> str:
     lines = [
         "#!/usr/bin/env bash",
@@ -439,6 +441,10 @@ def _sbatch_header(
         f"#SBATCH --output={log_dir}/%x_%j.log",
         f"#SBATCH --error={log_dir}/%x_%j.log",
     ]
+    if signal_before_timeout:
+        lines.append(f"#SBATCH --signal={signal_before_timeout}")
+    if requeue:
+        lines.append("#SBATCH --requeue")
     if qos:
         lines.append(f"#SBATCH --qos={qos}")
     if ntasks_per_node is None:
@@ -709,6 +715,8 @@ uv run python -m pytest tests/test_gated_delta_rule_pallas.py tests/test_gated_d
             ntasks_per_node=launch_ntasks_per_node,
             cpus_per_task=cpus_per_task,
             gres_gpu=gpus_per_node,
+            signal_before_timeout="USR1@1800",
+            requeue=True,
         )
     }
 
