@@ -281,14 +281,14 @@ class DataMixingTest(absltest.TestCase):
             chunked_a_short = build_chunk_index(
                 payload_a,
                 tmpdir / "a_chunked_short",
-                max_length=1,
+                max_length=2,
                 measure_message=lambda _m: 1,
                 records_per_shard=8,
             )
             chunked_a_long = build_chunk_index(
                 payload_a,
                 tmpdir / "a_chunked_long",
-                max_length=2,
+                max_length=3,
                 measure_message=lambda _m: 1,
                 records_per_shard=8,
             )

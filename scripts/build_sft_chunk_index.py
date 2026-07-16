@@ -45,14 +45,13 @@ flags.DEFINE_string(
 )
 flags.DEFINE_enum(
     "overflow_mode",
-    "split",
-    ["split", "truncate", "drop"],
+    "drop",
+    ["truncate", "drop"],
     "How to handle a conversation whose turns exceed the token budget. "
-    "'split': pack into multiple consecutive chunks at turn boundaries "
-    "(no turns dropped). 'truncate': keep only the first fitting chunk and "
-    "drop the overflowing turn plus the rest of the conversation. 'drop': "
-    "discard the whole conversation if it does not fit in a single chunk. "
-    "Truncation stats are written to truncation_stats.json.",
+    "'truncate': keep only the first fitting chunk (the goal-bearing prefix) "
+    "and drop the overflowing turn plus the rest of the conversation. "
+    "'drop' (default): discard the whole conversation if it does not fit in a "
+    "single chunk. Truncation stats are written to truncation_stats.json.",
 )
 flags.DEFINE_string(
     "message_lengths_path",

@@ -588,20 +588,18 @@ def _emit_truncation_stats(
     dropped_messages: int,
     dropped_tokens: int,
 ) -> None:
-    """Summarise per-session truncation/splitting, print it, and persist it to
+    """Summarise per-session truncation, print it, and persist it to
     ``truncation_stats.json`` in ``out_dir``.
 
     ``prefix_sessions`` lost their tail because a single turn exceeded the
-    budget (``split``/``truncate``); ``overflow_sessions`` lost their tail
-    because packing overflowed (``truncate`` only); ``dropped_sessions`` were
+    budget (``truncate``); ``overflow_sessions`` lost their tail because
+    packing overflowed (``truncate`` only); ``dropped_sessions`` were
     discarded wholesale because they did not fit in a single chunk (``drop``
-    only). ``split`` mode never drops accumulation overflow, so its only
-    dropped tokens come from the single-turn-too-big case.
+    only).
     """
     truncated_sessions = prefix_sessions | overflow_sessions
     num_chunks = sum(session_chunk_counts.values())
     sessions_with_chunks = len(session_chunk_counts)
-    sessions_split = sum(1 for c in session_chunk_counts.values() if c > 1)
     sessions_dropped_entirely = total_sessions - sessions_with_chunks
     kept_tokens = total_message_tokens - dropped_tokens
 
@@ -613,17 +611,13 @@ def _emit_truncation_stats(
         "sessions": {
             "total": total_sessions,
             "emitted_at_least_one_chunk": sessions_with_chunks,
-            "split_into_multiple_chunks": sessions_split,
             "truncated_total": len(truncated_sessions),
             "truncated_overflow": len(overflow_sessions),
             "truncated_single_message": len(prefix_sessions),
             "dropped_whole_session": len(dropped_sessions),
             "dropped_entirely": sessions_dropped_entirely,
         },
-        "chunks": {
-            "emitted": num_chunks,
-            "max_per_session": max(session_chunk_counts.values(), default=0),
-        },
+        "chunks": {"emitted": num_chunks},
         "messages": {"dropped": dropped_messages},
         "tokens": {
             "total_measured": total_message_tokens,
@@ -642,7 +636,7 @@ def _emit_truncation_stats(
         f"(overflow_mode={overflow_mode}, effective_max={effective_max} "
         f"= max_length={max_length} - system_tokens={system_message_length}):\n"
         f"  sessions: total={total_sessions} emitted={sessions_with_chunks} "
-        f"split={sessions_split} truncated={len(truncated_sessions)} "
+        f"truncated={len(truncated_sessions)} "
         f"(overflow={len(overflow_sessions)}, single_msg={len(prefix_sessions)}) "
         f"dropped_whole={len(dropped_sessions)} "
         f"dropped_entirely={sessions_dropped_entirely}\n"
@@ -665,7 +659,7 @@ def build_chunk_index(
     profile_metadata: dict[str, Any] | None = None,
     num_workers: int = 2,
     system_message: dict[str, Any] | None = None,
-    overflow_mode: str = "split",
+    overflow_mode: str = "drop",
     message_lengths_path: str | Path | None = None,
 ) -> Path:
     """Build an offline chunk index over a canonical payload-block dataset.
@@ -685,24 +679,22 @@ def build_chunk_index(
     ``overflow_mode`` controls what happens to a conversation (session) whose
     turns do not all fit within ``effective_max = max_length - system_tokens``:
 
-    * ``"split"`` (default, legacy behaviour): the session is packed into as
-      many consecutive ≤budget chunks as needed at turn boundaries. No turns
-      are dropped (every chunk is a fresh training sample with no shared
-      history across the split).
     * ``"truncate"``: only the first ≤budget chunk (the longest prefix of whole
       turns that fits) is kept; the overflowing turn and the rest of the
-      session are dropped.
-    * ``"drop"``: any conversation that does not fit entirely in a single chunk
-      (``total_tokens > effective_max``) is dropped wholesale; nothing is
-      emitted for it. Only conversations that fit within the budget survive.
+      session are dropped. This keeps the goal-bearing prefix (the goal lives
+      in the conversation's first user turn), so every emitted chunk stays
+      conditioned on the goal.
+    * ``"drop"`` (default): any conversation that does not fit entirely in a
+      single chunk (``total_tokens > effective_max``) is dropped wholesale;
+      nothing is emitted for it. Only conversations that fit within the budget
+      survive.
 
-    In ``split`` and ``truncate`` a single turn that alone exceeds
-    ``effective_max`` triggers prefix-truncation (the over-length turn and the
-    session tail are dropped); in ``drop`` that whole session is dropped too.
+    In ``truncate`` a single turn that alone exceeds ``effective_max`` triggers
+    prefix-truncation (the over-length turn and the session tail are dropped);
+    in ``drop`` that whole session is dropped too.
 
-    Truncation accounting (sessions/messages/tokens dropped, sessions split) is
-    printed to stdout and written to ``truncation_stats.json`` next to the
-    index.
+    Truncation accounting (sessions/messages/tokens dropped) is printed to
+    stdout and written to ``truncation_stats.json`` next to the index.
 
     ``message_lengths_path`` enables the per-message length cache. Tokenization
     (``measure_message`` over every message) is the only step that depends on
@@ -717,10 +709,8 @@ def build_chunk_index(
 
     if max_length <= 0:
         raise ValueError("max_length must be > 0")
-    if overflow_mode not in ("split", "truncate", "drop"):
-        raise ValueError(
-            f"overflow_mode must be 'split', 'truncate', or 'drop', got {overflow_mode!r}"
-        )
+    if overflow_mode not in ("truncate", "drop"):
+        raise ValueError(f"overflow_mode must be 'truncate' or 'drop', got {overflow_mode!r}")
 
     payload_path = Path(payload_path).expanduser().resolve()
     out_dir = Path(out_dir).expanduser().resolve()
@@ -804,7 +794,7 @@ def build_chunk_index(
         )
 
     # drop mode: any conversation that doesn't fit in a single chunk is dropped
-    # wholesale (handled at the top of the binner loop). Empty in other modes.
+    # wholesale (handled at the top of the binner loop). Empty in truncate mode.
     drop_sessions: set[str] = set()
     if overflow_mode == "drop":
         drop_sessions = {
@@ -974,6 +964,10 @@ def build_chunk_index(
                     start_record_idx = record_idx
                     start_message_offset = msg_offset
                 elif current_length + msg_length > effective_max:
+                    # Packing overflowed. Only reachable in truncate mode (drop
+                    # mode discards over-budget sessions wholesale up front):
+                    # keep only the first chunk; drop the overflowing turn and
+                    # the rest of the session.
                     descriptor = emit_current()
                     if descriptor is not None:
                         yield descriptor
@@ -982,17 +976,12 @@ def build_chunk_index(
                     current_vision_tokens = 0
                     current_vision_patches = 0
                     current_num_images = 0
-                    if overflow_mode == "truncate":
-                        # Keep only the first chunk; drop the overflowing turn
-                        # and the rest of the session.
-                        truncated_sessions.add(block_session_id)
-                        _trunc["overflow_sessions"].add(block_session_id)
-                        dm, dt = _dropped_range(record_idx, block, msg_offset)
-                        _trunc["dropped_messages"] += dm
-                        _trunc["dropped_tokens"] += dt
-                        break
-                    start_record_idx = record_idx
-                    start_message_offset = msg_offset
+                    truncated_sessions.add(block_session_id)
+                    _trunc["overflow_sessions"].add(block_session_id)
+                    dm, dt = _dropped_range(record_idx, block, msg_offset)
+                    _trunc["dropped_messages"] += dm
+                    _trunc["dropped_tokens"] += dt
+                    break
 
                 current_messages.append(message)
                 current_length += msg_length

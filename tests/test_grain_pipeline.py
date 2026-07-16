@@ -109,7 +109,9 @@ class GrainPipelineTest(absltest.TestCase):
                     fsdp_size=1,
                 )
 
-    def test_build_chunk_index_splits_across_payload_blocks(self):
+    def test_build_chunk_index_chunk_spans_payload_blocks(self):
+        # A session compiled into several payload blocks is reassembled into a
+        # single chunk when it fits within the budget.
         with tempfile.TemporaryDirectory() as tmpdir:
             src = Path(tmpdir) / "train.jsonl"
             self._write_jsonl(
@@ -137,7 +139,7 @@ class GrainPipelineTest(absltest.TestCase):
             chunked = build_chunk_index(
                 payload,
                 Path(tmpdir) / "chunked",
-                max_length=2,
+                max_length=6,
                 measure_message=_measure_one,
                 records_per_shard=8,
             )
@@ -155,17 +157,15 @@ class GrainPipelineTest(absltest.TestCase):
                 dp_size=1,
                 fsdp_size=1,
             )
-            records = [next(iterator) for _ in range(3)]
-            self.assertEqual([len(record["messages"]) for record in records], [2, 2, 2])
+            record = next(iterator)
+            self.assertEqual(len(record["messages"]), 6)
             self.assertEqual(
-                [record["messages"][0]["content"] for record in records], ["10", "12", "14"]
+                [message["content"] for message in record["messages"]],
+                ["10", "11", "12", "13", "14", "15"],
             )
-            expected_session_id = self._expected_session_id(src, 1)
-            self.assertEqual(
-                [record["_omegalax_session_id"] for record in records], [expected_session_id] * 3
-            )
+            self.assertEqual(record["_omegalax_session_id"], self._expected_session_id(src, 1))
 
-    def test_grain_iterator_checkpoint_restore_on_chunk_index(self):
+    def test_build_chunk_index_rejects_unknown_overflow_mode(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             src = Path(tmpdir) / "train.jsonl"
             self._write_jsonl(
@@ -175,14 +175,39 @@ class GrainPipelineTest(absltest.TestCase):
                         "messages": [
                             {"role": "user", "content": "10"},
                             {"role": "assistant", "content": "11"},
-                            {"role": "user", "content": "12"},
-                            {"role": "assistant", "content": "13"},
-                            {"role": "user", "content": "14"},
-                            {"role": "assistant", "content": "15"},
-                            {"role": "user", "content": "16"},
-                            {"role": "assistant", "content": "17"},
                         ],
                     },
+                ],
+            )
+            payload = compile_jsonl_to_arrayrecord(
+                src,
+                Path(tmpdir) / "payload",
+                messages_per_record=2,
+                records_per_shard=8,
+            )
+            with self.assertRaisesRegex(ValueError, "overflow_mode must be 'truncate' or 'drop'"):
+                build_chunk_index(
+                    payload,
+                    Path(tmpdir) / "chunked",
+                    max_length=2,
+                    measure_message=_measure_one,
+                    records_per_shard=8,
+                    overflow_mode="split",
+                )
+
+    def test_grain_iterator_checkpoint_restore_on_chunk_index(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src = Path(tmpdir) / "train.jsonl"
+            self._write_jsonl(
+                src,
+                [
+                    {
+                        "messages": [
+                            {"role": "user", "content": str(value)},
+                            {"role": "assistant", "content": str(value + 1)},
+                        ],
+                    }
+                    for value in (10, 12, 14, 16)
                 ],
             )
             payload = compile_jsonl_to_arrayrecord(
@@ -269,16 +294,11 @@ class GrainPipelineTest(absltest.TestCase):
                 [
                     {
                         "messages": [
-                            {"role": "user", "content": "10"},
-                            {"role": "assistant", "content": "11"},
-                            {"role": "user", "content": "12"},
-                            {"role": "assistant", "content": "13"},
-                            {"role": "user", "content": "14"},
-                            {"role": "assistant", "content": "15"},
-                            {"role": "user", "content": "16"},
-                            {"role": "assistant", "content": "17"},
+                            {"role": "user", "content": str(value)},
+                            {"role": "assistant", "content": str(value + 1)},
                         ],
-                    },
+                    }
+                    for value in (10, 12, 14, 16)
                 ],
             )
             payload = compile_jsonl_to_arrayrecord(
@@ -399,8 +419,8 @@ class GrainPipelineTest(absltest.TestCase):
     def test_build_chunk_index_with_system_message_prepends_to_every_chunk(self):
         # Verifies via the chunk-descriptor resolver directly rather than
         # through make_grain_iterator — the iterator path has unrelated
-        # breakage that an upstream test (test_build_chunk_index_splits_
-        # across_payload_blocks) also hits.
+        # breakage that an upstream test (test_build_chunk_index_chunk_
+        # spans_payload_blocks) also hits.
         from omegalax.data.grain_pipeline import (
             _ChunkDescriptorResolver,
             load_compiled_metadata,
@@ -415,14 +435,11 @@ class GrainPipelineTest(absltest.TestCase):
                 [
                     {
                         "messages": [
-                            {"role": "user", "content": "10"},
-                            {"role": "assistant", "content": "11"},
-                            {"role": "user", "content": "12"},
-                            {"role": "assistant", "content": "13"},
-                            {"role": "user", "content": "14"},
-                            {"role": "assistant", "content": "15"},
+                            {"role": "user", "content": str(value)},
+                            {"role": "assistant", "content": str(value + 1)},
                         ],
-                    },
+                    }
+                    for value in (10, 12, 14)
                 ],
             )
             payload = compile_jsonl_to_arrayrecord(
@@ -456,7 +473,7 @@ class GrainPipelineTest(absltest.TestCase):
             descriptors = [json.loads(chunked_source[i]) for i in range(len(chunked_source))]
 
             # Effective content budget = max_length - sys_len = 3 - 1 = 2;
-            # 6 content messages of length 1 split [2, 2, 2] across chunks.
+            # each 2-message session (both length 1) fits in its own chunk.
             self.assertEqual([d["measured_length"] for d in descriptors], [2, 2, 2])
 
             resolver = _ChunkDescriptorResolver(
