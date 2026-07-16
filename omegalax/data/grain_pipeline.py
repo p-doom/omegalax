@@ -704,7 +704,7 @@ def build_records_from_chat(
     overwrite: bool = False,
     profile_metadata: dict[str, Any] | None = None,
     num_workers: int = 2,
-    overflow_mode: str = "split",
+    overflow_mode: str = "drop",
     message_lengths_path: str | Path | None = None,
     val_fraction: float = 0.0,
     split: str | None = None,
@@ -721,8 +721,8 @@ def build_records_from_chat(
 
     The system prompt is NOT injected here: it is part of the conversation (the
     upstream chat.jsonl builder emits it as the first turn), so it is measured
-    and budgeted as a normal message. ``overflow_mode`` ("split" | "truncate" |
-    "drop") and ``message_lengths_path`` (measure-once cache, keyed to chat.jsonl
+    and budgeted as a normal message. ``overflow_mode`` ("drop" (default) |
+    "split" | "truncate") and ``message_lengths_path`` (measure-once cache, keyed to chat.jsonl
     positions, reused across every max_length / overflow_mode) are the only
     binning knobs.
 
