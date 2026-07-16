@@ -3,9 +3,9 @@
 from omegalax.data.collator_qwen3 import TextSFTCollator, VLMSFTCollator
 from omegalax.data.grain_pipeline import (
     MixSource,
-    build_chunk_index,
-    compile_jsonl_to_arrayrecord,
+    build_records_from_chat,
     make_grain_iterator,
+    measure_message_lengths_from_chat,
     pop_source_ids,
 )
 
@@ -13,8 +13,8 @@ __all__ = [
     "MixSource",
     "TextSFTCollator",
     "VLMSFTCollator",
-    "build_chunk_index",
-    "compile_jsonl_to_arrayrecord",
+    "build_records_from_chat",
     "make_grain_iterator",
+    "measure_message_lengths_from_chat",
     "pop_source_ids",
 ]
