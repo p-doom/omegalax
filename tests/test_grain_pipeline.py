@@ -31,6 +31,18 @@ def _batch_starts(examples):
     }
 
 
+# build_chunk_index measures messages in a `spawn` multiprocessing pool, so the
+# measure_message callable must be picklable (importable by qualified name) --
+# a local lambda is not. These module-level stand-ins count every message as a
+# fixed number of tokens.
+def _measure_one(message):
+    return 1
+
+
+def _measure_two(message):
+    return 2
+
+
 class GrainPipelineTest(absltest.TestCase):
     def _write_jsonl(self, path: Path, rows: list[dict]) -> None:
         with path.open("w") as f:
@@ -126,7 +138,7 @@ class GrainPipelineTest(absltest.TestCase):
                 payload,
                 Path(tmpdir) / "chunked",
                 max_length=2,
-                measure_message=lambda message: 1,
+                measure_message=_measure_one,
                 records_per_shard=8,
             )
 
@@ -183,7 +195,7 @@ class GrainPipelineTest(absltest.TestCase):
                 payload,
                 Path(tmpdir) / "chunked",
                 max_length=2,
-                measure_message=lambda message: 1,
+                measure_message=_measure_one,
                 records_per_shard=8,
             )
 
@@ -279,7 +291,7 @@ class GrainPipelineTest(absltest.TestCase):
                 payload,
                 Path(tmpdir) / "chunked",
                 max_length=2,
-                measure_message=lambda message: 1,
+                measure_message=_measure_one,
                 records_per_shard=8,
             )
 
@@ -349,7 +361,7 @@ class GrainPipelineTest(absltest.TestCase):
                 # tracking value stays at messages[0] and the assistant-turn filter
                 # is satisfied (one chunk per session).
                 max_length=2,
-                measure_message=lambda message: 1,
+                measure_message=_measure_one,
                 records_per_shard=8,
             )
 
@@ -424,7 +436,7 @@ class GrainPipelineTest(absltest.TestCase):
                 payload,
                 Path(tmpdir) / "chunked",
                 max_length=3,
-                measure_message=lambda message: 1,
+                measure_message=_measure_one,
                 records_per_shard=8,
                 system_message=system_message,
             )
@@ -488,7 +500,7 @@ class GrainPipelineTest(absltest.TestCase):
                     payload,
                     Path(tmpdir) / "chunked",
                     max_length=2,
-                    measure_message=lambda message: 2,
+                    measure_message=_measure_two,
                     records_per_shard=1,
                     system_message={"role": "system", "content": "SYS"},
                 )
