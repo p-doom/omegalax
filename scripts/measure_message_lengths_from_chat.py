@@ -1,13 +1,15 @@
-"""Measure per-message token lengths for a compiled payload, once.
+"""Measure per-message token lengths for a raw chat.jsonl, once (payload-free).
 
-Tokenization is the only tokenizer/processor-bound step of chunk-index
-building and is independent of max_length / overflow_mode / system_message.
-This script runs that pass once and writes a ``message_lengths.jsonl`` cache;
-``build_sft_chunk_index.py --message_lengths_path=<cache>`` then reuses it for
-every sequence length, so changing max_length no longer re-tokenizes.
+Payload-free analog of measure_message_lengths.py: tokenizes a raw chat.jsonl
+directly (no intermediate grain payload) and writes a ``message_lengths.jsonl``
+cache keyed by ``(conv_idx, msg_offset)``. Per-message lengths are the only
+tokenizer/processor-bound product of record building and are independent of
+max_length / overflow_mode / system_message, so running this once lets every
+build_sft_records_from_chat.py build over the same chat reuse the cache (via
+--message_lengths_path) instead of re-tokenizing per sequence length.
 
-Mirrors build_sft_chunk_index.py's tokenizer/processor setup so the measured
-lengths are byte-identical to what the in-line measurement would produce.
+Mirrors build_sft_records_from_chat.py's tokenizer/processor setup so the
+measured lengths are byte-identical to what the in-line measurement produces.
 """
 
 from __future__ import annotations
@@ -18,15 +20,16 @@ from pathlib import Path
 from absl import app, flags
 from transformers import AutoImageProcessor, AutoTokenizer
 
-from omegalax.data.grain_pipeline import MESSAGE_LENGTHS_FILENAME, measure_message_lengths
+from omegalax.data.grain_pipeline import (
+    MESSAGE_LENGTHS_FILENAME,
+    measure_message_lengths_from_chat,
+)
 from omegalax.data.qwen3_encoding import make_message_length_fn
 from omegalax.registry import resolve_hf_repo_id
 
 FLAGS = flags.FLAGS
 
-flags.DEFINE_string(
-    "data_path", None, "Path to a canonical compiled payload-block dataset.", required=True
-)
+flags.DEFINE_string("data_path", None, "Path to a raw chat.jsonl dataset.", required=True)
 flags.DEFINE_string(
     "out_dir",
     None,
@@ -66,7 +69,7 @@ def main(_) -> None:
 
     out_dir = Path(FLAGS.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = measure_message_lengths(
+    out_path = measure_message_lengths_from_chat(
         FLAGS.data_path,
         out_dir / MESSAGE_LENGTHS_FILENAME,
         measure_message=make_message_length_fn(tokenizer, image_processor),

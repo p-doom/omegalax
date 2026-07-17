@@ -159,11 +159,12 @@ class _MessageLengthFn:
     """Picklable ``message -> measurement`` callable (see ``make_message_length_fn``).
 
     Defined at module scope rather than as a closure so it can be pickled and
-    sent to ``spawn``/``forkserver`` multiprocessing workers. The parallel
-    chunk-index builder uses ``spawn`` (workers must not inherit the parent's
-    thread-tainted native ArrayRecord readers, which segfaults), and ``spawn``
-    re-pickles the measure fn into each worker -- a nested closure cannot cross
-    that boundary, an instance of this class can.
+    sent to ``spawn`` multiprocessing workers. The measure pass
+    (``grain_pipeline._compute_message_lengths_from_chat``) uses ``spawn`` --
+    workers must not inherit the parent's thread-tainted native ArrayRecord image
+    readers, which segfault -- and ``spawn`` re-pickles the measure fn into each
+    worker; a nested closure cannot cross that boundary, an instance of this
+    class can.
     """
 
     def __init__(
@@ -211,17 +212,15 @@ def make_message_length_fn(
     tokenizer: PreTrainedTokenizer,
     image_processor: BaseImageProcessor | None = None,
 ):
-    """Return a ``message -> token_count`` callable for use with ``build_chunk_index``.
+    """Return a ``message -> token_count`` callable for use with the record builders.
 
     Suitable for ChatML-formatted models (Qwen3 / Qwen3.5).  Token lengths are
     exactly additive at message boundaries: ``<|im_start|>``/``<|im_end|>`` act
     as hard BPE split points and ``add_special_tokens=False`` suppresses any
     per-sequence overhead, so ``sum(lengths)`` equals the full-sequence length
-    exactly.  For a different chat template, implement an analogous factory and
-    swap it in.
-
-    The returned callable (an :class:`_MessageLengthFn`) is picklable so it can
-    be shipped to ``spawn`` multiprocessing workers.
+    exactly.  Returns a picklable :class:`_MessageLengthFn` instance so it can be
+    shipped to ``spawn`` workers. For a different chat template, implement an
+    analogous factory and swap it in.
     """
     return _MessageLengthFn(tokenizer, image_processor)
 

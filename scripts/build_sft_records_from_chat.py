@@ -1,4 +1,16 @@
-"""Build an offline chunk index for a compiled canonical SFT dataset."""
+"""Build self-contained inline SFT records straight from a raw chat.jsonl.
+
+Payload-free analog of build_sft_chunk_index.py: skips the grain payload (stage
+05) entirely. Reads chat.jsonl directly, bins each conversation's turns into
+<= max_length token chunks, and writes ArrayRecord shards whose records ARE the
+training examples (message slices with ar:// image refs preserved) -- not
+pointers into a shared payload. The stage 01 master image store is unchanged;
+records reference it by ar:// exactly as chat.jsonl does.
+
+--message_lengths_path reuses a measure-once cache (see
+scripts/measure_message_lengths_from_chat.py) so re-binning at a different
+max_length / overflow_mode never re-tokenizes.
+"""
 
 from __future__ import annotations
 
@@ -7,16 +19,16 @@ import json
 from absl import app, flags
 from transformers import AutoImageProcessor, AutoTokenizer
 
-from omegalax.data.grain_pipeline import build_chunk_index
+from omegalax.data.grain_pipeline import build_records_from_chat
 from omegalax.data.qwen3_encoding import make_message_length_fn
 from omegalax.registry import resolve_hf_repo_id
 
 FLAGS = flags.FLAGS
 
+flags.DEFINE_string("data_path", None, "Path to a raw chat.jsonl dataset.", required=True)
 flags.DEFINE_string(
-    "data_path", None, "Path to a canonical compiled payload-block dataset.", required=True
+    "out_dir", None, "Output directory for the inline-records dataset.", required=True
 )
-flags.DEFINE_string("out_dir", None, "Output directory for the chunk-index dataset.", required=True)
 flags.DEFINE_string(
     "model_id", None, "Model id used to resolve the default tokenizer.", required=True
 )
@@ -35,33 +47,40 @@ flags.DEFINE_bool("overwrite", False, "Overwrite existing output directory.")
 flags.DEFINE_integer(
     "num_workers", 2, "Number of parallel workers for message length measurement.", lower_bound=2
 )
-flags.DEFINE_string(
-    "system_message_text",
-    "",
-    "If non-empty, prepend a text-only system message with this content to "
-    "every emitted chunk. Persisted in chunk-index metadata; the iterator "
-    "injects it at resolve time and the per-chunk token budget is reduced "
-    "by the system message's measured length.",
-)
 flags.DEFINE_enum(
     "overflow_mode",
-    "split",
+    "drop",
     ["split", "truncate", "drop"],
     "How to handle a conversation whose turns exceed the token budget. "
-    "'split': pack into multiple consecutive chunks at turn boundaries "
-    "(no turns dropped). 'truncate': keep only the first fitting chunk and "
-    "drop the overflowing turn plus the rest of the conversation. 'drop': "
-    "discard the whole conversation if it does not fit in a single chunk. "
+    "'drop' (default): discard the whole conversation if it does not fit in a "
+    "single chunk. 'split': pack into multiple consecutive chunks at turn "
+    "boundaries (no turns dropped). 'truncate': keep only the first fitting "
+    "chunk and drop the overflowing turn plus the rest of the conversation. "
     "Truncation stats are written to truncation_stats.json.",
 )
 flags.DEFINE_string(
     "message_lengths_path",
     None,
-    "Path to a message_lengths.jsonl cache (see scripts/measure_message_lengths.py). "
+    "Path to a message_lengths.jsonl cache (see measure_message_lengths_from_chat.py). "
     "If set and present, per-message token lengths are loaded from it and the "
     "tokenizer pass is skipped; if set and absent, lengths are measured and "
-    "written there. Lets repeated builds over the same payload (different "
+    "written there. Lets repeated builds over the same chat.jsonl (different "
     "max_length / overflow_mode) avoid re-tokenizing.",
+)
+flags.DEFINE_float(
+    "val_fraction",
+    0.0,
+    "Recording-level val fraction used only to compute the train/val split when "
+    "--split is set. The split is applied HERE (records stage), not upstream, so "
+    "the message-length cache stays split-agnostic and is reused across splits.",
+)
+flags.DEFINE_string(
+    "split",
+    None,
+    "If set (e.g. 'train' or 'val'), emit only conversations whose "
+    "recording-level split (from --val_fraction over the row's recording_id) "
+    "matches. The cache is still resolved/validated against the full chat.jsonl, "
+    "so conv_idx stays aligned. Omit to emit all conversations.",
 )
 
 
@@ -81,14 +100,7 @@ def main(_) -> None:
             processor_name, use_fast=False, **ip_kwargs
         )
 
-    system_message = None
-    if FLAGS.system_message_text:
-        system_message = {
-            "role": "system",
-            "content": [{"type": "text", "text": FLAGS.system_message_text}],
-        }
-
-    out_dir = build_chunk_index(
+    out_dir = build_records_from_chat(
         FLAGS.data_path,
         FLAGS.out_dir,
         max_length=FLAGS.max_length,
@@ -96,9 +108,10 @@ def main(_) -> None:
         records_per_shard=FLAGS.records_per_shard,
         overwrite=FLAGS.overwrite,
         num_workers=FLAGS.num_workers,
-        system_message=system_message,
         overflow_mode=FLAGS.overflow_mode,
         message_lengths_path=FLAGS.message_lengths_path,
+        val_fraction=FLAGS.val_fraction,
+        split=FLAGS.split,
         profile_metadata={
             "model_id": FLAGS.model_id,
             "tokenizer": tokenizer_name,
