@@ -5,7 +5,6 @@ from __future__ import annotations
 import dataclasses
 import os
 import re
-from unittest import mock
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 os.environ["OMEGALAX_DELTANET_KERNEL"] = "xla"
@@ -63,32 +62,22 @@ class EvalExecutorTest(absltest.TestCase):
             position_offsets_B=offsets,
         )
 
+    def test_segment_executor_is_jitted_and_uses_bounded_loss_tiles(self):
+        self.assertTrue(hasattr(executor._run_segment, "lower"))
+        self.assertEqual(executor._NUM_LOSS_TILES, 4)
+
     def test_real_chain_uses_per_chunk_nll_and_preserves_partial_tail(self):
         batch = self._batch()
-
-        with mock.patch.object(
-            executor.text_api,
-            "forward_with_gdn_state",
-            wraps=text_api.forward_with_gdn_state,
-        ) as forward_spy:
-            result = run_chain(
-                self.model,
-                self.cfg,
-                batch,
-                pad_id=0,
-                condition="stateful",
-                segment_input_fn=lambda idx, previous: self._global_inputs(
-                    batch, idx, previous, carry=True
-                ),
-            )
-
-        self.assertLen(forward_spy.call_args_list, batch.token_ids_BCT.shape[1])
-        for segment_idx, call in enumerate(forward_spy.call_args_list):
-            offsets = batch.chunk_indices_BC[:, segment_idx] * batch.token_ids_BCT.shape[-1]
-            np.testing.assert_array_equal(
-                np.asarray(call.kwargs["position_ids_ZBT"]),
-                np.asarray(_position_ids(offsets, batch.token_ids_BCT.shape[-1])),
-            )
+        result = run_chain(
+            self.model,
+            self.cfg,
+            batch,
+            pad_id=0,
+            condition="stateful",
+            segment_input_fn=lambda idx, previous: self._global_inputs(
+                batch, idx, previous, carry=True
+            ),
+        )
 
         counts_CB = np.stack([np.asarray(segment.token_count_B) for segment in result.segments])
         np.testing.assert_array_equal(
@@ -158,7 +147,87 @@ class EvalExecutorTest(absltest.TestCase):
                     np.asarray(actual), np.asarray(expected), rtol=1e-6, atol=1e-6
                 )
             for actual, expected in zip(segment.state.conv_states, expected_conv, strict=True):
-                np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
+                np.testing.assert_allclose(
+                    np.asarray(actual), np.asarray(expected), rtol=1e-5, atol=1e-5
+                )
+
+    def test_tiled_loss_matches_unbroken_eager_oracle_with_tile_padding(self):
+        token_ids = jnp.arange(1, 25, dtype=jnp.int32).reshape(2, 2, 6)
+        attention_mask = jnp.ones_like(token_ids)
+        loss_mask = attention_mask.at[1, 1, 4:].set(0)
+        batch = ChainBatch(
+            document_ids=("doc-a", "doc-b"),
+            token_ids_BCT=token_ids,
+            attention_mask_BCT=attention_mask,
+            loss_mask_BCT=loss_mask,
+            chunk_indices_BC=jnp.asarray([[0, 1], [0, 1]], dtype=jnp.int32),
+        )
+        result = run_chain(
+            self.model,
+            self.cfg,
+            batch,
+            pad_id=0,
+            condition="tiled",
+            segment_input_fn=lambda idx, previous: self._global_inputs(
+                batch, idx, previous, carry=True
+            ),
+        )
+
+        expected_nll = []
+        expected_counts = []
+        expected_states = []
+        gdn_states = None
+        conv_states = None
+        for segment_idx in range(token_ids.shape[1]):
+            offsets = batch.chunk_indices_BC[:, segment_idx] * token_ids.shape[-1]
+            hidden, _, gdn_states, conv_states = text_api.forward_with_gdn_state(
+                self.model,
+                token_ids[:, segment_idx],
+                pad_id=0,
+                cfg=self.cfg,
+                attention_mask_BT=attention_mask[:, segment_idx],
+                initial_gdn_states=gdn_states,
+                initial_conv_states=conv_states,
+                position_ids_ZBT=_position_ids(offsets, token_ids.shape[-1]),
+                return_conv_states=True,
+            )
+            document_nll = []
+            document_counts = []
+            for document_idx in range(token_ids.shape[0]):
+                nll_sum, token_count = chunked_cross_entropy_stats(
+                    hidden[document_idx : document_idx + 1],
+                    self.model.output_weight(),
+                    token_ids[document_idx : document_idx + 1, segment_idx],
+                    loss_mask[document_idx : document_idx + 1, segment_idx],
+                    num_tiles=1,
+                )
+                document_nll.append(nll_sum)
+                document_counts.append(token_count)
+            expected_nll.append(jnp.stack(document_nll))
+            expected_counts.append(jnp.stack(document_counts))
+            expected_states.append((gdn_states, conv_states))
+
+        np.testing.assert_allclose(
+            np.stack([np.asarray(segment.nll_sum_B) for segment in result.segments]),
+            np.asarray(jnp.stack(expected_nll)),
+            rtol=1e-5,
+            atol=1e-5,
+        )
+        np.testing.assert_array_equal(
+            np.stack([np.asarray(segment.token_count_B) for segment in result.segments]),
+            np.asarray(jnp.stack(expected_counts)),
+        )
+        for segment, (expected_gdn, expected_conv) in zip(
+            result.segments, expected_states, strict=True
+        ):
+            for actual, expected in zip(segment.state.gdn_states, expected_gdn, strict=True):
+                np.testing.assert_allclose(
+                    np.asarray(actual), np.asarray(expected), rtol=1e-6, atol=1e-6
+                )
+            for actual, expected in zip(segment.state.conv_states, expected_conv, strict=True):
+                np.testing.assert_allclose(
+                    np.asarray(actual), np.asarray(expected), rtol=1e-5, atol=1e-5
+                )
 
     def test_conditions_are_independent_and_chunk1_mismatch_is_hard_error(self):
         batch = self._batch()
@@ -326,30 +395,59 @@ class EvalExecutorTest(absltest.TestCase):
             loss_mask_BCT=loss_mask,
             chunk_indices_BC=jnp.asarray([[0, 1, 2]], dtype=jnp.int32),
         )
-        with mock.patch.object(
-            executor.text_api,
-            "forward_with_gdn_state",
-            wraps=text_api.forward_with_gdn_state,
-        ) as forward_spy:
-            result = run_chain(
-                self.model,
-                self.cfg,
-                batch,
-                pad_id=0,
-                condition="masked",
-                segment_input_fn=lambda idx, previous: self._global_inputs(
-                    batch, idx, previous, carry=False
-                ),
-            )
+        result = run_chain(
+            self.model,
+            self.cfg,
+            batch,
+            pad_id=0,
+            condition="masked",
+            segment_input_fn=lambda idx, previous: self._global_inputs(
+                batch, idx, previous, carry=False
+            ),
+        )
 
-        self.assertLen(forward_spy.call_args_list, 3)
-        for segment_idx, call in enumerate(forward_spy.call_args_list):
-            np.testing.assert_array_equal(
-                np.asarray(call.kwargs["attention_mask_BT"]),
-                np.asarray(attention_mask[:, segment_idx]),
+        expected_nll = []
+        expected_states = []
+        for segment_idx in range(token_ids.shape[1]):
+            offsets = batch.chunk_indices_BC[:, segment_idx] * token_ids.shape[-1]
+            hidden, _, gdn_states, conv_states = text_api.forward_with_gdn_state(
+                self.model,
+                token_ids[:, segment_idx],
+                pad_id=0,
+                cfg=self.cfg,
+                attention_mask_BT=attention_mask[:, segment_idx],
+                position_ids_ZBT=_position_ids(offsets, token_ids.shape[-1]),
+                return_conv_states=True,
             )
+            nll_sum, _ = chunked_cross_entropy_stats(
+                hidden,
+                self.model.output_weight(),
+                token_ids[:, segment_idx],
+                loss_mask[:, segment_idx],
+                num_tiles=1,
+            )
+            expected_nll.append(float(nll_sum))
+            expected_states.append((gdn_states, conv_states))
+
         self.assertTrue(np.all(np.asarray(token_ids[attention_mask == 0]) != 0))
         self.assertFalse(np.array_equal(np.asarray(attention_mask), np.asarray(loss_mask)))
+        np.testing.assert_allclose(
+            [float(segment.nll_sum_B[0]) for segment in result.segments],
+            expected_nll,
+            rtol=1e-6,
+            atol=1e-6,
+        )
+        for segment, (expected_gdn, expected_conv) in zip(
+            result.segments, expected_states, strict=True
+        ):
+            for actual, expected in zip(segment.state.gdn_states, expected_gdn, strict=True):
+                np.testing.assert_allclose(
+                    np.asarray(actual), np.asarray(expected), rtol=1e-6, atol=1e-6
+                )
+            for actual, expected in zip(segment.state.conv_states, expected_conv, strict=True):
+                np.testing.assert_allclose(
+                    np.asarray(actual), np.asarray(expected), rtol=1e-5, atol=1e-5
+                )
         np.testing.assert_array_equal(
             [float(segment.token_count_B[0]) for segment in result.segments],
             [3.0, 2.0, 0.0],
