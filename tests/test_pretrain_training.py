@@ -86,7 +86,11 @@ class PretrainBatchPrepTest(absltest.TestCase):
         }
 
         device_batch, metadata, debug = pretrain_trainer.prepare_pretrain_batch(
-            batch, pretrain_trainer.PretrainMode.IID_BASELINE, cfg, mesh
+            batch,
+            pretrain_trainer.PretrainMode.IID_BASELINE,
+            cfg,
+            mesh,
+            global_batch_size=2,
         )
 
         self.assertEqual(metadata["doc_ids"], ["a", "b"])
@@ -108,7 +112,11 @@ class PretrainBatchPrepTest(absltest.TestCase):
         }
 
         device_batch, metadata, debug = pretrain_trainer.prepare_pretrain_batch(
-            batch, pretrain_trainer.PretrainMode.STATEPASSING_NO_BPTT, cfg, mesh
+            batch,
+            pretrain_trainer.PretrainMode.STATEPASSING_NO_BPTT,
+            cfg,
+            mesh,
+            global_batch_size=2,
         )
 
         self.assertEqual(metadata["doc_ids"], ["doc"])
@@ -132,6 +140,7 @@ class PretrainBatchPrepTest(absltest.TestCase):
             pretrain_trainer.PretrainMode.IID_BASELINE,
             cfg,
             mesh,
+            global_batch_size=2,
             pass_rope_positions=True,
         )
 
@@ -163,6 +172,7 @@ class PretrainBatchPrepTest(absltest.TestCase):
             pretrain_trainer.PretrainMode.STATEPASSING_NO_BPTT,
             cfg,
             mesh,
+            global_batch_size=3,
             pass_rope_positions=True,
         )
 
@@ -174,7 +184,7 @@ class PretrainBatchPrepTest(absltest.TestCase):
             debug["chunk_idx_BC"], np.asarray([[4, 5, 6]], dtype=np.int32)
         )
 
-    def test_prepare_statepassing_batch_validates_window_batch_sharding(self):
+    def test_prepare_statepassing_batch_validates_global_window_batch_sharding(self):
         class MeshLike:
             shape = {"dp": 2}
 
@@ -194,16 +204,49 @@ class PretrainBatchPrepTest(absltest.TestCase):
             "reset_state_BC": np.asarray([[True, False, False]], dtype=np.bool_),
         }
 
-        with self.assertRaisesRegex(ValueError, "Statepassing window batch size"):
+        with self.assertRaisesRegex(ValueError, "Global statepassing window batch size"):
             pretrain_trainer.prepare_pretrain_batch(
                 batch,
                 pretrain_trainer.PretrainMode.STATEPASSING_NO_BPTT,
                 cfg,
                 MeshLike(),
+                global_batch_size=3,
             )
+
+    def test_statepassing_global_batch_accepts_multihost_c4_shape(self):
+        pretrain_trainer._validate_statepassing_global_batch(
+            global_batch_size=192,
+            num_segments=4,
+            batch_multiple=16,
+        )
 
 
 class PretrainMaskAndLossTest(absltest.TestCase):
+    def test_qwen3_5_tied_output_weight_reuses_embedding(self):
+        cfg = dataclasses.replace(_tiny_qwen3_5_config(), tie_word_embeddings=True)
+        model, cfg = text_api.init_model(
+            cfg, jax.random.PRNGKey(0), tp_size=1, fsdp_size=1, dp_size=1
+        )
+
+        self.assertIsNone(model.lm_head)
+        self.assertEqual(model.output_weight().shape, (cfg.hidden_size, cfg.vocab_size))
+        np.testing.assert_array_equal(
+            np.asarray(model.output_weight()),
+            np.asarray(model.text.embedder.embedding[...].T),
+        )
+
+    def test_qwen3_5_untied_output_weight_uses_lm_head(self):
+        cfg = dataclasses.replace(_tiny_qwen3_5_config(), tie_word_embeddings=False)
+        model, _ = text_api.init_model(
+            cfg, jax.random.PRNGKey(0), tp_size=1, fsdp_size=1, dp_size=1
+        )
+
+        self.assertIsNotNone(model.lm_head)
+        np.testing.assert_array_equal(
+            np.asarray(text_trainer._model_output_weight(model)),
+            np.asarray(model.lm_head.kernel[...]),
+        )
+
     def test_explicit_attention_mask_overrides_pad_id_fallback(self):
         token_ids = jnp.asarray([[5, 0, 7, 0]], dtype=jnp.int32)
         attention_mask = jnp.asarray([[1, 1, 1, 0]], dtype=jnp.int32)
@@ -931,6 +974,22 @@ class PretrainTrainingSmokeTest(absltest.TestCase):
 
             checkpoint_manager.close()
         self.assertEqual(restored, contract)
+
+    def test_checkpoint_manager_uses_stable_multihost_barrier_prefix(self):
+        with tempfile.TemporaryDirectory(prefix=".checkpoint-test-", dir=Path.cwd()) as tmp:
+            checkpoint_manager = text_trainer._make_checkpoint_manager(
+                Path(tmp), save_interval=None
+            )
+            multiprocessing_options = checkpoint_manager._options.multiprocessing_options
+            create = checkpoint_manager._options.create
+            checkpoint_manager.close()
+
+        self.assertFalse(create)
+        self.assertIsNone(multiprocessing_options.active_processes)
+        self.assertEqual(
+            multiprocessing_options.barrier_sync_key_prefix,
+            "omegalax_checkpoint_manager",
+        )
 
     def test_lr_contract_mismatch_fails_before_optimizer_build(self):
         train_cfg = pretrain_trainer.TrainConfig(

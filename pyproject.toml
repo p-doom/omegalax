@@ -16,9 +16,11 @@ dependencies = [
   "jax[cuda12]",
   "jax-triton",
   "jaxtyping",
+  "matplotlib",
   "optax",
   "orbax-checkpoint",
   "Pillow",
+  "pyarrow",
   "safetensors",
   "tokamax @ git+https://github.com/p-doom/tokamax.git@nested-mask", # change after fix has been upstreamed
   "transformers",

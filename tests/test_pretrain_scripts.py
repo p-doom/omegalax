@@ -18,7 +18,6 @@ from absl.testing import flagsaver
 from scripts import babysit_text_pretrain_slurm
 from scripts import build_pretrain_indexes
 from scripts import launch_text_pretrain_experiments
-from scripts import monitor_text_pretrain_slurm
 from scripts import submit_text_pretrain_slurm
 from omegalax.trainers.pretrain import PretrainMode
 
@@ -564,10 +563,12 @@ class SubmitTextPretrainSlurmScriptTest(absltest.TestCase):
                 save_root=Path("/runs"),
                 jax_cache_root=Path("/jax_cache"),
                 run_id="run",
-                total_tasks=8,
+                total_devices=8,
+                jax_processes=8,
                 batch_size=128,
                 grad_accum_steps=4,
                 single_process_per_run=False,
+                single_process_per_node=False,
             )
 
         self.assertIn("--chunk_length=2048", index_script)
@@ -584,6 +585,69 @@ class SubmitTextPretrainSlurmScriptTest(absltest.TestCase):
         self.assertIn("--gdn_layer_limit=1", train_flags)
         self.assertIn("--pass_rope_positions=True", train_flags)
         self.assertIn("--pass_conv_state=True", train_flags)
+
+    def test_train_flags_forward_run_specific_submit_overrides(self):
+        with flagsaver.flagsaver(
+            submit_model_id="/configs/xl",
+            submit_lr_end_factor=0.25,
+            submit_lr_schedule_steps=1234,
+            submit_save_every=2000,
+            submit_keep_latest=10,
+            submit_grain_read_threads=4,
+            submit_grain_read_prefetch_buffer_size=8,
+            submit_grain_workers=16,
+            submit_grain_worker_buffer_size=2,
+        ):
+            train_flags = submit_text_pretrain_slurm._train_flags(
+                mode=PretrainMode.STATEPASSING_BPTT,
+                save_root=Path("/runs"),
+                jax_cache_root=Path("/jax_cache"),
+                run_id="run",
+                total_devices=16,
+                jax_processes=16,
+                batch_size=192,
+                grad_accum_steps=5,
+                single_process_per_run=False,
+                single_process_per_node=False,
+            )
+
+        self.assertIn("--model_id=/configs/xl", train_flags)
+        self.assertIn("--lr_end_factor=0.25", train_flags)
+        self.assertIn("--lr_schedule_steps=1234", train_flags)
+        self.assertIn("--save_every=2000", train_flags)
+        self.assertIn("--keep_latest=10", train_flags)
+        self.assertIn("--grain_read_threads=4", train_flags)
+        self.assertIn("--grain_read_prefetch_buffer_size=8", train_flags)
+        self.assertIn("--grain_workers=16", train_flags)
+        self.assertIn("--grain_worker_buffer_size=2", train_flags)
+
+    def test_render_train_sbatch_can_request_memory(self):
+        script = submit_text_pretrain_slurm.render_train_sbatch(
+            repo_root="/repo",
+            source_root="/src",
+            dataset_root="/src/data",
+            index_root="/src/index",
+            save_root="/runs",
+            log_dir="/logs",
+            jax_cache_root="/jax_cache",
+            run_id="run",
+            mode=PretrainMode.STATEPASSING_BPTT,
+            partition="standard",
+            qos="normal",
+            time_limit="24:00:00",
+            nodes=2,
+            gpus_per_node=8,
+            batch_size=192,
+            grad_accum_steps=5,
+            cpus_per_task=24,
+            stage_to_scratch=False,
+            run_pallas_tests=False,
+            single_process_per_run=False,
+            single_process_per_node=False,
+            mem="120G",
+        )
+
+        self.assertIn("#SBATCH --mem=120G", script)
 
     def test_render_index_sbatch_uses_curriculum_flags(self):
         with flagsaver.flagsaver(
@@ -710,6 +774,7 @@ class SubmitTextPretrainSlurmScriptTest(absltest.TestCase):
             stage_to_scratch=True,
             run_pallas_tests=True,
             single_process_per_run=False,
+            single_process_per_node=False,
         )
 
         self.assertIn("#SBATCH --gres=gpu:8", script)
@@ -758,6 +823,7 @@ class SubmitTextPretrainSlurmScriptTest(absltest.TestCase):
                 stage_to_scratch=False,
                 run_pallas_tests=False,
                 single_process_per_run=False,
+                single_process_per_node=False,
             )
 
         self.assertNotIn("WANDB_MODE=online", script)
@@ -790,6 +856,7 @@ class SubmitTextPretrainSlurmScriptTest(absltest.TestCase):
             stage_to_scratch=False,
             run_pallas_tests=False,
             single_process_per_run=True,
+            single_process_per_node=False,
         )
 
         self.assertIn("#SBATCH --ntasks-per-node=1", script)
@@ -802,6 +869,46 @@ class SubmitTextPretrainSlurmScriptTest(absltest.TestCase):
         self.assertNotIn("--gpus-per-task=1", script)
         self.assertNotIn("--gpu-bind=single:1", script)
 
+    def test_render_train_sbatch_can_use_one_jax_process_per_node(self):
+        script = submit_text_pretrain_slurm.render_train_sbatch(
+            repo_root="/repo",
+            source_root="/fast/project/HFMI_SynergyUnit/p-doom_shared/salan",
+            dataset_root=(
+                "/fast/project/HFMI_SynergyUnit/p-doom_shared/salan/"
+                "datasets/fineweb_edu_dedup_30b_8kto32k"
+            ),
+            index_root=(
+                "/fast/project/HFMI_SynergyUnit/p-doom_shared/salan/pretrain_indexes/fineweb"
+            ),
+            save_root="/fast/project/HFMI_SynergyUnit/p-doom_shared/salan/runs",
+            log_dir="/fast/project/HFMI_SynergyUnit/p-doom_shared/salan/logs",
+            jax_cache_root="/fast/project/HFMI_SynergyUnit/p-doom_shared/salan/jax_cache",
+            run_id="run",
+            mode=PretrainMode.IID_BASELINE,
+            partition="standard",
+            qos="low",
+            time_limit="24:00:00",
+            nodes=2,
+            gpus_per_node=8,
+            batch_size=192,
+            grad_accum_steps=5,
+            cpus_per_task=24,
+            stage_to_scratch=False,
+            run_pallas_tests=False,
+            single_process_per_run=False,
+            single_process_per_node=True,
+        )
+
+        self.assertIn("#SBATCH --ntasks-per-node=1", script)
+        self.assertIn("JAX_LOCAL_DEVICE_IDS=0,1,2,3,4,5,6,7", script)
+        self.assertIn("srun --ntasks=2 --ntasks-per-node=1 --gres=gpu:8 bash", script)
+        self.assertIn('--fsdp_size="1"', script)
+        self.assertIn('--dp_size="16"', script)
+        self.assertIn('--iterator_fsdp_size="1"', script)
+        self.assertIn('--iterator_dp_size="2"', script)
+        self.assertNotIn("--gpus-per-task=1", script)
+        self.assertNotIn("--gpu-bind=single:1", script)
+
     def test_train_flags_omits_empty_wandb_entity(self):
         with flagsaver.flagsaver(submit_wandb_entity="", submit_wandb_project="omegalax"):
             train_flags = submit_text_pretrain_slurm._train_flags(
@@ -809,10 +916,12 @@ class SubmitTextPretrainSlurmScriptTest(absltest.TestCase):
                 save_root=Path("/runs"),
                 jax_cache_root=Path("/jax_cache"),
                 run_id="run",
-                total_tasks=8,
+                total_devices=8,
+                jax_processes=8,
                 batch_size=128,
                 grad_accum_steps=4,
                 single_process_per_run=False,
+                single_process_per_node=False,
             )
 
         self.assertIn("--wandb_project=omegalax", train_flags)
@@ -825,74 +934,38 @@ class SubmitTextPretrainSlurmScriptTest(absltest.TestCase):
                 save_root=Path("/runs"),
                 jax_cache_root=Path("/jax_cache"),
                 run_id="run",
-                total_tasks=8,
+                total_devices=8,
+                jax_processes=8,
                 batch_size=128,
                 grad_accum_steps=4,
                 single_process_per_run=False,
+                single_process_per_node=False,
                 wandb_resume_id="abc123",
             )
 
         self.assertIn("--wandb_id=abc123", train_flags)
         self.assertIn("--wandb_resume=allow", train_flags)
 
-    def test_render_monitor_sbatch_records_jobs_and_wiki_path(self):
-        script = submit_text_pretrain_slurm.render_monitor_sbatch(
-            repo_root="/repo",
-            log_dir="/logs/run",
-            run_id="run",
-            partition="standard",
-            qos=None,
-            time_limit="24:00:00",
-            job_ids=["1", "2", "3"],
-            wiki_path="/wiki/progress.md",
-            poll_seconds=1200,
-            codex_session_id="thread-1",
-            codex_interval_seconds=2700,
-            codex_on_failure=True,
-        )
 
-        self.assertNotIn("#SBATCH --gres=gpu", script)
-        self.assertIn("--monitor_job_ids=1,2,3", script)
-        self.assertIn("--monitor_wiki_path=/wiki/progress.md", script)
-        self.assertIn("--monitor_poll_seconds=1200", script)
-        self.assertIn("--monitor_codex_session_id=thread-1", script)
-        self.assertIn("--monitor_codex_interval_seconds=2700", script)
-        self.assertIn("--monitor_codex_on_failure=True", script)
-
-
-class MonitorTextPretrainSlurmScriptTest(absltest.TestCase):
-    def test_log_paths_include_nested_run_directories(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            log_path = root / "run" / "train_123.log"
-            log_path.parent.mkdir()
-            log_path.write_text("log")
-
-            self.assertEqual(monitor_text_pretrain_slurm._log_paths(root, "123"), [log_path])
-
-    def test_job_status_prefers_sacct_rows(self):
-        with mock.patch.object(monitor_text_pretrain_slurm, "_run") as run:
-            run.side_effect = [
-                mock.Mock(stdout="123 COMPLETED\n", stderr=""),
-            ]
-
-            state, source = monitor_text_pretrain_slurm.job_status("123")
-
-        self.assertEqual(state, "COMPLETED")
-        self.assertEqual(source, "sacct")
-
+class BabysitTextPretrainSlurmScriptTest(absltest.TestCase):
     def test_prompt_codex_uses_current_session_resume(self):
-        with mock.patch.object(monitor_text_pretrain_slurm.subprocess, "run") as run:
+        with mock.patch.object(babysit_text_pretrain_slurm.subprocess, "run") as run:
             run.return_value = mock.Mock(returncode=0, stdout="ok", stderr="")
 
-            with flagsaver.flagsaver(monitor_codex_session_id="thread-1"):
-                ok, output = monitor_text_pretrain_slurm._prompt_codex(
-                    reason="periodic health check",
-                    job_ids=["123"],
-                    states={"123": "RUNNING"},
+            with flagsaver.flagsaver(
+                babysit_codex_session_id="thread-1",
+                babysit_codex_model="gpt-5.6-terra",
+                babysit_codex_reasoning_effort="high",
+            ):
+                ok, output = babysit_text_pretrain_slurm._prompt_codex(
+                    mode="iid_baseline",
+                    reason="job failed with state FAILED",
+                    job_id="123",
+                    state="FAILED",
+                    script_path=Path("/logs/jobs/train_iid_baseline.sbatch"),
                     log_dir=Path("/logs"),
                     wiki_path=Path("/wiki/progress.md"),
-                    tail_text="tail",
+                    tail_text="traceback",
                 )
 
         self.assertTrue(ok)
@@ -901,41 +974,176 @@ class MonitorTextPretrainSlurmScriptTest(absltest.TestCase):
         self.assertIn("codex", args[0])
         self.assertIn("exec", args[0])
         self.assertIn("resume", args[0])
-        self.assertIn("periodic health check", kwargs["input"])
-
-
-class BabysitTextPretrainSlurmScriptTest(absltest.TestCase):
-    def test_prompt_codex_uses_current_session_resume(self):
-        with mock.patch.object(babysit_text_pretrain_slurm.subprocess, "run") as run:
-            run.return_value = mock.Mock(returncode=0, stdout="ok", stderr="")
-
-            ok, output = babysit_text_pretrain_slurm._prompt_codex(
-                mode="iid_baseline",
-                job_id="123",
-                state="FAILED",
-                script_path=Path("/logs/jobs/train_iid_baseline.sbatch"),
-                log_dir=Path("/logs"),
-                wiki_path=Path("/wiki/progress.md"),
-                tail_text="traceback",
-            )
-
-        self.assertTrue(ok)
-        self.assertIn("ok", output)
-        args, kwargs = run.call_args
-        self.assertIn("codex", args[0])
-        self.assertIn("exec", args[0])
-        self.assertIn("resume", args[0])
+        resume_index = args[0].index("resume")
+        self.assertEqual(args[0][resume_index + 1], "thread-1")
         self.assertLess(args[0].index("-C"), args[0].index("resume"))
         self.assertNotIn("--ask-for-approval", args[0])
+        self.assertIn("gpt-5.6-terra", args[0])
+        self.assertIn('model_reasoning_effort="high"', args[0])
         self.assertIn("Do not blindly resubmit", kwargs["input"])
 
-    def test_auto_resubmit_requires_successful_codex_prompt(self):
-        with flagsaver.flagsaver(babysit_auto_resubmit=True):
-            self.assertFalse(babysit_text_pretrain_slurm._should_auto_resubmit_after_codex(False))
-            self.assertTrue(babysit_text_pretrain_slurm._should_auto_resubmit_after_codex(True))
+    def test_metrics_after_returns_every_new_step_in_order(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "train_123.log").write_text(
+                "time=x step=10 loss=2.0 grad_norm=0.2 train/lr=1e-4\n"
+                "time=x step=20 loss=1.9 grad_norm=0.3 train/lr=9e-5\n"
+            )
 
-        with flagsaver.flagsaver(babysit_auto_resubmit=False):
-            self.assertFalse(babysit_text_pretrain_slurm._should_auto_resubmit_after_codex(True))
+            metrics = babysit_text_pretrain_slurm._metrics_after(root, "123", 10)
+
+        self.assertEqual([step for step, _ in metrics], [20])
+        self.assertIn("step=20", metrics[0][1])
+
+    def test_metric_check_only_flags_non_finite_values(self):
+        self.assertFalse(
+            babysit_text_pretrain_slurm._metric_has_non_finite_value(
+                "step=20 loss=1.9 grad_norm=0.3 train/lr=0.0"
+            )
+        )
+        self.assertTrue(
+            babysit_text_pretrain_slurm._metric_has_non_finite_value(
+                "step=21 loss=nan grad_norm=0.3 train/lr=9e-5"
+            )
+        )
+
+    def test_metrics_after_is_not_limited_to_log_tail(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "train_123.log").write_text(
+                "step=11 loss=nan grad_norm=0.2 train/lr=1e-4\n"
+                + "noise\n" * 600
+                + "step=12 loss=1.9 grad_norm=0.3 train/lr=9e-5\n"
+            )
+
+            metrics = babysit_text_pretrain_slurm._metrics_after(root, "123", 10)
+
+        self.assertEqual([step for step, _ in metrics], [11, 12])
+
+    def test_main_switches_from_startup_to_steady_polling(self):
+        metric_11 = "step=11 loss=2.0 grad_norm=0.2 train/lr=1e-4"
+        metric_12 = "step=12 loss=1.9 grad_norm=0.3 train/lr=9e-5"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            wiki = root / "progress.md"
+            with (
+                flagsaver.flagsaver(
+                    babysit_mode_job=["iid:123:/logs/train.sbatch"],
+                    babysit_resume_step=["iid:10"],
+                    babysit_log_dir=str(root),
+                    babysit_wiki_path=str(wiki),
+                    babysit_startup_steps=2,
+                    babysit_startup_poll_seconds=60,
+                    babysit_poll_seconds=1200,
+                ),
+                mock.patch.object(
+                    babysit_text_pretrain_slurm,
+                    "job_status",
+                    side_effect=[
+                        ("RUNNING", "sacct"),
+                        ("RUNNING", "sacct"),
+                        ("COMPLETED", "sacct"),
+                    ],
+                ),
+                mock.patch.object(
+                    babysit_text_pretrain_slurm,
+                    "_metrics_after",
+                    side_effect=[[(11, metric_11)], [(12, metric_12)], []],
+                ),
+                mock.patch.object(babysit_text_pretrain_slurm, "_alert_codex") as alert,
+                mock.patch.object(babysit_text_pretrain_slurm.time, "sleep") as sleep,
+            ):
+                babysit_text_pretrain_slurm.main(None)
+
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [60, 1200])
+        alert.assert_not_called()
+
+    def test_main_checks_final_metrics_before_accepting_completion(self):
+        metric = "step=11 loss=nan grad_norm=0.2 train/lr=1e-4"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with (
+                flagsaver.flagsaver(
+                    babysit_mode_job=["iid:123:/logs/train.sbatch"],
+                    babysit_resume_step=["iid:10"],
+                    babysit_log_dir=str(root),
+                    babysit_wiki_path=str(root / "progress.md"),
+                ),
+                mock.patch.object(
+                    babysit_text_pretrain_slurm,
+                    "job_status",
+                    return_value=("COMPLETED", "sacct"),
+                ),
+                mock.patch.object(
+                    babysit_text_pretrain_slurm,
+                    "_metrics_after",
+                    return_value=[(11, metric)],
+                ),
+                mock.patch.object(babysit_text_pretrain_slurm, "_alert_codex") as alert,
+            ):
+                babysit_text_pretrain_slurm.main(None)
+
+        self.assertIn("completed with non-finite metric", alert.call_args.kwargs["reason"])
+
+    def test_main_unknown_state_does_not_reset_stall_timer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with (
+                flagsaver.flagsaver(
+                    babysit_mode_job=["iid:123:/logs/train.sbatch"],
+                    babysit_resume_step=["iid:10"],
+                    babysit_log_dir=str(root),
+                    babysit_wiki_path=str(root / "progress.md"),
+                    babysit_stall_seconds=900,
+                ),
+                mock.patch.object(
+                    babysit_text_pretrain_slurm,
+                    "job_status",
+                    side_effect=[
+                        ("RUNNING", "sacct"),
+                        ("UNKNOWN", "unknown"),
+                        ("RUNNING", "sacct"),
+                        ("COMPLETED", "sacct"),
+                    ],
+                ),
+                mock.patch.object(
+                    babysit_text_pretrain_slurm,
+                    "_metrics_after",
+                    return_value=[],
+                ),
+                mock.patch.object(babysit_text_pretrain_slurm, "_alert_codex") as alert,
+                mock.patch.object(babysit_text_pretrain_slurm.time, "sleep"),
+                mock.patch.object(
+                    babysit_text_pretrain_slurm.time,
+                    "time",
+                    side_effect=[0, 0, 100, 901, 901, 902],
+                ),
+            ):
+                babysit_text_pretrain_slurm.main(None)
+
+        self.assertEqual(alert.call_count, 1)
+        self.assertIn("no new logged optimizer step", alert.call_args.kwargs["reason"])
+
+    def test_parse_resume_steps(self):
+        with flagsaver.flagsaver(
+            babysit_resume_step=["statepassing_bptt:31295", "iid_baseline:32875"]
+        ):
+            self.assertEqual(
+                babysit_text_pretrain_slurm._parse_resume_steps(),
+                {"statepassing_bptt": 31295, "iid_baseline": 32875},
+            )
+
+    def test_requeue_self_requeues_current_slurm_job(self):
+        completed = mock.Mock(returncode=0, stdout="", stderr="")
+        with (
+            mock.patch.dict(os.environ, {"SLURM_JOB_ID": "123"}),
+            mock.patch.object(babysit_text_pretrain_slurm, "_run", return_value=completed) as run,
+            self.assertRaises(SystemExit) as raised,
+        ):
+            babysit_text_pretrain_slurm._requeue_self(None, None)
+
+        self.assertEqual(raised.exception.code, 0)
+        run.assert_called_once_with(["scontrol", "requeue", "123"])
 
 
 if __name__ == "__main__":

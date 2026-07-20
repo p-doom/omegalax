@@ -22,6 +22,7 @@ from omegalax.data.pretrain_statepassing import (
     make_statepassing_iterator,
 )
 from omegalax.models.qwen3_5.config import Qwen3_5TextConfig
+from omegalax.training_contract import build_training_contract, ensure_training_contract
 from omegalax.trainers import pretrain as pretrain_trainer
 from omegalax.trainers.checkpoint_utils import ResumeMode
 from omegalax.trainers.perf import resolve_peak_tflops
@@ -67,7 +68,8 @@ flags.DEFINE_integer("iterator_fsdp_size", None, "Optional FSDP shard count for 
 flags.DEFINE_integer("iterator_dp_size", None, "Optional DP shard count for data iterator.")
 flags.DEFINE_string("save_dir", None, "Checkpoint save directory.")
 flags.DEFINE_string("jax_cache_dir", "/tmp/jax_cache", "JAX persistent compilation cache dir.")
-flags.DEFINE_integer("save_every", 100, "Save checkpoint every N steps.")
+flags.DEFINE_integer("save_every", 500, "Save checkpoint every N steps.")
+flags.DEFINE_integer("keep_latest", 10, "Retain the latest N checkpoints.")
 flags.DEFINE_integer("log_every", 10, "Log metrics every N steps.")
 flags.DEFINE_enum(
     "resume",
@@ -417,6 +419,19 @@ def main(_) -> None:
             else None
         )
     )
+    if pretrain_mode.is_statepassing and save_dir is not None:
+        training_contract = build_training_contract(
+            FLAGS.train_index_path,
+            pass_gdn_state=FLAGS.pass_gdn_state,
+            gdn_layer_limit=FLAGS.gdn_layer_limit,
+            pass_conv_state=FLAGS.pass_conv_state,
+            pass_rope_positions=FLAGS.pass_rope_positions,
+            pad_id=FLAGS.pad_id,
+            eos_id=FLAGS.eos_id,
+        )
+        if jax.process_index() == 0:
+            contract_hash = ensure_training_contract(save_dir, training_contract)
+            startup_log(f"training contract ready: {contract_hash}")
     peak_tflops = resolve_peak_tflops(FLAGS.peak_tflops)
 
     wandb_run = None
@@ -454,6 +469,7 @@ def main(_) -> None:
                 pretrain_mode=pretrain_mode,
                 save_dir=save_dir,
                 save_every=FLAGS.save_every,
+                keep_latest=FLAGS.keep_latest,
                 log_every=FLAGS.log_every,
                 resume=resume_mode,
                 pad_id=FLAGS.pad_id,
@@ -475,6 +491,7 @@ def main(_) -> None:
                 pretrain_mode=pretrain_mode,
                 save_dir=save_dir,
                 save_every=FLAGS.save_every,
+                keep_latest=FLAGS.keep_latest,
                 log_every=FLAGS.log_every,
                 resume=resume_mode,
                 pad_id=FLAGS.pad_id,

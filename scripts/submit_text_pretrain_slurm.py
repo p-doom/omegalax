@@ -6,7 +6,6 @@ import dataclasses
 import datetime as dt
 import enum
 import json
-import os
 from pathlib import Path
 import re
 import shlex
@@ -50,6 +49,7 @@ flags.DEFINE_string("submit_index_root", str(_INDEX_ROOT), "Reusable pretraining
 flags.DEFINE_string("submit_save_root", str(_SAVE_ROOT), "Checkpoint root.")
 flags.DEFINE_string("submit_log_dir", str(_LOG_DIR), "Slurm log root.")
 flags.DEFINE_string("submit_jax_cache_root", str(_JAX_CACHE_ROOT), "JAX compilation cache root.")
+flags.DEFINE_string("submit_model_id", None, "Optional supported/local text model config source.")
 flags.DEFINE_string(
     "submit_wiki_path", str(_WIKI_PROGRESS_PATH), "Wiki progress file for monitor updates."
 )
@@ -57,6 +57,7 @@ flags.DEFINE_string("submit_partition", "standard", "Slurm partition.")
 flags.DEFINE_string("submit_qos", None, "Optional Slurm QoS.")
 flags.DEFINE_string("submit_time", "24:00:00", "Training job time limit.")
 flags.DEFINE_string("submit_index_time", "12:00:00", "Index-build job time limit.")
+flags.DEFINE_string("submit_mem", None, "Optional Slurm memory request, e.g. 120G.")
 flags.DEFINE_integer("submit_nodes_per_run", 1, "Nodes per training run.")
 flags.DEFINE_integer("submit_gpus_per_node", 8, "GPUs/tasks per node for each training run.")
 flags.DEFINE_multi_string(
@@ -71,6 +72,11 @@ flags.DEFINE_bool(
     "submit_single_process_per_run",
     False,
     "Run one JAX process per Slurm job with all allocated GPUs visible locally.",
+)
+flags.DEFINE_bool(
+    "submit_single_process_per_node",
+    False,
+    "Run one JAX process per node with all node-local GPUs visible to each process.",
 )
 flags.DEFINE_integer("submit_index_cpus", 32, "CPUs for the index-build job.")
 flags.DEFINE_integer("submit_seq_len", 2048, "Segment length for index building and training.")
@@ -95,13 +101,16 @@ flags.DEFINE_integer("submit_grad_accum_steps", 4, "Gradient accumulation steps.
 flags.DEFINE_integer("submit_max_tokens", 15_000_000_000, "Total token budget.")
 flags.DEFINE_integer("submit_warmup_tokens", 150_000_000, "Warmup token budget.")
 flags.DEFINE_float("submit_learning_rate", 3e-4, "Peak learning rate.")
+flags.DEFINE_integer("submit_lr_schedule_steps", None, "Optional LR schedule horizon.")
+flags.DEFINE_float("submit_lr_end_factor", 0.1, "Final LR as fraction of peak LR.")
 flags.DEFINE_float("submit_weight_decay", 0.1, "AdamW weight decay.")
 flags.DEFINE_float("submit_adam_beta1", 0.9, "AdamW beta1.")
 flags.DEFINE_float("submit_adam_beta2", 0.95, "AdamW beta2.")
 flags.DEFINE_float("submit_adam_eps", 1e-8, "AdamW epsilon.")
 flags.DEFINE_float("submit_max_grad_norm", 1.0, "Gradient clipping norm.")
 flags.DEFINE_integer("submit_seed", 0, "RNG seed shared by all modes.")
-flags.DEFINE_integer("submit_save_every", 1000, "Checkpoint every N optimizer steps.")
+flags.DEFINE_integer("submit_save_every", 500, "Checkpoint every N optimizer steps.")
+flags.DEFINE_integer("submit_keep_latest", 10, "Retain the latest N checkpoints.")
 flags.DEFINE_integer("submit_log_every", 10, "Log every N optimizer steps.")
 flags.DEFINE_integer("submit_val_every", 500, "Validate every N optimizer steps.")
 flags.DEFINE_integer("submit_val_steps", 10, "Validation batches.")
@@ -110,6 +119,12 @@ flags.DEFINE_bool("submit_pass_gdn_state", True, "Pass GDN recurrent state betwe
 flags.DEFINE_integer("submit_gdn_layer_limit", None, "Only pass state for first N GDN layers.")
 flags.DEFINE_bool("submit_pass_rope_positions", False, "Pass chunk-aware RoPE position ids.")
 flags.DEFINE_bool("submit_pass_conv_state", False, "Pass 1D conv state between chunks.")
+flags.DEFINE_integer("submit_grain_read_threads", 2, "Grain read threads.")
+flags.DEFINE_integer(
+    "submit_grain_read_prefetch_buffer_size", 4, "Grain read prefetch buffer size."
+)
+flags.DEFINE_integer("submit_grain_workers", 8, "Grain multiprocessing workers.")
+flags.DEFINE_integer("submit_grain_worker_buffer_size", 1, "Grain worker buffer size.")
 flags.DEFINE_integer("submit_records_per_shard", 100_000, "Index records per shard.")
 flags.DEFINE_integer("submit_eos_check_records", 1000, "Records sampled for EOS sanity.")
 flags.DEFINE_float("submit_min_eos_fraction", 0.95, "Required dominant EOS fraction.")
@@ -130,28 +145,11 @@ flags.DEFINE_multi_string(
 )
 flags.DEFINE_string("submit_wandb_resume", None, "Optional W&B resume policy.")
 flags.DEFINE_bool("submit_dry_run", False, "Write scripts and print sbatch commands only.")
-flags.DEFINE_bool("submit_monitor", True, "Submit a lightweight monitor job.")
 flags.DEFINE_bool(
     "submit_sequential_train_jobs",
     False,
     "If true, chain train jobs with afterok dependencies in mode order.",
 )
-flags.DEFINE_integer("submit_monitor_poll_seconds", 1200, "Monitor poll interval.")
-flags.DEFINE_string("submit_monitor_time", "24:00:00", "Monitor job time limit.")
-flags.DEFINE_string(
-    "submit_codex_session_id",
-    os.environ.get("CODEX_THREAD_ID"),
-    "Codex session/thread id passed to the monitor for failure and health-check prompts.",
-)
-flags.DEFINE_integer(
-    "submit_monitor_codex_interval_seconds",
-    0,
-    "If >0, monitor prompts Codex every N seconds after any monitored job starts running.",
-)
-flags.DEFINE_bool(
-    "submit_monitor_codex_on_failure", False, "Prompt Codex immediately on monitor failures."
-)
-flags.DEFINE_integer("submit_monitor_codex_timeout_seconds", 1800, "Codex prompt timeout.")
 
 
 def _quote(value: str | Path | int | float) -> str:
@@ -298,12 +296,14 @@ def validate_submit_shape(
     gpus_per_node: int,
     num_segments: int = 2,
     single_process_per_run: bool = False,
+    single_process_per_node: bool = False,
     require_statepassing_divisibility: bool = True,
 ) -> int:
     total_tasks = int(nodes) * int(gpus_per_node)
     if total_tasks <= 0:
         raise ValueError("Total training tasks must be positive.")
-    if not single_process_per_run and _DEFAULT_PRETRAIN_HIDDEN_SIZE % total_tasks != 0:
+    use_local_gpu_process = single_process_per_run or single_process_per_node
+    if not use_local_gpu_process and _DEFAULT_PRETRAIN_HIDDEN_SIZE % total_tasks != 0:
         raise ValueError(
             f"fsdp_size={total_tasks} must divide hidden_size={_DEFAULT_PRETRAIN_HIDDEN_SIZE}."
         )
@@ -329,6 +329,7 @@ def parse_run_specs(
     default_batch_size: int,
     default_grad_accum_steps: int,
     single_process_per_run: bool = False,
+    single_process_per_node: bool = False,
     modes: list[PretrainMode] | None = None,
 ) -> list[RunSpec]:
     modes = list(modes or _all_modes())
@@ -386,6 +387,7 @@ def parse_run_specs(
                 nodes=spec.nodes,
                 gpus_per_node=spec.gpus_per_node,
                 single_process_per_run=single_process_per_run,
+                single_process_per_node=single_process_per_node,
                 require_statepassing_divisibility=False,
             )
             continue
@@ -396,6 +398,7 @@ def parse_run_specs(
                 gpus_per_node=spec.gpus_per_node,
                 num_segments=num_segments,
                 single_process_per_run=single_process_per_run,
+                single_process_per_node=single_process_per_node,
             )
     return specs
 
@@ -427,6 +430,7 @@ def _sbatch_header(
     nodes: int,
     ntasks_per_node: int | None = None,
     cpus_per_task: int,
+    mem: str | None = None,
     gres_gpu: int | None = None,
     signal_before_timeout: str | None = None,
     requeue: bool = False,
@@ -441,6 +445,8 @@ def _sbatch_header(
         f"#SBATCH --output={log_dir}/%x_%j.log",
         f"#SBATCH --error={log_dir}/%x_%j.log",
     ]
+    if mem:
+        lines.append(f"#SBATCH --mem={mem}")
     if signal_before_timeout:
         lines.append(f"#SBATCH --signal={signal_before_timeout}")
     if requeue:
@@ -473,6 +479,7 @@ def render_index_sbatch(
     overwrite: bool,
     trim_batch_size: int | None = None,
     trim_grad_accum_steps: int | None = None,
+    mem: str | None = None,
 ) -> str:
     splits = "--split=train --split=val"
     overwrite_flag = " --overwrite" if overwrite else ""
@@ -509,6 +516,7 @@ def render_index_sbatch(
             log_dir=Path(log_dir),
             nodes=1,
             cpus_per_task=cpus_per_task,
+            mem=mem,
         )
     }
 
@@ -538,14 +546,17 @@ def _train_flags(
     save_root: Path,
     jax_cache_root: Path,
     run_id: str,
-    total_tasks: int,
+    total_devices: int,
+    jax_processes: int,
     batch_size: int,
     grad_accum_steps: int,
     single_process_per_run: bool,
+    single_process_per_node: bool,
     wandb_resume_id: str | None = None,
 ) -> list[str]:
-    fsdp_size = 1 if single_process_per_run else total_tasks
-    dp_size = total_tasks if single_process_per_run else 1
+    use_local_gpu_process = single_process_per_run or single_process_per_node
+    fsdp_size = 1 if use_local_gpu_process else total_devices
+    dp_size = total_devices if use_local_gpu_process else 1
     flags_out = [
         f"--pretrain_mode={mode.value}",
         "--train_index_path=${TRAIN_INDEX_ROOT}",
@@ -559,7 +570,7 @@ def _train_flags(
         f"--adam_beta2={_flag_value('submit_adam_beta2')}",
         f"--adam_eps={_flag_value('submit_adam_eps')}",
         "--lr_schedule=cosine",
-        "--lr_end_factor=0.1",
+        f"--lr_end_factor={_flag_value('submit_lr_end_factor')}",
         f"--max_grad_norm={_flag_value('submit_max_grad_norm')}",
         f"--grad_accum_steps={grad_accum_steps}",
         f"--seed={_flag_value('submit_seed')}",
@@ -569,6 +580,7 @@ def _train_flags(
         f"--save_dir={save_root / run_id / mode.value}",
         f"--jax_cache_dir={jax_cache_root / run_id / mode.value}",
         f"--save_every={_flag_value('submit_save_every')}",
+        f"--keep_latest={_flag_value('submit_keep_latest')}",
         f"--log_every={_flag_value('submit_log_every')}",
         f"--val_every={_flag_value('submit_val_every')}",
         f"--val_steps={_flag_value('submit_val_steps')}",
@@ -578,7 +590,17 @@ def _train_flags(
         f"--pass_gdn_state={_flag_value('submit_pass_gdn_state')}",
         f"--pass_rope_positions={_flag_value('submit_pass_rope_positions')}",
         f"--pass_conv_state={_flag_value('submit_pass_conv_state')}",
+        f"--grain_read_threads={_flag_value('submit_grain_read_threads')}",
+        f"--grain_read_prefetch_buffer_size={_flag_value('submit_grain_read_prefetch_buffer_size')}",
+        f"--grain_workers={_flag_value('submit_grain_workers')}",
+        f"--grain_worker_buffer_size={_flag_value('submit_grain_worker_buffer_size')}",
     ]
+    model_id = _flag_value("submit_model_id")
+    if model_id:
+        flags_out.append(f"--model_id={model_id}")
+    lr_schedule_steps = _flag_value("submit_lr_schedule_steps")
+    if lr_schedule_steps is not None:
+        flags_out.append(f"--lr_schedule_steps={lr_schedule_steps}")
     bptt_chunks = _flag_value("submit_bptt_chunks")
     if bptt_chunks is not None:
         flags_out.append(f"--bptt_chunks={bptt_chunks}")
@@ -587,6 +609,8 @@ def _train_flags(
         flags_out.append(f"--gdn_layer_limit={gdn_layer_limit}")
     if single_process_per_run:
         flags_out.extend(["--iterator_fsdp_size=1", "--iterator_dp_size=1"])
+    elif single_process_per_node:
+        flags_out.extend(["--iterator_fsdp_size=1", f"--iterator_dp_size={jax_processes}"])
     wandb_project = _flag_value("submit_wandb_project")
     if wandb_project:
         group = _flag_value("submit_wandb_group") or run_id
@@ -649,22 +673,36 @@ def render_train_sbatch(
     stage_to_scratch: bool,
     run_pallas_tests: bool,
     single_process_per_run: bool,
+    single_process_per_node: bool,
     wandb_resume_id: str | None = None,
+    mem: str | None = None,
 ) -> str:
+    if single_process_per_run and single_process_per_node:
+        raise ValueError(
+            "--submit_single_process_per_run and --submit_single_process_per_node "
+            "are mutually exclusive."
+        )
     source_root = Path(source_root).expanduser().resolve()
     dataset_root = Path(dataset_root).expanduser().resolve()
     index_root = Path(index_root).expanduser().resolve()
     dataset_rel = _path_under(dataset_root, source_root)
     index_rel = _path_under(index_root, source_root)
-    total_tasks = nodes * gpus_per_node
-    launch_tasks = 1 if single_process_per_run else total_tasks
-    launch_ntasks_per_node = 1 if single_process_per_run else gpus_per_node
-    jax_local_device_ids = _local_device_ids(gpus_per_node) if single_process_per_run else "0"
-    step_gpu_args = (
-        f" --gres=gpu:{gpus_per_node}"
-        if single_process_per_run
-        else " --gpus-per-task=1 --gpu-bind=single:1"
-    )
+    total_devices = nodes * gpus_per_node
+    if single_process_per_run:
+        launch_tasks = 1
+        launch_ntasks_per_node = 1
+        jax_local_device_ids = _local_device_ids(gpus_per_node)
+        step_gpu_args = f" --gres=gpu:{gpus_per_node}"
+    elif single_process_per_node:
+        launch_tasks = nodes
+        launch_ntasks_per_node = 1
+        jax_local_device_ids = _local_device_ids(gpus_per_node)
+        step_gpu_args = f" --gres=gpu:{gpus_per_node}"
+    else:
+        launch_tasks = total_devices
+        launch_ntasks_per_node = gpus_per_node
+        jax_local_device_ids = "0"
+        step_gpu_args = " --gpus-per-task=1 --gpu-bind=single:1"
     flags_text = _train_flags_text(
         _train_flags(
             mode=mode,
@@ -672,10 +710,12 @@ def render_train_sbatch(
             jax_cache_root=Path(jax_cache_root),
             run_id=run_id,
             wandb_resume_id=wandb_resume_id,
-            total_tasks=total_tasks,
+            total_devices=total_devices,
+            jax_processes=launch_tasks,
             batch_size=batch_size,
             grad_accum_steps=grad_accum_steps,
             single_process_per_run=single_process_per_run,
+            single_process_per_node=single_process_per_node,
         )
     )
     wandb_env_block = _wandb_env_block(Path(log_dir), mode)
@@ -714,6 +754,7 @@ uv run python -m pytest tests/test_gated_delta_rule_pallas.py tests/test_gated_d
             nodes=nodes,
             ntasks_per_node=launch_ntasks_per_node,
             cpus_per_task=cpus_per_task,
+            mem=mem,
             gres_gpu=gpus_per_node,
             signal_before_timeout="USR1@1800",
             requeue=True,
@@ -749,54 +790,6 @@ uv run python scripts/train_text_pretrain.py \\
 """
 
 
-def render_monitor_sbatch(
-    *,
-    repo_root: str | Path,
-    log_dir: str | Path,
-    run_id: str,
-    partition: str,
-    qos: str | None,
-    time_limit: str,
-    job_ids: list[str],
-    wiki_path: str | Path,
-    poll_seconds: int,
-    codex_session_id: str | None = None,
-    codex_interval_seconds: int = 0,
-    codex_on_failure: bool = False,
-    codex_timeout_seconds: int = 1800,
-) -> str:
-    codex_session_flag = (
-        f" \\\n  --monitor_codex_session_id={_quote(codex_session_id)}" if codex_session_id else ""
-    )
-    return f"""{
-        _sbatch_header(
-            job_name=f"sp_monitor_{run_id}",
-            partition=partition,
-            qos=qos,
-            time_limit=time_limit,
-            log_dir=Path(log_dir),
-            nodes=1,
-            cpus_per_task=1,
-        )
-    }
-
-set -euo pipefail
-cd {_quote(repo_root)}
-source .venv/bin/activate
-export PYTHONUNBUFFERED=1
-
-cat "$0"
-uv run python scripts/monitor_text_pretrain_slurm.py \\
-  --monitor_job_ids={_quote(",".join(job_ids))} \\
-  --monitor_log_dir={_quote(log_dir)} \\
-  --monitor_wiki_path={_quote(wiki_path)} \\
-  --monitor_poll_seconds={poll_seconds} \\
-  --monitor_codex_interval_seconds={codex_interval_seconds} \\
-  --monitor_codex_on_failure={codex_on_failure} \\
-  --monitor_codex_timeout_seconds={codex_timeout_seconds}{codex_session_flag}
-"""
-
-
 def _submit(script_path: Path, *, dependency: str | None, dry_run: bool) -> str | None:
     cmd = ["sbatch"]
     if dependency:
@@ -827,6 +820,7 @@ def main(_) -> None:
         default_batch_size=FLAGS.submit_batch_size,
         default_grad_accum_steps=FLAGS.submit_grad_accum_steps,
         single_process_per_run=FLAGS.submit_single_process_per_run,
+        single_process_per_node=FLAGS.submit_single_process_per_node,
         modes=selected_modes,
     )
     wandb_resume_ids = parse_wandb_resume_ids(FLAGS.submit_wandb_resume_id)
@@ -854,6 +848,7 @@ def main(_) -> None:
                 qos=FLAGS.submit_qos,
                 time_limit=FLAGS.submit_index_time,
                 cpus_per_task=FLAGS.submit_index_cpus,
+                mem=FLAGS.submit_mem,
                 records_per_shard=FLAGS.submit_records_per_shard,
                 eos_check_records=FLAGS.submit_eos_check_records,
                 min_eos_fraction=FLAGS.submit_min_eos_fraction,
@@ -891,9 +886,11 @@ def main(_) -> None:
                 batch_size=spec.batch_size,
                 grad_accum_steps=spec.grad_accum_steps,
                 cpus_per_task=FLAGS.submit_cpus_per_task,
+                mem=FLAGS.submit_mem,
                 stage_to_scratch=FLAGS.submit_stage_to_scratch,
                 run_pallas_tests=FLAGS.submit_run_pallas_tests,
                 single_process_per_run=FLAGS.submit_single_process_per_run,
+                single_process_per_node=FLAGS.submit_single_process_per_node,
                 wandb_resume_id=wandb_resume_ids.get(spec.mode),
             )
         )
@@ -902,28 +899,6 @@ def main(_) -> None:
             train_job_ids.append(train_job_id)
             if FLAGS.submit_sequential_train_jobs:
                 dependency = f"afterok:{train_job_id}"
-
-    if FLAGS.submit_monitor and train_job_ids:
-        monitor_script = job_dir / "monitor.sbatch"
-        monitor_script.write_text(
-            render_monitor_sbatch(
-                repo_root=repo_root,
-                log_dir=log_dir,
-                run_id=run_id,
-                partition=FLAGS.submit_partition,
-                qos=FLAGS.submit_qos,
-                time_limit=FLAGS.submit_monitor_time,
-                job_ids=[job_id for job_id in ([index_job_id] if index_job_id else [])]
-                + train_job_ids,
-                wiki_path=FLAGS.submit_wiki_path,
-                poll_seconds=FLAGS.submit_monitor_poll_seconds,
-                codex_session_id=FLAGS.submit_codex_session_id,
-                codex_interval_seconds=FLAGS.submit_monitor_codex_interval_seconds,
-                codex_on_failure=FLAGS.submit_monitor_codex_on_failure,
-                codex_timeout_seconds=FLAGS.submit_monitor_codex_timeout_seconds,
-            )
-        )
-        _submit(monitor_script, dependency=None, dry_run=FLAGS.submit_dry_run)
 
     print(f"run_id={run_id}", flush=True)
     print(f"slurm_logs={log_dir}", flush=True)

@@ -29,6 +29,7 @@ from omegalax.models.qwen3_5.config import (
     make_config_from_hf as make_qwen3_5_config_from_hf,
 )
 from omegalax.models.qwen3_5.model import Qwen3_5ForCausalLM
+from omegalax.models.qwen3_5.cache import init_cache as init_qwen3_5_cache
 from omegalax.models.params_utils import load_hf_config_from_source
 
 ModelConfig = qwen3_registry.Qwen3Config
@@ -177,6 +178,7 @@ def forward_with_gdn_state(
     initial_conv_states: tuple[jax.Array, ...] | None = None,
     position_ids_ZBT: jax.Array | None = None,
     return_conv_states: bool = False,
+    cache=None,
 ) -> (
     tuple[jax.Array, jax.Array, tuple[jax.Array, ...]]
     | tuple[jax.Array, jax.Array, tuple[jax.Array, ...], tuple[jax.Array, ...]]
@@ -193,7 +195,7 @@ def forward_with_gdn_state(
         return model(
             token_ids_BT,
             segment_ids_BT,
-            None,
+            cache,
             jnp.array(0, dtype=jnp.int32),
             gdn_initial_states=initial_gdn_states,
             conv_initial_states=initial_conv_states,
@@ -227,7 +229,14 @@ def make_cache(
     generate_steps: int,
     dtype: jnp.dtype = jnp.bfloat16,
 ):
-    """Create KV cache for generation; only supported for Qwen3."""
-    if not isinstance(cfg, qwen3_registry.Qwen3Config):
-        raise NotImplementedError("Cache is only available for Qwen3 text models.")
-    return init_cache(cfg, batch_size, token_len, generate_steps, dtype)
+    """Create a KV cache for Qwen3 or Qwen3.5 generation."""
+    if isinstance(cfg, qwen3_registry.Qwen3Config):
+        return init_cache(cfg, batch_size, token_len, generate_steps, dtype)
+    if isinstance(cfg, Qwen3_5TextConfig):
+        return init_qwen3_5_cache(
+            cfg,
+            batch_size=batch_size,
+            cache_size=max(token_len + generate_steps, 1),
+            dtype=dtype,
+        )
+    raise TypeError(f"Unsupported text config type: {type(cfg)}")

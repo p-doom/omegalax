@@ -16,6 +16,7 @@ import jax.numpy as jnp
 from jax.sharding import NamedSharding, PartitionSpec
 import optax
 import orbax.checkpoint as ocp
+from orbax.checkpoint._src.multihost import multihost as orbax_multihost
 
 from omegalax.data.grain_pipeline import pop_source_ids
 from omegalax.distributed.mesh import ensure_mesh, mesh_rules, required_batch_multiple
@@ -33,6 +34,8 @@ from omegalax.trainers.perf import (
 )
 
 P = PartitionSpec
+
+_RESTORE_BARRIER_TIMEOUT_SECONDS = 600
 
 
 def startup_log(msg: str) -> None:
@@ -226,9 +229,18 @@ def _abstract_train_state(optimizer: MixedPrecisionOptimizer, rng: jax.Array) ->
     }
 
 
-def _make_checkpoint_manager(save_dir: Path, save_interval: int | None) -> ocp.CheckpointManager:
+def _make_checkpoint_manager(
+    save_dir: Path, save_interval: int | None, *, max_to_keep: int | None = 2
+) -> ocp.CheckpointManager:
     """Orbax requires an absolute checkpoint path."""
+    orbax_multihost._DEFAULT_BARRIER_TIMEOUT = max(
+        orbax_multihost._DEFAULT_BARRIER_TIMEOUT, _RESTORE_BARRIER_TIMEOUT_SECONDS
+    )
     save_dir = Path(save_dir).expanduser().resolve()
+    save_dir.mkdir(parents=True, exist_ok=True)
+    active_processes = None
+    if jax.process_count() > 1:
+        active_processes = set(range(jax.process_count()))
     handler_registry = ocp.handlers.DefaultCheckpointHandlerRegistry()
     handler_registry.add("train_state", ocp.args.PyTreeSave, ocp.handlers.PyTreeCheckpointHandler)
     handler_registry.add(
@@ -238,11 +250,22 @@ def _make_checkpoint_manager(save_dir: Path, save_interval: int | None) -> ocp.C
     checkpoint_utils.register_lr_contract_handler(handler_registry)
     options = ocp.CheckpointManagerOptions(
         save_interval_steps=save_interval,
-        max_to_keep=2,
+        max_to_keep=max_to_keep,
         step_format_fixed_length=6,
+        create=False,
         cleanup_tmp_directories=True,
+        multiprocessing_options=ocp.options.MultiprocessingOptions(
+            active_processes=active_processes, barrier_sync_key_prefix="omegalax_checkpoint_manager"
+        ),
     )
     return ocp.CheckpointManager(save_dir, options=options, handler_registry=handler_registry)
+
+
+def _model_output_weight(model) -> jax.Array:
+    output_weight = getattr(model, "output_weight", None)
+    if output_weight is not None:
+        return output_weight()
+    return model.lm_head.kernel[...]
 
 
 def _write_checkpoint_config(save_dir: Path, cfg) -> None:
@@ -306,7 +329,7 @@ def make_sft_train_step(cfg, pad_id: int = 0):
             hidden_BTD, aux_loss = text_api.forward(
                 model, token_ids_BT, pad_id, cfg, attention_mask_BT=attention_mask_BT
             )
-            lm_weight = model.lm_head.kernel[...]
+            lm_weight = _model_output_weight(model)
             loss = (
                 chunked_cross_entropy_loss(
                     hidden_BTD,
@@ -347,7 +370,7 @@ def make_sft_eval_step(cfg, pad_id: int = 0):
         hidden_BTD, aux_loss = text_api.forward(
             model, token_ids_BT, pad_id, cfg, attention_mask_BT=attention_mask_BT
         )
-        lm_weight = model.lm_head.kernel[...]
+        lm_weight = _model_output_weight(model)
         loss = (
             chunked_cross_entropy_loss(
                 hidden_BTD,
@@ -372,6 +395,7 @@ def run_sft(
     *,
     save_dir: str | Path | None = None,
     save_every: int = 0,
+    keep_latest: int | None = 2,
     log_every: int = 1,
     resume: checkpoint_utils.ResumeMode = checkpoint_utils.ResumeMode.NEVER,
     pad_id: int = 0,
@@ -402,7 +426,9 @@ def run_sft(
     checkpoint_manager: ocp.CheckpointManager | None = None
     if save_path is not None:
         save_path.mkdir(parents=True, exist_ok=True)
-        checkpoint_manager = _make_checkpoint_manager(save_path, save_interval=save_every or None)
+        checkpoint_manager = _make_checkpoint_manager(
+            save_path, save_interval=save_every or None, max_to_keep=keep_latest
+        )
 
     latest_step = checkpoint_manager.latest_step() if checkpoint_manager is not None else None
 

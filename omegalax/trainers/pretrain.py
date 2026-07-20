@@ -40,6 +40,7 @@ from omegalax.trainers.perf import (
 )
 from omegalax.trainers.text import (
     _make_checkpoint_manager,
+    _model_output_weight,
     _restore_sft_checkpoint,
     _save_sft_checkpoint,
     _write_checkpoint_config,
@@ -253,12 +254,32 @@ def statepassing_target_masks(
     )
 
 
+def _validate_statepassing_global_batch(
+    *,
+    global_batch_size: int,
+    num_segments: int,
+    batch_multiple: int,
+) -> None:
+    if global_batch_size % num_segments != 0:
+        raise ValueError(
+            f"Global segment batch size {global_batch_size} must be divisible by "
+            f"num_segments={num_segments}."
+        )
+    global_window_batch = global_batch_size // num_segments
+    if global_window_batch % batch_multiple != 0:
+        raise ValueError(
+            f"Global statepassing window batch size {global_window_batch} must be divisible by "
+            f"batch sharding multiple {batch_multiple}."
+        )
+
+
 def prepare_pretrain_batch(
     batch: dict[str, Any],
     pretrain_mode: PretrainMode,
     model_cfg: text_api.TextConfig,
     mesh,
     *,
+    global_batch_size: int,
     pass_rope_positions: bool = False,
 ) -> tuple[dict[str, jax.Array], dict[str, Any] | None, dict[str, Any]]:
     metadata = pop_pretrain_metadata(batch)
@@ -278,12 +299,11 @@ def prepare_pretrain_batch(
         raise KeyError(f"Missing required pretrain batch keys for {pretrain_mode}: {missing}")
     if pretrain_mode.is_statepassing:
         batch_multiple = required_batch_multiple(text_api.batch_partition_spec(model_cfg), mesh)
-        window_batch = int(batch["token_ids_BCT"].shape[0])
-        if window_batch % batch_multiple != 0:
-            raise ValueError(
-                f"Statepassing window batch size {window_batch} must be divisible by "
-                f"batch sharding multiple {batch_multiple}."
-            )
+        _validate_statepassing_global_batch(
+            global_batch_size=global_batch_size,
+            num_segments=int(batch["token_ids_BCT"].shape[1]),
+            batch_multiple=batch_multiple,
+        )
 
     device_batch = {key: batch[key] for key in required}
     if pass_rope_positions:
@@ -318,7 +338,7 @@ def _iid_loss_stats(model, batch: dict[str, jax.Array], cfg, pad_id: int):
     )
     nll_sum, token_count = chunked_cross_entropy_stats(
         hidden_BTD,
-        model.lm_head.kernel[...],
+        _model_output_weight(model),
         token_ids_BT,
         loss_mask_BT,
         num_tiles=_NUM_LOSS_TILES,
@@ -431,7 +451,7 @@ def _statepassing_loss_stats(
     )
     nll_sums, token_counts = chunked_cross_entropy_multi_stats(
         hidden_BT_D,
-        model.lm_head.kernel[...],
+        _model_output_weight(model),
         token_ids_BT,
         mask_stack,
         num_tiles=_NUM_LOSS_TILES,
@@ -760,6 +780,7 @@ def run_pretrain(
     pretrain_mode: PretrainMode | str,
     save_dir: str | Path | None = None,
     save_every: int = 0,
+    keep_latest: int | None = 2,
     log_every: int = 1,
     resume: checkpoint_utils.ResumeMode = checkpoint_utils.ResumeMode.NEVER,
     pad_id: int = 0,
@@ -786,7 +807,9 @@ def run_pretrain(
     checkpoint_manager = None
     if save_path is not None:
         save_path.mkdir(parents=True, exist_ok=True)
-        checkpoint_manager = _make_checkpoint_manager(save_path, save_interval=save_every or None)
+        checkpoint_manager = _make_checkpoint_manager(
+            save_path, save_interval=save_every or None, max_to_keep=keep_latest
+        )
 
     latest_step = checkpoint_manager.latest_step() if checkpoint_manager is not None else None
     if resume == checkpoint_utils.ResumeMode.REQUIRED and latest_step is None:
@@ -917,6 +940,7 @@ def run_pretrain(
                 pretrain_mode,
                 model_cfg,
                 mesh,
+                global_batch_size=train_cfg.batch_size,
                 pass_rope_positions=pass_rope_positions,
             )
             micro_flops = per_device_flops_per_step(
@@ -975,6 +999,7 @@ def run_pretrain(
                     pretrain_mode,
                     model_cfg,
                     mesh,
+                    global_batch_size=train_cfg.batch_size,
                     pass_rope_positions=pass_rope_positions,
                 )
                 val_metrics = eval_step(optimizer.model, val_batch)
@@ -1029,6 +1054,7 @@ def run_statepassing_curriculum(
     pretrain_mode: PretrainMode | str = PretrainMode.STATEPASSING_BPTT,
     save_dir: str | Path | None = None,
     save_every: int = 0,
+    keep_latest: int | None = 2,
     log_every: int = 1,
     resume: checkpoint_utils.ResumeMode = checkpoint_utils.ResumeMode.NEVER,
     pad_id: int = 0,
@@ -1062,7 +1088,9 @@ def run_statepassing_curriculum(
     checkpoint_manager = None
     if save_path is not None:
         save_path.mkdir(parents=True, exist_ok=True)
-        checkpoint_manager = _make_checkpoint_manager(save_path, save_interval=save_every or None)
+        checkpoint_manager = _make_checkpoint_manager(
+            save_path, save_interval=save_every or None, max_to_keep=keep_latest
+        )
 
     latest_step = checkpoint_manager.latest_step() if checkpoint_manager is not None else None
     if resume == checkpoint_utils.ResumeMode.REQUIRED and latest_step is None:
@@ -1090,6 +1118,12 @@ def run_statepassing_curriculum(
     if train_cfg.batch_size % batch_multiple != 0:
         raise ValueError(
             f"Global batch size {train_cfg.batch_size} must be divisible by {batch_multiple}."
+        )
+    for num_segments in train_order:
+        _validate_statepassing_global_batch(
+            global_batch_size=train_cfg.batch_size,
+            num_segments=num_segments,
+            batch_multiple=batch_multiple,
         )
     replicated_rng_sharding = NamedSharding(mesh, P())
     root_rng = jax.device_put(jax.random.key(train_cfg.seed), replicated_rng_sharding)
@@ -1225,6 +1259,7 @@ def run_statepassing_curriculum(
                     pretrain_mode,
                     model_cfg,
                     mesh,
+                    global_batch_size=train_cfg.batch_size,
                     pass_rope_positions=pass_rope_positions,
                 )
                 micro_flops = per_device_flops_per_step(

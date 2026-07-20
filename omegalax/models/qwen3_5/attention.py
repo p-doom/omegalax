@@ -21,6 +21,10 @@ P = PartitionSpec
 wp = nnx.with_partitioning
 
 
+def _mask_value(dtype: jnp.dtype) -> float:
+    return float(jnp.finfo(dtype).min)
+
+
 class Attention(nnx.Module):
     def __init__(self, cfg: Qwen3_5TextConfig, *, rngs: nnx.Rngs):
         hd = cfg.head_dim
@@ -86,6 +90,8 @@ class Attention(nnx.Module):
         sin_BTK: jax.Array,
         segment_ids_BT: jax.Array,
         position_ids_BT: jax.Array,
+        *,
+        cache=None,
     ) -> jax.Array:
         B, T, _ = hidden_BTD.shape
 
@@ -116,15 +122,50 @@ class Attention(nnx.Module):
 
         q_BTHK, k_BTGK = apply_text_rope(q_BTHK, k_BTGK, cos_BTK, sin_BTK)
 
-        attn_BTHK = dot_product_attention(
-            q_BTHK,
-            k_BTGK,
-            v_BTGK,
-            is_causal=True,
-            scale=self.scale,
-            implementation=self._attn_backend,
-            q_sharding=self._q_sharding,
-        )
+        if cache is None:
+            attn_BTHK = dot_product_attention(
+                q_BTHK,
+                k_BTGK,
+                v_BTGK,
+                is_causal=True,
+                scale=self.scale,
+                implementation=self._attn_backend,
+                q_sharding=self._q_sharding,
+            )
+        else:
+            slice_indices = (0, cache.cur_ind[...], 0, 0)
+            cache.k_cache[...] = jax.lax.dynamic_update_slice(
+                cache.k_cache[...], k_BTGK, slice_indices
+            )
+            cache.v_cache[...] = jax.lax.dynamic_update_slice(
+                cache.v_cache[...], v_BTGK, slice_indices
+            )
+
+            q_BTGRK = jax.lax.reshape(
+                q_BTHK,
+                (B, T, self.num_kv_heads, self.n_rep, self.head_dim),
+            )
+            logits_BTSGR = jnp.einsum("BTGRK,BSGK->BTSGR", q_BTGRK, cache.k_cache[...]) * self.scale
+            query_positions_T = cache.cur_ind[...] + jnp.arange(T, dtype=jnp.int32)
+            key_positions_S = jnp.arange(cache.size, dtype=jnp.int32)
+            valid_S = key_positions_S < cache.cur_ind[...] + T
+            causal_TS = key_positions_S[None, :] <= query_positions_T[:, None]
+            mask_TS = valid_S[None, :] & causal_TS
+            logits_BTSGR = jnp.where(
+                mask_TS[None, :, :, None, None],
+                logits_BTSGR,
+                _mask_value(logits_BTSGR.dtype),
+            )
+            weights_BTSGR = jax.nn.softmax(logits_BTSGR.astype(jnp.float32), axis=2).astype(
+                logits_BTSGR.dtype
+            )
+            attn_BTGRK = jnp.einsum("BTSGR,BSGK->BTGRK", weights_BTSGR, cache.v_cache[...])
+            attn_BTHK = jax.lax.reshape(
+                attn_BTGRK,
+                (B, T, self.num_heads, self.head_dim),
+                out_sharding=self.shd_cfg.act_btnh,
+            )
+            cache.cur_ind[...] = cache.cur_ind[...] + T
         attn_out_BTD = jax.lax.reshape(
             attn_BTHK, (B, T, self.num_heads * self.head_dim), out_sharding=self.shd_cfg.act_btf
         )

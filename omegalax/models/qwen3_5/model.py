@@ -206,8 +206,7 @@ class DecoderLayer(nnx.Module):
         self.input_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, rngs=rngs)
         self.post_attention_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, rngs=rngs)
 
-    @partial(jax.remat, static_argnums=(0, 8, 10))
-    def __call__(
+    def _forward(
         self,
         hidden_BTD: jax.Array,
         cos_BTK: jax.Array,
@@ -219,6 +218,7 @@ class DecoderLayer(nnx.Module):
         return_gdn_state: bool = False,
         conv_initial_state_BCS: jax.Array | None = None,
         return_conv_state: bool = False,
+        cache=None,
     ) -> (
         tuple[jax.Array, jax.Array]
         | tuple[jax.Array, jax.Array, jax.Array | None]
@@ -230,7 +230,14 @@ class DecoderLayer(nnx.Module):
         conv_final_state_BCS = None
 
         if self.layer_type == "full_attention":
-            attn_out_BTD = self.attn(normed_BTD, cos_BTK, sin_BTK, segment_ids_BT, position_ids_BT)
+            attn_out_BTD = self.attn(
+                normed_BTD,
+                cos_BTK,
+                sin_BTK,
+                segment_ids_BT,
+                position_ids_BT,
+                cache=cache,
+            )
         else:
             needs_stateful_call = (
                 return_gdn_state
@@ -273,6 +280,35 @@ class DecoderLayer(nnx.Module):
             return hidden_BTD, aux_loss, conv_final_state_BCS
         return hidden_BTD, aux_loss
 
+    @partial(jax.remat, static_argnums=(0, 8, 10))
+    def __call__(
+        self,
+        hidden_BTD: jax.Array,
+        cos_BTK: jax.Array,
+        sin_BTK: jax.Array,
+        segment_ids_BT: jax.Array,
+        position_ids_BT: jax.Array,
+        attention_mask_BT: jax.Array | None = None,
+        gdn_initial_state_BHAU: jax.Array | None = None,
+        return_gdn_state: bool = False,
+        conv_initial_state_BCS: jax.Array | None = None,
+        return_conv_state: bool = False,
+        cache=None,
+    ):
+        return self._forward(
+            hidden_BTD,
+            cos_BTK,
+            sin_BTK,
+            segment_ids_BT,
+            position_ids_BT,
+            attention_mask_BT,
+            gdn_initial_state_BHAU,
+            return_gdn_state,
+            conv_initial_state_BCS,
+            return_conv_state,
+            cache,
+        )
+
 
 # Text Model
 class TextModel(nnx.Module):
@@ -304,6 +340,7 @@ class TextModel(nnx.Module):
         gdn_initial_states: tuple[jax.Array, ...] | None = None,
         conv_initial_states: tuple[jax.Array, ...] | None = None,
         *,
+        cache=None,
         return_gdn_states: bool = False,
         return_conv_states: bool = False,
     ) -> (
@@ -360,10 +397,12 @@ class TextModel(nnx.Module):
             raise ValueError(
                 f"Expected {linear_layer_count} conv initial states, got {len(conv_initial_states)}"
             )
+        if cache is not None and len(cache) != cfg.num_hidden_layers:
+            raise ValueError(f"Expected {cfg.num_hidden_layers} cache entries, got {len(cache)}")
         gdn_state_idx = 0
-        for layer in self.layers:
+        for layer_idx, layer in enumerate(self.layers):
             if layer.layer_type == "full_attention":
-                hidden_BTD, aux = layer(
+                layer_args = (
                     hidden_BTD,
                     cos_BTK,
                     sin_BTK,
@@ -374,7 +413,12 @@ class TextModel(nnx.Module):
                     False,
                     None,
                     False,
+                    None if cache is None else cache[layer_idx],
                 )
+                if cache is None:
+                    hidden_BTD, aux = layer(*layer_args)
+                else:
+                    hidden_BTD, aux = layer._forward(*layer_args)
             else:
                 init_state = (
                     None if gdn_initial_states is None else gdn_initial_states[gdn_state_idx]
@@ -396,6 +440,7 @@ class TextModel(nnx.Module):
                         want_gdn_state,
                         init_conv_state,
                         want_conv_state,
+                        None,
                     )
                     if want_gdn_state and want_conv_state:
                         hidden_BTD, aux, final_state, final_conv_state = layer_result
@@ -421,6 +466,7 @@ class TextModel(nnx.Module):
                         False,
                         None,
                         False,
+                        None,
                     )
                 gdn_state_idx += 1
             aux_losses.append(aux)
@@ -443,15 +489,24 @@ class Qwen3_5ForCausalLM(nnx.Module):
     def __init__(self, cfg: Qwen3_5TextConfig, *, rngs: nnx.Rngs):
         self.text = TextModel(cfg, rngs=rngs)
         self.logits_shd = P(cfg.shd_cfg.act_btd[0], None, None)
-        lm_head_init = nnx.initializers.lecun_normal()
-        self.lm_head = nnx.Linear(
-            cfg.hidden_size,
-            cfg.vocab_size,
-            use_bias=False,
-            rngs=rngs,
-            dtype=cfg.dtype,
-            kernel_init=wp(lm_head_init, ("embed", "vocab")),
-        )
+        if cfg.tie_word_embeddings:
+            self.lm_head = None
+        else:
+            lm_head_init = nnx.initializers.lecun_normal()
+            self.lm_head = nnx.Linear(
+                cfg.hidden_size,
+                cfg.vocab_size,
+                use_bias=False,
+                rngs=rngs,
+                dtype=cfg.dtype,
+                kernel_init=wp(lm_head_init, ("embed", "vocab")),
+            )
+
+    def output_weight(self) -> jax.Array:
+        """Weight matrix used as the LM output projection: (hidden, vocab)."""
+        if self.lm_head is not None:
+            return self.lm_head.kernel[...]
+        return self.text.embedder.embedding[...].T
 
     def __call__(
         self,
@@ -466,13 +521,14 @@ class Qwen3_5ForCausalLM(nnx.Module):
         return_gdn_states: bool = False,
         return_conv_states: bool = False,
     ):
-        del cache, num_right_pads
+        del num_right_pads
         return self.text(
             token_ids_BT=token_ids_BT,
             segment_ids_BT=segment_ids_BT,
             position_ids_ZBT=position_ids_ZBT,
             gdn_initial_states=gdn_initial_states,
             conv_initial_states=conv_initial_states,
+            cache=cache,
             return_gdn_states=return_gdn_states,
             return_conv_states=return_conv_states,
         )

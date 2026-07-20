@@ -131,7 +131,7 @@ def _state_pass_pallas_fwd_only(kcd, k_dec, u_pre, df, initial_state):
 
 def _state_pass_fwd_for_vjp(kcd, k_dec, u_pre, df, initial_state):
     state_in, v_new, final_state = _state_pass_pallas_fwd_only(kcd, k_dec, u_pre, df, initial_state)
-    residuals = (kcd, k_dec, u_pre, df, state_in, v_new)
+    residuals = (kcd, k_dec, u_pre, df, initial_state)
     return (state_in, v_new, final_state), residuals
 
 
@@ -159,7 +159,9 @@ def _state_pass_bwd(residuals, cotangents):
 
       Total dstate carry = dstate_via_df + dstate_via_kcd + dstate_in[j]
     """
-    kcd, k_dec, u_pre, df, state_in, v_new = residuals
+    kcd, k_dec, u_pre, df, initial_state = residuals
+    # Avoid retaining these per-chunk buffers across every BPTT segment.
+    state_in, v_new, _ = _state_pass_pallas_fwd_only(kcd, k_dec, u_pre, df, initial_state)
     dstate_in, dv_new, dfinal_state = cotangents
     B, H, J, C, A = kcd.shape
 
