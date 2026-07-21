@@ -804,14 +804,23 @@ def _clear_plot_formats(directory: Path) -> None:
     if not directory.exists():
         return
     for suffix in ("*.pdf", "*.svg", "*.png"):
-        for path in directory.glob(suffix):
+        for path in directory.rglob(suffix):
             path.unlink()
 
 
-def _save_figure_to_targets(figure, targets: Sequence[Path]) -> None:
+def _save_figure_to_targets(
+    figure,
+    targets: Sequence[Path],
+    *,
+    svg_subdirectory: str | None = None,
+) -> None:
     try:
         for target in targets:
-            save_figure_formats(figure, target)
+            save_figure_formats(
+                figure,
+                target,
+                svg_subdirectory=svg_subdirectory,
+            )
     finally:
         plt.close(figure)
 
@@ -916,6 +925,7 @@ def _plot_single_checkpoint(
                             f"exact_length_L{length}_{metric}",
                             plot_output_roots,
                         ),
+                        svg_subdirectory="exact_length_svgs",
                     )
 
         if "heatmap" in plot_types:
@@ -1212,6 +1222,7 @@ def compare_checkpoint_results(
                             experiment,
                             f"exact_length_L{length}_{metric}",
                         ),
+                        svg_subdirectory="exact_length_svgs",
                     )
 
 

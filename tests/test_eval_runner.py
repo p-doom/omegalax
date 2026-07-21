@@ -381,27 +381,22 @@ def _assert_plot_inventory(
         lengths=lengths,
         plot_types=plot_types,
     )
-    formats_by_stem: dict[str, set[str]] = {}
-    for path in root.rglob("*"):
-        if not path.is_file():
-            continue
-        testcase.assertIn(path.suffix, {".pdf", ".svg", ".png"}, msg=str(path))
-        relative_stem = str(path.relative_to(root).with_suffix(""))
-        formats_by_stem.setdefault(relative_stem, set()).add(path.suffix)
-    testcase.assertEqual(set(formats_by_stem), required_stems)
+    expected_paths = set()
     for stem in required_stems:
-        testcase.assertEqual(formats_by_stem[stem], {".pdf", ".svg", ".png"})
-        for suffix in (".pdf", ".svg", ".png"):
-            path = root / f"{stem}{suffix}"
-            testcase.assertTrue(path.is_file(), msg=str(path))
-            testcase.assertGreater(path.stat().st_size, 0, msg=str(path))
+        expected_paths.add(root / "pdfs" / f"{stem}.pdf")
+        svg_directory = root / "exact_length_svgs" if stem.startswith("exact_length_") else root
+        expected_paths.add(svg_directory / f"{stem}.svg")
+    actual_paths = {path for path in root.rglob("*") if path.is_file()}
+    testcase.assertEqual(actual_paths, expected_paths)
+    for path in expected_paths:
+        testcase.assertGreater(path.stat().st_size, 0, msg=str(path))
 
 
 def _assert_external_plot_root(testcase: absltest.TestCase, root: Path) -> None:
     files = tuple(path for path in root.rglob("*") if path.is_file())
     testcase.assertNotEmpty(files)
     for path in files:
-        testcase.assertIn(path.suffix, {".pdf", ".svg", ".png"}, msg=str(path))
+        testcase.assertIn(path.suffix, {".pdf", ".svg"}, msg=str(path))
         testcase.assertTrue({"raw", "summary"}.isdisjoint(path.relative_to(root).parts))
 
 

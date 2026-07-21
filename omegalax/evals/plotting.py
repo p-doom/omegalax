@@ -424,13 +424,23 @@ def save_common_exact_length_scale(
     return output_path
 
 
-def save_figure_formats(figure: Figure, output_stem: str | Path) -> tuple[Path, ...]:
-    """Save a figure as PDF, SVG, and a 300-DPI PNG."""
+def save_figure_formats(
+    figure: Figure,
+    output_stem: str | Path,
+    *,
+    svg_subdirectory: str | None = None,
+) -> tuple[Path, ...]:
+    """Save a figure as PDF and SVG in the canonical plot layout."""
 
     output_stem = Path(output_stem)
-    output_stem.parent.mkdir(parents=True, exist_ok=True)
-    paths = tuple(output_stem.with_suffix(suffix) for suffix in (".pdf", ".svg", ".png"))
+    svg_directory = output_stem.parent
+    if svg_subdirectory is not None:
+        svg_directory /= svg_subdirectory
+    paths = (
+        output_stem.parent / "pdfs" / output_stem.with_suffix(".pdf").name,
+        svg_directory / output_stem.with_suffix(".svg").name,
+    )
     for path in paths:
-        save_kwargs = {"dpi": 300} if path.suffix == ".png" else {}
-        figure.savefig(path, **save_kwargs)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        figure.savefig(path)
     return paths

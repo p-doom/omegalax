@@ -16,7 +16,6 @@ from matplotlib import colors as mcolors  # noqa: E402
 from matplotlib.collections import LineCollection, PolyCollection  # noqa: E402
 from matplotlib import pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
-from PIL import Image  # noqa: E402
 
 from omegalax.evals.aggregation import SummaryPoint  # noqa: E402
 from omegalax.evals.plotting import (  # noqa: E402
@@ -1069,7 +1068,7 @@ class EvalPlottingTest(absltest.TestCase):
             self.assertGreaterEqual(gain_scale_upper, 0.4)
             self.assertLessEqual(gain_scale_upper, 0.48)
 
-    def test_save_figure_formats_writes_pdf_svg_and_300_dpi_png(self):
+    def test_save_figure_formats_writes_pdf_and_svg_to_separate_directories(self):
         points = tuple(
             self._point(
                 experiment="gdn",
@@ -1095,14 +1094,15 @@ class EvalPlottingTest(absltest.TestCase):
             self.assertIsInstance(paths, tuple)
             self.assertEqual(
                 set(paths),
-                {output_stem.with_suffix(suffix) for suffix in (".pdf", ".svg", ".png")},
+                {
+                    output_stem.parent / "pdfs" / "gdn_state_gain.pdf",
+                    output_stem.with_suffix(".svg"),
+                },
             )
             self.assertTrue(all(path.is_file() and path.stat().st_size > 0 for path in paths))
-            self.assertTrue(output_stem.with_suffix(".pdf").read_bytes().startswith(b"%PDF"))
+            self.assertTrue(paths[0].read_bytes().startswith(b"%PDF"))
             self.assertIn("<svg", output_stem.with_suffix(".svg").read_text())
-            with Image.open(output_stem.with_suffix(".png")) as image:
-                self.assertAlmostEqual(image.info["dpi"][0], 300.0, delta=1.0)
-                self.assertAlmostEqual(image.info["dpi"][1], 300.0, delta=1.0)
+            self.assertEmpty(tuple(output_stem.parent.rglob("*.png")))
 
 
 if __name__ == "__main__":
