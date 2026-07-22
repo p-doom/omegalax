@@ -328,11 +328,9 @@ class VisionAttention(nnx.Module):
         return out_ND
 
 
-# Whether the vision transformer block forward is rematerialized (activation
-# checkpointing). Single source of truth for both the runtime decorator on
-# ``VisionBlock.__call__`` below AND the hardware-FLOP (HFU) accounting in
-# ``omegalax.trainers.perf`` (only relevant when the vision tower is trained;
-# a frozen tower has no backward and therefore no recompute).
+# Single source of truth for vision-block activation checkpointing: drives both
+# the jax.remat decorator on VisionBlock.__call__ below and the HFU recompute
+# term in omegalax.trainers.perf (relevant only when the tower is trained).
 VISION_BLOCK_REMAT = True
 
 

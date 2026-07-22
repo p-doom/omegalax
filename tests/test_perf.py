@@ -31,7 +31,6 @@ class ForwardFlopsPerTokenTest(absltest.TestCase):
         fwd = forward_flops_per_token(cfg, seq_len=8)
         self.assertGreater(fwd.forward, 0)
         self.assertEqual(fwd.forward, fwd.weighted_layers + fwd.attention + fwd.head)
-        # training_flops_per_token is the full-FT convenience helper = 3 * forward
         self.assertEqual(training_flops_per_token(cfg, 8), 3 * fwd.forward)
         # qwen3-smoke: D=128, H=4, G=4, K=32, F=512, V=1024, L=2, T=8.
         # weighted_layers = 2*(qkv 98304 + o_proj 32768 + mlp 393216) = 1048576

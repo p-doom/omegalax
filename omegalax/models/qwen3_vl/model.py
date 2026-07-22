@@ -406,12 +406,9 @@ class TextAttention(nnx.Module):
         return out_BTD
 
 
-# Whether the text-decoder layer forward is rematerialized (activation
-# checkpointing): the layer forward is recomputed during the backward pass to
-# save activation memory. Single source of truth for both the runtime decorator
-# on ``TextDecoderLayer.__call__`` below AND the hardware-FLOP (HFU) accounting
-# in ``omegalax.trainers.perf`` (recompute doubles the layer forward). Keep the
-# two in lockstep by driving the decorator off this flag.
+# Single source of truth for text-decoder activation checkpointing: drives both
+# the jax.remat decorator on TextDecoderLayer.__call__ below and the HFU
+# recompute term in omegalax.trainers.perf.
 DECODER_LAYER_REMAT = True
 
 

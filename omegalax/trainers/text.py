@@ -409,10 +409,8 @@ def run_sft(
             if sids is not None:
                 for sid in sids.tolist():
                     source_counts[sid] = source_counts.get(sid, 0) + 1
-            # Text SFT is a full fine-tune (all weights trainable) and the
-            # decoder layers are unconditionally rematerialized (see
-            # qwen3/model.py and qwen3_5/model.py); vision_trainable is unused
-            # for text-only configs.
+            # Full fine-tune; text decoder layers always remat (qwen3/model.py,
+            # qwen3_5/model.py). vision_trainable is unused for text configs.
             micro_flops = per_device_step_flops(
                 model_cfg,
                 train_cfg.seq_len,
