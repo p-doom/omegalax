@@ -112,8 +112,7 @@ def build_optimizer(
     wd = 0.0 if wrt is LoRAParam else train_cfg.weight_decay
     chain.append(optax.adamw(lr_schedule_fn, weight_decay=wd))
     tx = optax.chain(*chain)
-    if train_cfg.grad_accum_steps > 1:
-        tx = optax.MultiSteps(tx, every_k_schedule=train_cfg.grad_accum_steps)
+    tx = optax.MultiSteps(tx, every_k_schedule=train_cfg.grad_accum_steps)
     opt = MixedPrecisionOptimizer(model, tx, wrt=wrt)
     return opt
 
