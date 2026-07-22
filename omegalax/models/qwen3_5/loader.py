@@ -1,4 +1,43 @@
-"""Weight conversion from HuggingFace Qwen3.5 safetensors to JAX."""
+"""Weight conversion from HuggingFace Qwen3.5 safetensors to JAX.
+
+Multi-token-prediction (MTP) head — deliberately not loaded
+-----------------------------------------------------------
+Real Qwen3.5 checkpoints ship a multi-token-prediction head (the ``mtp.*``
+tensors: ``mtp.fc``, ``mtp.pre_fc_norm_{hidden,embedding}``, a single
+full-attention decoder block ``mtp.layers.0.*`` — dense or MoE mirroring the
+main model — and ``mtp.norm``). It is a DeepSeek-V3/GLM-style auxiliary head
+used for (a) a multi-token-prediction training loss and (b) speculative
+decoding at inference. Note (a) can improve the main model even when the head
+is never used at inference — but that gain is a *pretraining*-scale result, and
+its value for a short agent-policy SFT run is unestablished.
+
+omegalax's Qwen3.5 model intentionally omits this head:
+
+* SFT trains a plain next-token objective — ``chunked_cross_entropy_loss`` on
+  the final hidden state plus the MoE router aux loss (``trainers/vlm.py``);
+  there is no multi-token-prediction loss term, and the forward pass returns
+  only ``(hidden_BTD, router_aux)``, so an MTP head would receive no gradient.
+* Rollout is plain autoregressive generation; there is no speculative-decoding
+  / draft-verify path anywhere in the repo (``vlm.api.decode`` is a stub).
+* The HuggingFace reference itself does not instantiate the head either — both
+  ``Qwen3_5ForConditionalGeneration`` and ``Qwen3_5MoeForConditionalGeneration``
+  declare ``_keys_to_ignore_on_load_unexpected = [r"^mtp.*"]`` and define no MTP
+  module. Building it here would diverge from the canonical model.
+
+Under the current objective the head therefore receives no gradient and would
+only cost memory / checkpoint bytes, so we do not build it. Rather than
+blanket-skipping anything matching ``mtp.*`` (which would also hide a
+genuinely-unmapped key), we enumerate the *exact* set of MTP keys the config
+implies (``_expected_mtp_keys``) and drop only those; any unexpected ``mtp.*``
+key, or a missing expected one, raises.
+
+This is a reversible decision, not a dead end. Adding an MTP training objective
+later is a deliberate, separately-validated feature (instantiate the head in the
+model, add the multi-token loss term to the trainer, wire up LoRA/export); the
+pretrained ``mtp.*`` weights are untouched on disk, and this loader's
+exact-enumeration approach means the drop-set simply shrinks as those keys get
+mapped — nothing here has to be undone first.
+"""
 
 from __future__ import annotations
 
@@ -250,6 +289,64 @@ _SHARED_EXPERT_GATE_RE = re.compile(
 _CONV3D_RE = re.compile(r"model\.visual\.patch_embed\.proj\.weight")
 
 
+def _expected_mtp_keys(hf_cfg: dict, cfg: Qwen3_5Config) -> set[str]:
+    """Exact set of HuggingFace ``mtp.*`` keys a Qwen3.5 checkpoint should carry.
+
+    The multi-token-prediction head is intentionally not instantiated (see the
+    module docstring). We still enumerate its keys precisely so that the drop is
+    explicit and complete: only these keys are excluded, an unexpected ``mtp.*``
+    key surfaces as an error, and a missing expected key surfaces too — instead
+    of a wildcard that would silently swallow either.
+
+    The structure is derived from ``text_config.mtp_num_hidden_layers`` (and, for
+    MoE checkpoints, ``num_experts``). ``mtp_num_hidden_layers`` is metadata that
+    only lives in ``config.json``; if it is absent/zero we expect no MTP head, and
+    any ``mtp.*`` weight then present is treated as unexpected (raises) rather than
+    dropped.
+    """
+    txt = hf_cfg["text_config"]
+    n_layers = txt.get("mtp_num_hidden_layers", 0)
+    if not isinstance(n_layers, int) or n_layers < 0:
+        raise ValueError(
+            f"Invalid text_config.mtp_num_hidden_layers={n_layers!r}; expected a non-negative int."
+        )
+    if n_layers == 0:
+        return set()
+
+    keys: set[str] = {
+        "mtp.fc.weight",
+        "mtp.norm.weight",
+        "mtp.pre_fc_norm_embedding.weight",
+        "mtp.pre_fc_norm_hidden.weight",
+    }
+    for i in range(n_layers):
+        base = f"mtp.layers.{i}"
+        keys.update(
+            {
+                f"{base}.input_layernorm.weight",
+                f"{base}.post_attention_layernorm.weight",
+                f"{base}.self_attn.q_proj.weight",
+                f"{base}.self_attn.k_proj.weight",
+                f"{base}.self_attn.v_proj.weight",
+                f"{base}.self_attn.o_proj.weight",
+                f"{base}.self_attn.q_norm.weight",
+                f"{base}.self_attn.k_norm.weight",
+            }
+        )
+        if cfg.text_config.is_moe:
+            # The MTP block's FFN mirrors the main model's MoE FFN.
+            keys.add(f"{base}.mlp.gate.weight")  # router
+            keys.add(f"{base}.mlp.shared_expert_gate.weight")
+            for proj in ("gate_proj", "up_proj", "down_proj"):
+                keys.add(f"{base}.mlp.shared_expert.{proj}.weight")
+                for e in range(cfg.text_config.num_experts):
+                    keys.add(f"{base}.mlp.experts.{e}.{proj}.weight")
+        else:
+            for proj in ("gate_proj", "up_proj", "down_proj"):
+                keys.add(f"{base}.mlp.{proj}.weight")
+    return keys
+
+
 def create_qwen3_5_from_safetensors(
     file_dir: str,
     model_id: str = "",
@@ -277,6 +374,12 @@ def create_qwen3_5_from_safetensors(
 
     non_expert_mapping = _get_non_expert_mapping()
     unmatched_hf_keys: list[str] = []
+
+    # The multi-token-prediction head is intentionally dropped (see module docstring).
+    # Enumerate the exact keys we expect to skip so the exclusion is explicit and
+    # complete rather than a wildcard that could hide a genuinely-unmapped key.
+    expected_mtp_keys = _expected_mtp_keys(hf_cfg, cfg)
+    seen_mtp_keys: set[str] = set()
 
     expert_buf: dict[tuple[int, str], dict[int, np.ndarray]] = defaultdict(dict)
 
@@ -384,6 +487,13 @@ def create_qwen3_5_from_safetensors(
                 if _handle_moe_specials(torch_key, tensor):
                     continue
 
+                # Multi-token-prediction head: deliberately not loaded. Drop only
+                # the exact expected keys; anything else under mtp.* falls through
+                # to unmatched below and raises.
+                if torch_key in expected_mtp_keys:
+                    seen_mtp_keys.add(torch_key)
+                    continue
+
                 # Generic mapping
                 jax_key, transform = map_to_bonsai_key(non_expert_mapping, torch_key)
                 if jax_key is None:
@@ -438,6 +548,18 @@ def create_qwen3_5_from_safetensors(
                     jnp.asarray(down_EFD),
                     "experts.*.down_proj",
                 )
+
+    # The MTP head must be present in full when the config declares it: a missing
+    # expected key means our understanding of the head drifted from the checkpoint,
+    # which we surface rather than silently tolerate. (Unexpected mtp.* keys already
+    # landed in unmatched_hf_keys and raise via check_conversion_errors below.)
+    missing_mtp_keys = expected_mtp_keys - seen_mtp_keys
+    if missing_mtp_keys:
+        raise RuntimeError(
+            "Expected multi-token-prediction (MTP) head weights were missing from the "
+            "checkpoint; the deliberate MTP exclusion is out of sync with the checkpoint "
+            "structure:\n" + "\n".join(sorted(missing_mtp_keys))
+        )
 
     check_conversion_errors(unmatched_hf_keys)
 
