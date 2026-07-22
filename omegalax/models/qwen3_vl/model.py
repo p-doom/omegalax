@@ -406,6 +406,15 @@ class TextAttention(nnx.Module):
         return out_BTD
 
 
+# Whether the text-decoder layer forward is rematerialized (activation
+# checkpointing): the layer forward is recomputed during the backward pass to
+# save activation memory. Single source of truth for both the runtime decorator
+# on ``TextDecoderLayer.__call__`` below AND the hardware-FLOP (HFU) accounting
+# in ``omegalax.trainers.perf`` (recompute doubles the layer forward). Keep the
+# two in lockstep by driving the decorator off this flag.
+DECODER_LAYER_REMAT = True
+
+
 class TextDecoderLayer(nnx.Module):
     def __init__(self, cfg: Qwen3VLConfig, layer_idx: int, *, rngs: nnx.Rngs):
         self.layer_idx = layer_idx
@@ -415,7 +424,7 @@ class TextDecoderLayer(nnx.Module):
         self.is_moe = cfg.is_moe_layer(layer_idx)
         self.mlp = TextMoEFeedForward(cfg, rngs=rngs) if self.is_moe else TextMLP(cfg, rngs=rngs)
 
-    @partial(jax.remat, static_argnums=0)
+    @(partial(jax.remat, static_argnums=0) if DECODER_LAYER_REMAT else (lambda f: f))
     def __call__(
         self, hidden_BTD: jax.Array, sin_BTK: jax.Array, cos_BTK: jax.Array
     ) -> tuple[jax.Array, jax.Array]:

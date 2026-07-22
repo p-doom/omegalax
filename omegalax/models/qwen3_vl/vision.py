@@ -328,6 +328,14 @@ class VisionAttention(nnx.Module):
         return out_ND
 
 
+# Whether the vision transformer block forward is rematerialized (activation
+# checkpointing). Single source of truth for both the runtime decorator on
+# ``VisionBlock.__call__`` below AND the hardware-FLOP (HFU) accounting in
+# ``omegalax.trainers.perf`` (only relevant when the vision tower is trained;
+# a frozen tower has no backward and therefore no recompute).
+VISION_BLOCK_REMAT = True
+
+
 class VisionBlock(nnx.Module):
     def __init__(
         self, cfg: Qwen3VLVisionConfig, hidden_shd: P, ff_shd: P, heads_shd: P, *, rngs: nnx.Rngs
@@ -338,7 +346,7 @@ class VisionBlock(nnx.Module):
         self.mlp = VisionMLP(cfg, hidden_shd=hidden_shd, ff_shd=ff_shd, rngs=rngs)
         self.hidden_shd = hidden_shd
 
-    @partial(jax.remat, static_argnums=0)
+    @(partial(jax.remat, static_argnums=0) if VISION_BLOCK_REMAT else (lambda f: f))
     def __call__(
         self,
         hidden_ND: jax.Array,
