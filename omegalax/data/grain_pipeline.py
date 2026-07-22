@@ -1035,6 +1035,7 @@ def make_grain_iterator(
     multiprocessing_options: grain.MultiprocessingOptions | None = None,
     dp_size: int,
     fsdp_size: int,
+    extra_transform: grain.transforms.RandomMap | None = None,
 ):
     """Create a checkpointable Grain iterator over one or more inline-records datasets.
 
@@ -1050,6 +1051,16 @@ def make_grain_iterator(
 
     Data-parallel sharding spans both axes: ``dp = dp_size * fsdp_size``. The
     process's slot is ``jax.process_index() % dp``.
+
+    ``extra_transform`` is an optional dataset-specific augmentation
+    (e.g. action-magnitude scaling): a ``grain.transforms.RandomMap`` applied
+    per-source via ``ds.random_map`` after content resolution and source
+    tagging, before mixing and batching, so it sees fully-materialized chat
+    content and may inspect the source-id tag to filter. It gets a
+    deterministic per-source seed derived from ``seed``, so
+    resume-from-checkpoint reproduces the same augmentation. Caller must
+    restrict this to the train iterator — augmenting a val iterator silently
+    corrupts metrics.
     """
     if batch_size <= 0:
         raise ValueError("batch_size must be > 0")
@@ -1099,6 +1110,12 @@ def make_grain_iterator(
         # zero out individual sources).
         ds = ds.map(_JsonLoadsMap())
         ds = ds.map(_TagSourceMap(source_id=original_idx))
+        # Optional user-supplied augmentation (a RandomMap), with a deterministic
+        # per-source seed so resume-from-checkpoint reproduces it.
+        if extra_transform is not None:
+            ds = ds.random_map(
+                extra_transform, seed=seed + 10_000 * (original_idx + 1)
+            )
         per_source.append(ds)
 
     mixed = (

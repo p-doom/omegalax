@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import gc
+import importlib
 import json
 from pathlib import Path
 
 from absl import app, flags
+import grain
 import jax
 import wandb
 from transformers import AutoImageProcessor, AutoTokenizer
@@ -159,6 +161,13 @@ flags.DEFINE_boolean(
     "gradient/opt-state layer. Mutually exclusive with "
     "--enable_lora (which already freezes vision).",
 )
+flags.DEFINE_string(
+    "extra_transform", None,
+    'A single {"class": "module:ClassName", "kwargs": {...}} object applied '
+    "as a grain RandomMap augmentation to the train iterator only. The class "
+    "must subclass grain.transforms.RandomMap and be importable in worker "
+    "processes — set PYTHONPATH in the launch environment if the module lives "
+    "outside the installed venv.")
 flags.DEFINE_integer(
     "num_loss_tiles",
     None,
@@ -289,6 +298,27 @@ def _resolve_train_sources() -> list[MixSource]:
     return [MixSource(path=FLAGS.data_path, weight=1.0)]
 
 
+def _parse_extra_transform(
+    spec: str | None,
+) -> grain.transforms.RandomMap | None:
+    """Instantiate the train-only augmentation transform from --extra_transform.
+
+    ``spec`` is a single JSON ``{"class": "module:ClassName", "kwargs": {...}}``
+    object whose class must be a ``grain.transforms.RandomMap`` subclass (our
+    augmentations are stochastic). A malformed spec fails loudly here.
+    """
+    if spec is None:
+        return None
+    entry = json.loads(spec)
+    module_path, _, class_name = entry["class"].partition(":")
+    cls = getattr(importlib.import_module(module_path), class_name)
+    assert issubclass(cls, grain.transforms.RandomMap), (
+        f"--extra_transform {entry['class']!r} is not a "
+        "grain.transforms.RandomMap subclass"
+    )
+    return cls(**entry["kwargs"])
+
+
 def _grain_iter(
     sources: list[MixSource],
     collator: VLMSFTCollator,
@@ -299,6 +329,7 @@ def _grain_iter(
     num_batches: int,
     dp_size: int,
     fsdp_size: int,
+    extra_transform: grain.transforms.RandomMap | None,
 ):
     if len(sources) == 1:
         num_epochs: int | None = required_epochs_for_batches(
@@ -327,6 +358,7 @@ def _grain_iter(
         ),
         dp_size=dp_size,
         fsdp_size=fsdp_size,
+        extra_transform=extra_transform,
     )
 
 
@@ -391,6 +423,9 @@ def main(_) -> None:
         )
 
     total_micro_batches = FLAGS.num_steps * FLAGS.grad_accum_steps
+    extra_transform = _parse_extra_transform(FLAGS.extra_transform)
+    if extra_transform is not None:
+        startup_log(f"loaded extra train transform: {type(extra_transform).__name__}")
     data_iter = _grain_iter(
         train_sources,
         collator,
@@ -400,11 +435,14 @@ def main(_) -> None:
         num_batches=total_micro_batches,
         dp_size=FLAGS.dp_size,
         fsdp_size=FLAGS.fsdp_size,
+        extra_transform=extra_transform,
     )
     startup_log("built train grain DataLoader iterator")
 
     val_data_iter = None
     if FLAGS.val_data_path:
+        # extra_transform=None — augmentation must NEVER run on validation data
+        # (it would corrupt val metrics by scoring against re-scaled labels).
         val_data_iter = _grain_iter(
             [MixSource(path=FLAGS.val_data_path, weight=1.0)],
             collator,
@@ -416,6 +454,7 @@ def main(_) -> None:
             ),
             dp_size=FLAGS.dp_size,
             fsdp_size=FLAGS.fsdp_size,
+            extra_transform=None,
         )
         startup_log(f"built val grain DataLoader iterator from {FLAGS.val_data_path!r}")
 
