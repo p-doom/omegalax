@@ -335,6 +335,10 @@ class Qwen3_5ForCausalLM(nnx.Module):
             kernel_init=wp(lm_head_init, ("embed", "vocab")),
         )
 
+    def output_weight(self) -> jax.Array:
+        """Weight matrix used as the LM output projection: (emb_dim, vocab)."""
+        return self.lm_head.kernel[...]
+
     def __call__(self, token_ids_BT, segment_ids_BT, cache, num_right_pads):
         del cache, num_right_pads
         return self.text(token_ids_BT=token_ids_BT, segment_ids_BT=segment_ids_BT)
@@ -358,6 +362,10 @@ class Qwen3_5ForConditionalGeneration(nnx.Module):
             dtype=cfg.text_config.dtype,
             kernel_init=wp(lm_head_init, ("embed", "vocab")),
         )
+
+    def output_weight(self) -> jax.Array:
+        """Weight matrix used as the LM output projection: (emb_dim, vocab)."""
+        return self.lm_head.kernel[...]
 
     def __call__(
         self,
