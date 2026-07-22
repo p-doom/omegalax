@@ -143,12 +143,24 @@ def forward(
     image_grid_thw: jax.Array | None = None,
     vision_cu_seqlens: jax.Array | None = None,
     position_ids_ZBT: jax.Array | None = None,
+    segment_ids_BT: jax.Array | None = None,
 ):
-    """Forward pass returning hidden states before lm_head, plus aux loss."""
+    """Forward pass returning hidden states before lm_head, plus aux loss.
+
+    ``segment_ids_BT`` (optional): per-token packed-sub-sequence id (1-based;
+    0 = padding). When provided, the model applies block-diagonal causal
+    attention so packed segments never attend across each other. When ``None``
+    (default), attention is plain causal.
+    """
     if attention_mask_BT is None:
         attention_mask_BT = (token_ids_BT != pad_id).astype(jnp.int32)
 
     if isinstance(model, Qwen3_5ForConditionalGeneration):
+        if segment_ids_BT is not None:
+            raise NotImplementedError(
+                "Sequence packing (segment_ids_BT) is only wired for Qwen3-VL, "
+                "not Qwen3.5."
+            )
         segment_ids_BT = attention_mask_BT.astype(jnp.int32)
         return model(
             token_ids_BT,
@@ -169,6 +181,7 @@ def forward(
             pixel_values=pixel_values,
             image_grid_thw=image_grid_thw,
             vision_cu_seqlens=vision_cu_seqlens,
+            segment_ids_BT=segment_ids_BT,
         )
 
     raise ValueError(f"Unsupported VLM model type: {type(model)}")
