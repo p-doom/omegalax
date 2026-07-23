@@ -10,8 +10,11 @@ from typing import Callable
 import jax
 from jax.ad_checkpoint import checkpoint_name
 
-# Selective: save dot_general (matmul) outputs, recompute cheap ops.
-DEFAULT_REMAT_POLICY = "dots_saveable"
+# Full remat (recompute everything) == main's effective behavior and the safe
+# default: activations are not fsdp-sharded, so selective policies (e.g.
+# "dots_saveable") spike saved-matmul HBM past the 80GB H100 at 8B/16k. Selective
+# remat stays available as a per-recipe opt-in.
+DEFAULT_REMAT_POLICY = "full"
 
 # Offload policies stage a saved activation to host ("pinned_host") for the
 # forward-to-backward gap instead of recomputing it or holding it in HBM. Cheap on
