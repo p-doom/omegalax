@@ -368,13 +368,22 @@ class VisionModel(nnx.Module):
         grid_thw: jax.Array,
         cu_seqlens: jax.Array | None = None,
     ) -> jax.Array:
+        # `grid_thw` is tiny per-image metadata; under FSDP/TP the batch sharding
+        # would otherwise leave it sharded on axis 0, so the index math below
+        # (cumulative token offsets, gather indices) mixes sharded operands with
+        # replicated constants and fails explicit-sharding type checks. Replicate
+        # it, then place the derived per-token tensors on the token sharding the
+        # patch embeddings use. Mirrors the Qwen3-VL vision path.
+        grid_thw = reshard(grid_thw, P())
         hidden_ND = self.patch_embed(pixel_values)
         total_tokens: int = hidden_ND.shape[0]
 
         pos_embeds_ND = self._fast_pos_embed_interpolate(grid_thw, total_tokens)
+        pos_embeds_ND = reshard(pos_embeds_ND, self.hidden_shd)
         hidden_ND = hidden_ND + pos_embeds_ND
 
         rotary_emb_NK = self._rot_pos_emb(grid_thw, total_tokens)
+        rotary_emb_NK = reshard(rotary_emb_NK, P(self.hidden_shd[0], None))
         emb_NK = jnp.concatenate([rotary_emb_NK, rotary_emb_NK], axis=-1)
         cos_NK, sin_NK = jnp.cos(emb_NK), jnp.sin(emb_NK)
         cos_NK = cos_NK.astype(self.cfg.dtype)
@@ -394,6 +403,13 @@ class VisionModel(nnx.Module):
                     ).astype(jnp.int32),
                 ]
             )
+        else:
+            # `cu_seqlens` are per-image segment offsets — tiny metadata that
+            # arrives sharded on the FSDP batch axis. The packed attention slices
+            # it (`jnp.diff`, `cu[None]`) to build segment lengths/offsets, which
+            # fails explicit-sharding checks on a sharded axis (its length is the
+            # image count, not divisible by the mesh). Replicate it.
+            cu_seqlens = reshard(cu_seqlens.astype(jnp.int32), P())
 
         for blk in self.blocks:
             hidden_ND = blk(hidden_ND, cu_seqlens, cos_NK, sin_NK)

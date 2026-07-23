@@ -393,8 +393,14 @@ class Qwen3_5ForConditionalGeneration(nnx.Module):
             inputs_embeds_BTD = jnp.where(image_mask_BTD, 0.0, inputs_embeds_BTD)
             n_embeds = image_embeds_ND.shape[0]  # static after padding
             seq_len = token_ids_BT.shape[1]
+            # Locating the image-token positions (`jnp.where` over the mask) and
+            # scattering the image embeddings into them span the whole batch/sequence,
+            # so under FSDP the sharded mask/features leave the scatter's output
+            # sharding unresolvable. Replicate both first, then let the `.at[].set`
+            # place the result back onto the batch sharding. Mirrors the Qwen3-VL path.
+            image_mask_replicated_BT = reshard(image_mask_BT, P())
             batch_indices, seq_indices = jnp.where(
-                image_mask_BT,
+                image_mask_replicated_BT,
                 size=n_embeds,
                 fill_value=(0, seq_len - 1),
             )
@@ -405,6 +411,7 @@ class Qwen3_5ForConditionalGeneration(nnx.Module):
                 image_embeds_ND,
                 0.0,
             ).astype(inputs_embeds_BTD.dtype)
+            safe_embeds = reshard(safe_embeds, P())
             inputs_embeds_BTD = inputs_embeds_BTD.at[batch_indices, seq_indices].set(
                 safe_embeds,
                 out_sharding=self.text.out_emb_shd,
