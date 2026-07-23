@@ -160,6 +160,8 @@ _QWEN3_VL_SMOKE_SPECS: dict[str, dict[str, Any]] = {
 
 _QWEN3_VL_REPOS = (
     "Qwen/Qwen3-VL-2B-Instruct",
+    "Qwen/Qwen3-VL-4B-Instruct",
+    "Qwen/Qwen3-VL-8B-Instruct",
     "Qwen/Qwen3-VL-30B-A3B-Instruct",
 )
 

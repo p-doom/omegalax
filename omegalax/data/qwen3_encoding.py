@@ -155,31 +155,37 @@ def _message_has_images(message: dict[str, Any]) -> bool:
     return any(block.get("type") == "image" for block in content)
 
 
-def make_message_length_fn(
-    tokenizer: PreTrainedTokenizer,
-    image_processor: BaseImageProcessor | None = None,
-):
-    """Return a ``message -> token_count`` callable for use with ``build_chunk_index``.
+class _MessageLengthFn:
+    """Picklable ``message -> measurement`` callable (see ``make_message_length_fn``).
 
-    Suitable for ChatML-formatted models (Qwen3 / Qwen3.5).  Token lengths are
-    exactly additive at message boundaries: ``<|im_start|>``/``<|im_end|>`` act
-    as hard BPE split points and ``add_special_tokens=False`` suppresses any
-    per-sequence overhead, so ``sum(lengths)`` equals the full-sequence length
-    exactly.  For a different chat template, implement an analogous factory and
-    swap it in.
+    Defined at module scope rather than as a closure so it can be pickled and
+    sent to ``spawn`` multiprocessing workers. The measure pass
+    (``grain_pipeline._compute_message_lengths_from_chat``) uses ``spawn`` --
+    workers must not inherit the parent's thread-tainted native ArrayRecord image
+    readers, which segfault -- and ``spawn`` re-pickles the measure fn into each
+    worker; a nested closure cannot cross that boundary, an instance of this
+    class can.
     """
-    merge_size = int(getattr(image_processor, "merge_size", 1)) if image_processor else 1
 
-    def _measure(message: dict[str, Any]) -> int | dict[str, Any]:
-        if image_processor is None and _message_has_images(message):
+    def __init__(
+        self,
+        tokenizer: PreTrainedTokenizer,
+        image_processor: BaseImageProcessor | None = None,
+    ) -> None:
+        self.tokenizer = tokenizer
+        self.image_processor = image_processor
+        self.merge_size = int(getattr(image_processor, "merge_size", 1)) if image_processor else 1
+
+    def __call__(self, message: dict[str, Any]) -> int | dict[str, Any]:
+        if self.image_processor is None and _message_has_images(message):
             raise ValueError(
                 "Encountered image content in message but no image_processor was provided. "
                 "Pass image_processor= to make_message_length_fn."
             )
         encoded = encode_qwen_messages(
             [message],
-            tokenizer=tokenizer,
-            image_processor=image_processor,
+            tokenizer=self.tokenizer,
+            image_processor=self.image_processor,
             include_pixels=False,
         )
         length = int(len(encoded["input_ids"]))
@@ -190,7 +196,7 @@ def make_message_length_fn(
         vision_patches = 0
         for row in grid_thw:
             t, h, w = int(row[0]), int(row[1]), int(row[2])
-            vision_tokens += t * (h // merge_size) * (w // merge_size)
+            vision_tokens += t * (h // self.merge_size) * (w // self.merge_size)
             vision_patches += t * h * w
 
         return {
@@ -201,7 +207,22 @@ def make_message_length_fn(
             "image_grid_thw": grid_thw.tolist(),
         }
 
-    return _measure
+
+def make_message_length_fn(
+    tokenizer: PreTrainedTokenizer,
+    image_processor: BaseImageProcessor | None = None,
+):
+    """Return a ``message -> token_count`` callable for use with the record builders.
+
+    Suitable for ChatML-formatted models (Qwen3 / Qwen3.5).  Token lengths are
+    exactly additive at message boundaries: ``<|im_start|>``/``<|im_end|>`` act
+    as hard BPE split points and ``add_special_tokens=False`` suppresses any
+    per-sequence overhead, so ``sum(lengths)`` equals the full-sequence length
+    exactly.  Returns a picklable :class:`_MessageLengthFn` instance so it can be
+    shipped to ``spawn`` workers. For a different chat template, implement an
+    analogous factory and swap it in.
+    """
+    return _MessageLengthFn(tokenizer, image_processor)
 
 
 def encode_qwen_messages(
