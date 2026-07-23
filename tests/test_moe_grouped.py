@@ -1,17 +1,10 @@
-"""Numerical-equivalence tests for the dropless grouped-GEMM / EP MoE path.
+"""Numerical-equivalence tests for the dropless grouped-GEMM MoE path.
 
-Phase 1 (single device): the grouped MoE block (and the ``grouped_moe`` kernel)
-must match a local dense compute-every-expert einsum reference (``_dense_ref`` /
-``_dense_moe_block_output``) on forward and backward, up to fp reduction-order
-roundoff. (The model has a single grouped stream now; the dense einsum lives here
-as the slow reference used to validate the fast kernel.)
-
-Phase 2 (expert parallelism): the ``grouped_moe_ep`` path on *faked* multi-CPU
-devices (EP=2 and EP=4) must match the single-device dense reference on forward
-and backward. ``jax.lax.ragged_all_to_all`` is not implemented on XLA:CPU, so the
-module uses a bit-identical ``all_gather``-based emulation of the ragged reshuffle
-on CPU (the real primitive is used on GPU/TPU); this test exercises the full
-dispatch -> grouped GEMM -> combine dataflow either way.
+The grouped MoE block (and the ``grouped_moe`` kernel) must match a local dense
+compute-every-expert einsum reference (``_dense_ref`` / ``_dense_moe_block_output``)
+on forward and backward, up to fp reduction-order roundoff. (The model has a single
+grouped stream now; the dense einsum lives here as the slow reference used to
+validate the fast kernel.)
 
 All tests are CPU-only (faked device count set before importing jax).
 """
@@ -19,7 +12,7 @@ All tests are CPU-only (faked device count set before importing jax).
 import os
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
-# Fake 4 CPU devices for the expert-parallel tests. Must be set before jax import.
+# Fake 4 CPU devices (some tests build small meshes). Must be set before jax import.
 os.environ["XLA_FLAGS"] = (
     os.environ.get("XLA_FLAGS", "") + " --xla_force_host_platform_device_count=4"
 ).strip()
@@ -31,10 +24,10 @@ import jax.numpy as jnp
 import numpy as np
 from absl.testing import absltest
 from flax import nnx
-from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec as P
+from jax.sharding import AxisType, Mesh
 
 from omegalax.distributed.mesh import mesh_rules
-from omegalax.models.moe_grouped import _ragged_all_to_all, _excl_cumsum, grouped_moe, grouped_moe_ep
+from omegalax.models.moe_grouped import grouped_moe
 from omegalax.models.qwen3.config import make_config
 from omegalax.models.qwen3.model import MoEFeedForward
 
@@ -283,99 +276,6 @@ class Qwen3VLPhase3Test(absltest.TestCase):
             cfg = dataclasses.replace(make_vl_config("qwen3-vl-smoke-moe"), dtype=jnp.float32)
             mlp = MoEVL(cfg=cfg, rngs=nnx.Rngs(params=0))
             _assert_backend_equiv(self, mlp, cfg.emb_dim)
-
-
-class RaggedAllToAllRoundTripTest(absltest.TestCase):
-    """dispatch -> combine of the ragged reshuffle is an exact identity."""
-
-    def test_roundtrip_identity(self):
-        if jax.device_count() < 4:
-            self.skipTest("needs 4 faked devices")
-        E, k, N, ep, D = 8, 2, 16, 4, 3
-        eps, n_local = E // ep, N // ep
-        local_Nk = n_local * k
-        cap = int(-(-(4 * N * k) // ep))
-        idx = jnp.asarray(np.random.RandomState(0).randint(0, E, size=(N, k)).astype(np.int32))
-        hidden = jnp.asarray(np.random.RandomState(1).randn(N, D).astype(np.float32))
-        mesh = Mesh(np.array(jax.devices()[:ep]).reshape(ep), ("expert",), axis_types=(AxisType.Explicit,))
-
-        def per_device(hidden_nd, idx_nk):
-            ax = "expert"
-            rows = hidden_nd[jnp.arange(local_Nk, dtype=jnp.int32) // k]
-            flat_expert = idx_nk.reshape(local_Nk).astype(jnp.int32)
-            sort_perm = jnp.argsort(flat_expert, stable=True).astype(jnp.int32)
-            inv_perm = jnp.argsort(sort_perm).astype(jnp.int32)
-            rows_sorted = rows[sort_perm]
-            gsz = jnp.bincount(flat_expert, length=E).astype(jnp.int32)
-            send = gsz.reshape(ep, eps).sum(1).astype(jnp.int32)
-            in_off = _excl_cumsum(send)
-            me = jax.lax.axis_index(ax)
-            sm = jax.lax.all_gather(send, ax, axis=0, tiled=False)
-            recv = sm[:, me].astype(jnp.int32)
-            rsbs = (jnp.cumsum(sm, axis=0) - sm).astype(jnp.int32)
-            out_off = rsbs[me, :].astype(jnp.int32)
-            recv_starts = rsbs[:, me].astype(jnp.int32)
-            all_in = jax.lax.all_gather(in_off, ax, axis=0, tiled=False)
-            comb_out = all_in[:, me].astype(jnp.int32)
-            disp = _ragged_all_to_all(rows_sorted, jnp.zeros((cap, D), jnp.float32), in_off, send, out_off, recv, axis_name=ax)
-            comb = _ragged_all_to_all(disp, jnp.zeros((local_Nk, D), jnp.float32), recv_starts, recv, comb_out, send, axis_name=ax)
-            return comb[inv_perm]
-
-        with jax.set_mesh(mesh):
-            sh = NamedSharding(mesh, P("expert", None))
-            f = jax.shard_map(per_device, mesh=mesh, in_specs=(P("expert", None), P("expert", None)),
-                              out_specs=P("expert", None), check_vma=False)
-            out = jax.jit(f)(jax.device_put(hidden, sh), jax.device_put(idx, sh))
-        out = np.array(out).reshape(N, k, D)
-        ref = np.array(hidden)[:, None, :] * np.ones((1, k, 1))
-        self.assertEqual(float(np.max(np.abs(out - ref))), 0.0)
-
-
-class ExpertParallelPhase2Test(absltest.TestCase):
-    """grouped_moe_ep (EP=2, EP=4 faked CPU) vs single-device dense reference."""
-
-    def _check_ep(self, ep):
-        if jax.device_count() < ep:
-            self.skipTest(f"needs {ep} faked devices")
-        d = _synthetic_moe(E=8, D=8, F=16, k=2, N=32, seed=0)
-        yd = _dense_ref(d["hidden"], d["gate"], d["up"], d["down"], d["router"], d["k"])
-        ct = jnp.asarray(np.random.RandomState(7).randn(*yd.shape).astype(np.float32))
-        gd = jax.grad(
-            lambda *a: jnp.sum(_dense_ref(*a, d["router"], d["k"]) * ct), argnums=(0, 1, 2, 3)
-        )(d["hidden"], d["gate"], d["up"], d["down"])
-
-        mesh = Mesh(np.array(jax.devices()[:ep]).reshape(ep), ("expert",), axis_types=(AxisType.Explicit,))
-        with jax.set_mesh(mesh):
-            w, idx = _route(d["hidden"], d["router"], d["k"])
-            sh_t = NamedSharding(mesh, P("expert", None))
-            sh_w = NamedSharding(mesh, P("expert", None, None))
-            h_s = jax.device_put(d["hidden"], sh_t)
-            idx_s = jax.device_put(idx, sh_t)
-            w_s = jax.device_put(w, sh_t)
-            g_s = jax.device_put(d["gate"], sh_w)
-            u_s = jax.device_put(d["up"], sh_w)
-            dn_s = jax.device_put(d["down"], sh_w)
-            yg = jax.jit(
-                lambda h, i, ww, g, u, dn: grouped_moe_ep(h, i, ww, g, u, dn, num_experts=d["E"])
-            )(h_s, idx_s, w_s, g_s, u_s, dn_s)
-            self.assertLess(float(jnp.max(jnp.abs(yd - np.array(yg)))), FWD_TOL)
-
-            def loss(h, g, u, dn):
-                wl, il = _route(h, d["router"], d["k"])
-                wl = jax.lax.with_sharding_constraint(wl, sh_t)
-                il = jax.lax.with_sharding_constraint(il, sh_t)
-                out = grouped_moe_ep(h, il, wl, g, u, dn, num_experts=d["E"])
-                return jnp.sum(out * jax.device_put(ct, sh_t))
-
-            gg = jax.grad(loss, argnums=(0, 1, 2, 3))(h_s, g_s, u_s, dn_s)
-        for a, b in zip(gd, gg):
-            self.assertLess(float(jnp.max(jnp.abs(np.array(a) - np.array(b)))), BWD_TOL)
-
-    def test_ep2_matches_dense(self):
-        self._check_ep(2)
-
-    def test_ep4_matches_dense(self):
-        self._check_ep(4)
 
 
 if __name__ == "__main__":

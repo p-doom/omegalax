@@ -11,7 +11,7 @@ from flax import nnx
 from jax.sharding import PartitionSpec, reshard
 from tokamax import dot_product_attention
 
-from omegalax.models.moe_grouped import grouped_moe_ep
+from omegalax.models.moe_grouped import grouped_moe
 from omegalax.models.remat_policy import resolve_remat_policy
 from .config import Qwen3VLConfig
 from .vision import VisionModel
@@ -281,12 +281,11 @@ class TextMoEFeedForward(nnx.Module):
 
         B, T = hidden_BTD.shape[:2]
 
-        # Dropless grouped-GEMM MoE; grouped_moe_ep self-selects EP off the real
-        # expert-axis mesh size (EP=1 == the single-device grouped path).
+        # Dropless grouped-GEMM MoE (single-device grouped path).
         flat_hidden_ND = hidden_BTD.reshape(B * T, cfg.emb_dim)
         flat_idx_Nk = topk_idx_BTk.reshape(B * T, cfg.num_experts_per_tok)
         flat_w_Nk = topk_weights_BTk.reshape(B * T, cfg.num_experts_per_tok)
-        merged_ND = grouped_moe_ep(
+        merged_ND = grouped_moe(
             flat_hidden_ND,
             flat_idx_Nk,
             flat_w_Nk,

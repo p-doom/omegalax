@@ -390,26 +390,6 @@ def mesh_rules(mesh: Mesh) -> Iterator[Mesh]:
         yield mesh
 
 
-# Dedicated 1-D ``('expert',)`` mesh for grouped_moe_ep, SEPARATE from the
-# ``('tp','cp','fsdp','dp')`` training mesh: no caller composes EP with training.
-_EXPERT_AXIS = "expert"
-
-
-def make_expert_mesh(ep_size: int, axis_name: str = _EXPERT_AXIS) -> Mesh:
-    """Build a 1-D expert-parallel mesh over the first ``ep_size`` devices.
-
-    ``AxisType.Explicit`` (matching the ``_AXES`` mesh) so Explicit-sharding code
-    behaves the same here. Requires ``jax.device_count() % ep_size == 0``.
-    """
-    ndev = jax.device_count()
-    if ep_size <= 0 or ndev % ep_size != 0:
-        raise ValueError(
-            f"expert-parallel size {ep_size} must divide device_count={ndev} and be > 0."
-        )
-    device_grid = mesh_utils.create_device_mesh((ep_size,), jax.devices()[:ep_size])
-    return Mesh(device_grid, (axis_name,), axis_types=(AxisType.Explicit,))
-
-
 @contextmanager
 def mesh_rules_for(
     tp_size: int, fsdp_size: int, dp_size: int, *, cp_size: int = 1
