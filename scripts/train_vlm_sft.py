@@ -79,6 +79,7 @@ flags.DEFINE_integer(
 )
 flags.DEFINE_integer("seed", None, "RNG seed.")
 flags.DEFINE_integer("tp_size", None, "Tensor parallelism size.")
+flags.DEFINE_integer("cp_size", 1, "Context (sequence) parallelism size (default 1 == disabled).")
 flags.DEFINE_integer("fsdp_size", None, "FSDP parallelism size.")
 flags.DEFINE_integer("dp_size", None, "Data parallelism size.")
 flags.DEFINE_string("save_dir", None, "Checkpoint save directory.")
@@ -476,6 +477,7 @@ def main(_) -> None:
             tp_size=FLAGS.tp_size,
             fsdp_size=FLAGS.fsdp_size,
             dp_size=FLAGS.dp_size,
+            cp_size=FLAGS.cp_size,
             wandb_run=wandb_run,
             val_data_iter=val_data_iter,
             val_every=FLAGS.val_every,

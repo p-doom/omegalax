@@ -257,9 +257,10 @@ def create_qwen3_5_from_safetensors(
     tp_size: int | None = None,
     fsdp_size: int | None = None,
     dp_size: int | None = None,
+    cp_size: int = 1,
 ) -> tuple[Qwen3_5ForConditionalGeneration, Qwen3_5Config]:
     """Load HuggingFace Qwen3.5 safetensors into a JAX Qwen3.5 model."""
-    mesh = ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size)
+    mesh = ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size, cp_size=cp_size)
 
     path = epath.Path(file_dir).expanduser()
     files = find_safetensors(file_dir)
