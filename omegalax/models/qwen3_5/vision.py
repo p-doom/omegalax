@@ -207,6 +207,17 @@ class VisionAttention(nnx.Module):
 
         q_NHK, k_NHK = apply_vision_rope(q_NHK, k_NHK, cos_NK, sin_NK)
 
+        # cuDNN's fused-attention partitioner forbids sharding the sequence dim,
+        # but under FSDP the vision tokens N are sharded on the batch axis. Replicate
+        # N for the packed attention (heads may stay sharded). Vision sequences are
+        # short relative to the FSDP-sharded text decoder, so the redundant per-device
+        # attention compute is cheap — and unlike a shard_map over the packed axis it
+        # needs no assumption that images align to device boundaries.
+        attn_in_shd = P(None, self.heads_shd[1], self.heads_shd[2])
+        q_NHK = reshard(q_NHK, attn_in_shd)
+        k_NHK = reshard(k_NHK, attn_in_shd)
+        v_NHK = reshard(v_NHK, attn_in_shd)
+
         attn_NHK = _cudnn_packed_vision_attention(
             q_NHK,
             k_NHK,
