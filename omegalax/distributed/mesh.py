@@ -299,20 +299,25 @@ def make_mesh(
     *,
     cp_size: int = 1,
 ) -> Mesh:
-    """Build the ``('tp', 'cp', 'fsdp', 'dp')`` mesh for the given sizes (``cp_size``
-    default 1 == no-op), deriving the ICI/DCN split via :func:`derive_ici_dcn`."""
+    """Build the ``('tp', 'cp', 'fsdp', 'dp')`` mesh over the GLOBAL device pool.
+
+    omegalax launches ONE PROCESS PER GPU (see :func:`init_distributed`), so every
+    process owns exactly one device and ``jax.local_device_count() == 1`` -- the
+    NVLink/ICI domain (node) is NOT introspectable from JAX on GPU. We therefore
+    build a single flat mesh over ``jax.devices()`` (the whole global pool), exactly
+    like ``main``'s ``jax.make_mesh((tp, fsdp, dp), _AXES)``: ``create_device_mesh``
+    lays the comm-heaviest axes (``tp``, ``cp``) over locally-adjacent devices so
+    they ride NVLink within a node. TP/CP must be intra-NVLink-domain, not
+    intra-PROCESS; the global-device mesh guarantees that. ``cp_size`` default 1 is
+    a strict no-op (size-1 axis dropped downstream)."""
     tp, cp, fsdp, dp = _resolve_mesh_shape(
         tp_size=tp_size, cp_size=cp_size, fsdp_size=fsdp_size, dp_size=dp_size
     )
-    parallelism = derive_ici_dcn(
-        tp_size=tp,
-        cp_size=cp,
-        fsdp_size=fsdp,
-        dp_size=dp,
-        local_device_count=local_device_count(),
-        num_processes=num_processes(),
-    )
-    return make_hierarchical_mesh(parallelism.ici_shape, parallelism.dcn_shape)
+    # Explicit axis types (matching jax.make_mesh): downstream out_sharding= code
+    # relies on them; a bare Mesh(...) defaults to AxisType.Auto and regresses.
+    axis_types = (AxisType.Explicit,) * len(_AXES)
+    device_grid = mesh_utils.create_device_mesh((tp, cp, fsdp, dp), jax.devices())
+    return Mesh(device_grid, _AXES, axis_types=axis_types)
 
 
 def set_default_mesh(
