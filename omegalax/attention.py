@@ -109,21 +109,8 @@ def context_parallel_attention(
             implementation=implementation,
         )
 
-    if cp_size == 1:
-        # Defensive: callers gate on cp_size > 1, so this path is not normally hit.
-        if use_seg:
-            same = (q_segment_ids_BT[:, None, :, None] == q_segment_ids_BT[:, None, None, :]) & (
-                q_segment_ids_BT[:, None, :, None] != 0
-            )
-            causal = q_positions_BT[:, None, :, None] >= q_positions_BT[:, None, None, :]
-            return dot_product_attention(
-                q_BTHK, k_BTGK, v_BTGK, mask=causal & same, is_causal=False,
-                scale=scale, implementation=implementation,
-            )
-        return dot_product_attention(
-            q_BTHK, k_BTGK, v_BTGK, is_causal=True, scale=scale,
-            implementation=implementation,
-        )
+    # size-1 cp axis is dropped upstream by shard_config, so cp_size > 1 here.
+    assert cp_size > 1, "context_parallel_attention requires cp_size > 1 (callers gate on it)"
 
     seg_in = q_segment_ids_BT if use_seg else jnp.zeros_like(q_positions_BT)
     # position/segment ids may arrive replicated or already cp-sharded; reshard both

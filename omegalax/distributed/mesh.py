@@ -33,7 +33,6 @@ _AXES = ("tp", "cp", "fsdp", "dp")
 
 # Per-axis-type parallelism quadruple, comm-heaviest-first: (tp, cp, fsdp, dp).
 Quad = tuple[int, int, int, int]
-Triple = Quad  # backwards-compatible alias
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
