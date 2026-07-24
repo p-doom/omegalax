@@ -13,16 +13,11 @@ from jax.ad_checkpoint import checkpoint_name
 # Selective: save dot_general (matmul) outputs, recompute cheap ops.
 DEFAULT_REMAT_POLICY = "dots_saveable"
 
-# Offload policies stage a saved activation to host ("pinned_host") for the
-# forward-to-backward gap instead of recomputing it or holding it in HBM. Cheap on
-# GH200 (Grace + NVLink-C2C, XLA overlaps the copies), transfer-bound on PCIe.
-# Numerically transparent (memory-kind move only). See omegalax.trainers.offload.
+# Offload policies stage saved activations to host instead of recomputing them.
 _OFFLOAD_SRC = "device"
 _OFFLOAD_DST = "pinned_host"
 
-# ``checkpoint_name`` tag on the per-layer residual so the name-based offload
-# policy has a stable handle; only applied under such a policy (see
-# tag_offload_residual / policy_uses_named_offload).
+# ``checkpoint_name`` handle the named-offload policy matches on the per-layer residual.
 OFFLOAD_RESIDUAL_NAME = "offload_residual"
 
 # Policy names needing the residual tagged with OFFLOAD_RESIDUAL_NAME.
@@ -36,8 +31,7 @@ def _offload_dot_policy():
 
 
 def _offload_named_policy():
-    # Save nothing to HBM by name, offload the tagged residual to host, recompute
-    # the (unnamed) cheap dots: the host-offload analogue of "checkpoint only the residual".
+    # Host-offload analogue of "checkpoint only the residual".
     return jax.checkpoint_policies.save_and_offload_only_these_names(
         names_which_can_be_saved=(),
         names_which_can_be_offloaded=(OFFLOAD_RESIDUAL_NAME,),
@@ -55,8 +49,7 @@ _POLICY_FACTORIES: dict[str, Callable[[], object | None]] = {
         lambda: jax.checkpoint_policies.dots_with_no_batch_dims_saveable
     ),
     "everything_saveable": lambda: jax.checkpoint_policies.everything_saveable,
-    # Offload (activations -> host) instead of recompute; offload_named needs the
-    # residual tagged via tag_offload_residual.
+    # offload_named needs the residual tagged via tag_offload_residual.
     "offload_dot": _offload_dot_policy,
     "offload_named": _offload_named_policy,
 }
@@ -68,11 +61,8 @@ def policy_uses_named_offload(name: str | None) -> bool:
 
 
 def tag_offload_residual(x, policy_name: str | None):
-    """Tag ``x`` with ``OFFLOAD_RESIDUAL_NAME`` iff a named-offload policy is set.
-
-    ``checkpoint_name`` is an identity op; skipped for every other policy so the
-    jaxpr is unchanged from trunk when offload is off.
-    """
+    """Tag ``x`` with ``OFFLOAD_RESIDUAL_NAME`` iff a named-offload policy is set;
+    otherwise a no-op, leaving the jaxpr unchanged from trunk."""
     if policy_uses_named_offload(policy_name):
         return checkpoint_name(x, OFFLOAD_RESIDUAL_NAME)
     return x

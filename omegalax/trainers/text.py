@@ -57,9 +57,7 @@ class TrainConfig:
     max_grad_norm: float = 0.0
     grad_accum_steps: int = 1
     print_every: int = 1
-    # Host/CPU offload of the fp32 optimizer moments (Adam mu/nu). Plain on/off,
-    # correctness-equivalent everywhere (transfer-bound off-GH200); see
-    # omegalax.trainers.offload. Activation offload is separate (remat_policy).
+    # Host offload of the fp32 optimizer moments (Adam mu/nu); see omegalax.trainers.offload.
     offload_optimizer: bool = False
 
 
@@ -93,10 +91,7 @@ def build_optimizer(model: nnx.Module, train_cfg: TrainConfig) -> MixedPrecision
     if train_cfg.grad_accum_steps > 1:
         tx = optax.MultiSteps(tx, every_k_schedule=train_cfg.grad_accum_steps)
     opt = MixedPrecisionOptimizer(model, tx)
-    # Resolve host-offload of optimizer state. "auto" enables it only on a
-    # coherent-host platform (GH200); explicit True/False is honored verbatim.
-    # Applied BEFORE any checkpoint restore so restored shardings (which carry
-    # memory_kind) match the host-resident state. Default False -> strict no-op.
+    # Enable before checkpoint restore so restored shardings match the host-resident state.
     if resolve_offload_enabled(train_cfg.offload_optimizer):
         opt.enable_state_offload()
         startup_log("optimizer-state host offload ENABLED (moments on pinned_host)")
@@ -170,10 +165,8 @@ def _restore_sft_checkpoint(
     train_state = restored["train_state"]
     was_offloaded = optimizer.offload_optimizer_state
     nnx.update(optimizer, train_state["optimizer"])
-    # Orbax restores the opt_state onto ``device`` (it repopulates shardings from
-    # the sharding file, dropping the ``pinned_host`` memory kind), so re-apply
-    # the host placement after restore to keep the moments off HBM. Idempotent;
-    # re-captures the device shardings from the restored on-device state.
+    # Orbax restores opt_state onto device (dropping the pinned_host memory kind),
+    # so re-apply host placement to keep the moments off HBM.
     if was_offloaded:
         optimizer.enable_state_offload()
     return (

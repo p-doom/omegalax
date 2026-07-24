@@ -172,7 +172,6 @@ class DecoderLayer(nnx.Module):
         else:
             ff_out_BTD = self.mlp(post_norm_BTD)
             aux_loss = jnp.array(0.0, dtype=jnp.float32)
-        # Tag the residual for the named-offload policy (no-op otherwise).
         out_BTD = tag_offload_residual(attn_out_BTD + ff_out_BTD, self._remat_policy_name)
         return out_BTD, aux_loss
 

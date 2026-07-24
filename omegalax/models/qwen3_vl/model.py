@@ -431,8 +431,6 @@ class TextDecoderLayer(nnx.Module):
         self.mlp = TextMoEFeedForward(cfg, rngs=rngs) if self.is_moe else TextMLP(cfg, rngs=rngs)
 
         self._remat_policy = resolve_remat_policy(cfg.remat_policy)
-        # Static string (keeps the graphdef stable) so the named-offload policy can
-        # tag the residual for host offload; inert under every other policy.
         self._remat_policy_name = cfg.remat_policy
 
     def __call__(
@@ -452,7 +450,6 @@ class TextDecoderLayer(nnx.Module):
         else:
             ff_out_BTD = self.mlp(self.post_attention_layernorm(hidden_BTD))
             aux_loss = jnp.array(0.0, dtype=jnp.float32)
-        # Tag the residual for the named-offload policy (no-op otherwise).
         hidden_BTD = tag_offload_residual(hidden_BTD + ff_out_BTD, self._remat_policy_name)
         return hidden_BTD, aux_loss
 

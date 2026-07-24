@@ -1,29 +1,9 @@
 """CPU tests for host/CPU offload of optimizer state + activations.
 
-Scope (what CAN be checked on a login-node CPU):
-  * **OFF is a strict no-op** — with the default config the optimizer builds
-    byte-identically to trunk (moments on ``device``), the offload flag is
-    off, and a train step runs and matches the pre-offload behavior.
-  * **On/off resolution** — offload is a plain config bool resolved once; a
-    non-bool value raises (no platform auto-detection).
-  * **Offload remat policies resolve and trace** — the new ``"offload_dot"`` /
-    ``"offload_named"`` policies resolve to jax policy objects and a smoke model
-    *traces* (``jax.eval_shape``) under them, exercising the policy wiring and
-    the ``checkpoint_name`` residual tag.
-  * **wrt filter is undisturbed** — turning offload on does not change which
-    variables get optimizer state (the grad/optimizer ``wrt`` filter).
-
-Explicitly NOT checked here (deferred to GPU/GH200, see the module + report):
-  * Actually *executing* the host<->device staging: the XLA:CPU runtime has no
-    ``annotate_device_placement`` implementation for its Host memory space, so a
-    jitted step that mixes ``pinned_host`` and ``device`` operands cannot run on
-    CPU. This is an XLA-CPU limitation, not a wiring bug — the placement itself
-    (``device_put`` to ``pinned_host``) succeeds on CPU, which is what we assert.
-  * Peak-memory reduction, C2C step-time overlap, and the checkpoint
-    save/restore-with-memory-kind round-trip.
-
-Runs on CPU (``JAX_PLATFORMS=cpu``); the attention backend is swapped to the
-CPU-safe XLA fallback (same shim the remat/scan tests use).
+Covers OFF being a strict no-op, on/off bool resolution, the offload remat policies
+resolving + tracing, and offload leaving the ``wrt`` filter untouched. Staging
+execution is GPU-only (XLA:CPU can't run a step mixing ``pinned_host`` and ``device``
+operands), so on CPU we assert only the placement. Runs under ``JAX_PLATFORMS=cpu``.
 """
 
 import dataclasses
@@ -122,12 +102,9 @@ class OptimizerOffloadOffIsNoOpTest(absltest.TestCase):
         with mesh_rules(mesh):
             opt = build_optimizer(model, TrainConfig(offload_optimizer=False))
         self.assertFalse(opt.offload_optimizer_state)
-        # All moment buffers stay in device memory -> no offload happened.
         self.assertEqual(_opt_state_memory_kinds(opt), {DEVICE_MEMORY_KIND})
 
     def test_off_train_step_runs_on_cpu(self):
-        # The whole point of OFF being a no-op: the CPU step still runs (a step
-        # with host-resident moments could NOT run on the XLA:CPU runtime).
         mesh = ensure_mesh(tp_size=1, fsdp_size=1, dp_size=1)
         model, cfg = _build_model(_fp32_cfg())
         with mesh_rules(mesh):
@@ -138,17 +115,11 @@ class OptimizerOffloadOffIsNoOpTest(absltest.TestCase):
             loss, _ = step(opt, batch)
             loss.block_until_ready()
         self.assertTrue(np.isfinite(float(loss)))
-        # opt_state still device-resident after the step.
         self.assertEqual(_opt_state_memory_kinds(opt), {DEVICE_MEMORY_KIND})
 
 
 class OptimizerOffloadPlacementTest(absltest.TestCase):
-    """Force-ON: build-time placement of moments on pinned_host works on CPU.
-
-    (Executing the staged step is GPU-only; we only assert the placement, which
-    the ``jax.device_put(x, sharding.with_memory_kind('pinned_host'))`` API
-    supports even on the CPU backend.)
-    """
+    """Force-ON: build-time placement of moments on pinned_host works on CPU."""
 
     def test_forced_on_places_moments_on_host(self):
         mesh = ensure_mesh(tp_size=1, fsdp_size=1, dp_size=1)
@@ -156,17 +127,11 @@ class OptimizerOffloadPlacementTest(absltest.TestCase):
         with mesh_rules(mesh):
             opt = build_optimizer(model, TrainConfig(offload_optimizer=True))
         self.assertTrue(opt.offload_optimizer_state)
-        # Every moment buffer now lives in host memory.
         self.assertEqual(_opt_state_memory_kinds(opt), {HOST_MEMORY_KIND})
 
     def test_stored_device_shardings_structure_matches_opt_state(self):
-        # Regression guard for the staging fix: the device-sharding pytree
-        # captured at enable_state_offload() must map 1:1 onto the SAME structure
-        # ``update`` feeds to / gets back from optax (``nnx.pure(self.opt_state)``
-        # and the ``tx.update`` output). A mismatch would raise "Expected tuple,
-        # got State" inside the jitted step on the accelerator. We can't run the
-        # host<->device step on CPU, but we CAN assert the tree structures match,
-        # which is what the fix hinges on.
+        # If the captured sharding tree diverges from nnx.pure(opt_state), the in-jit
+        # staging map raises "Expected tuple, got State" on the accelerator.
         mesh = ensure_mesh(tp_size=1, fsdp_size=1, dp_size=1)
         model, _ = _build_model(_fp32_cfg())
         with mesh_rules(mesh):
@@ -179,7 +144,6 @@ class OptimizerOffloadPlacementTest(absltest.TestCase):
             "stored device-sharding tree structure diverged from nnx.pure(opt_state); "
             "the in-jit staging map would fail.",
         )
-        # Every stored sharding carries the DEVICE memory kind (staging target).
         for shd in jax.tree_util.tree_leaves(
             stored, is_leaf=lambda x: x is None or hasattr(x, "memory_kind")
         ):
@@ -187,9 +151,6 @@ class OptimizerOffloadPlacementTest(absltest.TestCase):
                 self.assertEqual(shd.memory_kind, DEVICE_MEMORY_KIND)
 
     def test_stage_opt_state_preserves_structure_and_values(self):
-        # _stage_opt_state must return the same tree structure and (on CPU's
-        # single memory kind) the same values -- exercising the map that fires
-        # inside the jitted step, minus the host<->device transfer.
         mesh = ensure_mesh(tp_size=1, fsdp_size=1, dp_size=1)
         model, _ = _build_model(_fp32_cfg())
         with mesh_rules(mesh):
@@ -224,7 +185,6 @@ class OptimizerOffloadPlacementTest(absltest.TestCase):
         }
         self.assertEqual(host_kinds, {HOST_MEMORY_KIND})
         self.assertEqual(back_kinds, {DEVICE_MEMORY_KIND})
-        # Values are unchanged (memory-kind move never touches the math).
         for a, b in zip(jax.tree_util.tree_leaves(st), jax.tree_util.tree_leaves(back)):
             np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
 
@@ -236,7 +196,6 @@ class OptimizerOffloadPlacementTest(absltest.TestCase):
         leaf = jax.tree_util.tree_leaves(nnx.state(opt.opt_state))[1]
         host_shd = sharding_on_memory_kind(leaf.sharding, HOST_MEMORY_KIND)
         self.assertEqual(host_shd.memory_kind, HOST_MEMORY_KIND)
-        # None / non-sharding inputs pass through unchanged.
         self.assertIsNone(sharding_on_memory_kind(None, HOST_MEMORY_KIND))
 
 
@@ -249,13 +208,9 @@ class OptimizerOffloadWrtFilterTest(parameterized.TestCase):
         model, _ = _build_model(_fp32_cfg())
         with mesh_rules(mesh):
             opt = build_optimizer(model, TrainConfig(offload_optimizer=offload))
-        # The optimizer's wrt filter is unchanged (still nnx.Param) and the set
-        # of moment leaves matches the set of params exactly (offload only moves
-        # bytes; it never adds/drops state).
         self.assertIs(opt.wrt, nnx.Param)
         n_params = len(jax.tree_util.tree_leaves(nnx.state(model, nnx.Param)))
-        # opt_state = mu + nu per param (+ scalar counters). The mu subtree alone
-        # must have exactly n_params leaves.
+        # opt_state holds mu + nu per param; the mu subtree alone has n_params leaves.
         mu = nnx.state(opt.opt_state)[0][0]["mu"]
         self.assertEqual(len(jax.tree_util.tree_leaves(mu)), n_params)
 
@@ -279,14 +234,11 @@ class OffloadRematPolicyTest(parameterized.TestCase):
 
     def test_tag_is_noop_for_non_named_policy(self):
         x = jnp.ones((2, 2))
-        # For non-named policies the tag is skipped -> exact same object.
         self.assertIs(tag_offload_residual(x, "dots_saveable"), x)
         self.assertIs(tag_offload_residual(x, "offload_dot"), x)
         self.assertIs(tag_offload_residual(x, None), x)
 
     def test_tag_is_identity_value_for_named_policy(self):
-        # For the named policy the value is unchanged (checkpoint_name is an
-        # identity op that only attaches a name for the policy to match).
         x = jnp.arange(6.0).reshape(2, 3)
         tagged = tag_offload_residual(x, "offload_named")
         np.testing.assert_array_equal(np.asarray(tagged), np.asarray(x))
@@ -296,10 +248,8 @@ class OffloadRematPolicyTest(parameterized.TestCase):
         ("offload_named", "offload_named"),
     )
     def test_smoke_model_traces_under_offload_policy(self, policy):
-        # jax.eval_shape traces (abstract-evaluates) the whole fwd+bwd graph
-        # under the offload policy WITHOUT executing it -- so it exercises the
-        # policy wiring + checkpoint_name tag on CPU (where the host<->device
-        # runtime is unavailable) and catches any wiring breakage.
+        # eval_shape traces fwd+bwd under the policy without executing it, exercising
+        # the policy wiring + checkpoint_name tag on CPU (where the step can't run).
         mesh = ensure_mesh(tp_size=1, fsdp_size=1, dp_size=1)
         cfg = _fp32_cfg(remat_policy=policy)
         model, cfg = _build_model(cfg)
