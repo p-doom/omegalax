@@ -23,14 +23,14 @@ from .norms import LayerNorm
 from .rope import apply_vision_rope
 
 
-def _cudnn_packed_vision_attention(
+def _cudnn_packed_vision_attention_local(
     q_NHK: jax.Array,
     k_NHK: jax.Array,
     v_NHK: jax.Array,
     cu_seqlens: jax.Array,
     scale: float,
 ) -> jax.Array:
-    """Run vision attention via cuDNN's packed (THD) kernel.
+    """cuDNN packed (THD) attention on this shard's local tensors.
 
     All image tokens are concatenated along the sequence dim. ``cu_seqlens``
     describes per-image segment boundaries; cuDNN uses these to skip
@@ -54,6 +54,38 @@ def _cudnn_packed_vision_attention(
         qkv_layout="BTNH",
     )
     return out[0]
+
+
+def _cudnn_packed_vision_attention(
+    q_NHK: jax.Array,
+    k_NHK: jax.Array,
+    v_NHK: jax.Array,
+    cu_seqlens: jax.Array,
+    scale: float,
+) -> jax.Array:
+    """Run the packed cuDNN vision attention inside a manual-mode ``shard_map``.
+
+    cuDNN fused attention registers a ``custom_partitioning`` rule; under the
+    multi-process (fsdp>=2) SPMD/Shardy partitioner that rule emits ``Sharding``
+    custom calls which have no CUDA runtime handler ("No registered
+    implementation for custom call to Sharding for platform CUDA" at the first
+    step). Wrapping the call in ``shard_map`` runs it in manual mode, so the
+    partitioner never sees the cuDNN op — the same trick the Qwen3-VL vision path
+    uses. Callers pass q/k/v replicated on the sequence dim (see
+    ``VisionAttention``), so each shard holds the full packed sequence and the
+    per-segment attention is correct. Entered unconditionally (a no-op on a
+    single-device mesh), matching how DeltaNet wraps its kernel.
+    """
+    q_sharding = jax.typeof(q_NHK).sharding
+    qkv_spec = q_sharding.spec
+    cu_spec = jax.typeof(cu_seqlens).sharding.spec
+    return jax.shard_map(
+        lambda q, k, v, cu: _cudnn_packed_vision_attention_local(q, k, v, cu, scale),
+        mesh=q_sharding.mesh,
+        in_specs=(qkv_spec, qkv_spec, qkv_spec, cu_spec),
+        out_specs=qkv_spec,
+        check_vma=False,
+    )(q_NHK, k_NHK, v_NHK, cu_seqlens)
 
 
 def _token_spatial_coords(
