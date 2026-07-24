@@ -63,18 +63,11 @@ def _cudnn_packed_vision_attention(
     cu_seqlens: jax.Array,
     scale: float,
 ) -> jax.Array:
-    """Run the packed cuDNN vision attention inside a manual-mode ``shard_map``.
+    """Run packed cuDNN vision attention inside a manual-mode ``shard_map``.
 
-    cuDNN fused attention registers a ``custom_partitioning`` rule; under the
-    multi-process (fsdp>=2) SPMD/Shardy partitioner that rule emits ``Sharding``
-    custom calls which have no CUDA runtime handler ("No registered
-    implementation for custom call to Sharding for platform CUDA" at the first
-    step). Wrapping the call in ``shard_map`` runs it in manual mode, so the
-    partitioner never sees the cuDNN op — the same trick the Qwen3-VL vision path
-    uses. Callers pass q/k/v replicated on the sequence dim (see
-    ``VisionAttention``), so each shard holds the full packed sequence and the
-    per-segment attention is correct. Entered unconditionally (a no-op on a
-    single-device mesh), matching how DeltaNet wraps its kernel.
+    Under fsdp>=2 cuDNN's custom_partitioning rule emits Sharding custom calls with
+    no CUDA handler; shard_map hides the op from the partitioner. Callers replicate
+    q/k/v on the sequence dim, so each shard holds the full packed sequence.
     """
     q_sharding = jax.typeof(q_NHK).sharding
     qkv_spec = q_sharding.spec
@@ -239,12 +232,7 @@ class VisionAttention(nnx.Module):
 
         q_NHK, k_NHK = apply_vision_rope(q_NHK, k_NHK, cos_NK, sin_NK)
 
-        # cuDNN's fused-attention partitioner forbids sharding the sequence dim,
-        # but under FSDP the vision tokens N are sharded on the batch axis. Replicate
-        # N for the packed attention (heads may stay sharded). Vision sequences are
-        # short relative to the FSDP-sharded text decoder, so the redundant per-device
-        # attention compute is cheap — and unlike a shard_map over the packed axis it
-        # needs no assumption that images align to device boundaries.
+        # Replicate the sequence dim N (heads may stay sharded): cuDNN's attention partitioner forbids sharding it.
         attn_in_shd = P(None, self.heads_shd[1], self.heads_shd[2])
         q_NHK = reshard(q_NHK, attn_in_shd)
         k_NHK = reshard(k_NHK, attn_in_shd)
@@ -411,12 +399,7 @@ class VisionModel(nnx.Module):
         grid_thw: jax.Array,
         cu_seqlens: jax.Array | None = None,
     ) -> jax.Array:
-        # `grid_thw` is tiny per-image metadata; under FSDP/TP the batch sharding
-        # would otherwise leave it sharded on axis 0, so the index math below
-        # (cumulative token offsets, gather indices) mixes sharded operands with
-        # replicated constants and fails explicit-sharding type checks. Replicate
-        # it, then place the derived per-token tensors on the token sharding the
-        # patch embeddings use. Mirrors the Qwen3-VL vision path.
+        # Replicate tiny grid_thw metadata; sharded on the FSDP batch axis it breaks the index math below.
         grid_thw = reshard(grid_thw, P())
         hidden_ND = self.patch_embed(pixel_values)
         total_tokens: int = hidden_ND.shape[0]
@@ -447,11 +430,7 @@ class VisionModel(nnx.Module):
                 ]
             )
         else:
-            # `cu_seqlens` are per-image segment offsets — tiny metadata that
-            # arrives sharded on the FSDP batch axis. The packed attention slices
-            # it (`jnp.diff`, `cu[None]`) to build segment lengths/offsets, which
-            # fails explicit-sharding checks on a sharded axis (its length is the
-            # image count, not divisible by the mesh). Replicate it.
+            # Replicate cu_seqlens (tiny per-image metadata, not divisible by the mesh).
             cu_seqlens = reshard(cu_seqlens.astype(jnp.int32), P())
 
         for blk in self.blocks:

@@ -203,12 +203,7 @@ class GatedDeltaNet(nnx.Module):
             gated = normed * jax.nn.silu(z_flat.astype(jnp.float32))
             return gated.astype(dtype).reshape(out.shape[0], out.shape[1], H * U)
 
-        # Use the current `jax.shard_map` (explicit-sharding / Shardy aware), NOT the
-        # deprecated `jax.experimental.shard_map`. The deprecated one lowers the manual
-        # region via a GSPMD `Sharding` custom call that has no CUDA runtime handler
-        # under a multi-process (fsdp>=2) mesh — the exact op that crashed the first
-        # training step with "No registered implementation for custom call to Sharding
-        # for platform CUDA". The Qwen3-VL vision path already uses `jax.shard_map`.
+        # jax.shard_map, not the deprecated jax.experimental one (whose Sharding custom call has no CUDA handler under fsdp>=2).
         normed_BTD = jax.shard_map(
             _full_deltanet,
             mesh=mesh,
