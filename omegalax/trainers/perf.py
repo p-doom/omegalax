@@ -1,28 +1,10 @@
-"""Throughput metrics for training: FLOP counting, step timing, MFU and HFU.
+"""Throughput metrics: FLOP counting, step timing, MFU and HFU.
 
-Algorithmic ("MaxText-style") FLOP counting: causal text attention is halved
-(only visited positions counted) and vision attention is block-diagonal across
-images (sum_i N_i^2, not (sum_i N_i)^2, since the packed/THD kernel skips
-cross-image tiles).
-
-Two utilization numbers are reported:
-
-- MFU (model): theoretical FLOPs / (step_time * peak), LoRA-aware, no recompute.
-  A weighted matmul (qkv/o/mlp/lm_head) costs 3x forward when its weight is
-  trainable but only 2x when frozen (LoRA freezes the base weights, so their
-  weight-gradient matmul is never built). Weightless matmuls (attention scores
-  QK^T and P@V; the linear-attention delta recurrence) are always 3x -- there is
-  no weight to freeze. Comparable to the MFU reported in pretraining papers.
-- HFU (hardware): model FLOPs + the jax.remat recompute of the layer forward.
-  Whether layers are rematerialized is read from DECODER_LAYER_REMAT /
-  VISION_BLOCK_REMAT, not assumed here.
-
-Hence MFU == HFU for a full fine-tune without recompute and HFU > MFU with it;
-under LoRA the dropped weight-grads and the added recompute partially offset,
-which is why a single 3x-forward counter was only ~right for LoRA+remat.
-
-HFU counts only the explicit per-layer jax.remat recompute; kernel-internal
-recomputation (e.g. FlashAttention's backward) is out of scope.
+Algorithmic ("MaxText-style") FLOPs: causal attention halved; vision attention
+block-diagonal across images. MFU uses model FLOPs and is LoRA-aware (a frozen
+weighted matmul costs 2x forward, not 3x; weightless attention is always 3x). HFU
+adds the jax.remat layer recompute, read from DECODER_LAYER_REMAT /
+VISION_BLOCK_REMAT; the two are equal only for a full fine-tune without recompute.
 """
 
 from __future__ import annotations
@@ -42,8 +24,7 @@ from omegalax.models.qwen3_vl.config import Qwen3VLConfig
 # Config types that the FLOP counters accept (text or full VLM configs).
 RunPerfConfig = Union[Qwen3Config, Qwen3_5TextConfig, Qwen3_5Config, Qwen3VLConfig]
 
-# Full-FT training FLOPs = forward + backward; factor 3 (1 fwd + 2 bwd). Used by
-# ``training_flops_per_token`` (the full fine-tune convenience helper).
+# Full-FT training FLOPs = forward + backward; factor 3 (1 fwd + 2 bwd).
 TRAINING_FLOP_MULTIPLIER = 3
 
 # Peak bf16 TFLOPS (1e12 FLOP/s) for common GPUs. Used as denominator for MFU/HFU.
@@ -80,12 +61,8 @@ def resolve_peak_tflops(spec: str | float | None) -> float | None:
 class ForwardFlops:
     """Per-token forward matmul FLOPs, split by how the backward scales.
 
-    - weighted_layers: matmuls with a weight inside the rematerialized layer
-      (qkv/o + MLP/experts); backward is 2x (frozen) or 3x (trainable).
-    - attention: weightless matmuls (attention scores, causal-halved; the
-      linear-attention delta recurrence); backward is always 2x, i.e. 3x total.
-    - head: the lm_head projection -- weighted, but outside the rematerialized
-      layer, so never recomputed.
+    weighted_layers: weighted matmuls in the remat layer (2x frozen / 3x trainable).
+    attention: weightless matmuls, always 3x. head: lm_head, outside remat.
     """
 
     weighted_layers: int
@@ -128,12 +105,10 @@ class StepFlops:
 
 
 def forward_flops_per_token(cfg: RunPerfConfig, seq_len: int) -> ForwardFlops:
-    """Per-token forward matmul FLOPs, decomposed for MFU/HFU accounting.
+    """Per-token forward matmul FLOPs (text decoder), decomposed for MFU/HFU.
 
-    Accepts text configs (Qwen3, Qwen3.5 text) or full VLM configs
-    (Qwen3_5Config -> text decoder only; Qwen3VLConfig -> decoder stack). The
-    vision tower is handled separately by ``qwen3_vl_vision_flops`` because its
-    cost depends on the concrete ``image_grid_thw``.
+    Accepts text or full VLM configs; the vision tower is counted separately by
+    ``qwen3_vl_vision_flops``.
     """
     if isinstance(cfg, Qwen3_5Config):
         return _forward_flops_qwen3_5(cfg.text_config, seq_len)
@@ -149,10 +124,9 @@ def forward_flops_per_token(cfg: RunPerfConfig, seq_len: int) -> ForwardFlops:
 
 
 def training_flops_per_token(cfg: RunPerfConfig, seq_len: int) -> int:
-    """Full fine-tune training FLOPs per token (forward + backward, x3).
+    """Full fine-tune training FLOPs per token (3 * forward).
 
-    Convenience helper equal to ``3 * forward`` — i.e. the model FLOPs of a full
-    fine-tune (all weights trainable). For LoRA/frozen-aware counting use
+    For LoRA/frozen-aware counting use
     ``forward_flops_per_token(...).model_flops(base_weights_trainable=...)``.
     """
     return TRAINING_FLOP_MULTIPLIER * forward_flops_per_token(cfg, seq_len).forward
@@ -300,20 +274,10 @@ def _forward_flops_qwen3_5(cfg: Qwen3_5TextConfig, seq_len: int) -> ForwardFlops
 
 
 def qwen3_vl_vision_flops(cfg: Qwen3VLConfig, image_grid_thw: Any | None) -> VisionFlops:
-    """Theoretical Qwen3-VL vision-tower forward FLOPs for one training step.
+    """Qwen3-VL vision-tower forward matmul FLOPs for one step (no fwd/bwd multiplier).
 
-    Counts matmuls only and matches the current implementation in
-    ``omegalax.models.qwen3_vl.vision``:
-    - patch embed and patch mergers are linear layers (linear in token count);
-    - vision attention is block-diagonal across images: the cuDNN packed/THD
-      kernel uses ``vision_cu_seqlens`` to skip cross-image tiles, so per-image
-      attention costs are summed (``sum_i 4 * N_i^2 * H * K``) rather than
-      computed over the concatenated batch (``4 * (sum_i N_i)^2 * H * K``).
-
-    Returns forward FLOPs (no fwd/bwd multiplier). ``block_forward`` is the
-    transformer-block portion, i.e. the region wrapped in ``jax.remat`` — used
-    for HFU when the tower is trained. The caller applies the fwd/bwd multiplier
-    and recompute term via ``vision_trainable`` / ``VISION_BLOCK_REMAT``.
+    Vision attention is block-diagonal across images (sum_i N_i^2). ``block_forward``
+    is the jax.remat'd transformer-block portion, used for HFU on a trained tower.
     """
     if image_grid_thw is None:
         return VisionFlops(forward=0, block_forward=0)
@@ -363,14 +327,7 @@ def qwen3_vl_vision_flops(cfg: Qwen3VLConfig, image_grid_thw: Any | None) -> Vis
 def qwen3_vl_vision_training_flops(
     cfg: Qwen3VLConfig, image_grid_thw: Any | None, *, vision_trainable: bool = True
 ) -> int:
-    """Vision-tower *model* FLOPs for one step (fwd+bwd if trained, fwd if frozen).
-
-    Thin wrapper over ``qwen3_vl_vision_flops`` preserving the historical
-    semantics: a trained tower is forward+backward (``x3``); a frozen tower
-    (``--freeze_vision_tower`` or ``--enable_lora``) has no backward built, so it
-    is forward-only (``x1``). Counting frozen vision at ``x3`` would inflate the
-    metric because the vision tower is a non-trivial share of this VLM's FLOPs.
-    """
+    """Vision-tower model FLOPs for one step: x3 if trained, x1 if frozen (no backward built)."""
     forward = qwen3_vl_vision_flops(cfg, image_grid_thw).forward
     return forward * (TRAINING_FLOP_MULTIPLIER if vision_trainable else 1)
 
@@ -578,11 +535,9 @@ def per_device_step_flops(
     decoder_remat: bool,
     vision_remat: bool = True,
 ) -> StepFlops:
-    """Per-device model and hardware FLOPs for one step.
+    """Per-device model (MFU) and hardware (HFU) FLOPs for one step.
 
-    ``base_weights_trainable`` is ``False`` under LoRA (base weights frozen; only
-    adapters train, whose <1% matmuls are omitted). For Qwen3-VL, ``image_grid_thw``
-    adds the vision-tower FLOPs; a frozen tower has no backward, so no recompute.
+    base_weights_trainable is False under LoRA (frozen base weights, adapters omitted).
     """
     fwd = forward_flops_per_token(cfg, seq_len)
     tokens = seq_len * batch_size
@@ -614,14 +569,9 @@ def step_metrics(
     global_tokens_per_step: int,
     peak_tflops: float | None,
 ) -> dict[str, float]:
-    """Compute tokens/s, model/hardware TFLOPS/device, and MFU/HFU from timing.
+    """Tokens/s, model/hardware TFLOPS/device, and MFU/HFU from step timing.
 
-    - ``mfu`` uses model FLOPs (LoRA-aware, no recompute) — comparable to the MFU
-      reported in pretraining papers.
-    - ``hfu`` uses hardware FLOPs (includes activation-checkpoint recompute) —
-      how well the silicon is utilized.
-    - ``tflops_per_device`` is an alias of ``model_tflops_per_device`` (so
-      ``mfu == tflops_per_device / peak``).
+    tflops_per_device aliases model_tflops_per_device (mfu == tflops_per_device / peak).
     """
     sec = step_delta.total_seconds()
     if sec <= 0:

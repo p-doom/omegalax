@@ -655,8 +655,7 @@ def run_sft(
                 for sid in sids.tolist():
                     source_counts[sid] = source_counts.get(sid, 0) + 1
             grid_thw = batch.get("image_grid_thw")
-            # base_weights_trainable=False under LoRA (frozen base weights have no
-            # weight-gradient matmul); remat flags come from the model modules.
+            # LoRA freezes base weights (no weight-grad); remat flags from the model modules.
             micro_flops = per_device_step_flops(
                 model_cfg,
                 train_cfg.seq_len,

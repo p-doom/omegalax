@@ -406,9 +406,7 @@ class TextAttention(nnx.Module):
         return out_BTD
 
 
-# Single source of truth for text-decoder activation checkpointing: drives both
-# the jax.remat decorator on TextDecoderLayer.__call__ below and the HFU
-# recompute term in omegalax.trainers.perf.
+# Single source of truth for decoder-layer remat; also drives perf.py's HFU recompute term.
 DECODER_LAYER_REMAT = True
 
 

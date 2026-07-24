@@ -80,8 +80,7 @@ class ModelHardwareFlopsTest(absltest.TestCase):
         self.assertEqual(fwd.model_flops(base_weights_trainable=True), 3 * fwd.forward)
 
     def test_lora_model_skips_frozen_weight_grads(self):
-        # Frozen weighted matmuls: 2x (fwd + act-grad). Weightless attention:
-        # still 3x. So LoRA model = 3*forward - (weighted_layers + head).
+        # LoRA: frozen weighted matmuls 2x, weightless attention still 3x.
         fwd = self._fwd()
         expected = 3 * fwd.forward - (fwd.weighted_layers + fwd.head)
         self.assertEqual(fwd.model_flops(base_weights_trainable=False), expected)
@@ -99,8 +98,7 @@ class ModelHardwareFlopsTest(absltest.TestCase):
             )
 
     def test_hardware_with_remat_adds_layer_recompute(self):
-        # Remat recomputes the rematerialized layer forward (weighted_layers +
-        # attention), NOT the head (lm_head is outside the rematerialized layer).
+        # Remat recomputes the layer forward (weighted_layers + attention), not the head.
         fwd = self._fwd()
         recompute = fwd.weighted_layers + fwd.attention
         for trainable in (True, False):
@@ -179,9 +177,7 @@ class PerDeviceStepFlopsTest(absltest.TestCase):
         self.assertGreater(with_images.model, base.model)
 
     def test_vl_frozen_vision_forward_only(self):
-        # Frozen vision (forward-only, x1) vs trained (x3): the vision delta over
-        # the no-image baseline shrinks to exactly 1/3, and frozen vision adds no
-        # recompute even with vision_remat requested.
+        # Frozen vision (x1) vs trained (x3): vision delta shrinks to 1/3, no recompute.
         cfg = make_qwen3_vl_config("qwen3-vl-smoke")
         grid = [[1, 4, 4]]
         with mock.patch("jax.device_count", return_value=1):

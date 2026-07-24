@@ -328,9 +328,7 @@ class VisionAttention(nnx.Module):
         return out_ND
 
 
-# Single source of truth for vision-block activation checkpointing: drives both
-# the jax.remat decorator on VisionBlock.__call__ below and the HFU recompute
-# term in omegalax.trainers.perf (relevant only when the tower is trained).
+# Single source of truth for vision-block remat; also drives perf.py's HFU recompute term (trained tower only).
 VISION_BLOCK_REMAT = True
 
 
