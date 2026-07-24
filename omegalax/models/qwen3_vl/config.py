@@ -146,6 +146,11 @@ _QWEN3_VL_REPOS = (
     "Qwen/Qwen3-VL-4B-Instruct",
     "Qwen/Qwen3-VL-8B-Instruct",
     "Qwen/Qwen3-VL-30B-A3B-Instruct",
+    # Thinking (reasoning) variants: identical architecture to the same-size
+    # Instruct repo, only post-training weights differ — get_vl_spec reads the
+    # HF config directly, so listing them here is sufficient for export.
+    "Qwen/Qwen3-VL-4B-Thinking",
+    "Qwen/Qwen3-VL-8B-Thinking",
 )
 
 _SUPPORTED_MODEL_TYPES = {"qwen3_vl", "qwen3_vl_moe"}
