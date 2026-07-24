@@ -54,16 +54,9 @@ def single_device_mesh():
 
 @contextlib.contextmanager
 def force_jax_ragged_dot():
-    """Route grouped-MoE onto the CPU-safe ``jax`` ragged_dot reference.
-
-    tokamax's ragged_dot lowers to ``jax.lax.ragged_dot_general``, which has no
-    Explicit-sharding rule on CPU (see ``moe_grouped._auto``); under the Explicit
-    logical mesh these tests build, the grouped GEMM's activation carries an Auto
-    aval and the primitive rejects the mesh-type mismatch. The ``jax`` reference
-    goes through the auto_axes CPU path and is numerically identical (verified by
-    tests/test_moe_grouped.py), and these scan-equivalence tests are
-    primitive-agnostic, so we pin it. No-op for dense configs (no ragged_dot).
-    """
+    """Pin grouped-MoE to the ``jax`` ragged_dot reference: tokamax's kernel has no
+    CPU Explicit-sharding rule and rejects these Explicit-mesh tests (numerically
+    identical -- see test_moe_grouped)."""
     import omegalax.models.moe_grouped as _mg
 
     _orig = _mg._ragged_dot

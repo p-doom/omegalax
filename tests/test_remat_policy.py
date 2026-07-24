@@ -38,15 +38,9 @@ from omegalax.text import api as text_api
 
 @contextlib.contextmanager
 def force_jax_ragged_dot():
-    """Route grouped-MoE onto the CPU-safe ``jax`` ragged_dot reference.
-
-    tokamax's ragged_dot lowers to ``jax.lax.ragged_dot_general``, which has no
-    Explicit-sharding rule on CPU (see ``moe_grouped._auto``); under the Explicit
-    mesh these tests build, the grouped GEMM's activation carries an Auto aval and
-    the primitive rejects the mesh-type mismatch. The ``jax`` reference is
-    numerically identical (verified by tests/test_moe_grouped.py) and these
-    full-vs-selective remat cases are primitive-agnostic. No-op for dense.
-    """
+    """Pin grouped-MoE to the ``jax`` ragged_dot reference: tokamax's kernel has no
+    CPU Explicit-sharding rule and rejects these Explicit-mesh tests (numerically
+    identical -- see test_moe_grouped)."""
     import omegalax.models.moe_grouped as _mg
 
     _orig = _mg._ragged_dot
@@ -59,9 +53,7 @@ def force_jax_ragged_dot():
 
 
 FULL_POLICY = "full"  # == DEFAULT_REMAT_POLICY
-# A selective policy, contrasted against full remat for the equivalence tests.
-# Decoupled from DEFAULT_REMAT_POLICY on purpose: the default is now "full", but
-# these tests must still exercise a *saved-activation* policy for the comparison.
+# A saved-activation policy, contrasted against full remat in the equivalence tests.
 SELECTIVE_POLICY = "dots_saveable"
 _SEED = 0
 
@@ -75,11 +67,8 @@ def _patch_attention_backend_to_xla(model: nnx.Module) -> None:
 
 class RematPolicyResolverTest(absltest.TestCase):
     def test_default_is_full(self):
-        # Default flipped to full remat: safe at 8B/16k (activations aren't
-        # fsdp-sharded, so selective policies spike saved-matmul HBM past 80GB).
         self.assertEqual(DEFAULT_REMAT_POLICY, "full")
         self.assertIsNone(resolve_remat_policy(DEFAULT_REMAT_POLICY))
-        # The selective policy used for the equivalence tests still resolves.
         self.assertIsNotNone(resolve_remat_policy(SELECTIVE_POLICY))
 
     def test_full_resolves_to_none(self):
@@ -165,10 +154,7 @@ class RematPolicyEquivalenceTest(parameterized.TestCase):
         # bf16 machine epsilon ~ 2^-8; allow a few ULP for recompute rounding.
         if cfg.dtype != jnp.bfloat16:
             return 1e-6
-        # The hybrid stack (DeltaNet linear-attn + full-attn + MoE) has deeper
-        # recompute chains than the dense / MoE-only models, so full-vs-selective
-        # remat drift accumulates a wider (but still tiny) bf16 ULP band: ~0.012
-        # abs on <0.1% of grad elements. Dense/MoE bf16 stay at 5e-3.
+        # Hybrid (DeltaNet + full-attn + MoE) has deeper recompute chains -> wider bf16 band.
         hybrid = "linear_attention" in getattr(cfg, "layer_types", ())
         return 2e-2 if hybrid else 5e-3
 

@@ -299,17 +299,11 @@ def make_mesh(
     *,
     cp_size: int = 1,
 ) -> Mesh:
-    """Build the ``('tp', 'cp', 'fsdp', 'dp')`` mesh over the GLOBAL device pool.
+    """Build the ``('tp', 'cp', 'fsdp', 'dp')`` mesh over the global device pool.
 
-    omegalax launches ONE PROCESS PER GPU (see :func:`init_distributed`), so every
-    process owns exactly one device and ``jax.local_device_count() == 1`` -- the
-    NVLink/ICI domain (node) is NOT introspectable from JAX on GPU. We therefore
-    build a single flat mesh over ``jax.devices()`` (the whole global pool), exactly
-    like ``main``'s ``jax.make_mesh((tp, fsdp, dp), _AXES)``: ``create_device_mesh``
-    lays the comm-heaviest axes (``tp``, ``cp``) over locally-adjacent devices so
-    they ride NVLink within a node. TP/CP must be intra-NVLink-domain, not
-    intra-PROCESS; the global-device mesh guarantees that. ``cp_size`` default 1 is
-    a strict no-op (size-1 axis dropped downstream)."""
+    One process per GPU hides the NVLink domain from JAX, so we lay a flat mesh over
+    ``jax.devices()`` and let ``create_device_mesh`` place the comm-heavy tp/cp axes
+    on adjacent devices. ``cp_size`` default 1 is a no-op."""
     tp, cp, fsdp, dp = _resolve_mesh_shape(
         tp_size=tp_size, cp_size=cp_size, fsdp_size=fsdp_size, dp_size=dp_size
     )
