@@ -393,10 +393,25 @@ class TextAttention(nnx.Module):
         # backend. Precision reduction is thus explicit and gated on the dtype.
         attn_in_dtype = q_BTHK.dtype
         if attn_in_dtype == jnp.float32:
+            # tokamax's "xla" reference expands GQA KV heads internally via
+            # jnp.repeat(axis=-2) WITHOUT an out_sharding, which raises under an
+            # explicit/auto mesh (the GPU mosaic_gpu/cudnn kernels handle GQA
+            # natively and never hit this). Expand the KV heads here instead, with
+            # the head-axis (TP) sharding attached, so tokamax sees full MHA
+            # (k.shape[-2] == q.shape[-2]) and its own repeat becomes a no-op.
+            if self.n_rep > 1:
+                k_BTHK = jnp.repeat(
+                    k_BTGK, self.n_rep, axis=-2, out_sharding=self.shd_cfg.act_btnh
+                )
+                v_BTHK = jnp.repeat(
+                    v_BTGK, self.n_rep, axis=-2, out_sharding=self.shd_cfg.act_btnh
+                )
+            else:
+                k_BTHK, v_BTHK = k_BTGK, v_BTGK
             attn_BTHK = dot_product_attention(
                 q_BTHK,
-                k_BTGK,
-                v_BTGK,
+                k_BTHK,
+                v_BTHK,
                 is_causal=True,
                 scale=self.scale,
                 implementation="xla",

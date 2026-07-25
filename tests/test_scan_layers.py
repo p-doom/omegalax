@@ -366,7 +366,7 @@ class Qwen3VLScanEquivalenceTest(absltest.TestCase):
     ):
         from omegalax.models.qwen3_vl.model import Qwen3VL
 
-        with single_device_mesh():
+        with force_jax_ragged_dot(), single_device_mesh():
             m_unrolled = Qwen3VL(cfg, rngs=nnx.Rngs(0))
             m_scan = Qwen3VL(cfg, rngs=nnx.Rngs(0))
             m_scan = _copy_weights(m_unrolled, m_scan)
