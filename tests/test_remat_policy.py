@@ -2,8 +2,8 @@
 
 Remat policies are numerically transparent: whether an intermediate is *saved*
 or *recomputed* in the backward pass, the math is identical. These tests build
-small smoke models under the classic full-remat policy (``"full"``) and under
-the selective default (``"dots_saveable"``), share identical weights across the
+small smoke models under the default full-remat policy (``"full"``) and under
+a selective policy (``"dots_saveable"``), share identical weights across the
 two, and assert that both the forward loss and every gradient match within
 floating-point tolerance.
 
@@ -13,8 +13,10 @@ so we swap its ``_attn_backend`` to ``"xla"`` for the duration of the test
 (a test-only shim -- it does not touch the model source).
 """
 
+import contextlib
 import dataclasses
 import os
+import unittest.mock as mock
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 # Force the CPU-friendly DeltaNet backend regardless of visible devices.
@@ -34,8 +36,25 @@ from omegalax.models.remat_policy import (
 )
 from omegalax.text import api as text_api
 
-FULL_POLICY = "full"
-SELECTIVE_POLICY = DEFAULT_REMAT_POLICY  # "dots_saveable"
+@contextlib.contextmanager
+def force_jax_ragged_dot():
+    """Pin grouped-MoE to the ``jax`` ragged_dot reference: tokamax's kernel has no
+    CPU Explicit-sharding rule and rejects these Explicit-mesh tests (numerically
+    identical -- see test_moe_grouped)."""
+    import omegalax.models.moe_grouped as _mg
+
+    _orig = _mg._ragged_dot
+
+    def _jax_primitive(lhs, rhs, group_sizes, primitive, **kw):
+        return _orig(lhs, rhs, group_sizes, "jax", **kw)
+
+    with mock.patch.object(_mg, "_ragged_dot", _jax_primitive):
+        yield
+
+
+FULL_POLICY = "full"  # == DEFAULT_REMAT_POLICY
+# A saved-activation policy, contrasted against full remat in the equivalence tests.
+SELECTIVE_POLICY = "dots_saveable"
 _SEED = 0
 
 
@@ -47,8 +66,9 @@ def _patch_attention_backend_to_xla(model: nnx.Module) -> None:
 
 
 class RematPolicyResolverTest(absltest.TestCase):
-    def test_default_is_selective(self):
-        self.assertEqual(DEFAULT_REMAT_POLICY, "dots_saveable")
+    def test_default_is_full(self):
+        self.assertEqual(DEFAULT_REMAT_POLICY, "full")
+        self.assertIsNone(resolve_remat_policy(DEFAULT_REMAT_POLICY))
         self.assertIsNotNone(resolve_remat_policy(SELECTIVE_POLICY))
 
     def test_full_resolves_to_none(self):
@@ -102,7 +122,7 @@ class RematPolicyEquivalenceTest(parameterized.TestCase):
         return nnx.value_and_grad(loss_fn)(model)
 
     def _assert_equivalent(self, mesh, full, sel, token_ids_BT, segment_ids_BT, grad_tol):
-        with jax.set_mesh(mesh):
+        with force_jax_ragged_dot(), jax.set_mesh(mesh):
             loss_full, grads_full = self._loss_and_grads(full, token_ids_BT, segment_ids_BT)
             loss_sel, grads_sel = self._loss_and_grads(sel, token_ids_BT, segment_ids_BT)
 
@@ -132,7 +152,11 @@ class RematPolicyEquivalenceTest(parameterized.TestCase):
     @staticmethod
     def _grad_tol(cfg) -> float:
         # bf16 machine epsilon ~ 2^-8; allow a few ULP for recompute rounding.
-        return 5e-3 if cfg.dtype == jnp.bfloat16 else 1e-6
+        if cfg.dtype != jnp.bfloat16:
+            return 1e-6
+        # Hybrid (DeltaNet + full-attn + MoE) has deeper recompute chains -> wider bf16 band.
+        hybrid = "linear_attention" in getattr(cfg, "layer_types", ())
+        return 2e-2 if hybrid else 5e-3
 
     @parameterized.named_parameters(
         ("qwen3_dense_bf16", "qwen3-smoke", jnp.bfloat16),
@@ -142,7 +166,7 @@ class RematPolicyEquivalenceTest(parameterized.TestCase):
     )
     def test_qwen3_equivalence(self, model_id, dtype):
         text_cfg = text_api.resolve_config(model_id)
-        self.assertEqual(text_cfg.remat_policy, SELECTIVE_POLICY)  # default is selective
+        self.assertEqual(text_cfg.remat_policy, FULL_POLICY)  # default is now full
         text_cfg = dataclasses.replace(text_cfg, dtype=dtype)
         mesh, full, sel = self._build_pair(text_cfg)
         token_ids_BT, segment_ids_BT = _make_batch(text_cfg.vocab_size)
@@ -161,7 +185,7 @@ class RematPolicyEquivalenceTest(parameterized.TestCase):
     def test_qwen3_5_hybrid_equivalence(self, dtype):
         """Hybrid: DeltaNet linear-attn + full-attn + MoE (matches production shape)."""
         text_cfg = text_api.resolve_config("qwen3.5-smoke")
-        self.assertEqual(text_cfg.remat_policy, SELECTIVE_POLICY)
+        self.assertEqual(text_cfg.remat_policy, FULL_POLICY)  # default is now full
         # Sanity: config exercises both linear- and full-attention layers, plus MoE.
         self.assertIn("linear_attention", text_cfg.layer_types)
         self.assertIn("full_attention", text_cfg.layer_types)

@@ -65,9 +65,11 @@ def init_model(
     tp_size: int | None = None,
     fsdp_size: int | None = None,
     dp_size: int | None = None,
+    cp_size: int = 1,
 ) -> tuple[nnx.Module, text_api.TextConfig]:
     return text_api.init_model(
-        cfg_or_model_id, rng, tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size
+        cfg_or_model_id, rng, tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size,
+        cp_size=cp_size,
     )
 
 
@@ -281,6 +283,7 @@ def run_sft(
     tp_size: int | None = None,
     fsdp_size: int | None = None,
     dp_size: int | None = None,
+    cp_size: int = 1,
     wandb_run=None,
     val_data_iter: checkpoint_utils.GrainIterator | None = None,
     val_every: int | None = None,
@@ -332,9 +335,9 @@ def run_sft(
         model_cfg = text_api.resolve_config(model_id_or_cfg)
         startup_log("resolved model config")
     startup_log(f"model_cfg={model_cfg}")
-    mesh = ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size)
+    mesh = ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size, cp_size=cp_size)
     model_cfg = text_api.align_config_to_mesh(model_cfg, mesh)
-    startup_log("mesh ready (tp/fsdp/dp)")
+    startup_log("mesh ready (tp/cp/fsdp/dp)")
     batch_multiple = required_batch_multiple(text_api.batch_partition_spec(model_cfg), mesh)
     if train_cfg.batch_size % batch_multiple != 0:
         raise ValueError(
@@ -352,7 +355,8 @@ def run_sft(
     is_primary_process = jax.process_index() == 0
 
     model, model_cfg = init_model(
-        model_cfg, init_rng, tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size
+        model_cfg, init_rng, tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size,
+        cp_size=cp_size,
     )
     startup_log("initialized model")
     from omegalax.models.sharding_runtime import set_attn_backend

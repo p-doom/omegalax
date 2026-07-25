@@ -9,8 +9,8 @@ from typing import Callable
 
 import jax
 
-# Selective: save dot_general (matmul) outputs, recompute cheap ops.
-DEFAULT_REMAT_POLICY = "dots_saveable"
+# Full remat: selective policies spike saved-matmul HBM past 80GB at 8B/16k (acts not fsdp-sharded).
+DEFAULT_REMAT_POLICY = "full"
 
 
 # name -> zero-arg factory returning a jax remat policy (``None`` == full remat,

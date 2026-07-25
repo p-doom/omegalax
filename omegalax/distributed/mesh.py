@@ -299,20 +299,19 @@ def make_mesh(
     *,
     cp_size: int = 1,
 ) -> Mesh:
-    """Build the ``('tp', 'cp', 'fsdp', 'dp')`` mesh for the given sizes (``cp_size``
-    default 1 == no-op), deriving the ICI/DCN split via :func:`derive_ici_dcn`."""
+    """Build the ``('tp', 'cp', 'fsdp', 'dp')`` mesh over the global device pool.
+
+    One process per GPU hides the NVLink domain from JAX, so we lay a flat mesh over
+    ``jax.devices()`` and let ``create_device_mesh`` place the comm-heavy tp/cp axes
+    on adjacent devices. ``cp_size`` default 1 is a no-op."""
     tp, cp, fsdp, dp = _resolve_mesh_shape(
         tp_size=tp_size, cp_size=cp_size, fsdp_size=fsdp_size, dp_size=dp_size
     )
-    parallelism = derive_ici_dcn(
-        tp_size=tp,
-        cp_size=cp,
-        fsdp_size=fsdp,
-        dp_size=dp,
-        local_device_count=local_device_count(),
-        num_processes=num_processes(),
-    )
-    return make_hierarchical_mesh(parallelism.ici_shape, parallelism.dcn_shape)
+    # Explicit axis types (matching jax.make_mesh): downstream out_sharding= code
+    # relies on them; a bare Mesh(...) defaults to AxisType.Auto and regresses.
+    axis_types = (AxisType.Explicit,) * len(_AXES)
+    device_grid = mesh_utils.create_device_mesh((tp, cp, fsdp, dp), jax.devices())
+    return Mesh(device_grid, _AXES, axis_types=axis_types)
 
 
 def set_default_mesh(

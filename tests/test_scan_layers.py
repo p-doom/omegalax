@@ -52,6 +52,22 @@ def single_device_mesh():
         yield mesh
 
 
+@contextlib.contextmanager
+def force_jax_ragged_dot():
+    """Pin grouped-MoE to the ``jax`` ragged_dot reference: tokamax's kernel has no
+    CPU Explicit-sharding rule and rejects these Explicit-mesh tests (numerically
+    identical -- see test_moe_grouped)."""
+    import omegalax.models.moe_grouped as _mg
+
+    _orig = _mg._ragged_dot
+
+    def _jax_primitive(lhs, rhs, group_sizes, primitive, **kw):
+        return _orig(lhs, rhs, group_sizes, "jax", **kw)
+
+    with mock.patch.object(_mg, "_ragged_dot", _jax_primitive):
+        yield
+
+
 def _count_eqns(jaxpr) -> int:
     """Total number of equations, recursively descending into sub-jaxprs."""
     count = 0
@@ -176,7 +192,7 @@ class Qwen3ScanEquivalenceTest(absltest.TestCase):
         )
 
     def _run_case(self, cfg, atol=1e-5, rtol=1e-5):
-        with self._mesh():
+        with force_jax_ragged_dot(), self._mesh():
             m_unrolled, m_scan = self._build_pair(cfg)
 
             rng = np.random.RandomState(0)
@@ -319,7 +335,7 @@ class Qwen3VLScanEquivalenceTest(absltest.TestCase):
         return dataclasses.replace(
             cfg,
             num_layers=num_layers,
-            shd_cfg=ShardConfig.no_sharding(),
+            shd_cfg=ShardConfig.default(),
             dtype=jnp.float32,
             param_dtype=jnp.float32,
         )
@@ -511,7 +527,7 @@ class Qwen35BlockScanEquivalenceTest(absltest.TestCase):
     def _run_case(self, text_cfg, atol=1e-5, rtol=1e-5):
         from omegalax.models.qwen3_5.model import Qwen3_5ForCausalLM
 
-        with single_device_mesh():
+        with force_jax_ragged_dot(), single_device_mesh():
             m_unrolled = Qwen3_5ForCausalLM(text_cfg, rngs=nnx.Rngs(0))
             m_scan = Qwen3_5ForCausalLM(text_cfg, rngs=nnx.Rngs(0))
             m_scan = _copy_weights(m_unrolled, m_scan)
