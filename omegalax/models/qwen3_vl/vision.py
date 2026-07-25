@@ -101,12 +101,33 @@ def _cudnn_packed_vision_attention(
     describes per-image segment boundaries; cuDNN uses these to skip
     cross-segment tiles entirely rather than materializing a full [T, S] mask.
 
-    Under multi-device dp sharding, cuDNN's internal ``_fix_seqlen_offsets``
-    runs ``jnp.nonzero(..., size=size)`` on ``q_seqlen``, which lowers to a
-    scatter that can't resolve an output sharding when any of its inputs are
-    dp-sharded.  We wrap the whole call in ``shard_map`` so each device sees
-    only its local shards (no explicit sharding inside), matching cuDNN's
-    per-device view.
+    The cuDNN call is wrapped in a manual-mode ``jax.shard_map`` on ANY
+    non-empty mesh (a no-op on a single-device mesh), so the SPMD/Shardy
+    partitioner never sees the underlying ``custom_partitioning`` op — the same
+    technique as the Qwen3.5 vision fix (97ce1c9). Failures otherwise observed
+    on a multi-device mesh (all GPU-reproduced with replicated q/k/v):
+
+    * Forward-only: the partitioned op emits ``@Sharding`` custom calls that
+      have no CUDA runtime handler — "No registered implementation for custom
+      call to Sharding for platform CUDA" at the first step.
+    * With gradients flowing through vision (full fine-tune), cuDNN's Shardy
+      sharding rule maps the softmax-stat output's leading dim to
+      ``CompoundFactor('batch', 'n')``; our packed layout has batch == 1, and
+      Shardy rejects a size-1 factor combined with others — "dim mapping can't
+      have a factor of size 1 if there are multiple factors" at lowering, even
+      when q/k/v are fully replicated. So the wrap must be unconditional, not
+      just for dp-sharded inputs.
+    * Under dp sharding of the packed dim, cuDNN's internal
+      ``_fix_seqlen_offsets`` runs ``jnp.nonzero(..., size=size)`` on
+      ``q_seqlen``, which lowers to a scatter that can't resolve an output
+      sharding when its inputs are dp-sharded.
+
+    Inside the wrap each device holds its local shard: with the packed dim
+    replicated every shard computes the full packed sequence (per-segment
+    attention stays correct); with the packed dim dp-sharded each device gets
+    its own segments and matching local ``cu_seqlens``/``seqlens``; a
+    tp-sharded heads dim is fine since heads are independent. ``in_specs``
+    mirror each argument's actual sharding, so no resharding is introduced.
 
     ``seqlens`` is passed in rather than computed via ``jnp.diff(cu_seqlens)``
     since ``diff`` would slice a sharded (dp*(M+1),) axis to (dp*(M+1) - 1,),
@@ -121,8 +142,9 @@ def _cudnn_packed_vision_attention(
         (N, num_heads, head_dim)
     """
     sharding = jax.typeof(q_NHK).sharding
-    dp_axis = sharding.spec[0]
-    if dp_axis is None:
+    if sharding.mesh.empty:
+        # No mesh in scope (eager/CPU unit-test path): there is no partitioner
+        # to hide the op from, and shard_map would reject the empty mesh.
         return _cudnn_packed_vision_attention_local(
             q_NHK,
             k_NHK,
@@ -132,13 +154,14 @@ def _cudnn_packed_vision_attention(
             scale,
         )
 
-    q_spec = P(dp_axis, None, None)
-    cu_spec = P(dp_axis)
+    qkv_spec = sharding.spec
+    cu_spec = jax.typeof(cu_seqlens).sharding.spec
+    sq_spec = jax.typeof(seqlens).sharding.spec
     return jax.shard_map(
         lambda q, k, v, cu, sq: _cudnn_packed_vision_attention_local(q, k, v, cu, sq, scale),
         mesh=sharding.mesh,
-        in_specs=(q_spec, q_spec, q_spec, cu_spec, cu_spec),
-        out_specs=q_spec,
+        in_specs=(qkv_spec, qkv_spec, qkv_spec, cu_spec, sq_spec),
+        out_specs=qkv_spec,
         check_vma=False,
     )(q_NHK, k_NHK, v_NHK, cu_seqlens, seqlens)
 
