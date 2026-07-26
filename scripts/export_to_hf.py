@@ -31,6 +31,11 @@ from flax import nnx
 
 from omegalax import export as export_lib
 from omegalax import registry
+from omegalax.data.chat_template import (
+    copy_tokenizer_assets,
+    load_verbatim_chat_template,
+    write_chat_template,
+)
 from omegalax.distributed.mesh import ensure_mesh, mesh_rules
 from omegalax.vlm import api as vlm_api
 
@@ -43,6 +48,18 @@ flags.DEFINE_integer("tp_size", None, "Tensor parallelism size.")
 flags.DEFINE_integer("fsdp_size", None, "FSDP parallelism size.")
 flags.DEFINE_integer("dp_size", None, "Data parallelism size.")
 flags.DEFINE_integer("pad_id", 0, "Padding token id (for cache creation).")
+flags.DEFINE_enum(
+    "chat_template",
+    "verbatim",
+    ["verbatim", "stock"],
+    "Chat template shipped with the export. 'verbatim' (default) renders "
+    "assistant turns exactly as build_chatml_text does during training -- no "
+    "<think> stripping from history, generation prompt ends at "
+    "'<|im_start|>assistant\\n'. 'stock' keeps the base model's template, "
+    "which strips <think> blocks and force-opens one at generation time -- a "
+    "train/serve mismatch for our SFT checkpoints; use only for exporting "
+    "unmodified base weights.",
+)
 
 # Trained-checkpoint mode: set to a step dir like /.../first_training_run_*/010000/
 flags.DEFINE_string(
@@ -221,6 +238,27 @@ def _restore_trained_weights(model, cfg, checkpoint_path: Path):
     return model
 
 
+def _write_serving_assets(out_dir: Path) -> None:
+    """Ship tokenizer/processor files plus the chosen chat template with the export.
+
+    Copies the base snapshot's tokenizer assets so the checkpoint dir is
+    self-contained for sglang/transformers, then (unless --chat_template=stock)
+    replaces the chat template in BOTH chat_template.json and
+    tokenizer_config.json with the verbatim CUA template so serving renders
+    exactly what training saw (see omegalax/data/chat_template.py).
+    """
+    from huggingface_hub import snapshot_download
+
+    base_dir = snapshot_download(registry.resolve_hf_repo_id(FLAGS.model_id))
+    copied = copy_tokenizer_assets(base_dir, out_dir)
+    print(f"[export] copied {len(copied)} tokenizer/processor assets from {base_dir}")
+    if FLAGS.chat_template == "verbatim":
+        written = write_chat_template(out_dir, load_verbatim_chat_template())
+        print(f"[export] installed verbatim CUA chat template into {[p.name for p in written]}")
+    else:
+        print("[export] keeping STOCK chat template (train/serve mismatch for SFT checkpoints)")
+
+
 def main(_) -> None:
     jax.distributed.initialize()
     model, cfg = load_model()
@@ -230,6 +268,7 @@ def main(_) -> None:
     out_dir = Path(FLAGS.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     path = export_lib.export_model_to_hf(model, cfg, out_dir)
+    _write_serving_assets(out_dir)
     print(f"Exported safetensors to {path}")
 
 

@@ -1948,6 +1948,7 @@ torch-tests = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "jinja2" },
     { name = "setuptools" },
     { name = "tensorboard" },
     { name = "xprof" },
@@ -1979,6 +1980,7 @@ provides-extras = ["torch-tests"]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "jinja2", specifier = ">=3.1.6" },
     { name = "setuptools", specifier = "<81" },
     { name = "tensorboard", specifier = ">=2.20.0" },
     { name = "xprof", specifier = ">=2.22.0" },
