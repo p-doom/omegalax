@@ -85,11 +85,8 @@ def build_optimizer(model: nnx.Module, train_cfg: TrainConfig) -> MixedPrecision
         chain.append(optax.clip_by_global_norm(train_cfg.max_grad_norm))
     chain.append(optax.adamw(lr, weight_decay=train_cfg.weight_decay))
     tx = optax.chain(*chain)
-    # Always wrap in MultiSteps, even for grad_accum_steps=1: the plain optimizer
-    # tail makes XLA's GPU buffer-assignment fail to reuse the chunked-CE scan
-    # buffers, allocating ~num_loss_tiles extra chunk-logit-sized temps (+10-40 GB)
-    # and OOMing at accum=1 while accum>=2 fits. Wrapping unconditionally schedules
-    # buffers correctly. k=1 is a mathematical no-op. See project_grad_accum_oom.
+    # k=1 is a no-op, but the unwrapped optimizer tail defeats XLA's reuse of the
+    # chunked-CE scan buffers and OOMs, so wrap unconditionally.
     tx = optax.MultiSteps(tx, every_k_schedule=train_cfg.grad_accum_steps)
     opt = MixedPrecisionOptimizer(model, tx)
     return opt

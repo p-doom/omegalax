@@ -112,11 +112,8 @@ def build_optimizer(
     wd = 0.0 if wrt is LoRAParam else train_cfg.weight_decay
     chain.append(optax.adamw(lr_schedule_fn, weight_decay=wd))
     tx = optax.chain(*chain)
-    # Always wrap in MultiSteps, even for grad_accum_steps=1: the plain optimizer
-    # tail makes XLA's GPU buffer-assignment fail to reuse the chunked-CE scan
-    # buffers, allocating ~num_loss_tiles extra chunk-logit-sized temps (+10-40 GB)
-    # and OOMing at accum=1 while accum>=2 fits. Wrapping unconditionally schedules
-    # buffers correctly. k=1 is a mathematical no-op. See project_grad_accum_oom.
+    # k=1 is a no-op, but the unwrapped optimizer tail defeats XLA's reuse of the
+    # chunked-CE scan buffers and OOMs, so wrap unconditionally.
     tx = optax.MultiSteps(tx, every_k_schedule=train_cfg.grad_accum_steps)
     opt = MixedPrecisionOptimizer(model, tx, wrt=wrt)
     return opt
@@ -184,9 +181,7 @@ def _write_lora_metadata(save_dir: Path, train_cfg: TrainConfig) -> None:
     """
     import json
 
-    # lora_rank/alpha are None on a full-FT run that omits the (inert) LoRA
-    # flags; coerce only when present so full-FT doesn't crash on int(None).
-    # enable_lora=false ⇒ rank/alpha are ignored by the export driver anyway.
+    # rank/alpha are None on full-FT runs (LoRA flags omitted).
     meta = {
         "enable_lora": bool(train_cfg.enable_lora),
         "lora_rank": int(train_cfg.lora_rank) if train_cfg.lora_rank is not None else None,
