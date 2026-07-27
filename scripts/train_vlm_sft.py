@@ -71,6 +71,16 @@ flags.DEFINE_float(
     None,
     "Fraction of post-warmup steps at peak LR (wsd only). Required for wsd.",
 )
+flags.DEFINE_float(
+    "vision_learning_rate",
+    None,
+    "Dedicated peak LR for the vision tower when it is trainable (i.e. neither "
+    "--freeze_vision_tower nor --enable_lora). Unset = the vision tower trains "
+    "at the main --learning_rate. When set, vision-tower params are routed "
+    "through a separate AdamW via optax.multi_transform; its schedule reuses the "
+    "text schedule shape (--lr_schedule / --warmup_steps / --lr_end_factor / "
+    "--lr_stable_fraction), differing only in peak LR.",
+)
 flags.DEFINE_float("max_grad_norm", None, "Max gradient norm for clipping (0 = no clipping).")
 flags.DEFINE_integer("grad_accum_steps", None, "Gradient accumulation steps (1 = no accumulation).")
 flags.DEFINE_integer(
@@ -255,6 +265,15 @@ def _validate_flags() -> None:
     if FLAGS.lr_schedule == "wsd" and FLAGS.lr_stable_fraction is None:
         problems.append("lr_stable_fraction (required when lr_schedule=wsd)")
 
+    # A dedicated vision LR only makes sense when the vision tower is trainable.
+    # Its schedule reuses the text schedule shape, so the lr_schedule/end_factor/
+    # stable_fraction checks above already cover it — nothing else to validate.
+    if FLAGS.vision_learning_rate is not None and (FLAGS.enable_lora or FLAGS.freeze_vision_tower):
+        problems.append(
+            "vision_learning_rate requires a trainable vision tower "
+            "(incompatible with enable_lora / freeze_vision_tower)"
+        )
+
     # Weights & Biases is opt-in via wandb_project; if on, identifying fields are required.
     if FLAGS.wandb_project:
         for name in ("wandb_entity", "wandb_group", "wandb_name"):
@@ -437,6 +456,7 @@ def main(_) -> None:
         lora_rank=FLAGS.lora_rank,
         lora_alpha=FLAGS.lora_alpha,
         freeze_vision_tower=FLAGS.freeze_vision_tower,
+        vision_learning_rate=FLAGS.vision_learning_rate,
         num_loss_tiles=FLAGS.num_loss_tiles,
     )
     resume_mode = ResumeMode(FLAGS.resume)
