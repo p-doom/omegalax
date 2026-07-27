@@ -184,10 +184,13 @@ def _write_lora_metadata(save_dir: Path, train_cfg: TrainConfig) -> None:
     """
     import json
 
+    # lora_rank/alpha are None on a full-FT run that omits the (inert) LoRA
+    # flags; coerce only when present so full-FT doesn't crash on int(None).
+    # enable_lora=false ⇒ rank/alpha are ignored by the export driver anyway.
     meta = {
         "enable_lora": bool(train_cfg.enable_lora),
-        "lora_rank": int(train_cfg.lora_rank),
-        "lora_alpha": float(train_cfg.lora_alpha),
+        "lora_rank": int(train_cfg.lora_rank) if train_cfg.lora_rank is not None else None,
+        "lora_alpha": float(train_cfg.lora_alpha) if train_cfg.lora_alpha is not None else None,
     }
     (Path(save_dir) / "lora_metadata.json").write_text(json.dumps(meta, indent=2))
 
