@@ -112,8 +112,9 @@ def build_optimizer(
     wd = 0.0 if wrt is LoRAParam else train_cfg.weight_decay
     chain.append(optax.adamw(lr_schedule_fn, weight_decay=wd))
     tx = optax.chain(*chain)
-    if train_cfg.grad_accum_steps > 1:
-        tx = optax.MultiSteps(tx, every_k_schedule=train_cfg.grad_accum_steps)
+    # k=1 is a no-op, but the unwrapped optimizer tail defeats XLA's reuse of the
+    # chunked-CE scan buffers and OOMs, so wrap unconditionally.
+    tx = optax.MultiSteps(tx, every_k_schedule=train_cfg.grad_accum_steps)
     opt = MixedPrecisionOptimizer(model, tx, wrt=wrt)
     return opt
 
@@ -180,10 +181,11 @@ def _write_lora_metadata(save_dir: Path, train_cfg: TrainConfig) -> None:
     """
     import json
 
+    # rank/alpha are None on full-FT runs (LoRA flags omitted).
     meta = {
         "enable_lora": bool(train_cfg.enable_lora),
-        "lora_rank": int(train_cfg.lora_rank),
-        "lora_alpha": float(train_cfg.lora_alpha),
+        "lora_rank": int(train_cfg.lora_rank) if train_cfg.lora_rank is not None else None,
+        "lora_alpha": float(train_cfg.lora_alpha) if train_cfg.lora_alpha is not None else None,
     }
     (Path(save_dir) / "lora_metadata.json").write_text(json.dumps(meta, indent=2))
 
