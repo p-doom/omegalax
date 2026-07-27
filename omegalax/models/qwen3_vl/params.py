@@ -74,12 +74,21 @@ def qwen3_vl_to_hf_config_dict(cfg: Qwen3VLConfig) -> dict[str, Any]:
                 "norm_topk_prob": cfg.norm_topk_prob,
             }
         )
+    # HF/sglang require `architectures` (ModelConfig indexes architectures[0]
+    # to pick the model class; a missing key crashes server startup with
+    # "'NoneType' object is not subscriptable"). Dense -> ...ForConditionalGeneration,
+    # MoE -> ...MoeForConditionalGeneration. `vision_end_token_id` is the
+    # start token + 1 for Qwen3-VL (base configs: start=151652, end=151653);
+    # the runtime config only stores the start id, so derive it.
+    arch = "Qwen3VLMoeForConditionalGeneration" if cfg.num_experts > 0 else "Qwen3VLForConditionalGeneration"
     return {
+        "architectures": [arch],
         "model_type": model_type,
         "tie_word_embeddings": cfg.tie_word_embeddings,
         "image_token_id": cfg.image_token_id,
         "video_token_id": cfg.video_token_id,
         "vision_start_token_id": cfg.vision_start_token_id,
+        "vision_end_token_id": cfg.vision_start_token_id + 1,
         "vision_config": {
             "hidden_size": cfg.vision.hidden_size,
             "intermediate_size": cfg.vision.intermediate_size,
