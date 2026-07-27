@@ -103,6 +103,10 @@ def qwen3_5_to_hf_config_dict(cfg: Qwen3_5Config) -> dict[str, Any]:
         text_dict["intermediate_size"] = txt.intermediate_size
 
     return {
+        # sglang needs an explicit architectures entry to resolve Qwen3.5 (no model_type fallback).
+        "architectures": [
+            "Qwen3_5MoeForConditionalGeneration" if is_moe else "Qwen3_5ForConditionalGeneration"
+        ],
         "model_type": top_model_type,
         "tie_word_embeddings": txt.tie_word_embeddings,
         "image_token_id": cfg.image_token_id,
