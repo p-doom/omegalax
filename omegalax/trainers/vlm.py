@@ -33,12 +33,15 @@ from omegalax.trainers.perf import (
     log_pytree_bytes,
     log_top_leaves_with_paths,
     maybe_log_step_metrics,
-    per_device_flops_per_step,
+    per_device_step_flops,
+    StepFlops,
     StepTimer,
 )
 from omegalax.trainers.optim import MixedPrecisionOptimizer
 from omegalax.trainers.lora import LoRAParam, inject_lora
 from omegalax.trainers.text import startup_log
+from omegalax.models.qwen3_vl.model import DECODER_LAYER_REMAT
+from omegalax.models.qwen3_vl.vision import VISION_BLOCK_REMAT
 from omegalax.vlm import api as vlm_api
 
 P = PartitionSpec
@@ -577,7 +580,7 @@ def run_sft(
         nonlocal last_metrics
         if prev_metrics is None:
             return
-        step_to_log, metrics_to_log, step_delta, step_per_device_flops = prev_metrics
+        step_to_log, metrics_to_log, step_delta, step_flops = prev_metrics
         result = maybe_log_step_metrics(
             step_to_log,
             metrics_to_log,
@@ -585,7 +588,7 @@ def run_sft(
             is_primary_process=is_primary_process,
             log_every=log_every,
             force=force,
-            per_device_flops=step_per_device_flops,
+            step_flops=step_flops,
             global_tokens_per_step=global_tokens_per_step,
             peak_tflops=peak_tflops,
             wandb_run=wandb_run,
@@ -638,7 +641,8 @@ def run_sft(
         accum_sup_tokens = 0.0
         accum_total_tokens = 0.0
         accum_grad_norm = 0.0
-        accum_flops = 0.0
+        accum_model_flops = 0.0
+        accum_hardware_flops = 0.0
         accum_time = datetime.timedelta(0)
         source_counts: dict[int, int] = {}
 
@@ -653,12 +657,16 @@ def run_sft(
                 for sid in sids.tolist():
                     source_counts[sid] = source_counts.get(sid, 0) + 1
             grid_thw = batch.get("image_grid_thw")
-            micro_flops = per_device_flops_per_step(
+            # LoRA freezes base weights (no weight-grad); remat flags from the model modules.
+            micro_flops = per_device_step_flops(
                 model_cfg,
                 train_cfg.seq_len,
                 train_cfg.batch_size,
                 image_grid_thw=grid_thw,
+                base_weights_trainable=not train_cfg.enable_lora,
                 vision_trainable=not (train_cfg.freeze_vision_tower or train_cfg.enable_lora),
+                decoder_remat=DECODER_LAYER_REMAT,
+                vision_remat=VISION_BLOCK_REMAT,
             )
             batch = vlm_api.shard_batch_dict(batch, model_cfg, mesh)
             _, metrics = sft_step(optimizer, batch)
@@ -668,7 +676,8 @@ def run_sft(
             accum_sup_tokens = accum_sup_tokens + metrics["supervised_tokens"]
             accum_total_tokens = accum_total_tokens + metrics["total_tokens"]
             accum_grad_norm = accum_grad_norm + metrics["grad_norm"]
-            accum_flops += micro_flops
+            accum_model_flops += micro_flops.model
+            accum_hardware_flops += micro_flops.hardware
             accum_time += micro_delta
 
         # Log memory after first step and after 5 steps
@@ -697,7 +706,12 @@ def run_sft(
                     window_metrics[f"data_source_{sid}_frac"] = cnt / total
             _log_prev_metrics()
 
-            prev_metrics = (step, window_metrics, accum_time, accum_flops)
+            prev_metrics = (
+                step,
+                window_metrics,
+                accum_time,
+                StepFlops(model=accum_model_flops, hardware=accum_hardware_flops),
+            )
 
         if checkpoint_manager is not None and save_every and step % save_every == 0:
             _save_sft_checkpoint(checkpoint_manager, optimizer, rng, step, data_iter)
