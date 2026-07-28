@@ -436,6 +436,10 @@ class TextAttention(nnx.Module):
         return out_BTD
 
 
+# Single source of truth for decoder-layer remat; also drives perf.py's HFU recompute term.
+DECODER_LAYER_REMAT = True
+
+
 class TextDecoderLayer(nnx.Module):
     def __init__(self, cfg: Qwen3VLConfig, layer_idx: int, *, rngs: nnx.Rngs):
         self.layer_idx = layer_idx

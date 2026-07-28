@@ -386,6 +386,10 @@ class VisionAttention(nnx.Module):
         return out_ND
 
 
+# Single source of truth for vision-block remat; also drives perf.py's HFU recompute term (trained tower only).
+VISION_BLOCK_REMAT = True
+
+
 class VisionBlock(nnx.Module):
     def __init__(
         self, cfg: Qwen3VLVisionConfig, hidden_shd: P, ff_shd: P, heads_shd: P, *, rngs: nnx.Rngs

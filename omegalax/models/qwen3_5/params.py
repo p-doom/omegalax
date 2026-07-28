@@ -39,6 +39,23 @@ def _jnp_dtype_to_hf(dtype: Any) -> str:
     raise ValueError(f"Unsupported dtype for HF config export: {dtype!r}")
 
 
+def _full_attention_interval(layer_types: tuple[str, ...]) -> int:
+    """Spacing at which full_attention layers recur.
+
+    sglang's Qwen3_5TextConfig.layers_block_type rebuilds the layer plan from
+    full_attention_interval via ``(l + 1) % interval == 0`` and ignores the
+    explicit layer_types list, so the field must be written or serving fails.
+    Derived here so it tracks the actual pattern instead of a hardcoded 4.
+    """
+    full = [i for i, t in enumerate(layer_types) if t == "full_attention"]
+    if not full:
+        raise ValueError("layer_types has no full_attention layer")
+    interval = full[0] + 1
+    if [i for i in range(len(layer_types)) if (i + 1) % interval == 0] != full:
+        raise ValueError(f"full_attention pattern {full} is not a single interval")
+    return interval
+
+
 def qwen3_5_to_hf_config_dict(cfg: Qwen3_5Config) -> dict[str, Any]:
     txt = cfg.text_config
     vis = cfg.vision_config
@@ -56,6 +73,7 @@ def qwen3_5_to_hf_config_dict(cfg: Qwen3_5Config) -> dict[str, Any]:
         "hidden_act": "silu",
         "rms_norm_eps": txt.rms_norm_eps,
         "layer_types": list(txt.layer_types),
+        "full_attention_interval": _full_attention_interval(txt.layer_types),
         "rope_parameters": {
             "rope_theta": txt.rope_theta,
             "partial_rotary_factor": txt.partial_rotary_factor,
@@ -103,6 +121,9 @@ def qwen3_5_to_hf_config_dict(cfg: Qwen3_5Config) -> dict[str, Any]:
             "out_hidden_size": vis.out_hidden_size,
             "num_position_embeddings": vis.num_position_embeddings,
             "hidden_act": "gelu_pytorch_tanh",
+            # Qwen3.5 vision has a single merger / no deepstack; sglang otherwise
+            # inherits Qwen3-VL's [8, 16, 24] default and mismatches at first forward.
+            "deepstack_visual_indexes": [],
             "model_type": top_model_type,
         },
         "text_config": text_dict,

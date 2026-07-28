@@ -26,7 +26,8 @@ from omegalax.trainers.lr_schedule import build_lr_schedule
 from omegalax.trainers.optim import MixedPrecisionOptimizer
 from omegalax.trainers.perf import (
     maybe_log_step_metrics,
-    per_device_flops_per_step,
+    per_device_step_flops,
+    StepFlops,
     StepTimer,
 )
 
@@ -87,8 +88,7 @@ def build_optimizer(model: nnx.Module, train_cfg: TrainConfig) -> MixedPrecision
         chain.append(optax.clip_by_global_norm(train_cfg.max_grad_norm))
     chain.append(optax.adamw(lr, weight_decay=train_cfg.weight_decay))
     tx = optax.chain(*chain)
-    if train_cfg.grad_accum_steps > 1:
-        tx = optax.MultiSteps(tx, every_k_schedule=train_cfg.grad_accum_steps)
+    tx = optax.MultiSteps(tx, every_k_schedule=train_cfg.grad_accum_steps)
     opt = MixedPrecisionOptimizer(model, tx)
     return opt
 
@@ -409,7 +409,7 @@ def run_sft(
         nonlocal last_metrics
         if prev_metrics is None:
             return
-        step_to_log, metrics_to_log, step_delta, step_per_device_flops = prev_metrics
+        step_to_log, metrics_to_log, step_delta, step_flops = prev_metrics
         result = maybe_log_step_metrics(
             step_to_log,
             metrics_to_log,
@@ -417,7 +417,7 @@ def run_sft(
             is_primary_process=is_primary_process,
             log_every=log_every,
             force=force,
-            per_device_flops=step_per_device_flops,
+            step_flops=step_flops,
             global_tokens_per_step=global_tokens_per_step,
             peak_tflops=peak_tflops,
             wandb_run=wandb_run,
@@ -433,7 +433,8 @@ def run_sft(
         accum_loss = 0.0
         accum_sup_tokens = 0.0
         accum_grad_norm = 0.0
-        accum_flops = 0.0
+        accum_model_flops = 0.0
+        accum_hardware_flops = 0.0
         accum_time = datetime.timedelta(0)
         source_counts: dict[int, int] = {}
 
@@ -443,10 +444,14 @@ def run_sft(
             if sids is not None:
                 for sid in sids.tolist():
                     source_counts[sid] = source_counts.get(sid, 0) + 1
-            micro_flops = per_device_flops_per_step(
+            # Full fine-tune; text decoder always remat. vision_trainable unused for text.
+            micro_flops = per_device_step_flops(
                 model_cfg,
                 train_cfg.seq_len,
                 train_cfg.batch_size,
+                base_weights_trainable=True,
+                vision_trainable=False,
+                decoder_remat=True,
             )
             batch = text_api.shard_batch_dict(batch, model_cfg, mesh)
             _, metrics = sft_step(optimizer, batch)
@@ -455,7 +460,8 @@ def run_sft(
             accum_loss = accum_loss + metrics["loss"]
             accum_sup_tokens = accum_sup_tokens + metrics["supervised_tokens"]
             accum_grad_norm = accum_grad_norm + metrics["grad_norm"]
-            accum_flops += micro_flops
+            accum_model_flops += micro_flops.model
+            accum_hardware_flops += micro_flops.hardware
             accum_time += micro_delta
 
         with jax.default_device("cpu"):
@@ -476,7 +482,12 @@ def run_sft(
             for sid, cnt in source_counts.items():
                 window_metrics[f"data_source_{sid}_frac"] = cnt / total
         _log_prev_metrics()
-        prev_metrics = (step, window_metrics, accum_time, accum_flops)
+        prev_metrics = (
+            step,
+            window_metrics,
+            accum_time,
+            StepFlops(model=accum_model_flops, hardware=accum_hardware_flops),
+        )
 
         if checkpoint_manager is not None and save_every and step % save_every == 0:
             _save_sft_checkpoint(checkpoint_manager, optimizer, rng, step, data_iter)

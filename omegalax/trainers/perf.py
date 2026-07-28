@@ -1,20 +1,15 @@
-"""Throughput metrics for training: FLOP counting, step timing, and MFU.
+"""Throughput metrics: FLOP counting, step timing, MFU and HFU.
 
-Uses the MaxText-style ("algorithmic FLOPs") approach: attention FLOPs are
-counted only over positions the kernel actually visits.
-- Causal text attention is halved (2*T*H*K per token) because flash kernels
-  skip masked-out future positions.
-- Vision encoder attention is block-diagonal across images (sum of N_i^2
-  rather than (sum N_i)^2) because the cuDNN packed/THD kernel skips
-  cross-image tiles entirely via cu_seqlens.
-
-This matches the convention used by Megatron-LM, NeMo, and most published
-MFU numbers, and is consistent with the kernels in
-``omegalax.models.qwen3_vl.vision``.
+Algorithmic ("MaxText-style") FLOPs: causal attention halved; vision attention
+block-diagonal across images. MFU uses model FLOPs and is LoRA-aware (a frozen
+weighted matmul costs 2x forward, not 3x; weightless attention is always 3x). HFU
+adds the jax.remat layer recompute, read from DECODER_LAYER_REMAT /
+VISION_BLOCK_REMAT; the two are equal only for a full fine-tune without recompute.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import datetime
 from typing import Any, Union
 
@@ -26,13 +21,13 @@ from omegalax.models.qwen3.config import Qwen3Config
 from omegalax.models.qwen3_5.config import Qwen3_5Config, Qwen3_5TextConfig
 from omegalax.models.qwen3_vl.config import Qwen3VLConfig
 
-# Config types that training_flops_per_token accepts (text or full VLM configs).
+# Config types that the FLOP counters accept (text or full VLM configs).
 RunPerfConfig = Union[Qwen3Config, Qwen3_5TextConfig, Qwen3_5Config, Qwen3VLConfig]
 
-# Training FLOPs = forward + backward; factor 3 (1 fwd + 2 bwd).
+# Full-FT training FLOPs = forward + backward; factor 3 (1 fwd + 2 bwd).
 TRAINING_FLOP_MULTIPLIER = 3
 
-# Peak bf16 TFLOPS (1e12 FLOP/s) for common GPUs. Used as denominator for MFU.
+# Peak bf16 TFLOPS (1e12 FLOP/s) for common GPUs. Used as denominator for MFU/HFU.
 PEAK_TFLOPS: dict[str, float] = {
     "h100_sxm": 989.0,
     "h100_pcie": 756.0,
@@ -62,27 +57,82 @@ def resolve_peak_tflops(spec: str | float | None) -> float | None:
         ) from e
 
 
-def training_flops_per_token(cfg: RunPerfConfig, seq_len: int) -> int:
-    """Theoretical training FLOPs per token (forward + backward, x3).
+@dataclasses.dataclass(frozen=True, slots=True)
+class ForwardFlops:
+    """Per-token forward matmul FLOPs, split by how the backward scales.
 
-    Counts matmuls only. Accepts text configs (Qwen3, Qwen3.5 text) or full VLM
-    configs (Qwen3_5Config → text decoder only; Qwen3VLConfig → decoder stack).
-    Returns total FLOPs per token for one training step (already multiplied by 3).
+    weighted_layers: weighted matmuls in the remat layer (2x frozen / 3x trainable).
+    attention: weightless matmuls, always 3x. head: lm_head, outside remat.
+    """
+
+    weighted_layers: int
+    attention: int
+    head: int
+
+    @property
+    def forward(self) -> int:
+        return self.weighted_layers + self.attention + self.head
+
+    def model_flops(self, *, base_weights_trainable: bool) -> int:
+        """Theoretical training FLOPs/token (fwd+bwd), LoRA-aware, no recompute."""
+        weighted_mult = 3 if base_weights_trainable else 2
+        return weighted_mult * (self.weighted_layers + self.head) + 3 * self.attention
+
+    def recompute_flops(self) -> int:
+        """Extra FLOPs/token from recomputing the rematerialized layer forward."""
+        return self.weighted_layers + self.attention
+
+    def hardware_flops(self, *, base_weights_trainable: bool, decoder_remat: bool) -> int:
+        """Actual hardware FLOPs/token = model FLOPs + activation-checkpoint recompute."""
+        model = self.model_flops(base_weights_trainable=base_weights_trainable)
+        return model + (self.recompute_flops() if decoder_remat else 0)
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class VisionFlops:
+    """Vision-tower forward matmul FLOPs for one training step (whole batch)."""
+
+    forward: int  # patch-embed + transformer blocks + patch mergers
+    block_forward: int  # only the transformer blocks (the rematerialized region)
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class StepFlops:
+    """Per-device FLOPs for one training step, split into model vs hardware."""
+
+    model: float  # theoretical model FLOPs (drives MFU); LoRA-aware, no recompute
+    hardware: float  # actual hardware FLOPs (drives HFU); includes remat recompute
+
+
+def forward_flops_per_token(cfg: RunPerfConfig, seq_len: int) -> ForwardFlops:
+    """Per-token forward matmul FLOPs (text decoder), decomposed for MFU/HFU.
+
+    Accepts text or full VLM configs; the vision tower is counted separately by
+    ``qwen3_vl_vision_flops``.
     """
     if isinstance(cfg, Qwen3_5Config):
-        return _training_flops_per_token_qwen3_5(cfg.text_config, seq_len)
+        return _forward_flops_qwen3_5(cfg.text_config, seq_len)
     if isinstance(cfg, Qwen3VLConfig):
-        return _training_flops_per_token_qwen3_vl(cfg, seq_len)
+        return _forward_flops_qwen3_vl(cfg, seq_len)
     if isinstance(cfg, Qwen3Config):
         if cfg.is_moe:
-            return _training_flops_per_token_qwen3_moe(cfg, seq_len)
-        return _training_flops_per_token_qwen3_dense(cfg, seq_len)
+            return _forward_flops_qwen3_moe(cfg, seq_len)
+        return _forward_flops_qwen3_dense(cfg, seq_len)
     if isinstance(cfg, Qwen3_5TextConfig):
-        return _training_flops_per_token_qwen3_5(cfg, seq_len)
+        return _forward_flops_qwen3_5(cfg, seq_len)
     raise TypeError(f"Unsupported config for FLOP counting: {type(cfg)}")
 
 
-def _training_flops_per_token_qwen3_dense(cfg: Qwen3Config, seq_len: int) -> int:
+def training_flops_per_token(cfg: RunPerfConfig, seq_len: int) -> int:
+    """Full fine-tune training FLOPs per token (3 * forward).
+
+    For LoRA/frozen-aware counting use
+    ``forward_flops_per_token(...).model_flops(base_weights_trainable=...)``.
+    """
+    return TRAINING_FLOP_MULTIPLIER * forward_flops_per_token(cfg, seq_len).forward
+
+
+def _forward_flops_qwen3_dense(cfg: Qwen3Config, seq_len: int) -> ForwardFlops:
     D = cfg.emb_dim
     H = cfg.num_heads
     G = cfg.num_kv_heads
@@ -92,24 +142,19 @@ def _training_flops_per_token_qwen3_dense(cfg: Qwen3Config, seq_len: int) -> int
     L = cfg.num_layers
     T = seq_len
 
-    # Per layer, per token (matmul FLOPs: 2 * M * N * K for [M,K] @ [K,N])
     qkv_flops = 2 * D * (H + 2 * G) * K
-    attn_dot_flops = 2 * T * H * K  # causal attention: halved
+    attn_dot_flops = 2 * T * H * K  # causal: halved (weightless)
     o_proj_flops = 2 * H * K * D
-    attn_per_layer = qkv_flops + attn_dot_flops + o_proj_flops
-    mlp_per_layer = 2 * 3 * D * F  # SwiGLU: gate, up, down
-    embedding_flops = 2 * D * V
+    mlp_flops = 2 * 3 * D * F  # SwiGLU gate/up/down
 
-    forward_per_token = L * (attn_per_layer + mlp_per_layer) + embedding_flops
-    return forward_per_token * TRAINING_FLOP_MULTIPLIER
+    weighted_layers = L * (qkv_flops + o_proj_flops + mlp_flops)
+    attention = L * attn_dot_flops
+    head = 2 * D * V
+    return ForwardFlops(weighted_layers=weighted_layers, attention=attention, head=head)
 
 
-def _training_flops_per_token_qwen3_vl(cfg: Qwen3VLConfig, seq_len: int) -> int:
-    """Qwen3-VL decoder FLOPs (same structure as Qwen3 MoE/dense).
-
-    This excludes the vision tower because its cost depends on the concrete
-    ``image_grid_thw`` values for each batch.
-    """
+def _forward_flops_qwen3_vl(cfg: Qwen3VLConfig, seq_len: int) -> ForwardFlops:
+    """Qwen3-VL decoder forward FLOPs (excludes the vision tower)."""
     D = cfg.emb_dim
     H = cfg.num_heads
     G = cfg.num_kv_heads
@@ -123,51 +168,123 @@ def _training_flops_per_token_qwen3_vl(cfg: Qwen3VLConfig, seq_len: int) -> int:
     T = seq_len
 
     qkv_flops = 2 * D * (H + 2 * G) * K
-    attn_dot_flops = 2 * T * H * K  # causal attention: halved
+    attn_dot_flops = 2 * T * H * K  # causal attention: halved (weightless)
     o_proj_flops = 2 * H * K * D
-    attn_per_layer = qkv_flops + attn_dot_flops + o_proj_flops
 
-    layer_flops = 0
+    weighted_layers = 0
     for layer_idx in range(L):
-        layer_flops += attn_per_layer
+        weighted_layers += qkv_flops + o_proj_flops
         if cfg.is_moe_layer(layer_idx):
             gate_flops = 2 * D * E
             expert_flops = k * (2 * 3 * D * F_moe)
-            layer_flops += gate_flops + expert_flops
+            weighted_layers += gate_flops + expert_flops
         else:
-            layer_flops += 2 * 3 * D * F_dense
+            weighted_layers += 2 * 3 * D * F_dense
 
-    embedding_flops = 2 * D * V
-    forward_per_token = layer_flops + embedding_flops
-    return forward_per_token * TRAINING_FLOP_MULTIPLIER
+    attention = L * attn_dot_flops
+    head = 2 * D * V
+    return ForwardFlops(weighted_layers=weighted_layers, attention=attention, head=head)
 
 
-def qwen3_vl_vision_training_flops(
-    cfg: Qwen3VLConfig, image_grid_thw: Any | None, *, vision_trainable: bool = True
-) -> int:
-    """Theoretical Qwen3-VL vision-tower FLOPs for one training step.
+def _forward_flops_qwen3_moe(cfg: Qwen3Config, seq_len: int) -> ForwardFlops:
+    D = cfg.emb_dim
+    H = cfg.num_heads
+    G = cfg.num_kv_heads
+    K = cfg.head_dim
+    F_dense = cfg.mlp_dim
+    F_moe = cfg.moe_intermediate_size
+    E = cfg.num_experts
+    k = cfg.num_experts_per_tok
+    V = cfg.vocab_size
+    L = cfg.num_layers
+    T = seq_len
 
-    Counts matmuls only and matches the current implementation in
-    ``omegalax.models.qwen3_vl.vision``:
-    - patch embed and patch mergers are linear layers (linear in token count);
-    - vision attention is block-diagonal across images: the cuDNN packed/THD
-      kernel uses ``vision_cu_seqlens`` to skip cross-image tiles, so per-image
-      attention costs are summed (``sum_i 4 * N_i^2 * H * K``) rather than
-      computed over the concatenated batch (``4 * (sum_i N_i)^2 * H * K``).
+    qkv_flops = 2 * D * (H + 2 * G) * K
+    attn_dot_flops = 2 * T * H * K  # causal attention: halved (weightless)
+    o_proj_flops = 2 * H * K * D
 
-    ``vision_trainable`` controls the forward/backward multiplier. When the
-    vision tower is trained, FLOPs are forward + backward (``x3``). When it is
-    frozen (``--freeze_vision_tower`` or ``--enable_lora``, which take gradients
-    only ``wrt`` non-vision params), no backward is built for the tower, so it
-    runs forward-only (``x1``). Counting frozen vision at ``x3`` would inflate
-    MFU because the vision tower dominates this VLM's FLOPs.
+    weighted_layers = 0
+    for layer_idx in range(L):
+        weighted_layers += qkv_flops + o_proj_flops
+        if cfg.is_moe_layer(layer_idx):
+            gate_flops = 2 * D * E
+            expert_flops = k * (2 * 3 * D * F_moe)
+            weighted_layers += gate_flops + expert_flops
+        else:
+            weighted_layers += 2 * 3 * D * F_dense
+
+    attention = L * attn_dot_flops
+    head = 2 * D * V
+    return ForwardFlops(weighted_layers=weighted_layers, attention=attention, head=head)
+
+
+def _forward_flops_qwen3_5(cfg: Qwen3_5TextConfig, seq_len: int) -> ForwardFlops:
+    D = cfg.hidden_size
+    H = cfg.num_attention_heads
+    G = cfg.num_key_value_heads
+    K = cfg.head_dim
+    V = cfg.vocab_size
+    T = seq_len
+
+    key_dim = cfg.linear_key_head_dim * cfg.linear_num_key_heads
+    value_dim = cfg.linear_value_head_dim * cfg.linear_num_value_heads
+    nv = cfg.linear_num_value_heads
+    ak = cfg.linear_key_head_dim
+    av = cfg.linear_value_head_dim
+
+    weighted_layers = 0
+    attention = 0
+    for layer_type in cfg.layer_types:
+        if layer_type == "full_attention":
+            q_flops = 2 * D * (H * K * 2)
+            kv_flops = 2 * D * (2 * G * K)
+            attn_dot = 2 * T * H * K  # causal attention: halved (weightless)
+            o_flops = 2 * H * K * D
+            weighted_layers += q_flops + kv_flops + o_flops
+            attention += attn_dot
+        else:
+            conv_dim = key_dim * 2 + value_dim
+            in_proj_qkv = 2 * D * conv_dim
+            in_proj_z = 2 * D * value_dim
+            in_proj_b = 2 * D * nv
+            in_proj_a = 2 * D * nv
+            out_proj = 2 * value_dim * D
+            delta_rule_per_token = 2 * nv * (ak * av)  # weightless state recurrence
+            weighted_layers += in_proj_qkv + in_proj_z + in_proj_b + in_proj_a + out_proj
+            attention += delta_rule_per_token
+
+        if cfg.is_moe:
+            E = cfg.num_experts
+            k = cfg.num_experts_per_tok
+            F_moe = cfg.moe_intermediate_size
+            F_shared = cfg.shared_expert_intermediate_size
+            router_flops = 2 * D * E
+            gate_up_per_expert = 2 * (2 * F_moe) * D
+            down_per_expert = 2 * F_moe * D
+            routed_flops = k * (gate_up_per_expert + down_per_expert)
+            shared_flops = 2 * 3 * D * F_shared
+            shared_gate_flops = 2 * D * 1
+            weighted_layers += router_flops + routed_flops + shared_flops + shared_gate_flops
+        else:
+            F_dense = cfg.intermediate_size
+            weighted_layers += 2 * 3 * D * F_dense
+
+    head = 2 * D * V
+    return ForwardFlops(weighted_layers=weighted_layers, attention=attention, head=head)
+
+
+def qwen3_vl_vision_flops(cfg: Qwen3VLConfig, image_grid_thw: Any | None) -> VisionFlops:
+    """Qwen3-VL vision-tower forward matmul FLOPs for one step (no fwd/bwd multiplier).
+
+    Vision attention is block-diagonal across images (sum_i N_i^2). ``block_forward``
+    is the jax.remat'd transformer-block portion, used for HFU on a trained tower.
     """
     if image_grid_thw is None:
-        return 0
+        return VisionFlops(forward=0, block_forward=0)
 
     grid_N3 = np.asarray(image_grid_thw, dtype=np.int64)
     if grid_N3.size == 0:
-        return 0
+        return VisionFlops(forward=0, block_forward=0)
     if grid_N3.ndim != 2 or grid_N3.shape[1] != 3:
         raise ValueError(
             f"Expected image_grid_thw with shape (num_images, 3), got {grid_N3.shape}."
@@ -181,7 +298,7 @@ def qwen3_vl_vision_training_flops(
     sum_sq_tokens = int(np.sum(per_image_tokens * per_image_tokens))
     merged_tokens = int(np.sum(grid_N3[:, 0] * (grid_N3[:, 1] // merge) * (grid_N3[:, 2] // merge)))
     if total_tokens <= 0 or merged_tokens <= 0:
-        return 0
+        return VisionFlops(forward=0, block_forward=0)
 
     D = vis.hidden_size
     F = vis.intermediate_size
@@ -204,96 +321,15 @@ def qwen3_vl_vision_training_flops(
     merger_flops = num_mergers * (merger_fc1_flops + merger_fc2_flops)
 
     forward = patch_embed_flops + block_flops + merger_flops
-    multiplier = TRAINING_FLOP_MULTIPLIER if vision_trainable else 1
-    return forward * multiplier
+    return VisionFlops(forward=forward, block_forward=block_flops)
 
 
-def _training_flops_per_token_qwen3_moe(cfg: Qwen3Config, seq_len: int) -> int:
-    D = cfg.emb_dim
-    H = cfg.num_heads
-    G = cfg.num_kv_heads
-    K = cfg.head_dim
-    F_dense = cfg.mlp_dim
-    F_moe = cfg.moe_intermediate_size
-    E = cfg.num_experts
-    k = cfg.num_experts_per_tok
-    V = cfg.vocab_size
-    L = cfg.num_layers
-    T = seq_len
-
-    qkv_flops = 2 * D * (H + 2 * G) * K
-    attn_dot_flops = 2 * T * H * K  # causal attention: halved
-    o_proj_flops = 2 * H * K * D
-    attn_per_layer = qkv_flops + attn_dot_flops + o_proj_flops
-
-    layer_flops = 0
-    for layer_idx in range(L):
-        layer_flops += attn_per_layer
-        if cfg.is_moe_layer(layer_idx):
-            gate_flops = 2 * D * E
-            expert_flops = k * (2 * 3 * D * F_moe)
-            layer_flops += gate_flops + expert_flops
-        else:
-            layer_flops += 2 * 3 * D * F_dense
-
-    embedding_flops = 2 * D * V
-    forward_per_token = layer_flops + embedding_flops
-    return forward_per_token * TRAINING_FLOP_MULTIPLIER
-
-
-def _training_flops_per_token_qwen3_5(cfg: Qwen3_5TextConfig, seq_len: int) -> int:
-    D = cfg.hidden_size
-    H = cfg.num_attention_heads
-    G = cfg.num_key_value_heads
-    K = cfg.head_dim
-    V = cfg.vocab_size
-    T = seq_len
-
-    key_dim = cfg.linear_key_head_dim * cfg.linear_num_key_heads
-    value_dim = cfg.linear_value_head_dim * cfg.linear_num_value_heads
-    nv = cfg.linear_num_value_heads
-    ak = cfg.linear_key_head_dim
-    av = cfg.linear_value_head_dim
-
-    layer_flops = 0
-    for layer_idx, layer_type in enumerate(cfg.layer_types):
-        if layer_type == "full_attention":
-            q_flops = 2 * D * (H * K * 2)
-            kv_flops = 2 * D * (2 * G * K)
-            attn_dot = 2 * T * H * K  # causal attention: halved
-            o_flops = 2 * H * K * D
-            layer_flops += q_flops + kv_flops + attn_dot + o_flops
-        else:
-            conv_dim = key_dim * 2 + value_dim
-            in_proj_qkv = 2 * D * conv_dim
-            in_proj_z = 2 * D * value_dim
-            in_proj_b = 2 * D * nv
-            in_proj_a = 2 * D * nv
-            out_proj = 2 * value_dim * D
-            delta_rule_per_token = 2 * nv * (ak * av)
-            layer_flops += (
-                in_proj_qkv + in_proj_z + in_proj_b + in_proj_a + out_proj + delta_rule_per_token
-            )
-
-        if cfg.is_moe:
-            E = cfg.num_experts
-            k = cfg.num_experts_per_tok
-            F_moe = cfg.moe_intermediate_size
-            F_shared = cfg.shared_expert_intermediate_size
-            router_flops = 2 * D * E
-            gate_up_per_expert = 2 * (2 * F_moe) * D
-            down_per_expert = 2 * F_moe * D
-            routed_flops = k * (gate_up_per_expert + down_per_expert)
-            shared_flops = 2 * 3 * D * F_shared
-            shared_gate_flops = 2 * D * 1
-            layer_flops += router_flops + routed_flops + shared_flops + shared_gate_flops
-        else:
-            F_dense = cfg.intermediate_size
-            layer_flops += 2 * 3 * D * F_dense
-
-    embedding_flops = 2 * D * V
-    forward_per_token = layer_flops + embedding_flops
-    return forward_per_token * TRAINING_FLOP_MULTIPLIER
+def qwen3_vl_vision_training_flops(
+    cfg: Qwen3VLConfig, image_grid_thw: Any | None, *, vision_trainable: bool = True
+) -> int:
+    """Vision-tower model FLOPs for one step: x3 if trained, x1 if frozen (no backward built)."""
+    forward = qwen3_vl_vision_flops(cfg, image_grid_thw).forward
+    return forward * (TRAINING_FLOP_MULTIPLIER if vision_trainable else 1)
 
 
 def _tree_global_bytes(tree) -> int:
@@ -488,58 +524,83 @@ class StepTimer:
         return delta
 
 
-def per_device_flops_per_step(
+def per_device_step_flops(
     cfg: RunPerfConfig,
     seq_len: int,
     batch_size: int,
     image_grid_thw: Any | None = None,
     *,
-    vision_trainable: bool = True,
-) -> float:
-    """Total training FLOPs per step, divided by device count.
+    base_weights_trainable: bool,
+    vision_trainable: bool,
+    decoder_remat: bool,
+    vision_remat: bool = True,
+) -> StepFlops:
+    """Per-device model (MFU) and hardware (HFU) FLOPs for one step.
 
-    For Qwen3-VL, ``image_grid_thw`` adds the vision-tower FLOPs for the
-    concrete batch. Text-decoder FLOPs are still computed from the padded
-    ``seq_len`` and ``batch_size``. ``vision_trainable=False`` counts the
-    frozen vision tower forward-only (``x1``) instead of forward+backward
-    (``x3``); see ``qwen3_vl_vision_training_flops``.
+    base_weights_trainable is False under LoRA (frozen base weights, adapters omitted).
     """
-    total = training_flops_per_token(cfg, seq_len) * seq_len * batch_size
+    fwd = forward_flops_per_token(cfg, seq_len)
+    tokens = seq_len * batch_size
+    model = fwd.model_flops(base_weights_trainable=base_weights_trainable) * tokens
+    hardware = (
+        fwd.hardware_flops(base_weights_trainable=base_weights_trainable, decoder_remat=decoder_remat)
+        * tokens
+    )
+
     if isinstance(cfg, Qwen3VLConfig):
-        total += qwen3_vl_vision_training_flops(
-            cfg, image_grid_thw, vision_trainable=vision_trainable
-        )
-    return total / max(1, jax.device_count())
+        vis = qwen3_vl_vision_flops(cfg, image_grid_thw)
+        if vision_trainable:
+            vision_model = TRAINING_FLOP_MULTIPLIER * vis.forward
+            vision_recompute = vis.block_forward if vision_remat else 0
+        else:
+            # Frozen tower: forward-only, no backward and therefore no recompute.
+            vision_model = vis.forward
+            vision_recompute = 0
+        model += vision_model
+        hardware += vision_model + vision_recompute
+
+    n_devices = max(1, jax.device_count())
+    return StepFlops(model=model / n_devices, hardware=hardware / n_devices)
 
 
 def step_metrics(
-    per_device_flops: float,
+    step_flops: StepFlops,
     step_delta: datetime.timedelta,
     global_tokens_per_step: int,
     peak_tflops: float | None,
 ) -> dict[str, float]:
-    """Compute tokens/s, TFLOPS/device, and MFU from step timing."""
+    """Tokens/s, model/hardware TFLOPS/device, and MFU/HFU from step timing.
+
+    tflops_per_device aliases model_tflops_per_device (mfu == tflops_per_device / peak).
+    """
     sec = step_delta.total_seconds()
     if sec <= 0:
         return {
             "step_time_s": 0.0,
             "global_tokens_per_sec": 0.0,
             "tokens_per_sec_per_device": 0.0,
+            "model_tflops_per_device": 0.0,
+            "hardware_tflops_per_device": 0.0,
             "tflops_per_device": 0.0,
             "mfu": 0.0,
+            "hfu": 0.0,
         }
     n_devices = jax.device_count()
     global_tokens_per_sec = global_tokens_per_step / sec
     tokens_per_sec_per_device = global_tokens_per_sec / n_devices
-    flops_per_sec_per_device = per_device_flops / sec
-    tflops_per_device = flops_per_sec_per_device / 1e12
-    mfu = (flops_per_sec_per_device / (peak_tflops * 1e12)) if peak_tflops else 0.0
+    model_tflops = step_flops.model / sec / 1e12
+    hardware_tflops = step_flops.hardware / sec / 1e12
+    mfu = (model_tflops / peak_tflops) if peak_tflops else 0.0
+    hfu = (hardware_tflops / peak_tflops) if peak_tflops else 0.0
     return {
         "step_time_s": sec,
         "global_tokens_per_sec": global_tokens_per_sec,
         "tokens_per_sec_per_device": tokens_per_sec_per_device,
-        "tflops_per_device": tflops_per_device,
+        "model_tflops_per_device": model_tflops,
+        "hardware_tflops_per_device": hardware_tflops,
+        "tflops_per_device": model_tflops,
         "mfu": mfu,
+        "hfu": hfu,
     }
 
 
@@ -551,7 +612,7 @@ def maybe_log_step_metrics(
     is_primary_process: bool,
     log_every: int,
     force: bool = False,
-    per_device_flops: float,
+    step_flops: StepFlops,
     global_tokens_per_step: int,
     peak_tflops: float | None,
     wandb_run: Any = None,
@@ -571,7 +632,7 @@ def maybe_log_step_metrics(
     if batch_size > 0:
         host_metrics["total_samples"] = step_to_log * batch_size
     host_metrics.update(
-        step_metrics(per_device_flops, step_delta, global_tokens_per_step, peak_tflops)
+        step_metrics(step_flops, step_delta, global_tokens_per_step, peak_tflops)
     )
 
     if wandb_run is not None and is_primary_process:
@@ -594,8 +655,10 @@ def maybe_log_step_metrics(
             f"train/supervised_tokens={host_metrics.get('supervised_tokens', 0.0):.0f} "
             f"train/total_tokens={host_metrics.get('total_tokens', 0.0):.0f} "
             f"train/lr={lr:.2e} "
-            f"train/tflops_per_device={host_metrics.get('tflops_per_device', 0.0):.2f} "
+            f"train/model_tflops_per_device={host_metrics.get('model_tflops_per_device', 0.0):.2f} "
+            f"train/hardware_tflops_per_device={host_metrics.get('hardware_tflops_per_device', 0.0):.2f} "
             f"train/mfu={host_metrics.get('mfu', 0.0) * 100:.1f}% "
+            f"train/hfu={host_metrics.get('hfu', 0.0) * 100:.1f}% "
             f"train/tok/s/dev={host_metrics.get('tokens_per_sec_per_device', 0.0):.0f} ",
             flush=True,
         )
