@@ -48,6 +48,34 @@ def _write_metadata(path: Path, metadata: dict) -> None:
 
 
 class TrainingContractTest(absltest.TestCase):
+    def test_last_to_first_routing_is_resume_protected_without_changing_eval_config(self):
+        with test_temp_dir() as tmp:
+            tmpdir = Path(tmp)
+            index = tmpdir / "index"
+            _write_metadata(
+                index,
+                {
+                    "format": STATEPASSING_FIXED_C_INDEX_FORMAT,
+                    "num_segments": 6,
+                },
+            )
+            same_layer = build_training_contract(index, **_state_config())
+            last_to_first = build_training_contract(
+                index,
+                **_state_config(gdn_layer_limit=1),
+                gdn_state_routing="last_to_first",
+            )
+
+            self.assertNotIn("training_statepassing_config", same_layer)
+            self.assertEqual(
+                last_to_first["training_statepassing_config"],
+                {"gdn_state_routing": "last_to_first"},
+            )
+            checkpoint = tmpdir / "checkpoint"
+            ensure_training_contract(checkpoint, last_to_first)
+            with self.assertRaisesRegex(ValueError, "conflicts"):
+                ensure_training_contract(checkpoint, same_layer)
+
     def test_fixed_c_contract_resolves_actual_num_segments(self):
         with test_temp_dir() as tmp:
             tmpdir = Path(tmp)

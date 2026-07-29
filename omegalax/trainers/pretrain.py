@@ -86,6 +86,26 @@ class PretrainMode(enum.StrEnum):
         return self is not PretrainMode.IID_BASELINE
 
 
+class GdnStateRouting(enum.StrEnum):
+    SAME_LAYER = "same_layer"
+    LAST_TO_FIRST = "last_to_first"
+
+
+def validate_gdn_state_routing(
+    *,
+    pass_gdn_state: bool,
+    gdn_layer_limit: int | None,
+    gdn_state_routing: GdnStateRouting | str,
+) -> GdnStateRouting:
+    routing = GdnStateRouting(gdn_state_routing)
+    if routing is GdnStateRouting.LAST_TO_FIRST:
+        if not pass_gdn_state:
+            raise ValueError("last_to_first requires pass_gdn_state=True")
+        if gdn_layer_limit != 1:
+            raise ValueError("last_to_first requires gdn_layer_limit=1")
+    return routing
+
+
 @dataclasses.dataclass(frozen=True)
 class StatepassingTargetMasks:
     total: jax.Array
@@ -147,7 +167,20 @@ def _select_gdn_states_for_carry(
     *,
     pass_gdn_state: bool,
     gdn_layer_limit: int | None,
+    gdn_state_routing: GdnStateRouting | str = GdnStateRouting.SAME_LAYER,
 ) -> tuple[jax.Array, ...] | None:
+    routing = validate_gdn_state_routing(
+        pass_gdn_state=pass_gdn_state,
+        gdn_layer_limit=gdn_layer_limit,
+        gdn_state_routing=gdn_state_routing,
+    )
+    if routing is GdnStateRouting.LAST_TO_FIRST:
+        if not states:
+            raise ValueError("last_to_first requires at least one GDN layer")
+        return tuple(
+            states[-1] if state_idx == 0 else jnp.zeros_like(state)
+            for state_idx, state in enumerate(states)
+        )
     return _select_layer_states_for_carry(
         states,
         pass_state=pass_gdn_state,
@@ -366,6 +399,7 @@ def _statepassing_loss_stats(
     bptt_chunks: int | None = None,
     pass_gdn_state: bool = True,
     gdn_layer_limit: int | None = None,
+    gdn_state_routing: GdnStateRouting | str = GdnStateRouting.SAME_LAYER,
     pass_rope_positions: bool = False,
     pass_conv_state: bool = False,
 ):
@@ -429,6 +463,7 @@ def _statepassing_loss_stats(
             final_states,
             pass_gdn_state=pass_gdn_state,
             gdn_layer_limit=gdn_layer_limit,
+            gdn_state_routing=gdn_state_routing,
         )
         if pass_conv_state:
             carried_conv_states = _select_conv_states_for_carry(
@@ -481,6 +516,7 @@ def make_pretrain_train_step(
     bptt_chunks: int | None = None,
     pass_gdn_state: bool = True,
     gdn_layer_limit: int | None = None,
+    gdn_state_routing: GdnStateRouting | str = GdnStateRouting.SAME_LAYER,
     pass_rope_positions: bool = False,
     pass_conv_state: bool = False,
 ):
@@ -498,6 +534,7 @@ def make_pretrain_train_step(
                 bptt_chunks=bptt_chunks,
                 pass_gdn_state=pass_gdn_state,
                 gdn_layer_limit=gdn_layer_limit,
+                gdn_state_routing=gdn_state_routing,
                 pass_rope_positions=pass_rope_positions,
                 pass_conv_state=pass_conv_state,
             )
@@ -518,6 +555,7 @@ def make_pretrain_eval_step(
     bptt_chunks: int | None = None,
     pass_gdn_state: bool = True,
     gdn_layer_limit: int | None = None,
+    gdn_state_routing: GdnStateRouting | str = GdnStateRouting.SAME_LAYER,
     pass_rope_positions: bool = False,
     pass_conv_state: bool = False,
 ):
@@ -535,6 +573,7 @@ def make_pretrain_eval_step(
                 bptt_chunks=bptt_chunks,
                 pass_gdn_state=pass_gdn_state,
                 gdn_layer_limit=gdn_layer_limit,
+                gdn_state_routing=gdn_state_routing,
                 pass_rope_positions=pass_rope_positions,
                 pass_conv_state=pass_conv_state,
             )
@@ -797,6 +836,7 @@ def run_pretrain(
     bptt_chunks: int | None = None,
     pass_gdn_state: bool = True,
     gdn_layer_limit: int | None = None,
+    gdn_state_routing: GdnStateRouting | str = GdnStateRouting.SAME_LAYER,
     pass_rope_positions: bool = False,
     pass_conv_state: bool = False,
     lr_contract_explicit_fields: Collection[str] | None = None,
@@ -869,6 +909,7 @@ def run_pretrain(
         bptt_chunks=bptt_chunks,
         pass_gdn_state=pass_gdn_state,
         gdn_layer_limit=gdn_layer_limit,
+        gdn_state_routing=gdn_state_routing,
         pass_rope_positions=pass_rope_positions,
         pass_conv_state=pass_conv_state,
     )
@@ -879,6 +920,7 @@ def run_pretrain(
         bptt_chunks=bptt_chunks,
         pass_gdn_state=pass_gdn_state,
         gdn_layer_limit=gdn_layer_limit,
+        gdn_state_routing=gdn_state_routing,
         pass_rope_positions=pass_rope_positions,
         pass_conv_state=pass_conv_state,
     )
@@ -1068,6 +1110,7 @@ def run_statepassing_curriculum(
     bptt_chunks: int | None = None,
     pass_gdn_state: bool = True,
     gdn_layer_limit: int | None = None,
+    gdn_state_routing: GdnStateRouting | str = GdnStateRouting.SAME_LAYER,
     pass_rope_positions: bool = False,
     pass_conv_state: bool = False,
     lr_contract_explicit_fields: Collection[str] | None = None,
@@ -1236,6 +1279,7 @@ def run_statepassing_curriculum(
                 bptt_chunks=phase_bptt_chunks,
                 pass_gdn_state=pass_gdn_state,
                 gdn_layer_limit=gdn_layer_limit,
+                gdn_state_routing=gdn_state_routing,
                 pass_rope_positions=pass_rope_positions,
                 pass_conv_state=pass_conv_state,
             )

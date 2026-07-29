@@ -45,6 +45,47 @@ def _cross_entropy_nll(logits_NV: jax.Array, targets_N: jax.Array) -> jax.Array:
     return logsumexp_N - target_logits_N
 
 
+def _entropy_with_logits(logits_NV: jax.Array) -> jax.Array:
+    logits_NV = logits_NV.astype(jnp.float32)
+    log_probs_NV = jax.nn.log_softmax(logits_NV, axis=-1)
+    return -jnp.sum(jnp.exp(log_probs_NV) * log_probs_NV, axis=-1)
+
+
+def chunked_token_entropies(
+    hidden_BTD: jax.Array,
+    lm_head_kernel_DV: jax.Array,
+    num_tiles: int = 8,
+    logits_out_sharding: P | None = None,
+) -> jax.Array:
+    """Return predictive entropy for every next-token position, shape ``(B, T - 1)``."""
+    B, T, D = hidden_BTD.shape
+    hidden_BTD = hidden_BTD[:, :-1, :]
+    T1 = T - 1
+
+    if num_tiles <= 1 or T1 < num_tiles:
+        logits_BTV = jnp.einsum(
+            "BTD,DV->BTV", hidden_BTD, lm_head_kernel_DV, out_sharding=logits_out_sharding
+        )
+        return _entropy_with_logits(logits_BTV)
+
+    chunk_size = -(-T1 // num_tiles)
+    pad_t = chunk_size * num_tiles - T1
+    if pad_t > 0:
+        hidden_BTD = jnp.pad(hidden_BTD, ((0, 0), (0, pad_t), (0, 0)))
+    hidden_BCSD = hidden_BTD.reshape(B, num_tiles, chunk_size, D)
+
+    @jax.remat
+    def _remat_chunk(h_BSD):
+        logits_BSV = jnp.einsum(
+            "BSD,DV->BSV", h_BSD, lm_head_kernel_DV, out_sharding=logits_out_sharding
+        )
+        return _entropy_with_logits(logits_BSV)
+
+    entropy_CBS = jax.lax.map(_remat_chunk, jnp.moveaxis(hidden_BCSD, 1, 0))
+    entropy_BT = jnp.moveaxis(entropy_CBS, 0, 1).reshape(B, num_tiles * chunk_size)
+    return entropy_BT[:, :T1]
+
+
 def chunked_cross_entropy_stats(
     hidden_BTD: jax.Array,
     lm_head_kernel_DV: jax.Array,

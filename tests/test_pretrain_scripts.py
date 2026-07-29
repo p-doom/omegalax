@@ -235,8 +235,9 @@ train_text_pretrain.FLAGS(["probe", "--train_index_path=/idx"])
 
 with flagsaver.flagsaver(
     bptt_chunks=4,
-    pass_gdn_state=False,
+    pass_gdn_state=True,
     gdn_layer_limit=1,
+    gdn_state_routing="last_to_first",
     pass_rope_positions=True,
     pass_conv_state=True,
 ):
@@ -247,8 +248,9 @@ print(json.dumps(kwargs))
         )
 
         self.assertEqual(output["bptt_chunks"], 4)
-        self.assertFalse(output["pass_gdn_state"])
+        self.assertTrue(output["pass_gdn_state"])
         self.assertEqual(output["gdn_layer_limit"], 1)
+        self.assertEqual(output["gdn_state_routing"], "last_to_first")
         self.assertTrue(output["pass_rope_positions"])
         self.assertTrue(output["pass_conv_state"])
 
@@ -538,8 +540,9 @@ class SubmitTextPretrainSlurmScriptTest(absltest.TestCase):
             submit_seq_len=2048,
             submit_num_segments=6,
             submit_bptt_chunks=4,
-            submit_pass_gdn_state=False,
+            submit_pass_gdn_state=True,
             submit_gdn_layer_limit=1,
+            submit_gdn_state_routing="last_to_first",
             submit_pass_rope_positions=True,
             submit_pass_conv_state=True,
         ):
@@ -581,8 +584,9 @@ class SubmitTextPretrainSlurmScriptTest(absltest.TestCase):
         self.assertIn("--train_index_path=${TRAIN_INDEX_ROOT}", train_flags)
         self.assertFalse(any(flag.startswith("--val_index_path") for flag in train_flags))
         self.assertIn("--bptt_chunks=4", train_flags)
-        self.assertIn("--pass_gdn_state=False", train_flags)
+        self.assertIn("--pass_gdn_state=True", train_flags)
         self.assertIn("--gdn_layer_limit=1", train_flags)
+        self.assertIn("--gdn_state_routing=last_to_first", train_flags)
         self.assertIn("--pass_rope_positions=True", train_flags)
         self.assertIn("--pass_conv_state=True", train_flags)
 

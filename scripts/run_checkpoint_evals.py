@@ -14,6 +14,7 @@ from omegalax.training_contract import ManualEvalConfig
 _MODES = ("all", "subset", "plot", "compare")
 _EXPERIMENTS = ("gdn", "conv")
 _PLOT_TYPES = ("in_horizon", "beyond_horizon", "exact_length", "heatmap")
+_TOKEN_SELECTIONS = ("all", "top_entropy_10pct")
 _SPEC_FIELDS = (
     "c_train",
     "pass_gdn_state",
@@ -53,6 +54,16 @@ def _parse_plot_types(value: str) -> tuple[str, ...]:
     return plot_types
 
 
+def _parse_token_selections(value: str) -> tuple[str, ...]:
+    selections = tuple(item.strip() for item in value.split(",") if item.strip())
+    unknown = tuple(item for item in selections if item not in _TOKEN_SELECTIONS)
+    if not selections or unknown:
+        raise argparse.ArgumentTypeError(
+            f"token_selections must contain only {', '.join(_TOKEN_SELECTIONS)}; got {value!r}"
+        )
+    return selections
+
+
 def parse_worker_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", action="append", required=True)
@@ -66,6 +77,11 @@ def parse_worker_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--mode", choices=_MODES, required=True)
     parser.add_argument("--manifest_path")
     parser.add_argument("--experiments")
+    parser.add_argument(
+        "--token_selections",
+        type=_parse_token_selections,
+    )
+    parser.add_argument("--entropy_reference_checkpoint")
     parser.add_argument("--plot_types", type=_parse_plot_types, required=True)
     parser.add_argument("--plot_output_root", action="append", default=[])
     parser.add_argument("--document_cap", type=int)
@@ -142,6 +158,8 @@ def run_from_arguments(argv: Sequence[str] | None = None):
         mode=args.mode,
         manifest_path=args.manifest_path,
         experiments=experiments,
+        token_selections=args.token_selections,
+        entropy_reference_checkpoint=args.entropy_reference_checkpoint,
         plot_types=args.plot_types,
         plot_output_roots=tuple(args.plot_output_root),
         document_cap=args.document_cap,

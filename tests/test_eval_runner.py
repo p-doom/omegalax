@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import asdict, replace
 import inspect
 import json
 import os
 from pathlib import Path
 import shutil
+import subprocess
+import sys
 from types import SimpleNamespace
 from unittest import mock
 
@@ -170,17 +172,17 @@ def _build_manifest(
     return manifest_path, manifest
 
 
-def _save_checkpoint(root: Path, *, step: int) -> None:
+def _save_checkpoint(root: Path, *, step: int, dp_size: int = 1) -> None:
     root.mkdir(parents=True, exist_ok=True)
     model, cfg = text_api.init_model(
         tiny_hybrid_config(),
         jax.random.key(0),
         tp_size=1,
         fsdp_size=1,
-        dp_size=1,
+        dp_size=dp_size,
     )
     save_hf_config(export_lib.model_config_to_hf_dict(cfg), root)
-    with mesh_rules(ensure_mesh(tp_size=1, fsdp_size=1, dp_size=1)):
+    with mesh_rules(ensure_mesh(tp_size=1, fsdp_size=1, dp_size=dp_size)):
         optimizer = text_trainer.build_optimizer(
             model,
             text_trainer.TrainConfig(num_steps=1),
@@ -349,6 +351,7 @@ def _required_plot_stems(
     experiment: str,
     lengths: tuple[int, ...],
     plot_types: tuple[str, ...],
+    comparison: bool = False,
 ) -> set[str]:
     stems = set()
     for plot_type in plot_types:
@@ -365,6 +368,21 @@ def _required_plot_stems(
             stems.update(f"heatmap_{metric}" for metric in _METRICS[experiment] if metric != "nll")
         else:
             raise AssertionError(f"Unexpected plot type in test: {plot_type}")
+    if comparison:
+        for plot_type in plot_types:
+            if plot_type in ("in_horizon", "beyond_horizon"):
+                stems.update(
+                    f"{plot_type}_{metric}_percent"
+                    for metric in _METRICS[experiment]
+                    if metric != "nll"
+                )
+            elif plot_type == "exact_length":
+                stems.update(
+                    f"exact_length_L{length}_{metric}_percent"
+                    for length in lengths
+                    for metric in _METRICS[experiment]
+                    if metric != "nll"
+                )
     return stems
 
 
@@ -375,11 +393,13 @@ def _assert_plot_inventory(
     experiment: str,
     lengths: tuple[int, ...],
     plot_types: tuple[str, ...],
+    comparison: bool = False,
 ) -> None:
     required_stems = _required_plot_stems(
         experiment=experiment,
         lengths=lengths,
         plot_types=plot_types,
+        comparison=comparison,
     )
     expected_paths = set()
     for stem in required_stems:
@@ -457,6 +477,37 @@ def _assert_inodes_preserved(
 
 
 class EvalRunnerTest(absltest.TestCase):
+    def test_entropy_selection_is_optional_but_explicit_top_requires_reference(self):
+        self.assertEqual(runner._execution_token_selections(None, None), ("all",))
+        self.assertEqual(
+            runner._execution_token_selections(None, "/tmp/iid"),
+            ("all", "top_entropy_10pct"),
+        )
+        with self.assertRaisesRegex(ValueError, "entropy_reference_checkpoint"):
+            runner._execution_token_selections(("top_entropy_10pct",), None)
+
+    def test_two_device_gdn_pipeline_runs_in_fresh_subprocess(self):
+        env = os.environ.copy()
+        env.update(
+            JAX_PLATFORMS="cpu",
+            XLA_FLAGS="--xla_force_host_platform_device_count=2",
+            OMEGALAX_DELTANET_KERNEL="xla",
+        )
+        env.pop("JAX_LOCAL_DEVICE_IDS", None)
+        with test_temp_dir() as tmp:
+            root = Path(tmp)
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(Path(__file__).with_name("eval_multidevice_subprocess.py")),
+                    str(root),
+                ],
+                check=True,
+                cwd=Path(__file__).parents[1],
+                env=env,
+            )
+            self.assertTrue((root / "passed").is_file())
+
     def test_explicit_spec_applicability_and_canonical_result_path(self):
         signature = inspect.signature(CheckpointEvalSpec)
         for name in (
@@ -490,7 +541,7 @@ class EvalRunnerTest(absltest.TestCase):
             resolved = _resolved(Path(tmp) / "checkpoint", step=123)
             self.assertEqual(
                 result_dir_for_checkpoint(resolved),
-                resolved.root / "evals" / "state_usage_v1" / "step_123",
+                resolved.root / "evals" / "state_usage_v2" / "step_123",
             )
             with mock.patch.object(runner, "resolve_checkpoint", return_value=resolved):
                 with self.assertRaisesRegex(ValueError, "(?i)plot.*type"):
@@ -746,18 +797,20 @@ class EvalRunnerTest(absltest.TestCase):
                 "batch_size": 2,
             }
 
-            run_evals(
-                (spec,),
-                mode="subset",
-                manifest_path=manifest_path,
-                experiments=("gdn",),
-                plot_types=("heatmap",),
-                plot_output_roots=(external_root,),
-                document_cap=2,
-                **topology,
-            )
+            with mock.patch.object(runner, "mesh_rules", wraps=mesh_rules) as scoped_mesh_rules:
+                run_evals(
+                    (spec,),
+                    mode="subset",
+                    manifest_path=manifest_path,
+                    experiments=("gdn",),
+                    plot_types=("heatmap",),
+                    plot_output_roots=(external_root,),
+                    document_cap=2,
+                    **topology,
+                )
+            scoped_mesh_rules.assert_called_once()
 
-            run_dir = checkpoint_root / "evals" / "state_usage_v1" / "step_5"
+            run_dir = checkpoint_root / "evals" / "state_usage_v2" / "step_5"
             pilot_config = _eval_config(run_dir)
             expected_identity = {
                 "c_train": 2,
@@ -843,14 +896,14 @@ class EvalRunnerTest(absltest.TestCase):
                 _stored_identity(run_dir),
             )
             self.assertEqual(full_store.read_summary(), expected_summary)
-            self.assertEmpty(tuple((run_dir / "summary").glob("*_exact_length_scale.json")))
+            self.assertEmpty(tuple((run_dir / "summary" / "all").glob("*_exact_length_scale.json")))
             self.assertNotEmpty(
                 tuple(path for path in (run_dir / "summary").rglob("*") if path.is_file())
             )
             for experiment in _CONDITIONS:
                 _assert_plot_inventory(
                     self,
-                    run_dir / "plots" / experiment,
+                    run_dir / "plots" / "all" / experiment,
                     experiment=experiment,
                     lengths=(2, 3),
                     plot_types=("heatmap",),
@@ -925,19 +978,21 @@ class EvalRunnerTest(absltest.TestCase):
                 _stored_identity(run_dir),
             )
             self.assertEqual(regenerated_store.read_summary(), expected_summary)
-            self.assertEmpty(tuple((run_dir / "summary").glob("*_exact_length_scale.json")))
+            self.assertEmpty(tuple((run_dir / "summary" / "all").glob("*_exact_length_scale.json")))
             self.assertNotEmpty(
                 tuple(path for path in (run_dir / "summary").rglob("*") if path.is_file())
             )
             for experiment in _CONDITIONS:
                 _assert_plot_inventory(
                     self,
-                    run_dir / "plots" / experiment,
+                    run_dir / "plots" / "all" / experiment,
                     experiment=experiment,
                     lengths=(2, 3),
                     plot_types=("heatmap",),
                 )
-                self.assertEmpty(tuple((run_dir / "plots" / experiment).glob("in_horizon_*")))
+                self.assertEmpty(
+                    tuple((run_dir / "plots" / "all" / experiment).glob("in_horizon_*"))
+                )
 
             with mock.patch.object(runner, "resolve_checkpoint", return_value=resolved):
                 run_evals(
@@ -951,8 +1006,8 @@ class EvalRunnerTest(absltest.TestCase):
             self.assertEqual(_eval_config(run_dir), full_config)
             for experiment in _CONDITIONS:
                 for root in (
-                    run_dir / "plots" / experiment,
-                    external_root / checkpoint_root.name / "step_5" / experiment,
+                    run_dir / "plots" / "all" / experiment,
+                    external_root / checkpoint_root.name / "step_5" / "all" / experiment,
                 ):
                     _assert_plot_inventory(
                         self,
@@ -963,7 +1018,7 @@ class EvalRunnerTest(absltest.TestCase):
                     )
             _assert_common_scale_inventory(
                 self,
-                run_dir / "summary",
+                run_dir / "summary" / "all",
                 lengths=(2, 3),
             )
             _assert_external_plot_root(self, external_root)
@@ -1013,6 +1068,156 @@ class EvalRunnerTest(absltest.TestCase):
                 expected_summary,
             )
 
+    def test_explicit_iid_reference_adds_optional_top_entropy_selection(self):
+        with test_temp_dir() as tmp:
+            tmpdir = Path(tmp)
+            checkpoint_root = tmpdir / "checkpoint"
+            _save_checkpoint(checkpoint_root, step=5)
+            manifest_path, _ = _build_manifest(
+                tmpdir / "dataset",
+                documents_per_length=2,
+            )
+            spec = _spec(checkpoint_root, c_train=2)
+            run_evals(
+                (spec,),
+                mode="subset",
+                manifest_path=manifest_path,
+                experiments=("gdn",),
+                entropy_reference_checkpoint=checkpoint_root / "000005",
+                plot_types=("in_horizon", "beyond_horizon", "exact_length"),
+                document_cap=2,
+                tp_size=1,
+                fsdp_size=1,
+                dp_size=1,
+                batch_size=2,
+            )
+
+            run_dir = checkpoint_root / "evals" / "state_usage_v2" / "step_5"
+            config = _eval_config(run_dir)
+            self.assertEqual(
+                config["token_selections"],
+                ["all", "top_entropy_10pct"],
+            )
+            self.assertTrue(
+                tuple(
+                    checkpoint_root.glob("evals/entropy_selector_v1/step_5/*/selector_config.json")
+                )
+            )
+            store = EvalRunStore.open(checkpoint_root, 5, _stored_identity(run_dir))
+            all_rows = store.read_rows(experiment="gdn", selection="all")
+            top_rows = store.read_rows(experiment="gdn", selection="top_entropy_10pct")
+            self.assertLen(all_rows, len(top_rows))
+            all_counts = {
+                (row.condition, row.doc_id, row.chunk_position): row.token_count for row in all_rows
+            }
+            for row in top_rows:
+                all_count = all_counts[(row.condition, row.doc_id, row.chunk_position)]
+                expected = 0 if all_count == 0 else max(1, int(np.ceil(0.1 * all_count)))
+                self.assertEqual(row.token_count, expected)
+            self.assertTrue((run_dir / "summary" / "all" / "metrics.parquet").is_file())
+            self.assertTrue(
+                (run_dir / "summary" / "top_entropy_10pct" / "metrics.parquet").is_file()
+            )
+
+            run_evals(
+                (spec,),
+                mode="subset",
+                manifest_path=manifest_path,
+                experiments=("gdn",),
+                token_selections=("all",),
+                plot_types=("in_horizon",),
+                document_cap=2,
+                tp_size=1,
+                fsdp_size=1,
+                dp_size=1,
+                batch_size=2,
+            )
+
+    def test_top_entropy_pilot_extension_refreshes_the_full_merged_eval(self):
+        with test_temp_dir() as tmp:
+            tmpdir = Path(tmp)
+            checkpoint_root = tmpdir / "checkpoint"
+            _save_checkpoint(checkpoint_root, step=5)
+            manifest_path, manifest = _build_manifest(
+                tmpdir / "dataset",
+                documents_per_length=4,
+            )
+            spec = _spec(checkpoint_root, c_train=2)
+            topology = {
+                "tp_size": 1,
+                "fsdp_size": 1,
+                "dp_size": 1,
+                "batch_size": 2,
+            }
+
+            run_evals(
+                (spec,),
+                mode="subset",
+                manifest_path=manifest_path,
+                experiments=("gdn",),
+                token_selections=("top_entropy_10pct",),
+                entropy_reference_checkpoint=checkpoint_root / "000005",
+                plot_types=("heatmap",),
+                document_cap=2,
+                **topology,
+            )
+
+            run_dir = checkpoint_root / "evals" / "state_usage_v2" / "step_5"
+            selector_dirs = tuple(checkpoint_root.glob("evals/entropy_selector_v1/step_5/*"))
+            self.assertLen(selector_dirs, 1)
+            self.assertLen(tuple((selector_dirs[0] / "raw").glob("*.parquet")), 4)
+            shutil.rmtree(run_dir / "summary" / "top_entropy_10pct")
+            shutil.rmtree(run_dir / "plots" / "top_entropy_10pct")
+
+            run_evals(
+                (spec,),
+                mode="subset",
+                manifest_path=manifest_path,
+                experiments=("conv",),
+                token_selections=("all",),
+                plot_types=("heatmap",),
+                document_cap=None,
+                **topology,
+            )
+
+            config = _eval_config(run_dir)
+            self.assertIsNone(config["document_cap"])
+            self.assertEqual(config["effective_document_cap"], 4)
+            self.assertEqual(config["token_selections"], ["all", "top_entropy_10pct"])
+            self.assertEqual(config["experiments"], ["gdn", "conv"])
+            self.assertLen(tuple((selector_dirs[0] / "raw").glob("*.parquet")), 8)
+
+            store = EvalRunStore.open(checkpoint_root, 5, _stored_identity(run_dir))
+            population_counts = {
+                count.doc_num_chunks: count.available for count in manifest.counts_by_length
+            }
+            for selection in ("all", "top_entropy_10pct"):
+                rows = store.read_rows(selection=selection)
+                self.assertEqual(
+                    {(row.experiment, row.condition) for row in rows},
+                    {
+                        (experiment, condition)
+                        for experiment, conditions in _CONDITIONS.items()
+                        for condition in conditions
+                    },
+                )
+                self.assertEqual(
+                    store.read_summary(selection=selection),
+                    aggregate_metrics(
+                        rows,
+                        population_counts=population_counts,
+                        c_train=2,
+                    ),
+                )
+                for experiment in _CONDITIONS:
+                    _assert_plot_inventory(
+                        self,
+                        run_dir / "plots" / selection / experiment,
+                        experiment=experiment,
+                        lengths=(2, 3),
+                        plot_types=("heatmap",),
+                    )
+
     def test_three_checkpoint_comparison_covers_all_components_and_common_plot_types(self):
         with test_temp_dir() as tmp:
             tmpdir = Path(tmp)
@@ -1053,7 +1258,7 @@ class EvalRunnerTest(absltest.TestCase):
                 for spec, step in zip(specs, range(2, 5), strict=True)
             }
             roots = (tmpdir / "paper-a", tmpdir / "paper-b")
-            common_plot_types = ("in_horizon", "beyond_horizon", "exact_length")
+            common_plot_types = ("exact_length",)
 
             with mock.patch.object(
                 runner,
@@ -1080,11 +1285,19 @@ class EvalRunnerTest(absltest.TestCase):
                         experiment=experiment,
                         lengths=(2, 3, 4, 5),
                         plot_types=common_plot_types,
+                        comparison=True,
                     )
             for root in roots:
                 _assert_external_plot_root(self, root)
 
             run_dirs = tuple(store.run_dir for store in stores)
+            with self.assertRaisesRegex(ValueError, "(?i)(c_train|horizon)"):
+                compare_checkpoint_results(
+                    run_dirs,
+                    experiments=("gdn",),
+                    plot_types=("in_horizon",),
+                    comparison_name="incompatible_horizons",
+                )
             with self.assertRaisesRegex(ValueError, "(?i)(heatmap|comparison)"):
                 compare_checkpoint_results(
                     run_dirs,
@@ -1117,6 +1330,7 @@ class EvalRunnerTest(absltest.TestCase):
                     experiment="gdn",
                     lengths=(2, 3, 4, 5),
                     plot_types=("in_horizon",),
+                    comparison=True,
                 )
             with self.assertRaisesRegex(ValueError, "(?i)(conv|component|experiment|missing)"):
                 compare_checkpoint_results(
@@ -1185,6 +1399,186 @@ class EvalRunnerTest(absltest.TestCase):
                             plot_types=("in_horizon",),
                             comparison_name=f"bad_{label}",
                         )
+
+    def test_top_entropy_comparison_uses_v2_paths_and_requires_one_selector(self):
+        with test_temp_dir() as tmp:
+            tmpdir = Path(tmp)
+            selection = "top_entropy_10pct"
+            selector = runner.EntropySelectorIdentity(
+                reference_checkpoint_root=str((tmpdir / "iid-reference").resolve()),
+                reference_checkpoint_step=1,
+                reference_config_hash="sha256:reference-config",
+                manifest_hash="sha256:manifest",
+                dataset_hash="sha256:dataset",
+                code_hash="git:test",
+                pad_id=0,
+                fraction=0.1,
+                state_mode="zero_gdn_and_conv",
+                position_mode="reset_each_chunk",
+                tp_size=1,
+                fsdp_size=1,
+                dp_size=1,
+                batch_size=2,
+                deltanet_kernel="xla",
+                attention_backend="xla",
+            )
+
+            def complete_store(name: str, step: int, selector_identity):
+                root = tmpdir / name
+                identity = _identity(root, step=step, c_train=2)
+                expected_shards = identity.eval_config["expected_shards"]
+                identity = replace(
+                    identity,
+                    eval_config={
+                        **identity.eval_config,
+                        "result_version": "state_usage_v2",
+                        "token_selections": [selection],
+                        "selection_configs": {
+                            selection: {
+                                "kind": "top_entropy",
+                                "selector_identity": asdict(selector_identity),
+                            }
+                        },
+                        "expected_shards": {selection: expected_shards},
+                    },
+                )
+                store = EvalRunStore.open(root, step, identity)
+                for condition, shard_ids in expected_shards["gdn"].items():
+                    for shard_id in shard_ids:
+                        rows = tuple(
+                            replace(row, nll_sum=row.nll_sum / 2, token_count=1)
+                            for row in _rows("gdn", condition, shard_id)
+                        )
+                        store.write_shard(
+                            "gdn",
+                            condition,
+                            shard_id,
+                            rows,
+                            selection=selection,
+                        )
+                store.mark_complete()
+                return store
+
+            stores = (
+                complete_store("model-a", 1, selector),
+                complete_store("model-b", 2, selector),
+            )
+            compare_checkpoint_results(
+                tuple(store.run_dir for store in stores),
+                experiments=("gdn",),
+                token_selections=(selection,),
+                plot_types=("exact_length",),
+                comparison_name="shared_selector",
+            )
+            for store in stores:
+                _assert_plot_inventory(
+                    self,
+                    store.run_dir / "comparisons" / selection / "shared_selector" / "gdn",
+                    experiment="gdn",
+                    lengths=(2,),
+                    plot_types=("exact_length",),
+                    comparison=True,
+                )
+
+            incompatible = complete_store(
+                "model-c",
+                3,
+                replace(selector, reference_checkpoint_step=2),
+            )
+            with self.assertRaisesRegex(ValueError, "(?i)entropy selector conflict"):
+                compare_checkpoint_results(
+                    (stores[0].run_dir, incompatible.run_dir),
+                    experiments=("gdn",),
+                    token_selections=(selection,),
+                    plot_types=("exact_length",),
+                    comparison_name="different_selectors",
+                )
+
+    def test_empty_overview_is_skipped_and_extensions_invalidate_comparisons(self):
+        with test_temp_dir() as tmp:
+            tmpdir = Path(tmp)
+            stores = tuple(
+                _complete_store(
+                    tmpdir / name,
+                    _identity(
+                        tmpdir / name,
+                        step=step,
+                        c_train=6,
+                        population_counts={2: 2, 3: 2},
+                    ),
+                )
+                for name, step in (("model-a", 1), ("model-b", 2))
+            )
+            run_dirs = tuple(store.run_dir for store in stores)
+            external_root = tmpdir / "published"
+
+            compare_checkpoint_results(
+                run_dirs,
+                experiments=("gdn",),
+                plot_types=("beyond_horizon",),
+                comparison_name="empty_beyond",
+                plot_output_roots=(external_root,),
+            )
+            self.assertEmpty(tuple(external_root.rglob("*.pdf")))
+            self.assertEmpty(tuple(external_root.rglob("*.svg")))
+
+            compare_checkpoint_results(
+                run_dirs,
+                experiments=("gdn",),
+                plot_types=("exact_length",),
+                comparison_name="invalidate_me",
+                plot_output_roots=(external_root,),
+            )
+            local_comparison_roots = tuple(
+                store.run_dir / "comparisons" / "invalidate_me" for store in stores
+            )
+            external_comparison_root = external_root / "comparisons" / "invalidate_me"
+            for root in (*local_comparison_roots, external_comparison_root):
+                self.assertNotEmpty(tuple(root.rglob("*.pdf")))
+
+            extended_identity = replace(
+                stores[0].identity,
+                eval_config={
+                    **stores[0].identity.eval_config,
+                    "document_cap": 2,
+                },
+            )
+            registry_path = stores[0].run_dir / "comparison_outputs.json"
+            with mock.patch(
+                "omegalax.evals.storage.shutil.rmtree",
+                side_effect=PermissionError("invalidation denied"),
+            ):
+                with self.assertRaisesRegex(PermissionError, "invalidation denied"):
+                    stores[0].extend_identity(extended_identity)
+            self.assertTrue(registry_path.is_file())
+            for root in (*local_comparison_roots, external_comparison_root):
+                self.assertTrue(root.exists())
+
+            stores[0].extend_identity(extended_identity)
+            for root in (*local_comparison_roots, external_comparison_root):
+                self.assertFalse(root.exists())
+            self.assertFalse(json.loads(stores[0].status_path.read_text())["complete"])
+
+    def test_raw_validation_clears_only_a_genuinely_incomplete_status(self):
+        with test_temp_dir() as tmp:
+            root = Path(tmp) / "checkpoint"
+            store = _complete_store(root, _identity(root, step=1, c_train=2))
+            with self.assertRaisesRegex(ValueError, "(?i)(conv|component|experiment|missing)"):
+                runner.validate_checkpoint_results(
+                    store.run_dir,
+                    experiments=("conv",),
+                )
+            self.assertTrue(json.loads(store.status_path.read_text())["complete"])
+
+            next((store.run_dir / "raw" / "gdn").glob("true_gdn_shard_*.parquet")).unlink()
+
+            with self.assertRaisesRegex(ValueError, "(?i)(missing|incomplete)"):
+                runner.validate_checkpoint_results(
+                    store.run_dir,
+                    experiments=("gdn",),
+                )
+
+            self.assertFalse(json.loads(store.status_path.read_text())["complete"])
 
 
 if __name__ == "__main__":

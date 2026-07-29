@@ -104,6 +104,7 @@ def build_training_contract(
     *,
     pass_gdn_state: bool,
     gdn_layer_limit: int | None,
+    gdn_state_routing: str = "same_layer",
     pass_conv_state: bool,
     pass_rope_positions: bool,
     pad_id: int,
@@ -131,7 +132,7 @@ def build_training_contract(
             f"format={index_format!r}"
         )
 
-    return {
+    contract = {
         "schema_version": TRAINING_CONTRACT_SCHEMA_VERSION,
         "training_index": {
             "path": str(index_path),
@@ -147,6 +148,11 @@ def build_training_contract(
         },
         "horizon_by_step": horizons,
     }
+    if gdn_state_routing != "same_layer":
+        contract["training_statepassing_config"] = {
+            "gdn_state_routing": gdn_state_routing,
+        }
+    return contract
 
 
 def _checkpoint_directories(checkpoint_root: Path) -> tuple[Path, ...]:

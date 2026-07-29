@@ -7,11 +7,13 @@ from dataclasses import dataclass
 import jax
 import jax.numpy as jnp
 
+from omegalax.distributed.mesh import ensure_mesh
 from omegalax.evals.executor import (
     ChainBatch,
     ChainResult,
     SegmentInputs,
     assert_chunk1_consistent,
+    make_run_segment,
     run_chain,
 )
 from omegalax.text.chat import StatePassingConfig
@@ -75,9 +77,12 @@ def run_gdn_experiment(
     donor_indices_B: jax.Array,
     pad_id: int,
     checkpoint: str,
+    run_segment=None,
 ) -> ExperimentResult:
     """Compare true, zero, and shuffled GDN states with true Conv controls."""
     _validate_layer_limit(cfg, state_config)
+    if run_segment is None:
+        run_segment = make_run_segment(ensure_mesh())
     layer_limit = state_config.gdn_layer_limit
 
     def true_inputs(segment_idx, previous_state):
@@ -109,6 +114,7 @@ def run_gdn_experiment(
         pad_id=pad_id,
         condition="true_gdn",
         segment_input_fn=true_inputs,
+        run_segment=run_segment,
     )
 
     def control_inputs(segment_idx, *, shuffled):
@@ -146,6 +152,7 @@ def run_gdn_experiment(
         pad_id=pad_id,
         condition="zero_gdn",
         segment_input_fn=lambda idx, _previous: control_inputs(idx, shuffled=False),
+        run_segment=run_segment,
     )
     shuffled_result = run_chain(
         model,
@@ -154,6 +161,7 @@ def run_gdn_experiment(
         pad_id=pad_id,
         condition="shuffled_gdn",
         segment_input_fn=lambda idx, _previous: control_inputs(idx, shuffled=True),
+        run_segment=run_segment,
     )
     assert_chunk1_consistent(true_result, zero_result, checkpoint=checkpoint, atol=1e-6)
     assert_chunk1_consistent(true_result, shuffled_result, checkpoint=checkpoint, atol=1e-6)
@@ -175,9 +183,12 @@ def run_conv_experiment(
     donor_indices_B: jax.Array,
     pad_id: int,
     checkpoint: str,
+    run_segment=None,
 ) -> ExperimentResult:
     """Compare true, zero, and shuffled Conv states with true GDN controls."""
     _validate_layer_limit(cfg, state_config)
+    if run_segment is None:
+        run_segment = make_run_segment(ensure_mesh())
     if not state_config.pass_conv_state:
         raise ValueError("Conv state experiment is not applicable when pass_conv_state=False")
     layer_limit = state_config.gdn_layer_limit
@@ -211,6 +222,7 @@ def run_conv_experiment(
         pad_id=pad_id,
         condition="true_conv",
         segment_input_fn=true_inputs,
+        run_segment=run_segment,
     )
 
     def control_inputs(segment_idx, *, shuffled):
@@ -248,6 +260,7 @@ def run_conv_experiment(
         pad_id=pad_id,
         condition="zero_conv",
         segment_input_fn=lambda idx, _previous: control_inputs(idx, shuffled=False),
+        run_segment=run_segment,
     )
     shuffled_result = run_chain(
         model,
@@ -256,6 +269,7 @@ def run_conv_experiment(
         pad_id=pad_id,
         condition="shuffled_conv",
         segment_input_fn=lambda idx, _previous: control_inputs(idx, shuffled=True),
+        run_segment=run_segment,
     )
     assert_chunk1_consistent(true_result, zero_result, checkpoint=checkpoint, atol=1e-6)
     assert_chunk1_consistent(true_result, shuffled_result, checkpoint=checkpoint, atol=1e-6)

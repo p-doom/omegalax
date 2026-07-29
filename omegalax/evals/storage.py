@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass
 import json
 import os
 from pathlib import Path
+import shutil
 import tempfile
 from typing import TYPE_CHECKING, Any, Callable, Iterable
 
@@ -108,6 +109,42 @@ class EvalRunStore:
     status_path: Path
     identity: EvalRunIdentity
 
+    @property
+    def result_version(self) -> str:
+        return str(self.identity.eval_config.get("result_version", "state_usage_v1"))
+
+    @property
+    def token_selections(self) -> tuple[str, ...]:
+        return tuple(self.identity.eval_config.get("token_selections", ("all",)))
+
+    def _ensure_directories(self) -> None:
+        if self.result_version == "state_usage_v1":
+            relative_dirs = (
+                "raw/gdn",
+                "raw/conv",
+                "summary",
+                "plots/gdn",
+                "plots/conv",
+                "comparisons",
+            )
+        elif self.result_version == "state_usage_v2":
+            relative_dirs = tuple(
+                relative
+                for selection in self.token_selections
+                for relative in (
+                    f"raw/{selection}/gdn",
+                    f"raw/{selection}/conv",
+                    f"summary/{selection}",
+                    f"plots/{selection}/gdn",
+                    f"plots/{selection}/conv",
+                    f"comparisons/{selection}",
+                )
+            )
+        else:
+            raise ValueError(f"Unsupported evaluation result version: {self.result_version!r}")
+        for relative_dir in relative_dirs:
+            (self.run_dir / relative_dir).mkdir(parents=True, exist_ok=True)
+
     @classmethod
     def open(
         cls,
@@ -121,10 +158,21 @@ class EvalRunStore:
         if identity.checkpoint_step != checkpoint_step:
             raise ValueError("Evaluation identity checkpoint_step does not match the run path")
 
-        run_dir = checkpoint_root / "evals" / "state_usage_v1" / f"step_{checkpoint_step}"
+        result_version = str(identity.eval_config.get("result_version", "state_usage_v1"))
+        if result_version not in {"state_usage_v1", "state_usage_v2"}:
+            raise ValueError(f"Unsupported evaluation result version: {result_version!r}")
+        run_dir = checkpoint_root / "evals" / result_version / f"step_{checkpoint_step}"
+        run_dir.mkdir(parents=True, exist_ok=True)
         config_path = run_dir / "eval_config.json"
         status_path = run_dir / "status.json"
         identity_payload = asdict(identity)
+        store = cls(
+            run_dir=run_dir,
+            config_path=config_path,
+            status_path=status_path,
+            identity=identity,
+        )
+        store._ensure_directories()
 
         if config_path.is_file():
             stored_config = json.loads(config_path.read_text())
@@ -132,27 +180,11 @@ class EvalRunStore:
             if _canonical_json(stored_identity) != _canonical_json(identity_payload):
                 raise ValueError("Evaluation run identity conflicts with the stored identity")
 
-        for relative_dir in (
-            "raw/gdn",
-            "raw/conv",
-            "summary",
-            "plots/gdn",
-            "plots/conv",
-            "comparisons",
-        ):
-            (run_dir / relative_dir).mkdir(parents=True, exist_ok=True)
-
         if not config_path.exists():
             _write_json(config_path, {"identity": identity_payload})
         if not status_path.exists():
             _write_json(status_path, {"complete": False})
-
-        return cls(
-            run_dir=run_dir,
-            config_path=config_path,
-            status_path=status_path,
-            identity=identity,
-        )
+        return store
 
     def extend_identity(self, new_identity: EvalRunIdentity) -> None:
         if new_identity.checkpoint_root != self.identity.checkpoint_root:
@@ -160,25 +192,73 @@ class EvalRunStore:
         if new_identity.checkpoint_step != self.identity.checkpoint_step:
             raise ValueError("Extended identity must keep checkpoint_step unchanged")
 
-        _write_json(self.status_path, {"complete": False})
-        _write_json(self.config_path, {"identity": asdict(new_identity)})
+        self.invalidate_comparison_outputs()
         self.identity = new_identity
+        self._ensure_directories()
+        self.mark_incomplete()
+        _write_json(self.config_path, {"identity": asdict(new_identity)})
 
-    def _shard_path(self, experiment: str, condition: str, shard_id: int) -> Path:
+    def register_comparison_outputs(self, directories: Iterable[str | Path]) -> None:
+        path = self.run_dir / "comparison_outputs.json"
+        registered = set()
+        if path.is_file():
+            registered.update(json.loads(path.read_text()).get("directories", ()))
+        registered.update(str(Path(directory).expanduser().resolve()) for directory in directories)
+        _write_json(path, {"directories": sorted(registered)})
+
+    def invalidate_comparison_outputs(self) -> None:
+        registry_path = self.run_dir / "comparison_outputs.json"
+        directories = ()
+        if registry_path.is_file():
+            directories = json.loads(registry_path.read_text()).get("directories", ())
+        for directory in directories:
+            directory = Path(directory)
+            if directory.exists():
+                shutil.rmtree(directory)
+        comparisons_dir = self.run_dir / "comparisons"
+        if comparisons_dir.exists():
+            shutil.rmtree(comparisons_dir)
+        registry_path.unlink(missing_ok=True)
+
+    def mark_incomplete(self) -> None:
+        _write_json(self.status_path, {"complete": False})
+
+    def _shard_path(
+        self,
+        experiment: str,
+        condition: str,
+        shard_id: int,
+        *,
+        selection: str = "all",
+    ) -> Path:
         if experiment not in _CONDITIONS or condition not in _CONDITIONS[experiment]:
             raise ValueError(f"Unsupported evaluation condition: {experiment}/{condition}")
-        return self.run_dir / "raw" / experiment / f"{condition}_shard_{int(shard_id)}.parquet"
+        if selection not in self.token_selections:
+            raise ValueError(f"Unsupported token selection: {selection!r}")
+        raw_dir = self.run_dir / "raw"
+        if self.result_version == "state_usage_v2":
+            raw_dir /= selection
+        return raw_dir / experiment / f"{condition}_shard_{int(shard_id)}.parquet"
 
-    def shard_is_complete(self, experiment: str, condition: str, shard_id: int) -> bool:
-        return self._shard_path(experiment, condition, shard_id).is_file()
+    def shard_is_complete(
+        self,
+        experiment: str,
+        condition: str,
+        shard_id: int,
+        *,
+        selection: str = "all",
+    ) -> bool:
+        return self._shard_path(experiment, condition, shard_id, selection=selection).is_file()
 
     def read_shard(
         self,
         experiment: str,
         condition: str,
         shard_id: int,
+        *,
+        selection: str = "all",
     ) -> tuple[MetricRow, ...]:
-        path = self._shard_path(experiment, condition, shard_id)
+        path = self._shard_path(experiment, condition, shard_id, selection=selection)
         if not path.is_file():
             return ()
         return tuple(MetricRow(**row) for row in pq.read_table(path).to_pylist())
@@ -189,14 +269,17 @@ class EvalRunStore:
         condition: str,
         shard_id: int,
         rows: Iterable[MetricRow],
+        *,
+        selection: str = "all",
     ) -> Path:
-        path = self._shard_path(experiment, condition, shard_id)
+        path = self._shard_path(experiment, condition, shard_id, selection=selection)
+        path.parent.mkdir(parents=True, exist_ok=True)
         rows = tuple(rows)
         if any(row.experiment != experiment or row.condition != condition for row in rows):
             raise ValueError("Every metric row must match the shard experiment and condition")
 
         if path.is_file():
-            if self.read_shard(experiment, condition, shard_id) == rows:
+            if self.read_shard(experiment, condition, shard_id, selection=selection) == rows:
                 return path
             raise ValueError(f"Shard already exists with conflicting rows: {path}")
 
@@ -209,7 +292,13 @@ class EvalRunStore:
         *,
         experiment: str | None = None,
         condition: str | None = None,
+        selection: str = "all",
     ) -> tuple[MetricRow, ...]:
+        if selection not in self.token_selections:
+            raise ValueError(f"Unsupported token selection: {selection!r}")
+        raw_dir = self.run_dir / "raw"
+        if self.result_version == "state_usage_v2":
+            raw_dir /= selection
         rows = []
         for candidate_experiment, candidate_conditions in _CONDITIONS.items():
             if experiment is not None and candidate_experiment != experiment:
@@ -218,30 +307,45 @@ class EvalRunStore:
                 if condition is not None and candidate_condition != condition:
                     continue
                 prefix = f"{candidate_condition}_shard_"
-                paths = sorted(
-                    (self.run_dir / "raw" / candidate_experiment).glob(f"{prefix}*.parquet")
-                )
+                paths = sorted((raw_dir / candidate_experiment).glob(f"{prefix}*.parquet"))
                 for path in paths:
                     shard_id = int(path.stem.removeprefix(prefix))
                     rows.extend(
-                        self.read_shard(candidate_experiment, candidate_condition, shard_id)
+                        self.read_shard(
+                            candidate_experiment,
+                            candidate_condition,
+                            shard_id,
+                            selection=selection,
+                        )
                     )
         return tuple(rows)
 
-    def write_summary(self, points: Iterable[SummaryPoint]) -> Path:
-        path = self.run_dir / "summary" / "metrics.parquet"
+    def write_summary(
+        self,
+        points: Iterable[SummaryPoint],
+        *,
+        selection: str = "all",
+    ) -> Path:
+        summary_dir = self.run_dir / "summary"
+        if self.result_version == "state_usage_v2":
+            summary_dir /= selection
+        summary_dir.mkdir(parents=True, exist_ok=True)
+        path = summary_dir / "metrics.parquet"
         points = tuple(points)
-        if path.is_file() and self.read_summary() == points:
+        if path.is_file() and self.read_summary(selection=selection) == points:
             return path
 
         table = pa.Table.from_pylist([asdict(point) for point in points], schema=_SUMMARY_SCHEMA)
         _atomic_write(path, lambda temp_path: pq.write_table(table, temp_path))
         return path
 
-    def read_summary(self) -> tuple[SummaryPoint, ...]:
+    def read_summary(self, *, selection: str = "all") -> tuple[SummaryPoint, ...]:
         from omegalax.evals.aggregation import SummaryPoint
 
-        path = self.run_dir / "summary" / "metrics.parquet"
+        summary_dir = self.run_dir / "summary"
+        if self.result_version == "state_usage_v2":
+            summary_dir /= selection
+        path = summary_dir / "metrics.parquet"
         if not path.is_file():
             return ()
         return tuple(SummaryPoint(**row) for row in pq.read_table(path).to_pylist())
@@ -249,11 +353,20 @@ class EvalRunStore:
     def mark_complete(self) -> None:
         expected_shards = self.identity.eval_config.get("expected_shards", {})
         missing = []
-        for experiment, conditions in expected_shards.items():
-            for condition, shard_ids in conditions.items():
-                for shard_id in shard_ids:
-                    if not self.shard_is_complete(experiment, condition, int(shard_id)):
-                        missing.append((experiment, condition, int(shard_id)))
+        expected_by_selection = (
+            expected_shards if self.result_version == "state_usage_v2" else {"all": expected_shards}
+        )
+        for selection, experiments in expected_by_selection.items():
+            for experiment, conditions in experiments.items():
+                for condition, shard_ids in conditions.items():
+                    for shard_id in shard_ids:
+                        if not self.shard_is_complete(
+                            experiment,
+                            condition,
+                            int(shard_id),
+                            selection=selection,
+                        ):
+                            missing.append((selection, experiment, condition, int(shard_id)))
         if missing:
             raise ValueError(f"Evaluation is incomplete; missing shards: {missing}")
 

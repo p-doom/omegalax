@@ -9,8 +9,9 @@ from flax import nnx
 import jax
 import jax.numpy as jnp
 
+from omegalax.distributed.mesh import ensure_mesh, mesh_rules
 from omegalax.text import api as text_api
-from omegalax.trainers.loss import chunked_cross_entropy_stats
+from omegalax.trainers.loss import chunked_cross_entropy_multi_stats, chunked_token_entropies
 
 
 _NUM_LOSS_TILES = 4
@@ -23,6 +24,8 @@ class ChainBatch:
     attention_mask_BCT: jax.Array
     loss_mask_BCT: jax.Array
     chunk_indices_BC: jax.Array
+    selection_names: tuple[str, ...] = ("all",)
+    selection_masks_BNCT: jax.Array | None = None
 
 
 @dataclass(frozen=True)
@@ -43,6 +46,22 @@ class SegmentResult:
     nll_sum_B: jax.Array
     token_count_B: jax.Array
     state: SegmentState
+    nll_sums_by_selection: dict[str, jax.Array] | None = None
+    token_counts_by_selection: dict[str, jax.Array] | None = None
+
+    def nll_sum(self, selection: str) -> jax.Array:
+        if self.nll_sums_by_selection is None:
+            if selection != "all":
+                raise KeyError(selection)
+            return self.nll_sum_B
+        return self.nll_sums_by_selection[selection]
+
+    def token_count(self, selection: str) -> jax.Array:
+        if self.token_counts_by_selection is None:
+            if selection != "all":
+                raise KeyError(selection)
+            return self.token_count_B
+        return self.token_counts_by_selection[selection]
 
 
 @dataclass(frozen=True)
@@ -72,45 +91,86 @@ def _position_ids(position_offsets_B: jax.Array, seq_len: int) -> jax.Array:
     return jnp.stack([positions_BT] * 3, axis=0)
 
 
-@nnx.jit(static_argnames=("pad_id",))
-def _run_segment(
-    model,
-    token_ids_BT: jax.Array,
-    attention_mask_BT: jax.Array,
-    loss_mask_BT: jax.Array,
-    position_offsets_B: jax.Array,
-    initial_gdn_states: tuple[jax.Array, ...] | None,
-    initial_conv_states: tuple[jax.Array, ...] | None,
-    *,
-    pad_id: int,
-):
-    hidden_BTD, _, gdn_states, conv_states = text_api.forward_with_gdn_state(
-        model,
-        token_ids_BT,
-        pad_id=pad_id,
-        cfg=model.text.cfg,
-        attention_mask_BT=attention_mask_BT,
-        initial_gdn_states=initial_gdn_states,
-        initial_conv_states=initial_conv_states,
-        position_ids_ZBT=_position_ids(position_offsets_B, token_ids_BT.shape[1]),
-        return_conv_states=True,
-    )
+def make_run_segment(mesh):
+    """Create the segment JIT while its concrete mesh is active."""
+    with mesh_rules(mesh):
 
-    def document_stats(hidden_TD, targets_T, document_loss_mask_T):
-        return chunked_cross_entropy_stats(
-            hidden_TD[None, :, :],
-            model.output_weight(),
-            targets_T[None, :],
-            document_loss_mask_T[None, :],
-            num_tiles=_NUM_LOSS_TILES,
-        )
+        @nnx.jit(static_argnames=("pad_id",))
+        def run_segment(
+            model,
+            token_ids_BT: jax.Array,
+            attention_mask_BT: jax.Array,
+            loss_masks_BNT: jax.Array,
+            position_offsets_B: jax.Array,
+            initial_gdn_states: tuple[jax.Array, ...] | None,
+            initial_conv_states: tuple[jax.Array, ...] | None,
+            *,
+            pad_id: int,
+        ):
+            hidden_BTD, _, gdn_states, conv_states = text_api.forward_with_gdn_state(
+                model,
+                token_ids_BT,
+                pad_id=pad_id,
+                cfg=model.text.cfg,
+                attention_mask_BT=attention_mask_BT,
+                initial_gdn_states=initial_gdn_states,
+                initial_conv_states=initial_conv_states,
+                position_ids_ZBT=_position_ids(position_offsets_B, token_ids_BT.shape[1]),
+                return_conv_states=True,
+            )
 
-    nll_sum_B, token_count_B = jax.vmap(document_stats)(
-        hidden_BTD,
-        token_ids_BT,
-        loss_mask_BT,
-    )
-    return nll_sum_B, token_count_B, gdn_states, conv_states
+            def document_stats(hidden_TD, targets_T, document_loss_masks_NT):
+                return chunked_cross_entropy_multi_stats(
+                    hidden_TD[None, :, :],
+                    model.output_weight(),
+                    targets_T[None, :],
+                    document_loss_masks_NT[:, None, :],
+                    num_tiles=_NUM_LOSS_TILES,
+                )
+
+            nll_sums_BN, token_counts_BN = jax.vmap(document_stats)(
+                hidden_BTD,
+                token_ids_BT,
+                loss_masks_BNT,
+            )
+            return nll_sums_BN, token_counts_BN, gdn_states, conv_states
+
+    return run_segment
+
+
+def make_run_entropy_segment(mesh):
+    """Create the zero-state entropy JIT while its concrete mesh is active."""
+    with mesh_rules(mesh):
+
+        @nnx.jit(static_argnames=("pad_id",))
+        def run_entropy_segment(
+            model,
+            token_ids_BT: jax.Array,
+            attention_mask_BT: jax.Array,
+            *,
+            pad_id: int,
+        ):
+            hidden_BTD, _, _, _ = text_api.forward_with_gdn_state(
+                model,
+                token_ids_BT,
+                pad_id=pad_id,
+                cfg=model.text.cfg,
+                attention_mask_BT=attention_mask_BT,
+                initial_gdn_states=None,
+                initial_conv_states=None,
+                position_ids_ZBT=_position_ids(
+                    jnp.zeros(token_ids_BT.shape[0], dtype=jnp.int32),
+                    token_ids_BT.shape[1],
+                ),
+                return_conv_states=True,
+            )
+            return chunked_token_entropies(
+                hidden_BTD,
+                model.output_weight(),
+                num_tiles=_NUM_LOSS_TILES,
+            )
+
+    return run_entropy_segment
 
 
 def run_chain(
@@ -121,29 +181,47 @@ def run_chain(
     pad_id: int,
     condition: str,
     segment_input_fn: Callable[[int, SegmentState | None], SegmentInputs],
+    run_segment=None,
 ) -> ChainResult:
     """Run one independent condition over every segment in each document."""
+    if run_segment is None:
+        run_segment = make_run_segment(ensure_mesh())
     segments = []
     previous_state = None
     for segment_idx in range(batch.token_ids_BCT.shape[1]):
         inputs = segment_input_fn(segment_idx, previous_state)
         token_ids_BT = batch.token_ids_BCT[:, segment_idx]
-        nll_sum_B, token_count_B, gdn_states, conv_states = _run_segment(
+        if batch.selection_masks_BNCT is None:
+            selection_masks_BNT = batch.loss_mask_BCT[:, segment_idx, None, :]
+        else:
+            selection_masks_BNT = batch.selection_masks_BNCT[:, :, segment_idx, :]
+        nll_sums_BN, token_counts_BN, gdn_states, conv_states = run_segment(
             model,
             token_ids_BT,
             batch.attention_mask_BCT[:, segment_idx],
-            batch.loss_mask_BCT[:, segment_idx],
+            selection_masks_BNT,
             inputs.position_offsets_B,
             inputs.gdn_states,
             inputs.conv_states,
             pad_id=pad_id,
         )
         previous_state = SegmentState(gdn_states=gdn_states, conv_states=conv_states)
+        nll_sums_by_selection = {
+            selection: nll_sums_BN[:, selection_idx]
+            for selection_idx, selection in enumerate(batch.selection_names)
+        }
+        token_counts_by_selection = {
+            selection: token_counts_BN[:, selection_idx]
+            for selection_idx, selection in enumerate(batch.selection_names)
+        }
+        primary_selection = batch.selection_names[0]
         segments.append(
             SegmentResult(
-                nll_sum_B=nll_sum_B,
-                token_count_B=token_count_B,
+                nll_sum_B=nll_sums_by_selection[primary_selection],
+                token_count_B=token_counts_by_selection[primary_selection],
                 state=previous_state,
+                nll_sums_by_selection=nll_sums_by_selection,
+                token_counts_by_selection=token_counts_by_selection,
             )
         )
 

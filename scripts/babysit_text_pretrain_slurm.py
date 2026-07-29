@@ -48,6 +48,11 @@ flags.DEFINE_string(
     "babysit_codex_reasoning_effort", None, "Optional Codex reasoning effort override."
 )
 flags.DEFINE_integer("babysit_codex_timeout_seconds", 1800, "Codex alert timeout.")
+flags.DEFINE_integer(
+    "babysit_codex_checkin_seconds",
+    2700,
+    "Run a periodic Codex situation check this many seconds after the prior check; 0 disables it.",
+)
 
 _TERMINAL_STATES = {
     "COMPLETED",
@@ -196,6 +201,14 @@ def _prompt_codex(
     if not session_id:
         return False, "No Codex session id configured."
 
+    periodic_instruction = ""
+    if reason.startswith("scheduled periodic health check"):
+        periodic_instruction = """
+This is a scheduled health check, not itself a failure. Inspect the current
+Slurm state and recent logs, then give a concise state assessment. Do not edit,
+resubmit, or otherwise intervene when the run is healthy.
+"""
+
     prompt = f"""Statepassing pretraining babysitter alert.
 
 Reason: {reason}
@@ -209,12 +222,19 @@ Babysitter job: {os.environ.get("SLURM_JOB_ID", "unknown")}
 
 Inspect the full current state and diagnose the cause. If intervention is needed,
 make the smallest justified fix and run focused checks. Resubmit only after the
-cause is understood. A resubmit must use the latest valid checkpoint with
-resume=required, the identical W&B run id with wandb_resume=must, and unchanged
-data, effective tokens per optimizer step, optimizer, and LR-schedule arguments.
-Verify the next optimizer step and its LR against the checkpoint before launch.
-Document a replacement run in runs.md before it starts. If the training job id
-changes, submit a replacement babysitter for the new id. Do not blindly resubmit.
+cause is understood. First determine whether a valid checkpoint exists in this
+new run's save directory. If it does, a replacement must resume that checkpoint
+with resume=required and the identical W&B run id with wandb_resume=must. If
+the job failed before its first new-run checkpoint, submit a fresh bootstrap
+replacement from the same model-only source using resume=if_present and the
+same W&B id with wandb_resume=allow; do not demand a checkpoint or W&B run
+that does not exist. In both cases keep data, effective tokens per optimizer
+step, optimizer, and LR-schedule arguments unchanged. Verify the next update
+step and LR before launch. Document a replacement run in runs.md before it
+starts. If the training job id changes, submit a replacement babysitter for the
+new id. Do not blindly resubmit.
+
+{periodic_instruction}
 
 Recent log tail:
 
@@ -297,6 +317,7 @@ def main(_) -> None:
         info["startup_done"] = False
         info["last_metric_step"] = resume_step
         info["last_progress_at"] = now
+        info["last_codex_check_at"] = now
         info["was_running"] = False
     seen_states = {}
 
@@ -328,6 +349,7 @@ def main(_) -> None:
             if state == "RUNNING" and not info["was_running"]:
                 info["was_running"] = True
                 info["last_progress_at"] = now
+                info["last_codex_check_at"] = now
             metrics = _metrics_after(log_dir, job_id, int(info["last_metric_step"]))
             non_finite = []
             if metrics:
@@ -379,6 +401,7 @@ def main(_) -> None:
                     log_dir=log_dir,
                     wiki_path=wiki_path,
                 )
+                info["last_codex_check_at"] = time.time()
 
             if not info["startup_done"] and int(info["last_metric_step"]) >= int(
                 info["startup_target"]
@@ -404,17 +427,43 @@ def main(_) -> None:
                     wiki_path=wiki_path,
                 )
                 info["last_progress_at"] = time.time()
+                info["last_codex_check_at"] = time.time()
+
+            checkin_seconds = int(_flag_value("babysit_codex_checkin_seconds"))
+            if checkin_seconds > 0 and now - float(info["last_codex_check_at"]) >= checkin_seconds:
+                _alert_codex(
+                    reason="scheduled periodic health check",
+                    mode=mode,
+                    info=info,
+                    state=state,
+                    log_dir=log_dir,
+                    wiki_path=wiki_path,
+                )
+                info["last_codex_check_at"] = time.time()
 
         if all(bool(info["done"]) for info in modes.values()):
             break
         startup_active = any(
             not info["done"] and not info["startup_done"] for info in modes.values()
         )
-        time.sleep(
+        sleep_seconds = (
             int(_flag_value("babysit_startup_poll_seconds"))
             if startup_active
             else int(_flag_value("babysit_poll_seconds"))
         )
+        checkin_seconds = int(_flag_value("babysit_codex_checkin_seconds"))
+        if checkin_seconds > 0:
+            seconds_until_checkin = [
+                float(info["last_codex_check_at"]) + checkin_seconds - time.time()
+                for info in modes.values()
+                if not info["done"] and info["was_running"]
+            ]
+            if seconds_until_checkin:
+                sleep_seconds = min(
+                    sleep_seconds,
+                    max(1, math.ceil(min(seconds_until_checkin))),
+                )
+        time.sleep(sleep_seconds)
 
     _append(wiki_path, f"\n## Slurm Babysitter Complete\n\nTime: {_timestamp()}\n")
 

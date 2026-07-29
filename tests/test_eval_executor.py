@@ -21,6 +21,7 @@ from omegalax.evals.executor import (
     assert_chunk1_consistent,
     run_chain,
 )
+from omegalax.distributed.mesh import ensure_mesh
 from omegalax.models.sharding_runtime import set_attn_backend
 from omegalax.text import api as text_api
 from omegalax.trainers.loss import chunked_cross_entropy_stats
@@ -63,7 +64,7 @@ class EvalExecutorTest(absltest.TestCase):
         )
 
     def test_segment_executor_is_jitted_and_uses_bounded_loss_tiles(self):
-        self.assertTrue(hasattr(executor._run_segment, "lower"))
+        self.assertTrue(hasattr(executor.make_run_segment(ensure_mesh()), "lower"))
         self.assertEqual(executor._NUM_LOSS_TILES, 4)
 
     def test_real_chain_uses_per_chunk_nll_and_preserves_partial_tail(self):
@@ -228,6 +229,47 @@ class EvalExecutorTest(absltest.TestCase):
                 np.testing.assert_allclose(
                     np.asarray(actual), np.asarray(expected), rtol=1e-5, atol=1e-5
                 )
+
+    def test_one_forward_reports_all_and_selected_token_metrics(self):
+        batch = self._batch()
+        top_mask = jnp.zeros_like(batch.loss_mask_BCT)
+        top_mask = top_mask.at[:, :, 1].set(batch.loss_mask_BCT[:, :, 1])
+        selected_batch = dataclasses.replace(
+            batch,
+            selection_names=("all", "top_entropy_10pct"),
+            selection_masks_BNCT=jnp.stack((batch.loss_mask_BCT, top_mask), axis=1),
+        )
+        result = run_chain(
+            self.model,
+            self.cfg,
+            selected_batch,
+            pad_id=0,
+            condition="dual-selection",
+            segment_input_fn=lambda idx, previous: self._global_inputs(
+                selected_batch, idx, previous, carry=True
+            ),
+        )
+
+        for segment_idx, segment in enumerate(result.segments):
+            all_counts = np.asarray(segment.token_count("all"))
+            selected_counts = np.asarray(segment.token_count("top_entropy_10pct"))
+            np.testing.assert_array_equal(
+                all_counts,
+                np.asarray(batch.loss_mask_BCT[:, segment_idx, 1:].sum(axis=1)),
+            )
+            np.testing.assert_array_equal(
+                selected_counts,
+                np.asarray(top_mask[:, segment_idx, 1:].sum(axis=1)),
+            )
+            strict_subset = selected_counts < all_counts
+            self.assertTrue(np.any(strict_subset))
+            self.assertTrue(
+                np.all(
+                    np.asarray(segment.nll_sum("top_entropy_10pct"))[strict_subset]
+                    < np.asarray(segment.nll_sum("all"))[strict_subset]
+                )
+            )
+            self.assertIs(segment.nll_sum_B, segment.nll_sum("all"))
 
     def test_conditions_are_independent_and_chunk1_mismatch_is_hard_error(self):
         batch = self._batch()

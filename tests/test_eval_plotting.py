@@ -622,6 +622,60 @@ class EvalPlottingTest(absltest.TestCase):
             },
         )
 
+    def test_comparison_gain_percentage_uses_matching_ablation_nll(self):
+        def checkpoint_points(true_values, zero_values, shuffled_values):
+            return tuple(
+                self._point(
+                    experiment="gdn",
+                    metric="nll",
+                    view="in_horizon",
+                    position=position,
+                    condition=condition,
+                    value=value,
+                )
+                for condition, values in (
+                    ("true_gdn", true_values),
+                    ("zero_gdn", zero_values),
+                    ("shuffled_gdn", shuffled_values),
+                )
+                for position, value in enumerate(values, start=1)
+            )
+
+        figure = make_comparison_figure(
+            {
+                "Model A": (checkpoint_points((2.0, 3.0), (2.5, 4.0), (2.4, 3.6)), 4),
+                "Model B": (checkpoint_points((1.8, 2.7), (2.0, 3.0), (2.0, 3.0)), 4),
+            },
+            experiment="gdn",
+            metric="gdn_state_gain",
+            view="in_horizon",
+            as_percentage=True,
+        )
+        self.addCleanup(plt.close, figure)
+
+        axis = figure.axes[0]
+        values = {
+            line.get_label(): tuple(float(value) for value in line.get_ydata())
+            for line in axis.lines
+            if line.get_label() in {"Model A", "Model B"}
+        }
+        self.assertSequenceAlmostEqual(values["Model A"], (20.0, 25.0))
+        self.assertSequenceAlmostEqual(values["Model B"], (10.0, 10.0))
+        self.assertIn("%", axis.get_ylabel())
+
+        semantic_figure = make_comparison_figure(
+            {"Model A": (checkpoint_points((2.0, 3.0), (2.5, 4.0), (2.4, 3.6)), 4)},
+            experiment="gdn",
+            metric="gdn_semantic_gain",
+            view="in_horizon",
+            as_percentage=True,
+        )
+        self.addCleanup(plt.close, semantic_figure)
+        semantic_values = tuple(
+            float(value) for value in semantic_figure.axes[0].lines[0].get_ydata()
+        )
+        self.assertSequenceAlmostEqual(semantic_values, (100 / 6, 100 / 6))
+
     def test_heatmap_filters_component_metric_and_absolute_condition(self):
         points = []
         for length in (2, 3, 4):

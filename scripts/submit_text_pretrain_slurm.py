@@ -36,6 +36,11 @@ class PretrainMode(enum.StrEnum):
     STATEPASSING_BPTT = "statepassing_bptt"
 
 
+class GdnStateRouting(enum.StrEnum):
+    SAME_LAYER = "same_layer"
+    LAST_TO_FIRST = "last_to_first"
+
+
 flags.DEFINE_string("submit_run_id", None, "Run id used for jobs/checkpoints/logs.")
 flags.DEFINE_multi_enum(
     "submit_experiment_mode",
@@ -117,6 +122,12 @@ flags.DEFINE_integer("submit_val_steps", 10, "Validation batches.")
 flags.DEFINE_integer("submit_bptt_chunks", None, "BPTT span in chunks for statepassing.")
 flags.DEFINE_bool("submit_pass_gdn_state", True, "Pass GDN recurrent state between chunks.")
 flags.DEFINE_integer("submit_gdn_layer_limit", None, "Only pass state for first N GDN layers.")
+flags.DEFINE_enum(
+    "submit_gdn_state_routing",
+    GdnStateRouting.SAME_LAYER.value,
+    [routing.value for routing in GdnStateRouting],
+    "Route GDN state between chunks.",
+)
 flags.DEFINE_bool("submit_pass_rope_positions", False, "Pass chunk-aware RoPE position ids.")
 flags.DEFINE_bool("submit_pass_conv_state", False, "Pass 1D conv state between chunks.")
 flags.DEFINE_integer("submit_grain_read_threads", 2, "Grain read threads.")
@@ -554,6 +565,12 @@ def _train_flags(
     single_process_per_node: bool,
     wandb_resume_id: str | None = None,
 ) -> list[str]:
+    gdn_state_routing = GdnStateRouting(_flag_value("submit_gdn_state_routing"))
+    if gdn_state_routing is GdnStateRouting.LAST_TO_FIRST:
+        if not _flag_value("submit_pass_gdn_state"):
+            raise ValueError("last_to_first requires submit_pass_gdn_state=True")
+        if _flag_value("submit_gdn_layer_limit") != 1:
+            raise ValueError("last_to_first requires submit_gdn_layer_limit=1")
     use_local_gpu_process = single_process_per_run or single_process_per_node
     fsdp_size = 1 if use_local_gpu_process else total_devices
     dp_size = total_devices if use_local_gpu_process else 1
@@ -588,6 +605,7 @@ def _train_flags(
         "--resume=if_present",
         "--text_attn_backend=mosaic_gpu",
         f"--pass_gdn_state={_flag_value('submit_pass_gdn_state')}",
+        f"--gdn_state_routing={_flag_value('submit_gdn_state_routing')}",
         f"--pass_rope_positions={_flag_value('submit_pass_rope_positions')}",
         f"--pass_conv_state={_flag_value('submit_pass_conv_state')}",
         f"--grain_read_threads={_flag_value('submit_grain_read_threads')}",

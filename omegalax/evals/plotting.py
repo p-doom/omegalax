@@ -41,11 +41,15 @@ def _validate_metric(experiment: str, metric: str) -> None:
         raise ValueError(f"Unsupported metric for {experiment!r}: {metric!r}")
 
 
-def _metric_label(metric: str) -> str:
+def _metric_label(metric: str, *, as_percentage: bool = False) -> str:
     if metric == "nll":
         return "NLL (nats/token)"
     if metric.endswith("_state_gain"):
+        if as_percentage:
+            return "State Gain (% NLL reduction vs Zero State)"
         return "State Gain (nats/token)"
+    if as_percentage:
+        return "Semantic Gain (% NLL reduction vs Shuffled State)"
     return "Semantic Gain (nats/token)"
 
 
@@ -86,6 +90,65 @@ def _matching_points(
     )
 
 
+def _percentage_gain_points(
+    points: Sequence[SummaryPoint],
+    *,
+    experiment: str,
+    metric: str,
+    view: str,
+    doc_num_chunks: int | None,
+) -> list[SummaryPoint]:
+    if metric == "nll":
+        raise ValueError("Percentage comparison is only defined for gain metrics")
+    ablated_condition = (
+        f"zero_{experiment}" if metric.endswith("_state_gain") else f"shuffled_{experiment}"
+    )
+    true_by_position = {
+        point.chunk_position: point
+        for point in _matching_points(
+            points,
+            experiment=experiment,
+            metric="nll",
+            view=view,
+            doc_num_chunks=doc_num_chunks,
+            condition=f"true_{experiment}",
+        )
+    }
+    ablated_by_position = {
+        point.chunk_position: point
+        for point in _matching_points(
+            points,
+            experiment=experiment,
+            metric="nll",
+            view=view,
+            doc_num_chunks=doc_num_chunks,
+            condition=ablated_condition,
+        )
+    }
+    percentage_points = []
+    for position in sorted(set(true_by_position) & set(ablated_by_position)):
+        true = true_by_position[position]
+        ablated = ablated_by_position[position]
+        if ablated.value == 0:
+            raise ValueError(
+                f"Cannot calculate percentage gain with zero {ablated_condition} NLL at "
+                f"chunk position {position}"
+            )
+        percentage_points.append(
+            SummaryPoint(
+                experiment=experiment,
+                metric=metric,
+                view=view,
+                doc_num_chunks=doc_num_chunks,
+                chunk_position=position,
+                condition=None,
+                value=100 * (ablated.value - true.value) / ablated.value,
+                token_count=true.token_count,
+            )
+        )
+    return percentage_points
+
+
 def _finish_line_figure(
     figure: Figure,
     axis,
@@ -95,11 +158,12 @@ def _finish_line_figure(
     x_values: Sequence[int],
     y_values: Sequence[float],
     legend_handles: Sequence[Line2D],
+    as_percentage: bool = False,
 ) -> None:
     first = min(x_values)
     last = max(x_values)
     axis.set_xlabel("Chunk Position")
-    axis.set_ylabel(_metric_label(metric))
+    axis.set_ylabel(_metric_label(metric, as_percentage=as_percentage))
     axis.set_xticks(range(first, last + 1))
     axis.set_xlim(first - 0.15, last + 0.15)
     axis.set_ylim(*_y_limits(y_values, metric))
@@ -210,10 +274,13 @@ def make_comparison_figure(
     view: str,
     doc_num_chunks: int | None = None,
     title: str | None = None,
+    as_percentage: bool = False,
 ) -> Figure:
-    """Compare checkpoints, using only the component's true NLL condition."""
+    """Compare checkpoints, using either absolute or relative component gains."""
 
     _validate_metric(experiment, metric)
+    if as_percentage and metric == "nll":
+        raise ValueError("Percentage comparison is only defined for gain metrics")
     figure, axis = plt.subplots(figsize=(7.5, 4.5))
     handles = []
     x_values = []
@@ -223,14 +290,23 @@ def make_comparison_figure(
 
     for style_index, label in enumerate(sorted(models)):
         model_points, c_train = models[label]
-        selected = _matching_points(
-            model_points,
-            experiment=experiment,
-            metric=metric,
-            view=view,
-            doc_num_chunks=doc_num_chunks,
-            condition=condition,
-        )
+        if as_percentage:
+            selected = _percentage_gain_points(
+                model_points,
+                experiment=experiment,
+                metric=metric,
+                view=view,
+                doc_num_chunks=doc_num_chunks,
+            )
+        else:
+            selected = _matching_points(
+                model_points,
+                experiment=experiment,
+                metric=metric,
+                view=view,
+                doc_num_chunks=doc_num_chunks,
+                condition=condition,
+            )
         if not selected:
             continue
         color = _MODEL_COLORS[style_index % len(_MODEL_COLORS)]
@@ -284,6 +360,7 @@ def make_comparison_figure(
         x_values=x_values,
         y_values=y_values,
         legend_handles=handles,
+        as_percentage=as_percentage,
     )
     return figure
 

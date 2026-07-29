@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
+import gc
 import hashlib
 import json
 import os
@@ -14,9 +15,9 @@ import jax
 import numpy as np
 from matplotlib import pyplot as plt
 
-from omegalax.distributed.mesh import ensure_mesh
+from omegalax.distributed.mesh import ensure_mesh, mesh_rules
 from omegalax.evals.aggregation import SummaryPoint, aggregate_metrics
-from omegalax.evals.executor import ChainBatch
+from omegalax.evals.executor import ChainBatch, make_run_entropy_segment, make_run_segment
 from omegalax.evals.experiments import run_conv_experiment, run_gdn_experiment
 from omegalax.evals.manifest import (
     FullDocumentLoader,
@@ -30,6 +31,14 @@ from omegalax.evals.plotting import (
     make_single_figure,
     save_common_exact_length_scale,
     save_figure_formats,
+)
+from omegalax.evals.selection import (
+    TOP_ENTROPY_FRACTION,
+    TOP_ENTROPY_SELECTION,
+    EntropySelectionRow,
+    EntropySelectorIdentity,
+    EntropySelectorStore,
+    top_entropy_positions,
 )
 from omegalax.evals.storage import EvalRunIdentity, EvalRunStore, MetricRow
 from omegalax.models.sharding_runtime import set_attn_backend
@@ -52,8 +61,11 @@ _METRICS = {
     "conv": ("nll", "conv_state_gain", "conv_semantic_gain"),
 }
 _PLOT_TYPES = ("in_horizon", "beyond_horizon", "exact_length", "heatmap")
+_TOKEN_SELECTIONS = ("all", TOP_ENTROPY_SELECTION)
+_RESULT_VERSION = "state_usage_v2"
 _METRIC_CONTRACT = "nll_sum_token_count_v1"
 _IMMUTABLE_CONFIG_FIELDS = (
+    "result_version",
     "c_train",
     "pass_gdn_state",
     "gdn_layer_limit",
@@ -138,22 +150,32 @@ def applicable_experiments(spec: CheckpointEvalSpec) -> tuple[str, ...]:
 
 
 def result_dir_for_checkpoint(checkpoint: ResolvedCheckpoint) -> Path:
-    return checkpoint.root / "evals" / "state_usage_v1" / f"step_{checkpoint.step}"
+    return checkpoint.root / "evals" / _RESULT_VERSION / f"step_{checkpoint.step}"
 
 
 def _result_dir_from_checkpoint_request(checkpoint: str | Path) -> Path:
     try:
-        return result_dir_for_checkpoint(resolve_checkpoint(checkpoint))
+        resolved = resolve_checkpoint(checkpoint)
+        preferred = result_dir_for_checkpoint(resolved)
+        if (preferred / "eval_config.json").is_file():
+            return preferred
+        legacy = resolved.root / "evals" / "state_usage_v1" / f"step_{resolved.step}"
+        if (legacy / "eval_config.json").is_file():
+            return legacy
+        return preferred
     except ValueError as live_checkpoint_error:
         requested = Path(checkpoint).expanduser().resolve()
         if requested.name.isdigit():
-            candidates = (
-                requested.parent / "evals" / "state_usage_v1" / f"step_{int(requested.name)}",
+            candidates = tuple(
+                requested.parent / "evals" / version / f"step_{int(requested.name)}"
+                for version in (_RESULT_VERSION, "state_usage_v1")
             )
         else:
             candidates = tuple(
-                sorted(
-                    (requested / "evals" / "state_usage_v1").glob("step_*"),
+                candidate
+                for version in (_RESULT_VERSION, "state_usage_v1")
+                for candidate in sorted(
+                    (requested / "evals" / version).glob("step_*"),
                     key=lambda path: int(path.name.removeprefix("step_")),
                     reverse=True,
                 )
@@ -188,6 +210,30 @@ def _validate_plot_types(plot_types: Sequence[str]) -> tuple[str, ...]:
     if len(set(plot_types)) != len(plot_types):
         raise ValueError(f"Duplicate plot types: {plot_types}")
     return plot_types
+
+
+def _validate_token_selections(token_selections: Sequence[str]) -> tuple[str, ...]:
+    token_selections = tuple(token_selections)
+    unknown = [selection for selection in token_selections if selection not in _TOKEN_SELECTIONS]
+    if unknown:
+        raise ValueError(f"Unknown token selection(s): {unknown}")
+    if not token_selections:
+        raise ValueError("At least one token selection is required")
+    if len(set(token_selections)) != len(token_selections):
+        raise ValueError(f"Duplicate token selections: {token_selections}")
+    return tuple(selection for selection in _TOKEN_SELECTIONS if selection in token_selections)
+
+
+def _execution_token_selections(
+    token_selections: Sequence[str] | None,
+    entropy_reference_checkpoint: str | Path | None,
+) -> tuple[str, ...]:
+    if token_selections is None:
+        return _TOKEN_SELECTIONS if entropy_reference_checkpoint is not None else ("all",)
+    selections = _validate_token_selections(token_selections)
+    if TOP_ENTROPY_SELECTION in selections and entropy_reference_checkpoint is None:
+        raise ValueError(f"{TOP_ENTROPY_SELECTION} requires --entropy_reference_checkpoint")
+    return selections
 
 
 def _code_hash() -> str:
@@ -270,6 +316,8 @@ def _eval_config(
     manifest: FullDocumentManifest,
     *,
     experiments: Sequence[str],
+    token_selections: Sequence[str],
+    entropy_selector: EntropySelectorIdentity | dict[str, Any] | None,
     document_cap: int | None,
     tp_size: int,
     fsdp_size: int,
@@ -279,8 +327,24 @@ def _eval_config(
     selected = _selected_documents(manifest, document_cap)
     shard_ids = [shard_id for shard_id, _ in selected]
     experiments = tuple(experiment for experiment in _CONDITIONS if experiment in experiments)
+    token_selections = _validate_token_selections(token_selections)
+    selection_configs: dict[str, Any] = {"all": {"kind": "all"}}
+    if TOP_ENTROPY_SELECTION in token_selections:
+        if entropy_selector is None:
+            raise ValueError(
+                f"{TOP_ENTROPY_SELECTION} requires an explicit entropy reference checkpoint"
+            )
+        selection_configs[TOP_ENTROPY_SELECTION] = {
+            "kind": "top_entropy",
+            "selector_identity": (
+                asdict(entropy_selector)
+                if isinstance(entropy_selector, EntropySelectorIdentity)
+                else dict(entropy_selector)
+            ),
+        }
     deltanet_kernel, attention_backend = _runtime_backends()
     return {
+        "result_version": _RESULT_VERSION,
         "c_train": spec.c_train,
         "pass_gdn_state": spec.pass_gdn_state,
         "gdn_layer_limit": spec.gdn_layer_limit,
@@ -297,6 +361,10 @@ def _eval_config(
         "document_cap": document_cap,
         "effective_document_cap": (manifest.sample_cap if document_cap is None else document_cap),
         "experiments": list(experiments),
+        "token_selections": list(token_selections),
+        "selection_configs": {
+            selection: selection_configs[selection] for selection in token_selections
+        },
         "population_counts": {
             str(count.doc_num_chunks): count.available for count in manifest.counts_by_length
         },
@@ -307,8 +375,11 @@ def _eval_config(
             experiment: list(_CONDITIONS[experiment]) for experiment in experiments
         },
         "expected_shards": {
-            experiment: {condition: list(shard_ids) for condition in _CONDITIONS[experiment]}
-            for experiment in experiments
+            selection: {
+                experiment: {condition: list(shard_ids) for condition in _CONDITIONS[experiment]}
+                for experiment in experiments
+            }
+            for selection in token_selections
         },
     }
 
@@ -319,6 +390,8 @@ def _requested_identity(
     manifest: FullDocumentManifest,
     *,
     experiments: Sequence[str],
+    token_selections: Sequence[str],
+    entropy_selector: EntropySelectorIdentity | None,
     document_cap: int | None,
     tp_size: int,
     fsdp_size: int,
@@ -335,6 +408,8 @@ def _requested_identity(
             spec,
             manifest,
             experiments=experiments,
+            token_selections=token_selections,
+            entropy_selector=entropy_selector,
             document_cap=document_cap,
             tp_size=tp_size,
             fsdp_size=fsdp_size,
@@ -357,16 +432,15 @@ def _existing_store(run_dir: str | Path) -> EvalRunStore:
     expected_dir = (
         Path(identity.checkpoint_root).expanduser().resolve()
         / "evals"
-        / "state_usage_v1"
+        / str(identity.eval_config.get("result_version", "state_usage_v1"))
         / f"step_{identity.checkpoint_step}"
     )
     if run_dir != expected_dir:
         raise ValueError(f"Evaluation run directory conflicts with its stored identity: {run_dir}")
-    return EvalRunStore(
-        run_dir=run_dir,
-        config_path=run_dir / "eval_config.json",
-        status_path=run_dir / "status.json",
-        identity=identity,
+    return EvalRunStore.open(
+        identity.checkpoint_root,
+        identity.checkpoint_step,
+        identity,
     )
 
 
@@ -401,6 +475,26 @@ def _merge_identity(
         for experiment in _CONDITIONS
         if experiment in existing_experiments or experiment in requested_experiments
     )
+    existing_selections = tuple(existing.eval_config.get("token_selections", ("all",)))
+    requested_selections = tuple(requested.eval_config.get("token_selections", ("all",)))
+    merged_selections = tuple(
+        selection
+        for selection in _TOKEN_SELECTIONS
+        if selection in existing_selections or selection in requested_selections
+    )
+    existing_selection_configs = dict(existing.eval_config.get("selection_configs", {}))
+    requested_selection_configs = dict(requested.eval_config.get("selection_configs", {}))
+    for selection in set(existing_selections) & set(requested_selections):
+        if existing_selection_configs.get(selection) != requested_selection_configs.get(selection):
+            raise ValueError(
+                f"Token selection configuration conflict for {selection!r}: "
+                f"stored={existing_selection_configs.get(selection)!r}, "
+                f"requested={requested_selection_configs.get(selection)!r}"
+            )
+    merged_selection_configs = {
+        **existing_selection_configs,
+        **requested_selection_configs,
+    }
     existing_effective_cap = int(existing.eval_config["effective_document_cap"])
     requested_effective_cap = int(requested.eval_config["effective_document_cap"])
     existing_cap = existing.eval_config.get("document_cap")
@@ -412,6 +506,7 @@ def _merge_identity(
 
     if (
         merged_experiments == existing_experiments
+        and merged_selections == existing_selections
         and requested_effective_cap <= existing_effective_cap
     ):
         return existing
@@ -433,6 +528,10 @@ def _merge_identity(
             ),
             manifest,
             experiments=merged_experiments,
+            token_selections=merged_selections,
+            entropy_selector=(
+                merged_selection_configs.get(TOP_ENTROPY_SELECTION, {}).get("selector_identity")
+            ),
             document_cap=merged_cap,
             tp_size=int(requested.eval_config["tp_size"]),
             fsdp_size=int(requested.eval_config["fsdp_size"]),
@@ -463,86 +562,111 @@ def _open_or_extend_store(
 def _validate_raw_results(
     store: EvalRunStore,
     experiments: Sequence[str],
+    token_selections: Sequence[str] | None = None,
 ) -> None:
     config = store.identity.eval_config
-    expected_by_experiment = dict(config.get("expected_shards", {}))
+    if token_selections is None:
+        token_selections = tuple(config.get("token_selections", ("all",)))
+    token_selections = _validate_token_selections(token_selections)
+    configured_selections = tuple(config.get("token_selections", ("all",)))
+    expected_config = dict(config.get("expected_shards", {}))
     configured_experiments = set(config.get("experiments", ()))
-    target_signatures: dict[int, tuple[Any, ...]] = {}
-    chunk_one_nll: dict[int, float] = {}
-    for experiment in experiments:
-        if experiment not in configured_experiments:
-            raise ValueError(f"Evaluation component is missing: {experiment}")
-        expected_conditions = dict(expected_by_experiment.get(experiment, {}))
-        for condition in _CONDITIONS[experiment]:
-            if condition not in expected_conditions:
-                raise ValueError(
-                    f"Evaluation condition is incomplete or missing: {experiment}/{condition}"
-                )
-            for raw_shard_id in expected_conditions[condition]:
-                shard_id = int(raw_shard_id)
-                rows = store.read_shard(experiment, condition, shard_id)
-                if not rows:
+    for selection in token_selections:
+        if selection not in configured_selections:
+            raise ValueError(f"Evaluation token selection is missing: {selection}")
+        expected_by_experiment = (
+            dict(expected_config[selection])
+            if store.result_version == _RESULT_VERSION
+            else expected_config
+        )
+        target_signatures: dict[int, tuple[Any, ...]] = {}
+        chunk_one_nll: dict[int, float] = {}
+        for experiment in experiments:
+            if experiment not in configured_experiments:
+                raise ValueError(f"Evaluation component is missing: {experiment}")
+            expected_conditions = dict(expected_by_experiment.get(experiment, {}))
+            for condition in _CONDITIONS[experiment]:
+                if condition not in expected_conditions:
                     raise ValueError(
-                        f"Evaluation condition is incomplete; missing shard "
-                        f"{experiment}/{condition}/{shard_id}"
+                        f"Evaluation condition is incomplete or missing: "
+                        f"{selection}/{experiment}/{condition}"
                     )
-                first = rows[0]
-                expected_positions = list(range(1, first.doc_num_chunks + 1))
-                positions = sorted(row.chunk_position for row in rows)
-                if positions != expected_positions:
-                    raise ValueError(
-                        f"Evaluation shard has incomplete chunk rows for "
-                        f"{experiment}/{condition}/{shard_id}: "
-                        f"expected={expected_positions}, actual={positions}"
-                    )
-                for row in rows:
-                    if (
-                        row.experiment != experiment
-                        or row.condition != condition
-                        or row.bucket_idx != first.bucket_idx
-                        or row.record_idx != first.record_idx
-                        or row.doc_id != first.doc_id
-                        or row.doc_num_chunks != first.doc_num_chunks
-                    ):
+                for raw_shard_id in expected_conditions[condition]:
+                    shard_id = int(raw_shard_id)
+                    rows = store.read_shard(experiment, condition, shard_id, selection=selection)
+                    if not rows:
                         raise ValueError(
-                            f"Evaluation shard rows conflict for "
-                            f"{experiment}/{condition}/{shard_id}"
+                            f"Evaluation condition is incomplete; missing shard "
+                            f"{selection}/{experiment}/{condition}/{shard_id}"
                         )
-                signature = (
-                    first.bucket_idx,
-                    first.record_idx,
-                    first.doc_id,
-                    first.doc_num_chunks,
-                    tuple(
-                        (row.chunk_position, row.token_count)
-                        for row in sorted(rows, key=lambda row: row.chunk_position)
-                    ),
-                )
-                previous_signature = target_signatures.setdefault(shard_id, signature)
-                if previous_signature != signature:
-                    raise ValueError(
-                        f"Evaluation target/token_count conflict across conditions for "
-                        f"shard {shard_id}: {experiment}/{condition}"
+                    first = rows[0]
+                    expected_positions = list(range(1, first.doc_num_chunks + 1))
+                    positions = sorted(row.chunk_position for row in rows)
+                    if positions != expected_positions:
+                        raise ValueError(
+                            f"Evaluation shard has incomplete chunk rows for "
+                            f"{selection}/{experiment}/{condition}/{shard_id}: "
+                            f"expected={expected_positions}, actual={positions}"
+                        )
+                    for row in rows:
+                        if (
+                            row.experiment != experiment
+                            or row.condition != condition
+                            or row.bucket_idx != first.bucket_idx
+                            or row.record_idx != first.record_idx
+                            or row.doc_id != first.doc_id
+                            or row.doc_num_chunks != first.doc_num_chunks
+                        ):
+                            raise ValueError(
+                                f"Evaluation shard rows conflict for "
+                                f"{selection}/{experiment}/{condition}/{shard_id}"
+                            )
+                    signature = (
+                        first.bucket_idx,
+                        first.record_idx,
+                        first.doc_id,
+                        first.doc_num_chunks,
+                        tuple(
+                            (row.chunk_position, row.token_count)
+                            for row in sorted(rows, key=lambda row: row.chunk_position)
+                        ),
                     )
-                first_chunk_nll = next(row.nll_sum for row in rows if row.chunk_position == 1)
-                reference_nll = chunk_one_nll.setdefault(shard_id, first_chunk_nll)
-                if abs(first_chunk_nll - reference_nll) > 1e-6:
-                    raise ValueError(
-                        f"Evaluation chunk 1 nll_sum conflict across conditions for "
-                        f"shard {shard_id}: {experiment}/{condition}"
-                    )
+                    previous_signature = target_signatures.setdefault(shard_id, signature)
+                    if previous_signature != signature:
+                        raise ValueError(
+                            f"Evaluation target/token_count conflict across conditions for "
+                            f"selection {selection}, shard {shard_id}: {experiment}/{condition}"
+                        )
+                    first_chunk_nll = next(row.nll_sum for row in rows if row.chunk_position == 1)
+                    reference_nll = chunk_one_nll.setdefault(shard_id, first_chunk_nll)
+                    if abs(first_chunk_nll - reference_nll) > 1e-6:
+                        raise ValueError(
+                            f"Evaluation chunk 1 nll_sum conflict across conditions for "
+                            f"selection {selection}, shard {shard_id}: {experiment}/{condition}"
+                        )
 
 
 def validate_checkpoint_results(
     run_dir: str | Path,
     *,
     experiments: Sequence[str] | None = None,
+    token_selections: Sequence[str] | None = None,
 ) -> EvalRunStore:
     store = _existing_store(run_dir)
     selected = _validate_experiments(experiments)
     if selected is None:
         selected = tuple(store.identity.eval_config["experiments"])
-    _validate_raw_results(store, selected)
+    try:
+        _validate_raw_results(store, selected, token_selections)
+    except ValueError:
+        try:
+            _validate_raw_results(
+                store,
+                tuple(store.identity.eval_config["experiments"]),
+            )
+        except ValueError:
+            store.mark_incomplete()
+        raise
     return store
 
 
@@ -607,6 +731,119 @@ def _evaluation_batches(
     return tuple(batches)
 
 
+def _entropy_selector_identity(
+    checkpoint: ResolvedCheckpoint,
+    manifest: FullDocumentManifest,
+    *,
+    pad_id: int,
+    tp_size: int,
+    fsdp_size: int,
+    dp_size: int,
+    batch_size: int,
+) -> EntropySelectorIdentity:
+    deltanet_kernel, attention_backend = _runtime_backends()
+    return EntropySelectorIdentity(
+        reference_checkpoint_root=str(checkpoint.root.resolve()),
+        reference_checkpoint_step=checkpoint.step,
+        reference_config_hash=(
+            "sha256:" + hashlib.sha256(checkpoint.config_path.read_bytes()).hexdigest()
+        ),
+        manifest_hash=manifest.manifest_hash,
+        dataset_hash=manifest.dataset_hash,
+        code_hash=_code_hash(),
+        pad_id=pad_id,
+        fraction=TOP_ENTROPY_FRACTION,
+        state_mode="zero_gdn_and_conv",
+        position_mode="reset_each_chunk",
+        tp_size=tp_size,
+        fsdp_size=fsdp_size,
+        dp_size=dp_size,
+        batch_size=batch_size,
+        deltanet_kernel=deltanet_kernel,
+        attention_backend=attention_backend,
+    )
+
+
+def _ensure_entropy_selector(
+    checkpoint: ResolvedCheckpoint,
+    identity: EntropySelectorIdentity,
+    manifest: FullDocumentManifest,
+    documents: Sequence[tuple[int, ManifestDocument]],
+) -> EntropySelectorStore:
+    store = EntropySelectorStore.open(checkpoint.root, identity)
+    missing = tuple(item for item in documents if not store.shard_is_complete(item[0]))
+    if not missing:
+        return store
+
+    model, cfg = text_api.init_model(
+        str(checkpoint.config_path),
+        jax.random.key(0),
+        tp_size=identity.tp_size,
+        fsdp_size=identity.fsdp_size,
+        dp_size=identity.dp_size,
+    )
+    model = restore_model_params(model, checkpoint)
+    set_attn_backend(model, identity.attention_backend)
+    mesh = ensure_mesh(
+        tp_size=identity.tp_size,
+        fsdp_size=identity.fsdp_size,
+        dp_size=identity.dp_size,
+    )
+    loader = FullDocumentLoader(manifest)
+    by_length: dict[int, list[tuple[int, ManifestDocument]]] = {}
+    for item in missing:
+        by_length.setdefault(item[1].doc_num_chunks, []).append(item)
+
+    with mesh_rules(mesh):
+        run_entropy_segment = make_run_entropy_segment(mesh)
+        for doc_num_chunks in sorted(by_length):
+            length_documents = by_length[doc_num_chunks]
+            for start in range(0, len(length_documents), identity.batch_size):
+                batch_documents = tuple(length_documents[start : start + identity.batch_size])
+                chain_batch, _, original_count = _make_chain_batch(
+                    loader,
+                    batch_documents,
+                    batch_size=identity.batch_size,
+                    cfg=cfg,
+                    mesh=mesh,
+                    require_donors=False,
+                )
+                entropies_by_segment = tuple(
+                    np.asarray(
+                        jax.device_get(
+                            run_entropy_segment(
+                                model,
+                                chain_batch.token_ids_BCT[:, segment_idx],
+                                chain_batch.attention_mask_BCT[:, segment_idx],
+                                pad_id=identity.pad_id,
+                            )
+                        )
+                    )
+                    for segment_idx in range(doc_num_chunks)
+                )
+                for batch_idx, (shard_id, document) in enumerate(batch_documents[:original_count]):
+                    loaded_document = loader.load_document(document)
+                    rows = tuple(
+                        EntropySelectionRow(
+                            chunk_position=segment_idx + 1,
+                            eligible_count=int(
+                                np.count_nonzero(loaded_document.loss_mask_CT[segment_idx, 1:])
+                            ),
+                            selected_positions=top_entropy_positions(
+                                entropies_by_segment[segment_idx][batch_idx],
+                                loaded_document.loss_mask_CT[segment_idx],
+                            ),
+                        )
+                        for segment_idx in range(doc_num_chunks)
+                    )
+                    store.write_shard(shard_id, rows)
+
+    del model
+    gc.collect()
+    jax.clear_caches()
+    return store
+
+
 def _make_chain_batch(
     loader: FullDocumentLoader,
     documents: Sequence[tuple[int, ManifestDocument]],
@@ -614,6 +851,9 @@ def _make_chain_batch(
     batch_size: int,
     cfg,
     mesh,
+    token_selections: Sequence[str] = ("all",),
+    entropy_selector_store: EntropySelectorStore | None = None,
+    require_donors: bool = True,
 ) -> tuple[ChainBatch, jax.Array, int]:
     loaded = [(shard_id, entry, loader.load_document(entry)) for shard_id, entry in documents]
     original_count = len(loaded)
@@ -626,12 +866,34 @@ def _make_chain_batch(
         for index, (_, entry, _) in enumerate(loaded[:original_count])
     }
     for index, (_, entry, _) in enumerate(loaded):
-        if index >= original_count:
+        if not require_donors or index >= original_count:
             donor_indices.append(index)
             continue
         donor_ref = (entry.donor_bucket_idx, entry.donor_record_idx, entry.donor_doc_id)
         donor_indices.append(local_by_ref[donor_ref])
 
+    token_selections = _validate_token_selections(token_selections)
+    if TOP_ENTROPY_SELECTION in token_selections and entropy_selector_store is None:
+        raise ValueError("Top-entropy selection requires an entropy selector store")
+    selection_masks_BNCT = np.stack(
+        [
+            np.stack(
+                [
+                    (
+                        document.loss_mask_CT
+                        if selection == "all"
+                        else entropy_selector_store.selection_mask(
+                            shard_id,
+                            num_chunks=entry.doc_num_chunks,
+                            chunk_length=document.token_ids_CT.shape[-1],
+                        )
+                    )
+                    for selection in token_selections
+                ]
+            )
+            for shard_id, entry, document in loaded
+        ]
+    )
     arrays = text_api.shard_batch_dict(
         {
             "token_ids_BCT": np.stack([document.token_ids_CT for _, _, document in loaded]),
@@ -641,6 +903,7 @@ def _make_chain_batch(
             "loss_mask_BCT": np.stack([document.loss_mask_CT for _, _, document in loaded]),
             "chunk_indices_BC": np.stack([document.chunk_idx_C for _, _, document in loaded]),
             "donor_indices_B": np.asarray(donor_indices, dtype=np.int32),
+            "selection_masks_BNCT": selection_masks_BNCT,
         },
         cfg,
         mesh,
@@ -652,6 +915,8 @@ def _make_chain_batch(
             attention_mask_BCT=arrays["attention_mask_BCT"],
             loss_mask_BCT=arrays["loss_mask_BCT"],
             chunk_indices_BC=arrays["chunk_indices_BC"],
+            selection_names=tuple(token_selections),
+            selection_masks_BNCT=arrays["selection_masks_BNCT"],
         ),
         arrays["donor_indices_B"],
         original_count,
@@ -663,12 +928,14 @@ def _result_rows(
     condition: str,
     result,
     documents: Sequence[tuple[int, ManifestDocument]],
+    *,
+    selection: str,
 ) -> tuple[tuple[int, tuple[MetricRow, ...]], ...]:
     nll_by_segment = tuple(
-        np.asarray(jax.device_get(segment.nll_sum_B)) for segment in result.segments
+        np.asarray(jax.device_get(segment.nll_sum(selection))) for segment in result.segments
     )
     counts_by_segment = tuple(
-        np.asarray(jax.device_get(segment.token_count_B)) for segment in result.segments
+        np.asarray(jax.device_get(segment.token_count(selection))) for segment in result.segments
     )
     rows_by_shard = []
     for batch_index, (shard_id, document) in enumerate(documents):
@@ -698,11 +965,13 @@ def _run_missing_inference(
 ) -> None:
     config = store.identity.eval_config
     experiments = tuple(config["experiments"])
+    token_selections = tuple(config.get("token_selections", ("all",)))
     expected = dict(config["expected_shards"])
     missing = any(
-        not store.shard_is_complete(experiment, condition, int(shard_id))
+        not store.shard_is_complete(experiment, condition, int(shard_id), selection=selection)
+        for selection in token_selections
         for experiment in experiments
-        for condition, shard_ids in dict(expected[experiment]).items()
+        for condition, shard_ids in dict(expected[selection][experiment]).items()
         for shard_id in shard_ids
     )
     if not missing:
@@ -728,10 +997,20 @@ def _run_missing_inference(
         pass_conv_state=spec.pass_conv_state,
         pass_rope_positions=spec.pass_rope_positions,
     )
+    entropy_selector_store = None
+    if TOP_ENTROPY_SELECTION in token_selections:
+        selector_identity = EntropySelectorIdentity(
+            **dict(config["selection_configs"][TOP_ENTROPY_SELECTION]["selector_identity"])
+        )
+        entropy_selector_store = EntropySelectorStore.open(
+            selector_identity.reference_checkpoint_root,
+            selector_identity,
+        )
     selected_ids = {
         int(shard_id)
+        for selection in token_selections
         for experiment in experiments
-        for shard_ids in dict(expected[experiment]).values()
+        for shard_ids in dict(expected[selection][experiment]).values()
         for shard_id in shard_ids
     }
     selected = tuple(
@@ -749,51 +1028,81 @@ def _run_missing_inference(
         "gdn": run_gdn_experiment,
         "conv": run_conv_experiment,
     }
-    for doc_num_chunks in sorted(by_length):
-        for documents in _evaluation_batches(by_length[doc_num_chunks], batch_size=batch_size):
-            needed_experiments = [
-                experiment
-                for experiment in experiments
-                if any(
-                    not store.shard_is_complete(experiment, condition, shard_id)
-                    for condition in _CONDITIONS[experiment]
-                    for shard_id, _ in documents
+    with mesh_rules(mesh):
+        run_segment = make_run_segment(mesh)
+        for doc_num_chunks in sorted(by_length):
+            for documents in _evaluation_batches(by_length[doc_num_chunks], batch_size=batch_size):
+                needed_experiments = [
+                    experiment
+                    for experiment in experiments
+                    if any(
+                        not store.shard_is_complete(
+                            experiment,
+                            condition,
+                            shard_id,
+                            selection=selection,
+                        )
+                        for selection in token_selections
+                        for condition in _CONDITIONS[experiment]
+                        for shard_id, _ in documents
+                    )
+                ]
+                if not needed_experiments:
+                    continue
+                chain_batch, donor_indices_B, original_count = _make_chain_batch(
+                    loader,
+                    documents,
+                    batch_size=batch_size,
+                    cfg=cfg,
+                    mesh=mesh,
+                    token_selections=token_selections,
+                    entropy_selector_store=entropy_selector_store,
                 )
-            ]
-            if not needed_experiments:
-                continue
-            chain_batch, donor_indices_B, original_count = _make_chain_batch(
-                loader,
-                documents,
-                batch_size=batch_size,
-                cfg=cfg,
-                mesh=mesh,
-            )
-            original_documents = tuple(documents[:original_count])
-            for experiment in needed_experiments:
-                experiment_result = experiment_functions[experiment](
-                    model,
-                    cfg,
-                    chain_batch,
-                    state_config=state_config,
-                    donor_indices_B=donor_indices_B,
-                    pad_id=spec.pad_id,
-                    checkpoint=str(checkpoint.step_path),
-                )
-                for condition, chain_result in experiment_result.conditions.items():
-                    for shard_id, rows in _result_rows(
-                        experiment,
-                        condition,
-                        chain_result,
-                        original_documents,
-                    ):
-                        if not store.shard_is_complete(experiment, condition, shard_id):
-                            store.write_shard(experiment, condition, shard_id, rows)
+                original_documents = tuple(documents[:original_count])
+                for experiment in needed_experiments:
+                    experiment_result = experiment_functions[experiment](
+                        model,
+                        cfg,
+                        chain_batch,
+                        state_config=state_config,
+                        donor_indices_B=donor_indices_B,
+                        pad_id=spec.pad_id,
+                        checkpoint=str(checkpoint.step_path),
+                        run_segment=run_segment,
+                    )
+                    for condition, chain_result in experiment_result.conditions.items():
+                        for selection in token_selections:
+                            for shard_id, rows in _result_rows(
+                                experiment,
+                                condition,
+                                chain_result,
+                                original_documents,
+                                selection=selection,
+                            ):
+                                if not store.shard_is_complete(
+                                    experiment,
+                                    condition,
+                                    shard_id,
+                                    selection=selection,
+                                ):
+                                    store.write_shard(
+                                        experiment,
+                                        condition,
+                                        shard_id,
+                                        rows,
+                                        selection=selection,
+                                    )
 
 
-def _configured_rows(store: EvalRunStore) -> tuple[MetricRow, ...]:
+def _configured_rows(
+    store: EvalRunStore,
+    *,
+    selection: str = "all",
+) -> tuple[MetricRow, ...]:
     experiments = set(store.identity.eval_config["experiments"])
-    return tuple(row for row in store.read_rows() if row.experiment in experiments)
+    return tuple(
+        row for row in store.read_rows(selection=selection) if row.experiment in experiments
+    )
 
 
 def _population_counts(config: dict[str, Any]) -> dict[int, int]:
@@ -827,16 +1136,24 @@ def _save_figure_to_targets(
 
 def _single_plot_targets(
     store: EvalRunStore,
+    selection: str,
     experiment: str,
     stem: str,
     plot_output_roots: Sequence[str | Path],
 ) -> tuple[Path, ...]:
     checkpoint_name = Path(store.identity.checkpoint_root).name
     step_name = f"step_{store.identity.checkpoint_step}"
+    local_root = store.run_dir / "plots"
+    if store.result_version == _RESULT_VERSION:
+        local_root /= selection
+    external_relative = Path(checkpoint_name) / step_name
+    if store.result_version == _RESULT_VERSION:
+        external_relative /= selection
+    external_relative /= experiment
     return (
-        store.run_dir / "plots" / experiment / stem,
+        local_root / experiment / stem,
         *(
-            Path(root).expanduser().resolve() / checkpoint_name / step_name / experiment / stem
+            Path(root).expanduser().resolve() / external_relative / stem
             for root in plot_output_roots
         ),
     )
@@ -846,16 +1163,20 @@ def _plot_single_checkpoint(
     store: EvalRunStore,
     points: Sequence[SummaryPoint],
     *,
+    selection: str,
     experiments: Sequence[str],
     plot_types: Sequence[str],
     plot_output_roots: Sequence[str | Path],
 ) -> None:
     summary_dir = store.run_dir / "summary"
+    if store.result_version == _RESULT_VERSION:
+        summary_dir /= selection
     for experiment in experiments:
         target_dirs = {
             target.parent
             for target in _single_plot_targets(
                 store,
+                selection,
                 experiment,
                 "placeholder",
                 plot_output_roots,
@@ -884,6 +1205,7 @@ def _plot_single_checkpoint(
                     figure,
                     _single_plot_targets(
                         store,
+                        selection,
                         experiment,
                         f"{view}_{metric}",
                         plot_output_roots,
@@ -921,6 +1243,7 @@ def _plot_single_checkpoint(
                         figure,
                         _single_plot_targets(
                             store,
+                            selection,
                             experiment,
                             f"exact_length_L{length}_{metric}",
                             plot_output_roots,
@@ -940,6 +1263,7 @@ def _plot_single_checkpoint(
                     figure,
                     _single_plot_targets(
                         store,
+                        selection,
                         experiment,
                         f"heatmap_nll_{condition}",
                         plot_output_roots,
@@ -956,6 +1280,7 @@ def _plot_single_checkpoint(
                     figure,
                     _single_plot_targets(
                         store,
+                        selection,
                         experiment,
                         f"heatmap_{metric}",
                         plot_output_roots,
@@ -967,26 +1292,31 @@ def _derive_checkpoint_outputs(
     store: EvalRunStore,
     *,
     experiments: Sequence[str],
+    token_selections: Sequence[str],
     plot_types: Sequence[str],
     plot_output_roots: Sequence[str | Path],
-) -> tuple[SummaryPoint, ...]:
+) -> dict[str, tuple[SummaryPoint, ...]]:
     configured_experiments = tuple(store.identity.eval_config["experiments"])
-    _validate_raw_results(store, configured_experiments)
+    _validate_raw_results(store, configured_experiments, token_selections)
     (store.run_dir / "summary").mkdir(parents=True, exist_ok=True)
-    points = aggregate_metrics(
-        _configured_rows(store),
-        population_counts=_population_counts(store.identity.eval_config),
-        c_train=int(store.identity.eval_config["c_train"]),
-    )
-    store.write_summary(points)
-    _plot_single_checkpoint(
-        store,
-        points,
-        experiments=experiments,
-        plot_types=plot_types,
-        plot_output_roots=plot_output_roots,
-    )
-    return points
+    summaries = {}
+    for selection in token_selections:
+        points = aggregate_metrics(
+            _configured_rows(store, selection=selection),
+            population_counts=_population_counts(store.identity.eval_config),
+            c_train=int(store.identity.eval_config["c_train"]),
+        )
+        store.write_summary(points, selection=selection)
+        _plot_single_checkpoint(
+            store,
+            points,
+            selection=selection,
+            experiments=experiments,
+            plot_types=plot_types,
+            plot_output_roots=plot_output_roots,
+        )
+        summaries[selection] = points
+    return summaries
 
 
 def run_checkpoint_eval(
@@ -994,6 +1324,8 @@ def run_checkpoint_eval(
     *,
     manifest_path: str | Path,
     experiments: Sequence[str] | None,
+    token_selections: Sequence[str] = ("all",),
+    entropy_reference_checkpoint: str | Path | None = None,
     plot_types: Sequence[str],
     plot_output_roots: Sequence[str | Path] = (),
     document_cap: int | None = None,
@@ -1003,9 +1335,9 @@ def run_checkpoint_eval(
     batch_size: int = 1,
 ) -> Path:
     selected_experiments = _validate_experiments(experiments)
+    token_selections = _validate_token_selections(token_selections)
     plot_types = _validate_plot_types(plot_types)
     manifest = load_full_document_manifest(manifest_path)
-    _selected_documents(manifest, document_cap)
     if spec.c_train <= 0:
         raise ValueError(f"c_train must be > 0, got {spec.c_train}")
     if spec.gdn_layer_limit is not None and spec.gdn_layer_limit < 0:
@@ -1027,12 +1359,29 @@ def run_checkpoint_eval(
             f"Experiment(s) are not applicable to this checkpoint configuration: {unavailable}"
         )
 
+    entropy_selector_identity = None
+    if TOP_ENTROPY_SELECTION in token_selections:
+        if entropy_reference_checkpoint is None:
+            raise ValueError(f"{TOP_ENTROPY_SELECTION} requires --entropy_reference_checkpoint")
+        entropy_checkpoint = resolve_checkpoint(entropy_reference_checkpoint)
+        entropy_selector_identity = _entropy_selector_identity(
+            entropy_checkpoint,
+            manifest,
+            pad_id=spec.pad_id,
+            tp_size=tp_size,
+            fsdp_size=fsdp_size,
+            dp_size=dp_size,
+            batch_size=batch_size,
+        )
+
     checkpoint = resolve_checkpoint(spec.checkpoint)
     identity = _requested_identity(
         spec,
         checkpoint,
         manifest,
         experiments=selected_experiments,
+        token_selections=token_selections,
+        entropy_selector=entropy_selector_identity,
         document_cap=document_cap,
         tp_size=tp_size,
         fsdp_size=fsdp_size,
@@ -1040,10 +1389,49 @@ def run_checkpoint_eval(
         batch_size=batch_size,
     )
     store = _open_or_extend_store(checkpoint, identity, manifest)
+    store.mark_incomplete()
+    configured_selections = tuple(store.identity.eval_config.get("token_selections", ("all",)))
+    if TOP_ENTROPY_SELECTION in configured_selections:
+        selector_identity = EntropySelectorIdentity(
+            **dict(
+                store.identity.eval_config["selection_configs"][TOP_ENTROPY_SELECTION][
+                    "selector_identity"
+                ]
+            )
+        )
+        entropy_checkpoint = resolve_checkpoint(
+            Path(selector_identity.reference_checkpoint_root)
+            / f"{selector_identity.reference_checkpoint_step:06d}"
+        )
+        expected_selector_identity = _entropy_selector_identity(
+            entropy_checkpoint,
+            manifest,
+            pad_id=int(store.identity.eval_config["pad_id"]),
+            tp_size=int(store.identity.eval_config["tp_size"]),
+            fsdp_size=int(store.identity.eval_config["fsdp_size"]),
+            dp_size=int(store.identity.eval_config["dp_size"]),
+            batch_size=int(store.identity.eval_config["batch_size"]),
+        )
+        if selector_identity != expected_selector_identity:
+            raise ValueError(
+                "Stored entropy selector identity no longer matches its reference checkpoint"
+            )
+        merged_documents = _selected_documents(
+            manifest,
+            store.identity.eval_config.get("document_cap"),
+        )
+        _ensure_entropy_selector(
+            entropy_checkpoint,
+            selector_identity,
+            manifest,
+            merged_documents,
+        )
+
     _run_missing_inference(store, spec, checkpoint, manifest)
     _derive_checkpoint_outputs(
         store,
-        experiments=selected_experiments,
+        experiments=tuple(store.identity.eval_config["experiments"]),
+        token_selections=configured_selections,
         plot_types=plot_types,
         plot_output_roots=plot_output_roots,
     )
@@ -1055,6 +1443,7 @@ def plot_checkpoint_results(
     run_dir: str | Path,
     *,
     experiments: Sequence[str] | None = None,
+    token_selections: Sequence[str] | None = None,
     plot_types: Sequence[str] = _PLOT_TYPES,
     plot_output_roots: Sequence[str | Path] = (),
 ) -> Path:
@@ -1063,10 +1452,15 @@ def plot_checkpoint_results(
     store = _existing_store(run_dir)
     if selected_experiments is None:
         selected_experiments = tuple(store.identity.eval_config["experiments"])
-    _validate_raw_results(store, selected_experiments)
+    if token_selections is None:
+        token_selections = tuple(store.identity.eval_config.get("token_selections", ("all",)))
+    token_selections = _validate_token_selections(token_selections)
+    store.mark_incomplete()
+    _validate_raw_results(store, selected_experiments, token_selections)
     _derive_checkpoint_outputs(
         store,
         experiments=selected_experiments,
+        token_selections=token_selections,
         plot_types=plot_types,
         plot_output_roots=plot_output_roots,
     )
@@ -1074,19 +1468,40 @@ def plot_checkpoint_results(
     return store.run_dir
 
 
+def _comparison_root_targets(
+    run_dirs: Sequence[Path],
+    plot_output_roots: Sequence[str | Path],
+    comparison_name: str,
+    selection: str,
+) -> tuple[Path, ...]:
+    versioned = all(run_dir.parent.name == _RESULT_VERSION for run_dir in run_dirs)
+    relative = (
+        Path("comparisons") / selection / comparison_name
+        if versioned
+        else Path("comparisons") / comparison_name
+    )
+    return (
+        *(run_dir / relative for run_dir in run_dirs),
+        *(Path(root).expanduser().resolve() / relative for root in plot_output_roots),
+    )
+
+
 def _comparison_targets(
     run_dirs: Sequence[Path],
     plot_output_roots: Sequence[str | Path],
     comparison_name: str,
+    selection: str,
     experiment: str,
     stem: str,
 ) -> tuple[Path, ...]:
-    return (
-        *(run_dir / "comparisons" / comparison_name / experiment / stem for run_dir in run_dirs),
-        *(
-            Path(root).expanduser().resolve() / "comparisons" / comparison_name / experiment / stem
-            for root in plot_output_roots
-        ),
+    return tuple(
+        root / experiment / stem
+        for root in _comparison_root_targets(
+            run_dirs,
+            plot_output_roots,
+            comparison_name,
+            selection,
+        )
     )
 
 
@@ -1094,6 +1509,7 @@ def compare_checkpoint_results(
     run_dirs: Sequence[str | Path],
     *,
     experiments: Sequence[str],
+    token_selections: Sequence[str] | None = None,
     plot_types: Sequence[str],
     comparison_name: str,
     plot_output_roots: Sequence[str | Path] = (),
@@ -1110,11 +1526,48 @@ def compare_checkpoint_results(
     if not comparison_name or Path(comparison_name).name != comparison_name:
         raise ValueError(f"Invalid comparison name: {comparison_name!r}")
 
+    if token_selections is not None:
+        token_selections = _validate_token_selections(token_selections)
+        if len(token_selections) > 1:
+            for selection in token_selections:
+                compare_checkpoint_results(
+                    run_dirs,
+                    experiments=selected_experiments,
+                    token_selections=(selection,),
+                    plot_types=plot_types,
+                    comparison_name=comparison_name,
+                    plot_output_roots=plot_output_roots,
+                )
+            return
+
     stores = tuple(
-        validate_checkpoint_results(run_dir, experiments=selected_experiments)
+        validate_checkpoint_results(
+            run_dir,
+            experiments=selected_experiments,
+            token_selections=token_selections,
+        )
         for run_dir in run_dirs
     )
+    if token_selections is None:
+        token_selections = tuple(stores[0].identity.eval_config.get("token_selections", ("all",)))
+        if len(token_selections) > 1:
+            for selection in token_selections:
+                compare_checkpoint_results(
+                    run_dirs,
+                    experiments=selected_experiments,
+                    token_selections=(selection,),
+                    plot_types=plot_types,
+                    comparison_name=comparison_name,
+                    plot_output_roots=plot_output_roots,
+                )
+            return
+    selection = token_selections[0]
     baseline = stores[0].identity
+    c_trains = {int(store.identity.eval_config["c_train"]) for store in stores}
+    if len(c_trains) != 1 and {"in_horizon", "beyond_horizon"} & set(plot_types):
+        raise ValueError(
+            "in_horizon and beyond_horizon checkpoint comparisons require identical c_train"
+        )
     compatibility_fields = (
         ("dataset_hash", baseline.dataset_hash),
         ("manifest_hash", baseline.manifest_hash),
@@ -1134,6 +1587,14 @@ def compare_checkpoint_results(
                     f"Checkpoint comparison {label} conflict: "
                     f"expected={expected_value!r}, actual={candidate_values[label]!r}"
                 )
+        if selection == TOP_ENTROPY_SELECTION:
+            expected_selector = baseline.eval_config["selection_configs"][selection]
+            actual_selector = store.identity.eval_config["selection_configs"][selection]
+            if actual_selector != expected_selector:
+                raise ValueError(
+                    "Checkpoint comparison entropy selector conflict: "
+                    f"expected={expected_selector!r}, actual={actual_selector!r}"
+                )
 
     summaries = []
     labels: list[str] = []
@@ -1149,7 +1610,7 @@ def compare_checkpoint_results(
         labels.append(label)
         summaries.append(
             aggregate_metrics(
-                _configured_rows(store),
+                _configured_rows(store, selection=selection),
                 population_counts=_population_counts(store.identity.eval_config),
                 c_train=int(store.identity.eval_config["c_train"]),
             )
@@ -1158,6 +1619,36 @@ def compare_checkpoint_results(
         label: (summary, int(store.identity.eval_config["c_train"]))
         for label, summary, store in zip(labels, summaries, stores, strict=True)
     }
+    overview_support = {}
+    for experiment in selected_experiments:
+        for view in ("in_horizon", "beyond_horizon"):
+            if view not in plot_types:
+                continue
+            supports = tuple(
+                frozenset(
+                    point.chunk_position
+                    for point in summary
+                    if point.experiment == experiment
+                    and point.metric == "nll"
+                    and point.condition == f"true_{experiment}"
+                    and point.view == view
+                )
+                for summary in summaries
+            )
+            if len(set(supports)) != 1:
+                raise ValueError(
+                    f"Checkpoint comparison support conflict for {experiment}/{view}: {supports}"
+                )
+            overview_support[(experiment, view)] = supports[0]
+
+    comparison_roots = _comparison_root_targets(
+        run_dirs,
+        plot_output_roots,
+        comparison_name,
+        selection,
+    )
+    for store in stores:
+        store.register_comparison_outputs(comparison_roots)
 
     for experiment in selected_experiments:
         target_dirs = {
@@ -1166,6 +1657,7 @@ def compare_checkpoint_results(
                 run_dirs,
                 plot_output_roots,
                 comparison_name,
+                selection,
                 experiment,
                 "placeholder",
             )
@@ -1175,6 +1667,8 @@ def compare_checkpoint_results(
 
         for view in ("in_horizon", "beyond_horizon"):
             if view not in plot_types:
+                continue
+            if not overview_support[(experiment, view)]:
                 continue
             for metric in _METRICS[experiment]:
                 figure = make_comparison_figure(
@@ -1189,10 +1683,30 @@ def compare_checkpoint_results(
                         run_dirs,
                         plot_output_roots,
                         comparison_name,
+                        selection,
                         experiment,
                         f"{view}_{metric}",
                     ),
                 )
+                if metric != "nll":
+                    percentage_figure = make_comparison_figure(
+                        models,
+                        experiment=experiment,
+                        metric=metric,
+                        view=view,
+                        as_percentage=True,
+                    )
+                    _save_figure_to_targets(
+                        percentage_figure,
+                        _comparison_targets(
+                            run_dirs,
+                            plot_output_roots,
+                            comparison_name,
+                            selection,
+                            experiment,
+                            f"{view}_{metric}_percent",
+                        ),
+                    )
 
         if "exact_length" in plot_types:
             lengths = sorted(
@@ -1219,11 +1733,33 @@ def compare_checkpoint_results(
                             run_dirs,
                             plot_output_roots,
                             comparison_name,
+                            selection,
                             experiment,
                             f"exact_length_L{length}_{metric}",
                         ),
                         svg_subdirectory="exact_length_svgs",
                     )
+                    if metric != "nll":
+                        percentage_figure = make_comparison_figure(
+                            models,
+                            experiment=experiment,
+                            metric=metric,
+                            view="exact_length",
+                            doc_num_chunks=length,
+                            as_percentage=True,
+                        )
+                        _save_figure_to_targets(
+                            percentage_figure,
+                            _comparison_targets(
+                                run_dirs,
+                                plot_output_roots,
+                                comparison_name,
+                                selection,
+                                experiment,
+                                f"exact_length_L{length}_{metric}_percent",
+                            ),
+                            svg_subdirectory="exact_length_svgs",
+                        )
 
 
 def run_evals(
@@ -1232,6 +1768,8 @@ def run_evals(
     mode: str,
     manifest_path: str | Path | None = None,
     experiments: Sequence[str] | None = None,
+    token_selections: Sequence[str] | None = None,
+    entropy_reference_checkpoint: str | Path | None = None,
     plot_types: Sequence[str] = _PLOT_TYPES,
     plot_output_roots: Sequence[str | Path] = (),
     comparison_name: str | None = None,
@@ -1250,15 +1788,26 @@ def run_evals(
     plot_types = _validate_plot_types(plot_types)
 
     if mode in {"all", "subset"}:
+        token_selections = _execution_token_selections(
+            token_selections, entropy_reference_checkpoint
+        )
         if manifest_path is None:
             raise ValueError(f"mode={mode!r} requires manifest_path")
         if mode == "subset" and selected_experiments is None:
             raise ValueError("mode='subset' requires explicit experiments")
+        if TOP_ENTROPY_SELECTION in token_selections:
+            if len({spec.pad_id for spec in specs}) != 1:
+                raise ValueError(
+                    "All target checkpoints must use the same pad_id for one shared "
+                    "entropy selector"
+                )
         for spec in specs:
             run_checkpoint_eval(
                 spec,
                 manifest_path=manifest_path,
                 experiments=None if mode == "all" else selected_experiments,
+                token_selections=token_selections,
+                entropy_reference_checkpoint=entropy_reference_checkpoint,
                 plot_types=plot_types,
                 plot_output_roots=plot_output_roots,
                 document_cap=document_cap,
@@ -1282,18 +1831,22 @@ def run_evals(
     run_dirs = tuple(_result_dir_from_checkpoint_request(spec.checkpoint) for spec in specs)
     if mode == "plot":
         for run_dir in run_dirs:
-            plot_checkpoint_results(
-                run_dir,
-                experiments=selected_experiments,
-                plot_types=plot_types,
-                plot_output_roots=plot_output_roots,
-            )
+            kwargs = {
+                "experiments": selected_experiments,
+                "plot_types": plot_types,
+                "plot_output_roots": plot_output_roots,
+            }
+            if token_selections is not None:
+                kwargs["token_selections"] = _validate_token_selections(token_selections)
+            plot_checkpoint_results(run_dir, **kwargs)
         return
 
-    compare_checkpoint_results(
-        run_dirs,
-        experiments=selected_experiments,
-        plot_types=plot_types,
-        comparison_name=comparison_name,
-        plot_output_roots=plot_output_roots,
-    )
+    kwargs = {
+        "experiments": selected_experiments,
+        "plot_types": plot_types,
+        "comparison_name": comparison_name,
+        "plot_output_roots": plot_output_roots,
+    }
+    if token_selections is not None:
+        kwargs["token_selections"] = _validate_token_selections(token_selections)
+    compare_checkpoint_results(run_dirs, **kwargs)

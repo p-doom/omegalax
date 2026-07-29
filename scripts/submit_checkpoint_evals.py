@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 from collections.abc import Sequence
 from pathlib import Path
-import re
 import shlex
 import subprocess
 
@@ -18,6 +17,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 _MODES = ("all", "subset", "plot", "compare")
 _EXPERIMENTS = ("gdn", "conv")
 _PLOT_TYPES = ("in_horizon", "beyond_horizon", "exact_length", "heatmap")
+_TOKEN_SELECTIONS = ("all", "top_entropy_10pct")
 _SPEC_FIELDS = (
     "c_train",
     "pass_gdn_state",
@@ -57,6 +57,16 @@ def _parse_plot_types(value: str) -> tuple[str, ...]:
     return plot_types
 
 
+def _parse_token_selections(value: str) -> tuple[str, ...]:
+    selections = tuple(item.strip() for item in value.split(",") if item.strip())
+    unknown = tuple(item for item in selections if item not in _TOKEN_SELECTIONS)
+    if not selections or unknown:
+        raise argparse.ArgumentTypeError(
+            f"token_selections must contain only {', '.join(_TOKEN_SELECTIONS)}; got {value!r}"
+        )
+    return selections
+
+
 def _parse_experiments(value: str | None) -> tuple[str, ...] | None:
     if value is None:
         return None
@@ -83,30 +93,21 @@ def _command_argument(name: str, value: object) -> str:
     return f"--{name}={value}"
 
 
-def render_eval_sbatch(
-    request_or_requests: (
-        CheckpointEvalRequest
-        | CheckpointEvalSpec
-        | Sequence[CheckpointEvalRequest | CheckpointEvalSpec]
-    ),
+def _render_worker_command(
+    requests: Sequence[CheckpointEvalRequest | CheckpointEvalSpec],
     *,
     manifest_path: str | Path | None,
-    repo_root: str | Path,
-    log_dir: str | Path,
-    partition: str,
-    qos: str | None,
-    time_limit: str,
     mode: str,
     experiments: Sequence[str] | None,
     plot_types: Sequence[str],
     plot_output_roots: Sequence[str | Path],
     comparison_name: str | None,
     pilot_cap: int | None,
+    token_selections: Sequence[str] | None,
+    entropy_reference_checkpoint: str | Path | None,
+    dp_size: int,
 ) -> str:
-    """Render one fixed-topology evaluation batch script."""
-
-    requests = _as_requests(request_or_requests)
-    command = ["python", "scripts/run_checkpoint_evals.py"]
+    command = ["uv", "run", "python", "scripts/run_checkpoint_evals.py"]
     for request in requests:
         command.append(_command_argument("checkpoint", request.checkpoint))
         manual_config = (
@@ -152,6 +153,12 @@ def render_eval_sbatch(
         command.append(_command_argument("manifest_path", manifest_path))
     if experiments is not None:
         command.append(_command_argument("experiments", ",".join(experiments)))
+    if token_selections is not None:
+        command.append(_command_argument("token_selections", ",".join(token_selections)))
+    if entropy_reference_checkpoint is not None:
+        command.append(
+            _command_argument("entropy_reference_checkpoint", entropy_reference_checkpoint)
+        )
     command.append(_command_argument("plot_types", ",".join(plot_types)))
     command.extend(_command_argument("plot_output_root", root) for root in plot_output_roots)
     if pilot_cap is not None and mode in ("all", "subset"):
@@ -162,10 +169,71 @@ def render_eval_sbatch(
         (
             "--tp_size=1",
             "--fsdp_size=1",
-            "--dp_size=4",
+            _command_argument("dp_size", dp_size),
             "--batch_size=16",
         )
     )
+    return " \\\n  ".join(shlex.quote(argument) for argument in command)
+
+
+def render_eval_sbatch(
+    request_or_requests: (
+        CheckpointEvalRequest
+        | CheckpointEvalSpec
+        | Sequence[CheckpointEvalRequest | CheckpointEvalSpec]
+    ),
+    *,
+    manifest_path: str | Path | None,
+    repo_root: str | Path,
+    log_dir: str | Path,
+    partition: str,
+    qos: str | None,
+    time_limit: str,
+    mode: str,
+    experiments: Sequence[str] | None,
+    plot_types: Sequence[str],
+    plot_output_roots: Sequence[str | Path],
+    comparison_name: str | None,
+    pilot_cap: int | None,
+    token_selections: Sequence[str] | None = None,
+    entropy_reference_checkpoint: str | Path | None = None,
+    dp_size: int = 4,
+) -> str:
+    """Render one fixed-topology evaluation batch script."""
+
+    requests = _as_requests(request_or_requests)
+    commands = [
+        _render_worker_command(
+            requests,
+            manifest_path=manifest_path,
+            mode="subset" if mode == "compare" else mode,
+            experiments=experiments,
+            plot_types=plot_types,
+            plot_output_roots=plot_output_roots,
+            comparison_name=None if mode == "compare" else comparison_name,
+            pilot_cap=pilot_cap,
+            token_selections=token_selections,
+            entropy_reference_checkpoint=entropy_reference_checkpoint,
+            dp_size=dp_size,
+        )
+    ]
+    if mode == "compare":
+        commands.append(
+            _render_worker_command(
+                requests,
+                manifest_path=None,
+                mode="compare",
+                experiments=experiments,
+                plot_types=tuple(plot_type for plot_type in plot_types if plot_type != "heatmap"),
+                plot_output_roots=plot_output_roots,
+                comparison_name=comparison_name,
+                pilot_cap=None,
+                token_selections=token_selections,
+                entropy_reference_checkpoint=None,
+                dp_size=dp_size,
+            )
+        )
+    rendered_commands = "\n\n".join(commands)
 
     log_dir = Path(log_dir)
     lines = [
@@ -173,7 +241,7 @@ def render_eval_sbatch(
         "#SBATCH --job-name=checkpoint-eval",
         "#SBATCH --nodes=1",
         "#SBATCH --ntasks=1",
-        "#SBATCH --gres=gpu:4",
+        f"#SBATCH --gres=gpu:{dp_size}",
         "#SBATCH --cpus-per-task=24",
         "#SBATCH --mem=120G",
         f"#SBATCH --partition={shlex.quote(str(partition))}",
@@ -188,9 +256,9 @@ def render_eval_sbatch(
             "",
             "set -euo pipefail",
             f"cd {shlex.quote(str(repo_root))}",
-            "export JAX_LOCAL_DEVICE_IDS=0,1,2,3",
+            "export JAX_LOCAL_DEVICE_IDS=" + ",".join(str(index) for index in range(dp_size)),
             "",
-            " \\\n  ".join(shlex.quote(argument) for argument in command),
+            rendered_commands,
         )
     )
     return "\n".join(lines) + "\n"
@@ -203,6 +271,8 @@ def _validate_request(
     mode: str,
     experiments: Sequence[str] | None,
     plot_types: Sequence[str],
+    token_selections: Sequence[str] | None,
+    entropy_reference_checkpoint: str | Path | None,
     comparison_name: str | None,
 ) -> tuple[tuple[CheckpointEvalSpec, ...], tuple[str, ...] | None]:
     if not requests:
@@ -231,6 +301,19 @@ def _validate_request(
         )
     if len(set(plot_types)) != len(plot_types):
         raise ValueError(f"Duplicate plot types are not allowed: {tuple(plot_types)!r}")
+    if token_selections is not None:
+        unknown_selections = tuple(
+            selection for selection in token_selections if selection not in _TOKEN_SELECTIONS
+        )
+        if not token_selections or unknown_selections:
+            raise ValueError(
+                f"token_selections must contain only {', '.join(_TOKEN_SELECTIONS)}; "
+                f"got {tuple(token_selections)!r}"
+            )
+        if len(set(token_selections)) != len(token_selections):
+            raise ValueError(
+                f"Duplicate token selections are not allowed: {tuple(token_selections)!r}"
+            )
     if mode == "compare" and len(requests) < 2:
         raise ValueError("Compare mode requires at least two checkpoint specs")
     if mode == "compare" and not comparison_name:
@@ -239,6 +322,13 @@ def _validate_request(
         raise ValueError(f"Invalid comparison name: {comparison_name!r}")
     if mode in ("all", "subset", "compare") and manifest_path is None:
         raise ValueError(f"mode={mode} requires a manifest path")
+    if (
+        token_selections is not None
+        and "top_entropy_10pct" in token_selections
+        and mode in ("all", "subset", "compare")
+        and entropy_reference_checkpoint is None
+    ):
+        raise ValueError("top_entropy_10pct requires an explicit entropy_reference_checkpoint")
 
     specs = runner.resolve_checkpoint_eval_requests(requests)
     if experiments is not None:
@@ -256,20 +346,18 @@ def _validate_request(
         )
         if not comparison_plot_types:
             raise ValueError("Heatmap-only requests cannot produce a checkpoint comparison")
+        if {"in_horizon", "beyond_horizon"} & set(comparison_plot_types) and len(
+            {spec.c_train for spec in specs}
+        ) != 1:
+            raise ValueError(
+                "in_horizon and beyond_horizon checkpoint comparisons require identical c_train"
+            )
         return specs, comparison_plot_types
     return specs, None
 
 
-def _submit_script(path: Path, *, dependency: str | None = None) -> str:
-    command = ["sbatch"]
-    if dependency is not None:
-        command.append(f"--dependency=afterok:{dependency}")
-    command.append(str(path))
-    completed = subprocess.run(command, check=True, capture_output=True, text=True)
-    match = re.search(r"Submitted batch job (\d+)", completed.stdout)
-    if match is None:
-        raise RuntimeError(f"Could not parse Slurm job id from: {completed.stdout!r}")
-    return match.group(1)
+def _submit_script(path: Path) -> None:
+    subprocess.run(["sbatch", str(path)], check=True)
 
 
 def submit_checkpoint_evals(
@@ -285,22 +373,44 @@ def submit_checkpoint_evals(
     mode: str,
     experiments: Sequence[str] | None,
     plot_types: Sequence[str],
+    token_selections: Sequence[str] | None = None,
+    entropy_reference_checkpoint: str | Path | None = None,
     plot_output_roots: Sequence[str | Path],
     comparison_name: str | None,
     pilot_cap: int | None,
     dry_run: bool,
+    dp_size: int = 4,
 ) -> tuple[Path, ...]:
-    """Write evaluation scripts and submit them in the required dependency order."""
+    """Write and submit one sequential checkpoint evaluation script."""
 
     requests = tuple(requests)
-    specs, comparison_plot_types = _validate_request(
+    if dp_size <= 0:
+        raise ValueError(f"dp_size must be > 0, got {dp_size}")
+    if 16 % dp_size:
+        raise ValueError(f"batch_size=16 must be divisible by dp_size={dp_size}")
+    specs, _ = _validate_request(
         requests,
         manifest_path=manifest_path,
         mode=mode,
         experiments=experiments,
         plot_types=plot_types,
+        token_selections=token_selections,
+        entropy_reference_checkpoint=entropy_reference_checkpoint,
         comparison_name=comparison_name,
     )
+    effective_token_selections = token_selections
+    if token_selections is None and mode in ("all", "subset", "compare"):
+        effective_token_selections = (
+            _TOKEN_SELECTIONS if entropy_reference_checkpoint is not None else ("all",)
+        )
+    if (
+        mode in ("all", "subset", "compare")
+        and "top_entropy_10pct" in effective_token_selections
+        and len({spec.pad_id for spec in specs}) != 1
+    ):
+        raise ValueError(
+            "All target checkpoints must use the same pad_id for one shared entropy selector"
+        )
 
     if mode == "plot" and not dry_run:
         for spec in specs:
@@ -311,58 +421,32 @@ def submit_checkpoint_evals(
     log_dir = Path(log_dir)
     job_dir.mkdir(parents=True, exist_ok=True)
     log_dir.mkdir(parents=True, exist_ok=True)
-    script_paths = []
-    evaluation_mode = "subset" if mode == "compare" else mode
-    for index, request in enumerate(requests):
-        script_path = job_dir / f"eval_{index:03d}.sbatch"
-        script_path.write_text(
-            render_eval_sbatch(
-                request,
-                manifest_path=manifest_path,
-                repo_root=repo_root,
-                log_dir=log_dir,
-                partition=partition,
-                qos=qos,
-                time_limit=time_limit,
-                mode=evaluation_mode,
-                experiments=experiments,
-                plot_types=plot_types,
-                plot_output_roots=plot_output_roots,
-                comparison_name=None,
-                pilot_cap=pilot_cap,
-            ),
-            encoding="utf-8",
-        )
-        script_paths.append(script_path)
-
-    comparison_path = None
-    if mode == "compare":
-        comparison_path = job_dir / "compare.sbatch"
-        comparison_path.write_text(
-            render_eval_sbatch(
-                requests,
-                manifest_path=None,
-                repo_root=repo_root,
-                log_dir=log_dir,
-                partition=partition,
-                qos=qos,
-                time_limit=time_limit,
-                mode="compare",
-                experiments=experiments,
-                plot_types=comparison_plot_types or (),
-                plot_output_roots=plot_output_roots,
-                comparison_name=comparison_name,
-                pilot_cap=None,
-            ),
-            encoding="utf-8",
-        )
-        script_paths.append(comparison_path)
+    script_path = job_dir / "eval_000.sbatch"
+    script_path.write_text(
+        render_eval_sbatch(
+            requests,
+            manifest_path=manifest_path,
+            repo_root=repo_root,
+            log_dir=log_dir,
+            partition=partition,
+            qos=qos,
+            time_limit=time_limit,
+            mode=mode,
+            experiments=experiments,
+            plot_types=plot_types,
+            plot_output_roots=plot_output_roots,
+            comparison_name=comparison_name,
+            pilot_cap=pilot_cap,
+            token_selections=effective_token_selections,
+            entropy_reference_checkpoint=entropy_reference_checkpoint,
+            dp_size=dp_size,
+        ),
+        encoding="utf-8",
+    )
 
     if not dry_run:
-        job_ids = [_submit_script(path) for path in script_paths[: len(requests)]]
-        if comparison_path is not None:
-            _submit_script(comparison_path, dependency=":".join(job_ids))
-    return tuple(script_paths)
+        _submit_script(script_path)
+    return (script_path,)
 
 
 def parse_submit_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -378,6 +462,11 @@ def parse_submit_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--mode", choices=_MODES, required=True)
     parser.add_argument("--manifest_path")
     parser.add_argument("--experiments")
+    parser.add_argument(
+        "--token_selections",
+        type=_parse_token_selections,
+    )
+    parser.add_argument("--entropy_reference_checkpoint")
     parser.add_argument("--plot_types", type=_parse_plot_types, default=_PLOT_TYPES)
     parser.add_argument("--plot_output_root", action="append", default=[])
     parser.add_argument("--comparison_name")
@@ -387,6 +476,7 @@ def parse_submit_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--partition", default="gpu")
     parser.add_argument("--qos")
     parser.add_argument("--time_limit", default="04:00:00")
+    parser.add_argument("--dp_size", type=int, default=4)
     parser.add_argument("--pilot_cap", type=int)
     parser.add_argument("--dry_run", action="store_true")
     return parser.parse_args(argv)
@@ -443,11 +533,14 @@ def submit_from_arguments(argv: Sequence[str] | None = None) -> tuple[Path, ...]
         time_limit=args.time_limit,
         mode=args.mode,
         experiments=experiments,
+        token_selections=args.token_selections,
+        entropy_reference_checkpoint=args.entropy_reference_checkpoint,
         plot_types=args.plot_types,
         plot_output_roots=tuple(args.plot_output_root),
         comparison_name=args.comparison_name,
         pilot_cap=args.pilot_cap,
         dry_run=args.dry_run,
+        dp_size=args.dp_size,
     )
 
 

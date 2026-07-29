@@ -574,6 +574,18 @@ class PretrainMaskAndLossTest(absltest.TestCase):
             jnp.full((1, 1, 1, 1), 5.0, dtype=jnp.float32),
         )
 
+        last_to_first = pretrain_trainer._select_gdn_states_for_carry(
+            states,
+            pass_gdn_state=True,
+            gdn_layer_limit=1,
+            gdn_state_routing="last_to_first",
+        )
+        np.testing.assert_array_equal(np.asarray(last_to_first[0]), np.asarray(states[-1]))
+        np.testing.assert_array_equal(
+            np.asarray(last_to_first[1]),
+            np.zeros((1, 1, 1, 1), dtype=np.float32),
+        )
+
         self.assertIsNone(
             pretrain_trainer._select_gdn_states_for_carry(
                 states, pass_gdn_state=True, gdn_layer_limit=0
@@ -582,6 +594,20 @@ class PretrainMaskAndLossTest(absltest.TestCase):
         with self.assertRaisesRegex(ValueError, "gdn_layer_limit"):
             pretrain_trainer._select_gdn_states_for_carry(
                 states, pass_gdn_state=True, gdn_layer_limit=3
+            )
+        with self.assertRaisesRegex(ValueError, "pass_gdn_state=True"):
+            pretrain_trainer._select_gdn_states_for_carry(
+                states,
+                pass_gdn_state=False,
+                gdn_layer_limit=1,
+                gdn_state_routing="last_to_first",
+            )
+        with self.assertRaisesRegex(ValueError, "gdn_layer_limit=1"):
+            pretrain_trainer._select_gdn_states_for_carry(
+                states,
+                pass_gdn_state=True,
+                gdn_layer_limit=None,
+                gdn_state_routing="last_to_first",
             )
 
     def test_statepassing_loss_passes_rope_positions_per_segment(self):
@@ -870,6 +896,106 @@ class PretrainMaskAndLossTest(absltest.TestCase):
             np.testing.assert_allclose(
                 np.asarray(full_grad),
                 np.asarray(statepassing_grad),
+                rtol=2e-4,
+                atol=2e-5,
+            )
+
+    def test_last_to_first_full_bptt_matches_explicit_routing_loss_and_gradients(self):
+        cfg = dataclasses.replace(
+            _tiny_qwen3_5_config(),
+            num_hidden_layers=2,
+            layer_types=("linear_attention", "linear_attention"),
+        )
+        token_ids_BCT = jnp.arange(1, 9, dtype=jnp.int32).reshape(1, 2, 4)
+        batch = {
+            "token_ids_BCT": token_ids_BCT,
+            "attention_mask_BCT": jnp.ones_like(token_ids_BCT),
+            "loss_mask_BCT": jnp.asarray([[[0, 0, 0, 0], [1, 1, 1, 1]]]),
+            "reset_state_BC": jnp.asarray([[True, False]], dtype=jnp.bool_),
+        }
+        production_model, _ = text_api.init_model(
+            cfg, jax.random.PRNGKey(0), tp_size=1, fsdp_size=1, dp_size=1
+        )
+        oracle_model, _ = text_api.init_model(
+            cfg, jax.random.PRNGKey(0), tp_size=1, fsdp_size=1, dp_size=1
+        )
+
+        @nnx.jit
+        def production_value_and_grad(model):
+            def loss_fn(inner_model):
+                loss, _ = pretrain_trainer._statepassing_loss_stats(
+                    inner_model,
+                    batch,
+                    cfg,
+                    0,
+                    pretrain_trainer.PretrainMode.STATEPASSING_BPTT,
+                    bptt_chunks=2,
+                    pass_gdn_state=True,
+                    gdn_layer_limit=1,
+                    gdn_state_routing="last_to_first",
+                )
+                return loss
+
+            return nnx.value_and_grad(loss_fn)(model)
+
+        @nnx.jit
+        def oracle_value_and_grad(model):
+            def loss_fn(inner_model):
+                hidden0, aux0, final_states0 = text_api.forward_with_gdn_state(
+                    inner_model,
+                    token_ids_BCT[:, 0, :],
+                    0,
+                    cfg,
+                    attention_mask_BT=batch["attention_mask_BCT"][:, 0, :],
+                )
+                initial_states1 = tuple(
+                    final_states0[-1] if state_idx == 0 else jnp.zeros_like(state)
+                    for state_idx, state in enumerate(final_states0)
+                )
+                hidden1, aux1, _ = text_api.forward_with_gdn_state(
+                    inner_model,
+                    token_ids_BCT[:, 1, :],
+                    0,
+                    cfg,
+                    attention_mask_BT=batch["attention_mask_BCT"][:, 1, :],
+                    initial_gdn_states=initial_states1,
+                )
+                hidden_BT_D = jnp.concatenate((hidden0, hidden1), axis=1)
+                masks = pretrain_trainer.statepassing_target_masks(
+                    batch["loss_mask_BCT"],
+                    batch["reset_state_BC"],
+                    bptt_chunks=2,
+                )
+                mask_stack = jnp.stack(
+                    [masks.total, masks.iid_comparable, masks.boundary, *masks.segments],
+                    axis=0,
+                )
+                nll_sums, token_counts = chunked_cross_entropy_multi_stats(
+                    hidden_BT_D,
+                    pretrain_trainer._model_output_weight(inner_model),
+                    token_ids_BCT.reshape(1, -1),
+                    mask_stack,
+                    num_tiles=pretrain_trainer._NUM_LOSS_TILES,
+                    logits_out_sharding=cfg.shd_cfg.logits_btv,
+                )
+                return pretrain_trainer._nll(nll_sums[0], token_counts[0]) + (aux0 + aux1) / 2
+
+            return nnx.value_and_grad(loss_fn)(model)
+
+        with mesh_rules_for(tp_size=1, fsdp_size=1, dp_size=1):
+            production_loss, production_grads = production_value_and_grad(production_model)
+            oracle_loss, oracle_grads = oracle_value_and_grad(oracle_model)
+
+        np.testing.assert_allclose(production_loss, oracle_loss, rtol=1e-6, atol=1e-6)
+        self.assertEqual(jax.tree.structure(production_grads), jax.tree.structure(oracle_grads))
+        for production_grad, oracle_grad in zip(
+            jax.tree.leaves(production_grads),
+            jax.tree.leaves(oracle_grads),
+            strict=True,
+        ):
+            np.testing.assert_allclose(
+                np.asarray(production_grad),
+                np.asarray(oracle_grad),
                 rtol=2e-4,
                 atol=2e-5,
             )

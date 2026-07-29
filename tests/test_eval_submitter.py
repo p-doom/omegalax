@@ -247,6 +247,8 @@ class EvalSubmitterTest(absltest.TestCase):
                 plot_output_roots=plot_roots,
                 comparison_name=None,
                 pilot_cap=2,
+                token_selections=("all", "top_entropy_10pct"),
+                entropy_reference_checkpoint=tmpdir / "iid-reference",
             )
             normalized = _normalized(script)
             lower = normalized.lower()
@@ -276,10 +278,16 @@ class EvalSubmitterTest(absltest.TestCase):
             self.assertIn("--pass_conv_state=false", lower)
             self.assertIn("--pass_rope_positions=true", lower)
             self.assertIn("--experiments=gdn,conv", normalized)
+            self.assertIn("--token_selections=all,top_entropy_10pct", normalized)
+            self.assertIn(
+                f"--entropy_reference_checkpoint={tmpdir / 'iid-reference'}",
+                normalized,
+            )
             self.assertIn("--plot_types=in_horizon,heatmap", normalized)
             for root in plot_roots:
                 self.assertIn(str(root), normalized)
             self.assertIn("JAX_LOCAL_DEVICE_IDS=0,1,2,3", script)
+            self.assertRegex(script, r"uv\s+\\*\s*run\s+\\*\s*python")
             self.assertRegex(
                 script,
                 r"(?:scripts/run_checkpoint_evals\.py|scripts\.run_checkpoint_evals)",
@@ -289,6 +297,30 @@ class EvalSubmitterTest(absltest.TestCase):
             self.assertNotIn("--pilot_cap", normalized)
             self.assertNotIn("wandb", lower)
             self.assertNotIn("w&b", lower)
+
+    def test_rendered_job_uses_requested_data_parallel_gpu_count(self):
+        with test_temp_dir() as tmp:
+            tmpdir = Path(tmp)
+            script = eval_submitter.render_eval_sbatch(
+                _spec(tmpdir / "checkpoint"),
+                manifest_path=tmpdir / "manifest.json",
+                repo_root=tmpdir / "repo",
+                log_dir=tmpdir / "logs",
+                partition="gpu",
+                qos="normal",
+                time_limit="04:00:00",
+                mode="subset",
+                experiments=("gdn",),
+                plot_types=("in_horizon",),
+                plot_output_roots=(),
+                comparison_name=None,
+                pilot_cap=None,
+                dp_size=2,
+            )
+
+        self.assertIn("#SBATCH --gres=gpu:2", script)
+        self.assertIn("JAX_LOCAL_DEVICE_IDS=0,1", script)
+        self.assertIn("--dp_size=2", script)
 
     def test_rendered_job_quotes_real_parenthesized_repo_path_and_is_bash_valid(self):
         repo_root = Path(__file__).resolve().parents[1]
@@ -371,7 +403,7 @@ class EvalSubmitterTest(absltest.TestCase):
             self.assertNotIn("--document_cap", normalized)
             self.assertNotIn("--pilot_cap", normalized)
 
-    def test_submitter_creates_one_independent_job_per_spec_and_preserves_each_spec(self):
+    def test_submitter_creates_one_sequential_job_and_preserves_each_spec(self):
         with test_temp_dir() as tmp:
             tmpdir = Path(tmp)
             specs = (
@@ -399,10 +431,7 @@ class EvalSubmitterTest(absltest.TestCase):
             with mock.patch.object(
                 eval_submitter.subprocess,
                 "run",
-                side_effect=(
-                    _submitted("Submitted batch job 101\n"),
-                    _submitted("Submitted batch job 102\n"),
-                ),
+                return_value=_submitted("Submitted batch job 101\n"),
             ) as run:
                 eval_submitter.submit_checkpoint_evals(
                     specs,
@@ -422,10 +451,10 @@ class EvalSubmitterTest(absltest.TestCase):
                     dry_run=False,
                 )
 
-            self.assertEqual(run.call_count, 2)
-            scripts = sorted((tmpdir / "jobs").glob("*.sbatch"))
-            self.assertLen(scripts, 2)
-            contents = [_normalized(path.read_text()) for path in scripts]
+            run.assert_called_once()
+            scripts = tuple((tmpdir / "jobs").glob("*.sbatch"))
+            self.assertLen(scripts, 1)
+            content = _normalized(scripts[0].read_text())
             expected = {
                 str(specs[0].checkpoint): {
                     "c_train": "4",
@@ -447,23 +476,21 @@ class EvalSubmitterTest(absltest.TestCase):
                 },
             }
             for checkpoint, flags in expected.items():
-                matches = [text for text in contents if f"--checkpoint={checkpoint}" in text]
-                self.assertLen(matches, 1)
-                lower = matches[0].lower()
+                self.assertIn(f"--checkpoint={checkpoint}", content)
+                lower = content.lower()
                 for name, value in flags.items():
                     self.assertIn(f"--{name}={value}", lower)
                 self.assertIn("--mode=subset", lower)
                 self.assertIn("--experiments=gdn", lower)
                 self.assertIn("--plot_types=beyond_horizon,exact_length", lower)
                 self.assertIn("--document_cap=2", lower)
-                self.assertIn(str(tmpdir / "manifest.json"), matches[0])
-                self.assertIn(str(tmpdir / "published"), matches[0])
+                self.assertIn(str(tmpdir / "manifest.json"), content)
+                self.assertIn(str(tmpdir / "published"), content)
 
-            for call in run.call_args_list:
-                command = call.args[0]
-                self.assertEqual(command[0], "sbatch")
-                self.assertLen(command, 2)
-                self.assertNotIn("--dependency", " ".join(command))
+            command = run.call_args.args[0]
+            self.assertEqual(command[0], "sbatch")
+            self.assertLen(command, 2)
+            self.assertNotIn("--dependency", " ".join(command))
 
     def test_public_submitter_cli_roundtrips_aligned_specs_and_dispatch_options(self):
         with test_temp_dir() as tmp:
@@ -740,7 +767,7 @@ class EvalSubmitterTest(absltest.TestCase):
             self.assertNotIn("--document_cap", content)
             self.assertNotIn("afterok", content)
 
-    def test_compare_dry_run_writes_scripts_without_subprocess_or_dependencies(self):
+    def test_compare_dry_run_writes_one_sequential_script_without_subprocess(self):
         with test_temp_dir() as tmp:
             tmpdir = Path(tmp)
             specs = (
@@ -755,7 +782,6 @@ class EvalSubmitterTest(absltest.TestCase):
                 ),
                 _spec(
                     tmpdir / "c6",
-                    c_train=6,
                     pass_gdn_state=True,
                     gdn_layer_limit=2,
                     pass_conv_state=False,
@@ -785,12 +811,73 @@ class EvalSubmitterTest(absltest.TestCase):
 
             run.assert_not_called()
             scripts = tuple((tmpdir / "jobs").glob("*.sbatch"))
-            self.assertLen(scripts, len(specs) + 1)
-            contents = tuple(path.read_text().lower() for path in scripts)
-            self.assertLen([text for text in contents if "--mode=compare" in text], 1)
-            for content in contents:
-                self.assertNotIn("afterok", content)
-                self.assertNotIn("--dependency", content)
+            self.assertLen(scripts, 1)
+            content = scripts[0].read_text().lower()
+            self.assertEqual(content.count("scripts/run_checkpoint_evals.py"), 2)
+            self.assertEqual(content.count("--mode=subset"), 1)
+            self.assertEqual(content.count("--mode=compare"), 1)
+            self.assertNotIn("afterok", content)
+            self.assertNotIn("--dependency", content)
+
+    def test_compare_top_entropy_rejects_mismatched_pad_ids_before_writing(self):
+        with test_temp_dir() as tmp:
+            tmpdir = Path(tmp)
+            job_dir = tmpdir / "jobs"
+            specs = (
+                _spec(tmpdir / "checkpoint-a", pad_id=3),
+                _spec(tmpdir / "checkpoint-b", pad_id=5),
+            )
+            with mock.patch.object(eval_submitter.subprocess, "run") as run:
+                with self.assertRaisesRegex(ValueError, "(?i)pad_id"):
+                    eval_submitter.submit_checkpoint_evals(
+                        specs,
+                        manifest_path=tmpdir / "manifest.json",
+                        repo_root=tmpdir / "repo",
+                        job_dir=job_dir,
+                        log_dir=tmpdir / "logs",
+                        partition="gpu",
+                        qos=None,
+                        time_limit="04:00:00",
+                        mode="compare",
+                        experiments=("gdn",),
+                        plot_types=("in_horizon",),
+                        plot_output_roots=(),
+                        comparison_name="mismatched_pad",
+                        pilot_cap=None,
+                        entropy_reference_checkpoint=tmpdir / "iid-reference",
+                        dry_run=False,
+                    )
+
+            run.assert_not_called()
+            self.assertFalse(job_dir.exists())
+
+    def test_invalid_dp_size_is_rejected_before_writing_or_submitting(self):
+        with test_temp_dir() as tmp:
+            tmpdir = Path(tmp)
+            job_dir = tmpdir / "jobs"
+            with mock.patch.object(eval_submitter.subprocess, "run") as run:
+                with self.assertRaisesRegex(ValueError, "(?i)(batch_size|divisible|dp_size)"):
+                    eval_submitter.submit_checkpoint_evals(
+                        (_spec(tmpdir / "checkpoint"),),
+                        manifest_path=tmpdir / "manifest.json",
+                        repo_root=tmpdir / "repo",
+                        job_dir=job_dir,
+                        log_dir=tmpdir / "logs",
+                        partition="gpu",
+                        qos=None,
+                        time_limit="04:00:00",
+                        mode="all",
+                        experiments=None,
+                        plot_types=("in_horizon",),
+                        plot_output_roots=(),
+                        comparison_name=None,
+                        pilot_cap=None,
+                        dry_run=False,
+                        dp_size=3,
+                    )
+
+            run.assert_not_called()
+            self.assertFalse(job_dir.exists())
 
     def test_plot_mode_with_missing_condition_fails_before_inference_or_sbatch(self):
         with test_temp_dir() as tmp:
@@ -934,7 +1021,34 @@ class EvalSubmitterTest(absltest.TestCase):
             run.assert_not_called()
             self.assertEmpty(tuple(job_dir.glob("*.sbatch")))
 
-    def test_explicit_compare_submits_n_checkpoint_jobs_then_one_dependent_plot_job(self):
+    def test_compare_rejects_overview_plots_with_different_training_horizons(self):
+        with test_temp_dir() as tmp:
+            tmpdir = Path(tmp)
+            job_dir = tmpdir / "jobs"
+            with mock.patch.object(eval_submitter.subprocess, "run") as run:
+                with self.assertRaisesRegex(ValueError, "(?i)(c_train|horizon)"):
+                    eval_submitter.submit_checkpoint_evals(
+                        (_spec(tmpdir / "c4"), _spec(tmpdir / "c6", c_train=6)),
+                        manifest_path=tmpdir / "manifest.json",
+                        repo_root=tmpdir / "repo",
+                        job_dir=job_dir,
+                        log_dir=tmpdir / "logs",
+                        partition="gpu",
+                        qos=None,
+                        time_limit="04:00:00",
+                        mode="compare",
+                        experiments=("gdn",),
+                        plot_types=("in_horizon", "exact_length"),
+                        plot_output_roots=(),
+                        comparison_name="incompatible_horizons",
+                        pilot_cap=None,
+                        dry_run=False,
+                    )
+
+            run.assert_not_called()
+            self.assertFalse(job_dir.exists())
+
+    def test_explicit_compare_submits_one_job_with_sequential_eval_and_plot_commands(self):
         with test_temp_dir() as tmp:
             tmpdir = Path(tmp)
             specs = (
@@ -949,7 +1063,6 @@ class EvalSubmitterTest(absltest.TestCase):
                 ),
                 _spec(
                     tmpdir / "c6",
-                    c_train=6,
                     pass_gdn_state=True,
                     gdn_layer_limit=2,
                     pass_conv_state=False,
@@ -958,15 +1071,10 @@ class EvalSubmitterTest(absltest.TestCase):
                     eos_id=6,
                 ),
             )
-            submitted = (
-                _submitted("Submitted batch job 201\n"),
-                _submitted("Submitted batch job 202\n"),
-                _submitted("Submitted batch job 203\n"),
-            )
             with mock.patch.object(
                 eval_submitter.subprocess,
                 "run",
-                side_effect=submitted,
+                return_value=_submitted("Submitted batch job 201\n"),
             ) as run:
                 eval_submitter.submit_checkpoint_evals(
                     specs,
@@ -986,32 +1094,22 @@ class EvalSubmitterTest(absltest.TestCase):
                     dry_run=False,
                 )
 
-            self.assertEqual(run.call_count, len(specs) + 1)
-            for call in run.call_args_list[: len(specs)]:
-                self.assertNotIn("--dependency", " ".join(call.args[0]))
-            comparison_command = run.call_args_list[-1].args[0]
-            self.assertIn("--dependency=afterok:201:202", comparison_command)
+            run.assert_called_once()
+            self.assertNotIn("--dependency", " ".join(run.call_args.args[0]))
 
-            scripts = sorted((tmpdir / "jobs").glob("*.sbatch"))
-            self.assertLen(scripts, len(specs) + 1)
-            comparison_scripts = [
-                _normalized(path.read_text())
-                for path in scripts
-                if "--mode=compare" in _normalized(path.read_text())
-            ]
-            self.assertLen(comparison_scripts, 1)
-            comparison = comparison_scripts[0]
-            checkpoint_scripts = [
-                _normalized(path.read_text())
-                for path in scripts
-                if "--mode=compare" not in _normalized(path.read_text())
-            ]
-            self.assertLen(checkpoint_scripts, len(specs))
-            for script in checkpoint_scripts:
-                self.assertIn("--mode=subset", script)
-                self.assertIn("--experiments=gdn", script)
-                self.assertIn("--plot_types=in_horizon,heatmap", script)
-                self.assertNotIn("--document_cap", script)
+            scripts = tuple((tmpdir / "jobs").glob("*.sbatch"))
+            self.assertLen(scripts, 1)
+            commands = tuple(
+                _normalized(block)
+                for block in scripts[0].read_text().split("\n\n")
+                if "scripts/run_checkpoint_evals.py" in block
+            )
+            self.assertLen(commands, 2)
+            evaluation, comparison = commands
+            self.assertIn("--mode=subset", evaluation)
+            self.assertIn("--experiments=gdn", evaluation)
+            self.assertIn("--plot_types=in_horizon,heatmap", evaluation)
+            self.assertNotIn("--document_cap", evaluation)
             self.assertIn("--comparison_name=c4_vs_c6", comparison)
             self.assertIn("--plot_types=in_horizon", comparison)
             self.assertNotRegex(
@@ -1019,7 +1117,7 @@ class EvalSubmitterTest(absltest.TestCase):
                 r"--plot_types=[^\s\\]*heatmap",
             )
             for flag, values in (
-                ("c_train", ("4", "6")),
+                ("c_train", ("4", "4")),
                 ("pass_gdn_state", ("false", "true")),
                 ("gdn_layer_limit", ("all", "2")),
                 ("pass_conv_state", ("true", "false")),
@@ -1028,10 +1126,15 @@ class EvalSubmitterTest(absltest.TestCase):
                 ("eos_id", ("4", "6")),
             ):
                 self.assertEqual(
+                    re.findall(rf"--{flag}=([^\s\\]+)", evaluation.lower()),
+                    list(values),
+                )
+                self.assertEqual(
                     re.findall(rf"--{flag}=([^\s\\]+)", comparison.lower()),
                     list(values),
                 )
             for spec in specs:
+                self.assertIn(str(spec.checkpoint), evaluation)
                 self.assertIn(str(spec.checkpoint), comparison)
             for root in (tmpdir / "paper-a", tmpdir / "paper-b"):
                 self.assertIn(str(root), comparison)

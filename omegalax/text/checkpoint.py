@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from pathlib import Path
 
 from flax import nnx
@@ -85,6 +86,30 @@ def restore_model_params(model: nnx.Module, checkpoint: ResolvedCheckpoint) -> n
     default_sharding = NamedSharding(mesh, P())
 
     with mesh_rules(mesh):
+        lora_metadata_path = checkpoint.root / "lora_metadata.json"
+        if lora_metadata_path.is_file():
+            lora_metadata = json.loads(lora_metadata_path.read_text())
+            if bool(lora_metadata.get("enable_lora", False)):
+                from omegalax.trainers.lora import inject_lora
+
+                rngs = nnx.Rngs(int(lora_metadata["adapter_seed"]))
+                wrapped_counts = tuple(
+                    inject_lora(
+                        model,
+                        r=int(entry["r"]),
+                        alpha=float(entry["alpha"]),
+                        rngs=rngs,
+                        target_modules=tuple(entry["target_modules"]),
+                    )
+                    for entry in lora_metadata["profile"]
+                )
+                expected_counts = tuple(int(count) for count in lora_metadata["wrapped_counts"])
+                if wrapped_counts != expected_counts:
+                    raise ValueError(
+                        "LoRA checkpoint structure mismatch: "
+                        f"expected wrapped counts {expected_counts}, got {wrapped_counts}"
+                    )
+
         model_abstract = jax.tree.map(
             lambda value: jax.ShapeDtypeStruct(
                 value.shape,

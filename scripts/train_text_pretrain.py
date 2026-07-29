@@ -92,6 +92,12 @@ flags.DEFINE_integer("val_steps", 10, "Validation batches per validation run.")
 flags.DEFINE_integer("bptt_chunks", None, "Backpropagation span in chunks for statepassing.")
 flags.DEFINE_bool("pass_gdn_state", True, "Pass GDN recurrent state between chunks.")
 flags.DEFINE_integer("gdn_layer_limit", None, "Only pass state for the first N GDN layers.")
+flags.DEFINE_enum(
+    "gdn_state_routing",
+    pretrain_trainer.GdnStateRouting.SAME_LAYER.value,
+    [routing.value for routing in pretrain_trainer.GdnStateRouting],
+    "Route GDN state between chunks.",
+)
 flags.DEFINE_bool("pass_rope_positions", False, "Pass chunk-aware RoPE position ids.")
 flags.DEFINE_bool("pass_conv_state", False, "Pass 1D conv state between chunks.")
 flags.DEFINE_integer("grain_read_threads", 2, "Grain read threads.")
@@ -264,10 +270,16 @@ def _fixed_c_steps(
 
 
 def _runtime_kwargs() -> dict[str, object]:
+    pretrain_trainer.validate_gdn_state_routing(
+        pass_gdn_state=FLAGS.pass_gdn_state,
+        gdn_layer_limit=FLAGS.gdn_layer_limit,
+        gdn_state_routing=FLAGS.gdn_state_routing,
+    )
     return {
         "bptt_chunks": FLAGS.bptt_chunks,
         "pass_gdn_state": FLAGS.pass_gdn_state,
         "gdn_layer_limit": FLAGS.gdn_layer_limit,
+        "gdn_state_routing": FLAGS.gdn_state_routing,
         "pass_rope_positions": FLAGS.pass_rope_positions,
         "pass_conv_state": FLAGS.pass_conv_state,
     }
@@ -275,6 +287,7 @@ def _runtime_kwargs() -> dict[str, object]:
 
 def main(_) -> None:
     pretrain_mode = pretrain_trainer.PretrainMode(FLAGS.pretrain_mode)
+    runtime_kwargs = _runtime_kwargs()
     jax.config.update("jax_compilation_cache_dir", FLAGS.jax_cache_dir)
     jax.distributed.initialize()
     startup_log("jax.distributed initialized")
@@ -424,6 +437,7 @@ def main(_) -> None:
             FLAGS.train_index_path,
             pass_gdn_state=FLAGS.pass_gdn_state,
             gdn_layer_limit=FLAGS.gdn_layer_limit,
+            gdn_state_routing=FLAGS.gdn_state_routing,
             pass_conv_state=FLAGS.pass_conv_state,
             pass_rope_positions=FLAGS.pass_rope_positions,
             pad_id=FLAGS.pad_id,
@@ -481,7 +495,7 @@ def main(_) -> None:
                 text_attn_backend=FLAGS.text_attn_backend,
                 gc_period=FLAGS.gc_period,
                 lr_contract_explicit_fields=lr_contract_explicit_fields,
-                **_runtime_kwargs(),
+                **runtime_kwargs,
             )
         else:
             _, last_metrics = pretrain_trainer.run_pretrain(
@@ -506,7 +520,7 @@ def main(_) -> None:
                 text_attn_backend=FLAGS.text_attn_backend,
                 gc_period=FLAGS.gc_period,
                 lr_contract_explicit_fields=lr_contract_explicit_fields,
-                **_runtime_kwargs(),
+                **runtime_kwargs,
             )
     finally:
         if FLAGS.gc_period:
