@@ -181,13 +181,23 @@ def load_pretrained(
     fsdp_size: int | None = None,
     dp_size: int | None = None,
 ) -> tuple[nnx.Module, VLMConfig]:
-    """Load a pretrained VLM from HuggingFace safetensors."""
+    """Load a pretrained VLM from HuggingFace safetensors.
+
+    ``model_id`` may also be a local directory containing an exported HF
+    checkpoint (config.json + *.safetensors), e.g. a ``bc_export_hf_*``
+    artifact — used to warm-start a new SFT run from a previous run's
+    weights with a fresh optimizer/schedule/data pipeline (anneal-style
+    continuation). Local paths bypass ``snapshot_download``, which only
+    accepts hub repo ids.
+    """
+    import os
+
     from huggingface_hub import snapshot_download
 
     from omegalax.models.qwen3_5 import create_qwen3_5_from_safetensors
     from omegalax.models.qwen3_vl import create_qwen3_vl_from_safetensors
 
-    local_dir = snapshot_download(model_id)
+    local_dir = model_id if os.path.isdir(model_id) else snapshot_download(model_id)
     cfg = resolve_config(model_id)
     # Validates any active mesh matches the requested (tp, fsdp, dp); the loaders
     # below build their own mesh from these sizes, so the return value is unused.
