@@ -140,13 +140,24 @@ flags.DEFINE_integer(
     "max_vision_patches_per_sample",
     None,
     "Max vision patches per sample for JIT stability (0 = no padding). "
-    "Multiplied by batch_size automatically.",
+    "In legacy mode this is multiplied by batch_size into one global bucket; "
+    "with --batched_vision_padding it is the exact per-sample token budget S.",
 )
 flags.DEFINE_integer(
     "max_vision_images_per_sample",
     None,
     "Max images per sample for JIT stability (0 = no padding). "
-    "Multiplied by batch_size automatically.",
+    "In legacy mode multiplied by batch_size; with --batched_vision_padding it is "
+    "the per-sample image-slot count M.",
+)
+flags.DEFINE_boolean(
+    "batched_vision_padding",
+    None,
+    "Pad each sample's vision tokens to (max_vision_patches_per_sample, "
+    "max_vision_images_per_sample) per sample (NOT * batch_size) so the vision "
+    "tower runs cuDNN batched attention sharded on the batch dim (Qwen3-VL "
+    "Option A: fused backward, no dense [N,N] score matrix). Default: auto "
+    "(True for Qwen3-VL, False otherwise). Required for Qwen3-VL.",
 )
 flags.DEFINE_boolean(
     "enable_lora",
@@ -370,18 +381,42 @@ def main(_) -> None:
     image_processor = AutoImageProcessor.from_pretrained(repo_id, use_fast=False, **ip_kwargs)
     startup_log(f"loaded image processor from {repo_id!r}")
 
+    # Qwen3-VL requires the batched per-sample vision layout (its tower no longer
+    # has the token-axis shard_map path). Auto-enable unless explicitly overridden.
+    batched_vision_padding = FLAGS.batched_vision_padding
+    if batched_vision_padding is None:
+        batched_vision_padding = "qwen3-vl" in FLAGS.model_id.lower()
+
     if FLAGS.max_vision_patches_per_sample:
         merge_size = int(image_processor.merge_size)
         ms2 = merge_size * merge_size
-        max_patches = FLAGS.max_vision_patches_per_sample * FLAGS.batch_size
-        if max_patches % ms2 != 0:
-            raise ValueError(
-                f"max_vision_patches_per_sample * batch_size = "
-                f"{FLAGS.max_vision_patches_per_sample} * {FLAGS.batch_size} "
-                f"= {max_patches} must be divisible by merge_size**2={ms2} "
-                f"(remainder {max_patches % ms2}). Adjust the flags so their "
-                f"product is a multiple of {ms2}."
-            )
+        if batched_vision_padding:
+            # Per-sample budget S must be a clean multiple of ms**2, and the batch
+            # must split evenly across (dp * fsdp) so the [B*S]->[B,S] reshape that
+            # feeds cuDNN is collective-free (sharding moves from tokens to batch).
+            S = FLAGS.max_vision_patches_per_sample
+            if S % ms2 != 0:
+                raise ValueError(
+                    f"max_vision_patches_per_sample={S} must be divisible by "
+                    f"merge_size**2={ms2} for batched vision padding."
+                )
+            data_axis = FLAGS.dp_size * FLAGS.fsdp_size
+            if FLAGS.batch_size % data_axis != 0:
+                raise ValueError(
+                    f"batch_size={FLAGS.batch_size} must be divisible by "
+                    f"dp_size*fsdp_size={data_axis} so the vision batch dim shards "
+                    f"cleanly for cuDNN batched attention."
+                )
+        else:
+            max_patches = FLAGS.max_vision_patches_per_sample * FLAGS.batch_size
+            if max_patches % ms2 != 0:
+                raise ValueError(
+                    f"max_vision_patches_per_sample * batch_size = "
+                    f"{FLAGS.max_vision_patches_per_sample} * {FLAGS.batch_size} "
+                    f"= {max_patches} must be divisible by merge_size**2={ms2} "
+                    f"(remainder {max_patches % ms2}). Adjust the flags so their "
+                    f"product is a multiple of {ms2}."
+                )
 
     collator = VLMSFTCollator(
         tokenizer,
@@ -389,6 +424,7 @@ def main(_) -> None:
         image_processor=image_processor,
         max_vision_patches_per_sample=FLAGS.max_vision_patches_per_sample or None,
         max_vision_images_per_sample=FLAGS.max_vision_images_per_sample or None,
+        batched_vision_padding=batched_vision_padding,
     )
     startup_log("built VLMSFTCollator")
     train_sources = _resolve_train_sources()

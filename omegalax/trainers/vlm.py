@@ -294,6 +294,7 @@ def make_sft_train_step(cfg, pad_id: int = 0, *, wrt=nnx.Param, num_loss_tiles: 
         pixel_values = batch.get("pixel_values")
         image_grid_thw = batch.get("image_grid_thw")
         vision_cu_seqlens = batch.get("vision_cu_seqlens")
+        vision_merged_valid = batch.get("vision_merged_valid")
         position_ids_ZBT = batch.get("position_ids_ZBT")
 
         def loss_fn(model):
@@ -306,6 +307,7 @@ def make_sft_train_step(cfg, pad_id: int = 0, *, wrt=nnx.Param, num_loss_tiles: 
                 pixel_values=pixel_values,
                 image_grid_thw=image_grid_thw,
                 vision_cu_seqlens=vision_cu_seqlens,
+                vision_merged_valid=vision_merged_valid,
                 position_ids_ZBT=position_ids_ZBT,
             )
             lm_weight = model.output_weight()
@@ -352,6 +354,7 @@ def make_sft_eval_step(cfg, pad_id: int = 0, *, num_loss_tiles: int = 4):
         pixel_values = batch.get("pixel_values")
         image_grid_thw = batch.get("image_grid_thw")
         vision_cu_seqlens = batch.get("vision_cu_seqlens")
+        vision_merged_valid = batch.get("vision_merged_valid")
         position_ids_ZBT = batch.get("position_ids_ZBT")
 
         hidden_BTD, aux_loss = vlm_api.forward(
@@ -363,6 +366,7 @@ def make_sft_eval_step(cfg, pad_id: int = 0, *, num_loss_tiles: int = 4):
             pixel_values=pixel_values,
             image_grid_thw=image_grid_thw,
             vision_cu_seqlens=vision_cu_seqlens,
+            vision_merged_valid=vision_merged_valid,
             position_ids_ZBT=position_ids_ZBT,
         )
         lm_weight = model.output_weight()

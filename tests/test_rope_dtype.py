@@ -272,7 +272,7 @@ class Qwen3VLVisionRopeDtypeTest(_RopeDtypeTestBase):
 
         block_calls = []
 
-        def block_spy(self_blk, hidden, cu_seqlens, cos_NK, sin_NK):
+        def block_spy(self_blk, hidden, seqlens_BM, offsets_BM1, cos_NK, sin_NK):
             block_calls.append({"cos": cos_NK.dtype, "sin": sin_NK.dtype})
             return hidden  # skip actual block to avoid JAX dynamic-slice tracing issue
 
@@ -287,7 +287,7 @@ class Qwen3VLVisionRopeDtypeTest(_RopeDtypeTestBase):
         vision_cu_seqlens = jnp.array([0, h * w], dtype=jnp.int32)
 
         with mock.patch.object(vis_mod.VisionBlock, "__call__", block_spy):
-            vision(pixels, grid_thw, vision_cu_seqlens)
+            vision(pixels, grid_thw, vision_cu_seqlens, batch_size=1)
 
         self.assertGreater(len(block_calls), 0)
         for i, call in enumerate(block_calls):
