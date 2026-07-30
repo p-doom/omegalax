@@ -28,14 +28,28 @@ flags.DEFINE_enum(
     "pretrain_mode", PretrainMode.IID_BASELINE.value, [m.value for m in PretrainMode], "Tail mode."
 )
 flags.DEFINE_string("train_index_path", None, "Fixed-C tail bundle root.", required=True)
-flags.DEFINE_string("init_model_checkpoint", None, "Model-only source checkpoint.", required=True)
+flags.DEFINE_string("init_model_checkpoint", None, "Model-only source checkpoint.")
+flags.DEFINE_string(
+    "init_hf_model_path", None, "Local HuggingFace model used for fresh initialization."
+)
 flags.DEFINE_string("save_dir", None, "New tail checkpoint root.", required=True)
 flags.DEFINE_integer("seq_len", 2048, "Segment length.")
 flags.DEFINE_integer("batch_size", 192, "Global segment batch per microstep.")
 flags.DEFINE_integer("grad_accum_steps", 5, "Gradient accumulation microsteps.")
 flags.DEFINE_integer("global_step_offset", 40000, "Global step before the first tail update.")
-flags.DEFINE_float("start_lr", None, "First local tail-update LR.", required=True)
-flags.DEFINE_float("end_lr", None, "Last local tail-update LR.", required=True)
+flags.DEFINE_float("start_lr", None, "First local tail-update LR for cosine_bridge.")
+flags.DEFINE_float("end_lr", None, "Last local tail-update LR for cosine_bridge.")
+flags.DEFINE_integer("max_tokens", None, "Optional maximum number of training tokens.")
+flags.DEFINE_enum(
+    "lr_schedule",
+    "cosine_bridge",
+    ["cosine_bridge", "wsd"],
+    "Tail LR schedule.",
+)
+flags.DEFINE_float("learning_rate", None, "Peak LR for WSD.")
+flags.DEFINE_integer("warmup_tokens", 0, "Warmup token budget for WSD.")
+flags.DEFINE_float("lr_end_factor", 0.0, "Final LR fraction for WSD.")
+flags.DEFINE_float("lr_stable_fraction", 0.8, "Post-warmup peak-LR fraction for WSD.")
 flags.DEFINE_float("weight_decay", 0.1, "AdamW weight decay.")
 flags.DEFINE_float("adam_beta1", 0.9, "AdamW beta1.")
 flags.DEFINE_float("adam_beta2", 0.95, "AdamW beta2.")
@@ -110,10 +124,14 @@ def _load_bundle() -> tuple[dict[str, object], Path]:
         raise ValueError(f"Expected a fixed-C bundle, got {metadata.get('format')!r}")
     if int(metadata["num_segments"]) != 4:
         raise ValueError(f"Tail bundle must use num_segments=4, got {metadata['num_segments']}")
-    if int(metadata["trim_batch_size"]) != int(FLAGS.batch_size):
-        raise ValueError("Tail bundle trim_batch_size does not match --batch_size")
-    if int(metadata["trim_grad_accum_steps"]) != int(FLAGS.grad_accum_steps):
-        raise ValueError("Tail bundle trim_grad_accum_steps does not match --grad_accum_steps")
+    index_segments_per_update = int(metadata["trim_batch_size"]) * int(
+        metadata["trim_grad_accum_steps"]
+    )
+    runtime_segments_per_update = int(FLAGS.batch_size) * int(FLAGS.grad_accum_steps)
+    if runtime_segments_per_update != index_segments_per_update:
+        raise ValueError(
+            "Tail bundle segments per optimizer update does not match runtime configuration"
+        )
     if int(metadata["chunk_length"]) != int(FLAGS.seq_len):
         raise ValueError("Tail bundle chunk_length does not match --seq_len")
     if metadata.get("eos_id") != FLAGS.eos_id:
@@ -190,22 +208,38 @@ def main(_) -> None:
     mode = PretrainMode(FLAGS.pretrain_mode)
     if mode is PretrainMode.STATEPASSING_NO_BPTT:
         raise ValueError("The tail experiment requires statepassing_bptt or iid_baseline")
+    if (FLAGS.init_model_checkpoint is None) == (FLAGS.init_hf_model_path is None):
+        raise ValueError("Provide exactly one of --init_model_checkpoint or --init_hf_model_path")
+    if FLAGS.lr_schedule == "cosine_bridge":
+        if FLAGS.start_lr is None or FLAGS.end_lr is None:
+            raise ValueError("cosine_bridge requires --start_lr and --end_lr")
+    elif FLAGS.learning_rate is None:
+        raise ValueError("wsd requires --learning_rate")
     validate_gdn_state_routing(
         pass_gdn_state=FLAGS.pass_gdn_state,
         gdn_layer_limit=FLAGS.gdn_layer_limit,
         gdn_state_routing=FLAGS.gdn_state_routing,
     )
-    if FLAGS.enable_lora and float(FLAGS.weight_decay) != 0.0:
-        raise ValueError("LoRA tail training requires --weight_decay=0")
     jax.config.update("jax_compilation_cache_dir", FLAGS.jax_cache_dir)
     jax.distributed.initialize()
     metadata, root = _load_bundle()
     split = dict(dict(metadata["splits"])["train"])
-    num_steps = int(
+    available_steps = int(
         dict(split["iid"])["iid_steps"]
         if mode is PretrainMode.IID_BASELINE
         else split["statepassing_steps"]
     )
+    tokens_per_step = FLAGS.batch_size * FLAGS.seq_len * FLAGS.grad_accum_steps
+    num_steps = (
+        available_steps if FLAGS.max_tokens is None else int(FLAGS.max_tokens // tokens_per_step)
+    )
+    if num_steps <= 0:
+        raise ValueError("Requested token budget does not contain one optimizer update")
+    if num_steps > available_steps:
+        raise ValueError(
+            f"Requested {num_steps} optimizer steps, but the tail bundle contains only "
+            f"{available_steps}."
+        )
     config = TailTrainConfig(
         seed=FLAGS.seed,
         batch_size=FLAGS.batch_size,
@@ -220,6 +254,11 @@ def main(_) -> None:
         adam_beta2=FLAGS.adam_beta2,
         adam_eps=FLAGS.adam_eps,
         grad_accum_steps=FLAGS.grad_accum_steps,
+        lr_schedule=FLAGS.lr_schedule,
+        learning_rate=FLAGS.learning_rate,
+        warmup_steps=FLAGS.warmup_tokens // tokens_per_step,
+        lr_end_factor=FLAGS.lr_end_factor,
+        lr_stable_fraction=FLAGS.lr_stable_fraction,
     )
     data_iter = _make_tail_iterator(metadata, root, mode)
     save_dir = Path(FLAGS.save_dir).expanduser().resolve()
@@ -289,6 +328,7 @@ def main(_) -> None:
             pass_rope_positions=FLAGS.pass_rope_positions,
             pass_conv_state=FLAGS.pass_conv_state,
             stop_after_local_step=FLAGS.stop_after_local_step,
+            init_hf_model_path=FLAGS.init_hf_model_path,
         )
     finally:
         if FLAGS.gc_period:

@@ -12,6 +12,7 @@ import jax.numpy as jnp
 import numpy as np
 from etils import epath
 from huggingface_hub import hf_hub_download
+from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
 TransformRule = tuple[tuple[int, ...] | None, tuple[int, ...] | None, bool] | None
 
@@ -38,9 +39,26 @@ def map_to_bonsai_key(mapping: dict[str, tuple[str, Enum]], torch_key: str):
     return None, None
 
 
-def _place_like(value: jax.Array, target: Any) -> jax.Array:
-    sharding = getattr(target, "sharding", None)
-    return jax.device_put(value, sharding) if sharding is not None else value
+def _place_like(value: jax.Array, target: Any, sharding: NamedSharding | None = None) -> jax.Array:
+    if sharding is not None:
+        return jax.device_put(value, sharding)
+    target_sharding = getattr(target, "sharding", None)
+    return jax.device_put(value, target_sharding) if target_sharding is not None else value
+
+
+def _resolve_sharding(
+    keys: list[str | int],
+    pspec_dict: dict[str, Any] | None,
+    mesh: Mesh | None,
+) -> NamedSharding | None:
+    if pspec_dict is None or mesh is None:
+        return None
+    node: Any = pspec_dict
+    for key in keys:
+        node = node[key]
+    if not isinstance(node, PartitionSpec):
+        raise TypeError(f"Expected PartitionSpec at {keys}, got {type(node).__name__}")
+    return NamedSharding(mesh, node)
 
 
 def assign_weights_from_eval_shape(
@@ -49,6 +67,9 @@ def assign_weights_from_eval_shape(
     state_dict: dict[str, Any],
     torch_key: str,
     transform_rule: TransformRule,
+    *,
+    mesh: Mesh | None = None,
+    pspec_dict: dict[str, Any] | None = None,
 ):
     value = jnp.asarray(tensor)
     if transform_rule is not None:
@@ -75,7 +96,7 @@ def assign_weights_from_eval_shape(
     if target_dtype is not None:
         value = value.astype(target_dtype)
 
-    node[leaf_key] = _place_like(value, target)
+    node[leaf_key] = _place_like(value, target, _resolve_sharding(keys, pspec_dict, mesh))
 
 
 def assign_to_state_dict(
@@ -83,6 +104,9 @@ def assign_to_state_dict(
     dotted_key: str,
     value: Any,
     label: str,
+    *,
+    mesh: Mesh | None = None,
+    pspec_dict: dict[str, Any] | None = None,
 ) -> None:
     """Navigate state_dict by dotted key and set the value. Raises on shape mismatch or bad path."""
     keys = [stoi(k) for k in dotted_key.split(".")]
@@ -98,7 +122,7 @@ def assign_to_state_dict(
     target_dtype = getattr(target, "dtype", None)
     if target_dtype is not None:
         value = value.astype(target_dtype)
-    node[leaf_key] = _place_like(value, target)
+    node[leaf_key] = _place_like(value, target, _resolve_sharding(keys, pspec_dict, mesh))
 
 
 # MoE expert loading helpers

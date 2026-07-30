@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import gc
 import re
 from collections import defaultdict
@@ -13,6 +14,7 @@ from etils import epath
 from flax import nnx
 
 from omegalax.distributed.mesh import ensure_mesh, mesh_rules
+from omegalax.models.shard_config import shard_config_for_mesh
 from omegalax.models.params_utils import (
     Transform,
     assign_to_state_dict,
@@ -24,7 +26,7 @@ from omegalax.models.params_utils import (
     stoi,
 )
 from .config import Qwen3_5Config, make_config_from_hf
-from .model import Qwen3_5ForConditionalGeneration
+from .model import Qwen3_5ForCausalLM, Qwen3_5ForConditionalGeneration
 
 
 def _assert_config(cfg: Qwen3_5Config, hf_cfg: dict):
@@ -250,6 +252,51 @@ _SHARED_EXPERT_GATE_RE = re.compile(
 _CONV3D_RE = re.compile(r"model\.visual\.patch_embed\.proj\.weight")
 
 
+def _expected_mtp_keys(hf_cfg: dict, cfg: Qwen3_5Config) -> set[str]:
+    n_layers = hf_cfg["text_config"].get("mtp_num_hidden_layers", 0)
+    if not isinstance(n_layers, int) or n_layers < 0:
+        raise ValueError(
+            f"Invalid text_config.mtp_num_hidden_layers={n_layers!r}; expected a non-negative int."
+        )
+    keys: set[str] = set()
+    if n_layers == 0:
+        return keys
+
+    keys.update(
+        {
+            "mtp.fc.weight",
+            "mtp.norm.weight",
+            "mtp.pre_fc_norm_embedding.weight",
+            "mtp.pre_fc_norm_hidden.weight",
+        }
+    )
+    for layer_idx in range(n_layers):
+        base = f"mtp.layers.{layer_idx}"
+        keys.update(
+            {
+                f"{base}.input_layernorm.weight",
+                f"{base}.post_attention_layernorm.weight",
+                f"{base}.self_attn.q_proj.weight",
+                f"{base}.self_attn.k_proj.weight",
+                f"{base}.self_attn.v_proj.weight",
+                f"{base}.self_attn.o_proj.weight",
+                f"{base}.self_attn.q_norm.weight",
+                f"{base}.self_attn.k_norm.weight",
+            }
+        )
+        if cfg.text_config.is_moe:
+            keys.add(f"{base}.mlp.gate.weight")
+            keys.add(f"{base}.mlp.shared_expert_gate.weight")
+            for projection in ("gate_proj", "up_proj", "down_proj"):
+                keys.add(f"{base}.mlp.shared_expert.{projection}.weight")
+                for expert_idx in range(cfg.text_config.num_experts):
+                    keys.add(f"{base}.mlp.experts.{expert_idx}.{projection}.weight")
+        else:
+            for projection in ("gate_proj", "up_proj", "down_proj"):
+                keys.add(f"{base}.mlp.{projection}.weight")
+    return keys
+
+
 def create_qwen3_5_from_safetensors(
     file_dir: str,
     model_id: str = "",
@@ -257,7 +304,8 @@ def create_qwen3_5_from_safetensors(
     tp_size: int | None = None,
     fsdp_size: int | None = None,
     dp_size: int | None = None,
-) -> tuple[Qwen3_5ForConditionalGeneration, Qwen3_5Config]:
+    text_only: bool = False,
+) -> tuple[Qwen3_5ForConditionalGeneration | Qwen3_5ForCausalLM, Qwen3_5Config]:
     """Load HuggingFace Qwen3.5 safetensors into a JAX Qwen3.5 model."""
     mesh = ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size)
 
@@ -267,16 +315,30 @@ def create_qwen3_5_from_safetensors(
     hf_cfg = load_hf_config(path)
     cfg = make_config_from_hf(hf_cfg)
     _assert_config(cfg, hf_cfg)
+    cfg = dataclasses.replace(
+        cfg,
+        text_config=dataclasses.replace(
+            cfg.text_config, shd_cfg=shard_config_for_mesh(cfg.text_config.shd_cfg, mesh)
+        ),
+    )
 
     with mesh_rules(mesh):
-        model = nnx.eval_shape(
-            lambda: Qwen3_5ForConditionalGeneration(cfg, rngs=nnx.Rngs(params=0))
-        )
-    graph_def, abs_state = nnx.split(model)
+        if text_only:
+            model = nnx.eval_shape(
+                lambda: Qwen3_5ForCausalLM(cfg.text_config, rngs=nnx.Rngs(params=0))
+            )
+        else:
+            model = nnx.eval_shape(
+                lambda: Qwen3_5ForConditionalGeneration(cfg, rngs=nnx.Rngs(params=0))
+            )
+        graph_def, abs_state = nnx.split(model)
+        pspec_dict = nnx.to_pure_dict(nnx.get_partition_spec(abs_state))
     state_dict = nnx.to_pure_dict(abs_state)
 
     non_expert_mapping = _get_non_expert_mapping()
     unmatched_hf_keys: list[str] = []
+    expected_mtp_keys = _expected_mtp_keys(hf_cfg, cfg)
+    seen_mtp_keys: set[str] = set()
 
     expert_buf: dict[tuple[int, str], dict[int, np.ndarray]] = defaultdict(dict)
 
@@ -286,21 +348,37 @@ def create_qwen3_5_from_safetensors(
             layer_idx = int(m.group(1))
             value = jnp.asarray(tensor.squeeze(1))
             target = f"text.layers.{layer_idx}.linear_attn.conv_weight"
-            assign_to_state_dict(state_dict, target, value, torch_key)
+            assign_to_state_dict(
+                state_dict, target, value, torch_key, mesh=mesh, pspec_dict=pspec_dict
+            )
             return True
 
         m = _DT_BIAS_RE.match(torch_key)
         if m:
             layer_idx = int(m.group(1))
             target = f"text.layers.{layer_idx}.linear_attn.dt_bias"
-            assign_to_state_dict(state_dict, target, jnp.asarray(tensor), torch_key)
+            assign_to_state_dict(
+                state_dict,
+                target,
+                jnp.asarray(tensor),
+                torch_key,
+                mesh=mesh,
+                pspec_dict=pspec_dict,
+            )
             return True
 
         m = _A_LOG_RE.match(torch_key)
         if m:
             layer_idx = int(m.group(1))
             target = f"text.layers.{layer_idx}.linear_attn.A_log"
-            assign_to_state_dict(state_dict, target, jnp.asarray(tensor), torch_key)
+            assign_to_state_dict(
+                state_dict,
+                target,
+                jnp.asarray(tensor),
+                torch_key,
+                mesh=mesh,
+                pspec_dict=pspec_dict,
+            )
             return True
         return False
 
@@ -318,9 +396,16 @@ def create_qwen3_5_from_safetensors(
                 f"text.layers.{layer_idx}.mlp.gate_proj",
                 jnp.asarray(gate_EDF),
                 torch_key,
+                mesh=mesh,
+                pspec_dict=pspec_dict,
             )
             assign_to_state_dict(
-                state_dict, f"text.layers.{layer_idx}.mlp.up_proj", jnp.asarray(up_EDF), torch_key
+                state_dict,
+                f"text.layers.{layer_idx}.mlp.up_proj",
+                jnp.asarray(up_EDF),
+                torch_key,
+                mesh=mesh,
+                pspec_dict=pspec_dict,
             )
             return True
 
@@ -335,6 +420,8 @@ def create_qwen3_5_from_safetensors(
                 f"text.layers.{layer_idx}.mlp.down_proj",
                 jnp.asarray(down_EFD),
                 torch_key,
+                mesh=mesh,
+                pspec_dict=pspec_dict,
             )
             return True
 
@@ -351,7 +438,9 @@ def create_qwen3_5_from_safetensors(
             layer_idx = int(m.group(1))
             value = jnp.asarray(tensor.T)
             target = f"text.layers.{layer_idx}.mlp.router.kernel"
-            assign_to_state_dict(state_dict, target, value, torch_key)
+            assign_to_state_dict(
+                state_dict, target, value, torch_key, mesh=mesh, pspec_dict=pspec_dict
+            )
             return True
 
         m = _SHARED_EXPERT_GATE_RE.match(torch_key)
@@ -359,7 +448,9 @@ def create_qwen3_5_from_safetensors(
             layer_idx = int(m.group(1))
             value = jnp.asarray(tensor.T)
             target = f"text.layers.{layer_idx}.mlp.shared_expert_gate.kernel"
-            assign_to_state_dict(state_dict, target, value, torch_key)
+            assign_to_state_dict(
+                state_dict, target, value, torch_key, mesh=mesh, pspec_dict=pspec_dict
+            )
             return True
         return False
 
@@ -368,11 +459,23 @@ def create_qwen3_5_from_safetensors(
             for torch_key in sf.keys():
                 tensor = sf.get_tensor(torch_key)
 
+                if text_only and torch_key.startswith("model.visual."):
+                    continue
+
+                if torch_key in expected_mtp_keys:
+                    seen_mtp_keys.add(torch_key)
+                    continue
+
                 # Special: Conv3D patch embedding
                 if _CONV3D_RE.match(torch_key):
                     value = jnp.asarray(tensor.transpose(2, 3, 4, 1, 0))
                     assign_to_state_dict(
-                        state_dict, "vision.patch_embed.proj.kernel", value, torch_key
+                        state_dict,
+                        "vision.patch_embed.proj.kernel",
+                        value,
+                        torch_key,
+                        mesh=mesh,
+                        pspec_dict=pspec_dict,
                     )
                     continue
 
@@ -391,7 +494,15 @@ def create_qwen3_5_from_safetensors(
                     continue
 
                 keys = [stoi(k) for k in jax_key.split(".")]
-                assign_weights_from_eval_shape(keys, tensor, state_dict, torch_key, transform.value)
+                assign_weights_from_eval_shape(
+                    keys,
+                    tensor,
+                    state_dict,
+                    torch_key,
+                    transform.value,
+                    mesh=mesh,
+                    pspec_dict=pspec_dict,
+                )
         gc.collect()
 
     # Assemble per-expert weights into batched format (per-expert HF format)
@@ -414,6 +525,8 @@ def create_qwen3_5_from_safetensors(
                     f"text.layers.{layer_idx}.mlp.gate_proj",
                     jnp.asarray(gate_EDF),
                     "experts.*.gate_proj",
+                    mesh=mesh,
+                    pspec_dict=pspec_dict,
                 )
 
             if "up_proj" in projs:
@@ -425,6 +538,8 @@ def create_qwen3_5_from_safetensors(
                     f"text.layers.{layer_idx}.mlp.up_proj",
                     jnp.asarray(up_EDF),
                     "experts.*.up_proj",
+                    mesh=mesh,
+                    pspec_dict=pspec_dict,
                 )
 
             if "down_proj" in projs:
@@ -437,11 +552,19 @@ def create_qwen3_5_from_safetensors(
                     f"text.layers.{layer_idx}.mlp.down_proj",
                     jnp.asarray(down_EFD),
                     "experts.*.down_proj",
+                    mesh=mesh,
+                    pspec_dict=pspec_dict,
                 )
 
+    missing_mtp_keys = expected_mtp_keys - seen_mtp_keys
+    if missing_mtp_keys:
+        raise RuntimeError(
+            "Expected MTP head weights were missing from the checkpoint:\n"
+            + "\n".join(sorted(missing_mtp_keys))
+        )
     check_conversion_errors(unmatched_hf_keys)
 
-    if cfg.text_config.tie_word_embeddings:
+    if cfg.text_config.tie_word_embeddings and not text_only:
         state_dict["lm_head"]["kernel"] = state_dict["text"]["embedder"]["embedding"].T
 
     gc.collect()

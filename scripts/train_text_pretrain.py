@@ -37,6 +37,11 @@ flags.DEFINE_enum(
     "Pretraining experiment mode.",
 )
 flags.DEFINE_string("model_id", None, "Optional supported/local text model config source.")
+flags.DEFINE_string(
+    "init_hf_model_path",
+    None,
+    "Optional local HuggingFace Qwen3.5 checkpoint used for fresh initialization.",
+)
 flags.DEFINE_string("tokenizer", "Qwen/Qwen3.5-0.8B", "Fixed tokenizer name for run metadata.")
 flags.DEFINE_string("train_index_path", None, "Prebuilt train index path.", required=True)
 flags.DEFINE_string("val_index_path", None, "Optional prebuilt validation index path.")
@@ -231,17 +236,14 @@ def _validate_trimmed_index_runtime_config(
     *,
     label: str,
 ) -> None:
-    index_batch_size = int(metadata["trim_batch_size"])
-    index_grad_accum_steps = int(metadata["trim_grad_accum_steps"])
-    if int(FLAGS.batch_size) != index_batch_size:
+    index_segments_per_update = int(metadata["trim_batch_size"]) * int(
+        metadata["trim_grad_accum_steps"]
+    )
+    runtime_segments_per_update = int(FLAGS.batch_size) * int(FLAGS.grad_accum_steps)
+    if runtime_segments_per_update != index_segments_per_update:
         raise ValueError(
-            f"{label} index was trimmed for batch_size="
-            f"{index_batch_size}, got --batch_size={FLAGS.batch_size}."
-        )
-    if int(FLAGS.grad_accum_steps) != index_grad_accum_steps:
-        raise ValueError(
-            f"{label} index was trimmed for grad_accum_steps="
-            f"{index_grad_accum_steps}, got --grad_accum_steps={FLAGS.grad_accum_steps}."
+            f"{label} index was trimmed for {index_segments_per_update} segments per "
+            f"optimizer update, got {runtime_segments_per_update}."
         )
 
 
@@ -364,9 +366,19 @@ def main(_) -> None:
         splits_metadata = dict(bundle_metadata["splits"])
         train_split = dict(splits_metadata["train"])
         warmup_steps = _warmup_steps()
-        num_steps = _fixed_c_steps(train_split, pretrain_mode)
-        if FLAGS.num_steps is not None and int(FLAGS.num_steps) != num_steps:
-            raise ValueError("--num_steps cannot override fixed-C steps metadata")
+        available_steps = _fixed_c_steps(train_split, pretrain_mode)
+        if FLAGS.num_steps is not None:
+            num_steps = int(FLAGS.num_steps)
+        else:
+            tokens_per_step = FLAGS.batch_size * FLAGS.seq_len * FLAGS.grad_accum_steps
+            num_steps = int(FLAGS.max_tokens // tokens_per_step)
+        if num_steps <= 0:
+            raise ValueError("Requested token budget does not contain one optimizer update")
+        if num_steps > available_steps:
+            raise ValueError(
+                f"Requested {num_steps} fixed-C optimizer steps, but the index contains only "
+                f"{available_steps}; rebuilding or repeating the index is not supported."
+            )
         if num_steps <= 0:
             raise ValueError("Fixed-C index metadata has no training steps")
         train_iter = _make_iterator(
@@ -395,7 +407,7 @@ def main(_) -> None:
     else:
         raise ValueError(f"Unsupported pretraining bundle format: {bundle_format}")
 
-    model_source = FLAGS.model_id or _default_pretrain_config()
+    model_source = FLAGS.init_hf_model_path or FLAGS.model_id or _default_pretrain_config()
     _validate_model_sharding(model_source)
     train_cfg = pretrain_trainer.TrainConfig(
         seed=FLAGS.seed,
@@ -520,6 +532,7 @@ def main(_) -> None:
                 text_attn_backend=FLAGS.text_attn_backend,
                 gc_period=FLAGS.gc_period,
                 lr_contract_explicit_fields=lr_contract_explicit_fields,
+                init_hf_model_path=FLAGS.init_hf_model_path,
                 **runtime_kwargs,
             )
     finally:

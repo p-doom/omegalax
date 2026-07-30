@@ -230,7 +230,7 @@ replacement from the same model-only source using resume=if_present and the
 same W&B id with wandb_resume=allow; do not demand a checkpoint or W&B run
 that does not exist. In both cases keep data, effective tokens per optimizer
 step, optimizer, and LR-schedule arguments unchanged. Verify the next update
-step and LR before launch. Document a replacement run in runs.md before it
+step and LR before launch. Document a replacement run in {wiki_path} before it
 starts. If the training job id changes, submit a replacement babysitter for the
 new id. Do not blindly resubmit.
 

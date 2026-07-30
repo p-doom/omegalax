@@ -840,6 +840,7 @@ def run_pretrain(
     pass_rope_positions: bool = False,
     pass_conv_state: bool = False,
     lr_contract_explicit_fields: Collection[str] | None = None,
+    init_hf_model_path: str | Path | None = None,
 ) -> tuple[MixedPrecisionOptimizer, dict[str, float]]:
     pretrain_mode = PretrainMode(pretrain_mode)
     save_path = Path(save_dir).expanduser().resolve() if save_dir is not None else None
@@ -885,9 +886,21 @@ def run_pretrain(
     rng = jax.device_put(rng, replicated_rng_sharding)
     is_primary_process = jax.process_index() == 0
 
-    model, model_cfg = init_model(
-        model_cfg, init_rng, tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size
-    )
+    if not will_resume and init_hf_model_path is not None:
+        from omegalax.models.qwen3_5.params import create_qwen3_5_from_safetensors
+
+        model, _ = create_qwen3_5_from_safetensors(
+            str(init_hf_model_path),
+            tp_size=tp_size,
+            fsdp_size=fsdp_size,
+            dp_size=dp_size,
+            text_only=True,
+        )
+        startup_log(f"loaded text model parameters from {Path(init_hf_model_path).resolve()}")
+    else:
+        model, model_cfg = init_model(
+            model_cfg, init_rng, tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size
+        )
     from omegalax.models.sharding_runtime import set_attn_backend
 
     set_attn_backend(model, text_backend=text_attn_backend)

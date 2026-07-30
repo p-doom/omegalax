@@ -22,6 +22,7 @@ from omegalax.trainers import checkpoint_utils
 from omegalax.trainers.lora import LoRAParam, inject_lora
 from omegalax.trainers.optim import MixedPrecisionOptimizer
 from omegalax.trainers.perf import maybe_log_step_metrics, per_device_flops_per_step, StepTimer
+from omegalax.trainers.lr_schedule import build_lr_schedule
 from omegalax.trainers.pretrain import (
     _accumulate_metric_sums,
     _finalize_accumulated_metrics,
@@ -85,6 +86,11 @@ class TailTrainConfig:
     adam_beta2: float = 0.95
     adam_eps: float = 1e-8
     grad_accum_steps: int = 5
+    lr_schedule: str = "cosine_bridge"
+    learning_rate: float | None = None
+    warmup_steps: int = 0
+    lr_end_factor: float = 0.0
+    lr_stable_fraction: float = 0.8
 
     @property
     def global_stop_step(self) -> int:
@@ -103,7 +109,33 @@ def build_cosine_bridge(config: TailTrainConfig) -> optax.Schedule:
     )
 
 
+def build_tail_schedule(config: TailTrainConfig) -> optax.Schedule | float:
+    if config.lr_schedule == "cosine_bridge":
+        return build_cosine_bridge(config)
+    if config.learning_rate is None:
+        raise ValueError(f"learning_rate is required when lr_schedule={config.lr_schedule!r}")
+    return build_lr_schedule(
+        peak_lr=config.learning_rate,
+        num_steps=config.num_steps,
+        warmup_steps=config.warmup_steps,
+        schedule=config.lr_schedule,
+        end_factor=config.lr_end_factor,
+        stable_fraction=config.lr_stable_fraction,
+    )
+
+
 def lr_contract(config: TailTrainConfig) -> dict[str, object]:
+    if config.lr_schedule != "cosine_bridge":
+        if config.learning_rate is None:
+            raise ValueError(f"learning_rate is required when lr_schedule={config.lr_schedule!r}")
+        return {
+            "learning_rate": float(config.learning_rate),
+            "warmup_steps": int(config.warmup_steps),
+            "lr_schedule": str(config.lr_schedule),
+            "lr_end_factor": float(config.lr_end_factor),
+            "lr_stable_fraction": float(config.lr_stable_fraction),
+            "lr_schedule_steps": int(config.num_steps),
+        }
     return {
         "lr_schedule": "cosine_bridge",
         "lr_bridge_global_start_step": int(config.global_step_offset),
@@ -219,7 +251,16 @@ def _ensure_json(path: Path, requested: dict[str, object], *, will_resume: bool)
     path.write_text(json.dumps(requested, indent=2, sort_keys=True) + "\n")
 
 
-def _initialization_metadata(checkpoint: ResolvedCheckpoint) -> dict[str, object]:
+def _initialization_metadata(
+    checkpoint: ResolvedCheckpoint | None, init_hf_model_path: str | Path | None
+) -> dict[str, object]:
+    if init_hf_model_path is not None:
+        return {
+            "source_hf_model_path": str(Path(init_hf_model_path).expanduser().resolve()),
+            "restore": "huggingface_safetensors",
+        }
+    if checkpoint is None:
+        raise ValueError("Tail initialization requires a source checkpoint or HuggingFace path")
     return {
         "source_checkpoint_root": str(checkpoint.root),
         "source_checkpoint_step": int(checkpoint.step),
@@ -249,7 +290,7 @@ def _lora_metadata(
 
 
 def run_tail_pretrain(
-    init_model_checkpoint: str | Path,
+    init_model_checkpoint: str | Path | None,
     config: TailTrainConfig,
     data_iter: checkpoint_utils.GrainIterator,
     *,
@@ -275,6 +316,7 @@ def run_tail_pretrain(
     pass_rope_positions: bool = False,
     pass_conv_state: bool = False,
     stop_after_local_step: int | None = None,
+    init_hf_model_path: str | Path | None = None,
 ) -> tuple[MixedPrecisionOptimizer, dict[str, float]]:
     pretrain_mode = PretrainMode(pretrain_mode)
     save_path = Path(save_dir).expanduser().resolve()
@@ -289,7 +331,11 @@ def run_tail_pretrain(
         resume in (checkpoint_utils.ResumeMode.IF_PRESENT, checkpoint_utils.ResumeMode.REQUIRED)
         and latest_step is not None
     )
-    source_checkpoint = resolve_checkpoint(init_model_checkpoint)
+    if (init_model_checkpoint is None) == (init_hf_model_path is None):
+        raise ValueError("Provide exactly one tail initialization source")
+    source_checkpoint = (
+        resolve_checkpoint(init_model_checkpoint) if init_model_checkpoint is not None else None
+    )
     requested_lr_contract = lr_contract(config)
     if will_resume:
         stored_contract = dict(
@@ -307,7 +353,11 @@ def run_tail_pretrain(
             )
 
     model_cfg = text_api.resolve_config(
-        str(save_path) if will_resume else str(source_checkpoint.config_path)
+        str(save_path)
+        if will_resume
+        else str(
+            init_hf_model_path if init_hf_model_path is not None else source_checkpoint.config_path
+        )
     )
     mesh = ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size)
     model_cfg = text_api.align_config_to_mesh(model_cfg, mesh)
@@ -320,19 +370,31 @@ def run_tail_pretrain(
     replicated = NamedSharding(mesh, P())
     root_rng = jax.device_put(jax.random.key(config.seed), replicated)
     init_rng, rng = jax.random.split(root_rng)
-    model, model_cfg = init_model(
-        model_cfg,
-        jax.device_put(init_rng, replicated),
-        tp_size=tp_size,
-        fsdp_size=fsdp_size,
-        dp_size=dp_size,
-    )
-    if not will_resume:
-        model = restore_model_params(model, source_checkpoint)
-        startup_log(
-            f"restored model parameters only from {source_checkpoint.step_path}; "
-            "optimizer, RNG, and iterator start fresh"
+    if not will_resume and init_hf_model_path is not None:
+        from omegalax.models.qwen3_5.params import create_qwen3_5_from_safetensors
+
+        model, _ = create_qwen3_5_from_safetensors(
+            str(init_hf_model_path),
+            tp_size=tp_size,
+            fsdp_size=fsdp_size,
+            dp_size=dp_size,
+            text_only=True,
         )
+        startup_log(f"loaded text model parameters from {Path(init_hf_model_path).resolve()}")
+    else:
+        model, model_cfg = init_model(
+            model_cfg,
+            jax.device_put(init_rng, replicated),
+            tp_size=tp_size,
+            fsdp_size=fsdp_size,
+            dp_size=dp_size,
+        )
+        if not will_resume:
+            model = restore_model_params(model, source_checkpoint)
+            startup_log(
+                f"restored model parameters only from {source_checkpoint.step_path}; "
+                "optimizer, RNG, and iterator start fresh"
+            )
 
     wrt_filter = nnx.Param
     wrapped_counts: tuple[int, ...] = ()
@@ -348,7 +410,7 @@ def run_tail_pretrain(
 
     _ensure_json(
         save_path / "initialization.json",
-        _initialization_metadata(source_checkpoint),
+        _initialization_metadata(source_checkpoint, init_hf_model_path),
         will_resume=will_resume,
     )
     if enable_lora:
@@ -363,7 +425,7 @@ def run_tail_pretrain(
         )
 
     set_attn_backend(model, text_backend=text_attn_backend)
-    schedule = build_cosine_bridge(config)
+    schedule = build_tail_schedule(config)
     with mesh_rules(mesh):
         optimizer = build_tail_optimizer(model, schedule, config, wrt=wrt_filter)
     train_step = make_tail_train_step(
