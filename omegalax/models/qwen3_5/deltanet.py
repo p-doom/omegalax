@@ -103,10 +103,22 @@ class GatedDeltaNet(nnx.Module):
 
         in_proj_init = wp(init, ("embed", "mlp"))
         self.in_proj_qkv = nnx.Linear(
-            D, conv_dim, use_bias=False, rngs=rngs, dtype=cfg.dtype, kernel_init=in_proj_init
+            D,
+            conv_dim,
+            use_bias=False,
+            rngs=rngs,
+            dtype=cfg.dtype,
+            param_dtype=cfg.param_dtype,
+            kernel_init=in_proj_init,
         )
         self.in_proj_z = nnx.Linear(
-            D, self.value_dim, use_bias=False, rngs=rngs, dtype=cfg.dtype, kernel_init=in_proj_init
+            D,
+            self.value_dim,
+            use_bias=False,
+            rngs=rngs,
+            dtype=cfg.dtype,
+            param_dtype=cfg.param_dtype,
+            kernel_init=in_proj_init,
         )
         self.in_proj_b = nnx.Linear(
             D,
@@ -114,6 +126,7 @@ class GatedDeltaNet(nnx.Module):
             use_bias=False,
             rngs=rngs,
             dtype=cfg.dtype,
+            param_dtype=cfg.param_dtype,
             kernel_init=in_proj_init,
         )
         self.in_proj_a = nnx.Linear(
@@ -122,6 +135,7 @@ class GatedDeltaNet(nnx.Module):
             use_bias=False,
             rngs=rngs,
             dtype=cfg.dtype,
+            param_dtype=cfg.param_dtype,
             kernel_init=in_proj_init,
         )
 
@@ -158,6 +172,7 @@ class GatedDeltaNet(nnx.Module):
             use_bias=False,
             rngs=rngs,
             dtype=cfg.dtype,
+            param_dtype=cfg.param_dtype,
             kernel_init=wp(init, ("mlp", "embed")),
         )
 

@@ -41,6 +41,7 @@ class Attention(nnx.Module):
             use_bias=cfg.attention_bias,
             rngs=rngs,
             dtype=cfg.dtype,
+            param_dtype=cfg.param_dtype,
             kernel_init=qkv_init,
         )
         self.k_proj = nnx.Linear(
@@ -49,6 +50,7 @@ class Attention(nnx.Module):
             use_bias=cfg.attention_bias,
             rngs=rngs,
             dtype=cfg.dtype,
+            param_dtype=cfg.param_dtype,
             kernel_init=qkv_init,
         )
         self.v_proj = nnx.Linear(
@@ -57,6 +59,7 @@ class Attention(nnx.Module):
             use_bias=cfg.attention_bias,
             rngs=rngs,
             dtype=cfg.dtype,
+            param_dtype=cfg.param_dtype,
             kernel_init=qkv_init,
         )
         self.o_proj = nnx.Linear(
@@ -65,6 +68,7 @@ class Attention(nnx.Module):
             use_bias=cfg.attention_bias,
             rngs=rngs,
             dtype=cfg.dtype,
+            param_dtype=cfg.param_dtype,
             kernel_init=o_init,
         )
 
