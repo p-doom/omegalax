@@ -45,19 +45,39 @@ from omegalax.vlm import api as vlm_api
 P = PartitionSpec
 
 
+def _path_key(part) -> str:
+    """Best-effort string key for a JAX/NNX tree-path element."""
+    return getattr(part, "key", None) or getattr(part, "name", None) or str(part)
+
+
+def _is_vision_path(path) -> bool:
+    """True if a state-tree path passes through a ``vision`` attribute — i.e. the
+    leaf belongs to the vision tower (``Qwen3VL.vision`` / ``Qwen3_5...vision``).
+    """
+    return any(_path_key(part) == "vision" for part in path)
+
+
 def _trainable_non_vision(path, x):
     """NNX filter predicate: select every ``nnx.Param`` whose state-tree path
-    does not pass through ``Qwen3VL.vision`` (or any nested ``vision``
-    attribute). Used as the ``wrt`` filter for full-FT-with-frozen-vision
-    training. Mirrors ``DEFAULT_SKIP_PATHS = ("vision",)`` in ``lora.py``.
+    does not pass through the vision tower. Used as the ``wrt`` filter for
+    full-FT-with-frozen-vision training. Mirrors ``DEFAULT_SKIP_PATHS =
+    ("vision",)`` in ``lora.py``.
     """
     if not isinstance(x, nnx.Param):
         return False
-    for part in path:
-        key = getattr(part, "key", None) or getattr(part, "name", None) or str(part)
-        if key == "vision":
-            return False
-    return True
+    return not _is_vision_path(path)
+
+
+def _vision_label_fn(params):
+    """Label tree for ``optax.multi_transform``: tag each leaf ``"vision"`` if it
+    belongs to the vision tower, else ``"text"``. The returned tree matches the
+    structure of the pure param pytree ``MixedPrecisionOptimizer`` feeds to the
+    transform.
+    """
+    return jax.tree_util.tree_map_with_path(
+        lambda path, _: "vision" if _is_vision_path(path) else "text",
+        params,
+    )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -79,6 +99,7 @@ class TrainConfig:
     lora_rank: int = 32
     lora_alpha: float = 32.0
     freeze_vision_tower: bool = False
+    vision_learning_rate: float | None = None
     num_loss_tiles: int = 4
     # Host/CPU offload of the fp32 optimizer moments (Adam mu/nu). Plain on/off,
     # correctness-equivalent everywhere (transfer-bound off-GH200); see
@@ -110,12 +131,27 @@ def build_optimizer(
     train_cfg: TrainConfig,
     *,
     wrt=nnx.Param,
+    vision_lr_schedule_fn: optax.Schedule | float | None = None,
 ) -> MixedPrecisionOptimizer:
     chain = []
     if train_cfg.max_grad_norm > 0:
         chain.append(optax.clip_by_global_norm(train_cfg.max_grad_norm))
     wd = 0.0 if wrt is LoRAParam else train_cfg.weight_decay
-    chain.append(optax.adamw(lr_schedule_fn, weight_decay=wd))
+    if vision_lr_schedule_fn is not None:
+        # Route vision-tower leaves through a dedicated AdamW with its own LR
+        # schedule; every other trainable leaf uses the main schedule. Note the
+        # clip_by_global_norm above and any MultiSteps below still wrap BOTH
+        # groups together -- one global grad-norm, one accumulation counter.
+        core = optax.multi_transform(
+            {
+                "text": optax.adamw(lr_schedule_fn, weight_decay=wd),
+                "vision": optax.adamw(vision_lr_schedule_fn, weight_decay=wd),
+            },
+            _vision_label_fn,
+        )
+    else:
+        core = optax.adamw(lr_schedule_fn, weight_decay=wd)
+    chain.append(core)
     tx = optax.chain(*chain)
     if train_cfg.grad_accum_steps > 1:
         tx = optax.MultiSteps(tx, every_k_schedule=train_cfg.grad_accum_steps)
@@ -277,6 +313,7 @@ def make_sft_train_step(cfg, pad_id: int = 0, *, wrt=nnx.Param, num_loss_tiles: 
         pixel_values = batch.get("pixel_values")
         image_grid_thw = batch.get("image_grid_thw")
         vision_cu_seqlens = batch.get("vision_cu_seqlens")
+        vision_merged_valid = batch.get("vision_merged_valid")
         position_ids_ZBT = batch.get("position_ids_ZBT")
 
         def loss_fn(model):
@@ -289,6 +326,7 @@ def make_sft_train_step(cfg, pad_id: int = 0, *, wrt=nnx.Param, num_loss_tiles: 
                 pixel_values=pixel_values,
                 image_grid_thw=image_grid_thw,
                 vision_cu_seqlens=vision_cu_seqlens,
+                vision_merged_valid=vision_merged_valid,
                 position_ids_ZBT=position_ids_ZBT,
             )
             lm_weight = model.output_weight()
@@ -335,6 +373,7 @@ def make_sft_eval_step(cfg, pad_id: int = 0, *, num_loss_tiles: int = 4):
         pixel_values = batch.get("pixel_values")
         image_grid_thw = batch.get("image_grid_thw")
         vision_cu_seqlens = batch.get("vision_cu_seqlens")
+        vision_merged_valid = batch.get("vision_merged_valid")
         position_ids_ZBT = batch.get("position_ids_ZBT")
 
         hidden_BTD, aux_loss = vlm_api.forward(
@@ -346,6 +385,7 @@ def make_sft_eval_step(cfg, pad_id: int = 0, *, num_loss_tiles: int = 4):
             pixel_values=pixel_values,
             image_grid_thw=image_grid_thw,
             vision_cu_seqlens=vision_cu_seqlens,
+            vision_merged_valid=vision_merged_valid,
             position_ids_ZBT=position_ids_ZBT,
         )
         lm_weight = model.output_weight()
@@ -514,6 +554,15 @@ def run_sft(
             "--enable_lora already freezes the vision tower; "
             "--freeze_vision_tower is redundant. Pass at most one."
         )
+    if train_cfg.vision_learning_rate is not None and (
+        train_cfg.enable_lora or train_cfg.freeze_vision_tower
+    ):
+        raise ValueError(
+            "--vision_learning_rate needs a trainable vision tower; it is incompatible "
+            "with --enable_lora and --freeze_vision_tower (both freeze the vision tower)."
+        )
+
+    vision_lr_schedule_fn = None
     if train_cfg.enable_lora:
         with mesh_rules(mesh):
             n_wrapped = inject_lora(
@@ -534,13 +583,36 @@ def run_sft(
         )
     else:
         wrt_filter = nnx.Param
+        if train_cfg.vision_learning_rate is not None:
+            # Same schedule SHAPE as the text tower (warmup / schedule / decay);
+            # only the peak LR differs.
+            vision_lr_schedule_fn = build_lr_schedule(
+                peak_lr=train_cfg.vision_learning_rate,
+                num_steps=train_cfg.num_steps,
+                warmup_steps=train_cfg.warmup_steps,
+                schedule=train_cfg.lr_schedule,
+                end_factor=train_cfg.lr_end_factor,
+                stable_fraction=train_cfg.lr_stable_fraction,
+            )
+            startup_log(
+                "dedicated vision LR schedule: peak="
+                f"{train_cfg.vision_learning_rate:g} "
+                f"schedule={train_cfg.lr_schedule} "
+                f"(text peak={train_cfg.learning_rate:g})"
+            )
 
     if log_memory:
         log_pytree_bytes("params (after load)", nnx.state(model, nnx.Param), save_dir=save_path)
         log_device_memory("after model load", save_dir=save_path)
 
     with mesh_rules(mesh):
-        optimizer = build_optimizer(model, lr_schedule_fn, train_cfg, wrt=wrt_filter)
+        optimizer = build_optimizer(
+            model,
+            lr_schedule_fn,
+            train_cfg,
+            wrt=wrt_filter,
+            vision_lr_schedule_fn=vision_lr_schedule_fn,
+        )
 
     startup_log("built optimizer")
     if log_memory:

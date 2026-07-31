@@ -72,6 +72,16 @@ flags.DEFINE_float(
     None,
     "Fraction of post-warmup steps at peak LR (wsd only). Required for wsd.",
 )
+flags.DEFINE_float(
+    "vision_learning_rate",
+    None,
+    "Dedicated peak LR for the vision tower when it is trainable (i.e. neither "
+    "--freeze_vision_tower nor --enable_lora). Unset = the vision tower trains at "
+    "the main --learning_rate. When set, vision-tower params are routed through a "
+    "separate AdamW via optax.multi_transform; its schedule reuses the text "
+    "schedule shape (--lr_schedule / --warmup_steps / --lr_end_factor / "
+    "--lr_stable_fraction), differing only in peak LR.",
+)
 flags.DEFINE_float("max_grad_norm", None, "Max gradient norm for clipping (0 = no clipping).")
 flags.DEFINE_integer("grad_accum_steps", None, "Gradient accumulation steps (1 = no accumulation).")
 flags.DEFINE_integer(
@@ -131,13 +141,25 @@ flags.DEFINE_integer(
     "max_vision_patches_per_sample",
     None,
     "Max vision patches per sample for JIT stability (0 = no padding). "
-    "Multiplied by batch_size automatically.",
+    "In legacy mode this is multiplied by batch_size into one global bucket; "
+    "with --batched_vision_padding it is the exact per-sample token budget S.",
 )
 flags.DEFINE_integer(
     "max_vision_images_per_sample",
     None,
     "Max images per sample for JIT stability (0 = no padding). "
-    "Multiplied by batch_size automatically.",
+    "In legacy mode multiplied by batch_size; with --batched_vision_padding it is "
+    "the per-sample image-slot count M.",
+)
+flags.DEFINE_boolean(
+    "batched_vision_padding",
+    None,
+    "Pad each sample's vision tokens to (max_vision_patches_per_sample, "
+    "max_vision_images_per_sample) PER SAMPLE (not * batch_size) so the vision "
+    "tower runs cuDNN batched attention sharded on the batch dim instead of the "
+    "packed token axis. Default: auto (True for Qwen3-VL and Qwen3.5, False "
+    "otherwise). Strongly recommended -- the packed-axis path cannot shard the "
+    "vision tower and must replicate attention across devices.",
 )
 flags.DEFINE_boolean(
     "enable_lora",
@@ -256,6 +278,15 @@ def _validate_flags() -> None:
     if FLAGS.lr_schedule == "wsd" and FLAGS.lr_stable_fraction is None:
         problems.append("lr_stable_fraction (required when lr_schedule=wsd)")
 
+    # A dedicated vision LR only makes sense when the vision tower is trainable.
+    # Its schedule reuses the text schedule shape, so the lr_schedule/end_factor/
+    # stable_fraction checks above already cover it -- nothing else to validate.
+    if FLAGS.vision_learning_rate is not None and (FLAGS.enable_lora or FLAGS.freeze_vision_tower):
+        problems.append(
+            "vision_learning_rate requires a trainable vision tower "
+            "(incompatible with enable_lora / freeze_vision_tower)"
+        )
+
     # Weights & Biases is opt-in via wandb_project; if on, identifying fields are required.
     if FLAGS.wandb_project:
         for name in ("wandb_entity", "wandb_group", "wandb_name"):
@@ -352,18 +383,45 @@ def main(_) -> None:
     image_processor = AutoImageProcessor.from_pretrained(repo_id, use_fast=False, **ip_kwargs)
     startup_log(f"loaded image processor from {repo_id!r}")
 
+    # Both Qwen3-VL and Qwen3.5 want the batched per-sample vision layout: their
+    # towers can only shard the vision batch dim, not the packed token axis.
+    batched_vision_padding = FLAGS.batched_vision_padding
+    if batched_vision_padding is None:
+        mid = FLAGS.model_id.lower()
+        batched_vision_padding = "qwen3-vl" in mid or "qwen3.5" in mid
+    startup_log(f"batched_vision_padding={batched_vision_padding}")
+
     if FLAGS.max_vision_patches_per_sample:
         merge_size = int(image_processor.merge_size)
         ms2 = merge_size * merge_size
-        max_patches = FLAGS.max_vision_patches_per_sample * FLAGS.batch_size
-        if max_patches % ms2 != 0:
-            raise ValueError(
-                f"max_vision_patches_per_sample * batch_size = "
-                f"{FLAGS.max_vision_patches_per_sample} * {FLAGS.batch_size} "
-                f"= {max_patches} must be divisible by merge_size**2={ms2} "
-                f"(remainder {max_patches % ms2}). Adjust the flags so their "
-                f"product is a multiple of {ms2}."
-            )
+        if batched_vision_padding:
+            # S is the exact per-sample budget, so it must itself be a clean
+            # multiple of ms**2; and the batch must split evenly across
+            # (dp * fsdp) so the [B*S]->[B,S] reshape feeding cuDNN is
+            # collective-free (sharding moves from tokens to batch).
+            S = FLAGS.max_vision_patches_per_sample
+            if S % ms2 != 0:
+                raise ValueError(
+                    f"max_vision_patches_per_sample={S} must be divisible by "
+                    f"merge_size**2={ms2} for batched vision padding."
+                )
+            data_axis = FLAGS.dp_size * FLAGS.fsdp_size
+            if FLAGS.batch_size % data_axis != 0:
+                raise ValueError(
+                    f"batch_size={FLAGS.batch_size} must be divisible by "
+                    f"dp_size*fsdp_size={data_axis} so the vision batch dim shards "
+                    f"cleanly for cuDNN batched attention."
+                )
+        else:
+            max_patches = FLAGS.max_vision_patches_per_sample * FLAGS.batch_size
+            if max_patches % ms2 != 0:
+                raise ValueError(
+                    f"max_vision_patches_per_sample * batch_size = "
+                    f"{FLAGS.max_vision_patches_per_sample} * {FLAGS.batch_size} "
+                    f"= {max_patches} must be divisible by merge_size**2={ms2} "
+                    f"(remainder {max_patches % ms2}). Adjust the flags so their "
+                    f"product is a multiple of {ms2}."
+                )
 
     collator = VLMSFTCollator(
         tokenizer,
@@ -371,6 +429,7 @@ def main(_) -> None:
         image_processor=image_processor,
         max_vision_patches_per_sample=FLAGS.max_vision_patches_per_sample or None,
         max_vision_images_per_sample=FLAGS.max_vision_images_per_sample or None,
+        batched_vision_padding=batched_vision_padding,
     )
     startup_log("built VLMSFTCollator")
     train_sources = _resolve_train_sources()
@@ -438,6 +497,7 @@ def main(_) -> None:
         lora_rank=FLAGS.lora_rank,
         lora_alpha=FLAGS.lora_alpha,
         freeze_vision_tower=FLAGS.freeze_vision_tower,
+        vision_learning_rate=FLAGS.vision_learning_rate,
         num_loss_tiles=FLAGS.num_loss_tiles,
     )
     resume_mode = ResumeMode(FLAGS.resume)
