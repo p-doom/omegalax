@@ -413,8 +413,7 @@ class Qwen3_5ForCausalLM(nnx.Module):
             kernel_init=wp(lm_head_init, ("embed", "vocab")),
         )
 
-    def __call__(self, token_ids_BT, segment_ids_BT, cache, num_right_pads,
-                 position_ids_BT=None):
+    def __call__(self, token_ids_BT, segment_ids_BT, cache, num_right_pads, position_ids_BT=None):
         del cache, num_right_pads
         # position_ids_BT (zig-zag CP: each token's original index) broadcast across
         # the 3 MRoPE sections downstream.
@@ -427,6 +426,26 @@ class Qwen3_5ForCausalLM(nnx.Module):
 
 
 # VLM
+def _compact_valid_merged(features_ND: jax.Array, valid: jax.Array | None) -> jax.Array:
+    """Gather rows where ``valid == 1`` to the front, order-preserving.
+
+    Per-sample vision padding interleaves each sample's real merged tokens with its
+    own padding tokens. The multimodal scatter matches feature row ``k`` to the
+    ``k``-th real ``<|image_pad|>`` position (row-major across the batch), so the real
+    rows must be front-contiguous. Rows past the real count are garbage, but they only
+    ever land on positions the scatter masks out.
+
+    ``valid is None`` (legacy one-bucket padding) returns the features untouched --
+    that layout already appends all dummies at the end.
+    """
+    if valid is None:
+        return features_ND
+    n = features_ND.shape[0]
+    valid_replicated = reshard(valid.astype(bool), P())
+    idx = jnp.where(valid_replicated, size=n, fill_value=n - 1)[0]
+    return features_ND[idx]
+
+
 class Qwen3_5ForConditionalGeneration(nnx.Module):
     """Vision-Language Model."""
 
@@ -445,6 +464,17 @@ class Qwen3_5ForConditionalGeneration(nnx.Module):
             kernel_init=wp(lm_head_init, ("embed", "vocab")),
         )
 
+    def output_weight(self) -> jax.Array:
+        """Weight matrix used as the LM output projection: (emb_dim, vocab).
+
+        Mirrors ``Qwen3VLForConditionalGeneration.output_weight`` -- the SFT trainer
+        reads it to compute the chunked cross-entropy without materializing logits.
+        ``lm_head`` is always constructed here (unlike qwen3_vl, where it is None when
+        tied); the loader seeds its kernel from the embedding transpose for
+        ``tie_word_embeddings``, so this is the right matrix either way.
+        """
+        return self.lm_head.kernel[...]
+
     def __call__(
         self,
         token_ids_BT: jax.Array,
@@ -454,6 +484,7 @@ class Qwen3_5ForConditionalGeneration(nnx.Module):
         pixel_values: jax.Array | None = None,
         image_grid_thw: jax.Array | None = None,
         vision_cu_seqlens: jax.Array | None = None,
+        vision_merged_valid: jax.Array | None = None,
         position_ids_ZBT: jax.Array | None = None,
     ):
         del cache, num_right_pads
@@ -465,22 +496,49 @@ class Qwen3_5ForConditionalGeneration(nnx.Module):
         )
 
         if pixel_values is not None and image_grid_thw is not None:
-            image_embeds_ND = self.vision(pixel_values, image_grid_thw, vision_cu_seqlens)
+            # `vision_merged_valid` is emitted only under per-sample vision padding
+            # (--batched_vision_padding). Its presence is what makes the flat vision
+            # sequence splittable into B contiguous per-sample blocks; without it the
+            # padding is one batch-wide bucket whose sample boundaries are NOT
+            # S-aligned, so the tower must treat the whole thing as a single sample.
+            vision_batch = token_ids_BT.shape[0] if vision_merged_valid is not None else 1
+            image_embeds_ND = self.vision(
+                pixel_values, image_grid_thw, vision_cu_seqlens, batch_size=vision_batch
+            )
             image_mask_BT = token_ids_BT == self.cfg.image_token_id
-            image_mask_BTD = jnp.broadcast_to(image_mask_BT[:, :, None], inputs_embeds_BTD.shape)
+            # Under an all-Explicit mesh every operand of a broadcast must carry the
+            # SAME spec, and equivalent-but-differently-spelled specs do not count:
+            # the mask's spec is inferred from token_ids_BT and collapses to ('fsdp',)
+            # when dp=1, while out_emb_shd spells the same layout as ('dp', 'fsdp').
+            # Pin the mask to out_emb_shd so the zeroing broadcast agrees.
+            image_mask_BTD = reshard(
+                jnp.broadcast_to(image_mask_BT[:, :, None], inputs_embeds_BTD.shape),
+                self.text.out_emb_shd,
+            )
             inputs_embeds_BTD = jnp.where(image_mask_BTD, 0.0, inputs_embeds_BTD)
             n_embeds = image_embeds_ND.shape[0]  # static after padding
             seq_len = token_ids_BT.shape[1]
+            # `jnp.where(..., size=)` and the scatter below both address the batch
+            # GLOBALLY, so mask and values must be replicated -- reading them from a
+            # batch-sharded array would yield per-shard-local indices.
+            image_mask_replicated = reshard(image_mask_BT, P())
             batch_indices, seq_indices = jnp.where(
-                image_mask_BT,
+                image_mask_replicated,
                 size=n_embeds,
                 fill_value=(0, seq_len - 1),
             )
-            num_real = jnp.sum(image_mask_BT)
+            num_real = jnp.sum(image_mask_replicated)
             valid = jnp.arange(n_embeds) < num_real
+            # Under per-sample padding the merged tokens arrive interleaved as
+            # [s0 real, s0 pad, s1 real, s1 pad, ...]. Compact the real ones to the
+            # front so row k lines up with the k-th real <|image_pad|> position
+            # (row-major across the batch), which is what the scatter below assumes.
+            embeds_replicated = _compact_valid_merged(
+                reshard(image_embeds_ND, P()), vision_merged_valid
+            )
             safe_embeds = jnp.where(
                 valid[:, None],
-                image_embeds_ND,
+                embeds_replicated,
                 0.0,
             ).astype(inputs_embeds_BTD.dtype)
             inputs_embeds_BTD = inputs_embeds_BTD.at[batch_indices, seq_indices].set(

@@ -22,37 +22,89 @@ from .norms import LayerNorm
 from .rope import apply_vision_rope
 
 
-def _cudnn_packed_vision_attention(
-    q_NHK: jax.Array,
-    k_NHK: jax.Array,
-    v_NHK: jax.Array,
-    cu_seqlens: jax.Array,
+def _cudnn_batched_vision_attention_local(
+    q_BSHK: jax.Array,
+    k_BSHK: jax.Array,
+    v_BSHK: jax.Array,
+    seqlens_BM: jax.Array,
+    offsets_BM1: jax.Array,
     scale: float,
 ) -> jax.Array:
-    """Run vision attention via cuDNN's packed (THD) kernel.
+    """cuDNN batched packed (THD) attention on a device-local shard.
 
-    All image tokens are concatenated along the sequence dim. ``cu_seqlens``
-    describes per-image segment boundaries; cuDNN uses these to skip
-    cross-segment tiles entirely rather than materializing a full [T, S] mask.
+    ``seqlens_BM``/``offsets_BM1`` give the per-image segment boundaries WITHIN each
+    sample; cuDNN skips cross-segment tiles rather than materializing a full
+    ``[S, S]`` mask, so the backward stays fused (dQ/dK/dV only, never a dense
+    ``[H, S, S]`` score matrix).
     """
-    cu = cu_seqlens.astype(jnp.int32)
-    q_offsets = cu[None]
-    kv_offsets = cu[None]
-    seqlens = jnp.diff(cu)[None]
-
+    orig_dtype = q_BSHK.dtype
     out = _cudnn_dot_product_attention(
-        q_NHK[None],
-        k_NHK[None],
-        v_NHK[None],
-        q_seqlen=seqlens,
-        kv_seqlen=seqlens,
-        q_offsets=q_offsets,
-        kv_offsets=kv_offsets,
+        # cuDNN flash attention only supports fp16/bf16/fp8.
+        q_BSHK.astype(jnp.bfloat16),
+        k_BSHK.astype(jnp.bfloat16),
+        v_BSHK.astype(jnp.bfloat16),
+        q_seqlen=seqlens_BM.astype(jnp.int32),
+        kv_seqlen=seqlens_BM.astype(jnp.int32),
+        q_offsets=offsets_BM1.astype(jnp.int32),
+        kv_offsets=offsets_BM1.astype(jnp.int32),
         scale=scale,
         mask_type=_CuDnnMaskType.NO_MASK,
         qkv_layout="BTNH",
     )
-    return out[0]
+    return out.astype(orig_dtype)
+
+
+def _cudnn_batched_vision_attention(
+    q_BSHK: jax.Array,
+    k_BSHK: jax.Array,
+    v_BSHK: jax.Array,
+    seqlens_BM: jax.Array,
+    offsets_BM1: jax.Array,
+    scale: float,
+) -> jax.Array:
+    """Batched packed vision attention, sharded on **batch** (and head).
+
+    The ViT has no batch dim natively. Per-sample vision padding
+    (``--batched_vision_padding``) gives every sample its own contiguous ``S``-row
+    block, so the flat sequence reshapes to a real ``[B, S, num_heads, head_dim]``
+    and the (dp,fsdp) sharding moves off the token axis onto the batch axis.
+
+    Sharding batch rather than the packed token axis is what makes this correct:
+    every image's tokens stay on one device, so a device's segment offsets always
+    describe tokens it actually holds. Sharding the packed axis put shard
+    boundaries at arbitrary tokens, mid-image.
+
+    ``shard_map`` (not cuDNN's ``custom_partitioning``) is required because under an
+    all-Explicit mesh the partitioner cannot emit a valid sharding rule for this
+    custom call -- it fails with "dim mapping can't have a factor of size 1 if there
+    are multiple factors" on a mesh mixing size-1 axes with a real one, even when
+    every operand is replicated. ``shard_map`` makes the region device-local, so no
+    sharding rule is needed at all.
+
+    Args:
+        q/k/v_BSHK: ``(B, S, num_heads, head_dim)`` (BTNH), batch over (dp,fsdp),
+            heads over tp.
+        seqlens_BM: int32 ``(B, M)`` per-image token counts, batch-sharded.
+        offsets_BM1: int32 ``(B, M+1)`` per-sample cumulative offsets (0..S).
+        scale: attention logits scale.
+    """
+    sharding = jax.typeof(q_BSHK).sharding
+    batch_axis = sharding.spec[0]
+    head_axis = sharding.spec[2]
+    if batch_axis is None and head_axis is None:
+        return _cudnn_batched_vision_attention_local(
+            q_BSHK, k_BSHK, v_BSHK, seqlens_BM, offsets_BM1, scale
+        )
+
+    q_spec = P(batch_axis, None, head_axis, None)
+    m_spec = P(batch_axis, None)
+    return jax.shard_map(
+        lambda q, k, v, sl, off: _cudnn_batched_vision_attention_local(q, k, v, sl, off, scale),
+        mesh=sharding.mesh,
+        in_specs=(q_spec, q_spec, q_spec, m_spec, m_spec),
+        out_specs=q_spec,
+        check_vma=False,
+    )(q_BSHK, k_BSHK, v_BSHK, seqlens_BM, offsets_BM1)
 
 
 def _token_spatial_coords(
@@ -60,9 +112,16 @@ def _token_spatial_coords(
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Map each vision token to its (row, col) in the original spatial grid.
 
+    Args:
+        grid_thw: per-image (t, h, w). Expected to be REPLICATED across the mesh;
+            callers must ``reshard`` before invoking this. The cumulative token
+            offsets below are global, so a mesh-sharded leading axis is both
+            wrong and, under an Explicit mesh, a hard ShardingTypeError on the
+            concat against the replicated leading zero.
+
     Returns:
         row_coord, col_coord, image_id: each int32 of shape
-        ``(total_tokens,)``.
+        ``(total_tokens,)`` and replicated.
     """
     tokens_per_image = grid_thw[:, 0] * grid_thw[:, 1] * grid_thw[:, 2]
     cu_tokens = jnp.concatenate(
@@ -192,7 +251,8 @@ class VisionAttention(nnx.Module):
     def __call__(
         self,
         hidden_ND: jax.Array,
-        cu_seqlens: jax.Array,
+        seqlens_BM: jax.Array,
+        offsets_BM1: jax.Array,
         cos_NK: jax.Array,
         sin_NK: jax.Array,
     ) -> jax.Array:
@@ -206,12 +266,30 @@ class VisionAttention(nnx.Module):
 
         q_NHK, k_NHK = apply_vision_rope(q_NHK, k_NHK, cos_NK, sin_NK)
 
-        attn_NHK = _cudnn_packed_vision_attention(
-            q_NHK,
-            k_NHK,
-            v_NHK,
-            cu_seqlens,
-            self.scale,
+        # Split the flat [B*S, H, K] sequence into a real batch [B, S, H, K]. Each
+        # sample owns a contiguous S-block (per-sample vision padding), so this
+        # reshape moves the (dp,fsdp) sharding from the token axis onto the batch
+        # axis collective-free, and heads onto tp -- the layout cuDNN's fused
+        # fwd+bwd accepts. B == 1 reproduces the old single packed sequence.
+        B = seqlens_BM.shape[0]
+        S = N // B
+        attn_shd = P(self.heads_shd[0], None, self.heads_shd[1], self.heads_shd[2])
+        q_BSHK = jax.lax.reshape(
+            q_NHK, (B, S, self.num_heads, self.head_dim), out_sharding=attn_shd
+        )
+        k_BSHK = jax.lax.reshape(
+            k_NHK, (B, S, self.num_heads, self.head_dim), out_sharding=attn_shd
+        )
+        v_BSHK = jax.lax.reshape(
+            v_NHK, (B, S, self.num_heads, self.head_dim), out_sharding=attn_shd
+        )
+
+        attn_BSHK = _cudnn_batched_vision_attention(
+            q_BSHK, k_BSHK, v_BSHK, seqlens_BM, offsets_BM1, self.scale
+        )
+
+        attn_NHK = jax.lax.reshape(
+            attn_BSHK, (N, self.num_heads, self.head_dim), out_sharding=self.heads_shd
         )
         outputs_ND = attn_NHK.reshape(N, -1)
 
@@ -231,17 +309,19 @@ class VisionBlock(nnx.Module):
 
         self._remat_policy = resolve_remat_policy(cfg.remat_policy)
 
-    def __call__(self, hidden_ND, cu_seqlens, cos_NK, sin_NK):
+    def __call__(self, hidden_ND, seqlens_BM, offsets_BM1, cos_NK, sin_NK):
         # Inline nnx.remat on the UNBOUND method (no static_argnums): nnx
         # functionalizes ``self`` via split/merge, so it must not be static.
         # Building the transform inline keeps graphdefs equal across fresh
         # instances (stable hash -> one trace, not one per instance).
         return nnx.remat(type(self)._impl, policy=self._remat_policy)(
-            self, hidden_ND, cu_seqlens, cos_NK, sin_NK
+            self, hidden_ND, seqlens_BM, offsets_BM1, cos_NK, sin_NK
         )
 
-    def _impl(self, hidden_ND, cu_seqlens, cos_NK, sin_NK):
-        hidden_ND = hidden_ND + self.attn(self.norm1(hidden_ND), cu_seqlens, cos_NK, sin_NK)
+    def _impl(self, hidden_ND, seqlens_BM, offsets_BM1, cos_NK, sin_NK):
+        hidden_ND = hidden_ND + self.attn(
+            self.norm1(hidden_ND), seqlens_BM, offsets_BM1, cos_NK, sin_NK
+        )
         hidden_ND = hidden_ND + self.mlp(self.norm2(hidden_ND))
         return hidden_ND
 
@@ -376,35 +456,61 @@ class VisionModel(nnx.Module):
         pixel_values: jax.Array,
         grid_thw: jax.Array,
         cu_seqlens: jax.Array | None = None,
+        batch_size: int = 1,
     ) -> jax.Array:
+        # ``cu_seqlens`` is accepted for API compatibility (callers still pass the
+        # collator's global packed offsets) but unused: the batched attention derives
+        # its own PER-SAMPLE segment metadata from grid_thw + batch_size below.
+        # ``batch_size=1`` treats the whole flat sequence as one sample, which is
+        # exactly the legacy global-bucket packed layout.
+        del cu_seqlens
+
+        # Under an all-Explicit mesh JAX never inserts an implicit reshard, so every
+        # operand of a binary op / concat must already agree. `grid_thw` arrives
+        # sharded on its leading (image) axis, which makes the cumulative token
+        # offsets in `_token_spatial_coords` both mis-sharded and semantically wrong
+        # (a cumsum used as GLOBAL offsets). Replicate it, then push the derived
+        # per-token tables back onto the token-sharded layout `hidden_ND` uses.
+        grid_thw = reshard(grid_thw, P())
+
+        # Per-image token counts as a real batch [B, M] (one image == one attention
+        # segment), plus per-sample cumulative offsets [B, M+1] running 0..S. Each
+        # sample's M image slots (real + dummy padding) sum to exactly S tokens.
+        M = grid_thw.shape[0] // batch_size
+        grid_BM3 = grid_thw.reshape(batch_size, M, 3)
+        seqlens_BM = (grid_BM3[:, :, 0] * grid_BM3[:, :, 1] * grid_BM3[:, :, 2]).astype(jnp.int32)
+        offsets_BM1 = jnp.concatenate(
+            [
+                jnp.zeros((batch_size, 1), jnp.int32),
+                jnp.cumsum(seqlens_BM, axis=1, dtype=jnp.int32),
+            ],
+            axis=1,
+        )
+        # Batch-shard the segment metadata over the same axes the batch dim uses, so
+        # the attention shard_map's per-device batch slice gets its matching rows.
+        seqlens_BM = reshard(seqlens_BM, P(self.heads_shd[0], None))
+        offsets_BM1 = reshard(offsets_BM1, P(self.heads_shd[0], None))
+
         hidden_ND = self.patch_embed(pixel_values)
         total_tokens: int = hidden_ND.shape[0]
+        assert total_tokens % batch_size == 0, (
+            f"vision tokens {total_tokens} not divisible by batch_size {batch_size}; "
+            "per-sample vision padding (--batched_vision_padding with "
+            "max_vision_patches_per_sample) is required for the batched layout."
+        )
 
         pos_embeds_ND = self._fast_pos_embed_interpolate(grid_thw, total_tokens)
+        pos_embeds_ND = reshard(pos_embeds_ND, self.hidden_shd)
         hidden_ND = hidden_ND + pos_embeds_ND
 
         rotary_emb_NK = self._rot_pos_emb(grid_thw, total_tokens)
+        rotary_emb_NK = reshard(rotary_emb_NK, P(self.hidden_shd[0], None))
         emb_NK = jnp.concatenate([rotary_emb_NK, rotary_emb_NK], axis=-1)
         cos_NK, sin_NK = jnp.cos(emb_NK), jnp.sin(emb_NK)
         cos_NK = cos_NK.astype(self.cfg.dtype)
         sin_NK = sin_NK.astype(self.cfg.dtype)
 
-        if cu_seqlens is None:
-            # Eager fallback (e.g. unit tests passing raw grids). Under JIT
-            # the caller must precompute and pass cu_seqlens — `jnp.repeat`
-            # below has data-dependent output shape.
-            cu_seqlens = jnp.concatenate(
-                [
-                    jnp.array([0], dtype=jnp.int32),
-                    jnp.cumsum(
-                        jnp.repeat(
-                            grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0], out_sharding=P()
-                        )
-                    ).astype(jnp.int32),
-                ]
-            )
-
         for blk in self.blocks:
-            hidden_ND = blk(hidden_ND, cu_seqlens, cos_NK, sin_NK)
+            hidden_ND = blk(hidden_ND, seqlens_BM, offsets_BM1, cos_NK, sin_NK)
 
         return self.merger(hidden_ND, self.cfg.spatial_merge_size)
