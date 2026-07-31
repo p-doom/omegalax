@@ -196,10 +196,44 @@ def _save_sft_checkpoint(
     rng: jax.Array,
     step: int,
     input_iter: checkpoint_utils.GrainIterator,
-) -> None:
+    *,
+    force: bool = False,
+) -> bool:
     train_state = _train_state(optimizer, rng)
     save_args = checkpoint_utils.make_grain_save_args(train_state, input_iter)
-    checkpoint_manager.save(step, args=save_args)
+    if force:
+        return checkpoint_manager.save(step, args=save_args, force=True)
+    return checkpoint_manager.save(step, args=save_args)
+
+
+def _save_sft_checkpoint_for_requeue(
+    checkpoint_manager: ocp.CheckpointManager,
+    optimizer: MixedPrecisionOptimizer,
+    rng: jax.Array,
+    step: int,
+    input_iter: checkpoint_utils.GrainIterator,
+    save_path: Path,
+) -> None:
+    """Force and attest an off-cycle checkpoint before allowing requeue."""
+    save_started = _save_sft_checkpoint(
+        checkpoint_manager,
+        optimizer,
+        rng,
+        step,
+        input_iter,
+        force=True,
+    )
+    if not save_started:
+        raise RuntimeError(f"Requeue checkpoint save was skipped at step {step}.")
+    checkpoint_manager.wait_until_finished()
+    marker = Path(save_path) / f"{step:06d}" / "_CHECKPOINT_METADATA"
+    latest_step = checkpoint_manager.latest_step()
+    if latest_step != step or not marker.is_file():
+        raise RuntimeError(
+            "Requeue checkpoint did not finalize: "
+            f"requested_step={step} latest_step={latest_step} marker={marker}"
+        )
+    checkpoint_manager.close()
 
 
 def _restore_sft_checkpoint(
@@ -735,14 +769,22 @@ def run_sft(
 
         if requeue_requested:
             startup_log(f"[signal] saving checkpoint at step={step} and requeueing")
-            if checkpoint_manager is not None:
-                _save_sft_checkpoint(checkpoint_manager, optimizer, rng, step, data_iter)
-                checkpoint_manager.wait_until_finished()
-                checkpoint_manager.close()
+            if checkpoint_manager is None:
+                raise RuntimeError("Refusing to requeue without a checkpoint manager.")
+            _save_sft_checkpoint_for_requeue(
+                checkpoint_manager, optimizer, rng, step, data_iter, save_path
+            )
             slurm_job_id = os.environ.get("SLURM_JOB_ID")
             if slurm_job_id and is_primary_process:
                 startup_log(f"[signal] scontrol requeue {slurm_job_id}")
-                subprocess.run(["scontrol", "requeue", slurm_job_id], check=False)
+                result = subprocess.run(
+                    ["scontrol", "requeue", slurm_job_id], check=False
+                )
+                if result.returncode != 0:
+                    raise RuntimeError(
+                        f"scontrol requeue failed for job {slurm_job_id}: "
+                        f"returncode={result.returncode}"
+                    )
             _autotune_ctx.__exit__(None, None, None)
             return optimizer, last_metrics
 
