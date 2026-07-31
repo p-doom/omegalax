@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import gc
 import re
 from collections import defaultdict
@@ -13,6 +14,7 @@ from etils import epath
 from flax import nnx
 
 from omegalax.distributed.mesh import ensure_mesh, mesh_rules
+from omegalax.models.shard_config import shard_config_for_mesh
 from omegalax.models.params_utils import (
     Transform,
     assign_to_state_dict,
@@ -268,11 +270,34 @@ def create_qwen3_5_from_safetensors(
     cfg = make_config_from_hf(hf_cfg)
     _assert_config(cfg, hf_cfg)
 
+    # Drop size-1 mesh axes from the activation specs BEFORE building the model, the
+    # way the qwen3_vl loader does. The module tree captures these specs at
+    # construction (``out_emb_shd``, ``act_btf``, ...) and uses them as explicit
+    # ``out_sharding=``. The trainer separately aligns its own copy of the config and
+    # shards the batch with it, so leaving this unaligned means the batch arrives as
+    # e.g. P('fsdp') while the model demands P(('dp','fsdp')) -- the same layout spelled
+    # two ways. An Explicit mesh compares specs structurally, not semantically, so that
+    # mismatch is a hard ShardingTypeError on the first op that mixes the two.
+    cfg = dataclasses.replace(
+        cfg,
+        text_config=dataclasses.replace(
+            cfg.text_config,
+            shd_cfg=shard_config_for_mesh(cfg.text_config.shd_cfg, mesh),
+        ),
+    )
+
+    # `nnx.get_partition_spec` must run INSIDE `mesh_rules` so the logical axis
+    # annotations resolve to concrete PartitionSpecs; every loaded tensor is then
+    # placed directly onto its FSDP/TP shard. Without pspec_dict, placement falls
+    # back to the abstract eval_shape leaf's own sharding, which carries an
+    # AbstractMesh that `jax.device_put` cannot consume -- it raises
+    # "is_fully_addressable is not implemented for jax.sharding.AbstractMesh".
     with mesh_rules(mesh):
         model = nnx.eval_shape(
             lambda: Qwen3_5ForConditionalGeneration(cfg, rngs=nnx.Rngs(params=0))
         )
-    graph_def, abs_state = nnx.split(model)
+        graph_def, abs_state = nnx.split(model)
+        pspec_dict = nnx.to_pure_dict(nnx.get_partition_spec(abs_state))
     state_dict = nnx.to_pure_dict(abs_state)
 
     non_expert_mapping = _get_non_expert_mapping()
@@ -299,6 +324,8 @@ def create_qwen3_5_from_safetensors(
                     f"text.layers.{layer_idx}.linear_attn.in_proj_{name}.kernel",
                     jnp.asarray(part.T),
                     torch_key,
+                    mesh=mesh,
+                    pspec_dict=pspec_dict,
                 )
             return True
 
@@ -314,6 +341,8 @@ def create_qwen3_5_from_safetensors(
                     f"text.layers.{layer_idx}.linear_attn.conv_weight_{name}",
                     jnp.asarray(part),
                     torch_key,
+                    mesh=mesh,
+                    pspec_dict=pspec_dict,
                 )
             return True
 
@@ -321,14 +350,18 @@ def create_qwen3_5_from_safetensors(
         if m:
             layer_idx = int(m.group(1))
             target = f"text.layers.{layer_idx}.linear_attn.dt_bias"
-            assign_to_state_dict(state_dict, target, jnp.asarray(tensor), torch_key)
+            assign_to_state_dict(
+                state_dict, target, jnp.asarray(tensor), torch_key, mesh=mesh, pspec_dict=pspec_dict
+            )
             return True
 
         m = _A_LOG_RE.match(torch_key)
         if m:
             layer_idx = int(m.group(1))
             target = f"text.layers.{layer_idx}.linear_attn.A_log"
-            assign_to_state_dict(state_dict, target, jnp.asarray(tensor), torch_key)
+            assign_to_state_dict(
+                state_dict, target, jnp.asarray(tensor), torch_key, mesh=mesh, pspec_dict=pspec_dict
+            )
             return True
         return False
 
@@ -346,9 +379,16 @@ def create_qwen3_5_from_safetensors(
                 f"text.layers.{layer_idx}.mlp.gate_proj",
                 jnp.asarray(gate_EDF),
                 torch_key,
+                mesh=mesh,
+                pspec_dict=pspec_dict,
             )
             assign_to_state_dict(
-                state_dict, f"text.layers.{layer_idx}.mlp.up_proj", jnp.asarray(up_EDF), torch_key
+                state_dict,
+                f"text.layers.{layer_idx}.mlp.up_proj",
+                jnp.asarray(up_EDF),
+                torch_key,
+                mesh=mesh,
+                pspec_dict=pspec_dict,
             )
             return True
 
@@ -363,6 +403,8 @@ def create_qwen3_5_from_safetensors(
                 f"text.layers.{layer_idx}.mlp.down_proj",
                 jnp.asarray(down_EFD),
                 torch_key,
+                mesh=mesh,
+                pspec_dict=pspec_dict,
             )
             return True
 
@@ -379,7 +421,9 @@ def create_qwen3_5_from_safetensors(
             layer_idx = int(m.group(1))
             value = jnp.asarray(tensor.T)
             target = f"text.layers.{layer_idx}.mlp.router.kernel"
-            assign_to_state_dict(state_dict, target, value, torch_key)
+            assign_to_state_dict(
+                state_dict, target, value, torch_key, mesh=mesh, pspec_dict=pspec_dict
+            )
             return True
 
         m = _SHARED_EXPERT_GATE_RE.match(torch_key)
@@ -387,20 +431,36 @@ def create_qwen3_5_from_safetensors(
             layer_idx = int(m.group(1))
             value = jnp.asarray(tensor.T)
             target = f"text.layers.{layer_idx}.mlp.shared_expert_gate.kernel"
-            assign_to_state_dict(state_dict, target, value, torch_key)
+            assign_to_state_dict(
+                state_dict, target, value, torch_key, mesh=mesh, pspec_dict=pspec_dict
+            )
             return True
         return False
 
     for f in files:
         with safetensors.safe_open(f, framework="numpy") as sf:
             for torch_key in sf.keys():
+                # Qwen3.5 ships a Multi-Token-Prediction draft head (`mtp_num_hidden_layers`
+                # blocks under an `mtp.` prefix) used only to propose tokens for
+                # speculative decoding at inference. It is not part of the LM's forward
+                # pass and has no JAX counterpart, so skip it rather than reporting the
+                # keys as unmapped. Everything the model actually computes lives under
+                # `model.` (e.g. 617 of 632 tensors for Qwen3.5-2B; the other 15 are these).
+                if torch_key.startswith("mtp."):
+                    continue
+
                 tensor = sf.get_tensor(torch_key)
 
                 # Special: Conv3D patch embedding
                 if _CONV3D_RE.match(torch_key):
                     value = jnp.asarray(tensor.transpose(2, 3, 4, 1, 0))
                     assign_to_state_dict(
-                        state_dict, "vision.patch_embed.proj.kernel", value, torch_key
+                        state_dict,
+                        "vision.patch_embed.proj.kernel",
+                        value,
+                        torch_key,
+                        mesh=mesh,
+                        pspec_dict=pspec_dict,
                     )
                     continue
 
@@ -419,7 +479,15 @@ def create_qwen3_5_from_safetensors(
                     continue
 
                 keys = [stoi(k) for k in jax_key.split(".")]
-                assign_weights_from_eval_shape(keys, tensor, state_dict, torch_key, transform.value)
+                assign_weights_from_eval_shape(
+                    keys,
+                    tensor,
+                    state_dict,
+                    torch_key,
+                    transform.value,
+                    mesh=mesh,
+                    pspec_dict=pspec_dict,
+                )
         gc.collect()
 
     # Assemble per-expert weights into batched format (per-expert HF format)
@@ -442,6 +510,8 @@ def create_qwen3_5_from_safetensors(
                     f"text.layers.{layer_idx}.mlp.gate_proj",
                     jnp.asarray(gate_EDF),
                     "experts.*.gate_proj",
+                    mesh=mesh,
+                    pspec_dict=pspec_dict,
                 )
 
             if "up_proj" in projs:
@@ -453,6 +523,8 @@ def create_qwen3_5_from_safetensors(
                     f"text.layers.{layer_idx}.mlp.up_proj",
                     jnp.asarray(up_EDF),
                     "experts.*.up_proj",
+                    mesh=mesh,
+                    pspec_dict=pspec_dict,
                 )
 
             if "down_proj" in projs:
@@ -465,6 +537,8 @@ def create_qwen3_5_from_safetensors(
                     f"text.layers.{layer_idx}.mlp.down_proj",
                     jnp.asarray(down_EFD),
                     "experts.*.down_proj",
+                    mesh=mesh,
+                    pspec_dict=pspec_dict,
                 )
 
     check_conversion_errors(unmatched_hf_keys)
