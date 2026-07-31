@@ -61,50 +61,59 @@ next_logits, cache, aux_loss = api.decode(model, cache, tokens, pad_id=0, cfg=cf
 ## Training
 The expected flow is:
 1. Start from a raw JSONL file where each line is a session with a `session_id` and `messages`.
-2. Compile it into canonical payload-block ArrayRecord shards.
-3. Build a chunk-index dataset at the target sequence length.
-4. Train from the chunk-index dataset.
+2. Build an inline-records dataset at the target sequence length.
+3. Train from the inline-records dataset.
 
 Example raw JSONL row:
 ```json
 {"session_id":"demo-0","messages":[{"role":"user","content":"Hello"},{"role":"assistant","content":"Hi there"}]}
 ```
 
-Compile a raw SFT dataset into Grain payload shards:
+Build inline training records straight from the chat JSONL. Each emitted record
+IS a training example (the message slice for one `<= max_length` token chunk), so
+there is no separate payload stage and no pointer indirection — the trainer reads
+these records directly:
 ```bash
-uv run scripts/compile_sft_dataset.py \
-  --data-path /path/to/train.jsonl \
-  --out-dir /path/to/train_payload \
-  --messages-per-record 128
+uv run scripts/build_sft_records_from_chat.py \
+  --data_path /path/to/chat.jsonl \
+  --out_dir /path/to/train_records \
+  --model_id qwen3-smoke \
+  --max_length 512
 ```
 
-Build a chunk index for text SFT:
+`--overflow_mode` decides what happens to a conversation that exceeds
+`--max_length`: `drop` (default) discards it, `split` bins it into several
+chunks, `truncate` keeps the prefix.
+
+If the dataset contains image content, also pass `--processor` (and optionally
+`--preprocessor_config`).
+
+Tokenizing every message is the expensive part, and it is independent of
+`--max_length` / `--overflow_mode`. Measure once into a reusable cache, then point
+each length variant at it with `--message_lengths_path` to skip re-tokenizing:
 ```bash
-uv run scripts/build_sft_chunk_index.py \
-  --data-path /path/to/train_payload \
-  --out-dir /path/to/train_chunks \
-  --model-id qwen3-smoke \
-  --max-length 512
+uv run scripts/measure_message_lengths_from_chat.py \
+  --data_path /path/to/chat.jsonl \
+  --out_dir /path/to/lengths \
+  --model_id qwen3-smoke
 ```
 
-If the dataset contains image content, also pass `--processor` (and optionally `--preprocessor-config`) when building the chunk index.
-
-Run text SFT from the compiled Grain chunk-index dataset:
+Run text SFT from the inline-records dataset:
 ```bash
 uv run scripts/train_text_sft.py \
   --model-id qwen3-smoke \
-  --data-path /path/to/train_chunks \
+  --data-path /path/to/train_records \
   --max-length 512 \
   --batch-size 8 \
   --tp-size 1 \
   --fsdp-size 1
 ```
 
-Run VLM SFT from the compiled Grain chunk-index dataset:
+Run VLM SFT from the inline-records dataset:
 ```bash
 uv run scripts/train_vlm_sft.py \
   --model-id qwen3-vl-smoke \
-  --data-path /path/to/train_chunks \
+  --data-path /path/to/train_records \
   --processor Qwen/Qwen3-VL-2B-Instruct \
   --max-length 512 \
   --batch-size 4 \

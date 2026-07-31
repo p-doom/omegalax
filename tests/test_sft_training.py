@@ -13,8 +13,7 @@ from absl.testing import absltest
 import numpy as np
 
 from omegalax.data.grain_pipeline import (
-    build_chunk_index,
-    compile_jsonl_to_arrayrecord,
+    build_records_from_chat,
     make_grain_iterator,
     make_grain_multiprocessing_options,
     make_grain_read_options,
@@ -115,26 +114,53 @@ def _restore_arrays(value):
     return value
 
 
+# build_records_from_chat ships measure_message to `spawn` pool workers via the
+# pool initializer, so it must be picklable -- a lambda is not.
+def _measure_one(_message):
+    return 1
+
+
+def _write_stub_chat(tmpdir: Path, batch: dict[str, np.ndarray]) -> Path:
+    """Write a one-conversation chat.jsonl smuggling a ready-made batch.
+
+    The pre-built batch rides along as a top-level field: the builder copies every
+    non-``messages`` key of the row into the emitted record, so ``batch_fn`` can
+    read it back and hand the trainer a fixed batch. The assistant turn is
+    required -- the builder drops chunks with no assistant tokens.
+    """
+    src = tmpdir / "chat.jsonl"
+    src.write_text(
+        json.dumps(
+            {
+                "messages": [
+                    {"role": "user", "content": "stub"},
+                    {"role": "assistant", "content": "ok"},
+                ],
+                "batch": _to_jsonable(batch),
+            }
+        )
+        + "\n"
+    )
+    return src
+
+
+def _build_stub_records(src: Path, out_dir: Path) -> Path:
+    # max_length=2 with _measure_one keeps the user+assistant pair in one chunk,
+    # so the conversation yields exactly one record.
+    return build_records_from_chat(
+        src,
+        out_dir,
+        max_length=2,
+        measure_message=_measure_one,
+        records_per_shard=1,
+        num_workers=1,
+    )
+
+
 def _make_grain_batch_iter(batch: dict[str, np.ndarray]):
     with tempfile.TemporaryDirectory() as tmpdir:
-        src = Path(tmpdir) / "train.jsonl"
-        src.write_text(
-            json.dumps(
-                {
-                    "messages": [{"role": "user", "content": "stub"}],
-                    "batch": _to_jsonable(batch),
-                }
-            )
-            + "\n"
-        )
-        payload = compile_jsonl_to_arrayrecord(src, Path(tmpdir) / "payload", records_per_shard=1)
-        compiled = build_chunk_index(
-            payload,
-            Path(tmpdir) / "chunked",
-            max_length=1,
-            measure_message=lambda message: 1,
-            records_per_shard=1,
-        )
+        src = _write_stub_chat(Path(tmpdir), batch)
+        compiled = _build_stub_records(src, Path(tmpdir) / "records")
         iterator = make_grain_iterator(
             compiled,
             batch_size=1,
@@ -145,6 +171,8 @@ def _make_grain_batch_iter(batch: dict[str, np.ndarray]):
             multiprocessing_options=make_grain_multiprocessing_options(
                 num_workers=0, per_worker_buffer_size=1
             ),
+            dp_size=1,
+            fsdp_size=1,
         )
         yield from iterator
 
@@ -159,24 +187,8 @@ def _grain_iter_ctx(batch: dict[str, np.ndarray]):
     iterator, so the tempdir is owned by this context manager.
     """
     with tempfile.TemporaryDirectory() as tmpdir:
-        src = Path(tmpdir) / "train.jsonl"
-        src.write_text(
-            json.dumps(
-                {
-                    "messages": [{"role": "user", "content": "stub"}],
-                    "batch": _to_jsonable(batch),
-                }
-            )
-            + "\n"
-        )
-        payload = compile_jsonl_to_arrayrecord(src, Path(tmpdir) / "payload", records_per_shard=1)
-        compiled = build_chunk_index(
-            payload,
-            Path(tmpdir) / "chunked",
-            max_length=1,
-            measure_message=lambda message: 1,
-            records_per_shard=1,
-        )
+        src = _write_stub_chat(Path(tmpdir), batch)
+        compiled = _build_stub_records(src, Path(tmpdir) / "records")
         iterator = make_grain_iterator(
             compiled,
             batch_size=1,
@@ -187,6 +199,8 @@ def _grain_iter_ctx(batch: dict[str, np.ndarray]):
             multiprocessing_options=make_grain_multiprocessing_options(
                 num_workers=0, per_worker_buffer_size=1
             ),
+            dp_size=1,
+            fsdp_size=1,
         )
         yield iterator
 
