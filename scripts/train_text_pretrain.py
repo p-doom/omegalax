@@ -234,8 +234,8 @@ def _make_iterator(
     return make_statepassing_iterator(
         index_path,
         **common,
-        excluded_prefix_stride=FLAGS.iterator_excluded_prefix_stride,
-        excluded_prefix_count=FLAGS.iterator_excluded_prefix_count,
+        excluded_prefix_stride=FLAGS.iterator_excluded_prefix_stride if shuffle else 1,
+        excluded_prefix_count=FLAGS.iterator_excluded_prefix_count if shuffle else 0,
     )
 
 

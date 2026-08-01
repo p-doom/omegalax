@@ -224,6 +224,41 @@ print(json.dumps({
         self.assertEqual(output["grain_workers"], 3)
         self.assertTrue(output["shuffle"])
 
+    def test_iterator_migration_applies_to_train_not_validation(self):
+        output = self._run_train_script_probe(
+            """
+import json
+from unittest import mock
+from absl.testing import flagsaver
+from scripts import train_text_pretrain
+from omegalax.trainers.pretrain import PretrainMode
+
+train_text_pretrain.FLAGS(["probe", "--train_index_path=/idx"])
+
+with flagsaver.flagsaver(
+    iterator_excluded_prefix_stride=4,
+    iterator_excluded_prefix_count=720000,
+):
+    with mock.patch.object(train_text_pretrain, "make_statepassing_iterator") as iterator:
+        train_text_pretrain._make_iterator(
+            "/train", PretrainMode.STATEPASSING_BPTT, 12, shuffle=True
+        )
+        train_kwargs = iterator.call_args.kwargs
+        train_text_pretrain._make_iterator(
+            "/val", PretrainMode.STATEPASSING_BPTT, 12, shuffle=False
+        )
+        val_kwargs = iterator.call_args.kwargs
+
+print(json.dumps({
+    "train": [train_kwargs["excluded_prefix_stride"], train_kwargs["excluded_prefix_count"]],
+    "val": [val_kwargs["excluded_prefix_stride"], val_kwargs["excluded_prefix_count"]],
+}))
+"""
+        )
+
+        self.assertEqual(output["train"], [4, 720000])
+        self.assertEqual(output["val"], [1, 0])
+
     def test_runtime_kwargs_forward_statepassing_flags(self):
         output = self._run_train_script_probe(
             """
