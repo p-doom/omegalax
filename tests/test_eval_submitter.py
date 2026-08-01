@@ -247,7 +247,7 @@ class EvalSubmitterTest(absltest.TestCase):
                 plot_output_roots=plot_roots,
                 comparison_name=None,
                 pilot_cap=2,
-                token_selections=("all", "top_entropy_10pct"),
+                token_selections=("all", "top_entropy_20pct"),
                 entropy_reference_checkpoint=tmpdir / "iid-reference",
             )
             normalized = _normalized(script)
@@ -278,7 +278,7 @@ class EvalSubmitterTest(absltest.TestCase):
             self.assertIn("--pass_conv_state=false", lower)
             self.assertIn("--pass_rope_positions=true", lower)
             self.assertIn("--experiments=gdn,conv", normalized)
-            self.assertIn("--token_selections=all,top_entropy_10pct", normalized)
+            self.assertIn("--token_selections=all,top_entropy_20pct", normalized)
             self.assertIn(
                 f"--entropy_reference_checkpoint={tmpdir / 'iid-reference'}",
                 normalized,

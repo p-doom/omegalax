@@ -236,7 +236,7 @@ class EvalExecutorTest(absltest.TestCase):
         top_mask = top_mask.at[:, :, 1].set(batch.loss_mask_BCT[:, :, 1])
         selected_batch = dataclasses.replace(
             batch,
-            selection_names=("all", "top_entropy_10pct"),
+            selection_names=("all", "top_entropy_20pct"),
             selection_masks_BNCT=jnp.stack((batch.loss_mask_BCT, top_mask), axis=1),
         )
         result = run_chain(
@@ -252,7 +252,7 @@ class EvalExecutorTest(absltest.TestCase):
 
         for segment_idx, segment in enumerate(result.segments):
             all_counts = np.asarray(segment.token_count("all"))
-            selected_counts = np.asarray(segment.token_count("top_entropy_10pct"))
+            selected_counts = np.asarray(segment.token_count("top_entropy_20pct"))
             np.testing.assert_array_equal(
                 all_counts,
                 np.asarray(batch.loss_mask_BCT[:, segment_idx, 1:].sum(axis=1)),
@@ -265,7 +265,7 @@ class EvalExecutorTest(absltest.TestCase):
             self.assertTrue(np.any(strict_subset))
             self.assertTrue(
                 np.all(
-                    np.asarray(segment.nll_sum("top_entropy_10pct"))[strict_subset]
+                    np.asarray(segment.nll_sum("top_entropy_20pct"))[strict_subset]
                     < np.asarray(segment.nll_sum("all"))[strict_subset]
                 )
             )

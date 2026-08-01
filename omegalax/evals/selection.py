@@ -16,8 +16,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 
-TOP_ENTROPY_FRACTION = 0.10
-TOP_ENTROPY_SELECTION = "top_entropy_10pct"
+TOP_ENTROPY_FRACTION = 0.20
+TOP_ENTROPY_SELECTION = "top_entropy_20pct"
 
 
 @dataclass(frozen=True)

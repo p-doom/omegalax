@@ -17,7 +17,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 _MODES = ("all", "subset", "plot", "compare")
 _EXPERIMENTS = ("gdn", "conv")
 _PLOT_TYPES = ("in_horizon", "beyond_horizon", "exact_length", "heatmap")
-_TOKEN_SELECTIONS = ("all", "top_entropy_10pct")
+_TOKEN_SELECTIONS = ("all", "top_entropy_20pct")
 _SPEC_FIELDS = (
     "c_train",
     "pass_gdn_state",
@@ -324,11 +324,11 @@ def _validate_request(
         raise ValueError(f"mode={mode} requires a manifest path")
     if (
         token_selections is not None
-        and "top_entropy_10pct" in token_selections
+        and "top_entropy_20pct" in token_selections
         and mode in ("all", "subset", "compare")
         and entropy_reference_checkpoint is None
     ):
-        raise ValueError("top_entropy_10pct requires an explicit entropy_reference_checkpoint")
+        raise ValueError("top_entropy_20pct requires an explicit entropy_reference_checkpoint")
 
     specs = runner.resolve_checkpoint_eval_requests(requests)
     if experiments is not None:
@@ -405,7 +405,7 @@ def submit_checkpoint_evals(
         )
     if (
         mode in ("all", "subset", "compare")
-        and "top_entropy_10pct" in effective_token_selections
+        and "top_entropy_20pct" in effective_token_selections
         and len({spec.pad_id for spec in specs}) != 1
     ):
         raise ValueError(

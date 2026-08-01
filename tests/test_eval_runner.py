@@ -481,10 +481,10 @@ class EvalRunnerTest(absltest.TestCase):
         self.assertEqual(runner._execution_token_selections(None, None), ("all",))
         self.assertEqual(
             runner._execution_token_selections(None, "/tmp/iid"),
-            ("all", "top_entropy_10pct"),
+            ("all", "top_entropy_20pct"),
         )
         with self.assertRaisesRegex(ValueError, "entropy_reference_checkpoint"):
-            runner._execution_token_selections(("top_entropy_10pct",), None)
+            runner._execution_token_selections(("top_entropy_20pct",), None)
 
     def test_two_device_gdn_pipeline_runs_in_fresh_subprocess(self):
         env = os.environ.copy()
@@ -1096,7 +1096,7 @@ class EvalRunnerTest(absltest.TestCase):
             config = _eval_config(run_dir)
             self.assertEqual(
                 config["token_selections"],
-                ["all", "top_entropy_10pct"],
+                ["all", "top_entropy_20pct"],
             )
             self.assertTrue(
                 tuple(
@@ -1105,18 +1105,18 @@ class EvalRunnerTest(absltest.TestCase):
             )
             store = EvalRunStore.open(checkpoint_root, 5, _stored_identity(run_dir))
             all_rows = store.read_rows(experiment="gdn", selection="all")
-            top_rows = store.read_rows(experiment="gdn", selection="top_entropy_10pct")
+            top_rows = store.read_rows(experiment="gdn", selection="top_entropy_20pct")
             self.assertLen(all_rows, len(top_rows))
             all_counts = {
                 (row.condition, row.doc_id, row.chunk_position): row.token_count for row in all_rows
             }
             for row in top_rows:
                 all_count = all_counts[(row.condition, row.doc_id, row.chunk_position)]
-                expected = 0 if all_count == 0 else max(1, int(np.ceil(0.1 * all_count)))
+                expected = 0 if all_count == 0 else max(1, int(np.ceil(0.2 * all_count)))
                 self.assertEqual(row.token_count, expected)
             self.assertTrue((run_dir / "summary" / "all" / "metrics.parquet").is_file())
             self.assertTrue(
-                (run_dir / "summary" / "top_entropy_10pct" / "metrics.parquet").is_file()
+                (run_dir / "summary" / "top_entropy_20pct" / "metrics.parquet").is_file()
             )
 
             run_evals(
@@ -1155,7 +1155,7 @@ class EvalRunnerTest(absltest.TestCase):
                 mode="subset",
                 manifest_path=manifest_path,
                 experiments=("gdn",),
-                token_selections=("top_entropy_10pct",),
+                token_selections=("top_entropy_20pct",),
                 entropy_reference_checkpoint=checkpoint_root / "000005",
                 plot_types=("heatmap",),
                 document_cap=2,
@@ -1166,8 +1166,8 @@ class EvalRunnerTest(absltest.TestCase):
             selector_dirs = tuple(checkpoint_root.glob("evals/entropy_selector_v1/step_5/*"))
             self.assertLen(selector_dirs, 1)
             self.assertLen(tuple((selector_dirs[0] / "raw").glob("*.parquet")), 4)
-            shutil.rmtree(run_dir / "summary" / "top_entropy_10pct")
-            shutil.rmtree(run_dir / "plots" / "top_entropy_10pct")
+            shutil.rmtree(run_dir / "summary" / "top_entropy_20pct")
+            shutil.rmtree(run_dir / "plots" / "top_entropy_20pct")
 
             run_evals(
                 (spec,),
@@ -1183,7 +1183,7 @@ class EvalRunnerTest(absltest.TestCase):
             config = _eval_config(run_dir)
             self.assertIsNone(config["document_cap"])
             self.assertEqual(config["effective_document_cap"], 4)
-            self.assertEqual(config["token_selections"], ["all", "top_entropy_10pct"])
+            self.assertEqual(config["token_selections"], ["all", "top_entropy_20pct"])
             self.assertEqual(config["experiments"], ["gdn", "conv"])
             self.assertLen(tuple((selector_dirs[0] / "raw").glob("*.parquet")), 8)
 
@@ -1191,7 +1191,7 @@ class EvalRunnerTest(absltest.TestCase):
             population_counts = {
                 count.doc_num_chunks: count.available for count in manifest.counts_by_length
             }
-            for selection in ("all", "top_entropy_10pct"):
+            for selection in ("all", "top_entropy_20pct"):
                 rows = store.read_rows(selection=selection)
                 self.assertEqual(
                     {(row.experiment, row.condition) for row in rows},
@@ -1403,7 +1403,7 @@ class EvalRunnerTest(absltest.TestCase):
     def test_top_entropy_comparison_uses_v2_paths_and_requires_one_selector(self):
         with test_temp_dir() as tmp:
             tmpdir = Path(tmp)
-            selection = "top_entropy_10pct"
+            selection = "top_entropy_20pct"
             selector = runner.EntropySelectorIdentity(
                 reference_checkpoint_root=str((tmpdir / "iid-reference").resolve()),
                 reference_checkpoint_step=1,
@@ -1412,7 +1412,7 @@ class EvalRunnerTest(absltest.TestCase):
                 dataset_hash="sha256:dataset",
                 code_hash="git:test",
                 pad_id=0,
-                fraction=0.1,
+                fraction=0.2,
                 state_mode="zero_gdn_and_conv",
                 position_mode="reset_each_chunk",
                 tp_size=1,

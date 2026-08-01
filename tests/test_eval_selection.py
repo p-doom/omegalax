@@ -29,7 +29,7 @@ class EvalSelectionTest(absltest.TestCase):
             dataset_hash="sha256:dataset",
             code_hash="sha256:code",
             pad_id=0,
-            fraction=0.1,
+            fraction=0.2,
             state_mode="zero_gdn_and_conv",
             position_mode="reset_each_chunk",
             tp_size=1,
@@ -40,13 +40,13 @@ class EvalSelectionTest(absltest.TestCase):
             attention_backend="xla",
         )
 
-    def test_top_ten_percent_uses_only_valid_targets_and_deterministic_ties(self):
+    def test_top_twenty_percent_uses_only_valid_targets_and_deterministic_ties(self):
         entropies = np.asarray([0.2, 0.9, 0.9, 0.1, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3])
         loss_mask = np.ones(11, dtype=np.int32)
         loss_mask[2] = 0
         self.assertEqual(
             top_entropy_positions(entropies, loss_mask),
-            (3,),
+            (3, 5),
         )
         self.assertEmpty(top_entropy_positions(np.asarray([0.1]), np.asarray([1, 0])))
 

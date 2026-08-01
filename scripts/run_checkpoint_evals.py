@@ -14,7 +14,7 @@ from omegalax.training_contract import ManualEvalConfig
 _MODES = ("all", "subset", "plot", "compare")
 _EXPERIMENTS = ("gdn", "conv")
 _PLOT_TYPES = ("in_horizon", "beyond_horizon", "exact_length", "heatmap")
-_TOKEN_SELECTIONS = ("all", "top_entropy_10pct")
+_TOKEN_SELECTIONS = ("all", "top_entropy_20pct")
 _SPEC_FIELDS = (
     "c_train",
     "pass_gdn_state",
