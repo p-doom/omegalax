@@ -903,6 +903,8 @@ def make_statepassing_iterator(
     fsdp_size: int,
     dp_index: int | None = None,
     process_index: int | None = None,
+    excluded_prefix_stride: int = 1,
+    excluded_prefix_count: int = 0,
     grain_workers: int = 8,
     grain_worker_buffer_size: int = 1,
     grain_read_threads: int = 2,
@@ -970,6 +972,8 @@ def make_statepassing_iterator(
         shuffle=shuffle,
         seed=seed,
         shuffle_rounds=STATEPASSING_INDEX_SHUFFLE_ROUNDS,
+        excluded_prefix_stride=excluded_prefix_stride,
+        excluded_prefix_count=excluded_prefix_count,
     )
     batched = dataset_index.batch(
         batch_size=records_per_local_batch,

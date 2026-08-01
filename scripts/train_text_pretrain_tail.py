@@ -76,6 +76,22 @@ flags.DEFINE_integer("fsdp_size", 1, "FSDP size.")
 flags.DEFINE_integer("dp_size", 8, "Data parallel size.")
 flags.DEFINE_integer("iterator_fsdp_size", 1, "Iterator FSDP shard count.")
 flags.DEFINE_integer("iterator_dp_size", 1, "Iterator DP shard count.")
+flags.DEFINE_integer(
+    "iterator_excluded_prefix_stride",
+    1,
+    "Old iterator shard count whose consumed prefix is excluded on resume.",
+)
+flags.DEFINE_integer(
+    "iterator_excluded_prefix_count",
+    0,
+    "Per-old-shard index records already consumed before a sharding migration.",
+)
+flags.DEFINE_bool(
+    "restore_input_iter",
+    True,
+    "Restore the saved iterator state; disable only for an explicit iterator migration.",
+)
+flags.DEFINE_integer("resume_expected_step", None, "Require this exact checkpoint step on resume.")
 flags.DEFINE_integer("grain_workers", 8, "Grain multiprocessing workers.")
 flags.DEFINE_integer("grain_worker_buffer_size", 1, "Grain worker buffer size.")
 flags.DEFINE_integer("grain_read_threads", 2, "Grain read threads.")
@@ -150,8 +166,7 @@ def _make_tail_iterator(metadata: dict[str, object], root: Path, mode: PretrainM
     else:
         path = root / str(train_split["path"])
         make_iterator = make_statepassing_iterator
-    return make_iterator(
-        str(path),
+    iterator_kwargs = dict(
         batch_size=per_process_batch,
         chunk_length=FLAGS.seq_len,
         pad_id=FLAGS.pad_id,
@@ -167,6 +182,10 @@ def _make_tail_iterator(metadata: dict[str, object], root: Path, mode: PretrainM
         grain_read_threads=FLAGS.grain_read_threads,
         grain_read_prefetch_buffer_size=FLAGS.grain_read_prefetch_buffer_size,
     )
+    if mode is not PretrainMode.IID_BASELINE:
+        iterator_kwargs["excluded_prefix_stride"] = FLAGS.iterator_excluded_prefix_stride
+        iterator_kwargs["excluded_prefix_count"] = FLAGS.iterator_excluded_prefix_count
+    return make_iterator(str(path), **iterator_kwargs)
 
 
 def _replay_wandb_loss_history(wandb_run) -> None:
@@ -222,6 +241,12 @@ def main(_) -> None:
     )
     jax.config.update("jax_compilation_cache_dir", FLAGS.jax_cache_dir)
     jax.distributed.initialize()
+    startup_log(
+        f"iterator process_count={jax.process_count()} dp={FLAGS.iterator_dp_size} "
+        f"fsdp={FLAGS.iterator_fsdp_size} excluded_prefix=(stride="
+        f"{FLAGS.iterator_excluded_prefix_stride}, count={FLAGS.iterator_excluded_prefix_count}) "
+        f"restore_input_iter={FLAGS.restore_input_iter}"
+    )
     metadata, root = _load_bundle()
     split = dict(dict(metadata["splits"])["train"])
     available_steps = int(
@@ -329,6 +354,8 @@ def main(_) -> None:
             pass_conv_state=FLAGS.pass_conv_state,
             stop_after_local_step=FLAGS.stop_after_local_step,
             init_hf_model_path=FLAGS.init_hf_model_path,
+            restore_input_iter=FLAGS.restore_input_iter,
+            resume_expected_step=FLAGS.resume_expected_step,
         )
     finally:
         if FLAGS.gc_period:

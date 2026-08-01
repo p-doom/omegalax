@@ -841,6 +841,8 @@ def run_pretrain(
     pass_conv_state: bool = False,
     lr_contract_explicit_fields: Collection[str] | None = None,
     init_hf_model_path: str | Path | None = None,
+    restore_input_iter: bool = True,
+    resume_expected_step: int | None = None,
 ) -> tuple[MixedPrecisionOptimizer, dict[str, float]]:
     pretrain_mode = PretrainMode(pretrain_mode)
     save_path = Path(save_dir).expanduser().resolve() if save_dir is not None else None
@@ -859,6 +861,10 @@ def run_pretrain(
         resume in (checkpoint_utils.ResumeMode.IF_PRESENT, checkpoint_utils.ResumeMode.REQUIRED)
         and latest_step is not None
     )
+    if resume_expected_step is not None and latest_step != int(resume_expected_step):
+        raise ValueError(
+            f"Expected resume checkpoint {resume_expected_step}, found {latest_step} at {save_path}."
+        )
     train_cfg, lr_contract = _resolve_pretrain_lr_contract(
         train_cfg,
         checkpoint_manager,
@@ -943,8 +949,15 @@ def run_pretrain(
 
     start_step = 0
     if will_resume:
+        startup_log(
+            f"restoring checkpoint step={latest_step} restore_input_iter={restore_input_iter}"
+        )
         optimizer, start_step, rng, data_iter = _restore_sft_checkpoint(
-            checkpoint_manager, optimizer, rng, data_iter
+            checkpoint_manager,
+            optimizer,
+            rng,
+            data_iter,
+            restore_input_iter=restore_input_iter,
         )
         rng = jax.device_put(rng, replicated_rng_sharding)
 

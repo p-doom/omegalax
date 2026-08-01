@@ -321,6 +321,8 @@ class IndexRecordLookup:
         shuffle: bool,
         seed: int,
         shuffle_rounds: int,
+        excluded_prefix_stride: int = 1,
+        excluded_prefix_count: int = 0,
     ) -> None:
         self.index_shard_paths = [
             str(Path(path).expanduser().resolve()) for path in index_shard_paths
@@ -332,6 +334,8 @@ class IndexRecordLookup:
         self.shuffle = bool(shuffle)
         self.seed = int(seed)
         self.shuffle_rounds = int(shuffle_rounds)
+        self.excluded_prefix_stride = int(excluded_prefix_stride)
+        self.excluded_prefix_count = int(excluded_prefix_count)
         self._source: grain.sources.ArrayRecordDataSource | None = None
 
     def _index_source(self) -> grain.sources.ArrayRecordDataSource:
@@ -341,7 +345,15 @@ class IndexRecordLookup:
 
     def __call__(self, absolute_pos: int) -> dict[str, Any]:
         epoch, local_pos = divmod(int(absolute_pos), self.epoch_samples_per_process)
-        global_pos = self.dp_index + local_pos * self.dp_size
+        if self.excluded_prefix_count:
+            prefix_remaining = (self.excluded_prefix_stride - 1) * self.excluded_prefix_count
+            if local_pos < prefix_remaining:
+                group, offset = divmod(local_pos, self.excluded_prefix_stride - 1)
+                global_pos = group * self.excluded_prefix_stride + offset + 1
+            else:
+                global_pos = local_pos + self.excluded_prefix_count
+        else:
+            global_pos = self.dp_index + local_pos * self.dp_size
         if self.shuffle:
             index_record_idx = grain.experimental.index_shuffle(
                 global_pos,
@@ -365,7 +377,19 @@ def make_dataset_index(
     seed: int,
     shuffle_rounds: int,
     records_per_local_batch: int = 1,
+    excluded_prefix_stride: int = 1,
+    excluded_prefix_count: int = 0,
 ) -> tuple[grain.MapDataset, int]:
+    if excluded_prefix_stride <= 0:
+        raise ValueError("excluded_prefix_stride must be > 0")
+    if excluded_prefix_count < 0:
+        raise ValueError("excluded_prefix_count must be >= 0")
+    if excluded_prefix_count and (
+        dp_size != 1 or dp_index != 0 or num_epochs != 1 or excluded_prefix_stride <= 1
+    ):
+        raise ValueError(
+            "Excluded-prefix resume requires one data shard, one epoch, and a stride > 1."
+        )
     usable_records = num_pretrain_records_usable(
         num_records=num_records,
         dp_size=dp_size,
@@ -376,6 +400,10 @@ def make_dataset_index(
         dp_size=dp_size,
         dp_index=dp_index,
     )
+    if excluded_prefix_count:
+        if excluded_prefix_count > usable_records // excluded_prefix_stride:
+            raise ValueError("excluded_prefix_count exceeds the available strided prefix")
+        epoch_samples_per_process -= excluded_prefix_count
     if not epoch_samples_per_process:
         raise ValueError(
             f"No complete pretrain batch assigned to dp_index={dp_index} "
@@ -395,6 +423,8 @@ def make_dataset_index(
             shuffle=shuffle,
             seed=seed,
             shuffle_rounds=shuffle_rounds,
+            excluded_prefix_stride=excluded_prefix_stride,
+            excluded_prefix_count=excluded_prefix_count,
         )
     )
     return dataset_index, epoch_samples_per_process

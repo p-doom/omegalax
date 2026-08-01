@@ -71,6 +71,22 @@ flags.DEFINE_integer("fsdp_size", 1, "FSDP parallelism size.")
 flags.DEFINE_integer("dp_size", 1, "Data parallelism size.")
 flags.DEFINE_integer("iterator_fsdp_size", None, "Optional FSDP shard count for data iterator.")
 flags.DEFINE_integer("iterator_dp_size", None, "Optional DP shard count for data iterator.")
+flags.DEFINE_integer(
+    "iterator_excluded_prefix_stride",
+    1,
+    "Old iterator shard count whose consumed prefix is excluded on resume.",
+)
+flags.DEFINE_integer(
+    "iterator_excluded_prefix_count",
+    0,
+    "Per-old-shard index records already consumed before a sharding migration.",
+)
+flags.DEFINE_bool(
+    "restore_input_iter",
+    True,
+    "Restore the saved iterator state; disable only for an explicit iterator migration.",
+)
+flags.DEFINE_integer("resume_expected_step", None, "Require this exact checkpoint step on resume.")
 flags.DEFINE_string("save_dir", None, "Checkpoint save directory.")
 flags.DEFINE_string("jax_cache_dir", "/tmp/jax_cache", "JAX persistent compilation cache dir.")
 flags.DEFINE_integer("save_every", 500, "Save checkpoint every N steps.")
@@ -215,7 +231,12 @@ def _make_iterator(
     )
     if mode is pretrain_trainer.PretrainMode.IID_BASELINE:
         return make_iid_iterator(index_path, **common)
-    return make_statepassing_iterator(index_path, **common)
+    return make_statepassing_iterator(
+        index_path,
+        **common,
+        excluded_prefix_stride=FLAGS.iterator_excluded_prefix_stride,
+        excluded_prefix_count=FLAGS.iterator_excluded_prefix_count,
+    )
 
 
 def _maybe_statepassing_bundle_metadata(index_path: str | Path) -> dict[str, object] | None:
@@ -293,6 +314,12 @@ def main(_) -> None:
     jax.config.update("jax_compilation_cache_dir", FLAGS.jax_cache_dir)
     jax.distributed.initialize()
     startup_log("jax.distributed initialized")
+    startup_log(
+        f"iterator process_count={jax.process_count()} dp={FLAGS.iterator_dp_size} "
+        f"fsdp={FLAGS.iterator_fsdp_size} excluded_prefix=(stride="
+        f"{FLAGS.iterator_excluded_prefix_stride}, count={FLAGS.iterator_excluded_prefix_count}) "
+        f"restore_input_iter={FLAGS.restore_input_iter}"
+    )
     startup_log(f"fixed tokenizer for metadata: {FLAGS.tokenizer!r}")
 
     if FLAGS.batch_size % jax.process_count():
@@ -533,6 +560,8 @@ def main(_) -> None:
                 gc_period=FLAGS.gc_period,
                 lr_contract_explicit_fields=lr_contract_explicit_fields,
                 init_hf_model_path=FLAGS.init_hf_model_path,
+                restore_input_iter=FLAGS.restore_input_iter,
+                resume_expected_step=FLAGS.resume_expected_step,
                 **runtime_kwargs,
             )
     finally:

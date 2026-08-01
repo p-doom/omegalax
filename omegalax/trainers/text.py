@@ -294,13 +294,19 @@ def _restore_sft_checkpoint(
     optimizer: MixedPrecisionOptimizer,
     rng: jax.Array,
     input_iter: checkpoint_utils.GrainIterator,
+    *,
+    restore_input_iter: bool = True,
 ) -> tuple[MixedPrecisionOptimizer, int, jax.Array, checkpoint_utils.GrainIterator]:
     latest_step = checkpoint_manager.latest_step()
     if latest_step is None:
         raise ValueError("No checkpoint found to restore.")
 
     abstract_state = _abstract_train_state(optimizer, rng)
-    restore_args = checkpoint_utils.make_grain_restore_args(abstract_state, input_iter)
+    restore_args = (
+        checkpoint_utils.make_grain_restore_args(abstract_state, input_iter)
+        if restore_input_iter
+        else ocp.args.Composite(train_state=ocp.args.PyTreeRestore(abstract_state))
+    )
     restored = checkpoint_manager.restore(latest_step, args=restore_args)
     train_state = restored["train_state"]
     nnx.update(optimizer, train_state["optimizer"])
@@ -308,7 +314,7 @@ def _restore_sft_checkpoint(
         optimizer,
         int(latest_step),
         train_state["rng"],
-        checkpoint_utils.restored_input_iter(restored),
+        checkpoint_utils.restored_input_iter(restored) if restore_input_iter else input_iter,
     )
 
 

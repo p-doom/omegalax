@@ -317,6 +317,8 @@ def run_tail_pretrain(
     pass_conv_state: bool = False,
     stop_after_local_step: int | None = None,
     init_hf_model_path: str | Path | None = None,
+    restore_input_iter: bool = True,
+    resume_expected_step: int | None = None,
 ) -> tuple[MixedPrecisionOptimizer, dict[str, float]]:
     pretrain_mode = PretrainMode(pretrain_mode)
     save_path = Path(save_dir).expanduser().resolve()
@@ -331,6 +333,10 @@ def run_tail_pretrain(
         resume in (checkpoint_utils.ResumeMode.IF_PRESENT, checkpoint_utils.ResumeMode.REQUIRED)
         and latest_step is not None
     )
+    if resume_expected_step is not None and latest_step != int(resume_expected_step):
+        raise ValueError(
+            f"Expected resume checkpoint {resume_expected_step}, found {latest_step} at {save_path}."
+        )
     if (init_model_checkpoint is None) == (init_hf_model_path is None):
         raise ValueError("Provide exactly one tail initialization source")
     source_checkpoint = (
@@ -445,8 +451,15 @@ def run_tail_pretrain(
 
     start_local_step = 0
     if will_resume:
+        startup_log(
+            f"restoring checkpoint step={latest_step} restore_input_iter={restore_input_iter}"
+        )
         optimizer, restored_step, rng, data_iter = _restore_sft_checkpoint(
-            checkpoint_manager, optimizer, rng, data_iter
+            checkpoint_manager,
+            optimizer,
+            rng,
+            data_iter,
+            restore_input_iter=restore_input_iter,
         )
         start_local_step = int(restored_step) - int(config.global_step_offset)
         rng = jax.device_put(rng, replicated)

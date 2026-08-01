@@ -416,6 +416,34 @@ class PretrainDataSetTest(absltest.TestCase):
             self.assertLen(dataset_index, 4)
             self.assertEqual([dataset_index[i]["record"] for i in range(4)], [1, 3, 1, 3])
 
+    def test_pretrain_index_excluded_prefix_keeps_unconsumed_records(self):
+        with test_temp_dir() as tmp:
+            index = write_json_arrayrecord_dataset(
+                ({"record": i} for i in range(12)),
+                Path(tmp) / "index",
+                records_per_shard=12,
+                overwrite=False,
+                metadata={"format": "test_index"},
+            )
+            dataset_index, total_samples_per_process = make_dataset_index(
+                index_shard_paths=sorted(index.glob("*.array_record")),
+                num_records=12,
+                num_epochs=1,
+                dp_size=1,
+                dp_index=0,
+                shuffle=False,
+                seed=0,
+                shuffle_rounds=4,
+                excluded_prefix_stride=4,
+                excluded_prefix_count=2,
+            )
+
+            self.assertEqual(total_samples_per_process, 10)
+            self.assertEqual(
+                [dataset_index[i]["record"] for i in range(10)],
+                [1, 2, 3, 5, 6, 7, 8, 9, 10, 11],
+            )
+
 
 if __name__ == "__main__":
     absltest.main()
