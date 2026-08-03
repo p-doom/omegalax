@@ -50,21 +50,41 @@ def _get_arrayrecord_image_reader(path: str) -> Any:
     return reader
 
 
-def build_chatml_text(
+# A ChatML turn is ``<|im_start|>{role}\n{content}<|im_end|>\n``. Because
+# ``<|im_start|>``/``<|im_end|>`` are registered special tokens (hard BPE split
+# points), the assistant header ``<|im_start|>assistant\n`` always tokenizes to
+# exactly three tokens and the ``<|im_end|>\n`` footer to two, independent of the
+# surrounding text. These offsets let us mask assistant content structurally.
+_ASSISTANT_ROLE = "assistant"
+_CHATML_HEADER_TOKENS = 3  # <|im_start|> , role , \n
+_CHATML_TRAILING_TOKENS = 1  # the \n after <|im_end|> (the <|im_end|> itself is supervised)
+
+
+def build_chatml_blocks(
     messages: list[dict[str, Any]],
     image_grids: list[tuple[int, int, int]],
     merge_size: int,
-) -> str:
-    """Build a ChatML string from messages, inserting image pad tokens."""
+) -> list[tuple[str, str]]:
+    """Return one ``(role, block_text)`` per message.
 
-    parts: list[str] = []
+    Each block is a complete ChatML turn ``<|im_start|>{role}\n{content}<|im_end|>\n``.
+    Concatenating the block texts reproduces :func:`build_chatml_text` exactly, and
+    because ``<|im_start|>``/``<|im_end|>`` are registered special tokens (hard BPE
+    split points) each block also tokenizes independently: the concatenation of the
+    per-block token ids equals ``tokenizer.encode(build_chatml_text(...))``. Callers
+    use this to build the assistant loss mask from message *structure* rather than by
+    scanning the final token stream for ChatML specials -- the latter is corrupted
+    when user/context text contains literal ``<|im_start|>`` / ``<|im_end|>`` markers.
+    """
+
+    blocks: list[tuple[str, str]] = []
     img_idx = 0
 
     for msg in messages:
         role = msg["role"]
         content = msg["content"]
 
-        parts.append(f"<|im_start|>{role}\n")
+        parts: list[str] = [f"<|im_start|>{role}\n"]
 
         if isinstance(content, str):
             parts.append(content)
@@ -79,8 +99,44 @@ def build_chatml_text(
                     parts.append("<|vision_start|>" + "<|image_pad|>" * n_tokens + "<|vision_end|>")
 
         parts.append("<|im_end|>\n")
+        blocks.append((role, "".join(parts)))
 
-    return "".join(parts)
+    return blocks
+
+
+def build_chatml_text(
+    messages: list[dict[str, Any]],
+    image_grids: list[tuple[int, int, int]],
+    merge_size: int,
+) -> str:
+    """Build a ChatML string from messages, inserting image pad tokens."""
+
+    return "".join(
+        block_text for _, block_text in build_chatml_blocks(messages, image_grids, merge_size)
+    )
+
+
+def _assistant_block_loss_mask(block_ids: np.ndarray, is_assistant: bool) -> np.ndarray:
+    """Loss mask for a single ChatML block: 1 on supervised tokens, 0 elsewhere.
+
+    A block is ``<|im_start|>{role}\n{content}<|im_end|>\n``. Non-assistant turns are
+    never supervised. For assistant turns everything between the 3-token header
+    (``<|im_start|>``, ``assistant``, ``\n``) and the trailing ``\n`` is supervised --
+    i.e. the content plus the terminating ``<|im_end|>`` so the model learns to stop.
+
+    Because the mask is scoped to one block built from message structure, literal
+    ``<|im_start|>`` / ``<|im_end|>`` markers appearing inside ``content`` cannot flip
+    neighbouring (user/system) turns -- or image pad tokens -- to supervised.
+    """
+
+    mask = np.zeros(len(block_ids), dtype=np.int32)
+    if not is_assistant:
+        return mask
+    start = _CHATML_HEADER_TOKENS
+    end = len(block_ids) - _CHATML_TRAILING_TOKENS  # exclude trailing \n, keep <|im_end|>
+    if end > start:
+        mask[start:end] = 1
+    return mask
 
 
 def _is_arrayrecord_image_uri(value: object) -> bool:
@@ -232,7 +288,13 @@ def encode_qwen_messages(
     image_processor: BaseImageProcessor | None = None,
     include_pixels: bool = False,
 ) -> dict[str, np.ndarray]:
-    """Encode a Qwen chat example exactly as the collators expect."""
+    """Encode a Qwen chat example exactly as the collators expect.
+
+    Returns ``input_ids`` and a matching assistant ``loss_mask`` (both 1-D int32),
+    plus ``image_grid_thw`` / ``pixel_values`` when an image processor is given. The
+    loss mask is built from message structure per ChatML turn, so it is unaffected by
+    literal ``<|im_start|>`` / ``<|im_end|>`` markers embedded in user/context text.
+    """
 
     image_grids: list[tuple[int, int, int]] = []
     result: dict[str, np.ndarray] = {}
@@ -246,9 +308,23 @@ def encode_qwen_messages(
             image_grids = [tuple(row) for row in result["image_grid_thw"].tolist()]
 
     merge_size = int(getattr(image_processor, "merge_size", 1))
-    text = build_chatml_text(messages, image_grids, merge_size)
-    result["input_ids"] = np.asarray(
-        tokenizer.encode(text, add_special_tokens=False),
-        dtype=np.int32,
-    )
+    blocks = build_chatml_blocks(messages, image_grids, merge_size)
+
+    # Encode each ChatML turn independently and build its loss mask from message
+    # structure. The additive property of the ChatML specials (see
+    # ``build_chatml_blocks``) guarantees the concatenated ids are identical to a
+    # single ``tokenizer.encode`` of the whole conversation, while masking per block
+    # is immune to literal ``<|im_start|>`` / ``<|im_end|>`` markers in user text.
+    id_parts: list[np.ndarray] = []
+    mask_parts: list[np.ndarray] = []
+    for role, block_text in blocks:
+        block_ids = np.asarray(
+            tokenizer.encode(block_text, add_special_tokens=False),
+            dtype=np.int32,
+        )
+        id_parts.append(block_ids)
+        mask_parts.append(_assistant_block_loss_mask(block_ids, role == _ASSISTANT_ROLE))
+
+    result["input_ids"] = np.concatenate(id_parts) if id_parts else np.zeros(0, dtype=np.int32)
+    result["loss_mask"] = np.concatenate(mask_parts) if mask_parts else np.zeros(0, dtype=np.int32)
     return result
