@@ -38,6 +38,7 @@ from typing import Sequence
 from flax import nnx
 import jax
 import jax.numpy as jnp
+from jax.sharding import PartitionSpec as P, reshard
 
 
 # Standard LoRA target-module names for transformer-block projections.
@@ -79,15 +80,12 @@ class LoRALinear(nnx.Module):
     are frozen at the gradient layer while still being checkpointed as
     part of the model state.
 
-    A and B share the base linear's logical sharding axes:
-        A: (in_features, r) sharded on the input axis only (mid-dim ``r``
-           is replicated; it's tiny).
-        B: (r, out_features) sharded on the output axis only.
-
-    This composes naturally with FSDP/TP: the ``x @ A`` matmul reduces
-    along the sharded input axis (same all-reduce pattern as base's
-    forward), then the result @ B fans back out along the output axis.
-    No new collective shapes.
+    ``lora_A`` / ``lora_B`` are stored replicated (they are tiny: ~r·d
+    each); sharding is applied in the forward instead. ``__call__``
+    reshards ``lora_B`` so the delta is *born* with the base projection's
+    output sharding — mirroring how the base weight is tp-sharded — which
+    keeps the delta activation tp-sharded under TP with no extra
+    collective. At tp=1 it is a no-op.
     """
 
     def __init__(
@@ -148,10 +146,14 @@ class LoRALinear(nnx.Module):
         base_out = self.base(inputs, out_sharding=out_sharding)
         a = self.lora_A[...]
         b = self.lora_B[...]
+        if out_sharding is not None:
+            # reshard lora_B (not the delta) so the delta is born tp-sharded; no-op at tp=1.
+            b = reshard(b, P(None, out_sharding[-1]))
         # (..., d_in) @ (d_in, r) -> (..., r) -> @ (r, d_out) -> (..., d_out)
         delta = jnp.matmul(jnp.matmul(inputs, a), b) * self.scaling
         delta = delta.astype(base_out.dtype)
         if out_sharding is not None:
+            # No-op given the born-sharded delta; kept as a defensive assertion.
             delta = jax.lax.with_sharding_constraint(delta, out_sharding)
         return base_out + delta
 
