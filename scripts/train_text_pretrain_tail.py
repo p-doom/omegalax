@@ -13,6 +13,7 @@ import wandb
 from omegalax.data.pretrain_iid_pipeline import make_iid_iterator
 from omegalax.data.pretrain_statepassing import (
     STATEPASSING_FIXED_C_INDEX_FORMAT,
+    STATEPASSING_WINDOW_INDEX_FORMAT,
     make_statepassing_iterator,
 )
 from omegalax.training_contract import build_training_contract, ensure_training_contract
@@ -27,7 +28,12 @@ FLAGS = flags.FLAGS
 flags.DEFINE_enum(
     "pretrain_mode", PretrainMode.IID_BASELINE.value, [m.value for m in PretrainMode], "Tail mode."
 )
-flags.DEFINE_string("train_index_path", None, "Fixed-C tail bundle root.", required=True)
+flags.DEFINE_string(
+    "train_index_path",
+    None,
+    "Fixed-C tail bundle root or direct Statepassing C=4 window index.",
+    required=True,
+)
 flags.DEFINE_string("init_model_checkpoint", None, "Model-only source checkpoint.")
 flags.DEFINE_string(
     "init_hf_model_path", None, "Local HuggingFace model used for fresh initialization."
@@ -130,42 +136,57 @@ flags.DEFINE_integer(
 )
 
 
-def _load_bundle() -> tuple[dict[str, object], Path]:
+def _load_bundle() -> tuple[dict[str, object], Path, bool]:
     root = Path(FLAGS.train_index_path).expanduser().resolve()
     metadata_path = root / "metadata.json"
     if not metadata_path.is_file():
         raise ValueError(f"Tail bundle has no metadata.json: {root}")
     metadata = json.loads(metadata_path.read_text())
-    if metadata.get("format") != STATEPASSING_FIXED_C_INDEX_FORMAT:
-        raise ValueError(f"Expected a fixed-C bundle, got {metadata.get('format')!r}")
-    if int(metadata["num_segments"]) != 4:
-        raise ValueError(f"Tail bundle must use num_segments=4, got {metadata['num_segments']}")
-    index_segments_per_update = int(metadata["trim_batch_size"]) * int(
-        metadata["trim_grad_accum_steps"]
-    )
-    runtime_segments_per_update = int(FLAGS.batch_size) * int(FLAGS.grad_accum_steps)
-    if runtime_segments_per_update != index_segments_per_update:
+    index_format = metadata.get("format")
+    if index_format not in (STATEPASSING_FIXED_C_INDEX_FORMAT, STATEPASSING_WINDOW_INDEX_FORMAT):
         raise ValueError(
-            "Tail bundle segments per optimizer update does not match runtime configuration"
+            f"Expected a fixed-C bundle or Statepassing window index, got {index_format!r}"
         )
+    if int(metadata["num_segments"]) != 4:
+        raise ValueError(f"Tail index must use num_segments=4, got {metadata['num_segments']}")
+    is_fixed_c_bundle = index_format == STATEPASSING_FIXED_C_INDEX_FORMAT
+    if is_fixed_c_bundle:
+        index_segments_per_update = int(metadata["trim_batch_size"]) * int(
+            metadata["trim_grad_accum_steps"]
+        )
+        runtime_segments_per_update = int(FLAGS.batch_size) * int(FLAGS.grad_accum_steps)
+        if runtime_segments_per_update != index_segments_per_update:
+            raise ValueError(
+                "Tail bundle segments per optimizer update does not match runtime configuration"
+            )
     if int(metadata["chunk_length"]) != int(FLAGS.seq_len):
         raise ValueError("Tail bundle chunk_length does not match --seq_len")
     if metadata.get("eos_id") != FLAGS.eos_id:
         raise ValueError("Tail bundle eos_id does not match --eos_id")
-    return metadata, root
+    return metadata, root, is_fixed_c_bundle
 
 
-def _make_tail_iterator(metadata: dict[str, object], root: Path, mode: PretrainMode):
+def _make_tail_iterator(
+    metadata: dict[str, object], root: Path, mode: PretrainMode, *, is_fixed_c_bundle: bool
+):
     if FLAGS.batch_size % jax.process_count():
         raise ValueError("Global batch size must be divisible by jax.process_count()")
     per_process_batch = FLAGS.batch_size // jax.process_count()
-    train_split = dict(dict(metadata["splits"])["train"])
-    if mode is PretrainMode.IID_BASELINE:
-        path = root / str(dict(train_split["iid"])["path"])
-        make_iterator = make_iid_iterator
+    if is_fixed_c_bundle:
+        train_split = dict(dict(metadata["splits"])["train"])
+        if mode is PretrainMode.IID_BASELINE:
+            path = root / str(dict(train_split["iid"])["path"])
+            make_iterator = make_iid_iterator
+        else:
+            path = root / str(train_split["path"])
+            make_iterator = make_statepassing_iterator
+        num_epochs = 1
     else:
-        path = root / str(train_split["path"])
+        if mode is PretrainMode.IID_BASELINE:
+            raise ValueError("A direct Statepassing window index does not provide an IID split")
+        path = root
         make_iterator = make_statepassing_iterator
+        num_epochs = None
     iterator_kwargs = dict(
         batch_size=per_process_batch,
         chunk_length=FLAGS.seq_len,
@@ -173,7 +194,7 @@ def _make_tail_iterator(metadata: dict[str, object], root: Path, mode: PretrainM
         eos_id=FLAGS.eos_id,
         shuffle=True,
         seed=FLAGS.seed,
-        num_epochs=1,
+        num_epochs=num_epochs,
         dp_size=FLAGS.iterator_dp_size,
         fsdp_size=FLAGS.iterator_fsdp_size,
         process_index=jax.process_index(),
@@ -247,13 +268,21 @@ def main(_) -> None:
         f"{FLAGS.iterator_excluded_prefix_stride}, count={FLAGS.iterator_excluded_prefix_count}) "
         f"restore_input_iter={FLAGS.restore_input_iter}"
     )
-    metadata, root = _load_bundle()
-    split = dict(dict(metadata["splits"])["train"])
-    available_steps = int(
-        dict(split["iid"])["iid_steps"]
-        if mode is PretrainMode.IID_BASELINE
-        else split["statepassing_steps"]
-    )
+    metadata, root, is_fixed_c_bundle = _load_bundle()
+    if is_fixed_c_bundle:
+        split = dict(dict(metadata["splits"])["train"])
+        available_steps = int(
+            dict(split["iid"])["iid_steps"]
+            if mode is PretrainMode.IID_BASELINE
+            else split["statepassing_steps"]
+        )
+    else:
+        segments_per_step = int(FLAGS.batch_size) * int(FLAGS.grad_accum_steps)
+        if segments_per_step % int(metadata["num_segments"]):
+            raise ValueError("batch_size * grad_accum_steps must be divisible by num_segments")
+        available_steps = int(metadata["num_windows"]) // (
+            segments_per_step // int(metadata["num_segments"])
+        )
     tokens_per_step = FLAGS.batch_size * FLAGS.seq_len * FLAGS.grad_accum_steps
     num_steps = (
         available_steps if FLAGS.max_tokens is None else int(FLAGS.max_tokens // tokens_per_step)
@@ -285,7 +314,7 @@ def main(_) -> None:
         lr_end_factor=FLAGS.lr_end_factor,
         lr_stable_fraction=FLAGS.lr_stable_fraction,
     )
-    data_iter = _make_tail_iterator(metadata, root, mode)
+    data_iter = _make_tail_iterator(metadata, root, mode, is_fixed_c_bundle=is_fixed_c_bundle)
     save_dir = Path(FLAGS.save_dir).expanduser().resolve()
     if mode.is_statepassing:
         contract = build_training_contract(

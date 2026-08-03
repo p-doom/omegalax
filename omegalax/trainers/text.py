@@ -213,6 +213,7 @@ def build_optimizer(model: nnx.Module, train_cfg: TrainConfig) -> MixedPrecision
 
 
 _NUM_LOSS_TILES = 4
+_CHECKPOINT_CONCURRENT_GB = 2
 
 
 def _train_state(optimizer: MixedPrecisionOptimizer, rng: jax.Array) -> dict[str, object]:
@@ -242,10 +243,16 @@ def _make_checkpoint_manager(
     if jax.process_count() > 1:
         active_processes = set(range(jax.process_count()))
     handler_registry = ocp.handlers.DefaultCheckpointHandlerRegistry()
-    handler_registry.add("train_state", ocp.args.PyTreeSave, ocp.handlers.PyTreeCheckpointHandler)
-    handler_registry.add(
-        "train_state", ocp.args.PyTreeRestore, ocp.handlers.PyTreeCheckpointHandler
+    train_state_handler = ocp.handlers.PyTreeCheckpointHandler(
+        save_concurrent_gb=_CHECKPOINT_CONCURRENT_GB,
+        restore_concurrent_gb=_CHECKPOINT_CONCURRENT_GB,
+        save_device_host_concurrent_gb=_CHECKPOINT_CONCURRENT_GB,
+        use_ocdbt=False,
+        enable_pinned_host_transfer=True,
+        is_prioritized_key_fn=lambda _: False,
     )
+    handler_registry.add("train_state", ocp.args.PyTreeSave, train_state_handler)
+    handler_registry.add("train_state", ocp.args.PyTreeRestore, train_state_handler)
     checkpoint_utils.register_grain_iterator_handler(handler_registry)
     checkpoint_utils.register_lr_contract_handler(handler_registry)
     options = ocp.CheckpointManagerOptions(
@@ -254,6 +261,7 @@ def _make_checkpoint_manager(
         step_format_fixed_length=6,
         create=False,
         cleanup_tmp_directories=True,
+        enable_async_checkpointing=False,
         multiprocessing_options=ocp.options.MultiprocessingOptions(
             active_processes=active_processes, barrier_sync_key_prefix="omegalax_checkpoint_manager"
         ),
@@ -287,6 +295,7 @@ def _save_sft_checkpoint(
         train_state, input_iter, lr_contract=lr_contract
     )
     checkpoint_manager.save(step, args=save_args, force=force)
+    checkpoint_manager.wait_until_finished()
 
 
 def _restore_sft_checkpoint(

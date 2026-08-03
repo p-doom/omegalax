@@ -723,6 +723,7 @@ def _save_curriculum_checkpoint(
         train_state, input_iter, lr_contract=lr_contract
     )
     checkpoint_manager.save(global_step, args=save_args, force=force)
+    checkpoint_manager.wait_until_finished()
 
 
 def _restore_curriculum_train_state_only(
@@ -947,7 +948,7 @@ def run_pretrain(
         pass_conv_state=pass_conv_state,
     )
 
-    if checkpoint_manager is not None and not will_resume:
+    if checkpoint_manager is not None and not will_resume and is_primary_process:
         _write_checkpoint_config(save_path, model_cfg)
 
     start_step = 0
