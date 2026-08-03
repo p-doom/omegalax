@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Collection, Mapping, Sequence
+import contextlib
 import dataclasses
 import datetime
 import enum
@@ -27,6 +28,7 @@ from omegalax.data.pretrain_data_set import pop_pretrain_metadata
 from omegalax.distributed.mesh import ensure_mesh, mesh_rules, required_batch_multiple
 from omegalax.text import api as text_api
 from omegalax.trainers import checkpoint_utils
+from omegalax.trainers import tokamax_cache as tokamax_cache_lib
 from omegalax.trainers.loss import (
     chunked_cross_entropy_multi_stats,
     chunked_cross_entropy_stats,
@@ -843,6 +845,7 @@ def run_pretrain(
     init_hf_model_path: str | Path | None = None,
     restore_input_iter: bool = True,
     resume_expected_step: int | None = None,
+    tokamax_cache_dir: str | Path | None = None,
 ) -> tuple[MixedPrecisionOptimizer, dict[str, float]]:
     pretrain_mode = PretrainMode(pretrain_mode)
     save_path = Path(save_dir).expanduser().resolve() if save_dir is not None else None
@@ -990,6 +993,28 @@ def run_pretrain(
 
     requeue_requested = _install_requeue_signal_handler()
 
+    autotune_result = None
+    pending_batch = None
+    if tokamax_cache_dir is not None:
+        autotune_result = tokamax_cache_lib.try_load(tokamax_cache_dir)
+        if autotune_result is None:
+            startup_log("priming tokamax autotuning with first training batch")
+            raw_batch = next(data_iter)
+            pending_batch, _, _ = prepare_pretrain_batch(
+                raw_batch,
+                pretrain_mode,
+                model_cfg,
+                mesh,
+                global_batch_size=train_cfg.batch_size,
+                pass_rope_positions=pass_rope_positions,
+            )
+            autotune_result = tokamax_cache_lib.autotune_and_save(
+                tokamax_cache_dir, train_step, optimizer, pending_batch
+            )
+
+    _autotune_ctx = autotune_result if autotune_result is not None else contextlib.nullcontext()
+    _autotune_ctx.__enter__()
+
     startup_log(f"entering pretrain loop mode={pretrain_mode}")
     for step_idx in range(start_step, train_cfg.num_steps):
         step = step_idx + 1
@@ -1001,16 +1026,20 @@ def run_pretrain(
 
         for _micro in range(accum_steps):
             wait_start = time.perf_counter()
-            raw_batch = next(data_iter)
+            if pending_batch is None:
+                raw_batch = next(data_iter)
+                batch, _, _ = prepare_pretrain_batch(
+                    raw_batch,
+                    pretrain_mode,
+                    model_cfg,
+                    mesh,
+                    global_batch_size=train_cfg.batch_size,
+                    pass_rope_positions=pass_rope_positions,
+                )
+            else:
+                batch = pending_batch
+                pending_batch = None
             accum_data_wait_s += time.perf_counter() - wait_start
-            batch, _, _ = prepare_pretrain_batch(
-                raw_batch,
-                pretrain_mode,
-                model_cfg,
-                mesh,
-                global_batch_size=train_cfg.batch_size,
-                pass_rope_positions=pass_rope_positions,
-            )
             micro_flops = per_device_flops_per_step(
                 model_cfg,
                 train_cfg.seq_len,
@@ -1091,6 +1120,7 @@ def run_pretrain(
                 checkpoint_manager.wait_until_finished()
                 checkpoint_manager.close()
             _request_slurm_requeue_if_primary(is_primary_process)
+            _autotune_ctx.__exit__(None, None, None)
             return optimizer, last_metrics
 
     _log_prev_metrics(force=True)
@@ -1109,6 +1139,7 @@ def run_pretrain(
         checkpoint_manager.wait_until_finished()
         checkpoint_manager.close()
 
+    _autotune_ctx.__exit__(None, None, None)
     return optimizer, last_metrics
 
 

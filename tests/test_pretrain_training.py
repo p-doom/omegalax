@@ -1228,6 +1228,72 @@ class PretrainTrainingSmokeTest(absltest.TestCase):
 
         self.assertAlmostEqual(metrics["lr"], float(schedule(1)))
 
+    def test_tokamax_cache_miss_reuses_priming_batch_for_first_update(self):
+        cfg = _tiny_qwen3_5_config()
+        train_cfg = pretrain_trainer.TrainConfig(
+            seed=0,
+            batch_size=1,
+            seq_len=8,
+            num_steps=1,
+            learning_rate=1e-3,
+            weight_decay=0.0,
+            print_every=0,
+        )
+        data_iter = iter(
+            [
+                {
+                    "token_ids_BT": np.asarray([[1, 2, 3, 4, 5, 6, 7, 8]], dtype=np.int32),
+                    "attention_mask_BT": np.ones((1, 8), dtype=np.int32),
+                    "loss_mask_BT": np.ones((1, 8), dtype=np.int32),
+                    "chunk_idx_B": np.asarray([0], dtype=np.int32),
+                    "metadata": {"doc_ids": ["first"]},
+                }
+            ]
+        )
+        real_make_train_step = pretrain_trainer.make_pretrain_train_step
+        trained_batches = []
+
+        def make_spy_train_step(*args, **kwargs):
+            real_train_step = real_make_train_step(*args, **kwargs)
+
+            def spy_train_step(optimizer, batch):
+                trained_batches.append(batch)
+                return real_train_step(optimizer, batch)
+
+            return spy_train_step
+
+        autotune_result = mock.MagicMock()
+        with (
+            mock.patch.object(
+                pretrain_trainer,
+                "make_pretrain_train_step",
+                side_effect=make_spy_train_step,
+            ),
+            mock.patch.object(pretrain_trainer.tokamax_cache_lib, "try_load", return_value=None),
+            mock.patch.object(
+                pretrain_trainer.tokamax_cache_lib,
+                "autotune_and_save",
+                return_value=autotune_result,
+            ) as autotune_and_save,
+        ):
+            pretrain_trainer.run_pretrain(
+                cfg,
+                train_cfg,
+                data_iter,
+                pretrain_mode=pretrain_trainer.PretrainMode.IID_BASELINE,
+                log_every=0,
+                tp_size=1,
+                fsdp_size=1,
+                dp_size=1,
+                tokamax_cache_dir="/tmp/tokamax-test-cache",
+            )
+
+        tuned_batch = autotune_and_save.call_args.args[-1]
+        self.assertLen(trained_batches, 1)
+        self.assertIs(tuned_batch, trained_batches[0])
+        autotune_result.__enter__.assert_called_once_with()
+        autotune_result.__exit__.assert_called_once_with(None, None, None)
+
     def test_signal_checkpoint_resume_matches_uninterrupted_statepassing(self):
         cfg = _tiny_qwen3_5_config()
         train_cfg = pretrain_trainer.TrainConfig(

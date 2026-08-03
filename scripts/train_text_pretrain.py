@@ -89,6 +89,11 @@ flags.DEFINE_bool(
 flags.DEFINE_integer("resume_expected_step", None, "Require this exact checkpoint step on resume.")
 flags.DEFINE_string("save_dir", None, "Checkpoint save directory.")
 flags.DEFINE_string("jax_cache_dir", "/tmp/jax_cache", "JAX persistent compilation cache dir.")
+flags.DEFINE_string(
+    "tokamax_cache_dir",
+    None,
+    "Directory for the persistent tokamax autotuning cache.",
+)
 flags.DEFINE_integer("save_every", 500, "Save checkpoint every N steps.")
 flags.DEFINE_integer("keep_latest", 10, "Retain the latest N checkpoints.")
 flags.DEFINE_integer("log_every", 10, "Log metrics every N steps.")
@@ -562,6 +567,7 @@ def main(_) -> None:
                 init_hf_model_path=FLAGS.init_hf_model_path,
                 restore_input_iter=FLAGS.restore_input_iter,
                 resume_expected_step=FLAGS.resume_expected_step,
+                tokamax_cache_dir=FLAGS.tokamax_cache_dir,
                 **runtime_kwargs,
             )
     finally:
