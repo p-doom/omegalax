@@ -113,6 +113,27 @@ uv run scripts/train_vlm_sft.py \
 ```
 Resume from the latest checkpoint with `--resume`. Training checkpoints also persist the Grain iterator state.
 
+### Continuing weights on a new dataset (`--init_from` + `--reset_optimizer`)
+`--resume` continues *one* optimization — weights, optimizer state, step counter and the
+Grain iterator position — so it is only correct while the dataset stays the same. To keep
+the trained weights (or LoRA adapter) but start a **new** optimization on **different**
+data, name the source checkpoint step and reset the optimizer:
+```bash
+uv run scripts/train_vlm_sft.py \
+  --init_from /runs/previous/orbax/000900 \  # one step directory, not the run root
+  --reset_optimizer \
+  --resume=never \
+  --save_dir /runs/continued/orbax \         # must be fresh and hold no checkpoints
+  --data_path /path/to/new_chunks \
+  ...
+```
+Before the first step the trainer restores that checkpoint over its own mesh, then zeroes
+`opt_state` and `step` (so Adam moments, the gradient-accumulation buffers and every optax
+counter restart cold and the LR schedule re-runs warmup), re-derives the RNG from `--seed`
+and starts a fresh Grain iterator. `--save_dir` gets an `optimizer_reset_receipt.json`
+recording the source step and how much state was zeroed. A Slurm requeue into a `--save_dir`
+that now holds checkpoints is a hard error: use `--resume` to continue that run instead.
+
 Export any supported model (Qwen3 dense/MoE, Qwen3.5, Qwen3-VL) to HuggingFace safetensors:
 ```bash
 uv run scripts/export_to_hf.py --model-id qwen3-smoke --out-dir /tmp/qwen3-smoke-export --tp-size 1 --fsdp-size 1
