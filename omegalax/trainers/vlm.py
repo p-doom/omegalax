@@ -9,7 +9,9 @@ import gc
 import os
 import signal
 import subprocess
+import weakref
 from pathlib import Path
+from typing import Any, NamedTuple
 from flax import nnx
 import jax
 import jax.numpy as jnp
@@ -124,14 +126,40 @@ def _train_state(optimizer: MixedPrecisionOptimizer, rng: jax.Array) -> dict[str
     return {"optimizer": nnx.state(optimizer), "rng": rng}
 
 
-def _abstract_train_state(optimizer: MixedPrecisionOptimizer, rng: jax.Array) -> dict[str, object]:
-    return {
+class _RestoreSpec(NamedTuple):
+    graphdef: Any
+    item: dict[str, object]
+    restore_args: dict[str, object]
+    fresh_arrays: tuple[weakref.ReferenceType, ...]
+
+
+def _restore_spec(optimizer: MixedPrecisionOptimizer, rng: jax.Array) -> _RestoreSpec:
+    """Array-free material to restore into, plus weakrefs to the arrays the caller drops.
+
+    Orbax honours the trainer's shardings only when they arrive as explicit
+    ``ArrayRestoreArgs``; a bare ``ShapeDtypeStruct`` tree is ignored in favour of the
+    checkpoint's own ``_sharding`` file. Leaving ``dtype`` unset there keeps each
+    checkpointed dtype, so trained fp32 moments are not rounded into a fresh bf16 leaf.
+    """
+    graphdef, state = nnx.split(optimizer)
+    jax.block_until_ready(state)
+    item = {
         "optimizer": jax.tree.map(
             lambda value: jax.ShapeDtypeStruct(value.shape, value.dtype, sharding=value.sharding),
-            nnx.state(optimizer),
+            state,
         ),
         "rng": jax.ShapeDtypeStruct(rng.shape, rng.dtype, sharding=rng.sharding),
     }
+    return _RestoreSpec(
+        graphdef,
+        item,
+        jax.tree.map(
+            lambda value: ocp.ArrayRestoreArgs(sharding=value.sharding),
+            item,
+            is_leaf=lambda value: isinstance(value, jax.ShapeDtypeStruct),
+        ),
+        tuple(weakref.ref(value) for value in jax.tree.leaves(state)),
+    )
 
 
 def _make_checkpoint_manager(
@@ -204,33 +232,22 @@ def _save_sft_checkpoint(
 
 def _restore_sft_checkpoint(
     checkpoint_manager: ocp.CheckpointManager,
-    optimizer: MixedPrecisionOptimizer,
-    rng: jax.Array,
+    spec: _RestoreSpec,
     input_iter: checkpoint_utils.GrainIterator,
 ) -> tuple[MixedPrecisionOptimizer, int, jax.Array, checkpoint_utils.GrainIterator]:
     latest_step = checkpoint_manager.latest_step()
     if latest_step is None:
         raise ValueError("No checkpoint found to restore.")
 
-    abstract_state = _abstract_train_state(optimizer, rng)
-    restore_args = checkpoint_utils.make_grain_restore_args(abstract_state, input_iter)
-    restored = checkpoint_manager.restore(latest_step, args=restore_args)
-    train_state = restored["train_state"]
-    # Canonicalize restored opt-state dtypes against the freshly-built
-    # optimizer's expectations: some prior checkpoints stored Adam's first
-    # moment in bf16; the optimizer now uses optax's default (fp32), so
-    # MultiSteps (grad_accum) would otherwise see a dtype mismatch between
-    # the passthrough branch (restored dtype) and the active-step branch
-    # (optax's expected dtype) and lax.cond would reject it at trace time.
-    expected_state = nnx.state(optimizer)
-    restored_state = jax.tree.map(
-        lambda exp, got: got.astype(exp.dtype) if exp.dtype != got.dtype else got,
-        expected_state,
-        train_state["optimizer"],
+    restored = checkpoint_manager.restore(
+        latest_step,
+        args=checkpoint_utils.make_grain_restore_args(
+            spec.item, input_iter, restore_args=spec.restore_args
+        ),
     )
-    nnx.update(optimizer, restored_state)
+    train_state = restored["train_state"]
     return (
-        optimizer,
+        nnx.merge(spec.graphdef, train_state["optimizer"]),
         int(latest_step),
         train_state["rng"],
         checkpoint_utils.restored_input_iter(restored),
@@ -534,6 +551,21 @@ def run_sft(
         )
         log_device_memory("after optimizer build", save_dir=save_path)
 
+    if will_resume:
+        # Orbax allocates the restored tree alongside the freshly initialized one unless
+        # every concrete reference is dropped first — ``optimizer`` and the ``model``
+        # alias it holds — which otherwise doubles peak HBM.
+        spec = _restore_spec(optimizer, rng)
+        del optimizer, model
+        gc.collect()
+        live = sum(reference() is not None for reference in spec.fresh_arrays)
+        if live:
+            raise RuntimeError(
+                f"{live}/{len(spec.fresh_arrays)} freshly initialized arrays are still "
+                "referenced; the restore would peak at fresh + restored size"
+            )
+        startup_log(f"released {len(spec.fresh_arrays)} freshly initialized arrays")
+
     sft_step = make_sft_train_step(
         model_cfg,
         pad_id=pad_id,
@@ -565,7 +597,7 @@ def run_sft(
     start_step = 0
     if will_resume:
         optimizer, start_step, rng, data_iter = _restore_sft_checkpoint(
-            checkpoint_manager, optimizer, rng, data_iter
+            checkpoint_manager, spec, data_iter
         )
         rng = jax.device_put(rng, replicated_rng_sharding)
         startup_log(f"restored checkpoint at step {start_step}")
