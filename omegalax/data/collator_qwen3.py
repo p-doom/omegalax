@@ -3,6 +3,43 @@
 Tokenize chat conversations and produce loss masks. Both collators output
 numpy dicts ready for ``shard_batch_dict``. Model-specific to Qwen3-VL and
 Qwen3.5 (ChatML delimiters, assistant-based loss, Qwen image processor).
+
+Serialization and loss masking are DELEGATED to the ``renderers`` library
+(``renderers.build_training_sample`` + ``Qwen3VLRenderer``); this module owns
+only the JAX-side batching (padding to static shapes, vision-array packing,
+``position_ids_ZBT`` precompute). Three things went away when renderers was
+adopted:
+
+* ``qwen3_encoding.build_chatml_text`` — renderers emits the ChatML stream and
+  the ``<|vision_start|>`` + N x ``<|image_pad|>`` + ``<|vision_end|>``
+  expansion, matching ``Qwen3VLProcessor.apply_chat_template`` byte-for-byte
+  (asserted: ``test_sft_collators.TemplateParityTest``).
+
+Renderer config is chosen per model family and never auto-resolved. The VLM
+collator pins ``Qwen3VLRendererConfig``; the TEXT collator must NOT use it,
+because the VL renderer omits the ``<think>\\n\\n</think>\\n\\n`` block that the
+Qwen3 / Qwen3.5 template emits on the final assistant turn — that shrinks the
+supervised span (4 vs 8 mask tokens on a two-assistant-turn conversation) and is
+train/serve skew against vLLM / prime-rl, which render the model's own template.
+``TextSFTCollator`` therefore resolves via ``resolve_text_renderer_config`` and
+self-checks the pick with ``assert_text_template_parity`` at construction.
+* ``qwen3_encoding.encode_qwen_messages`` — ``renderer.render`` does the single
+  BPE-boundary-correct encode; per-image processor output arrives via
+  ``multi_modal_data.mm_items["image"][i]``.
+* ``_build_assistant_loss_mask`` — the renderer's own ``sampled_mask`` is the
+  mask. NO ``role_to_mask`` is passed: the renderers default supervises the
+  whole assistant body plus ``<|im_end|>`` on EVERY assistant turn (including
+  historical ones), excluding the 3-token ``<|im_start|>assistant\\n`` header
+  and the trailing ``\\n`` — exactly the old cumsum mask's contract, per-token
+  instead of reconstructed from token ids.
+
+``mm_token_type_ids`` (0=text / 1=image / 2=video) is kept from
+``RenderedTrainingSample``: the vision encoder needs it to slice image tokens
+out of the packed stream.
+
+Video is not supported: the Qwen3-VL renderer raises ``NotImplementedError`` on
+``{"type": "video"}`` parts. We feed frames as individual image parts, so this
+never fires on our data.
 """
 
 from __future__ import annotations
@@ -12,48 +49,236 @@ from typing import Any
 
 import ml_dtypes
 import numpy as np
+from renderers import (
+    Qwen35RendererConfig,
+    Qwen3RendererConfig,
+    Qwen3VLRenderer,
+    Qwen3VLRendererConfig,
+    build_training_sample,
+    create_renderer,
+)
 from transformers import BaseImageProcessor, PreTrainedTokenizer
 
-from omegalax.data.qwen3_encoding import (
-    encode_qwen_messages as _encode_qwen_messages,
-)
+from omegalax.data.arrayrecord_images import resolve_message_images
+
+#: Probe conversation for the text-renderer template-parity self-check. Two
+#: assistant turns on purpose: Qwen3's template appends the empty
+#: ``<think>\n\n</think>\n\n`` block to the FINAL assistant turn only, so a
+#: single-turn probe cannot tell a correct renderer from one that drops it.
+_TEXT_TEMPLATE_PROBE = [
+    {"role": "system", "content": "s"},
+    {"role": "user", "content": "a"},
+    {"role": "assistant", "content": "b"},
+    {"role": "user", "content": "c"},
+    {"role": "assistant", "content": "d"},
+]
 
 
-def _build_assistant_loss_mask(
-    input_ids: np.ndarray,
-    im_start_id: int,
-    im_end_id: int,
-    assistant_token_id: int,
-) -> np.ndarray:
-    """Mask with 1 on assistant-content tokens, 0 elsewhere.
+def resolve_text_renderer_config(
+    tokenizer: PreTrainedTokenizer,
+    model_id: str | None = None,
+) -> Qwen3RendererConfig | Qwen35RendererConfig:
+    """Pick the renderer config for a TEXT Qwen model.
 
-    ChatML ``<|im_start|>``/``<|im_end|>`` pair 1:1 in sequence order.
-    We find which pairs are assistant turns, then fill the content spans
-    via cumsum — no Python loops.
+    NOT ``Qwen3VLRendererConfig``: the VL renderer omits the
+    ``<think>\\n\\n</think>\\n\\n`` block that the Qwen3 / Qwen3.5 chat template
+    emits on the final assistant turn, which both shortens the rendered stream and
+    shrinks the supervised span (measured: 4 vs 8 mask tokens on a two-assistant-turn
+    conversation). Training with it while vLLM / prime-rl serve the model's own
+    template is train/serve skew.
+
+    Also NOT ``AutoRendererConfig``: resolution there is an exact match on
+    ``tokenizer.name_or_path``, which misses every fine-tuned checkpoint export we
+    train from and silently falls back to ``DefaultRenderer`` for text models.
+
+    ``Qwen3RendererConfig`` and ``Qwen35RendererConfig`` were measured to render
+    byte-identically for both the Qwen3 and Qwen3.5 tokenizers across plain,
+    multi-turn and inline-``<think>`` conversations, so the distinction does not
+    currently affect our SFT data; we still pick the family-correct one when
+    ``model_id`` identifies it, so a future template divergence lands correctly.
     """
-    n = len(input_ids)
-    starts = np.where(input_ids == im_start_id)[0]
-    ends = np.where(input_ids == im_end_id)[0]
-    k = min(len(starts), len(ends))
-    if k == 0:
-        return np.zeros(n, dtype=np.int32)
-    starts, ends = starts[:k], ends[:k]
+    if model_id is not None:
+        from omegalax.models.qwen3_5.config import is_supported_qwen3_5_model_id  # noqa: PLC0415
 
-    # Which <|im_start|> are followed by `assistant`?
-    is_asst = (starts + 1 < n) & (input_ids[starts + 1] == assistant_token_id)
-    # Content starts after <|im_start|> assistant \n  (3 tokens).
-    content_starts = starts[is_asst] + 3
-    content_ends = ends[is_asst]
+        if is_supported_qwen3_5_model_id(model_id) or "qwen3.5" in model_id.lower():
+            return Qwen35RendererConfig()
+    return Qwen3RendererConfig()
 
-    # +1 at content start, -1 after <|im_end|> → cumsum gives the mask.
-    # content_ends points at <|im_end|> itself, which must be a supervised
-    # target so the model learns to terminate; the \n that follows is not.
-    signal = np.zeros(n, dtype=np.int32)
-    valid = content_starts < n
-    ends_plus_one = content_ends[valid] + 1
-    np.add.at(signal, content_starts[valid], 1)
-    np.add.at(signal, ends_plus_one[ends_plus_one < n], -1)
-    return np.cumsum(signal).astype(np.int32)
+
+def assert_text_template_parity(
+    tokenizer: PreTrainedTokenizer,
+    renderer_config: Any,
+) -> None:
+    """Fail at construction if the renderer diverges from the tokenizer's own template.
+
+    This is the property the module docstring promises and that nothing asserted:
+    what we train on must be what the serving stack renders. Checked only for the
+    auto-resolved default — passing ``renderer_config`` explicitly is the escape
+    hatch for a checkpoint whose chat template legitimately differs.
+    """
+    reference = tokenizer.apply_chat_template(
+        _TEXT_TEMPLATE_PROBE, tokenize=False, add_generation_prompt=False
+    )
+    sample = build_training_sample(
+        create_renderer(tokenizer, renderer_config), _TEXT_TEMPLATE_PROBE
+    )
+    rendered = tokenizer.decode(list(sample.token_ids))
+    if rendered != reference:
+        raise ValueError(
+            f"{type(renderer_config).__name__} does not reproduce the chat template of "
+            f"{getattr(tokenizer, 'name_or_path', '<unknown>')!r}, so SFT would train on a "
+            f"different stream than the serving stack renders.\n"
+            f"  renderer: {rendered!r}\n"
+            f"  template: {reference!r}\n"
+            "Pass renderer_config= explicitly if this checkpoint's template really does "
+            "differ and you have confirmed the rollout side matches."
+        )
+
+
+class _ImageProcessorAsProcessor:
+    """Adapt a bare ``BaseImageProcessor`` to the ``.image_processor`` attribute
+    the Qwen3-VL renderer reads off a full ``Qwen3VLProcessor``.
+
+    omegalax constructs the image processor directly (``AutoImageProcessor``,
+    ``use_fast=False``, optionally with an overridden ``preprocessor_config``),
+    and that exact instance must be the one the renderer calls — otherwise a
+    lazily ``AutoProcessor.from_pretrained``-loaded default would silently
+    change patch geometry.
+    """
+
+    __slots__ = ("image_processor",)
+
+    def __init__(self, image_processor: BaseImageProcessor) -> None:
+        self.image_processor = image_processor
+
+
+class Qwen3RendererEncoder:
+    """Picklable ``messages -> (token_ids, loss_mask, vision arrays)`` encoder.
+
+    Defined at module scope with a lazily-built renderer so it survives
+    ``spawn`` multiprocessing (``grain_pipeline._compute_message_lengths_from_chat``
+    re-pickles the measure fn into each worker; the HF tokenizer pickles, the
+    renderer's caches need not travel).
+
+    ``renderer_config`` MUST be passed explicitly rather than auto-resolved:
+    renderer resolution is an exact match on ``tokenizer.name_or_path`` against
+    ``MODEL_RENDERER_MAP`` and *raises* for a VLM that misses the map, which is
+    every fine-tuned checkpoint export we train from.
+    """
+
+    def __init__(
+        self,
+        tokenizer: PreTrainedTokenizer,
+        image_processor: BaseImageProcessor | None = None,
+        renderer_config: Qwen3VLRendererConfig | None = None,
+    ) -> None:
+        self.tokenizer = tokenizer
+        self.image_processor = image_processor
+        self.renderer_config = renderer_config or Qwen3VLRendererConfig()
+        self._renderer = None
+
+    def __getstate__(self) -> dict[str, Any]:
+        state = self.__dict__.copy()
+        state["_renderer"] = None
+        return state
+
+    @property
+    def renderer(self):
+        if self._renderer is None:
+            if self.image_processor is not None:
+                # Constructed directly so OUR image processor is the one used;
+                # ``create_renderer`` has no processor seam and the renderer would
+                # otherwise lazily ``AutoProcessor.from_pretrained`` a default,
+                # silently changing patch geometry.
+                self._renderer = Qwen3VLRenderer(
+                    self.tokenizer,
+                    self.renderer_config,
+                    processor=_ImageProcessorAsProcessor(self.image_processor),
+                )
+            else:
+                self._renderer = create_renderer(self.tokenizer, self.renderer_config)
+        return self._renderer
+
+    def render(self, messages: list[dict[str, Any]]):
+        """``messages -> RenderedTrainingSample``.
+
+        Named (not just ``__call__``) because ``encode`` must reach it without
+        going through ``__call__``: ``_MessageLengthFn`` overrides ``__call__``
+        with a *different* signature and calls ``encode`` from it, so an
+        ``encode -> self(...)`` self-call is unbounded mutual recursion.
+        """
+        return build_training_sample(self.renderer, resolve_message_images(messages))
+
+    def __call__(self, messages: list[dict[str, Any]]):
+        return self.render(messages)
+
+    def encode(self, messages: list[dict[str, Any]]) -> dict[str, np.ndarray]:
+        """``token_ids`` + ``loss_mask`` + concatenated vision arrays for one example."""
+        sample = self.render(messages)
+        out: dict[str, np.ndarray] = {
+            "input_ids": np.asarray(sample.token_ids, dtype=np.int32),
+            "loss_mask": np.asarray(sample.loss_mask, dtype=np.int32),
+        }
+        if sample.mm_token_type_ids is not None:
+            out["mm_token_type_ids"] = np.asarray(sample.mm_token_type_ids, dtype=np.int32)
+        items = sample.multi_modal_data.mm_items.get("image", []) if sample.multi_modal_data else []
+        if items:
+            out["pixel_values"] = np.concatenate([i["pixel_values"] for i in items], axis=0)
+            out["image_grid_thw"] = np.concatenate(
+                [np.asarray(i["image_grid_thw"]).reshape(-1, 3) for i in items], axis=0
+            )
+        return out
+
+
+class _MessageLengthFn(Qwen3RendererEncoder):
+    """Picklable ``message -> measurement`` callable (see ``make_message_length_fn``)."""
+
+    def __call__(self, message: dict[str, Any]) -> int | dict[str, Any]:  # type: ignore[override]
+        if self.image_processor is None and _message_has_images(message):
+            raise ValueError(
+                "Encountered image content in message but no image_processor was provided. "
+                "Pass image_processor= to make_message_length_fn."
+            )
+        encoded = self.encode([message])
+        merge_size = (
+            int(getattr(self.image_processor, "merge_size", 1)) if self.image_processor else 1
+        )
+        grid_thw = encoded.get("image_grid_thw", np.empty((0, 3), dtype=np.int64))
+        vision_tokens = 0
+        vision_patches = 0
+        for row in grid_thw:
+            t, h, w = int(row[0]), int(row[1]), int(row[2])
+            vision_tokens += t * (h // merge_size) * (w // merge_size)
+            vision_patches += t * h * w
+        return {
+            "length": int(len(encoded["input_ids"])),
+            "vision_tokens": vision_tokens,
+            "vision_patches": vision_patches,
+            "num_images": int(grid_thw.shape[0]),
+            "image_grid_thw": grid_thw.tolist(),
+        }
+
+
+def _message_has_images(message: dict[str, Any]) -> bool:
+    content = message.get("content", "")
+    if isinstance(content, str):
+        return False
+    return any(block.get("type") in ("image", "image_url") for block in content)
+
+
+def make_message_length_fn(
+    tokenizer: PreTrainedTokenizer,
+    image_processor: BaseImageProcessor | None = None,
+    renderer_config: Qwen3VLRendererConfig | None = None,
+):
+    """Return a ``message -> measurement`` callable for the record builders.
+
+    Token lengths are exactly additive at message boundaries:
+    ``<|im_start|>``/``<|im_end|>`` are hard BPE split points, so
+    ``sum(lengths)`` equals the full-sequence length exactly. Returns a
+    picklable instance so it can be shipped to ``spawn`` workers.
+    """
+    return _MessageLengthFn(tokenizer, image_processor, renderer_config)
 
 
 class TextSFTCollator:
@@ -63,16 +288,26 @@ class TextSFTCollator:
     ``(B, max_length)`` int32.
     """
 
-    def __init__(self, tokenizer: PreTrainedTokenizer, max_length: int) -> None:
+    def __init__(
+        self,
+        tokenizer: PreTrainedTokenizer,
+        max_length: int,
+        renderer_config: Any | None = None,
+        model_id: str | None = None,
+    ) -> None:
         self.tokenizer = tokenizer
         self.max_length = max_length
         assert tokenizer.pad_token_id is not None, (
             "tokenizer must have pad_token_id set (e.g. Qwen3-VL, Qwen3.5)"
         )
-
-        self._im_start_id = tokenizer.convert_tokens_to_ids("<|im_start|>")
-        self._im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
-        self._assistant_token_id = tokenizer.encode("assistant", add_special_tokens=False)[0]
+        # A TEXT model must NOT get Qwen3VLRendererConfig: it drops the
+        # <think>\n\n</think>\n\n block the Qwen3/Qwen3.5 template emits, shrinking
+        # both the stream and the supervised span. Self-check the auto-resolved
+        # pick against the tokenizer's own template so skew fails at startup.
+        if renderer_config is None:
+            renderer_config = resolve_text_renderer_config(tokenizer, model_id)
+            assert_text_template_parity(tokenizer, renderer_config)
+        self._encoder = Qwen3RendererEncoder(tokenizer, None, renderer_config)
 
     def __call__(self, examples: Sequence[dict[str, Any]]) -> dict[str, np.ndarray]:
         batch_ids: list[np.ndarray] = []
@@ -81,10 +316,7 @@ class TextSFTCollator:
 
         for ex in examples:
             messages = ex["messages"]
-            encoded = _encode_qwen_messages(
-                messages,
-                tokenizer=self.tokenizer,
-            )
+            encoded = self._encoder.encode(messages)
             full_ids = encoded["input_ids"]
             if len(full_ids) > self.max_length:
                 raise ValueError(
@@ -96,13 +328,7 @@ class TextSFTCollator:
             pad_len = self.max_length - seq_len
             token_ids = np.array(full_ids, dtype=np.int32)
             attn_mask = np.ones(seq_len, dtype=np.int32)
-
-            loss_mask = _build_assistant_loss_mask(
-                token_ids,
-                self._im_start_id,
-                self._im_end_id,
-                self._assistant_token_id,
-            )
+            loss_mask = encoded["loss_mask"]
 
             if pad_len > 0:
                 token_ids = np.pad(
@@ -220,9 +446,12 @@ class VLMSFTCollator:
     and encodes via ``tokenizer.encode``.  Images are preprocessed by the
     HF image processor (slow path, NumPy backend).
 
-    Outputs ``{"token_ids_BT", "attention_mask_BT", "loss_mask_BT"}`` plus
-    ``"pixel_values"``, ``"image_grid_thw"``, and ``"position_ids_ZBT"``
-    when images are present.
+    Outputs ``{"token_ids_BT", "attention_mask_BT", "loss_mask_BT",
+    "mm_token_type_ids_BT"}`` plus ``"pixel_values"``, ``"image_grid_thw"``,
+    and ``"position_ids_ZBT"`` when images are present.
+    ``mm_token_type_ids_BT`` comes straight from the renderer's placeholder
+    ranges (0=text / 1=image / 2=video) — the vision encoder slices image
+    tokens out of the packed stream with it.
 
     ``position_ids_ZBT`` is precomputed here (on CPU, via numpy) so the
     model's ``get_rope_index`` never needs to run inside ``jax.jit``.
@@ -237,6 +466,7 @@ class VLMSFTCollator:
         max_vision_patches_per_sample: int | None = None,
         max_vision_images_per_sample: int | None = None,
         pixel_values_dtype: Any = ml_dtypes.bfloat16,
+        renderer_config: Qwen3VLRendererConfig | None = None,
     ) -> None:
         self.tokenizer = tokenizer
         self.max_length = max_length
@@ -247,10 +477,7 @@ class VLMSFTCollator:
         assert tokenizer.pad_token_id is not None, (
             "tokenizer must have pad_token_id set (e.g. Qwen3-VL, Qwen3.5)"
         )
-
-        self._im_start_id = tokenizer.convert_tokens_to_ids("<|im_start|>")
-        self._im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
-        self._assistant_token_id = tokenizer.encode("assistant", add_special_tokens=False)[0]
+        self._encoder = Qwen3RendererEncoder(tokenizer, image_processor, renderer_config)
 
         self._image_token_id = tokenizer.convert_tokens_to_ids("<|image_pad|>")
         self._video_token_id = tokenizer.convert_tokens_to_ids("<|video_pad|>")
@@ -275,14 +502,11 @@ class VLMSFTCollator:
         all_pixel_values: list[np.ndarray] = []
         all_grid_thw: list[np.ndarray] = []
 
+        batch_mm_type: list[np.ndarray] = []
+
         for ex in examples:
             messages = ex["messages"]
-            encoded = _encode_qwen_messages(
-                messages,
-                tokenizer=self.tokenizer,
-                image_processor=self.image_processor,
-                include_pixels=True,
-            )
+            encoded = self._encoder.encode(messages)
             full_ids = encoded["input_ids"]
             if len(full_ids) > self.max_length:
                 raise ValueError(
@@ -298,15 +522,17 @@ class VLMSFTCollator:
             pad_len = self.max_length - seq_len
             token_ids = np.array(full_ids, dtype=np.int32)
             attn_mask = np.ones(seq_len, dtype=np.int32)
-
-            loss_mask = _build_assistant_loss_mask(
-                token_ids,
-                self._im_start_id,
-                self._im_end_id,
-                self._assistant_token_id,
-            )
+            loss_mask = encoded["loss_mask"]
+            # 0=text / 1=image / 2=video — the vision encoder slices image
+            # tokens out of the packed stream with this. Text-only samples
+            # through the VLM renderer get no sidecar; synthesize zeros so the
+            # batch key is always present at a fixed shape.
+            mm_type = encoded.get("mm_token_type_ids")
+            if mm_type is None:
+                mm_type = np.zeros(seq_len, dtype=np.int32)
 
             if pad_len > 0:
+                mm_type = np.pad(mm_type, (0, pad_len), constant_values=0)
                 token_ids = np.pad(
                     token_ids, (0, pad_len), constant_values=self.tokenizer.pad_token_id
                 )
@@ -316,11 +542,13 @@ class VLMSFTCollator:
             batch_ids.append(token_ids)
             batch_attn.append(attn_mask)
             batch_mask.append(loss_mask)
+            batch_mm_type.append(mm_type)
 
         result: dict[str, np.ndarray] = {
             "token_ids_BT": np.stack(batch_ids).astype(np.int32),
             "attention_mask_BT": np.stack(batch_attn).astype(np.int32),
             "loss_mask_BT": np.stack(batch_mask).astype(np.int32),
+            "mm_token_type_ids_BT": np.stack(batch_mm_type).astype(np.int32),
         }
 
         if all_pixel_values:

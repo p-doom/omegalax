@@ -187,7 +187,7 @@ def main(_) -> None:
     assert FLAGS.max_length <= tokenizer.model_max_length, (
         f"--max_length={FLAGS.max_length} exceeds tokenizer.model_max_length={tokenizer.model_max_length}"
     )
-    collator = TextSFTCollator(tokenizer, max_length=FLAGS.max_length)
+    collator = TextSFTCollator(tokenizer, max_length=FLAGS.max_length, model_id=FLAGS.model_id)
     startup_log("built TextSFTCollator")
     train_sources = _resolve_train_sources()
     per_process_batch = process_local_batch_size(

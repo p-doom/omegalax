@@ -4,6 +4,8 @@ import os
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
+import pickle
+
 from absl.testing import absltest
 
 import ml_dtypes
@@ -13,11 +15,11 @@ from transformers import AutoTokenizer
 from transformers import AutoImageProcessor
 
 from omegalax.data.collator_qwen3 import (
+    Qwen3RendererEncoder,
     TextSFTCollator,
     VLMSFTCollator,
-    _build_assistant_loss_mask,
+    make_message_length_fn,
 )
-from omegalax.data.qwen3_encoding import build_chatml_text as _build_chatml_text
 
 
 def _make_tokenizer():
@@ -136,187 +138,6 @@ class TextSFTCollatorTest(absltest.TestCase):
         ]
         with self.assertRaisesRegex(ValueError, "exceeds max_length"):
             collator(examples)
-
-
-class BuildAssistantLossMaskTest(absltest.TestCase):
-    """Direct tests for the token-scanning loss mask builder."""
-
-    def setUp(self):
-        super().setUp()
-        self.tokenizer = _make_tokenizer()
-        self._im_start_id = self.tokenizer.convert_tokens_to_ids("<|im_start|>")
-        self._im_end_id = self.tokenizer.convert_tokens_to_ids("<|im_end|>")
-        self._assistant_token_id = self.tokenizer.encode("assistant", add_special_tokens=False)[0]
-
-    def _apply_and_mask(self, messages):
-        result = self.tokenizer.apply_chat_template(
-            messages,
-            tokenize=True,
-            add_generation_prompt=False,
-        )
-        ids = np.array(result["input_ids"], dtype=np.int32)
-        mask = _build_assistant_loss_mask(
-            ids,
-            self._im_start_id,
-            self._im_end_id,
-            self._assistant_token_id,
-        )
-        return ids, mask
-
-    def test_single_turn(self):
-        messages = [
-            {"role": "user", "content": "Hello"},
-            {"role": "assistant", "content": "Hi!"},
-        ]
-        ids, mask = self._apply_and_mask(messages)
-        self.assertGreater(np.sum(mask), 0)
-        # User tokens should not be supervised
-        self.assertLess(np.sum(mask), len(ids))
-
-    def test_multi_turn(self):
-        messages = [
-            {"role": "user", "content": "A"},
-            {"role": "assistant", "content": "B"},
-            {"role": "user", "content": "C"},
-            {"role": "assistant", "content": "D"},
-        ]
-        _, mask = self._apply_and_mask(messages)
-        # Should have supervised tokens from both assistant turns
-        self.assertGreater(np.sum(mask), 0)
-
-    def test_no_assistant(self):
-        messages = [
-            {"role": "user", "content": "Hello"},
-        ]
-        _, mask = self._apply_and_mask(messages)
-        self.assertEqual(np.sum(mask), 0)
-
-    def test_mask_includes_assistant_im_end(self):
-        messages = [
-            {"role": "user", "content": "X"},
-            {"role": "assistant", "content": "Y"},
-        ]
-        ids, mask = self._apply_and_mask(messages)
-        # Assistant <|im_end|> should be supervised so the model learns to terminate.
-        # User <|im_end|> should not be supervised.
-        im_end_positions = np.where(ids == self._im_end_id)[0]
-        # First <|im_end|> is from user turn (not supervised)
-        self.assertEqual(mask[im_end_positions[0]], 0, "User <|im_end|> should not be supervised")
-        # Second <|im_end|> is from assistant turn (supervised)
-        self.assertEqual(mask[im_end_positions[1]], 1, "Assistant <|im_end|> should be supervised")
-
-
-class BuildChatMLTextTest(absltest.TestCase):
-    """Tests for _build_chatml_text ChatML output format."""
-
-    def setUp(self):
-        super().setUp()
-        self.tokenizer = _make_tokenizer()
-
-    def test_text_only_single_turn(self):
-        messages = [
-            {"role": "user", "content": "Hello"},
-            {"role": "assistant", "content": "Hi!"},
-        ]
-        result = _build_chatml_text(messages, image_grids=[], merge_size=2)
-        expected = "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\nHi!<|im_end|>\n"
-        self.assertEqual(result, expected)
-
-    def test_text_only_multi_turn(self):
-        messages = [
-            {"role": "user", "content": "A"},
-            {"role": "assistant", "content": "B"},
-            {"role": "user", "content": "C"},
-            {"role": "assistant", "content": "D"},
-        ]
-        result = _build_chatml_text(messages, image_grids=[], merge_size=2)
-        expected = (
-            "<|im_start|>user\nA<|im_end|>\n"
-            "<|im_start|>assistant\nB<|im_end|>\n"
-            "<|im_start|>user\nC<|im_end|>\n"
-            "<|im_start|>assistant\nD<|im_end|>\n"
-        )
-        self.assertEqual(result, expected)
-
-    def test_with_system_prompt(self):
-        messages = [
-            {"role": "system", "content": "You are a helpful assistant."},
-            {"role": "user", "content": "Hello"},
-            {"role": "assistant", "content": "Hi!"},
-        ]
-        result = _build_chatml_text(messages, image_grids=[], merge_size=2)
-        expected = (
-            "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
-            "<|im_start|>user\nHello<|im_end|>\n"
-            "<|im_start|>assistant\nHi!<|im_end|>\n"
-        )
-        self.assertEqual(result, expected)
-
-    def test_image_tokens_inserted(self):
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image"},
-                    {"type": "text", "text": "Describe."},
-                ],
-            },
-            {"role": "assistant", "content": "A cat."},
-        ]
-        grid = (1, 8, 8)
-        merge_size = 2
-        n_tokens = 1 * (8 // 2) * (8 // 2)  # = 16
-
-        result = _build_chatml_text(messages, image_grids=[grid], merge_size=merge_size)
-        self.assertIn("<|vision_start|>", result)
-        self.assertIn("<|vision_end|>", result)
-        self.assertEqual(result.count("<|image_pad|>"), n_tokens)
-
-    def test_multi_image(self):
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image"},
-                    {"type": "image"},
-                    {"type": "text", "text": "Compare."},
-                ],
-            },
-        ]
-        grids = [(1, 4, 4), (1, 8, 8)]
-        merge_size = 2
-        n1 = 1 * (4 // 2) * (4 // 2)  # = 4
-        n2 = 1 * (8 // 2) * (8 // 2)  # = 16
-
-        result = _build_chatml_text(messages, image_grids=grids, merge_size=merge_size)
-        self.assertEqual(result.count("<|image_pad|>"), n1 + n2)
-        self.assertEqual(result.count("<|vision_start|>"), 2)
-        self.assertEqual(result.count("<|vision_end|>"), 2)
-
-    def test_encodes_correctly(self):
-        """Verify that tokenizer.encode on our ChatML text produces valid token IDs."""
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image"},
-                    {"type": "text", "text": "What is this?"},
-                ],
-            },
-            {"role": "assistant", "content": "A photo."},
-        ]
-        grid = (1, 4, 4)
-        text = _build_chatml_text(messages, image_grids=[grid], merge_size=2)
-        ids = self.tokenizer.encode(text, add_special_tokens=False)
-
-        im_start_id = self.tokenizer.convert_tokens_to_ids("<|im_start|>")
-        im_end_id = self.tokenizer.convert_tokens_to_ids("<|im_end|>")
-        image_pad_id = self.tokenizer.convert_tokens_to_ids("<|image_pad|>")
-
-        self.assertEqual(ids.count(im_start_id), 2)
-        self.assertEqual(ids.count(im_end_id), 2)
-        n_expected = 1 * (4 // 2) * (4 // 2)  # = 4
-        self.assertEqual(ids.count(image_pad_id), n_expected)
 
 
 class VLMSFTCollatorTest(absltest.TestCase):
@@ -524,6 +345,148 @@ class VLMSFTCollatorTest(absltest.TestCase):
         grid = batch["image_grid_thw"][0]
         expected_pads = int(grid[0]) * (int(grid[1]) // 2) * (int(grid[2]) // 2)
         self.assertEqual(n_pad_sample_1, expected_pads)
+
+
+class TemplateParityTest(absltest.TestCase):
+    """What we train on must be what the serving stack renders.
+
+    The module docstring promised byte-parity with ``apply_chat_template`` and
+    nothing asserted it; the deleted ``BuildChatMLTextTest`` held the only such
+    checks. Text models were additionally getting ``Qwen3VLRendererConfig``,
+    which silently drops the ``<think>\\n\\n</think>\\n\\n`` block.
+    """
+
+    PROBE = [
+        {"role": "system", "content": "s"},
+        {"role": "user", "content": "a"},
+        {"role": "assistant", "content": "b"},
+        {"role": "user", "content": "c"},
+        {"role": "assistant", "content": "d"},
+    ]
+
+    def test_text_collator_renders_the_tokenizers_own_template(self):
+        tokenizer = _make_tokenizer()
+        collator = TextSFTCollator(tokenizer, max_length=256)
+        batch = collator([{"messages": self.PROBE}])
+        n = int(batch["attention_mask_BT"][0].sum())
+        rendered = tokenizer.decode(batch["token_ids_BT"][0][:n].tolist())
+        self.assertEqual(
+            rendered,
+            tokenizer.apply_chat_template(self.PROBE, tokenize=False, add_generation_prompt=False),
+        )
+
+    def test_text_collator_supervises_the_think_block(self):
+        """The concrete regression the VL-config-on-text-model bug caused."""
+        tokenizer = _make_tokenizer()
+        collator = TextSFTCollator(tokenizer, max_length=256)
+        batch = collator([{"messages": self.PROBE}])
+        mask = batch["loss_mask_BT"][0].astype(bool)
+        supervised = tokenizer.decode(batch["token_ids_BT"][0][mask].tolist())
+        self.assertIn("<think>", supervised)
+        self.assertEqual(supervised, "b<|im_end|><think>\n\n</think>\n\nd<|im_end|>")
+
+    def test_vl_config_on_a_text_model_is_rejected(self):
+        """The self-check must catch exactly the config that shipped."""
+        from renderers import Qwen3VLRendererConfig as _VLCfg
+
+        from omegalax.data.collator_qwen3 import assert_text_template_parity
+
+        with self.assertRaisesRegex(ValueError, "does not reproduce the chat template"):
+            assert_text_template_parity(_make_tokenizer(), _VLCfg())
+
+    def test_explicit_renderer_config_bypasses_the_self_check(self):
+        """Escape hatch for a checkpoint whose template legitimately differs."""
+        from renderers import Qwen3VLRendererConfig as _VLCfg
+
+        collator = TextSFTCollator(_make_tokenizer(), max_length=256, renderer_config=_VLCfg())
+        self.assertIsInstance(collator._encoder.renderer_config, _VLCfg)
+
+    def test_vlm_collator_matches_the_hf_processor_byte_for_byte(self):
+        """Vision-placeholder expansion parity, incl. the image-pad count."""
+        from PIL import Image
+        from transformers import AutoProcessor
+
+        tokenizer = _make_tokenizer()
+        processor = AutoProcessor.from_pretrained("Qwen/Qwen3-VL-2B-Instruct", use_fast=False)
+        image = Image.new("RGB", (112, 112), (128, 64, 32))
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": image},
+                    {"type": "text", "text": "what?"},
+                ],
+            },
+            {"role": "assistant", "content": "a square"},
+        ]
+        encoder = Qwen3RendererEncoder(
+            tokenizer,
+            AutoImageProcessor.from_pretrained("Qwen/Qwen3-VL-2B-Instruct", use_fast=False),
+            None,
+        )
+        ours = encoder.encode(messages)
+        reference = processor(
+            images=[image],
+            text=[processor.apply_chat_template(messages, tokenize=False)],
+            return_tensors="np",
+        )
+        np.testing.assert_array_equal(
+            np.asarray(ours["input_ids"]), np.asarray(reference["input_ids"][0])
+        )
+        np.testing.assert_allclose(
+            ours["pixel_values"].astype(np.float32),
+            np.asarray(reference["pixel_values"]).astype(np.float32),
+        )
+
+
+class MessageLengthFnTest(absltest.TestCase):
+    """``make_message_length_fn`` is the record builders' measure fn.
+
+    It had no coverage, and shipped as an unbounded ``__call__``/``encode``
+    mutual recursion: ``Qwen3RendererEncoder.encode`` self-called via
+    ``self(...)``, which ``_MessageLengthFn.__call__`` overrides with a
+    different signature and calls ``encode`` from. Every chunk-index /
+    length-measurement job died with ``RecursionError``.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.tokenizer = _make_tokenizer()
+
+    def test_measures_a_single_text_message(self):
+        fn = make_message_length_fn(self.tokenizer)
+        out = fn({"role": "user", "content": "hello world"})
+        self.assertEqual(out["length"], 7)
+        self.assertEqual(out["vision_tokens"], 0)
+        self.assertEqual(out["num_images"], 0)
+
+    def test_lengths_are_additive_at_message_boundaries(self):
+        """The property the chunk index depends on: sum(per-message) == full."""
+        fn = make_message_length_fn(self.tokenizer)
+        encoder = Qwen3RendererEncoder(self.tokenizer, None, None)
+        conversation = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "turn 0"},
+            {"role": "assistant", "content": "12 -8 0 ; +LMB -LMB"},
+            {"role": "user", "content": "turn 1"},
+            {"role": "assistant", "content": "TERMINATE"},
+        ]
+        per_message = sum(fn(m)["length"] for m in conversation)
+        full = len(encoder.encode(conversation)["input_ids"])
+        self.assertEqual(per_message, full)
+
+    def test_raises_on_images_without_an_image_processor(self):
+        fn = make_message_length_fn(self.tokenizer)
+        with self.assertRaisesRegex(ValueError, "no image_processor"):
+            fn({"role": "user", "content": [{"type": "image", "image": "x.png"}]})
+
+    def test_survives_pickling_with_a_live_renderer(self):
+        """Shipped to ``spawn`` workers via the pool initializer."""
+        fn = make_message_length_fn(self.tokenizer)
+        _ = fn.renderer  # force the lazy renderer to exist: the hard case
+        restored = pickle.loads(pickle.dumps(fn))
+        self.assertIsNone(restored._renderer)
+        self.assertEqual(restored({"role": "user", "content": "hello world"})["length"], 7)
 
 
 if __name__ == "__main__":
