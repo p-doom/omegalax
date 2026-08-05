@@ -20,7 +20,7 @@ from absl import app, flags
 from transformers import AutoImageProcessor, AutoTokenizer
 
 from omegalax.data.grain_pipeline import build_records_from_chat
-from omegalax.data.qwen3_encoding import make_message_length_fn
+from omegalax.data.collator_qwen3 import make_message_length_fn
 from omegalax.registry import resolve_hf_repo_id
 
 FLAGS = flags.FLAGS

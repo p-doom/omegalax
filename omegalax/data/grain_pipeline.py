@@ -319,6 +319,36 @@ def _measure_init(measure_message) -> None:
     _measure_fn = measure_message
 
 
+def _preflight_measure_fn(measure_message, tasks, chat_path) -> None:
+    """Reject a whole-run misconfiguration in the PARENT, before spawning workers.
+
+    A measure fn built without an image processor raises on the first image-bearing
+    message — but that happens inside a pool worker, so the operator sees a child
+    traceback with the pool machinery stacked on top, *after* the job has started,
+    instead of the flag they forgot. The message set is already fully enumerated
+    here, so the same condition is checkable up front for free.
+
+    Duck-typed on ``image_processor`` so a caller's own measure fn is left alone.
+    """
+    if not hasattr(measure_message, "image_processor"):
+        return
+    if measure_message.image_processor is not None:
+        return
+
+    from omegalax.data.collator_qwen3 import _message_has_images  # noqa: PLC0415
+
+    for (conv_idx, msg_offset), message in tasks:
+        if _message_has_images(message):
+            raise ValueError(
+                f"{Path(chat_path).name} contains image content (first at conversation "
+                f"{conv_idx}, message {msg_offset}) but the measure fn has no image "
+                "processor, so every worker would fail on it. Pass --processor "
+                "<hf-repo> (the scripts' flag; --preprocessor_config to override its "
+                "geometry), or image_processor= if calling make_message_length_fn "
+                "directly."
+            )
+
+
 def _compute_message_lengths_from_chat(chat_path, measure_message, num_workers) -> dict:
     """Tokenize every message in a chat.jsonl once, in parallel, under ``spawn``.
 
@@ -335,6 +365,7 @@ def _compute_message_lengths_from_chat(chat_path, measure_message, num_workers) 
             tasks.append(((conv_idx, msg_offset), message))
     if not tasks:
         return {}
+    _preflight_measure_fn(measure_message, tasks, chat_path)
     ctx = mp.get_context("spawn")
     chunksize = max(1, min(32, len(tasks) // num_workers))
     with ctx.Pool(num_workers, initializer=_measure_init, initargs=(measure_message,)) as pool:
