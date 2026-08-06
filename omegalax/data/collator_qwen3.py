@@ -205,12 +205,24 @@ class Qwen3RendererEncoder:
 class _MessageLengthFn(Qwen3RendererEncoder):
     """Picklable ``message -> measurement`` callable (see ``make_message_length_fn``)."""
 
-    def __call__(self, message: dict[str, Any]) -> int | dict[str, Any]:  # type: ignore[override]
+    def reject_unmeasurable(self, message: dict[str, Any]) -> None:
+        """Raise if this fn cannot measure ``message``.
+
+        The single definition of measurability. ``grain_pipeline`` calls it over
+        the whole task list in the parent before spawning workers, so the failure
+        lands on the operator's terminal instead of inside a pool child; keeping
+        the predicate here means the two boundaries cannot drift apart.
+        """
         if self.image_processor is None and _message_has_images(message):
             raise ValueError(
-                "Encountered image content in message but no image_processor was provided. "
-                "Pass image_processor= to make_message_length_fn."
+                "message has image content but the measure fn has no image_processor. "
+                "Pass --processor <hf-repo> (the scripts' flag; --preprocessor_config "
+                "to override its geometry), or image_processor= if calling "
+                "make_message_length_fn directly."
             )
+
+    def __call__(self, message: dict[str, Any]) -> int | dict[str, Any]:
+        self.reject_unmeasurable(message)
         encoded = self.encode([message])
         merge_size = (
             int(getattr(self.image_processor, "merge_size", 1)) if self.image_processor else 1
