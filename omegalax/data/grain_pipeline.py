@@ -322,31 +322,28 @@ def _measure_init(measure_message) -> None:
 def _preflight_measure_fn(measure_message, tasks, chat_path) -> None:
     """Reject a whole-run misconfiguration in the PARENT, before spawning workers.
 
-    A measure fn built without an image processor raises on the first image-bearing
-    message — but that happens inside a pool worker, so the operator sees a child
-    traceback with the pool machinery stacked on top, *after* the job has started,
-    instead of the flag they forgot. The message set is already fully enumerated
-    here, so the same condition is checkable up front for free.
+    A measure fn that cannot handle a message raises on the first one — but that
+    happens inside a pool worker, so the operator sees a child traceback with the
+    pool machinery stacked on top, after the job has started, instead of the flag
+    they forgot. The task list is already fully enumerated here, so the same
+    check is affordable up front.
 
-    Duck-typed on ``image_processor`` so a caller's own measure fn is left alone.
+    The condition itself lives on the measure fn (``reject_unmeasurable``), not
+    here, so the two boundaries cannot disagree about what is measurable. A
+    caller's own measure fn that does not declare one is left alone: an arbitrary
+    callable has no contract this could check.
     """
-    if not hasattr(measure_message, "image_processor"):
+    reject_unmeasurable = getattr(measure_message, "reject_unmeasurable", None)
+    if reject_unmeasurable is None:
         return
-    if measure_message.image_processor is not None:
-        return
-
-    from omegalax.data.collator_qwen3 import _message_has_images  # noqa: PLC0415
-
     for (conv_idx, msg_offset), message in tasks:
-        if _message_has_images(message):
+        try:
+            reject_unmeasurable(message)
+        except ValueError as exc:
             raise ValueError(
-                f"{Path(chat_path).name} contains image content (first at conversation "
-                f"{conv_idx}, message {msg_offset}) but the measure fn has no image "
-                "processor, so every worker would fail on it. Pass --processor "
-                "<hf-repo> (the scripts' flag; --preprocessor_config to override its "
-                "geometry), or image_processor= if calling make_message_length_fn "
-                "directly."
-            )
+                f"{Path(chat_path).name} conversation {conv_idx} message "
+                f"{msg_offset}: {exc} Every worker would fail on it."
+            ) from exc
 
 
 def _compute_message_lengths_from_chat(chat_path, measure_message, num_workers) -> dict:
