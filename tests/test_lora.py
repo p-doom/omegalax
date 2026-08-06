@@ -85,11 +85,6 @@ class _MiniModel(nnx.Module):
         return self.lm_head(x)
 
 
-# ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
-
-
 def _make_model(seed: int = 0, d: int = 16, mlp: int = 32, n_layers: int = 2):
     return _MiniModel(d=d, mlp=mlp, n_layers=n_layers, rngs=nnx.Rngs(seed))
 

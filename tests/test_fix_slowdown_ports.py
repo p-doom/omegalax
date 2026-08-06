@@ -64,9 +64,7 @@ def _block_diag_reference(
     return out_HNK
 
 
-# --------------------------------------------------------------------------- #
 # A. cuDNN packed attention correctness
-# --------------------------------------------------------------------------- #
 
 
 class CuDnnPackedVisionAttentionTest(absltest.TestCase):
@@ -104,9 +102,7 @@ class CuDnnPackedVisionAttentionTest(absltest.TestCase):
         )
 
 
-# --------------------------------------------------------------------------- #
 # B. qwen3 text-attn backend selector
-# --------------------------------------------------------------------------- #
 
 
 def _qwen3_test_cfg() -> Qwen3Config:
@@ -147,9 +143,7 @@ class Qwen3TextAttnBackendSwapTest(absltest.TestCase):
         np.testing.assert_allclose(out_cudnn, out_default, rtol=3e-2, atol=3e-2)
 
 
-# --------------------------------------------------------------------------- #
 # Shared qwen3_5 VLM test fixtures
-# --------------------------------------------------------------------------- #
 
 
 def _qwen3_5_vlm_test_cfg() -> Qwen3_5Config:
@@ -245,9 +239,7 @@ def _make_vlm_inputs(cfg: Qwen3_5Config, real_grids, max_images=None, max_patche
     )
 
 
-# --------------------------------------------------------------------------- #
 # C. qwen3_5 padding-no-op
-# --------------------------------------------------------------------------- #
 
 
 class Qwen3_5PaddingNoOpTest(absltest.TestCase):
@@ -315,9 +307,7 @@ class Qwen3_5PaddingNoOpTest(absltest.TestCase):
         )
 
 
-# --------------------------------------------------------------------------- #
 # D. JIT-stability: padded budget should not recompile when real counts vary
-# --------------------------------------------------------------------------- #
 
 
 class Qwen3_5JitStabilityTest(absltest.TestCase):
