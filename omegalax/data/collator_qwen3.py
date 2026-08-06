@@ -1,41 +1,16 @@
 """Qwen3 / Qwen3.5 SFT collators (ChatML format, vision tokens).
 
-Tokenize chat conversations and produce loss masks. Both collators output
-numpy dicts ready for ``shard_batch_dict``. Model-specific to Qwen3-VL and
-Qwen3.5 (ChatML delimiters, assistant-based loss, Qwen image processor).
-
-Serialization and loss masking are DELEGATED to the ``renderers`` library
-(``renderers.build_training_sample`` + ``Qwen3VLRenderer``); this module owns
+Serialization and loss masking are delegated to ``renderers``; this module owns
 only the JAX-side batching (padding to static shapes, vision-array packing,
-``position_ids_ZBT`` precompute). Three things went away when renderers was
-adopted:
+``position_ids_ZBT`` precompute). No ``role_to_mask`` is passed, so the
+supervised span is the renderers default, pinned by
+``test_renderers_loss_mask_gate``.
 
-* ``qwen3_encoding.build_chatml_text`` — renderers emits the ChatML stream and
-  the ``<|vision_start|>`` + N x ``<|image_pad|>`` + ``<|vision_end|>``
-  expansion, matching ``Qwen3VLProcessor.apply_chat_template`` byte-for-byte
-  (asserted: ``test_sft_collators.TemplateParityTest``).
-
-Renderer config is chosen per model family and never auto-resolved. The VLM
-collator pins ``Qwen3VLRendererConfig``; the TEXT collator must NOT use it,
-because the VL renderer omits the ``<think>\\n\\n</think>\\n\\n`` block that the
-Qwen3 / Qwen3.5 template emits on the final assistant turn — that shrinks the
-supervised span (4 vs 8 mask tokens on a two-assistant-turn conversation) and is
-train/serve skew against vLLM / prime-rl, which render the model's own template.
-``TextSFTCollator`` therefore resolves via ``resolve_text_renderer_config`` and
-self-checks the pick with ``assert_text_template_parity`` at construction.
-* ``qwen3_encoding.encode_qwen_messages`` — ``renderer.render`` does the single
-  BPE-boundary-correct encode; per-image processor output arrives via
-  ``multi_modal_data.mm_items["image"][i]``.
-* ``_build_assistant_loss_mask`` — the renderer's own ``sampled_mask`` is the
-  mask. NO ``role_to_mask`` is passed: the renderers default supervises the
-  whole assistant body plus ``<|im_end|>`` on EVERY assistant turn (including
-  historical ones), excluding the 3-token ``<|im_start|>assistant\\n`` header
-  and the trailing ``\\n`` — exactly the old cumsum mask's contract, per-token
-  instead of reconstructed from token ids.
-
-``mm_token_type_ids`` (0=text / 1=image / 2=video) is kept from
-``RenderedTrainingSample``: the vision encoder needs it to slice image tokens
-out of the packed stream.
+The TEXT collator must NOT use ``Qwen3VLRendererConfig``: the VL renderer omits
+the ``<think>\\n\\n</think>\\n\\n`` block that the Qwen3 / Qwen3.5 template emits
+on the final assistant turn, which shrinks the supervised span (measured: 4 vs 8
+mask tokens on a two-assistant-turn conversation) and is train/serve skew
+against vLLM / prime-rl, which render the model's own template.
 
 Video is not supported: the Qwen3-VL renderer raises ``NotImplementedError`` on
 ``{"type": "video"}`` parts. We feed frames as individual image parts, so this
@@ -75,33 +50,30 @@ _TEXT_TEMPLATE_PROBE = [
 
 
 def resolve_text_renderer_config(
-    tokenizer: PreTrainedTokenizer,
     model_id: str | None = None,
 ) -> Qwen3RendererConfig | Qwen35RendererConfig:
     """Pick the renderer config for a TEXT Qwen model.
 
-    NOT ``Qwen3VLRendererConfig``: the VL renderer omits the
-    ``<think>\\n\\n</think>\\n\\n`` block that the Qwen3 / Qwen3.5 chat template
-    emits on the final assistant turn, which both shortens the rendered stream and
-    shrinks the supervised span (measured: 4 vs 8 mask tokens on a two-assistant-turn
-    conversation). Training with it while vLLM / prime-rl serve the model's own
-    template is train/serve skew.
-
-    Also NOT ``AutoRendererConfig``: resolution there is an exact match on
+    Not ``AutoRendererConfig``: resolution there is an exact match on
     ``tokenizer.name_or_path``, which misses every fine-tuned checkpoint export we
     train from and silently falls back to ``DefaultRenderer`` for text models.
 
     ``Qwen3RendererConfig`` and ``Qwen35RendererConfig`` were measured to render
     byte-identically for both the Qwen3 and Qwen3.5 tokenizers across plain,
-    multi-turn and inline-``<think>`` conversations, so the distinction does not
-    currently affect our SFT data; we still pick the family-correct one when
-    ``model_id`` identifies it, so a future template divergence lands correctly.
+    multi-turn and inline-``<think>`` conversations, so the family split changes
+    nothing today. It is kept only so a future template divergence lands on the
+    right config; ``assert_text_template_parity`` is what actually catches a
+    wrong pick. The registry predicate is the single spelling of "is this
+    Qwen3.5" -- a ``"qwen3.5" in model_id`` substring test would guess, and guess
+    wrong for any fine-tune not named after its base.
     """
-    if model_id is not None:
-        from omegalax.models.qwen3_5.config import is_supported_qwen3_5_model_id  # noqa: PLC0415
+    if model_id is None:
+        return Qwen3RendererConfig()
 
-        if is_supported_qwen3_5_model_id(model_id) or "qwen3.5" in model_id.lower():
-            return Qwen35RendererConfig()
+    from omegalax.models.qwen3_5.config import is_supported_qwen3_5_model_id  # noqa: PLC0415
+
+    if is_supported_qwen3_5_model_id(model_id):
+        return Qwen35RendererConfig()
     return Qwen3RendererConfig()
 
 
@@ -160,10 +132,10 @@ class Qwen3RendererEncoder:
     re-pickles the measure fn into each worker; the HF tokenizer pickles, the
     renderer's caches need not travel).
 
-    ``renderer_config`` MUST be passed explicitly rather than auto-resolved:
-    renderer resolution is an exact match on ``tokenizer.name_or_path`` against
-    ``MODEL_RENDERER_MAP`` and *raises* for a VLM that misses the map, which is
-    every fine-tuned checkpoint export we train from.
+    The config is pinned here, never auto-resolved: ``AutoRendererConfig`` is an
+    exact match on ``tokenizer.name_or_path`` against ``MODEL_RENDERER_MAP`` and
+    *raises* for a VLM that misses the map, which is every fine-tuned checkpoint
+    export we train from.
     """
 
     def __init__(
@@ -174,7 +146,9 @@ class Qwen3RendererEncoder:
     ) -> None:
         self.tokenizer = tokenizer
         self.image_processor = image_processor
-        self.renderer_config = renderer_config or Qwen3VLRendererConfig()
+        self.renderer_config = (
+            Qwen3VLRendererConfig() if renderer_config is None else renderer_config
+        )
         self._renderer = None
 
     def __getstate__(self) -> dict[str, Any]:
@@ -202,15 +176,13 @@ class Qwen3RendererEncoder:
     def render(self, messages: list[dict[str, Any]]):
         """``messages -> RenderedTrainingSample``.
 
-        Named (not just ``__call__``) because ``encode`` must reach it without
-        going through ``__call__``: ``_MessageLengthFn`` overrides ``__call__``
-        with a *different* signature and calls ``encode`` from it, so an
-        ``encode -> self(...)`` self-call is unbounded mutual recursion.
+        This class deliberately defines NO ``__call__``. ``_MessageLengthFn``
+        subclasses it and is invoked as ``fn(message)`` with a different
+        signature, so a base ``__call__`` that forwards to ``render`` plus an
+        ``encode`` that self-calls via ``self(...)`` is unbounded mutual
+        recursion -- that shipped once and killed every chunk-index job.
         """
         return build_training_sample(self.renderer, resolve_message_images(messages))
-
-    def __call__(self, messages: list[dict[str, Any]]):
-        return self.render(messages)
 
     def encode(self, messages: list[dict[str, Any]]) -> dict[str, np.ndarray]:
         """``token_ids`` + ``loss_mask`` + concatenated vision arrays for one example."""
@@ -300,12 +272,8 @@ class TextSFTCollator:
         assert tokenizer.pad_token_id is not None, (
             "tokenizer must have pad_token_id set (e.g. Qwen3-VL, Qwen3.5)"
         )
-        # A TEXT model must NOT get Qwen3VLRendererConfig: it drops the
-        # <think>\n\n</think>\n\n block the Qwen3/Qwen3.5 template emits, shrinking
-        # both the stream and the supervised span. Self-check the auto-resolved
-        # pick against the tokenizer's own template so skew fails at startup.
         if renderer_config is None:
-            renderer_config = resolve_text_renderer_config(tokenizer, model_id)
+            renderer_config = resolve_text_renderer_config(model_id)
             assert_text_template_parity(tokenizer, renderer_config)
         self._encoder = Qwen3RendererEncoder(tokenizer, None, renderer_config)
 
@@ -441,17 +409,12 @@ class VLMSFTCollator:
     """Collate Qwen multimodal chat examples into padded numpy arrays with loss masks.
 
     Expects messages in the Qwen structured-content format where images are
-    inline ``{"type": "image", "url": "..."}`` blocks inside ``content``
-    lists.  Builds ChatML text with the correct number of image pad tokens
-    and encodes via ``tokenizer.encode``.  Images are preprocessed by the
-    HF image processor (slow path, NumPy backend).
+    inline ``{"type": "image", "url": "..."}`` blocks inside ``content`` lists.
 
-    Outputs ``{"token_ids_BT", "attention_mask_BT", "loss_mask_BT",
-    "mm_token_type_ids_BT"}`` plus ``"pixel_values"``, ``"image_grid_thw"``,
-    and ``"position_ids_ZBT"`` when images are present.
-    ``mm_token_type_ids_BT`` comes straight from the renderer's placeholder
-    ranges (0=text / 1=image / 2=video) — the vision encoder slices image
-    tokens out of the packed stream with it.
+    Every key is always present at a fixed shape, images or not, so ``train_step``
+    never recompiles: ``token_ids_BT``, ``attention_mask_BT``, ``loss_mask_BT``,
+    ``mm_token_type_ids_BT``, ``pixel_values``, ``image_grid_thw``,
+    ``vision_cu_seqlens``, ``position_ids_ZBT``.
 
     ``position_ids_ZBT`` is precomputed here (on CPU, via numpy) so the
     model's ``get_rope_index`` never needs to run inside ``jax.jit``.

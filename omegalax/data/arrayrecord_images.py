@@ -1,16 +1,11 @@
 """ArrayRecord (``ar://``) image-reference resolution.
 
-Moved verbatim out of the deleted ``omegalax/data/qwen3_encoding.py``. This is
-the one part of that module the ``renderers`` library does *not* subsume:
 ``renderers`` resolves ``ImagePart`` sources that PIL understands (a PIL image,
-a filesystem path, an http(s) URL, a base64 data URI), but it has no notion of
-our grain image store's ``ar:///shard.array_record#42`` URIs.
-
-The seam is therefore "resolve refs, then render": :func:`resolve_message_images`
-rewrites every ``ar://`` reference in a message list into a live PIL image, and
-the renderer sees an ordinary ``{"type": "image", "image": <PIL.Image>}`` part.
-Message serialization, vision-placeholder expansion and loss masking all live in
-``renderers`` (see ``omegalax/data/collator_qwen3.py``).
+a filesystem path, an http(s) URL, a base64 data URI) but has no notion of our
+grain image store's ``ar:///shard.array_record#42`` URIs, so the seam is
+"resolve refs, then render": :func:`resolve_message_images` rewrites every
+``ar://`` reference into a live PIL image and the renderer sees an ordinary
+``{"type": "image", "image": <PIL.Image>}`` part.
 """
 
 from __future__ import annotations
