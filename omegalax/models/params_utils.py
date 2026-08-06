@@ -44,8 +44,8 @@ def _place_like(value: jax.Array, target: Any, sharding: NamedSharding | None = 
     # takes precedence. We must NOT fall back to `target.sharding` when the target
     # is an abstract `eval_shape` leaf: that sharding carries an AbstractMesh, which
     # `jax.device_put` cannot place ("is_fully_addressable not implemented"). Callers
-    # loading into an abstract state pass `sharding=`; legacy callers (concrete target
-    # arrays) pass nothing and keep the old behavior.
+    # loading into an abstract state pass `sharding=`; a caller holding a concrete
+    # target array passes nothing and falls back to that array's own sharding.
     if sharding is not None:
         return jax.device_put(value, sharding)
     target_sharding = getattr(target, "sharding", None)

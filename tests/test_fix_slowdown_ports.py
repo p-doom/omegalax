@@ -1,4 +1,4 @@
-"""GPU verification of fix-slowdown ports to qwen3 and qwen3_5.
+"""GPU verification of the qwen3 / qwen3_5 packed-attention paths.
 
 Covers four layered checks:
 
@@ -72,8 +72,8 @@ def _block_diag_reference(
 class CuDnnPackedVisionAttentionTest(absltest.TestCase):
     """Validates the cuDNN packed kernel + cu_seqlens path used by both VLMs.
 
-    Uses unequal segment sizes — the precise case the `Mask(k_start, k_end)`
-    path used to handle on the old branch.
+    Uses unequal segment sizes, which is the case a uniform-segment mask cannot
+    express.
     """
 
     def test_unequal_segments_match_reference(self):
