@@ -22,10 +22,6 @@ dependencies = [
   "Pillow",
   # Sourced from the vendored checkout in [tool.uv.sources] below, which is the
   # copy prime-rl is pinned to, so training and rollout share one renderer.
-  # Sharing the library is necessary but NOT sufficient for identical rendering:
-  # the renderer CONFIG must also match per model family (a text model rendered
-  # with Qwen3VLRendererConfig loses the <think>\n\n</think>\n\n block that
-  # prime-rl's Qwen3 renderer emits).
   "renderers",
   "safetensors",
   "tokamax @ git+https://github.com/p-doom/tokamax.git@nested-mask", # change after fix has been upstreamed
