@@ -78,11 +78,9 @@ def _get_vision_key_mapping():
     """HF → JAX mapping for vision encoder weights."""
     p = r"model\.visual\."
     return {
-        # Patch embedding (Conv3D handled separately)
+        # Conv3D patch-embed weight is handled separately; only the bias maps here.
         p + r"patch_embed\.proj\.bias": ("vision.patch_embed.proj.bias", Transform.BIAS),
-        # Position embedding
         p + r"pos_embed\.weight": ("vision.pos_embed.embedding", Transform.EMBED),
-        # Blocks
         p + r"blocks\.([0-9]+)\.norm1\.weight": (r"vision.blocks.\1.norm1.weight", Transform.SCALE),
         p + r"blocks\.([0-9]+)\.norm1\.bias": (r"vision.blocks.\1.norm1.bias", Transform.BIAS),
         p + r"blocks\.([0-9]+)\.attn\.qkv\.weight": (
@@ -119,7 +117,6 @@ def _get_vision_key_mapping():
             r"vision.blocks.\1.mlp.fc2.bias",
             Transform.BIAS,
         ),
-        # Merger
         p + r"merger\.norm\.weight": ("vision.merger.norm.weight", Transform.SCALE),
         p + r"merger\.norm\.bias": ("vision.merger.norm.bias", Transform.BIAS),
         p + r"merger\.linear_fc1\.weight": ("vision.merger.fc1.kernel", Transform.LINEAR),
@@ -230,7 +227,6 @@ def _get_non_expert_mapping():
     return mapping
 
 
-# Regex patterns for special keys
 _CONV1D_RE = re.compile(r"model\.language_model\.layers\.(\d+)\.linear_attn\.conv1d\.weight")
 _DT_BIAS_RE = re.compile(r"model\.language_model\.layers\.(\d+)\.linear_attn\.dt_bias")
 _A_LOG_RE = re.compile(r"model\.language_model\.layers\.(\d+)\.linear_attn\.A_log")

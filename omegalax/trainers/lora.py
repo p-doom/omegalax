@@ -121,7 +121,7 @@ class LoRALinear(nnx.Module):
             jnp.zeros((r, d_out), dtype=adapter_dtype),
         )
 
-    # ---- forward-compat surface so callers that read base.kernel etc. still work ----
+    # Forward-compat surface so callers that read base.kernel etc. still work.
     @property
     def kernel(self):
         return self.base.kernel

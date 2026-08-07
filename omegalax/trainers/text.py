@@ -330,7 +330,6 @@ def run_sft(
     with mesh_rules(mesh):
         optimizer = build_optimizer(model, train_cfg)
 
-    # Init cpu learning rate scheduler function for logging
     lr_schedule_fn = build_lr_schedule(
         peak_lr=train_cfg.learning_rate,
         num_steps=train_cfg.num_steps,

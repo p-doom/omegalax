@@ -238,33 +238,28 @@ def _validate_flags() -> None:
         if FLAGS[name].value is None:
             problems.append(name)
 
-    # Exactly one data source.
     if (FLAGS.data_path is None) == (FLAGS.data_mix is None):
         problems.append("exactly one of {data_path, data_mix} (got neither or both)")
 
-    # enable_lora / freeze_vision_tower are mutually exclusive (both freeze the vision tower).
+    # Both freeze the vision tower, so asking for both is a contradiction, not a no-op.
     if FLAGS.enable_lora and FLAGS.freeze_vision_tower:
         problems.append("enable_lora and freeze_vision_tower are mutually exclusive")
 
-    # LoRA hyperparameters required only when LoRA is on.
     if FLAGS.enable_lora:
         for name in ("lora_rank", "lora_alpha"):
             if FLAGS[name].value is None:
                 problems.append(f"{name} (required when enable_lora=true)")
 
-    # Validation cadence required only when a validation set is configured.
     if FLAGS.val_data_path:
         for name in ("val_every", "val_steps"):
             if FLAGS[name].value is None:
                 problems.append(f"{name} (required when val_data_path is set)")
 
-    # LR-schedule shape parameters required only for the schedules that use them.
     if FLAGS.lr_schedule in ("cosine", "wsd") and FLAGS.lr_end_factor is None:
         problems.append(f"lr_end_factor (required when lr_schedule={FLAGS.lr_schedule})")
     if FLAGS.lr_schedule == "wsd" and FLAGS.lr_stable_fraction is None:
         problems.append("lr_stable_fraction (required when lr_schedule=wsd)")
 
-    # Weights & Biases is opt-in via wandb_project; if on, identifying fields are required.
     if FLAGS.wandb_project:
         for name in ("wandb_entity", "wandb_group", "wandb_name"):
             if FLAGS[name].value is None:

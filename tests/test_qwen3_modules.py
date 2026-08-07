@@ -1,6 +1,6 @@
 """Module-level numerical equivalence tests.
 
-Each test feeds the **identical** input (produced by HF) into both the JAX
+Each test feeds the identical input (produced by HF) into both the JAX
 and HuggingFace implementations of a single module so that per-module error
 is measured in isolation, without accumulation from prior layers.
 

@@ -390,7 +390,6 @@ def run_sft(
 
     # Build the canonical CheckpointManager up-front so a single ``latest_step()``
     # query drives both the model_cfg-source decision and the eventual restore.
-    # No throwaway probes.
     checkpoint_manager: ocp.CheckpointManager | None = None
     if save_path is not None:
         save_path.mkdir(parents=True, exist_ok=True)
@@ -677,7 +676,6 @@ def run_sft(
             accum_hardware_flops += micro_flops.hardware
             accum_time += micro_delta
 
-        # Log memory after first step and after 5 steps
         if not _mem_logged_after_first_step:
             jax.block_until_ready(metrics["loss"])
             log_device_memory("after first step (compile done)", save_dir=save_path)
