@@ -163,7 +163,6 @@ def export_qwen3_5_to_safetensors(
             ].astype(np.float32)
             return True
 
-        # dt_bias
         m = re.fullmatch(r"text\.layers\.([0-9]+)\.linear_attn\.dt_bias", jax_key)
         if m:
             layer_idx = m.group(1)
@@ -173,7 +172,6 @@ def export_qwen3_5_to_safetensors(
             )
             return True
 
-        # A_log
         m = re.fullmatch(r"text\.layers\.([0-9]+)\.linear_attn\.A_log", jax_key)
         if m:
             layer_idx = m.group(1)

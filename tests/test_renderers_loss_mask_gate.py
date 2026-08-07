@@ -1,13 +1,12 @@
-"""Gate: the ``renderers`` default loss mask IS our supervision target.
+"""Gate: the ``renderers`` default loss mask is our supervision target.
 
-Locks in the one property the whole adoption rests on. We pass NO
-``role_to_mask``, so ``build_training_sample`` returns the renderer's
-``sampled_mask`` verbatim. That default must be, for EVERY assistant turn
+We pass no ``role_to_mask``, so ``build_training_sample`` returns the renderer's
+``sampled_mask`` verbatim. That default must be, for every assistant turn
 including historical ones: the assistant content plus ``<|im_end|>``, excluding
 the 3-token ``<|im_start|>assistant\\n`` header and the trailing ``\\n``.
 
 If a renderers bump changes this, the mask silently shifts and every SFT run
-trains on the wrong spans — so this test, not a comment, is the contract.
+trains on the wrong spans.
 """
 
 import os

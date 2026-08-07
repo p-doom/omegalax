@@ -19,7 +19,6 @@ P = PartitionSpec
 wp = nnx.with_partitioning
 
 
-# Feed-forward blocks
 class MLP(nnx.Module):
     """Standard gated MLP."""
 
@@ -180,7 +179,6 @@ class MoEFeedForward(nnx.Module):
         return output_BTD, aux_loss
 
 
-# Decoder Layer
 class DecoderLayer(nnx.Module):
     """Hybrid decoder layer: full_attention or linear_attention + dense MLP or MoE."""
 
@@ -238,7 +236,6 @@ class DecoderLayer(nnx.Module):
         return hidden_BTD, aux_loss
 
 
-# Text Model
 class TextModel(nnx.Module):
     """Qwen3.5 text decoder."""
 
@@ -318,7 +315,6 @@ class TextModel(nnx.Module):
         return hidden_BTD, total_aux
 
 
-# Causal LM
 class Qwen3_5ForCausalLM(nnx.Module):
     """Text-only causal language model."""
 
@@ -340,7 +336,6 @@ class Qwen3_5ForCausalLM(nnx.Module):
         return self.text(token_ids_BT=token_ids_BT, segment_ids_BT=segment_ids_BT)
 
 
-# VLM
 class Qwen3_5ForConditionalGeneration(nnx.Module):
     """Vision-Language Model."""
 
