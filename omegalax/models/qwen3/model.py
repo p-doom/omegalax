@@ -7,7 +7,7 @@ import jax.numpy as jnp
 from flax import nnx
 from jax.sharding import PartitionSpec as P, reshard
 from omegalax.models.moe_grouped import grouped_moe
-from omegalax.models.remat_policy import resolve_remat_policy
+from omegalax.models.remat_policy import resolve_remat_policy, tag_offload_residual
 from .attention import Attention
 from .config import Qwen3Config
 from .norms import RMSNorm
@@ -172,7 +172,7 @@ class DecoderLayer(nnx.Module):
         else:
             ff_out_BTD = self.mlp(post_norm_BTD)
             aux_loss = jnp.array(0.0, dtype=jnp.float32)
-        out_BTD = attn_out_BTD + ff_out_BTD
+        out_BTD = tag_offload_residual(attn_out_BTD + ff_out_BTD, self._remat_policy_name)
         return out_BTD, aux_loss
 
 

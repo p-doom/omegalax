@@ -37,6 +37,7 @@ from omegalax.trainers.perf import (
     StepFlops,
     StepTimer,
 )
+from omegalax.trainers.offload import resolve_offload_enabled
 from omegalax.trainers.optim import MixedPrecisionOptimizer
 from omegalax.trainers.lora import LoRAParam, inject_lora
 from omegalax.trainers.text import startup_log
@@ -82,6 +83,8 @@ class TrainConfig:
     lora_alpha: float = 32.0
     freeze_vision_tower: bool = False
     num_loss_tiles: int = 4
+    # Host offload of the fp32 optimizer moments (Adam mu/nu); see omegalax.trainers.offload.
+    offload_optimizer: bool = False
 
 
 def init_model(
@@ -119,6 +122,10 @@ def build_optimizer(
     tx = optax.chain(*chain)
     tx = optax.MultiSteps(tx, every_k_schedule=train_cfg.grad_accum_steps)
     opt = MixedPrecisionOptimizer(model, tx, wrt=wrt)
+    # Enable before checkpoint restore so restored shardings match the host-resident state.
+    if resolve_offload_enabled(train_cfg.offload_optimizer):
+        opt.enable_state_offload()
+        startup_log("optimizer-state host offload ENABLED (moments on pinned_host)")
     return opt
 
 
@@ -230,7 +237,12 @@ def _restore_sft_checkpoint(
         expected_state,
         train_state["optimizer"],
     )
+    was_offloaded = optimizer.offload_optimizer_state
     nnx.update(optimizer, restored_state)
+    # Orbax restores opt_state onto device (dropping the pinned_host memory kind),
+    # so re-apply host placement to keep the moments off HBM.
+    if was_offloaded:
+        optimizer.enable_state_offload()
     return (
         optimizer,
         int(latest_step),

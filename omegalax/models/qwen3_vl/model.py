@@ -12,7 +12,7 @@ from jax.sharding import PartitionSpec, reshard
 from tokamax import dot_product_attention
 
 from omegalax.models.moe_grouped import grouped_moe
-from omegalax.models.remat_policy import resolve_remat_policy
+from omegalax.models.remat_policy import resolve_remat_policy, tag_offload_residual
 from .config import Qwen3VLConfig
 from .vision import VisionModel
 
@@ -450,6 +450,7 @@ class TextDecoderLayer(nnx.Module):
         self.mlp = TextMoEFeedForward(cfg, rngs=rngs) if self.is_moe else TextMLP(cfg, rngs=rngs)
 
         self._remat_policy = resolve_remat_policy(cfg.remat_policy)
+        self._remat_policy_name = cfg.remat_policy
 
     def __call__(
         self, hidden_BTD: jax.Array, sin_BTK: jax.Array, cos_BTK: jax.Array
@@ -468,7 +469,7 @@ class TextDecoderLayer(nnx.Module):
         else:
             ff_out_BTD = self.mlp(self.post_attention_layernorm(hidden_BTD))
             aux_loss = jnp.array(0.0, dtype=jnp.float32)
-        hidden_BTD = hidden_BTD + ff_out_BTD
+        hidden_BTD = tag_offload_residual(hidden_BTD + ff_out_BTD, self._remat_policy_name)
         return hidden_BTD, aux_loss
 
 
