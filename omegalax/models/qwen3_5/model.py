@@ -7,7 +7,7 @@ import jax.numpy as jnp
 from flax import nnx
 from jax.sharding import PartitionSpec, reshard
 
-from omegalax.models.moe_grouped import grouped_moe
+from omegalax.models.moe_grouped import grouped_moe_ep
 from omegalax.models.remat_policy import resolve_remat_policy
 from omegalax.models.shard_config import ShardConfig
 from .attention import Attention
@@ -143,12 +143,12 @@ class MoEFeedForward(nnx.Module):
         up_proj = jnp.astype(self.up_proj[...], compute_dtype)
         down_proj = jnp.astype(self.down_proj[...], compute_dtype)
 
-        # Dropless grouped-GEMM MoE for the routed experts (single-device grouped
-        # path). The shared expert / gate below are separate and unchanged.
+        # Dropless grouped-GEMM MoE for the routed experts; grouped_moe_ep self-selects
+        # EP (1 == single-device). The shared expert / gate below are separate.
         flat_hidden_ND = hidden_BTD.reshape(B * T, cfg.hidden_size)
         flat_idx_Nk = topk_idx_BTk.reshape(B * T, cfg.num_experts_per_tok)
         flat_w_Nk = topk_weights_BTk.reshape(B * T, cfg.num_experts_per_tok)
-        moe_out_ND = grouped_moe(
+        moe_out_ND = grouped_moe_ep(
             flat_hidden_ND,
             flat_idx_Nk,
             flat_w_Nk,
