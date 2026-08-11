@@ -192,6 +192,7 @@ class VLMSFTCollator:
         *,
         max_vision_patches_per_sample: int | None = None,
         max_vision_images_per_sample: int | None = None,
+        batched_vision_padding: bool = False,
         pixel_values_dtype: Any = ml_dtypes.bfloat16,
     ) -> None:
         self.tokenizer = tokenizer
@@ -199,6 +200,13 @@ class VLMSFTCollator:
         self.image_processor = image_processor
         self._max_vision_patches_per_sample = max_vision_patches_per_sample
         self._max_vision_images_per_sample = max_vision_images_per_sample
+        # When True, pad EACH sample to (max_vision_patches_per_sample patches,
+        # max_vision_images_per_sample image slots) so the flat vision sequence
+        # reshapes to a real [B, S, ...] batch for cuDNN batched attention
+        # (Qwen3-VL Option A). When False, keep the legacy batch-wide global-sum
+        # padding bucket (max_vision_*_per_sample * batch_size), which every other
+        # model (e.g. Qwen3.5) still expects.
+        self._batched_vision_padding = batched_vision_padding
         self._pixel_values_dtype = pixel_values_dtype
         assert tokenizer.pad_token_id is not None, (
             "tokenizer must have pad_token_id set (e.g. Qwen3-VL, Qwen3.5)"
@@ -226,6 +234,11 @@ class VLMSFTCollator:
         batch_mask: list[np.ndarray] = []
         all_pixel_values: list[np.ndarray] = []
         all_grid_thw: list[np.ndarray] = []
+        # Per-example vision arrays (empty placeholder for text-only samples) so we
+        # can pad EACH sample to a fixed (S patches, M images) block — required for
+        # the batched [B, S, ...] vision-attention layout (Option A).
+        ex_pixel_values: list[np.ndarray] = []
+        ex_grid_thw: list[np.ndarray] = []
 
         for ex in examples:
             messages = ex["messages"]
@@ -245,6 +258,11 @@ class VLMSFTCollator:
             if "pixel_values" in encoded:
                 all_pixel_values.append(encoded["pixel_values"])
                 all_grid_thw.append(encoded["image_grid_thw"])
+                ex_pixel_values.append(encoded["pixel_values"])
+                ex_grid_thw.append(encoded["image_grid_thw"])
+            else:
+                ex_pixel_values.append(np.zeros((0, self._patch_feat_dim), dtype=np.float32))
+                ex_grid_thw.append(np.zeros((0, 3), dtype=np.int32))
 
             seq_len = len(full_ids)
             pad_len = self.max_length - seq_len
@@ -273,18 +291,17 @@ class VLMSFTCollator:
             "loss_mask_BT": np.stack(batch_mask).astype(np.int32),
         }
 
+        # Real (unpadded) grid, concatenated in sample order — used ONLY to
+        # compute position_ids, which depend solely on real <|image_pad|>
+        # positions in token_ids_BT.
         if all_pixel_values:
-            pixel_values = np.concatenate(all_pixel_values, axis=0)
-            image_grid_thw = np.concatenate(all_grid_thw, axis=0)
+            real_grid_thw = np.concatenate(all_grid_thw, axis=0)
         else:
-            pixel_values = np.zeros((0, self._patch_feat_dim), dtype=np.float32)
-            image_grid_thw = np.zeros((0, 3), dtype=np.int32)
+            real_grid_thw = np.zeros((0, 3), dtype=np.int32)
 
-        # Compute position_ids from REAL (unpadded) grid — these only
-        # depend on real <|image_pad|> positions in token_ids_BT.
         position_ids, _ = get_rope_index(
             result["token_ids_BT"],
-            image_grid_thw=image_grid_thw,
+            image_grid_thw=real_grid_thw,
             attention_mask=result["attention_mask_BT"],
             spatial_merge_size=self.image_processor.merge_size,
             image_token_id=self._image_token_id,
@@ -293,26 +310,75 @@ class VLMSFTCollator:
         )
         result["position_ids_ZBT"] = position_ids.astype(np.int32)
 
-        # Pad vision arrays to static shapes so JAX JIT never recompiles.
-        # Per-sample limits are multiplied by batch size so the user
-        # doesn't need to recompute when changing batch_size.
-        if (
+        ms = self.image_processor.merge_size
+        ms2 = ms * ms
+        padding_enabled = (
             self._max_vision_patches_per_sample is not None
             and self._max_vision_images_per_sample is not None
-        ):
+        )
+        vision_merged_valid: np.ndarray | None = None
+
+        if self._batched_vision_padding and padding_enabled:
+            # Batched vision layout (Option A): pad EACH sample to exactly
+            # (S patches, M image slots) so the flat [B*S, ...] vision sequence
+            # reshapes to [B, S, ...] on sample boundaries and cuDNN can shard
+            # the batch dim. Dummy images fill the remaining patch budget so every
+            # token still belongs to a (real or dummy) image segment (keeps the
+            # per-token pos-embed / RoPE path unchanged). ``vision_merged_valid``
+            # marks the real (front) merged tokens of each S-block for the LLM
+            # merge-in, since padding merged tokens are now interleaved per sample.
+            S = self._max_vision_patches_per_sample
+            M = self._max_vision_images_per_sample
+            merged_per_sample = S // ms2
+            per_pv: list[np.ndarray] = []
+            per_grid: list[np.ndarray] = []
+            per_valid: list[np.ndarray] = []
+            for pv_i, grid_i in zip(ex_pixel_values, ex_grid_thw):
+                padded_pv, padded_grid, _ = _pad_vision_arrays(
+                    pv_i, grid_i, merge_size=ms, max_patches=S, max_images=M
+                )
+                n_real_merged = pv_i.shape[0] // ms2
+                valid = np.zeros(merged_per_sample, dtype=np.int32)
+                valid[:n_real_merged] = 1
+                per_pv.append(padded_pv)
+                per_grid.append(padded_grid)
+                per_valid.append(valid)
+            pixel_values = np.concatenate(per_pv, axis=0)  # [B*S, feat]
+            image_grid_thw = np.concatenate(per_grid, axis=0)  # [B*M, 3]
+            vision_merged_valid = np.concatenate(per_valid, axis=0)  # [B*merged_per_sample]
+            vision_cu_seqlens = _compute_vision_cu_seqlens(image_grid_thw)
+        elif padding_enabled:
+            # Legacy global-sum padding: one batch-wide bucket
+            # (max_vision_*_per_sample * batch_size), dummies appended at the end
+            # so real merged tokens stay front-contiguous (no compaction needed).
+            if all_pixel_values:
+                pixel_values = np.concatenate(all_pixel_values, axis=0)
+                image_grid_thw = np.concatenate(all_grid_thw, axis=0)
+            else:
+                pixel_values = np.zeros((0, self._patch_feat_dim), dtype=np.float32)
+                image_grid_thw = np.zeros((0, 3), dtype=np.int32)
             bs = len(examples)
             pixel_values, image_grid_thw, vision_cu_seqlens = _pad_vision_arrays(
                 pixel_values,
                 image_grid_thw,
-                merge_size=self.image_processor.merge_size,
+                merge_size=ms,
                 max_patches=self._max_vision_patches_per_sample * bs,
                 max_images=self._max_vision_images_per_sample * bs,
             )
         else:
+            # No padding: a single flat packed sequence (recompiles per batch shape).
+            if all_pixel_values:
+                pixel_values = np.concatenate(all_pixel_values, axis=0)
+                image_grid_thw = np.concatenate(all_grid_thw, axis=0)
+            else:
+                pixel_values = np.zeros((0, self._patch_feat_dim), dtype=np.float32)
+                image_grid_thw = np.zeros((0, 3), dtype=np.int32)
             vision_cu_seqlens = _compute_vision_cu_seqlens(image_grid_thw)
 
         result["pixel_values"] = pixel_values.astype(self._pixel_values_dtype, copy=False)
         result["image_grid_thw"] = image_grid_thw
         result["vision_cu_seqlens"] = vision_cu_seqlens
+        if vision_merged_valid is not None:
+            result["vision_merged_valid"] = vision_merged_valid
 
         return result

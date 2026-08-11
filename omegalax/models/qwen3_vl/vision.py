@@ -18,94 +18,88 @@ from omegalax.models.shard_config import ShardConfig
 from .config import Qwen3VLVisionConfig
 
 
-def _cudnn_packed_vision_attention_local(
-    q_NHK: jax.Array,
-    k_NHK: jax.Array,
-    v_NHK: jax.Array,
-    cu_seqlens: jax.Array,
-    seqlens: jax.Array,
+def _cudnn_batched_vision_attention_local(
+    q_BSHK: jax.Array,
+    k_BSHK: jax.Array,
+    v_BSHK: jax.Array,
+    seqlens_BM: jax.Array,
+    offsets_BM1: jax.Array,
     scale: float,
 ) -> jax.Array:
-    cu = cu_seqlens.astype(jnp.int32)
-    q_offsets = cu[None]
-    kv_offsets = cu[None]
-    seqlens_1M = seqlens.astype(jnp.int32)[None]
+    """cuDNN batched packed (THD) attention on a device-local shard.
 
+    ``seqlens_BM``/``offsets_BM1`` give the per-image segment boundaries within
+    each sample; cuDNN skips cross-segment tiles rather than materializing a full
+    ``[S, S]`` mask, so the backward stays fused (dQ/dK/dV only, no dense
+    ``[H, S, S]`` score matrix).
+    """
     # force bfloat16 - cuDNN flash attention only supports fp16/bf16/fp8
-    orig_dtype = q_NHK.dtype
-    q_NHK = q_NHK.astype(jnp.bfloat16)
-    k_NHK = k_NHK.astype(jnp.bfloat16)
-    v_NHK = v_NHK.astype(jnp.bfloat16)
-
+    orig_dtype = q_BSHK.dtype
     out = _cudnn_dot_product_attention(
-        q_NHK[None],
-        k_NHK[None],
-        v_NHK[None],
-        q_seqlen=seqlens_1M,
-        kv_seqlen=seqlens_1M,
-        q_offsets=q_offsets,
-        kv_offsets=kv_offsets,
+        q_BSHK.astype(jnp.bfloat16),
+        k_BSHK.astype(jnp.bfloat16),
+        v_BSHK.astype(jnp.bfloat16),
+        q_seqlen=seqlens_BM.astype(jnp.int32),
+        kv_seqlen=seqlens_BM.astype(jnp.int32),
+        q_offsets=offsets_BM1.astype(jnp.int32),
+        kv_offsets=offsets_BM1.astype(jnp.int32),
         scale=scale,
         mask_type=_CuDnnMaskType.NO_MASK,
         qkv_layout="BTNH",
     )
-    return out[0].astype(orig_dtype)
+    return out.astype(orig_dtype)
 
 
-def _cudnn_packed_vision_attention(
-    q_NHK: jax.Array,
-    k_NHK: jax.Array,
-    v_NHK: jax.Array,
-    cu_seqlens: jax.Array,
-    seqlens: jax.Array,
+def _cudnn_batched_vision_attention(
+    q_BSHK: jax.Array,
+    k_BSHK: jax.Array,
+    v_BSHK: jax.Array,
+    seqlens_BM: jax.Array,
+    offsets_BM1: jax.Array,
     scale: float,
 ) -> jax.Array:
-    """Run vision attention via cuDNN's packed (THD) kernel.
+    """Batched packed vision attention, sharded on **batch** (and num_head).
 
-    All image tokens are concatenated along the sequence dim. ``cu_seqlens``
-    describes per-image segment boundaries; cuDNN uses these to skip
-    cross-segment tiles entirely rather than materializing a full [T, S] mask.
+    The ViT has no batch dim natively; per-sample padding gives us a real
+    ``[B, S, num_heads, head_dim]`` batch (each sample a contiguous S-row). We
+    run cuDNN inside a ``shard_map`` over the batch (dp/fsdp) and head (tp) axes,
+    so each device computes attention only for its own samples/heads over the
+    full ``S`` sequence — exactly correct for packed block-diagonal attention
+    (no cross-device dependency), memory-safe (per-device
+    ``[B_local, S, H_local, K]`` → cost ``Σ n_i²``, never a global ``[N, N]``),
+    and fused (cuDNN's own fwd+bwd runs locally).
 
-    Under multi-device dp sharding, cuDNN's internal ``_fix_seqlen_offsets``
-    runs ``jnp.nonzero(..., size=size)`` on ``q_seqlen``, which lowers to a
-    scatter that can't resolve an output sharding when any of its inputs are
-    dp-sharded.  We wrap the whole call in ``shard_map`` so each device sees
-    only its local shards (no explicit sharding inside), matching cuDNN's
-    per-device view.
-
-    ``seqlens`` is passed in rather than computed via ``jnp.diff(cu_seqlens)``
-    since ``diff`` would slice a sharded (dp*(M+1),) axis to (dp*(M+1) - 1,),
-    which is not evenly divisible by ``dp``.
+    ``shard_map`` (not cuDNN's ``custom_partitioning``) is required because under
+    an all-Explicit mesh the partitioner leaves an unlowered ``Sharding`` custom
+    call ("No registered implementation for custom call to Sharding" on CUDA).
+    Sharding **batch**, not the sequence axis, keeps every image's tokens on one
+    device — fixing both that error and the old token-shard correctness hazard.
 
     Args:
-        q_NHK, k_NHK, v_NHK: (N, num_heads, head_dim) with N == cu_seqlens[-1].
-        cu_seqlens: int32, shape (M+1,). Static length at trace time.
-        seqlens: int32, shape (M,). Per-segment token counts.
+        q/k/v_BSHK: ``(B, S, num_heads, head_dim)`` (BTNH), batch sharded over
+            (dp,fsdp), heads over tp.
+        seqlens_BM: int32 ``(B, M)`` per-image token counts, batch-sharded.
+        offsets_BM1: int32 ``(B, M+1)`` per-sample cumulative offsets (0..S),
+            batch-sharded.
         scale: attention logits scale.
-    Returns:
-        (N, num_heads, head_dim)
     """
-    sharding = jax.typeof(q_NHK).sharding
-    dp_axis = sharding.spec[0]
-    if dp_axis is None:
-        return _cudnn_packed_vision_attention_local(
-            q_NHK,
-            k_NHK,
-            v_NHK,
-            cu_seqlens,
-            seqlens,
-            scale,
+    sharding = jax.typeof(q_BSHK).sharding
+    batch_axis = sharding.spec[0]
+    head_axis = sharding.spec[2]
+    if batch_axis is None and head_axis is None:
+        return _cudnn_batched_vision_attention_local(
+            q_BSHK, k_BSHK, v_BSHK, seqlens_BM, offsets_BM1, scale
         )
 
-    q_spec = P(dp_axis, None, None)
-    cu_spec = P(dp_axis)
+    q_spec = P(batch_axis, None, head_axis, None)
+    m_spec = P(batch_axis, None)
     return jax.shard_map(
-        lambda q, k, v, cu, sq: _cudnn_packed_vision_attention_local(q, k, v, cu, sq, scale),
+        lambda q, k, v, sl, off: _cudnn_batched_vision_attention_local(q, k, v, sl, off, scale),
         mesh=sharding.mesh,
-        in_specs=(q_spec, q_spec, q_spec, cu_spec, cu_spec),
+        in_specs=(q_spec, q_spec, q_spec, m_spec, m_spec),
         out_specs=q_spec,
         check_vma=False,
-    )(q_NHK, k_NHK, v_NHK, cu_seqlens, seqlens)
+    )(q_BSHK, k_BSHK, v_BSHK, seqlens_BM, offsets_BM1)
 
 
 def _token_spatial_coords(
@@ -296,12 +290,14 @@ class VisionAttention(nnx.Module):
     def __call__(
         self,
         hidden_ND: jax.Array,
-        cu_seqlens: jax.Array,
-        seqlens: jax.Array,
+        seqlens_BM: jax.Array,
+        offsets_BM1: jax.Array,
         cos_NK: jax.Array,
         sin_NK: jax.Array,
     ) -> jax.Array:
         N = hidden_ND.shape[0]
+        B = seqlens_BM.shape[0]
+        S = N // B
         qkv_shd = P(self.hidden_shd[0], None, self.heads_shd[1], self.heads_shd[2])
         qkv = jax.lax.reshape(
             self.qkv(hidden_ND, out_sharding=self.hidden_shd),
@@ -314,13 +310,28 @@ class VisionAttention(nnx.Module):
 
         q_NHK, k_NHK = apply_rotary_pos_emb_vision(q_NHK, k_NHK, cos_NK, sin_NK)
 
-        attn_NHK = _cudnn_packed_vision_attention(
-            q_NHK,
-            k_NHK,
-            v_NHK,
-            cu_seqlens,
-            seqlens,
-            self.scale,
+        # Reshape the flat [B*S, H, K] sequence into a real batch [B, S, H, K].
+        # Per-sample padding guarantees each sample occupies a contiguous S-block,
+        # so this split moves the (dp,fsdp) sharding from the token axis onto the
+        # batch axis (collective-free) and shards heads over tp — the exact layout
+        # cuDNN's fused fwd+bwd partitioner accepts.
+        attn_shd = P(self.heads_shd[0], None, self.heads_shd[1], self.heads_shd[2])
+        q_BSHK = jax.lax.reshape(
+            q_NHK, (B, S, self.num_heads, self.head_dim), out_sharding=attn_shd
+        )
+        k_BSHK = jax.lax.reshape(
+            k_NHK, (B, S, self.num_heads, self.head_dim), out_sharding=attn_shd
+        )
+        v_BSHK = jax.lax.reshape(
+            v_NHK, (B, S, self.num_heads, self.head_dim), out_sharding=attn_shd
+        )
+
+        attn_BSHK = _cudnn_batched_vision_attention(
+            q_BSHK, k_BSHK, v_BSHK, seqlens_BM, offsets_BM1, self.scale
+        )
+
+        attn_NHK = jax.lax.reshape(
+            attn_BSHK, (N, self.num_heads, self.head_dim), out_sharding=self.heads_shd
         )
         outputs_ND = attn_NHK.reshape(N, -1)
 
@@ -346,13 +357,13 @@ class VisionBlock(nnx.Module):
     def __call__(
         self,
         hidden_ND: jax.Array,
-        cu_seqlens: jax.Array,
-        seqlens: jax.Array,
+        seqlens_BM: jax.Array,
+        offsets_BM1: jax.Array,
         cos_NK: jax.Array,
         sin_NK: jax.Array,
     ) -> jax.Array:
         hidden_ND = hidden_ND + self.attn(
-            self.norm1(hidden_ND), cu_seqlens, seqlens, cos_NK, sin_NK
+            self.norm1(hidden_ND), seqlens_BM, offsets_BM1, cos_NK, sin_NK
         )
         hidden_ND = hidden_ND + self.mlp(self.norm2(hidden_ND))
         return hidden_ND
@@ -507,13 +518,43 @@ class VisionModel(nnx.Module):
         )
 
     def __call__(
-        self, pixel_values: jax.Array, image_grid: jax.Array, vision_cu_seqlens: jax.Array
+        self,
+        pixel_values: jax.Array,
+        image_grid: jax.Array,
+        vision_cu_seqlens: jax.Array,
+        batch_size: int = 1,
     ) -> tuple[jax.Array, list[jax.Array]]:
+        # ``vision_cu_seqlens`` is retained for API compatibility (callers still
+        # pass it); the batched attention derives its own per-sample segment
+        # metadata from ``image_grid`` + ``batch_size`` below.
+        del vision_cu_seqlens
         image_grid = reshard(image_grid, P())
-        seqlens_M = image_grid[:, 0] * image_grid[:, 1] * image_grid[:, 2]
-        seqlens_M = reshard(seqlens_M.astype(jnp.int32), P(self.hidden_shd[0]))
+        # Per-image token counts as a real batch [B, M] (whole image = one
+        # attention segment), plus per-sample cumulative offsets [B, M+1] (0..S).
+        # Each sample's M image slots (real + dummy padding) sum to S tokens.
+        M = image_grid.shape[0] // batch_size
+        grid_BM3 = image_grid.reshape(batch_size, M, 3)
+        seqlens_BM = (grid_BM3[:, :, 0] * grid_BM3[:, :, 1] * grid_BM3[:, :, 2]).astype(jnp.int32)
+        offsets_BM1 = jnp.concatenate(
+            [
+                jnp.zeros((batch_size, 1), jnp.int32),
+                jnp.cumsum(seqlens_BM, axis=1, dtype=jnp.int32),
+            ],
+            axis=1,
+        )
+        # Batch-shard the segment metadata (over the same (dp,fsdp) axes the
+        # batch dim uses) so the attention shard_map's per-device batch slice
+        # gets its matching [B_local, M] / [B_local, M+1] rows.
+        seqlens_BM = reshard(seqlens_BM, P(self.heads_shd[0], None))
+        offsets_BM1 = reshard(offsets_BM1, P(self.heads_shd[0], None))
+
         hidden_ND = self.patch_embed(pixel_values)
         total_tokens: int = hidden_ND.shape[0]
+        assert total_tokens % batch_size == 0, (
+            f"vision tokens {total_tokens} not divisible by batch_size {batch_size}; "
+            "per-sample vision padding (max_vision_patches_per_sample) is required "
+            "for the batched vision-attention layout."
+        )
 
         pos_embeds_ND = self._interpolate_pos_embed(image_grid, total_tokens)
         pos_embeds_ND = reshard(pos_embeds_ND, self.hidden_shd)
@@ -526,11 +567,9 @@ class VisionModel(nnx.Module):
         cos_NK = cos_NK.astype(self.cfg.dtype)
         sin_NK = sin_NK.astype(self.cfg.dtype)
 
-        cu_seqlens = vision_cu_seqlens.astype(jnp.int32)
-
         deepstack_features: list[jax.Array] = []
         for layer_num, blk in enumerate(self.blocks):
-            hidden_ND = blk(hidden_ND, cu_seqlens, seqlens_M, cos_NK, sin_NK)
+            hidden_ND = blk(hidden_ND, seqlens_BM, offsets_BM1, cos_NK, sin_NK)
             if layer_num in self.deepstack_visual_indexes:
                 idx = list(self.deepstack_visual_indexes).index(layer_num)
                 deepstack_features.append(self.deepstack_mergers[idx](hidden_ND))

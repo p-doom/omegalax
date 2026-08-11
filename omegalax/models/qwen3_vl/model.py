@@ -485,6 +485,7 @@ class Qwen3VL(nnx.Module):
         pixel_values: jax.Array | None = None,
         image_grid_thw: jax.Array | None = None,
         vision_cu_seqlens: jax.Array | None = None,
+        vision_merged_valid: jax.Array | None = None,
     ) -> tuple[jax.Array, jax.Array]:
         cfg = self.cfg
 
@@ -497,7 +498,10 @@ class Qwen3VL(nnx.Module):
                     "vision_cu_seqlens is required when passing image_grid_thw to Qwen3VL"
                 )
             image_features_ND, deepstack_features = self.vision(
-                pixel_values, image_grid_thw, vision_cu_seqlens
+                pixel_values,
+                image_grid_thw,
+                vision_cu_seqlens,
+                batch_size=token_ids_BT.shape[0],
             )
 
         embedding_VD = jnp.astype(self.text.embedder.embedding[...], self.text.embedder.dtype)
@@ -509,13 +513,19 @@ class Qwen3VL(nnx.Module):
             visual_pos_mask_BT = image_mask_BT
             n_features = image_features_ND.shape[0]  # static after padding
             seq_len = token_ids_BT.shape[1]
+            image_features_replicated = reshard(image_features_ND, P())
+            # Per-sample vision padding interleaves real/padding merged tokens;
+            # compact the real ones (vision_merged_valid==1) to the front so
+            # feature k aligns with the k-th <image_pad> position (row-major).
+            image_features_replicated = _compact_valid_merged(
+                image_features_replicated, vision_merged_valid
+            )
             image_mask_replicated = reshard(image_mask_BT, P())
             batch_idx, seq_idx = jnp.where(
                 image_mask_replicated,
                 size=n_features,
                 fill_value=(0, seq_len),
             )
-            image_features_replicated = reshard(image_features_ND, P())
             inputs_embeds_BTD = inputs_embeds_BTD.at[batch_idx, seq_idx].set(
                 image_features_replicated.astype(inputs_embeds_BTD.dtype),
                 mode="drop",
@@ -554,6 +564,7 @@ class Qwen3VL(nnx.Module):
                     hidden_BTD,
                     visual_pos_mask_BT,
                     deepstack_features[layer_idx],
+                    vision_merged_valid,
                     out_sharding=self.text.out_emb_shd,
                 )
 
@@ -564,10 +575,31 @@ class Qwen3VL(nnx.Module):
         return hidden_BTD, total_aux
 
 
+def _compact_valid_merged(features_ND: jax.Array, valid: jax.Array | None) -> jax.Array:
+    """Gather rows where ``valid == 1`` to the front, order-preserving.
+
+    Vision merged tokens arrive as ``[sample0 real, sample0 pad, sample1 real,
+    ...]`` under per-sample padding. Compacting the real rows to the front makes
+    row ``k`` correspond to the ``k``-th real ``<image_pad>`` position (row-major
+    across the batch), which is what the scatter below assumes. Rows beyond the
+    number of real tokens are garbage but land on dropped (fill) positions.
+
+    ``valid is None`` (no per-sample padding) leaves the features untouched —
+    the legacy layout already has real tokens front-contiguous.
+    """
+    if valid is None:
+        return features_ND
+    n = features_ND.shape[0]
+    valid_replicated = reshard(valid.astype(bool), P())
+    idx = jnp.where(valid_replicated, size=n, fill_value=n - 1)[0]
+    return features_ND[idx]
+
+
 def _deepstack_process(
     hidden_BTD: jax.Array,
     visual_pos_mask_BT: jax.Array,
     visual_embeds_ND: jax.Array,
+    valid: jax.Array | None = None,
     out_sharding: P | None = None,
 ) -> jax.Array:
     """Add visual embeddings to hidden states at visual token positions."""
@@ -575,6 +607,7 @@ def _deepstack_process(
     seq_len = hidden_BTD.shape[1]
     mask_replicated = reshard(visual_pos_mask_BT, P())
     embeds_replicated = reshard(visual_embeds_ND, P())
+    embeds_replicated = _compact_valid_merged(embeds_replicated, valid)
     batch_idx, seq_idx = jnp.where(
         mask_replicated,
         size=n_embeds,
