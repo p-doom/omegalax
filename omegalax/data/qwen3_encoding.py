@@ -133,7 +133,7 @@ def _assistant_block_loss_mask(block_ids: np.ndarray, is_assistant: bool) -> np.
     if not is_assistant:
         return mask
     start = _CHATML_HEADER_TOKENS
-    end = len(block_ids) - _CHATML_TRAILING_TOKENS  # exclude trailing \n, keep <|im_end|>
+    end = len(block_ids) - _CHATML_TRAILING_TOKENS
     if end > start:
         mask[start:end] = 1
     return mask
