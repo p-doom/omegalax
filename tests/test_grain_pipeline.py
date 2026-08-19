@@ -1,4 +1,4 @@
-"""Tests for Grain-backed payload-block compilation and chunk-index iteration."""
+"""Tests for Grain-backed inline-record building and iteration."""
 
 import json
 import os
@@ -15,8 +15,7 @@ import numpy as np
 import orbax.checkpoint as ocp
 
 from omegalax.data.grain_pipeline import (
-    build_chunk_index,
-    compile_jsonl_to_arrayrecord,
+    build_records_from_chat,
     make_grain_iterator,
     make_grain_multiprocessing_options,
     make_grain_read_options,
@@ -31,16 +30,12 @@ def _batch_starts(examples):
     }
 
 
-# build_chunk_index measures messages in a `spawn` multiprocessing pool, so the
-# measure_message callable must be picklable (importable by qualified name) --
-# a local lambda is not. These module-level stand-ins count every message as a
-# fixed number of tokens.
+# build_records_from_chat measures messages in a `spawn` multiprocessing pool, so
+# the measure_message callable must be picklable (importable by qualified name) --
+# a local lambda is not. This module-level stand-in counts every message as one
+# token.
 def _measure_one(message):
     return 1
-
-
-def _measure_two(message):
-    return 2
 
 
 class GrainPipelineTest(absltest.TestCase):
@@ -52,51 +47,68 @@ class GrainPipelineTest(absltest.TestCase):
     def _expected_session_id(self, path: Path, line_num: int) -> str:
         return f"{path.stem}-{line_num:09d}"
 
-    def test_compile_jsonl_to_arrayrecord_blocks_messages(self):
+    def test_system_turn_is_budgeted_and_carried_into_the_record(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             src = Path(tmpdir) / "train.jsonl"
+            system_message = {"role": "system", "content": "SYS"}
             self._write_jsonl(
                 src,
                 [
                     {
                         "messages": [
-                            {"role": "user", "content": "a"},
-                            {"role": "assistant", "content": "b"},
-                            {"role": "user", "content": "c"},
-                            {"role": "assistant", "content": "d"},
-                            {"role": "user", "content": "e"},
+                            system_message,
+                            {"role": "user", "content": "10"},
+                            {"role": "assistant", "content": "11"},
                         ],
                     },
                 ],
             )
 
-            out_dir = compile_jsonl_to_arrayrecord(
+            records_dir = build_records_from_chat(
                 src,
-                Path(tmpdir) / "compiled",
-                messages_per_record=2,
-                records_per_shard=1,
+                Path(tmpdir) / "records",
+                max_length=3,
+                measure_message=_measure_one,
+                records_per_shard=8,
             )
-            shard_paths = resolve_arrayrecord_paths(out_dir)
-            self.assertLen(shard_paths, 3)
 
-    def test_make_grain_iterator_requires_chunk_index_dataset(self):
+            iterator = make_grain_iterator(
+                records_dir,
+                batch_size=1,
+                batch_fn=lambda batch: batch[0],
+                shuffle=False,
+                seed=0,
+                read_options=make_grain_read_options(num_threads=1, prefetch_buffer_size=1),
+                multiprocessing_options=make_grain_multiprocessing_options(
+                    num_workers=0, per_worker_buffer_size=1
+                ),
+                dp_size=1,
+                fsdp_size=1,
+            )
+            record = next(iterator)
+            self.assertEqual(record["messages"][0], system_message)
+            self.assertEqual(record["_omegalax_measured_length"], 3)
+
+    def test_make_grain_iterator_requires_inline_records_dataset(self):
+        # Legacy pre-inline-records datasets still sit on disk; iterating one would
+        # feed the trainer chunk descriptors instead of examples.
         with tempfile.TemporaryDirectory() as tmpdir:
-            src = Path(tmpdir) / "train.jsonl"
-            self._write_jsonl(
-                src,
-                [
+            legacy = Path(tmpdir) / "legacy"
+            legacy.mkdir()
+            (legacy / "metadata.json").write_text(
+                json.dumps(
                     {
-                        "messages": [{"role": "user", "content": "a"}],
-                    },
-                ],
-            )
-            payload = compile_jsonl_to_arrayrecord(
-                src, Path(tmpdir) / "payload", records_per_shard=1
+                        "version": 1,
+                        "num_records": 1,
+                        "num_shards": 1,
+                        "shard_paths": ["part-00000.array_record"],
+                    }
+                )
             )
 
-            with self.assertRaisesRegex(ValueError, "chunk-index dataset"):
+            with self.assertRaisesRegex(ValueError, "inline-records dataset"):
                 make_grain_iterator(
-                    payload,
+                    legacy,
                     batch_size=1,
                     batch_fn=lambda batch: batch[0],
                     shuffle=False,
@@ -109,7 +121,7 @@ class GrainPipelineTest(absltest.TestCase):
                     fsdp_size=1,
                 )
 
-    def test_build_chunk_index_splits_across_payload_blocks(self):
+    def test_build_records_from_chat_splits_oversized_conversation(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             src = Path(tmpdir) / "train.jsonl"
             self._write_jsonl(
@@ -128,22 +140,17 @@ class GrainPipelineTest(absltest.TestCase):
                 ],
             )
 
-            payload = compile_jsonl_to_arrayrecord(
+            records_dir = build_records_from_chat(
                 src,
-                Path(tmpdir) / "payload",
-                messages_per_record=2,
-                records_per_shard=8,
-            )
-            chunked = build_chunk_index(
-                payload,
-                Path(tmpdir) / "chunked",
+                Path(tmpdir) / "records",
                 max_length=2,
                 measure_message=_measure_one,
                 records_per_shard=8,
+                overflow_mode="split",
             )
 
             iterator = make_grain_iterator(
-                chunked,
+                records_dir,
                 batch_size=1,
                 batch_fn=lambda batch: batch[0],
                 shuffle=False,
@@ -165,7 +172,7 @@ class GrainPipelineTest(absltest.TestCase):
                 [record["_omegalax_session_id"] for record in records], [expected_session_id] * 3
             )
 
-    def test_grain_iterator_checkpoint_restore_on_chunk_index(self):
+    def test_grain_iterator_checkpoint_restore_on_records(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             src = Path(tmpdir) / "train.jsonl"
             self._write_jsonl(
@@ -185,22 +192,17 @@ class GrainPipelineTest(absltest.TestCase):
                     },
                 ],
             )
-            payload = compile_jsonl_to_arrayrecord(
+            records_dir = build_records_from_chat(
                 src,
-                Path(tmpdir) / "payload",
-                messages_per_record=2,
-                records_per_shard=8,
-            )
-            chunked = build_chunk_index(
-                payload,
-                Path(tmpdir) / "chunked",
+                Path(tmpdir) / "records",
                 max_length=2,
                 measure_message=_measure_one,
                 records_per_shard=8,
+                overflow_mode="split",
             )
 
             iterator = make_grain_iterator(
-                chunked,
+                records_dir,
                 batch_size=2,
                 batch_fn=_batch_starts,
                 shuffle=False,
@@ -240,7 +242,7 @@ class GrainPipelineTest(absltest.TestCase):
             self.assertEqual(expected_next["starts"].tolist(), [14, 16])
 
             restored_iterator = make_grain_iterator(
-                chunked,
+                records_dir,
                 batch_size=2,
                 batch_fn=_batch_starts,
                 shuffle=False,
@@ -281,23 +283,18 @@ class GrainPipelineTest(absltest.TestCase):
                     },
                 ],
             )
-            payload = compile_jsonl_to_arrayrecord(
+            records_dir = build_records_from_chat(
                 src,
-                Path(tmpdir) / "payload",
-                messages_per_record=2,
-                records_per_shard=8,
-            )
-            chunked = build_chunk_index(
-                payload,
-                Path(tmpdir) / "chunked",
+                Path(tmpdir) / "records",
                 max_length=2,
                 measure_message=_measure_one,
                 records_per_shard=8,
+                overflow_mode="split",
             )
 
             with mock.patch("jax.process_index", return_value=0):
                 iterator0 = make_grain_iterator(
-                    chunked,
+                    records_dir,
                     batch_size=1,
                     batch_fn=lambda batch: batch[0],
                     shuffle=False,
@@ -313,7 +310,7 @@ class GrainPipelineTest(absltest.TestCase):
 
             with mock.patch("jax.process_index", return_value=1):
                 iterator1 = make_grain_iterator(
-                    chunked,
+                    records_dir,
                     batch_size=1,
                     batch_fn=lambda batch: batch[0],
                     shuffle=False,
@@ -348,15 +345,9 @@ class GrainPipelineTest(absltest.TestCase):
                 )
             self._write_jsonl(src, rows)
 
-            payload = compile_jsonl_to_arrayrecord(
+            records_dir = build_records_from_chat(
                 src,
-                Path(tmpdir) / "payload",
-                messages_per_record=1,
-                records_per_shard=8,
-            )
-            chunked = build_chunk_index(
-                payload,
-                Path(tmpdir) / "chunked",
+                Path(tmpdir) / "records",
                 # max_length=2 keeps the user+assistant pair in one chunk, so the
                 # tracking value stays at messages[0] and the assistant-turn filter
                 # is satisfied (one chunk per session).
@@ -368,7 +359,7 @@ class GrainPipelineTest(absltest.TestCase):
             def collect_process_order(process_index: int, seed: int) -> list[str]:
                 with mock.patch("jax.process_index", return_value=process_index):
                     iterator = make_grain_iterator(
-                        chunked,
+                        records_dir,
                         batch_size=1,
                         batch_fn=lambda batch: batch[0],
                         shuffle=True,
@@ -395,115 +386,6 @@ class GrainPipelineTest(absltest.TestCase):
             self.assertEqual(set(process0_seed0).union(process1_seed0), {str(i) for i in range(8)})
             self.assertNotEqual(process0_seed0 + process1_seed0, [str(i) for i in range(8)])
             self.assertNotEqual(process0_seed0 + process1_seed0, process0_seed1 + process1_seed1)
-
-    def test_build_chunk_index_with_system_message_prepends_to_every_chunk(self):
-        # Verifies via the chunk-descriptor resolver directly rather than
-        # through make_grain_iterator — the iterator path has unrelated
-        # breakage that an upstream test (test_build_chunk_index_splits_
-        # across_payload_blocks) also hits.
-        from omegalax.data.grain_pipeline import (
-            _ChunkDescriptorResolver,
-            load_compiled_metadata,
-            resolve_arrayrecord_paths,
-        )
-        import grain
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            src = Path(tmpdir) / "train.jsonl"
-            self._write_jsonl(
-                src,
-                [
-                    {
-                        "messages": [
-                            {"role": "user", "content": "10"},
-                            {"role": "assistant", "content": "11"},
-                            {"role": "user", "content": "12"},
-                            {"role": "assistant", "content": "13"},
-                            {"role": "user", "content": "14"},
-                            {"role": "assistant", "content": "15"},
-                        ],
-                    },
-                ],
-            )
-            payload = compile_jsonl_to_arrayrecord(
-                src,
-                Path(tmpdir) / "payload",
-                messages_per_record=2,
-                records_per_shard=8,
-            )
-            system_message = {"role": "system", "content": "SYS"}
-            chunked = build_chunk_index(
-                payload,
-                Path(tmpdir) / "chunked",
-                max_length=3,
-                measure_message=_measure_one,
-                records_per_shard=8,
-                system_message=system_message,
-            )
-
-            # Persisted in chunk-index metadata so the iterator rebuilds the
-            # same chunks across runs without re-passing the prompt at iter time.
-            metadata = load_compiled_metadata(chunked)
-            self.assertEqual(metadata["system_message"], system_message)
-            self.assertEqual(metadata["system_message_length"], 1)
-
-            # Read the chunk descriptors directly off-disk and resolve each
-            # through the resolver; this is the same code path the iterator
-            # uses, just without the grain pipeline plumbing.
-            chunked_source = grain.sources.ArrayRecordDataSource(
-                [str(p) for p in resolve_arrayrecord_paths(chunked)]
-            )
-            descriptors = [json.loads(chunked_source[i]) for i in range(len(chunked_source))]
-
-            # Effective content budget = max_length - sys_len = 3 - 1 = 2;
-            # 6 content messages of length 1 split [2, 2, 2] across chunks.
-            self.assertEqual([d["measured_length"] for d in descriptors], [2, 2, 2])
-
-            resolver = _ChunkDescriptorResolver(
-                str(metadata["payload_path"]), system_message=system_message
-            )
-            examples = [resolver.map(d) for d in descriptors]
-            self.assertEqual([len(e["messages"]) for e in examples], [3, 3, 3])
-            for example in examples:
-                self.assertEqual(example["messages"][0], system_message)
-            self.assertEqual(
-                [e["messages"][1]["content"] for e in examples],
-                ["10", "12", "14"],
-            )
-
-            # And verify that without a system_message the resolver does not
-            # prepend anything (sources without system_message in metadata
-            # share the same code path during mixing).
-            no_sys_resolver = _ChunkDescriptorResolver(
-                str(metadata["payload_path"]), system_message=None
-            )
-            no_sys_examples = [no_sys_resolver.map(d) for d in descriptors]
-            self.assertEqual([len(e["messages"]) for e in no_sys_examples], [2, 2, 2])
-            for example in no_sys_examples:
-                self.assertNotEqual(example["messages"][0]["role"], "system")
-
-    def test_build_chunk_index_rejects_oversized_system_message(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            src = Path(tmpdir) / "train.jsonl"
-            self._write_jsonl(
-                src,
-                [{"messages": [{"role": "user", "content": "a"}]}],
-            )
-            payload = compile_jsonl_to_arrayrecord(
-                src,
-                Path(tmpdir) / "payload",
-                messages_per_record=1,
-                records_per_shard=1,
-            )
-            with self.assertRaisesRegex(ValueError, "no room for content"):
-                build_chunk_index(
-                    payload,
-                    Path(tmpdir) / "chunked",
-                    max_length=2,
-                    measure_message=_measure_two,
-                    records_per_shard=1,
-                    system_message={"role": "system", "content": "SYS"},
-                )
 
     def test_resolve_arrayrecord_paths_rejects_raw_jsonl_files(self):
         with tempfile.TemporaryDirectory() as tmpdir:

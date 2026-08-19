@@ -13,8 +13,7 @@ from absl.testing import absltest
 import numpy as np
 
 from omegalax.data.grain_pipeline import (
-    build_chunk_index,
-    compile_jsonl_to_arrayrecord,
+    build_records_from_chat,
     make_grain_iterator,
     make_grain_multiprocessing_options,
     make_grain_read_options,
@@ -115,24 +114,32 @@ def _restore_arrays(value):
     return value
 
 
+# build_records_from_chat measures messages in a `spawn` multiprocessing pool, so
+# the measure_message callable must be picklable -- a local lambda is not.
+def _measure_one(message):
+    return 1
+
+
 def _make_grain_batch_iter(batch: dict[str, np.ndarray]):
     with tempfile.TemporaryDirectory() as tmpdir:
         src = Path(tmpdir) / "train.jsonl"
         src.write_text(
             json.dumps(
                 {
-                    "messages": [{"role": "user", "content": "stub"}],
+                    "messages": [
+                        {"role": "user", "content": "stub"},
+                        {"role": "assistant", "content": "ok"},
+                    ],
                     "batch": _to_jsonable(batch),
                 }
             )
             + "\n"
         )
-        payload = compile_jsonl_to_arrayrecord(src, Path(tmpdir) / "payload", records_per_shard=1)
-        compiled = build_chunk_index(
-            payload,
-            Path(tmpdir) / "chunked",
-            max_length=1,
-            measure_message=lambda message: 1,
+        compiled = build_records_from_chat(
+            src,
+            Path(tmpdir) / "records",
+            max_length=2,
+            measure_message=_measure_one,
             records_per_shard=1,
         )
         iterator = make_grain_iterator(
@@ -145,6 +152,8 @@ def _make_grain_batch_iter(batch: dict[str, np.ndarray]):
             multiprocessing_options=make_grain_multiprocessing_options(
                 num_workers=0, per_worker_buffer_size=1
             ),
+            dp_size=1,
+            fsdp_size=1,
         )
         yield from iterator
 
@@ -163,18 +172,20 @@ def _grain_iter_ctx(batch: dict[str, np.ndarray]):
         src.write_text(
             json.dumps(
                 {
-                    "messages": [{"role": "user", "content": "stub"}],
+                    "messages": [
+                        {"role": "user", "content": "stub"},
+                        {"role": "assistant", "content": "ok"},
+                    ],
                     "batch": _to_jsonable(batch),
                 }
             )
             + "\n"
         )
-        payload = compile_jsonl_to_arrayrecord(src, Path(tmpdir) / "payload", records_per_shard=1)
-        compiled = build_chunk_index(
-            payload,
-            Path(tmpdir) / "chunked",
-            max_length=1,
-            measure_message=lambda message: 1,
+        compiled = build_records_from_chat(
+            src,
+            Path(tmpdir) / "records",
+            max_length=2,
+            measure_message=_measure_one,
             records_per_shard=1,
         )
         iterator = make_grain_iterator(
@@ -187,6 +198,8 @@ def _grain_iter_ctx(batch: dict[str, np.ndarray]):
             multiprocessing_options=make_grain_multiprocessing_options(
                 num_workers=0, per_worker_buffer_size=1
             ),
+            dp_size=1,
+            fsdp_size=1,
         )
         yield iterator
 
@@ -260,7 +273,7 @@ class VLMSFTTrainingTest(absltest.TestCase):
         data_iter = _make_grain_batch_iter(batch)
 
         _, metrics = vlm_trainer.run_sft(
-            "qwen3-vl-smoke",
+            make_vl_config("qwen3-vl-smoke"),
             train_cfg,
             data_iter,
             log_every=0,
@@ -287,7 +300,7 @@ class VLMSFTTrainingTest(absltest.TestCase):
         data_iter = _make_grain_batch_iter(batch)
 
         _, metrics = vlm_trainer.run_sft(
-            "qwen3-vl-smoke",
+            make_vl_config("qwen3-vl-smoke"),
             train_cfg,
             data_iter,
             log_every=0,

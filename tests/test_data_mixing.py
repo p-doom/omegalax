@@ -14,8 +14,7 @@ import orbax.checkpoint as ocp
 from omegalax.data.grain_pipeline import (
     BATCH_SOURCE_IDS_KEY,
     MixSource,
-    build_chunk_index,
-    compile_jsonl_to_arrayrecord,
+    build_records_from_chat,
     make_grain_iterator,
     make_grain_multiprocessing_options,
     make_grain_read_options,
@@ -40,18 +39,24 @@ def _write_jsonl(path: Path, rows: list[dict]) -> None:
             f.write(json.dumps(row) + "\n")
 
 
+# build_records_from_chat measures messages in a `spawn` multiprocessing pool, so
+# the measure_message callable must be picklable -- a local lambda is not.
+def _measure_one(message):
+    return 1
+
+
 def _build_chunked_source(
     tmpdir: Path,
     *,
     name: str,
     contents: list[str],
 ) -> Path:
-    """Compile a user+assistant-per-session JSONL into a chunk-index dataset.
+    """Build an inline-records dataset from a user+assistant-per-session chat.jsonl.
 
     Each session pairs the tracking value (carried as the user turn so tests can
     read it back at ``messages[0]``) with a trivial assistant turn, so the chunk
-    survives ``build_chunk_index``'s assistant-turn filter. ``max_length=2`` keeps
-    both messages in a single chunk, preserving one chunk per session.
+    survives ``build_records_from_chat``'s assistant-turn filter. ``max_length=2``
+    keeps both messages in a single chunk, preserving one record per session.
     """
     src = tmpdir / f"{name}.jsonl"
     _write_jsonl(
@@ -66,20 +71,13 @@ def _build_chunked_source(
             for value in contents
         ],
     )
-    payload = compile_jsonl_to_arrayrecord(
+    return build_records_from_chat(
         src,
-        tmpdir / f"{name}_payload",
-        messages_per_record=1,
-        records_per_shard=8,
-    )
-    chunked = build_chunk_index(
-        payload,
-        tmpdir / f"{name}_chunked",
+        tmpdir / f"{name}_records",
         max_length=2,
-        measure_message=lambda _msg: 1,
+        measure_message=_measure_one,
         records_per_shard=8,
     )
-    return chunked
 
 
 _FAST_OPTS = dict(
@@ -256,10 +254,10 @@ class DataMixingTest(absltest.TestCase):
                 )
 
     def test_mixing_different_max_length_rejected(self):
-        """Mixing chunk indices built with different max_length is refused."""
+        """Mixing record datasets built with different max_length is refused."""
         with tempfile.TemporaryDirectory() as tmp:
             tmpdir = Path(tmp)
-            # Build two payloads, then chunk-index them with different max_lengths.
+            # Build the same chat twice, with different max_lengths.
             src_a = tmpdir / "a.jsonl"
             _write_jsonl(
                 src_a,
@@ -272,24 +270,18 @@ class DataMixingTest(absltest.TestCase):
                     }
                 ],
             )
-            payload_a = compile_jsonl_to_arrayrecord(
+            chunked_a_short = build_records_from_chat(
                 src_a,
-                tmpdir / "a_payload",
-                messages_per_record=1,
-                records_per_shard=8,
-            )
-            chunked_a_short = build_chunk_index(
-                payload_a,
-                tmpdir / "a_chunked_short",
-                max_length=1,
-                measure_message=lambda _m: 1,
-                records_per_shard=8,
-            )
-            chunked_a_long = build_chunk_index(
-                payload_a,
-                tmpdir / "a_chunked_long",
+                tmpdir / "a_records_short",
                 max_length=2,
-                measure_message=lambda _m: 1,
+                measure_message=_measure_one,
+                records_per_shard=8,
+            )
+            chunked_a_long = build_records_from_chat(
+                src_a,
+                tmpdir / "a_records_long",
+                max_length=3,
+                measure_message=_measure_one,
                 records_per_shard=8,
             )
             with self.assertRaisesRegex(ValueError, "different max_length"):

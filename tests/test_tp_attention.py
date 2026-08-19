@@ -2,9 +2,13 @@
 
 import jax
 import jax.numpy as jnp
+import pytest
 from jax.sharding import NamedSharding, PartitionSpec as P
 
-jax.distributed.initialize()
+try:
+    jax.distributed.initialize()
+except ValueError as exc:
+    pytest.skip(f"requires a distributed JAX launch: {exc}", allow_module_level=True)
 
 mesh = jax.make_mesh((jax.device_count(),), ("tp",))
 jax.set_mesh(mesh)
