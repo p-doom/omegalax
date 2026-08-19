@@ -1,6 +1,5 @@
 """Smoke tests for SFT training loops and shard_batch_dict."""
 
-import contextlib
 import json
 import os
 from pathlib import Path
@@ -156,52 +155,6 @@ def _make_grain_batch_iter(batch: dict[str, np.ndarray]):
             fsdp_size=1,
         )
         yield from iterator
-
-
-@contextlib.contextmanager
-def _grain_iter_ctx(batch: dict[str, np.ndarray]):
-    """Yield a checkpointable Grain iterator (not a generator wrapper).
-
-    The trainer's checkpoint save path needs the underlying ``grain.DatasetIterator``
-    (not a ``yield from`` wrapper) so its position can be serialized via the
-    registered Grain checkpoint handler. The ArrayRecord files must outlive the
-    iterator, so the tempdir is owned by this context manager.
-    """
-    with tempfile.TemporaryDirectory() as tmpdir:
-        src = Path(tmpdir) / "train.jsonl"
-        src.write_text(
-            json.dumps(
-                {
-                    "messages": [
-                        {"role": "user", "content": "stub"},
-                        {"role": "assistant", "content": "ok"},
-                    ],
-                    "batch": _to_jsonable(batch),
-                }
-            )
-            + "\n"
-        )
-        compiled = build_records_from_chat(
-            src,
-            Path(tmpdir) / "records",
-            max_length=2,
-            measure_message=_measure_one,
-            records_per_shard=1,
-        )
-        iterator = make_grain_iterator(
-            compiled,
-            batch_size=1,
-            batch_fn=lambda records: _restore_arrays(records[0]["batch"]),
-            shuffle=False,
-            seed=0,
-            read_options=make_grain_read_options(num_threads=1, prefetch_buffer_size=1),
-            multiprocessing_options=make_grain_multiprocessing_options(
-                num_workers=0, per_worker_buffer_size=1
-            ),
-            dp_size=1,
-            fsdp_size=1,
-        )
-        yield iterator
 
 
 class ShardBatchDictTest(absltest.TestCase):
