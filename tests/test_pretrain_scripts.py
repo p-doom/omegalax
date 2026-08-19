@@ -195,7 +195,10 @@ with flagsaver.flagsaver(
     grain_read_threads=7,
     grain_read_prefetch_buffer_size=11,
 ):
-    with mock.patch.object(train_text_pretrain, "make_statepassing_iterator") as iterator:
+    with (
+        mock.patch.object(train_text_pretrain, "make_statepassing_iterator") as iterator,
+        mock.patch.object(train_text_pretrain.jax, "process_count", return_value=8),
+    ):
         iterator.return_value = object()
         train_text_pretrain._make_iterator(
             "/idx", PretrainMode.STATEPASSING_BPTT, 12, shuffle=True
@@ -219,7 +222,7 @@ print(json.dumps({
         self.assertEqual(output["batch_size"], 12)
         self.assertEqual(output["chunk_length"], 2048)
         self.assertEqual(output["seed"], 123)
-        self.assertEqual(output["dp_size"], 1)
+        self.assertEqual(output["dp_size"], 8)
         self.assertEqual(output["fsdp_size"], 1)
         self.assertEqual(output["grain_workers"], 3)
         self.assertTrue(output["shuffle"])
@@ -330,7 +333,9 @@ with flagsaver.flagsaver(batch_size=128, grad_accum_steps=4):
 """
         )
 
-        self.assertIn("batch_size=240", output["error"])
+        self.assertIn("Curriculum", output["error"])
+        self.assertIn("960", output["error"])
+        self.assertIn("512", output["error"])
 
     def test_fixed_c_runtime_config_rejects_mismatched_shape(self):
         output = self._run_train_script_probe(
@@ -355,7 +360,9 @@ with flagsaver.flagsaver(batch_size=240, grad_accum_steps=2):
 """
         )
 
-        self.assertIn("grad_accum_steps=4", output["error"])
+        self.assertIn("Fixed-C", output["error"])
+        self.assertIn("960", output["error"])
+        self.assertIn("480", output["error"])
 
     def test_fixed_c_bundle_path_helpers_select_mode_paths_and_steps(self):
         output = self._run_train_script_probe(
@@ -1125,6 +1132,20 @@ class BabysitTextPretrainSlurmScriptTest(absltest.TestCase):
         self.assertIn("completed with non-finite metric", alert.call_args.kwargs["reason"])
 
     def test_main_unknown_state_does_not_reset_stall_timer(self):
+        clock = {"now": 0.0}
+        polls = iter(
+            [
+                (0.0, ("RUNNING", "sacct")),
+                (100.0, ("UNKNOWN", "unknown")),
+                (901.0, ("RUNNING", "sacct")),
+                (902.0, ("COMPLETED", "sacct")),
+            ]
+        )
+
+        def poll(_job_id):
+            clock["now"], state = next(polls)
+            return state
+
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             with (
@@ -1138,12 +1159,7 @@ class BabysitTextPretrainSlurmScriptTest(absltest.TestCase):
                 mock.patch.object(
                     babysit_text_pretrain_slurm,
                     "job_status",
-                    side_effect=[
-                        ("RUNNING", "sacct"),
-                        ("UNKNOWN", "unknown"),
-                        ("RUNNING", "sacct"),
-                        ("COMPLETED", "sacct"),
-                    ],
+                    side_effect=poll,
                 ),
                 mock.patch.object(
                     babysit_text_pretrain_slurm,
@@ -1155,7 +1171,7 @@ class BabysitTextPretrainSlurmScriptTest(absltest.TestCase):
                 mock.patch.object(
                     babysit_text_pretrain_slurm.time,
                     "time",
-                    side_effect=[0, 0, 100, 901, 901, 902],
+                    side_effect=lambda: clock["now"],
                 ),
             ):
                 babysit_text_pretrain_slurm.main(None)
