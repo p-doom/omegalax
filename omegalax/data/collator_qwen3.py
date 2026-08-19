@@ -146,8 +146,14 @@ class Qwen3RendererEncoder:
     ) -> None:
         self.tokenizer = tokenizer
         self.image_processor = image_processor
+        # image_cache_max=1, not the renderers default of 256: that cache keeps
+        # materialised pixel_values (48.8 MB per entry on our frames) keyed by image
+        # hash, and Grain shuffles, so it hits ~0%. Measured 14.66 GB peak RSS per
+        # Grain worker against 2.44 GB, and worst-case 1.62 against 5.78 samples/s.
         self.renderer_config = (
-            Qwen3VLRendererConfig() if renderer_config is None else renderer_config
+            Qwen3VLRendererConfig(image_cache_max=1)
+            if renderer_config is None
+            else renderer_config
         )
         self._renderer = None
 
