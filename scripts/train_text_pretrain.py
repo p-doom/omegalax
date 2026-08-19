@@ -224,10 +224,10 @@ def _make_iterator(
         shuffle=shuffle,
         seed=FLAGS.seed,
         num_epochs=num_epochs,
-        dp_size=FLAGS.iterator_dp_size if FLAGS.iterator_dp_size is not None else FLAGS.dp_size,
-        fsdp_size=(
-            FLAGS.iterator_fsdp_size if FLAGS.iterator_fsdp_size is not None else FLAGS.fsdp_size
+        dp_size=(
+            FLAGS.iterator_dp_size if FLAGS.iterator_dp_size is not None else jax.process_count()
         ),
+        fsdp_size=FLAGS.iterator_fsdp_size if FLAGS.iterator_fsdp_size is not None else 1,
         process_index=jax.process_index(),
         grain_workers=FLAGS.grain_workers,
         grain_worker_buffer_size=FLAGS.grain_worker_buffer_size,

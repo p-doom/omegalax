@@ -219,8 +219,8 @@ print(json.dumps({
         self.assertEqual(output["batch_size"], 12)
         self.assertEqual(output["chunk_length"], 2048)
         self.assertEqual(output["seed"], 123)
-        self.assertEqual(output["dp_size"], 2)
-        self.assertEqual(output["fsdp_size"], 4)
+        self.assertEqual(output["dp_size"], 1)
+        self.assertEqual(output["fsdp_size"], 1)
         self.assertEqual(output["grain_workers"], 3)
         self.assertTrue(output["shuffle"])
 
