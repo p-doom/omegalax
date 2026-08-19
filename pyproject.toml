@@ -20,9 +20,11 @@ dependencies = [
   "optax",
   "orbax-checkpoint",
   "Pillow",
-  # Sourced from the vendored checkout in [tool.uv.sources] below, which is the
-  # copy prime-rl is pinned to, so training and rollout share one renderer.
-  "renderers",
+  # From the index, pinned exactly to the version prime-rl is on, so training and
+  # rollout share one renderer. It used to come from a path source into a personal
+  # clone of prime-rl, at that clone's pre-#44 layout: it resolved only while the
+  # clone stayed stale, and `uv.lock` recorded the dependency nowhere at all.
+  "renderers==0.1.9.dev1",
   "safetensors",
   "tokamax @ git+https://github.com/p-doom/tokamax.git@nested-mask", # change after fix has been upstreamed
   "transformers",
@@ -39,9 +41,6 @@ torch-tests = [
 
 [tool.uv]
 override-dependencies = ["nvidia-cudnn-cu12==9.18.1.3"]
-
-[tool.uv.sources]
-renderers = { path = "/fast/project/HFMI_SynergyUnit/p-doom_shared/franz/reinforcement-learning/prime-rl/deps/renderers", editable = false }
 
 [tool.hatch.metadata]
 allow-direct-references = true
