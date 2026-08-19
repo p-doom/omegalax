@@ -191,8 +191,6 @@ class Qwen3RendererEncoder:
             "input_ids": np.asarray(sample.token_ids, dtype=np.int32),
             "loss_mask": np.asarray(sample.loss_mask, dtype=np.int32),
         }
-        if sample.mm_token_type_ids is not None:
-            out["mm_token_type_ids"] = np.asarray(sample.mm_token_type_ids, dtype=np.int32)
         items = sample.multi_modal_data.mm_items.get("image", []) if sample.multi_modal_data else []
         if items:
             out["pixel_values"] = np.concatenate([i["pixel_values"] for i in items], axis=0)
@@ -425,8 +423,7 @@ class VLMSFTCollator:
 
     Every key is always present at a fixed shape, images or not, so ``train_step``
     never recompiles: ``token_ids_BT``, ``attention_mask_BT``, ``loss_mask_BT``,
-    ``mm_token_type_ids_BT``, ``pixel_values``, ``image_grid_thw``,
-    ``vision_cu_seqlens``, ``position_ids_ZBT``.
+    ``pixel_values``, ``image_grid_thw``, ``vision_cu_seqlens``, ``position_ids_ZBT``.
 
     ``position_ids_ZBT`` is precomputed here (on CPU, via numpy) so the
     model's ``get_rope_index`` never needs to run inside ``jax.jit``.
@@ -477,8 +474,6 @@ class VLMSFTCollator:
         all_pixel_values: list[np.ndarray] = []
         all_grid_thw: list[np.ndarray] = []
 
-        batch_mm_type: list[np.ndarray] = []
-
         for ex in examples:
             messages = ex["messages"]
             encoded = self._encoder.encode(messages)
@@ -498,16 +493,8 @@ class VLMSFTCollator:
             token_ids = np.array(full_ids, dtype=np.int32)
             attn_mask = np.ones(seq_len, dtype=np.int32)
             loss_mask = encoded["loss_mask"]
-            # 0=text / 1=image / 2=video — the vision encoder slices image
-            # tokens out of the packed stream with this. Text-only samples
-            # through the VLM renderer get no sidecar; synthesize zeros so the
-            # batch key is always present at a fixed shape.
-            mm_type = encoded.get("mm_token_type_ids")
-            if mm_type is None:
-                mm_type = np.zeros(seq_len, dtype=np.int32)
 
             if pad_len > 0:
-                mm_type = np.pad(mm_type, (0, pad_len), constant_values=0)
                 token_ids = np.pad(
                     token_ids, (0, pad_len), constant_values=self.tokenizer.pad_token_id
                 )
@@ -517,13 +504,11 @@ class VLMSFTCollator:
             batch_ids.append(token_ids)
             batch_attn.append(attn_mask)
             batch_mask.append(loss_mask)
-            batch_mm_type.append(mm_type)
 
         result: dict[str, np.ndarray] = {
             "token_ids_BT": np.stack(batch_ids).astype(np.int32),
             "attention_mask_BT": np.stack(batch_attn).astype(np.int32),
             "loss_mask_BT": np.stack(batch_mask).astype(np.int32),
-            "mm_token_type_ids_BT": np.stack(batch_mm_type).astype(np.int32),
         }
 
         if all_pixel_values:
