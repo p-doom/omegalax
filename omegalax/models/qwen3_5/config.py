@@ -163,6 +163,62 @@ _QWEN3_5_SMOKE_SPECS: dict[str, dict[str, Any]] = {
     },
 }
 
+_FULL_ATTENTION_INTERVAL = 4
+
+
+def _generate_layer_types(num_layers: int) -> tuple[str, ...]:
+    """Generate layer_types with full_attention every 4th layer (1-indexed)."""
+    return tuple(
+        "full_attention" if (i + 1) % _FULL_ATTENTION_INTERVAL == 0 else "linear_attention"
+        for i in range(num_layers)
+    )
+
+
+_MEMORY_LADDER_SHARED: dict[str, Any] = {
+    "vocab_size": 1024,
+    "rms_norm_eps": 1e-6,
+    "rope_theta": 10_000_000,
+    "partial_rotary_factor": 0.25,
+    "mrope_section": (11, 11, 10),
+    "tie_word_embeddings": True,
+    "linear_conv_kernel_dim": 4,
+    "linear_key_head_dim": 128,
+    "linear_value_head_dim": 128,
+}
+
+_QWEN3_5_MEMORY_SPECS: dict[str, dict[str, Any]] = {
+    "qwen3.5-memory-50m": {
+        "vision_config": _SMOKE_VISION,
+        "text_config": {
+            **_MEMORY_LADDER_SHARED,
+            "hidden_size": 512,
+            "num_hidden_layers": 9,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 256,
+            "layer_types": _generate_layer_types(9),
+            "linear_num_key_heads": 8,
+            "linear_num_value_heads": 8,
+            "intermediate_size": 1792,
+        },
+    },
+    "qwen3.5-memory-200m": {
+        "vision_config": _SMOKE_VISION,
+        "text_config": {
+            **_MEMORY_LADDER_SHARED,
+            "hidden_size": 768,
+            "num_hidden_layers": 17,
+            "num_attention_heads": 6,
+            "num_key_value_heads": 2,
+            "head_dim": 256,
+            "layer_types": _generate_layer_types(17),
+            "linear_num_key_heads": 12,
+            "linear_num_value_heads": 12,
+            "intermediate_size": 2688,
+        },
+    },
+}
+
 _QWEN3_5_REPOS = (
     "Qwen/Qwen3.5-0.8B",
     "Qwen/Qwen3.5-2B",
@@ -175,8 +231,9 @@ _QWEN3_5_REPOS = (
 )
 
 _SUPPORTED_MODEL_TYPES = {"qwen3_5", "qwen3_5_moe"}
-_SUPPORTED_MODEL_IDS = sorted((*_QWEN3_5_SMOKE_SPECS.keys(), *_QWEN3_5_REPOS))
-_FULL_ATTENTION_INTERVAL = 4
+_SUPPORTED_MODEL_IDS = sorted(
+    (*_QWEN3_5_SMOKE_SPECS.keys(), *_QWEN3_5_MEMORY_SPECS.keys(), *_QWEN3_5_REPOS)
+)
 
 
 def _required(mapping: dict[str, Any], key: str, where: str) -> Any:
@@ -208,6 +265,8 @@ def resolve_qwen3_5_repo_id(model_id: str) -> str:
 def get_qwen3_5_spec(model_id: str) -> dict[str, Any]:
     if model_id in _QWEN3_5_SMOKE_SPECS:
         return dict(_QWEN3_5_SMOKE_SPECS[model_id])
+    if model_id in _QWEN3_5_MEMORY_SPECS:
+        return dict(_QWEN3_5_MEMORY_SPECS[model_id])
     if model_id in _QWEN3_5_REPOS:
         return {"hf_repo_id": model_id}
     raise ValueError(
@@ -216,24 +275,27 @@ def get_qwen3_5_spec(model_id: str) -> dict[str, Any]:
 
 
 def is_supported_qwen3_5_model_id(model_id: str) -> bool:
-    return model_id in _QWEN3_5_SMOKE_SPECS or model_id in _QWEN3_5_REPOS
+    return (
+        model_id in _QWEN3_5_SMOKE_SPECS
+        or model_id in _QWEN3_5_MEMORY_SPECS
+        or model_id in _QWEN3_5_REPOS
+    )
 
 
 def list_supported_qwen3_5_model_ids() -> list[str]:
     return list(_SUPPORTED_MODEL_IDS)
 
 
-def _generate_layer_types(num_layers: int) -> tuple[str, ...]:
-    """Generate layer_types with full_attention every 4th layer (1-indexed)."""
-    return tuple(
-        "full_attention" if (i + 1) % _FULL_ATTENTION_INTERVAL == 0 else "linear_attention"
-        for i in range(num_layers)
-    )
-
-
 def make_config(model_id: str) -> Qwen3_5Config:
     if model_id in _QWEN3_5_SMOKE_SPECS:
         spec = _QWEN3_5_SMOKE_SPECS[model_id]
+        return Qwen3_5Config(
+            vision_config=Qwen3_5VisionConfig(**spec["vision_config"]),
+            text_config=Qwen3_5TextConfig(**spec["text_config"]),
+        )
+
+    if model_id in _QWEN3_5_MEMORY_SPECS:
+        spec = _QWEN3_5_MEMORY_SPECS[model_id]
         return Qwen3_5Config(
             vision_config=Qwen3_5VisionConfig(**spec["vision_config"]),
             text_config=Qwen3_5TextConfig(**spec["text_config"]),
