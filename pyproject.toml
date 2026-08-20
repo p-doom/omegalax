@@ -25,7 +25,11 @@ dependencies = [
   # clone of prime-rl, at that clone's pre-#44 layout: it resolved only while the
   # clone stayed stale, and `uv.lock` recorded the dependency nowhere at all.
   "renderers==0.1.9.dev1",
-  "safetensors",
+  # 0.8.0 stopped honouring strides in save_file (it copies straight off the raw
+  # pointer), which silently changed what a non-contiguous view serialized to.
+  # The exporter no longer relies on either behaviour, but floor it at the version
+  # whose semantics we write against so the change cannot happen under us again.
+  "safetensors>=0.8.0",
   "tokamax @ git+https://github.com/p-doom/tokamax.git@nested-mask", # change after fix has been upstreamed
   "transformers",
   "triton", 
