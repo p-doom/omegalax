@@ -1,6 +1,8 @@
 """Production-contract tests for the controlled symbolic memory tasks."""
 
+import contextlib
 import dataclasses
+import io
 import json
 from pathlib import Path
 import tempfile
@@ -29,8 +31,10 @@ from omegalax.models.qwen3_5.config import Qwen3_5TextConfig
 from omegalax.models.shard_config import ShardConfig
 from omegalax.text import api as text_api
 from omegalax.trainers import pretrain as pretrain_trainer
+from scripts import train_memory_tasks
 from scripts.train_memory_tasks import TrainingCondition, training_layout
 from scripts.eval_memory_tasks import _validate_training_contract, summarize_rows
+from tests.pretrain_real_data_test_utils import test_temp_dir
 
 
 def _tiny_gdn_config() -> Qwen3_5TextConfig:
@@ -409,6 +413,44 @@ class MemoryTaskTest(parameterized.TestCase):
 
         self.assertTrue(np.isfinite(metrics["loss"]))
         self.assertEqual(metrics["supervised_tokens"], 2.0)
+
+    def test_cli_trains_one_step_with_explicit_adam_hparams_and_device_memory(self):
+        # Exercises the real argparse -> Grain iterator -> Qwen3.5 ->
+        # run_pretrain -> optimizer -> checkpoint path through
+        # scripts.train_memory_tasks.main, rather than calling run_pretrain
+        # directly, so a regression in flag wiring or contract persistence
+        # would be caught here even if the lower-level trainer tests pass.
+        with test_temp_dir() as tmp:
+            tmpdir = Path(tmp)
+            save_dir = tmpdir / "run"
+            argv = [
+                "--task=exact",
+                "--condition=full_context",
+                f"--save_dir={save_dir}",
+                "--model_id=qwen3.5-smoke-dense",
+                "--num_steps=1",
+                "--pairs_per_batch=1",
+                "--log_every=0",
+                f"--jax_cache_dir={tmpdir / 'jax_cache'}",
+                "--adam_beta1=0.8",
+                "--adam_beta2=0.9",
+                "--adam_eps=1e-6",
+            ]
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                train_memory_tasks.main(argv)
+
+            metrics = json.loads(stdout.getvalue().strip().splitlines()[-1])
+            contract = json.loads((save_dir / "memory_task_contract.json").read_text())
+
+            self.assertEqual(contract["optimizer"]["adam_beta1"], 0.8)
+            self.assertEqual(contract["optimizer"]["adam_beta2"], 0.9)
+            self.assertEqual(contract["optimizer"]["adam_eps"], 1e-6)
+            self.assertTrue((save_dir / "000001").is_dir())
+            self.assertTrue((save_dir / "config.json").exists())
+            self.assertIn("device_memory", metrics)
+            self.assertIsInstance(metrics["device_memory"], list)
 
     @parameterized.parameters(
         dict(num_exact_bindings=1, relevance_cue=MemoryTaskCue.MARKED),

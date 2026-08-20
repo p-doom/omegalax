@@ -102,6 +102,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--lr_schedule", choices=("linear", "cosine", "wsd"), default="linear")
     parser.add_argument("--lr_end_factor", type=float, default=1.0)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
+    parser.add_argument("--adam_beta1", type=float, default=0.9)
+    parser.add_argument("--adam_beta2", type=float, default=0.95)
+    parser.add_argument("--adam_eps", type=float, default=1e-8)
     parser.add_argument("--grad_accum_steps", type=int, default=1)
     parser.add_argument("--tp_size", type=int, default=1)
     parser.add_argument("--fsdp_size", type=int, default=1)
@@ -120,6 +123,30 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--wandb_resume")
     parser.add_argument("--wandb_tags", nargs="*", default=())
     return parser
+
+
+def _device_memory_stats() -> list[dict[str, object]]:
+    stats = []
+    for device in jax.local_devices():
+        try:
+            memory = device.memory_stats()
+        except Exception:
+            continue
+        if not memory:
+            continue
+        try:
+            stats.append(
+                {
+                    "device_id": device.id,
+                    "platform": device.platform,
+                    "bytes_in_use": int(memory["bytes_in_use"]),
+                    "peak_bytes_in_use": int(memory["peak_bytes_in_use"]),
+                    "bytes_limit": int(memory["bytes_limit"]),
+                }
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+    return stats
 
 
 def _ensure_contract(save_dir: Path, contract: dict[str, object]) -> None:
@@ -201,6 +228,9 @@ def main(argv: list[str] | None = None) -> None:
             "lr_schedule": args.lr_schedule,
             "lr_end_factor": args.lr_end_factor,
             "max_grad_norm": args.max_grad_norm,
+            "adam_beta1": args.adam_beta1,
+            "adam_beta2": args.adam_beta2,
+            "adam_eps": args.adam_eps,
             "grad_accum_steps": args.grad_accum_steps,
         },
         "state": {
@@ -243,6 +273,9 @@ def main(argv: list[str] | None = None) -> None:
                 lr_schedule=args.lr_schedule,
                 lr_end_factor=args.lr_end_factor,
                 max_grad_norm=args.max_grad_norm,
+                adam_beta1=args.adam_beta1,
+                adam_beta2=args.adam_beta2,
+                adam_eps=args.adam_eps,
                 grad_accum_steps=args.grad_accum_steps,
                 print_every=args.log_every,
             )
@@ -279,6 +312,9 @@ def main(argv: list[str] | None = None) -> None:
                 lr_schedule=args.lr_schedule,
                 lr_end_factor=args.lr_end_factor,
                 max_grad_norm=args.max_grad_norm,
+                adam_beta1=args.adam_beta1,
+                adam_beta2=args.adam_beta2,
+                adam_eps=args.adam_eps,
                 grad_accum_steps=args.grad_accum_steps,
             )
             _, metrics = tail_pretrain.run_tail_pretrain(
@@ -304,6 +340,7 @@ def main(argv: list[str] | None = None) -> None:
     finally:
         if wandb_run is not None:
             wandb_run.finish()
+    metrics["device_memory"] = _device_memory_stats()
     print(json.dumps(metrics, sort_keys=True))
 
 
