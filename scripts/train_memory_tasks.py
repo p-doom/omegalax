@@ -5,13 +5,17 @@ from __future__ import annotations
 import argparse
 import dataclasses
 from enum import StrEnum
+import hashlib
 import json
 from pathlib import Path
+import re
+import subprocess
 
 from absl import flags
 import jax
 import wandb
 
+import omegalax
 from omegalax.data.memory_tasks import (
     MemoryTask,
     MemoryTaskConfig,
@@ -19,6 +23,7 @@ from omegalax.data.memory_tasks import (
     MemoryTaskSplit,
     make_memory_task_iterator,
 )
+from omegalax.models.qwen3_5.kernels import _resolve_backend
 from omegalax.text import api as text_api
 from omegalax.text.checkpoint import resolve_checkpoint
 from omegalax.trainers import pretrain as pretrain_trainer
@@ -30,6 +35,17 @@ class TrainingCondition(StrEnum):
     FULL_CONTEXT = "full_context"
     RESET = "reset"
     STATE = "state"
+
+
+_SHA256_RE = re.compile(r"[0-9a-fA-F]{64}")
+
+
+def _sha256_arg(value: str) -> str:
+    if not _SHA256_RE.fullmatch(value):
+        raise argparse.ArgumentTypeError(
+            "--run_plan_sha256 must be exactly 64 hexadecimal characters"
+        )
+    return value.lower()
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -113,8 +129,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--keep_latest", type=int, default=3)
     parser.add_argument("--log_every", type=int, default=10)
     parser.add_argument("--resume", choices=[mode.value for mode in ResumeMode], default="never")
-    parser.add_argument("--text_attn_backend", default="xla")
+    parser.add_argument("--text_attn_backend", default="mosaic_gpu")
     parser.add_argument("--jax_cache_dir", type=Path, required=True)
+    parser.add_argument("--run_plan_sha256", required=True, type=_sha256_arg)
+    parser.add_argument("--success_criterion", required=True)
     parser.add_argument("--wandb_project")
     parser.add_argument("--wandb_entity")
     parser.add_argument("--wandb_group")
@@ -126,15 +144,16 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _device_memory_stats() -> list[dict[str, object]]:
+    try:
+        devices = jax.local_devices()
+    except Exception:
+        return []
     stats = []
-    for device in jax.local_devices():
+    for device in devices:
         try:
             memory = device.memory_stats()
-        except Exception:
-            continue
-        if not memory:
-            continue
-        try:
+            if not memory:
+                continue
             stats.append(
                 {
                     "device_id": device.id,
@@ -144,9 +163,76 @@ def _device_memory_stats() -> list[dict[str, object]]:
                     "bytes_limit": int(memory["bytes_limit"]),
                 }
             )
-        except (KeyError, TypeError, ValueError):
+        except Exception:
             continue
     return stats
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
+def _content_sha256(repo_root: Path, paths: tuple[Path, ...]) -> str:
+    digest = hashlib.sha256()
+    for path in paths:
+        resolved = path.resolve()
+        digest.update(str(resolved.relative_to(repo_root)).encode() + b"\0")
+        digest.update(resolved.read_bytes())
+    return digest.hexdigest()
+
+
+def _revision() -> dict[str, object]:
+    repo_root = _repo_root()
+    commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    dirty = bool(
+        subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    )
+    return {
+        "commit": commit,
+        "dirty": dirty,
+        "content_sha256": _content_sha256(
+            repo_root,
+            (
+                Path(__file__),
+                repo_root / "omegalax/data/memory_tasks.py",
+                repo_root / "omegalax/trainers/pretrain.py",
+                repo_root / "omegalax/trainers/tail_pretrain.py",
+            ),
+        ),
+    }
+
+
+def _wandb_identity(args: argparse.Namespace) -> dict[str, object] | None:
+    identity_fields = ("wandb_entity", "wandb_project", "wandb_group", "wandb_name", "wandb_id")
+    has_identity = any(getattr(args, name) is not None for name in identity_fields)
+    if not has_identity:
+        return None
+    if not args.wandb_project:
+        raise ValueError("--wandb_project is required when any W&B identity field is set")
+    missing = [name for name in identity_fields if not getattr(args, name)]
+    if missing:
+        raise ValueError(f"W&B requires explicit identity fields: {', '.join(missing)}")
+    return {
+        "entity": args.wandb_entity,
+        "project": args.wandb_project,
+        "group": args.wandb_group,
+        "name": args.wandb_name,
+        "id": args.wandb_id,
+        "resume": args.wandb_resume,
+        "tags": list(args.wandb_tags),
+    }
 
 
 def _ensure_contract(save_dir: Path, contract: dict[str, object]) -> None:
@@ -166,6 +252,9 @@ def main(argv: list[str] | None = None) -> None:
     args = _parser().parse_args(argv)
     if not flags.FLAGS.is_parsed():
         flags.FLAGS(["train_memory_tasks.py"])
+    if not args.success_criterion.strip():
+        raise ValueError("--success_criterion must be non-empty")
+    wandb_identity = _wandb_identity(args)
     jax.config.update("jax_compilation_cache_dir", str(args.jax_cache_dir))
     task_config = MemoryTaskConfig(
         task=args.task,
@@ -204,7 +293,7 @@ def main(argv: list[str] | None = None) -> None:
         fsdp_size=args.fsdp_size,
     )
     contract = {
-        "schema_version": 1,
+        "schema_version": 2,
         "task": dataclasses.asdict(task_config),
         "condition": str(args.condition),
         "pairs_per_batch": args.pairs_per_batch,
@@ -239,27 +328,50 @@ def main(argv: list[str] | None = None) -> None:
             "pass_rope_positions": False,
             "pass_conv_state": False,
         },
+        "run_plan": {
+            "sha256": args.run_plan_sha256,
+            "success_criterion": args.success_criterion,
+        },
+        "revision": _revision(),
+        "runtime": {
+            "omegalax_file": str(Path(omegalax.__file__).resolve()),
+            "jax_backend": jax.default_backend(),
+            "jax_device_count": jax.device_count(),
+            "topology": {
+                "tp_size": args.tp_size,
+                "fsdp_size": args.fsdp_size,
+                "dp_size": args.dp_size,
+            },
+            "text_attn_backend": args.text_attn_backend,
+            "deltanet_kernel": _resolve_backend(),
+        },
+        "wandb": wandb_identity,
     }
     save_dir = args.save_dir.expanduser().resolve()
     if jax.process_index() == 0:
         _ensure_contract(save_dir, contract)
 
     wandb_run = None
-    if args.wandb_project and jax.process_index() == 0:
+    if wandb_identity is not None and jax.process_index() == 0:
         wandb_kwargs = {
-            "project": args.wandb_project,
-            "entity": args.wandb_entity,
-            "group": args.wandb_group,
-            "name": args.wandb_name,
+            "project": wandb_identity["project"],
+            "entity": wandb_identity["entity"],
+            "group": wandb_identity["group"],
+            "name": wandb_identity["name"],
             "tags": list(args.wandb_tags) or None,
             "config": contract,
+            "id": wandb_identity["id"],
         }
-        if args.wandb_id:
-            wandb_kwargs["id"] = args.wandb_id
         if args.wandb_resume:
             wandb_kwargs["resume"] = args.wandb_resume
         wandb_run = wandb.init(**wandb_kwargs)
-
+        if wandb_run.id != args.wandb_id:
+            actual_wandb_id = wandb_run.id
+            wandb_run.finish()
+            wandb_run = None
+            raise ValueError(
+                f"W&B returned run id {actual_wandb_id!r}, expected requested id {args.wandb_id!r}"
+            )
     try:
         if source_checkpoint is None:
             train_config = pretrain_trainer.TrainConfig(

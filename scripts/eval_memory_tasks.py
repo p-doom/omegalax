@@ -80,8 +80,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--tp_size", type=int, default=1)
     parser.add_argument("--fsdp_size", type=int, default=1)
     parser.add_argument("--dp_size", type=int, default=1)
-    parser.add_argument("--text_attn_backend", default="xla")
+    parser.add_argument("--text_attn_backend", default="mosaic_gpu")
     parser.add_argument("--jax_cache_dir", type=Path, required=True)
+    parser.add_argument("--wiki_mirror_dir", type=Path)
     return parser
 
 
@@ -109,19 +110,35 @@ def _manifest(config: MemoryTaskConfig, num_pairs: int) -> dict[str, Any]:
     return manifest | {"sha256": hashlib.sha256(payload).hexdigest()}
 
 
+def _canonical_json_sha256(value: Any) -> str:
+    payload = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 # seed/split are expected to differ between a training contract and the
 # requested eval config (eval always uses split=EVAL, and often a distinct
 # seed); every other field is part of the frozen task semantics.
 _MEMORY_TASK_CONTRACT_ALLOWED_DIFFERENCES = frozenset({"seed", "split"})
 
 
-def _validate_training_contract(checkpoint_root: Path, task_config: MemoryTaskConfig) -> None:
+def _validate_training_contract(checkpoint_root: Path, task_config: MemoryTaskConfig) -> str:
     contract_path = checkpoint_root / "memory_task_contract.json"
     if not contract_path.is_file():
-        return
-    contract = json.loads(contract_path.read_text())
-    trained_task = contract["task"]
-    trained_split = trained_task["split"]
+        raise ValueError(f"Refusing to evaluate without memory_task_contract.json: {contract_path}")
+    try:
+        contract = json.loads(contract_path.read_text())
+        trained_task = contract["task"]
+        trained_split = trained_task["split"]
+    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise ValueError(f"Unreadable memory-task contract: {contract_path}") from exc
     if trained_split != MemoryTaskSplit.TRAIN.value:
         raise ValueError(
             f"Refusing to evaluate {checkpoint_root}: memory_task_contract.json records "
@@ -129,15 +146,16 @@ def _validate_training_contract(checkpoint_root: Path, task_config: MemoryTaskCo
         )
     requested_task = dataclasses.asdict(task_config)
     mismatches = {
-        name: (trained_task[name], value)
+        name: (trained_task.get(name), value)
         for name, value in requested_task.items()
-        if name not in _MEMORY_TASK_CONTRACT_ALLOWED_DIFFERENCES and trained_task[name] != value
+        if name not in _MEMORY_TASK_CONTRACT_ALLOWED_DIFFERENCES and trained_task.get(name) != value
     }
     if mismatches:
         raise ValueError(
             f"Refusing to evaluate {checkpoint_root} on a mismatched memory-task config: "
             f"{mismatches!r}"
         )
+    return _canonical_json_sha256(contract)
 
 
 def _revision() -> dict[str, Any]:
@@ -158,13 +176,108 @@ def _revision() -> dict[str, Any]:
             text=True,
         ).stdout.strip()
     )
-    return {"commit": commit, "dirty": dirty}
+    relevant_paths = (
+        Path(__file__),
+        repo / "omegalax/data/memory_tasks.py",
+        repo / "omegalax/evals/memory_tasks.py",
+    )
+    digest = hashlib.sha256()
+    for path in relevant_paths:
+        resolved = path.resolve()
+        digest.update(str(resolved.relative_to(repo)).encode() + b"\0")
+        digest.update(resolved.read_bytes())
+    return {"commit": commit, "dirty": dirty, "content_sha256": digest.hexdigest()}
+
+
+def _ensure_not_complete(run_dir: Path, manifest: dict[str, Any], config: dict[str, Any]) -> None:
+    status_path = run_dir / "status.json"
+    if not status_path.is_file():
+        return
+    try:
+        status = json.loads(status_path.read_text())
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Unreadable eval status at {status_path}") from exc
+    if status.get("status") != "complete":
+        return
+    for path, value in (
+        (run_dir / "manifest.json", manifest),
+        (run_dir / "eval_config.json", config),
+    ):
+        if not path.is_file() or json.loads(path.read_text()) != value:
+            raise ValueError(f"Completed eval has inconsistent immutable input: {path}")
+    _verify_artifact_manifest(run_dir)
+    raise ValueError(f"Eval is already complete; refusing to overwrite {run_dir}")
+
+
+def _verify_artifact_manifest(run_dir: Path) -> None:
+    manifest_path = run_dir / "artifact_manifest.json"
+    if not manifest_path.is_file():
+        raise ValueError(f"Completed eval is missing artifact manifest: {manifest_path}")
+    try:
+        artifact_manifest = json.loads(manifest_path.read_text())
+        artifacts = artifact_manifest["artifacts"]
+    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise ValueError(
+            f"Completed eval has an unreadable artifact manifest: {manifest_path}"
+        ) from exc
+    if not isinstance(artifacts, dict) or not artifacts:
+        raise ValueError(f"Completed eval has an empty artifact manifest: {manifest_path}")
+    resolved_run_dir = run_dir.resolve()
+    for relative_path, expected_sha256 in artifacts.items():
+        path = (run_dir / relative_path).resolve()
+        if not path.is_relative_to(resolved_run_dir):
+            raise ValueError(f"Artifact manifest escapes eval directory: {relative_path!r}")
+        if not path.is_file():
+            raise ValueError(f"Completed eval is missing artifact: {relative_path}")
+        actual_sha256 = _file_sha256(path)
+        if actual_sha256 != expected_sha256:
+            raise ValueError(
+                f"Completed eval artifact hash mismatch for {relative_path}: "
+                f"expected {expected_sha256}, got {actual_sha256}"
+            )
+
+
+def _write_artifact_manifest(run_dir: Path) -> dict[str, Any]:
+    artifact_paths = (
+        run_dir / "raw.jsonl",
+        run_dir / "summary.json",
+        run_dir / "plots" / "accuracy.svg",
+        run_dir / "plots" / "answer_nll.svg",
+    )
+    artifacts = {str(path.relative_to(run_dir)): _file_sha256(path) for path in artifact_paths}
+    manifest = {"schema_version": 1, "artifacts": artifacts}
+    _write_json(run_dir / "artifact_manifest.json", manifest)
+    return manifest
+
+
+def _write_mirror_file(path: Path, content: bytes) -> None:
+    if path.exists():
+        if path.read_bytes() != content:
+            raise ValueError(f"Refusing to overwrite different Wiki mirror file: {path}")
+        return
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_bytes(content)
+    temporary.replace(path)
+
+
+def _mirror_svgs(run_dir: Path, mirror_dir: Path, artifact_manifest: dict[str, Any]) -> None:
+    mirror_dir = mirror_dir.expanduser().resolve()
+    mirror_dir.mkdir(parents=True, exist_ok=True)
+    for name in ("accuracy.svg", "answer_nll.svg"):
+        _write_mirror_file(mirror_dir / name, (run_dir / "plots" / name).read_bytes())
+    readme = (
+        "# Controlled memory eval\n\n"
+        f"Source: {run_dir}\n\n"
+        f"Artifact manifest SHA256: {_canonical_json_sha256(artifact_manifest)}\n"
+    )
+    _write_mirror_file(mirror_dir / "README.md", readme.encode())
 
 
 def _plot(summary: dict[str, dict[str, float]], plots_dir: Path) -> None:
     import matplotlib
 
     matplotlib.use("Agg")
+    matplotlib.rcParams["svg.hashsalt"] = "omegalax-memory-eval-v1"
     import matplotlib.pyplot as plt
 
     modes = [mode.value for mode in MemoryEvalMode]
@@ -188,7 +301,7 @@ def _plot(summary: dict[str, dict[str, float]], plots_dir: Path) -> None:
     axis.set_xticks(x, labels)
     axis.legend()
     figure.tight_layout()
-    figure.savefig(plots_dir / "accuracy.svg", format="svg")
+    figure.savefig(plots_dir / "accuracy.svg", format="svg", metadata={"Date": None})
     plt.close(figure)
 
     figure, axis = plt.subplots(figsize=(9, 4.5))
@@ -205,7 +318,7 @@ def _plot(summary: dict[str, dict[str, float]], plots_dir: Path) -> None:
     axis.set_xticks(x, labels)
     axis.legend()
     figure.tight_layout()
-    figure.savefig(plots_dir / "answer_nll.svg", format="svg")
+    figure.savefig(plots_dir / "answer_nll.svg", format="svg", metadata={"Date": None})
     plt.close(figure)
 
 
@@ -215,7 +328,15 @@ def main(argv: list[str] | None = None) -> None:
         flags.FLAGS(["eval_memory_tasks.py"])
     if args.num_pairs <= 0 or args.num_pairs % args.pairs_per_batch:
         raise ValueError("num_pairs must be positive and divisible by pairs_per_batch")
+    if (args.tp_size, args.fsdp_size, args.dp_size) != (1, 1, 1):
+        raise ValueError(
+            "Memory evaluation currently supports only one device with tp_size=fsdp_size=dp_size=1"
+        )
     jax.config.update("jax_compilation_cache_dir", str(args.jax_cache_dir))
+    if jax.device_count() != 1:
+        raise ValueError(
+            f"Memory evaluation currently requires exactly one visible JAX device, got {jax.device_count()}"
+        )
     task_config = MemoryTaskConfig(
         task=args.task,
         seed=args.seed,
@@ -228,7 +349,32 @@ def main(argv: list[str] | None = None) -> None:
         split=MemoryTaskSplit.EVAL,
     )
     resolved = resolve_checkpoint(args.checkpoint)
-    _validate_training_contract(resolved.root, task_config)
+    training_contract_sha256 = _validate_training_contract(resolved.root, task_config)
+    eval_name = f"memory_{task_config.task.value}_v1"
+    run_dir = resolved.root / "evals" / eval_name / f"step_{resolved.step}"
+    manifest = _manifest(task_config, args.num_pairs)
+    config = {
+        "schema_version": 2,
+        "checkpoint_root": str(resolved.root),
+        "checkpoint_step": resolved.step,
+        "manifest_sha256": manifest["sha256"],
+        "training_contract_sha256": training_contract_sha256,
+        "pairs_per_batch": args.pairs_per_batch,
+        "topology": {"tp_size": args.tp_size, "fsdp_size": args.fsdp_size, "dp_size": args.dp_size},
+        "text_attn_backend": args.text_attn_backend,
+        "conditions": [mode.value for mode in MemoryEvalMode],
+        "revision": _revision(),
+    }
+    run_dir.mkdir(parents=True, exist_ok=True)
+    _ensure_not_complete(run_dir, manifest, config)
+    for path, value in (
+        (run_dir / "manifest.json", manifest),
+        (run_dir / "eval_config.json", config),
+    ):
+        if path.exists() and json.loads(path.read_text()) != value:
+            raise ValueError(f"Refusing to change immutable eval input: {path}")
+        _write_json(path, value)
+    _write_json(run_dir / "status.json", {"status": "running"})
     model_config = text_api.resolve_config(str(resolved.config_path))
     if task_config.vocab_size > model_config.vocab_size:
         raise ValueError(
@@ -243,28 +389,6 @@ def main(argv: list[str] | None = None) -> None:
     )
     restore_model_params(model, resolved)
     set_attn_backend(model, text_backend=args.text_attn_backend)
-
-    eval_name = f"memory_{task_config.task.value}_v1"
-    run_dir = resolved.root / "evals" / eval_name / f"step_{resolved.step}"
-    run_dir.mkdir(parents=True, exist_ok=True)
-    manifest = _manifest(task_config, args.num_pairs)
-    config = {
-        "schema_version": 1,
-        "checkpoint_root": str(resolved.root),
-        "checkpoint_step": resolved.step,
-        "manifest_sha256": manifest["sha256"],
-        "pairs_per_batch": args.pairs_per_batch,
-        "conditions": [mode.value for mode in MemoryEvalMode],
-        "revision": _revision(),
-    }
-    for path, value in (
-        (run_dir / "manifest.json", manifest),
-        (run_dir / "eval_config.json", config),
-    ):
-        if path.exists() and json.loads(path.read_text()) != value:
-            raise ValueError(f"Refusing to change immutable eval input: {path}")
-        _write_json(path, value)
-    _write_json(run_dir / "status.json", {"status": "running"})
 
     rows: list[dict[str, Any]] = []
     for start in range(0, args.num_pairs, args.pairs_per_batch):
@@ -316,6 +440,9 @@ def main(argv: list[str] | None = None) -> None:
     summary = {"modes": mode_summary, "causal_effects": effects}
     _write_json(run_dir / "summary.json", summary)
     _plot(mode_summary, run_dir / "plots")
+    artifact_manifest = _write_artifact_manifest(run_dir)
+    if args.wiki_mirror_dir is not None:
+        _mirror_svgs(run_dir, args.wiki_mirror_dir, artifact_manifest)
     _write_json(run_dir / "status.json", {"status": "complete"})
     print(json.dumps({"run_dir": str(run_dir), **summary}, sort_keys=True))
 

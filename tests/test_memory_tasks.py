@@ -11,6 +11,7 @@ from absl.testing import absltest, parameterized
 import jax
 import jax.numpy as jnp
 import numpy as np
+import orbax.checkpoint as ocp
 
 from omegalax.data.memory_tasks import (
     MemoryTask,
@@ -31,9 +32,18 @@ from omegalax.models.qwen3_5.config import Qwen3_5TextConfig
 from omegalax.models.shard_config import ShardConfig
 from omegalax.text import api as text_api
 from omegalax.trainers import pretrain as pretrain_trainer
-from scripts import train_memory_tasks
+from omegalax.trainers import checkpoint_utils
+from scripts import eval_memory_tasks, train_memory_tasks
 from scripts.train_memory_tasks import TrainingCondition, training_layout
-from scripts.eval_memory_tasks import _validate_training_contract, summarize_rows
+from scripts.eval_memory_tasks import (
+    _canonical_json_sha256,
+    _ensure_not_complete,
+    _plot,
+    _validate_training_contract,
+    _write_artifact_manifest,
+    _write_mirror_file,
+    summarize_rows,
+)
 from tests.pretrain_real_data_test_utils import test_temp_dir
 
 
@@ -337,6 +347,67 @@ class MemoryTaskTest(parameterized.TestCase):
         np.testing.assert_array_equal(second["pair_index_B"], [2, 2, 3, 3])
         np.testing.assert_array_equal(second["world_B"], [0, 1, 0, 1])
 
+    def test_grain_iterator_restores_the_next_pair_cursor_after_grad_accumulation(self):
+        # A checkpoint is saved only after an optimizer update. With two
+        # microbatches per update, the restored iterator must therefore start
+        # at pair 2 rather than replaying either accumulation microbatch.
+        config = MemoryTaskConfig(
+            task=MemoryTask.EXACT,
+            seed=29,
+            segment_length=16,
+            num_segments=2,
+        )
+        with test_temp_dir() as tmp:
+            iterator = make_memory_task_iterator(
+                config,
+                global_batch_size=4,
+                num_batches=4,
+                flatten=False,
+                dp_size=1,
+                fsdp_size=1,
+                process_index=0,
+            )
+            _ = next(iterator)
+            _ = next(iterator)
+            registry = ocp.handlers.DefaultCheckpointHandlerRegistry()
+            registry.add("train_state", ocp.args.PyTreeSave, ocp.handlers.PyTreeCheckpointHandler)
+            registry.add(
+                "train_state", ocp.args.PyTreeRestore, ocp.handlers.PyTreeCheckpointHandler
+            )
+            checkpoint_utils.register_grain_iterator_handler(registry)
+            manager = ocp.CheckpointManager(
+                Path(tmp) / "iterator_checkpoint",
+                options=ocp.CheckpointManagerOptions(save_interval_steps=1),
+                handler_registry=registry,
+            )
+            manager.save(
+                1,
+                args=checkpoint_utils.make_grain_save_args(
+                    {"step": np.asarray(1, dtype=np.int32)}, iterator
+                ),
+            )
+            manager.wait_until_finished()
+
+            restored = make_memory_task_iterator(
+                config,
+                global_batch_size=4,
+                num_batches=4,
+                flatten=False,
+                dp_size=1,
+                fsdp_size=1,
+                process_index=0,
+            )
+            restored_state = manager.restore(
+                1,
+                args=checkpoint_utils.make_grain_restore_args(
+                    {"step": jax.ShapeDtypeStruct((), jnp.int32)}, restored
+                ),
+            )
+            restored = checkpoint_utils.restored_input_iter(restored_state)
+            metadata = next(restored)[BATCH_PRETRAIN_METADATA_KEY]
+            np.testing.assert_array_equal(metadata["pair_index_B"], [2, 2])
+            manager.close()
+
     @parameterized.parameters(
         dict(
             condition=TrainingCondition.STATE,
@@ -347,6 +418,11 @@ class MemoryTaskTest(parameterized.TestCase):
             condition=TrainingCondition.STATE,
             num_exact_bindings=3,
             relevance_cue=MemoryTaskCue.SURPRISE,
+        ),
+        dict(
+            condition=TrainingCondition.RESET,
+            num_exact_bindings=1,
+            relevance_cue=MemoryTaskCue.MARKED,
         ),
         dict(
             condition=TrainingCondition.FULL_CONTEXT,
@@ -430,8 +506,12 @@ class MemoryTaskTest(parameterized.TestCase):
                 "--model_id=qwen3.5-smoke-dense",
                 "--num_steps=1",
                 "--pairs_per_batch=1",
+                "--grad_accum_steps=2",
                 "--log_every=0",
                 f"--jax_cache_dir={tmpdir / 'jax_cache'}",
+                "--text_attn_backend=xla",
+                f"--run_plan_sha256={'a' * 64}",
+                "--success_criterion=unit-test criterion",
                 "--adam_beta1=0.8",
                 "--adam_beta2=0.9",
                 "--adam_eps=1e-6",
@@ -447,10 +527,99 @@ class MemoryTaskTest(parameterized.TestCase):
             self.assertEqual(contract["optimizer"]["adam_beta1"], 0.8)
             self.assertEqual(contract["optimizer"]["adam_beta2"], 0.9)
             self.assertEqual(contract["optimizer"]["adam_eps"], 1e-6)
+            self.assertEqual(
+                contract["run_plan"],
+                {
+                    "sha256": "a" * 64,
+                    "success_criterion": "unit-test criterion",
+                },
+            )
+            self.assertEqual(contract["runtime"]["text_attn_backend"], "xla")
+            self.assertEqual(
+                contract["runtime"]["topology"], {"tp_size": 1, "fsdp_size": 1, "dp_size": 1}
+            )
+            self.assertEqual(contract["runtime"]["jax_backend"], jax.default_backend())
+            self.assertEqual(contract["runtime"]["jax_device_count"], jax.device_count())
+            self.assertEqual(contract["runtime"]["deltanet_kernel"], "xla")
+            self.assertIn("commit", contract["revision"])
+            self.assertIn("dirty", contract["revision"])
+            self.assertIn("content_sha256", contract["revision"])
+            self.assertTrue(Path(contract["runtime"]["omegalax_file"]).is_file())
             self.assertTrue((save_dir / "000001").is_dir())
             self.assertTrue((save_dir / "config.json").exists())
             self.assertIn("device_memory", metrics)
             self.assertIsInstance(metrics["device_memory"], list)
+
+    def test_training_cli_defaults_to_mosaic_gpu_attention(self):
+        action = next(
+            action
+            for action in train_memory_tasks._parser()._actions
+            if action.dest == "text_attn_backend"
+        )
+        self.assertEqual(action.default, "mosaic_gpu")
+
+    def test_tail_cli_and_eval_run_from_a_real_tiny_checkpoint(self):
+        with test_temp_dir() as tmp:
+            tmpdir = Path(tmp)
+            source_dir = tmpdir / "source"
+            source_argv = [
+                "--task=exact",
+                "--condition=full_context",
+                f"--save_dir={source_dir}",
+                "--model_id=qwen3.5-smoke-dense",
+                "--num_steps=1",
+                "--pairs_per_batch=1",
+                "--log_every=0",
+                f"--jax_cache_dir={tmpdir / 'source_jax_cache'}",
+                "--text_attn_backend=xla",
+                f"--run_plan_sha256={'b' * 64}",
+                "--success_criterion=source checkpoint for tail CLI test",
+            ]
+            with contextlib.redirect_stdout(io.StringIO()):
+                train_memory_tasks.main(source_argv)
+
+            tail_dir = tmpdir / "tail"
+            tail_argv = [
+                "--task=exact",
+                "--condition=full_context",
+                f"--save_dir={tail_dir}",
+                f"--init_model_checkpoint={source_dir}",
+                "--num_steps=1",
+                "--pairs_per_batch=1",
+                "--log_every=0",
+                f"--jax_cache_dir={tmpdir / 'tail_jax_cache'}",
+                "--text_attn_backend=xla",
+                f"--run_plan_sha256={'c' * 64}",
+                "--success_criterion=tail CLI initialization from real checkpoint",
+            ]
+            with contextlib.redirect_stdout(io.StringIO()):
+                train_memory_tasks.main(tail_argv)
+
+            contract = json.loads((tail_dir / "memory_task_contract.json").read_text())
+            self.assertEqual(contract["source"]["checkpoint_root"], str(source_dir.resolve()))
+            self.assertEqual(contract["source"]["checkpoint_step"], 1)
+            self.assertTrue((tail_dir / "000002").is_dir())
+            mirror_dir = tmpdir / "wiki_mirror"
+            eval_argv = [
+                f"--checkpoint={tail_dir}",
+                "--task=exact",
+                "--num_pairs=2",
+                "--pairs_per_batch=1",
+                "--text_attn_backend=xla",
+                f"--jax_cache_dir={tmpdir / 'eval_jax_cache'}",
+                f"--wiki_mirror_dir={mirror_dir}",
+            ]
+            with contextlib.redirect_stdout(io.StringIO()):
+                eval_memory_tasks.main(eval_argv)
+
+            eval_dir = tail_dir / "evals" / "memory_exact_v1" / "step_2"
+            eval_config = json.loads((eval_dir / "eval_config.json").read_text())
+            self.assertIn("training_contract_sha256", eval_config)
+            self.assertTrue((eval_dir / "artifact_manifest.json").is_file())
+            self.assertTrue((mirror_dir / "accuracy.svg").is_file())
+            self.assertTrue((mirror_dir / "answer_nll.svg").is_file())
+            self.assertTrue((mirror_dir / "README.md").is_file())
+            self.assertFalse((mirror_dir / "raw.jsonl").exists())
 
     @parameterized.parameters(
         dict(num_exact_bindings=1, relevance_cue=MemoryTaskCue.MARKED),
@@ -633,7 +802,10 @@ class MemoryTaskTest(parameterized.TestCase):
                 json.dumps({"task": dataclasses.asdict(base_config)})
             )
 
-            _validate_training_contract(root, base_config)
+            self.assertEqual(
+                _validate_training_contract(root, base_config),
+                _canonical_json_sha256({"task": dataclasses.asdict(base_config)}),
+            )
             # seed and split are intentionally allowed to differ between the
             # trained contract and the requested eval config.
             _validate_training_contract(
@@ -665,6 +837,79 @@ class MemoryTaskTest(parameterized.TestCase):
             )
             with self.assertRaises(ValueError):
                 _validate_training_contract(root, base_config)
+
+    def test_eval_contract_validation_rejects_missing_contract(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(ValueError, "memory_task_contract.json"):
+                _validate_training_contract(
+                    Path(tmp),
+                    MemoryTaskConfig(
+                        task=MemoryTask.EXACT,
+                        seed=0,
+                        segment_length=16,
+                        num_segments=2,
+                    ),
+                )
+
+    def test_eval_refuses_to_overwrite_a_completed_identical_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            manifest = {"sha256": "manifest"}
+            config = {"manifest_sha256": "manifest"}
+            (run_dir / "manifest.json").write_text(json.dumps(manifest))
+            (run_dir / "eval_config.json").write_text(json.dumps(config))
+            (run_dir / "status.json").write_text(json.dumps({"status": "complete"}))
+            (run_dir / "raw.jsonl").write_text("{}\n")
+            (run_dir / "summary.json").write_text("{}\n")
+            plots = run_dir / "plots"
+            plots.mkdir()
+            (plots / "accuracy.svg").write_text("<svg />\n")
+            (plots / "answer_nll.svg").write_text("<svg />\n")
+            _write_artifact_manifest(run_dir)
+
+            with self.assertRaisesRegex(ValueError, "already complete"):
+                _ensure_not_complete(run_dir, manifest, config)
+            (run_dir / "raw.jsonl").write_text('{"corrupt": true}\n')
+            with self.assertRaisesRegex(ValueError, "hash mismatch"):
+                _ensure_not_complete(run_dir, manifest, config)
+
+    def test_eval_svg_output_is_deterministic_without_date_metadata(self):
+        summary = {
+            mode.value: {
+                "accuracy": 0.5,
+                "donor_accuracy": 0.5,
+                "answer_nll": 1.0,
+                "donor_answer_nll": 1.0,
+            }
+            for mode in MemoryEvalMode
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            first = Path(tmp) / "first"
+            second = Path(tmp) / "second"
+            _plot(summary, first)
+            _plot(summary, second)
+            for name in ("accuracy.svg", "answer_nll.svg"):
+                self.assertEqual((first / name).read_bytes(), (second / name).read_bytes())
+                self.assertNotIn(b"<dc:date>", (first / name).read_bytes())
+
+    def test_wiki_mirror_refuses_to_replace_different_content(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "accuracy.svg"
+            _write_mirror_file(path, b"first")
+            _write_mirror_file(path, b"first")
+            with self.assertRaisesRegex(ValueError, "Refusing to overwrite"):
+                _write_mirror_file(path, b"second")
+
+    def test_eval_rejects_unsupported_multi_device_topology_before_restore(self):
+        with self.assertRaisesRegex(ValueError, "only one device"):
+            eval_memory_tasks.main(
+                [
+                    "--checkpoint=/unused",
+                    "--task=exact",
+                    "--tp_size=2",
+                    "--jax_cache_dir=/unused",
+                ]
+            )
 
 
 if __name__ == "__main__":
