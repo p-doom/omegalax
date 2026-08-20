@@ -543,6 +543,8 @@ class Qwen3VL(nnx.Module):
         sin_BTK, cos_BTK = compute_mrope_pos_embeddings(
             position_ids_ZBT, cfg.head_dim, cfg.rope_theta, cfg.mrope_section
         )
+        sin_BTK = sin_BTK.astype(cfg.dtype)
+        cos_BTK = cos_BTK.astype(cfg.dtype)
 
         hidden_BTD = inputs_embeds_BTD
         aux_losses = []
