@@ -1355,6 +1355,7 @@ class PretrainTrainingSmokeTest(absltest.TestCase):
 
             run_kwargs = {
                 "pretrain_mode": pretrain_trainer.PretrainMode.STATEPASSING_BPTT,
+                "save_every": 1,
                 "log_every": 0,
                 "tp_size": 1,
                 "fsdp_size": 1,
@@ -1516,7 +1517,7 @@ class PretrainTrainingSmokeTest(absltest.TestCase):
                         iterator,
                         pretrain_mode=pretrain_trainer.PretrainMode.STATEPASSING_BPTT,
                         save_dir=checkpoint_dir,
-                        save_every=0,
+                        save_every=1,
                         log_every=0,
                         tp_size=1,
                         fsdp_size=1,
@@ -1530,10 +1531,12 @@ class PretrainTrainingSmokeTest(absltest.TestCase):
                 signal.signal(signal.SIGUSR1, previous_usr1)
                 signal.signal(signal.SIGTERM, previous_term)
 
+            # save_every=1 means the periodic-save branch and the signal branch
+            # both target step=1; the signal branch must not re-save it.
             request_requeue.assert_not_called()
             self.assertTrue((checkpoint_dir / "000001").is_dir())
-            self.assertTrue(
-                any(call.kwargs.get("force") is True for call in save_checkpoint.call_args_list)
+            self.assertEqual(
+                sum(1 for call in save_checkpoint.call_args_list if call.args[3] == 1), 1
             )
             self.assertEqual(metrics["step"], 1)
 

@@ -1109,15 +1109,16 @@ def run_pretrain(
         if requeue_requested():
             startup_log(f"[signal] saving checkpoint at step={step} after signal")
             if checkpoint_manager is not None:
-                _save_sft_checkpoint(
-                    checkpoint_manager,
-                    optimizer,
-                    rng,
-                    step,
-                    data_iter,
-                    lr_contract=lr_contract,
-                    force=True,
-                )
+                if not (save_every and step % save_every == 0):
+                    _save_sft_checkpoint(
+                        checkpoint_manager,
+                        optimizer,
+                        rng,
+                        step,
+                        data_iter,
+                        lr_contract=lr_contract,
+                        force=True,
+                    )
                 checkpoint_manager.wait_until_finished()
                 checkpoint_manager.close()
             if step < train_cfg.num_steps:

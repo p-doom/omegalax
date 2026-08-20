@@ -369,7 +369,7 @@ class TailPretrainTest(absltest.TestCase):
                 seed=0,
                 batch_size=2,
                 seq_len=4,
-                num_steps=1,
+                num_steps=2,
                 global_step_offset=40000,
                 learning_rate=7e-4,
                 lr_schedule="linear",
@@ -410,7 +410,7 @@ class TailPretrainTest(absltest.TestCase):
                         iterator,
                         pretrain_mode=PretrainMode.STATEPASSING_BPTT,
                         save_dir=save_dir,
-                        save_every=0,
+                        save_every=1,
                         log_every=0,
                         resume=checkpoint_utils.ResumeMode.NEVER,
                         pad_id=0,
@@ -422,15 +422,21 @@ class TailPretrainTest(absltest.TestCase):
                         pass_gdn_state=True,
                         pass_rope_positions=False,
                         pass_conv_state=False,
+                        stop_after_local_step=1,
                     )
             finally:
                 signal.signal(signal.SIGUSR1, previous_usr1)
                 signal.signal(signal.SIGTERM, previous_term)
 
+            # config.num_steps=2 but stop_after_local_step=1: this call's real
+            # completion boundary is local_stop_step=1, not config.num_steps.
+            # save_every=1 means the periodic-save branch and the signal
+            # branch both target local_step=1, so the signal branch must not
+            # re-save it.
             request_requeue.assert_not_called()
             self.assertTrue((save_dir / "040001").is_dir())
-            self.assertTrue(
-                any(call.kwargs.get("force") is True for call in save_checkpoint.call_args_list)
+            self.assertEqual(
+                sum(1 for call in save_checkpoint.call_args_list if call.args[3] == 40001), 1
             )
             self.assertEqual(metrics["step"], 40001)
 

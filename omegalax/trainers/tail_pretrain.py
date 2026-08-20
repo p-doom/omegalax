@@ -559,18 +559,19 @@ def run_tail_pretrain(
                 lr_contract=requested_lr_contract,
             )
         if requeue_requested():
-            _save_sft_checkpoint(
-                checkpoint_manager,
-                optimizer,
-                rng,
-                global_step,
-                data_iter,
-                lr_contract=requested_lr_contract,
-                force=True,
-            )
+            if not (save_every and local_step % save_every == 0):
+                _save_sft_checkpoint(
+                    checkpoint_manager,
+                    optimizer,
+                    rng,
+                    global_step,
+                    data_iter,
+                    lr_contract=requested_lr_contract,
+                    force=True,
+                )
             checkpoint_manager.wait_until_finished()
             checkpoint_manager.close()
-            if local_step < config.num_steps:
+            if local_step < local_stop_step:
                 _request_slurm_requeue_if_primary(is_primary)
                 return optimizer, last_metrics
             log_previous(force=True)

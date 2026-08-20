@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import subprocess
 from unittest import mock
 
 from absl.testing import absltest
@@ -65,6 +66,8 @@ class MemoryTaskSubmitterTest(absltest.TestCase):
         self.assertNotIn("scontrol requeue", script)
         self.assertIn('>"$TRAIN_LOG" 2>&1\n', script)
         self.assertNotIn('>"$TRAIN_LOG" 2>&1 &', script)
+        preflight = script.split("<<'PY'\n", maxsplit=1)[1].split("\nPY\n", maxsplit=1)[0]
+        compile(preflight, "rendered_train_preflight", "exec")
 
     def test_default_cli_only_renders_and_never_submits(self):
         with test_temp_dir() as tmp:
@@ -84,6 +87,7 @@ class MemoryTaskSubmitterTest(absltest.TestCase):
             submit.assert_not_called()
             self.assertTrue((tmpdir / "job.sbatch").is_file())
             self.assertTrue((tmpdir / "logs").is_dir())
+            subprocess.run(["bash", "-n", str(tmpdir / "job.sbatch")], check=True)
 
     def test_renderer_rejects_non_sha256_run_plan_value(self):
         with test_temp_dir() as tmp:
