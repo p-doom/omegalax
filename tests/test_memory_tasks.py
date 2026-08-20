@@ -619,6 +619,18 @@ class MemoryTaskTest(parameterized.TestCase):
             eval_dir = tail_dir / "evals" / "memory_exact_v1" / "step_2"
             eval_config = json.loads((eval_dir / "eval_config.json").read_text())
             self.assertIn("training_contract_sha256", eval_config)
+            self.assertEqual(eval_config["text_attn_backend"], "xla")
+            self.assertEqual(
+                eval_config["runtime"],
+                {
+                    "jax_backend": jax.default_backend(),
+                    "visible_device_platforms": sorted(
+                        {device.platform for device in jax.devices()}
+                    ),
+                    "visible_device_count": jax.device_count(),
+                    "deltanet_kernel": "xla",
+                },
+            )
             self.assertTrue((eval_dir / "artifact_manifest.json").is_file())
             self.assertTrue((mirror_dir / "accuracy.svg").is_file())
             self.assertTrue((mirror_dir / "answer_nll.svg").is_file())
@@ -910,6 +922,8 @@ class MemoryTaskTest(parameterized.TestCase):
                 [
                     "--checkpoint=/unused",
                     "--task=exact",
+                    "--num_pairs=2",
+                    "--wiki_mirror_dir=/unused",
                     "--tp_size=2",
                     "--jax_cache_dir=/unused",
                 ]

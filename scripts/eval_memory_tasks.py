@@ -24,6 +24,7 @@ from omegalax.data.memory_tasks import (
 )
 from omegalax.data.pretrain_data_set import BATCH_PRETRAIN_METADATA_KEY
 from omegalax.evals.memory_tasks import MemoryEvalMode, evaluate_memory_batch
+from omegalax.models.qwen3_5.kernels import _resolve_backend
 from omegalax.models.sharding_runtime import set_attn_backend
 from omegalax.text import api as text_api
 from omegalax.text.checkpoint import resolve_checkpoint, restore_model_params
@@ -75,14 +76,14 @@ def _parser() -> argparse.ArgumentParser:
         choices=[cue.value for cue in MemoryTaskCue],
         default=MemoryTaskCue.MARKED.value,
     )
-    parser.add_argument("--num_pairs", type=int, default=256)
+    parser.add_argument("--num_pairs", type=int, required=True)
     parser.add_argument("--pairs_per_batch", type=int, default=8)
     parser.add_argument("--tp_size", type=int, default=1)
     parser.add_argument("--fsdp_size", type=int, default=1)
     parser.add_argument("--dp_size", type=int, default=1)
     parser.add_argument("--text_attn_backend", default="mosaic_gpu")
     parser.add_argument("--jax_cache_dir", type=Path, required=True)
-    parser.add_argument("--wiki_mirror_dir", type=Path)
+    parser.add_argument("--wiki_mirror_dir", type=Path, required=True)
     return parser
 
 
@@ -337,6 +338,13 @@ def main(argv: list[str] | None = None) -> None:
         raise ValueError(
             f"Memory evaluation currently requires exactly one visible JAX device, got {jax.device_count()}"
         )
+    visible_devices = jax.local_devices()
+    runtime = {
+        "jax_backend": jax.default_backend(),
+        "visible_device_platforms": sorted({device.platform for device in visible_devices}),
+        "visible_device_count": len(visible_devices),
+        "deltanet_kernel": _resolve_backend(),
+    }
     task_config = MemoryTaskConfig(
         task=args.task,
         seed=args.seed,
@@ -362,6 +370,7 @@ def main(argv: list[str] | None = None) -> None:
         "pairs_per_batch": args.pairs_per_batch,
         "topology": {"tp_size": args.tp_size, "fsdp_size": args.fsdp_size, "dp_size": args.dp_size},
         "text_attn_backend": args.text_attn_backend,
+        "runtime": runtime,
         "conditions": [mode.value for mode in MemoryEvalMode],
         "revision": _revision(),
     }
@@ -441,8 +450,7 @@ def main(argv: list[str] | None = None) -> None:
     _write_json(run_dir / "summary.json", summary)
     _plot(mode_summary, run_dir / "plots")
     artifact_manifest = _write_artifact_manifest(run_dir)
-    if args.wiki_mirror_dir is not None:
-        _mirror_svgs(run_dir, args.wiki_mirror_dir, artifact_manifest)
+    _mirror_svgs(run_dir, args.wiki_mirror_dir, artifact_manifest)
     _write_json(run_dir / "status.json", {"status": "complete"})
     print(json.dumps({"run_dir": str(run_dir), **summary}, sort_keys=True))
 
