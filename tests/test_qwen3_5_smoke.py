@@ -26,6 +26,7 @@ from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
 )
 
 from omegalax.models.qwen3_5.params import create_qwen3_5_from_safetensors
+from omegalax.models.sharding_runtime import set_attn_backend
 
 from tests.logits_assert import assert_logits_close
 
@@ -117,6 +118,9 @@ class Qwen3_5WeightsTest(absltest.TestCase):
             fsdp_size=1,
             dp_size=1,
         )
+        # This module runs on CPU, where the default mosaic_gpu backend raises
+        # before any assertion below executes.
+        set_attn_backend(cls.jax_model, text_backend="xla")
 
         torch_dtype = _JNP_TO_TORCH[cls.jax_cfg.text_config.dtype]
         cls.hf_model = hf_model.to(torch_dtype)

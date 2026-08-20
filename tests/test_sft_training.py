@@ -204,6 +204,9 @@ class TextSFTTrainingTest(absltest.TestCase):
             tp_size=1,
             fsdp_size=1,
             dp_size=1,
+            # This module runs on CPU, where the default mosaic_gpu backend
+            # raises before any assertion below executes.
+            text_attn_backend="xla",
         )
         self.assertIn("loss", metrics)
         self.assertIn("supervised_tokens", metrics)
@@ -233,6 +236,9 @@ class VLMSFTTrainingTest(absltest.TestCase):
             tp_size=1,
             fsdp_size=1,
             dp_size=1,
+            # This module runs on CPU, where the default mosaic_gpu backend
+            # raises before any assertion below executes.
+            text_attn_backend="xla",
         )
         self.assertIn("loss", metrics)
         self.assertIn("supervised_tokens", metrics)
@@ -260,6 +266,9 @@ class VLMSFTTrainingTest(absltest.TestCase):
             tp_size=1,
             fsdp_size=1,
             dp_size=1,
+            # This module runs on CPU, where the default mosaic_gpu backend
+            # raises before any assertion below executes.
+            text_attn_backend="xla",
         )
         self.assertIn("loss", metrics)
         self.assertIn("supervised_tokens", metrics)

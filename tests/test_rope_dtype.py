@@ -17,6 +17,7 @@ import jax.numpy as jnp
 from absl.testing import absltest
 
 from omegalax.distributed.mesh import mesh_rules_for
+from omegalax.models.sharding_runtime import set_attn_backend
 
 MODEL_DTYPE = jnp.bfloat16
 
@@ -70,6 +71,9 @@ class Qwen3RopeDtypeTest(_RopeDtypeTestBase):
 
         cfg = dataclasses.replace(make_config("qwen3-smoke"), dtype=MODEL_DTYPE)
         attn = attn_mod.Attention(cfg, rngs=nnx.Rngs(0))
+        # This module runs on CPU, where the default mosaic_gpu backend raises
+        # before any assertion below executes.
+        set_attn_backend(attn, text_backend="xla")
 
         gen_calls, apply_calls = [], []
         orig_gen = rope_mod.generate_pos_embeddings
@@ -126,6 +130,9 @@ class Qwen3_5TextRopeDtypeTest(_RopeDtypeTestBase):
         cfg = make_config("qwen3.5-smoke")
         text_cfg = dataclasses.replace(cfg.text_config, dtype=MODEL_DTYPE)
         model = model_mod.Qwen3_5ForCausalLM(text_cfg, rngs=nnx.Rngs(0))
+        # This module runs on CPU, where the default mosaic_gpu backend raises
+        # before any assertion below executes.
+        set_attn_backend(model, text_backend="xla")
 
         gen_calls = []
         orig_gen = rope_mod.generate_text_rope
@@ -220,6 +227,9 @@ class Qwen3VLRopeDtypeTest(_RopeDtypeTestBase):
         base_cfg = make_vl_config("qwen3-vl-smoke")
         cfg = dataclasses.replace(base_cfg, dtype=MODEL_DTYPE)
         model = model_mod.Qwen3VL(cfg, rngs=nnx.Rngs(0))
+        # This module runs on CPU, where the default mosaic_gpu backend raises
+        # before any assertion below executes.
+        set_attn_backend(model, text_backend="xla")
 
         gen_calls = []
         orig_gen = model_mod.compute_mrope_pos_embeddings
