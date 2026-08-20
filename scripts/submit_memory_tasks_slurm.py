@@ -87,6 +87,8 @@ def render_sbatch(
     repo_root = repo_root.expanduser().resolve()
     python_bin = python_bin.expanduser().resolve()
     log_dir = log_dir.expanduser().resolve()
+    wandb_dir = log_dir / "wandb"
+    wandb_cache_dir = log_dir.parent / "wandb_cache"
     primary_command = _command_lines(train_args)
     return f"""#!/usr/bin/env bash
 #SBATCH --job-name={shlex.quote(job_name)}
@@ -106,12 +108,17 @@ set -euo pipefail
 REPO_ROOT={shlex.quote(str(repo_root))}
 PYTHON_BIN={shlex.quote(str(python_bin))}
 EXPECTED_COMMIT={shlex.quote(expected_commit)}
+LOG_DIR={shlex.quote(str(log_dir))}
+export WANDB_MODE=online
+export WANDB_DIR={shlex.quote(str(wandb_dir))}
+export WANDB_CACHE_DIR={shlex.quote(str(wandb_cache_dir))}
 export PYTHONPATH="$REPO_ROOT${{PYTHONPATH:+:$PYTHONPATH}}"
 export PYTHONUNBUFFERED=1
 export JAX_PLATFORMS=cuda
 export JAX_LOCAL_DEVICE_IDS=0
+export XLA_PYTHON_CLIENT_MEM_FRACTION=0.95
 export OMEGALAX_DELTANET_KERNEL=pallas
-mkdir -p {shlex.quote(str(log_dir))}
+mkdir -p "$LOG_DIR" "$WANDB_DIR" "$WANDB_CACHE_DIR"
 cd "$REPO_ROOT"
 
 "$PYTHON_BIN" - "$REPO_ROOT" "$EXPECTED_COMMIT" <<'PY'
@@ -135,7 +142,6 @@ if subprocess.run(["git", "status", "--porcelain"], cwd=root, check=True, captur
     raise RuntimeError("refusing to run from a dirty worktree")
 PY
 
-LOG_DIR={shlex.quote(str(log_dir))}
 TRAIN_LOG="$LOG_DIR/train-${{SLURM_JOB_ID:-local}}.log"
 train_pid=""
 requeue_requested=0
