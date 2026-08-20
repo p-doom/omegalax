@@ -16,6 +16,7 @@ from omegalax.models.params_utils import (
     inverse_transform,
     save_hf_config,
     save_hf_tensors,
+    write_moe_experts_to_hf,
 )
 from .config import Qwen3_5Config
 from .loader import _get_non_expert_mapping, create_qwen3_5_from_safetensors
@@ -147,6 +148,9 @@ def export_qwen3_5_to_safetensors(
     hf_tensors: dict[str, np.ndarray] = {}
     unmatched: list[str] = []
 
+    expert_params: dict[int, dict[str, np.ndarray]] = {}
+    router_params: dict[int, np.ndarray] = {}
+
     def _handle_special(jax_key: str, value) -> bool:
         if jax_key == "lm_head.kernel" and cfg.text_config.tie_word_embeddings:
             return True
@@ -205,34 +209,15 @@ def export_qwen3_5_to_safetensors(
         if not cfg.text_config.is_moe:
             return False
 
-        # MoE expert fused gate/up: stored as-is (E, 2F, D)
-        m = re.fullmatch(r"text\.layers\.([0-9]+)\.mlp\.gate_up_proj", jax_key)
+        m = re.fullmatch(r"text\.layers\.([0-9]+)\.mlp\.(gate_proj|up_proj|down_proj)", jax_key)
         if m:
-            layer_idx = m.group(1)
-            arr = np.asarray(jax.device_get(value))
-            hf_tensors[f"model.language_model.layers.{layer_idx}.mlp.experts.gate_up_proj"] = (
-                arr.astype(np.float32)
-            )
+            layer_idx = int(m.group(1))
+            expert_params.setdefault(layer_idx, {})[m.group(2)] = np.asarray(jax.device_get(value))
             return True
 
-        # MoE expert down_proj: stored as-is (E, D, F)
-        m = re.fullmatch(r"text\.layers\.([0-9]+)\.mlp\.down_proj", jax_key)
-        if m:
-            layer_idx = m.group(1)
-            arr = np.asarray(jax.device_get(value))
-            hf_tensors[f"model.language_model.layers.{layer_idx}.mlp.experts.down_proj"] = (
-                arr.astype(np.float32)
-            )
-            return True
-
-        # MoE router: (D, E) -> (E, D)
         m = re.fullmatch(r"text\.layers\.([0-9]+)\.mlp\.router\.kernel", jax_key)
         if m:
-            layer_idx = m.group(1)
-            arr = np.asarray(jax.device_get(value))
-            hf_tensors[f"model.language_model.layers.{layer_idx}.mlp.gate.weight"] = arr.T.astype(
-                np.float32
-            )
+            router_params[int(m.group(1))] = np.asarray(jax.device_get(value))
             return True
 
         # Shared expert gate: (D, 1) -> (1, D)
@@ -265,6 +250,18 @@ def export_qwen3_5_to_safetensors(
             break
         if not matched:
             unmatched.append(jax_key)
+
+    if cfg.text_config.is_moe:
+        # Qwen3.5 has no per-layer MoE predicate: `is_moe` is global, so every
+        # decoder layer carries experts.
+        write_moe_experts_to_hf(
+            expert_params,
+            router_params,
+            hf_tensors,
+            num_layers=cfg.text_config.num_hidden_layers,
+            is_moe_layer=lambda _: True,
+            hf_prefix="model.language_model.layers",
+        )
 
     if unmatched:
         raise RuntimeError(
