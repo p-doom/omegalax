@@ -265,6 +265,28 @@ class MemoryTaskTest(parameterized.TestCase):
                 relevance_cue=MemoryTaskCue.SURPRISE,
             )
 
+    def test_dominant_rule_num_rule_examples_is_bounded_by_the_rule_item_pool(self):
+        # _RULE_ITEMS holds 64 pairwise-distinct items; the generator draws
+        # num_rule_examples + 1 of them without replacement, so 63 is the
+        # boundary-valid value and 65 must be rejected here -- at
+        # MemoryTaskConfig construction -- rather than inside
+        # np.random.Generator.choice during batch generation.
+        MemoryTaskConfig(
+            task=MemoryTask.DOMINANT_RULE,
+            seed=1,
+            segment_length=1 + 3 * 63,
+            num_segments=2,
+            num_rule_examples=63,
+        )
+        with self.assertRaisesRegex(ValueError, "num_rule_examples"):
+            MemoryTaskConfig(
+                task=MemoryTask.DOMINANT_RULE,
+                seed=1,
+                segment_length=1 + 3 * 65,
+                num_segments=2,
+                num_rule_examples=65,
+            )
+
     def test_dominant_rule_pair_requires_the_majority_convention(self):
         config = MemoryTaskConfig(
             task=MemoryTask.DOMINANT_RULE,

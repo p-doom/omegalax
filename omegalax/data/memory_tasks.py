@@ -72,6 +72,12 @@ class MemoryTaskConfig:
                 raise ValueError(
                     f"segment_length must be >= {required} for {self.num_rule_examples} examples"
                 )
+            if self.num_rule_examples + 1 > _RULE_ITEMS.size:
+                raise ValueError(
+                    f"num_rule_examples={self.num_rule_examples} needs "
+                    f"{self.num_rule_examples + 1} pairwise-distinct rule items "
+                    f"but only {_RULE_ITEMS.size} exist"
+                )
             if self.num_exact_bindings != 1 or self.relevance_cue is not MemoryTaskCue.MARKED:
                 raise ValueError(
                     "num_exact_bindings/relevance_cue are only defined for MemoryTask.EXACT"
