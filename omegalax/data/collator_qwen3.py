@@ -231,7 +231,18 @@ class _MessageLengthFn(Qwen3RendererEncoder):
         merge_size = (
             int(getattr(self.image_processor, "merge_size", 1)) if self.image_processor else 1
         )
-        grid_thw = encoded.get("image_grid_thw", np.empty((0, 3), dtype=np.int64))
+        if _message_has_images(message):
+            # `encode` emits the key only when the renderer produced image mm_items,
+            # so an absent one here is a message whose images the renderer dropped:
+            # substituting an empty grid measures a VLM turn as if it were text.
+            if "image_grid_thw" not in encoded:
+                raise ValueError(
+                    "message has image content but the renderer produced no image items, "
+                    f"so this measurement would report 0 vision tokens: {message!r}"
+                )
+            grid_thw = encoded["image_grid_thw"]
+        else:
+            grid_thw = np.empty((0, 3), dtype=np.int64)
         vision_tokens = 0
         vision_patches = 0
         for row in grid_thw:

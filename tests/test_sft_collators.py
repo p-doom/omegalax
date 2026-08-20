@@ -4,16 +4,20 @@ import os
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
+import dataclasses
 import pickle
+from unittest import mock
 
 from absl.testing import absltest
 
 import ml_dtypes
 import numpy as np
+from PIL import Image
 from transformers import AutoTokenizer
 
 from transformers import AutoImageProcessor
 
+from omegalax.data import collator_qwen3
 from omegalax.data.collator_qwen3 import (
     Qwen3RendererEncoder,
     TextSFTCollator,
@@ -501,6 +505,34 @@ class MessageLengthFnTest(absltest.TestCase):
         fn = make_message_length_fn(self.tokenizer)
         with self.assertRaisesRegex(ValueError, "no image_processor"):
             fn({"role": "user", "content": [{"type": "image", "image": "x.png"}]})
+
+    def test_raises_when_the_renderer_drops_the_images(self):
+        """A renderer that stops emitting image mm_items used to measure a VLM turn
+        as text: the absent ``image_grid_thw`` was substituted with an empty grid,
+        so the record was indexed at its text length with the images still in it.
+
+        The double strips ``multi_modal_data`` off a real render, which is what a
+        ``renderers`` regression looks like from here -- the encoder emits
+        ``pixel_values``/``image_grid_thw`` only when that field carries items.
+        """
+        image_processor = AutoImageProcessor.from_pretrained(
+            "Qwen/Qwen3-VL-2B-Instruct", use_fast=False
+        )
+        fn = make_message_length_fn(self.tokenizer, image_processor)
+        message = {
+            "role": "user",
+            "content": [{"type": "image", "image": Image.new("RGB", (64, 64))}],
+        }
+        self.assertEqual(fn(message)["num_images"], 1)
+
+        real = collator_qwen3.build_training_sample
+
+        def drop_images(*args, **kwargs):
+            return dataclasses.replace(real(*args, **kwargs), multi_modal_data=None)
+
+        with mock.patch.object(collator_qwen3, "build_training_sample", drop_images):
+            with self.assertRaisesRegex(ValueError, "produced no image items"):
+                fn(message)
 
     def test_survives_pickling_with_a_live_renderer(self):
         """Shipped to ``spawn`` workers via the pool initializer."""
