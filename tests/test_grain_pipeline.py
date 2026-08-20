@@ -164,6 +164,58 @@ class GrainPipelineTest(absltest.TestCase):
                     fsdp_size=1,
                 )
 
+    def test_split_never_breaks_a_screen_from_its_action(self):
+        # An overflow landing on an assistant turn closed the chunk on its user
+        # screen -- nothing supervised after it, its vision tokens paid for -- and
+        # opened the next chunk on the action with the screen gone. 2519 of the
+        # 91550 continuation-chunk boundaries in the eov3 corpus land there.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src = Path(tmpdir) / "train.jsonl"
+            self._write_jsonl(
+                src,
+                [
+                    {
+                        "messages": [
+                            {"role": "user", "content": "10"},
+                            {"role": "assistant", "content": "11"},
+                            {"role": "user", "content": "12"},
+                            {"role": "assistant", "content": "13"},
+                            {"role": "user", "content": "14"},
+                            {"role": "assistant", "content": "15"},
+                        ],
+                    },
+                ],
+            )
+
+            records_dir = build_records_from_chat(
+                src,
+                Path(tmpdir) / "records",
+                max_length=3,
+                measure_message=_measure_one,
+                records_per_shard=8,
+                overflow_mode="split",
+            )
+
+            iterator = make_grain_iterator(
+                records_dir,
+                batch_size=1,
+                batch_fn=lambda batch: batch[0],
+                shuffle=False,
+                seed=0,
+                read_options=make_grain_read_options(num_threads=1, prefetch_buffer_size=1),
+                multiprocessing_options=make_grain_multiprocessing_options(
+                    num_workers=0, per_worker_buffer_size=1
+                ),
+                dp_size=1,
+                fsdp_size=1,
+            )
+            metadata = json.loads((records_dir / "metadata.json").read_text())
+            self.assertEqual(metadata["num_records"], 3)
+            for _ in range(3):
+                roles = [message["role"] for message in next(iterator)["messages"]]
+                pairs = roles[1:] if roles[0] == "system" else roles
+                self.assertEqual(pairs, ["user", "assistant"] * (len(pairs) // 2))
+
     def test_build_records_from_chat_splits_oversized_conversation(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             src = Path(tmpdir) / "train.jsonl"

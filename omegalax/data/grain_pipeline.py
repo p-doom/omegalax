@@ -687,17 +687,34 @@ def _process_conversation(
         if not cur_msgs:
             pass
         elif cur_len + length > effective_max:
-            pair = _make_example(cur_msgs, cur_len, cur_vt, cur_vp, cur_ni)
+            # Never break between a user screen and the assistant action it
+            # conditions: the screen would close a chunk with nothing supervised
+            # after it (its vision tokens paid for, its response elsewhere) and
+            # the action would open the next chunk with its screen gone. Carry
+            # the screen forward instead.
+            back = 1 if messages[msg_offset]["role"] == "assistant" else 0
+            blen, bvt, bvp, bni = (
+                _extract_measurement(precomputed[(conv_idx, msg_offset - 1)])[:4]
+                if back
+                else (0, 0, 0, 0)
+            )
+            pair = _make_example(
+                cur_msgs[: len(cur_msgs) - back],
+                cur_len - blen,
+                cur_vt - bvt,
+                cur_vp - bvp,
+                cur_ni - bni,
+            )
             if pair is not None:
                 _record(pair)
-            cur_msgs, cur_len, cur_vt, cur_vp, cur_ni = [], 0, 0, 0, 0
+            carried = cur_msgs[len(cur_msgs) - back :]
             if overflow_mode == "truncate":
                 overflow_truncated = True
-                dm, dt = _dropped(msg_offset)
+                dm, dt = _dropped(msg_offset - back)
                 dropped_messages += dm
                 dropped_tokens += dt
                 break
-            # split: fall through and start a fresh chunk with this message
+            cur_msgs, cur_len, cur_vt, cur_vp, cur_ni = carried, blen, bvt, bvp, bni
 
         cur_msgs.append(messages[msg_offset])
         cur_len += length
