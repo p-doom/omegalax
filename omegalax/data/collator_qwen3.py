@@ -370,11 +370,14 @@ def _pad_vision_arrays(
     num_dummies = max_images - real_images
     extra_patches = max_patches - real_patches
 
-    if num_dummies < 0 or extra_patches < 0:
+    exceeded = []
+    if num_dummies < 0:
+        exceeded.append(f"real_images={real_images} > max_images={max_images}")
+    if extra_patches < 0:
+        exceeded.append(f"real_patches={real_patches} > max_patches={max_patches}")
+    if exceeded:
         raise ValueError(
-            f"Batch exceeds padding budget: real_images={real_images} > "
-            f"max_images={max_images} or real_patches={real_patches} > "
-            f"max_patches={max_patches}. Increase the per-sample limits."
+            f"Batch exceeds padding budget: {', '.join(exceeded)}. Increase the per-sample limits."
         )
 
     if num_dummies == 0 and extra_patches == 0:
