@@ -9,13 +9,13 @@ from typing import Any
 import jax
 import numpy as np
 from flax import nnx
-from safetensors import numpy as stnp
 
 from omegalax.models.params_utils import (
     build_inverse_mapping,
     flatten_pure_state,
     inverse_transform,
     save_hf_config,
+    save_hf_tensors,
 )
 from .config import Qwen3_5Config
 from .loader import _get_non_expert_mapping, create_qwen3_5_from_safetensors
@@ -271,7 +271,7 @@ def export_qwen3_5_to_safetensors(
             "Unmapped JAX parameters during export:\n" + "\n".join(sorted(unmatched))
         )
 
-    stnp.save_file(hf_tensors, tensor_path)
+    save_hf_tensors(hf_tensors, tensor_path)
     save_hf_config(qwen3_5_to_hf_config_dict(cfg), out_path)
 
     return tensor_path

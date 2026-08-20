@@ -13,6 +13,7 @@ import numpy as np
 from etils import epath
 from huggingface_hub import hf_hub_download
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
+from safetensors import numpy as stnp
 
 TransformRule = tuple[tuple[int, ...] | None, tuple[int, ...] | None, bool] | None
 
@@ -404,6 +405,22 @@ def flatten_pure_state(tree: dict[str, Any]) -> dict[str, Any]:
 
     _recurse(tree, [])
     return flat
+
+
+def save_hf_tensors(hf_tensors: dict[str, np.ndarray], tensor_path: str | epath.Path):
+    """Serialize HF-layout tensors to a safetensors file, rewriting `hf_tensors` in place.
+
+    safetensors copies each tensor straight off `ctypes.data` for `nbytes` and
+    ignores strides, so a transposed or permuted view is written as its
+    pre-transpose buffer under the post-transpose shape: a file that loads at
+    the right shape with the wrong values. `inverse_transform` returns such a
+    view for every LINEAR kernel, so this is the common case, not the corner.
+    Each copy replaces its view in the caller's dict rather than accumulating
+    into a second one, which would hold two whole models in host memory.
+    """
+    for key in list(hf_tensors):
+        hf_tensors[key] = np.ascontiguousarray(hf_tensors[key])
+    stnp.save_file(hf_tensors, str(tensor_path))
 
 
 def save_hf_config(cfg: dict[str, Any], path: str | epath.Path):

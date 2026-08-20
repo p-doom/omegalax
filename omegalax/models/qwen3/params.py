@@ -9,7 +9,6 @@ from typing import Any
 import jax
 import numpy as np
 from flax import nnx
-from safetensors import numpy as stnp
 from etils import epath
 
 from omegalax.models.params_utils import (
@@ -17,6 +16,7 @@ from omegalax.models.params_utils import (
     flatten_pure_state,
     inverse_transform,
     save_hf_config,
+    save_hf_tensors,
     write_moe_experts_to_hf,
 )
 from .config import Qwen3Config
@@ -167,7 +167,7 @@ def export_qwen3_to_safetensors(
         missing = "\n".join(sorted(unmatched))
         raise RuntimeError(f"Unmapped JAX parameters during export:\n{missing}")
 
-    stnp.save_file(hf_tensors, str(tensor_path))
+    save_hf_tensors(hf_tensors, tensor_path)
     save_hf_config(qwen3_to_hf_config_dict(cfg), out_dir)
 
     return tensor_path
