@@ -570,7 +570,10 @@ def run_tail_pretrain(
             )
             checkpoint_manager.wait_until_finished()
             checkpoint_manager.close()
-            _request_slurm_requeue_if_primary(is_primary)
+            if local_step < config.num_steps:
+                _request_slurm_requeue_if_primary(is_primary)
+                return optimizer, last_metrics
+            log_previous(force=True)
             return optimizer, last_metrics
 
     log_previous(force=True)

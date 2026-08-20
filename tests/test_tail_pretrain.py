@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import signal
+from unittest import mock
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 os.environ["OMEGALAX_DELTANET_KERNEL"] = "xla"
@@ -27,6 +29,7 @@ from omegalax.models.shard_config import ShardConfig
 from omegalax.text import api as text_api
 from omegalax.text.checkpoint import resolve_checkpoint, restore_model_params
 from omegalax.trainers import checkpoint_utils
+from omegalax.trainers import tail_pretrain as tail_pretrain_trainer
 from omegalax.trainers.lora import LoRALinear, LoRAParam
 from omegalax.trainers.pretrain import PretrainMode
 from omegalax.trainers.tail_pretrain import (
@@ -312,6 +315,124 @@ class TailPretrainTest(absltest.TestCase):
             np.testing.assert_allclose(
                 np.asarray(eval_hidden), np.asarray(trained_hidden), rtol=0, atol=0
             )
+
+    def test_signal_at_final_tail_step_checkpoints_and_finishes_without_requeue(self):
+        with test_temp_dir() as tmp:
+            tmpdir = Path(tmp)
+            cfg = _tiny_config()
+            source_model, cfg = text_api.init_model(
+                cfg, jax.random.key(0), tp_size=1, fsdp_size=1, dp_size=1
+            )
+            source_root = tmpdir / "source"
+            _save_source_checkpoint(source_root, source_model, cfg)
+            source_checkpoint = resolve_checkpoint(source_root / "040000")
+
+            docs = tmpdir / "docs"
+            write_json_arrayrecord_dataset(
+                (
+                    {
+                        "dataset_format": DOC_CHAIN_FORMAT,
+                        "doc_id": "final-signal-doc",
+                        "token_ids": list(range(1, 32)) + [63],
+                        "doc_token_count": 32,
+                    },
+                ),
+                docs / "train" / "bucket_2k",
+                records_per_shard=10,
+                overwrite=False,
+                metadata={"dataset_format": DOC_CHAIN_FORMAT},
+            )
+            bundle = build_statepassing_fixed_c_indexes(
+                docs,
+                tmpdir / "bundle",
+                num_segments=2,
+                trim_batch_size=2,
+                trim_grad_accum_steps=1,
+                chunk_length=4,
+                eos_id=63,
+                splits=("train",),
+                records_per_shard=10,
+            )
+            iterator = make_statepassing_iterator(
+                bundle / "train",
+                batch_size=2,
+                chunk_length=4,
+                eos_id=63,
+                shuffle=False,
+                num_epochs=1,
+                dp_size=1,
+                fsdp_size=1,
+                process_index=0,
+                grain_workers=0,
+            )
+            config = TailTrainConfig(
+                seed=0,
+                batch_size=2,
+                seq_len=4,
+                num_steps=1,
+                global_step_offset=40000,
+                learning_rate=7e-4,
+                lr_schedule="linear",
+                warmup_steps=0,
+                weight_decay=0.0,
+                max_grad_norm=1.0,
+                grad_accum_steps=1,
+            )
+            save_dir = tmpdir / "tail-run"
+            previous_usr1 = signal.getsignal(signal.SIGUSR1)
+            previous_term = signal.getsignal(signal.SIGTERM)
+            install_handler = tail_pretrain_trainer._install_requeue_signal_handler
+
+            def install_handler_and_request_requeue():
+                requeue_requested = install_handler()
+                os.kill(os.getpid(), signal.SIGUSR1)
+                return requeue_requested
+
+            try:
+                with (
+                    mock.patch.object(
+                        tail_pretrain_trainer,
+                        "_install_requeue_signal_handler",
+                        side_effect=install_handler_and_request_requeue,
+                    ),
+                    mock.patch.object(
+                        tail_pretrain_trainer, "_request_slurm_requeue_if_primary"
+                    ) as request_requeue,
+                    mock.patch.object(
+                        tail_pretrain_trainer,
+                        "_save_sft_checkpoint",
+                        wraps=tail_pretrain_trainer._save_sft_checkpoint,
+                    ) as save_checkpoint,
+                ):
+                    _, metrics = run_tail_pretrain(
+                        source_checkpoint.step_path,
+                        config,
+                        iterator,
+                        pretrain_mode=PretrainMode.STATEPASSING_BPTT,
+                        save_dir=save_dir,
+                        save_every=0,
+                        log_every=0,
+                        resume=checkpoint_utils.ResumeMode.NEVER,
+                        pad_id=0,
+                        tp_size=1,
+                        fsdp_size=1,
+                        dp_size=1,
+                        text_attn_backend="xla",
+                        bptt_chunks=2,
+                        pass_gdn_state=True,
+                        pass_rope_positions=False,
+                        pass_conv_state=False,
+                    )
+            finally:
+                signal.signal(signal.SIGUSR1, previous_usr1)
+                signal.signal(signal.SIGTERM, previous_term)
+
+            request_requeue.assert_not_called()
+            self.assertTrue((save_dir / "040001").is_dir())
+            self.assertTrue(
+                any(call.kwargs.get("force") is True for call in save_checkpoint.call_args_list)
+            )
+            self.assertEqual(metrics["step"], 40001)
 
 
 if __name__ == "__main__":

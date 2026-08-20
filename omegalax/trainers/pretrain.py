@@ -1107,7 +1107,7 @@ def run_pretrain(
                 wandb_run.log({f"val/{key}": value for key, value in val_host.items()}, step=step)
 
         if requeue_requested():
-            startup_log(f"[signal] saving checkpoint at step={step} before requeue")
+            startup_log(f"[signal] saving checkpoint at step={step} after signal")
             if checkpoint_manager is not None:
                 _save_sft_checkpoint(
                     checkpoint_manager,
@@ -1120,7 +1120,11 @@ def run_pretrain(
                 )
                 checkpoint_manager.wait_until_finished()
                 checkpoint_manager.close()
-            _request_slurm_requeue_if_primary(is_primary_process)
+            if step < train_cfg.num_steps:
+                _request_slurm_requeue_if_primary(is_primary_process)
+                _autotune_ctx.__exit__(None, None, None)
+                return optimizer, last_metrics
+            _log_prev_metrics(force=True)
             _autotune_ctx.__exit__(None, None, None)
             return optimizer, last_metrics
 

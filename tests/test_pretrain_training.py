@@ -1433,6 +1433,110 @@ class PretrainTrainingSmokeTest(absltest.TestCase):
                 np.asarray(resumed_leaf),
             )
 
+    def test_signal_at_final_step_checkpoints_and_finishes_without_requeue(self):
+        cfg = _tiny_qwen3_5_config()
+        train_cfg = pretrain_trainer.TrainConfig(
+            seed=0,
+            batch_size=2,
+            seq_len=4,
+            num_steps=1,
+            learning_rate=1e-3,
+            weight_decay=0.0,
+            print_every=0,
+        )
+
+        with test_temp_dir() as tmp:
+            tmpdir = Path(tmp)
+            data_root = tmpdir / "docs"
+            token_ids = [index % 63 + 1 for index in range(48)]
+            write_json_arrayrecord_dataset(
+                (
+                    {
+                        "dataset_format": DOC_CHAIN_FORMAT,
+                        "doc_id": "final-signal-doc",
+                        "token_ids": token_ids,
+                        "doc_token_count": len(token_ids),
+                    },
+                ),
+                data_root / "train" / "bucket_2k",
+                records_per_shard=16,
+                overwrite=False,
+                metadata={"dataset_format": DOC_CHAIN_FORMAT},
+            )
+            index_path = build_statepassing_window_index(
+                data_root,
+                tmpdir / "index",
+                chunk_length=4,
+                num_segments=2,
+                split="train",
+                records_per_shard=16,
+            )
+            iterator = make_statepassing_iterator(
+                index_path,
+                batch_size=2,
+                chunk_length=4,
+                shuffle=False,
+                num_epochs=1,
+                dp_size=1,
+                fsdp_size=1,
+                process_index=0,
+                grain_workers=0,
+                grain_read_threads=1,
+                grain_read_prefetch_buffer_size=1,
+            )
+            checkpoint_dir = tmpdir / "checkpoint"
+            previous_usr1 = signal.getsignal(signal.SIGUSR1)
+            previous_term = signal.getsignal(signal.SIGTERM)
+            install_handler = pretrain_trainer._install_requeue_signal_handler
+
+            def install_handler_and_request_requeue():
+                requeue_requested = install_handler()
+                os.kill(os.getpid(), signal.SIGUSR1)
+                return requeue_requested
+
+            try:
+                with (
+                    mock.patch.object(
+                        pretrain_trainer,
+                        "_install_requeue_signal_handler",
+                        side_effect=install_handler_and_request_requeue,
+                    ),
+                    mock.patch.object(
+                        pretrain_trainer, "_request_slurm_requeue_if_primary"
+                    ) as request_requeue,
+                    mock.patch.object(
+                        pretrain_trainer,
+                        "_save_sft_checkpoint",
+                        wraps=pretrain_trainer._save_sft_checkpoint,
+                    ) as save_checkpoint,
+                ):
+                    _, metrics = pretrain_trainer.run_pretrain(
+                        cfg,
+                        train_cfg,
+                        iterator,
+                        pretrain_mode=pretrain_trainer.PretrainMode.STATEPASSING_BPTT,
+                        save_dir=checkpoint_dir,
+                        save_every=0,
+                        log_every=0,
+                        tp_size=1,
+                        fsdp_size=1,
+                        dp_size=1,
+                        bptt_chunks=2,
+                        pass_gdn_state=True,
+                        pass_rope_positions=False,
+                        pass_conv_state=False,
+                    )
+            finally:
+                signal.signal(signal.SIGUSR1, previous_usr1)
+                signal.signal(signal.SIGTERM, previous_term)
+
+            request_requeue.assert_not_called()
+            self.assertTrue((checkpoint_dir / "000001").is_dir())
+            self.assertTrue(
+                any(call.kwargs.get("force") is True for call in save_checkpoint.call_args_list)
+            )
+            self.assertEqual(metrics["step"], 1)
+
     def test_one_step_iid_pretrain(self):
         cfg = _tiny_qwen3_5_config()
         train_cfg = pretrain_trainer.TrainConfig(
