@@ -639,16 +639,31 @@ def maybe_log_step_metrics(
         return None
 
     host_metrics = {k: float(v) for k, v in metrics_to_log.items()}
-    required = ("loss", "grad_norm")
-    missing = [k for k in required if k not in host_metrics]
-    if missing:
-        raise KeyError(f"Missing required metrics for logging: {missing}")
     host_metrics["step"] = step_to_log
     if batch_size > 0:
         host_metrics["total_samples"] = step_to_log * batch_size
     host_metrics.update(
         step_metrics(step_flops, step_delta, global_tokens_per_step, peak_tflops)
     )
+    # Checked after step_metrics has filled its keys in, so a rename there is a
+    # missing metric and not a logged 0.0. An MFU figure was quoted for weeks
+    # before being found to be a blend of two things.
+    required = (
+        "loss",
+        "grad_norm",
+        "lr",
+        "supervised_tokens",
+        "step_time_s",
+        "global_tokens_per_sec",
+        "tokens_per_sec_per_device",
+        "model_tflops_per_device",
+        "hardware_tflops_per_device",
+        "mfu",
+        "hfu",
+    )
+    missing = [k for k in required if k not in host_metrics]
+    if missing:
+        raise KeyError(f"Missing required metrics for logging: {missing}")
 
     if wandb_run is not None and is_primary_process:
         _SKIP = {"step"}
@@ -658,23 +673,22 @@ def maybe_log_step_metrics(
         )
 
     if is_primary_process:
-        lr = host_metrics.get("lr", 0.0)
         print(
             f"time={datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} "
             f"step={step_to_log} "
             f"loss={host_metrics['loss']:.4f} "
             f"grad_norm={host_metrics['grad_norm']:.4f} "
             f"train/total_samples={host_metrics.get('total_samples', 0)} "
-            f"train/global_tokens_per_sec={host_metrics.get('global_tokens_per_sec', 0.0):.0f} "
-            f"train/step_time_s={host_metrics.get('step_time_s', 0.0):.2f}s "
-            f"train/supervised_tokens={host_metrics.get('supervised_tokens', 0.0):.0f} "
+            f"train/global_tokens_per_sec={host_metrics['global_tokens_per_sec']:.0f} "
+            f"train/step_time_s={host_metrics['step_time_s']:.2f}s "
+            f"train/supervised_tokens={host_metrics['supervised_tokens']:.0f} "
             f"train/total_tokens={host_metrics.get('total_tokens', 0.0):.0f} "
-            f"train/lr={lr:.2e} "
-            f"train/model_tflops_per_device={host_metrics.get('model_tflops_per_device', 0.0):.2f} "
-            f"train/hardware_tflops_per_device={host_metrics.get('hardware_tflops_per_device', 0.0):.2f} "
-            f"train/mfu={host_metrics.get('mfu', 0.0) * 100:.1f}% "
-            f"train/hfu={host_metrics.get('hfu', 0.0) * 100:.1f}% "
-            f"train/tok/s/dev={host_metrics.get('tokens_per_sec_per_device', 0.0):.0f} ",
+            f"train/lr={host_metrics['lr']:.2e} "
+            f"train/model_tflops_per_device={host_metrics['model_tflops_per_device']:.2f} "
+            f"train/hardware_tflops_per_device={host_metrics['hardware_tflops_per_device']:.2f} "
+            f"train/mfu={host_metrics['mfu'] * 100:.1f}% "
+            f"train/hfu={host_metrics['hfu'] * 100:.1f}% "
+            f"train/tok/s/dev={host_metrics['tokens_per_sec_per_device']:.0f} ",
             flush=True,
         )
 

@@ -9,12 +9,14 @@ from omegalax.distributed.mesh import process_local_batch_size
 from omegalax.models.qwen3.config import make_config as make_qwen3_config
 from omegalax.models.qwen3_5.config import make_config as make_qwen3_5_config
 from omegalax.models.qwen3_vl.config import make_vl_config as make_qwen3_vl_config
+from omegalax.trainers import perf
 from omegalax.trainers.perf import (
     ForwardFlops,
     PEAK_TFLOPS,
     StepFlops,
     StepTimer,
     forward_flops_per_token,
+    maybe_log_step_metrics,
     per_device_step_flops,
     qwen3_vl_vision_flops,
     qwen3_vl_vision_training_flops,
@@ -222,6 +224,51 @@ class StepMetricsTest(absltest.TestCase):
         self.assertEqual(out["mfu"], 0.0)
         self.assertEqual(out["hfu"], 0.0)
         self.assertGreater(out["model_tflops_per_device"], 0)
+
+
+class MaybeLogStepMetricsTest(absltest.TestCase):
+    """The utilisation numbers a run is judged on come out of here.
+
+    They were all read with a ``0.0`` default, so renaming one in ``step_metrics``
+    logged and returned zero for it instead of raising -- on exactly the figures
+    with a history of being misread.
+    """
+
+    #: What both trainers put in `window_metrics` (vlm.py, text.py).
+    _CALLER_METRICS = {"loss": 1.5, "grad_norm": 0.5, "supervised_tokens": 64.0, "lr": 1e-4}
+
+    def _log(self, metrics=None):
+        return maybe_log_step_metrics(
+            1,
+            dict(self._CALLER_METRICS if metrics is None else metrics),
+            datetime.timedelta(seconds=1),
+            is_primary_process=True,
+            log_every=1,
+            step_flops=StepFlops(model=1e12, hardware=2e12),
+            global_tokens_per_step=64,
+            peak_tflops=312.0,
+            batch_size=8,
+        )
+
+    def test_logs_the_utilization_metrics_step_metrics_produced(self):
+        out = self._log()
+        self.assertAlmostEqual(out["mfu"], 1.0 / 312.0)
+        self.assertAlmostEqual(out["hfu"], 2.0 / 312.0)
+        self.assertEqual(out["total_samples"], 8)
+
+    def test_a_renamed_step_metric_raises(self):
+        renamed = dict(step_metrics(StepFlops(1e12, 2e12), datetime.timedelta(seconds=1), 64, 312.0))
+        renamed["model_flops_utilization"] = renamed.pop("mfu")
+        with mock.patch.object(perf, "step_metrics", return_value=renamed):
+            with self.assertRaisesRegex(KeyError, "mfu"):
+                self._log()
+
+    def test_a_caller_metric_the_print_reads_is_required(self):
+        for key in ("lr", "supervised_tokens"):
+            metrics = dict(self._CALLER_METRICS)
+            metrics.pop(key)
+            with self.assertRaisesRegex(KeyError, key):
+                self._log(metrics)
 
 
 class ProcessLocalBatchSizeTest(absltest.TestCase):
