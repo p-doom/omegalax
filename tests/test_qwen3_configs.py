@@ -41,6 +41,7 @@ def _moe_hf_cfg() -> dict:
         "mlp_only_layers": [],
         "decoder_sparse_step": 1,
         "norm_topk_prob": True,
+        "router_aux_loss_coef": 0.001,
     }
 
 
@@ -61,7 +62,25 @@ class Qwen3RegistryTest(absltest.TestCase):
         self.assertEqual(cfg.num_experts, 128)
         self.assertEqual(cfg.num_experts_per_tok, 8)
         self.assertEqual(cfg.moe_intermediate_size, 768)
+        self.assertEqual(cfg.aux_loss_coef, 0.001)
         self.assertTrue(cfg.is_moe)
+
+    def test_moe_hf_config_without_an_aux_loss_coef_raises(self):
+        """Every qwen3_moe config.json Qwen ships carries router_aux_loss_coef, so an
+        absent one is a truncated config -- and defaulting it to 0.0 trains the MoE
+        with the load-balancing loss switched off, which no metric reports.
+        """
+        hf_cfg = _moe_hf_cfg()
+        hf_cfg.pop("router_aux_loss_coef")
+        with self.assertRaisesRegex(ValueError, "router_aux_loss_coef"):
+            make_config_from_hf(hf_cfg)
+
+    def test_dense_hf_config_needs_no_aux_loss_coef(self):
+        """No dense qwen3 config.json declares one, and 0.0 is inert there: the
+        aux-loss term is computed inside the MoE MLP, and `params.py` exports the
+        key only `if cfg.is_moe`."""
+        self.assertNotIn("router_aux_loss_coef", _dense_hf_cfg())
+        self.assertEqual(make_config_from_hf(_dense_hf_cfg()).aux_loss_coef, 0.0)
 
     def test_moe_hf_config_accepts_num_local_experts_alias(self):
         hf_cfg = _moe_hf_cfg()

@@ -216,7 +216,7 @@ def make_config_from_hf(hf_cfg: dict[str, Any]) -> Qwen3Config:
         mlp_only_layers=tuple(_required(hf_cfg, "mlp_only_layers", "hf_cfg")) if is_moe else (),
         decoder_sparse_step=_required(hf_cfg, "decoder_sparse_step", "hf_cfg") if is_moe else 1,
         norm_topk_prob=_required(hf_cfg, "norm_topk_prob", "hf_cfg") if is_moe else True,
-        aux_loss_coef=float(hf_cfg.get("router_aux_loss_coef", 0.0)),
+        aux_loss_coef=float(_required(hf_cfg, "router_aux_loss_coef", "hf_cfg")) if is_moe else 0.0,
         dtype=dtype,
     )
     return dataclasses.replace(cfg, shd_cfg=ShardConfig.default())
