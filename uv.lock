@@ -2110,7 +2110,7 @@ requires-dist = [
     { name = "tokamax", git = "https://github.com/p-doom/tokamax.git?rev=nested-mask" },
     { name = "torch", marker = "sys_platform == 'linux' and extra == 'torch-tests'", specifier = "==2.10.*" },
     { name = "torchvision", marker = "sys_platform == 'linux' and extra == 'torch-tests'" },
-    { name = "transformers" },
+    { name = "transformers", specifier = "<5.4" },
     { name = "triton" },
     { name = "wandb" },
 ]

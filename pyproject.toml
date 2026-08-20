@@ -31,7 +31,10 @@ dependencies = [
   # whose semantics we write against so the change cannot happen under us again.
   "safetensors>=0.8.0",
   "tokamax @ git+https://github.com/p-doom/tokamax.git@nested-mask", # change after fix has been upstreamed
-  "transformers",
+  # 5.4.0 gave Qwen3VLMoeTextConfig `attribute_map = {"num_experts":
+  # "num_local_experts"}`, so `to_dict()` stops writing the `text_config.num_experts`
+  # the Qwen3-VL MoE loader requires and every config on the Hub carries.
+  "transformers<5.4",
   "triton", 
   "huggingface-hub",
   "wandb",
