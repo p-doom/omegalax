@@ -180,7 +180,7 @@ _MEMORY_LADDER_SHARED: dict[str, Any] = {
     "rope_theta": 10_000_000,
     "partial_rotary_factor": 0.25,
     "mrope_section": (11, 11, 10),
-    "tie_word_embeddings": True,
+    "tie_word_embeddings": False,
     "linear_conv_kernel_dim": 4,
     "linear_key_head_dim": 128,
     "linear_value_head_dim": 128,

@@ -23,8 +23,8 @@ def _expected_layer_types(num_hidden_layers: int) -> tuple[str, ...]:
 
 class Qwen3_5MemoryConfigLadderTest(parameterized.TestCase):
     @parameterized.named_parameters(
-        ("50m", "qwen3.5-memory-50m", 9, 512, 47_996_400),
-        ("200m", "qwen3.5-memory-200m", 17, 768, 200_558_776),
+        ("50m", "qwen3.5-memory-50m", 9, 512, 48_520_688),
+        ("200m", "qwen3.5-memory-200m", 17, 768, 201_345_208),
     )
     def test_config_resolves_to_expected_model(
         self, model_id, num_hidden_layers, hidden_size, expected_param_count
@@ -33,13 +33,14 @@ class Qwen3_5MemoryConfigLadderTest(parameterized.TestCase):
 
         self.assertEqual(cfg.num_hidden_layers, num_hidden_layers)
         self.assertEqual(cfg.hidden_size, hidden_size)
-        self.assertTrue(cfg.tie_word_embeddings)
+        self.assertFalse(cfg.tie_word_embeddings)
         self.assertEqual(cfg.layer_types, _expected_layer_types(num_hidden_layers))
 
         with mesh_rules_for(tp_size=1, fsdp_size=1, dp_size=1):
             abs_model = nnx.eval_shape(lambda: Qwen3_5ForCausalLM(cfg, rngs=nnx.Rngs(0)))
 
-        self.assertIsNone(abs_model.lm_head)
+        self.assertIsNotNone(abs_model.lm_head)
+        self.assertEqual(abs_model.lm_head.kernel.shape, (hidden_size, cfg.vocab_size))
 
         _, abs_state = nnx.split(abs_model)
         pure_state = nnx.to_pure_dict(abs_state)
