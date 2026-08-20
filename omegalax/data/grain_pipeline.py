@@ -585,6 +585,36 @@ def _emit_truncation_stats(
     )
 
 
+def _goal_head(messages: list[dict[str, Any]], first_user_length: int, measure_message):
+    """The session head re-attached to every continuation chunk under ``split``:
+    the system turn, plus the goal text that lives in the first user turn.
+
+    A continuation chunk is a fresh training sample, not a continued context. With
+    neither the system turn nor the goal it trains as unconditioned mid-episode
+    cloning, which pulls the policy onto the no-op-dominated marginal action
+    distribution -- and it conditions on a prompt shape that never occurs at
+    inference, where the full head is always rendered.
+
+    Returns ``(system_message, goal_parts, head_tokens)``. ``head_tokens`` is the
+    budget a continuation chunk must reserve; the goal cost is measured as the
+    first user turn minus that turn with its text stripped, so it is exact for the
+    merge below rather than assuming a per-message template overhead.
+    """
+    system_message, first_user = messages[0], messages[1]
+    assert system_message["role"] == "system", (
+        f"expected a system turn at message 0, got {system_message['role']!r}"
+    )
+    assert first_user["role"] == "user" and isinstance(first_user["content"], list), (
+        f"expected a multi-part user turn at message 1, got {first_user['role']!r}"
+    )
+    goal_parts = [part for part in first_user["content"] if part.get("type") == "text"]
+    assert goal_parts, "first user turn carries no text part to read the goal from"
+    stripped = {**first_user, "content": [p for p in first_user["content"] if p not in goal_parts]}
+    goal_tokens = first_user_length - _extract_measurement(measure_message(stripped))[0]
+    head_tokens = _extract_measurement(measure_message(system_message))[0] + goal_tokens
+    return system_message, goal_parts, head_tokens
+
+
 def _process_conversation(
     conv_idx: int,
     session_id: str,
@@ -595,6 +625,7 @@ def _process_conversation(
     effective_max: int,
     overflow_mode: str,
     truncate_offset: int | None,
+    goal_head: tuple[dict[str, Any] | None, list[dict[str, Any]], int],
 ) -> dict[str, Any]:
     """Bin one conversation's messages into <=effective_max token chunks and
     build the self-contained inline example records for it.
@@ -626,6 +657,19 @@ def _process_conversation(
             dt += length
         return dm, dt
 
+    system_message, goal_parts, head_tokens = goal_head
+    continuation = False
+
+    def _rehead(cur_msgs):
+        """Re-attach the session head, merging the goal into the chunk's opening
+        user turn so it reads exactly like the session's first turn."""
+        opening = cur_msgs[0]
+        assert opening["role"] == "user" and isinstance(opening["content"], list), (
+            f"split chunk opens on {opening['role']!r}, which carries no goal slot"
+        )
+        merged = {**opening, "content": goal_parts + opening["content"]}
+        return [system_message, merged, *cur_msgs[1:]]
+
     def _make_example(cur_msgs, cur_len, cur_vt, cur_vp, cur_ni):
         """Return (example, chunk_stat) or None (chunk with no assistant turn).
 
@@ -638,10 +682,10 @@ def _process_conversation(
         if not any(m.get("role") == "assistant" for m in cur_msgs):
             return None
         example = dict(session_meta)
-        example["messages"] = list(cur_msgs)
+        example["messages"] = _rehead(cur_msgs) if continuation else list(cur_msgs)
         example["_omegalax_session_id"] = session_id
         example["_omegalax_measured_length"] = cur_len
-        return example, (cur_len, cur_vt, cur_vp, cur_ni, len(cur_msgs))
+        return example, (cur_len, cur_vt, cur_vp, cur_ni, len(example["messages"]))
 
     def _record(pair) -> None:
         example, chunk_stat = pair
@@ -679,9 +723,10 @@ def _process_conversation(
             for shape in grid:
                 image_shapes.append(str(tuple(shape)))
 
-        assert length <= effective_max, (
+        assert length + head_tokens <= effective_max, (
             f"prefix-truncation pre-scan missed session={session_id} "
-            f"offset={msg_offset} (msg_length={length} > effective_max={effective_max})"
+            f"offset={msg_offset} (msg_length={length} + goal head {head_tokens} "
+            f"> effective_max={effective_max})"
         )
 
         if not cur_msgs:
@@ -690,8 +735,8 @@ def _process_conversation(
             # Never break between a user screen and the assistant action it
             # conditions: the screen would close a chunk with nothing supervised
             # after it (its vision tokens paid for, its response elsewhere) and
-            # the action would open the next chunk with its screen gone. Carry
-            # the screen forward instead.
+            # the action would open the next chunk with its screen gone -- which
+            # is also a chunk with no user turn to carry the goal into.
             back = 1 if messages[msg_offset]["role"] == "assistant" else 0
             blen, bvt, bvp, bni = (
                 _extract_measurement(precomputed[(conv_idx, msg_offset - 1)])[:4]
@@ -714,7 +759,14 @@ def _process_conversation(
                 dropped_messages += dm
                 dropped_tokens += dt
                 break
-            cur_msgs, cur_len, cur_vt, cur_vp, cur_ni = carried, blen, bvt, bvp, bni
+            continuation = True
+            cur_msgs, cur_len, cur_vt, cur_vp, cur_ni = (
+                carried,
+                head_tokens + blen,
+                bvt,
+                bvp,
+                bni,
+            )
 
         cur_msgs.append(messages[msg_offset])
         cur_len += length
@@ -782,9 +834,11 @@ def build_records_from_chat(
     store is unchanged; records reference it by ar:// exactly as chat.jsonl does.
     The trainer reads these records directly via :func:`make_grain_iterator`.
 
-    The system prompt is NOT injected here: it is part of the conversation (the
-    upstream chat.jsonl builder emits it as the first turn), so it is measured
-    and budgeted as a normal message. ``overflow_mode`` ("drop" (default) |
+    The system prompt is part of the conversation (the upstream chat.jsonl builder
+    emits it as the first turn), so it is measured and budgeted as a normal
+    message. Under ``split`` it -- and the goal text that lives in the first user
+    turn -- is re-attached to every continuation chunk and its cost reserved from
+    the budget; see :func:`_goal_head`. ``overflow_mode`` ("drop" (default) |
     "split" | "truncate") and ``message_lengths_path`` (measure-once cache, keyed to chat.jsonl
     positions, reused across every max_length / overflow_mode) are the only
     binning knobs.
@@ -808,6 +862,15 @@ def build_records_from_chat(
     chat_path = Path(chat_path).expanduser().resolve()
     out_dir = Path(out_dir).expanduser().resolve()
     effective_max = max_length
+
+    def goal_head(conv_idx: int, messages: list[dict[str, Any]]):
+        # Only split emits continuation chunks, so only split needs a head -- and
+        # only split may demand a goal-bearing conversation shape.
+        if overflow_mode != "split":
+            return None, [], 0
+        return _goal_head(
+            messages, _extract_measurement(precomputed[(conv_idx, 1)])[0], measure_message
+        )
 
     def _in_split(session_meta: dict[str, Any]) -> bool:
         # conv_idx (and thus the cache key) is always over the full chat; this only
@@ -908,6 +971,7 @@ def build_records_from_chat(
                 effective_max=effective_max,
                 overflow_mode=overflow_mode,
                 truncate_offset=session_truncate_at.get(session_id),
+                goal_head=goal_head(conv_idx, messages),
             )
 
             _msg_lengths.extend(res["msg_lengths"])

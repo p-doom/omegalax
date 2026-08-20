@@ -54,7 +54,8 @@ flags.DEFINE_enum(
     "How to handle a conversation whose turns exceed the token budget. "
     "'drop' (default): discard the whole conversation if it does not fit in a "
     "single chunk. 'split': pack into multiple consecutive chunks at turn "
-    "boundaries (no turns dropped). 'truncate': keep only the first fitting "
+    "boundaries (no turns dropped); every continuation chunk is re-headed with "
+    "the system turn and the goal. 'truncate': keep only the first fitting "
     "chunk and drop the overflowing turn plus the rest of the conversation. "
     "Truncation stats are written to truncation_stats.json.",
 )

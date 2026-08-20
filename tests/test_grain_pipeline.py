@@ -24,10 +24,28 @@ from omegalax.data.grain_pipeline import (
 from omegalax.trainers import checkpoint_utils
 
 
+def _goal_session(values):
+    """A conversation shaped like the chat.jsonl builder's output: a system turn,
+    then (user screen, assistant action) pairs, the goal on the first user turn.
+
+    ``split`` re-heads every continuation chunk from this shape, so a fixture
+    without it exercises a conversation the real consumer never produces.
+    """
+    messages = [{"role": "system", "content": "SYS"}]
+    for value in values:
+        messages.append({"role": "user", "content": [{"type": "text", "text": str(value)}]})
+        messages.append({"role": "assistant", "content": str(value + 1)})
+    return {"messages": messages}
+
+
+def _start_of(record):
+    """The chunk's own screen: last text part of its opening user turn, after the
+    carried goal has been merged in front of it."""
+    return record["messages"][1]["content"][-1]["text"]
+
+
 def _batch_starts(examples):
-    return {
-        "starts": np.asarray([int(ex["messages"][0]["content"]) for ex in examples], dtype=np.int32)
-    }
+    return {"starts": np.asarray([int(_start_of(ex)) for ex in examples], dtype=np.int32)}
 
 
 # build_records_from_chat measures messages in a `spawn` multiprocessing pool, so
@@ -168,22 +186,52 @@ class GrainPipelineTest(absltest.TestCase):
         # An overflow landing on an assistant turn closed the chunk on its user
         # screen -- nothing supervised after it, its vision tokens paid for -- and
         # opened the next chunk on the action with the screen gone. 2519 of the
-        # 91550 continuation-chunk boundaries in the eov3 corpus land there.
+        # 91550 continuation-chunk boundaries in the eov3 corpus land there, and
+        # such a chunk has no user turn to carry the goal into either.
         with tempfile.TemporaryDirectory() as tmpdir:
             src = Path(tmpdir) / "train.jsonl"
             self._write_jsonl(
                 src,
                 [
-                    {
-                        "messages": [
-                            {"role": "user", "content": "10"},
-                            {"role": "assistant", "content": "11"},
-                            {"role": "user", "content": "12"},
-                            {"role": "assistant", "content": "13"},
-                            {"role": "user", "content": "14"},
-                            {"role": "assistant", "content": "15"},
-                        ],
-                    },
+                    _goal_session([10, 12, 14]),
+                ],
+            )
+
+            records_dir = build_records_from_chat(
+                src,
+                Path(tmpdir) / "records",
+                max_length=4,
+                measure_message=_measure_one,
+                records_per_shard=8,
+                overflow_mode="split",
+            )
+
+            iterator = make_grain_iterator(
+                records_dir,
+                batch_size=1,
+                batch_fn=lambda batch: batch[0],
+                shuffle=False,
+                seed=0,
+                read_options=make_grain_read_options(num_threads=1, prefetch_buffer_size=1),
+                multiprocessing_options=make_grain_multiprocessing_options(
+                    num_workers=0, per_worker_buffer_size=1
+                ),
+                dp_size=1,
+                fsdp_size=1,
+            )
+            metadata = json.loads((records_dir / "metadata.json").read_text())
+            self.assertEqual(metadata["num_records"], 3)
+            for _ in range(3):
+                roles = [message["role"] for message in next(iterator)["messages"]]
+                self.assertEqual(roles, ["system", "user", "assistant"])
+
+    def test_build_records_from_chat_splits_oversized_conversation(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src = Path(tmpdir) / "train.jsonl"
+            self._write_jsonl(
+                src,
+                [
+                    _goal_session([10, 12, 14]),
                 ],
             )
 
@@ -209,59 +257,9 @@ class GrainPipelineTest(absltest.TestCase):
                 dp_size=1,
                 fsdp_size=1,
             )
-            metadata = json.loads((records_dir / "metadata.json").read_text())
-            self.assertEqual(metadata["num_records"], 3)
-            for _ in range(3):
-                roles = [message["role"] for message in next(iterator)["messages"]]
-                pairs = roles[1:] if roles[0] == "system" else roles
-                self.assertEqual(pairs, ["user", "assistant"] * (len(pairs) // 2))
-
-    def test_build_records_from_chat_splits_oversized_conversation(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            src = Path(tmpdir) / "train.jsonl"
-            self._write_jsonl(
-                src,
-                [
-                    {
-                        "messages": [
-                            {"role": "user", "content": "10"},
-                            {"role": "assistant", "content": "11"},
-                            {"role": "user", "content": "12"},
-                            {"role": "assistant", "content": "13"},
-                            {"role": "user", "content": "14"},
-                            {"role": "assistant", "content": "15"},
-                        ],
-                    },
-                ],
-            )
-
-            records_dir = build_records_from_chat(
-                src,
-                Path(tmpdir) / "records",
-                max_length=2,
-                measure_message=_measure_one,
-                records_per_shard=8,
-                overflow_mode="split",
-            )
-
-            iterator = make_grain_iterator(
-                records_dir,
-                batch_size=1,
-                batch_fn=lambda batch: batch[0],
-                shuffle=False,
-                seed=0,
-                read_options=make_grain_read_options(num_threads=1, prefetch_buffer_size=1),
-                multiprocessing_options=make_grain_multiprocessing_options(
-                    num_workers=0, per_worker_buffer_size=1
-                ),
-                dp_size=1,
-                fsdp_size=1,
-            )
             records = [next(iterator) for _ in range(3)]
-            self.assertEqual([len(record["messages"]) for record in records], [2, 2, 2])
-            self.assertEqual(
-                [record["messages"][0]["content"] for record in records], ["10", "12", "14"]
-            )
+            self.assertEqual([len(record["messages"]) for record in records], [3, 3, 3])
+            self.assertEqual([_start_of(record) for record in records], ["10", "12", "14"])
             expected_session_id = self._expected_session_id(src, 1)
             self.assertEqual(
                 [record["_omegalax_session_id"] for record in records], [expected_session_id] * 3
@@ -273,24 +271,13 @@ class GrainPipelineTest(absltest.TestCase):
             self._write_jsonl(
                 src,
                 [
-                    {
-                        "messages": [
-                            {"role": "user", "content": "10"},
-                            {"role": "assistant", "content": "11"},
-                            {"role": "user", "content": "12"},
-                            {"role": "assistant", "content": "13"},
-                            {"role": "user", "content": "14"},
-                            {"role": "assistant", "content": "15"},
-                            {"role": "user", "content": "16"},
-                            {"role": "assistant", "content": "17"},
-                        ],
-                    },
+                    _goal_session([10, 12, 14, 16]),
                 ],
             )
             records_dir = build_records_from_chat(
                 src,
                 Path(tmpdir) / "records",
-                max_length=2,
+                max_length=3,
                 measure_message=_measure_one,
                 records_per_shard=8,
                 overflow_mode="split",
@@ -364,24 +351,13 @@ class GrainPipelineTest(absltest.TestCase):
             self._write_jsonl(
                 src,
                 [
-                    {
-                        "messages": [
-                            {"role": "user", "content": "10"},
-                            {"role": "assistant", "content": "11"},
-                            {"role": "user", "content": "12"},
-                            {"role": "assistant", "content": "13"},
-                            {"role": "user", "content": "14"},
-                            {"role": "assistant", "content": "15"},
-                            {"role": "user", "content": "16"},
-                            {"role": "assistant", "content": "17"},
-                        ],
-                    },
+                    _goal_session([10, 12, 14, 16]),
                 ],
             )
             records_dir = build_records_from_chat(
                 src,
                 Path(tmpdir) / "records",
-                max_length=2,
+                max_length=3,
                 measure_message=_measure_one,
                 records_per_shard=8,
                 overflow_mode="split",
@@ -419,8 +395,8 @@ class GrainPipelineTest(absltest.TestCase):
                 )
                 records1 = [next(iterator1) for _ in range(2)]
 
-            starts0 = [record["messages"][0]["content"] for record in records0]
-            starts1 = [record["messages"][0]["content"] for record in records1]
+            starts0 = [_start_of(record) for record in records0]
+            starts1 = [_start_of(record) for record in records1]
             self.assertEqual(starts0, ["10", "12"])
             self.assertEqual(starts1, ["14", "16"])
             self.assertEmpty(set(starts0).intersection(starts1))
