@@ -19,6 +19,7 @@ from omegalax.data.grain_pipeline import (
     make_grain_iterator,
     make_grain_multiprocessing_options,
     make_grain_read_options,
+    parse_data_mix,
     required_epochs_for_batches,
 )
 from omegalax.distributed.mesh import process_local_batch_size
@@ -270,24 +271,11 @@ def _validate_flags() -> None:
         )
 
 
-def _parse_data_mix(spec: str) -> list[MixSource]:
-    """Parse the --data_mix JSON spec into a list of MixSource."""
-    raw = json.loads(spec)
-    if not isinstance(raw, list) or not raw:
-        raise ValueError("--data_mix must be a non-empty JSON list of {path, weight} objects")
-    out: list[MixSource] = []
-    for entry in raw:
-        if not isinstance(entry, dict) or "path" not in entry:
-            raise ValueError(f"--data_mix entry must be an object with a 'path' field: {entry!r}")
-        out.append(MixSource(path=str(entry["path"]), weight=float(entry.get("weight", 1.0))))
-    return out
-
-
 def _resolve_train_sources() -> list[MixSource]:
     if (FLAGS.data_path is None) == (FLAGS.data_mix is None):
         raise ValueError("Specify exactly one of --data_path or --data_mix.")
     if FLAGS.data_mix is not None:
-        return _parse_data_mix(FLAGS.data_mix)
+        return parse_data_mix(FLAGS.data_mix)
     return [MixSource(path=FLAGS.data_path, weight=1.0)]
 
 

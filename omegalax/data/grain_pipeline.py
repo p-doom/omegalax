@@ -55,6 +55,19 @@ class MixSource:
     weight: float = 1.0
 
 
+def parse_data_mix(spec: str) -> list[MixSource]:
+    """Parse a ``--data_mix`` JSON spec into a list of MixSource."""
+    raw = json.loads(spec)
+    if not isinstance(raw, list) or not raw:
+        raise ValueError("--data_mix must be a non-empty JSON list of {path, weight} objects")
+    out: list[MixSource] = []
+    for entry in raw:
+        if not isinstance(entry, dict) or "path" not in entry:
+            raise ValueError(f"--data_mix entry must be an object with a 'path' field: {entry!r}")
+        out.append(MixSource(path=str(entry["path"]), weight=float(entry.get("weight", 1.0))))
+    return out
+
+
 def _prepare_output_dir(out_dir: Path, *, overwrite: bool) -> None:
     if out_dir.exists():
         has_contents = any(out_dir.iterdir())
