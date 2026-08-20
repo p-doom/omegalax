@@ -50,6 +50,7 @@ packages = ["omegalax"]
 
 [dependency-groups]
 dev = [
+    "pytest>=8",
     "setuptools<81",
     "tensorboard>=2.20.0",
     "xprof>=2.22.0",
