@@ -27,6 +27,7 @@ from omegalax.trainers.optim import MixedPrecisionOptimizer
 from omegalax.trainers.perf import (
     maybe_log_step_metrics,
     per_device_step_flops,
+    record_deltanet_kernel,
     StepFlops,
     StepTimer,
 )
@@ -327,6 +328,9 @@ def run_sft(
 
     set_attn_backend(model, text_backend=text_attn_backend)
     startup_log(f"set attn backend: text={text_attn_backend}")
+    deltanet_kernel = record_deltanet_kernel(model_cfg, wandb_run)
+    if deltanet_kernel is not None:
+        startup_log(f"deltanet kernel: {deltanet_kernel}")
     with mesh_rules(mesh):
         optimizer = build_optimizer(model, train_cfg)
 

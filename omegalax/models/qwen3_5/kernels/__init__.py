@@ -28,7 +28,7 @@ from .xla_reference import chunk_gated_delta_rule_xla
 __all__ = ["chunk_gated_delta_rule_xla"]
 
 
-def _resolve_backend():
+def resolve_backend():
     explicit = os.environ.get("OMEGALAX_DELTANET_KERNEL")
     if explicit is not None:
         return explicit.lower()
@@ -50,7 +50,7 @@ def chunk_gated_delta_rule(
     chunk_size: int = 64,
 ):
     """Dispatcher. Late-binds the backend so env-var changes take effect per process."""
-    backend = _resolve_backend()
+    backend = resolve_backend()
     if backend == "xla":
         return chunk_gated_delta_rule_xla(q_BTHA, k_BTHA, v_BTHU, g_BTH, beta_BTH, chunk_size)
     if backend == "pallas":
