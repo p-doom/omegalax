@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import gc
 import re
 from collections import defaultdict
@@ -13,6 +14,7 @@ from etils import epath
 from flax import nnx
 
 from omegalax.distributed.mesh import ensure_mesh, mesh_rules
+from omegalax.models.shard_config import shard_config_for_mesh
 from omegalax.models.params_utils import (
     Transform,
     assign_to_state_dict,
@@ -263,6 +265,12 @@ def create_qwen3_5_from_safetensors(
     hf_cfg = load_hf_config(path)
     cfg = make_config_from_hf(hf_cfg)
     _assert_config(cfg, hf_cfg)
+    cfg = dataclasses.replace(
+        cfg,
+        text_config=dataclasses.replace(
+            cfg.text_config, shd_cfg=shard_config_for_mesh(cfg.text_config.shd_cfg, mesh)
+        ),
+    )
 
     with mesh_rules(mesh):
         model = nnx.eval_shape(
