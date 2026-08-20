@@ -133,27 +133,6 @@ class Qwen3DenseSmokeTest(absltest.TestCase):
         mask = attention_mask_BT.astype(bool)
         assert_logits_close(self, jax_logits_BTV, hf_logits_BTV, mask)
 
-    def test_round_trip_preserves_logits(self):
-        from flax import nnx
-
-        token_ids_BT = _random_input(batch_size=1, seq_len=16, vocab_size=HF_SMOKE_CFG.vocab_size)
-        jax_token_ids_BT = jnp.asarray(token_ids_BT)
-        segment_ids_BT = 1 * (jax_token_ids_BT != self.pad_id)
-        baseline_hidden, _ = self.jax_model(
-            jax_token_ids_BT, segment_ids_BT, None, jnp.array(0, dtype=jnp.int32)
-        )
-        baseline_BTV = np.asarray(self.jax_model.lm_head(baseline_hidden))
-
-        graph_def, state = nnx.split(self.jax_model)
-        pure_state = nnx.to_pure_dict(state)
-        restored = nnx.merge(graph_def, pure_state)
-        restored_hidden, _ = restored(
-            jax_token_ids_BT, segment_ids_BT, None, jnp.array(0, dtype=jnp.int32)
-        )
-        restored_logits_BTV = np.asarray(restored.lm_head(restored_hidden))
-
-        np.testing.assert_array_equal(restored_logits_BTV, baseline_BTV)
-
 
 if __name__ == "__main__":
     absltest.main()

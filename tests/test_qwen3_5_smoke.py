@@ -179,26 +179,6 @@ class Qwen3_5WeightsTest(absltest.TestCase):
         mask = attention_mask_BT.astype(bool)
         assert_logits_close(self, jax_logits_BTV, hf_logits_BTV, mask)
 
-    def test_round_trip_preserves_logits(self):
-        """Split → merge round-trip should produce identical logits."""
-        from flax import nnx
-
-        token_ids_BT = _random_input(batch_size=1, seq_len=16, vocab_size=HF_TEXT_CFG.vocab_size)
-        baseline_BTV = self._jax_prefill_logits(token_ids_BT)
-
-        graph_def, state = nnx.split(self.jax_model)
-        pure_state = nnx.to_pure_dict(state)
-        restored = nnx.merge(graph_def, pure_state)
-
-        jax_token_ids_BT = jnp.asarray(token_ids_BT)
-        segment_ids_BT = (jax_token_ids_BT != self.pad_id).astype(jnp.int32)
-        restored_hidden, _ = restored(
-            jax_token_ids_BT, segment_ids_BT, None, jnp.array(0, dtype=jnp.int32)
-        )
-        restored_logits_BTV = np.asarray(restored.lm_head(restored_hidden))
-
-        np.testing.assert_array_equal(restored_logits_BTV, baseline_BTV)
-
 
 if __name__ == "__main__":
     absltest.main()

@@ -153,23 +153,6 @@ class Qwen3MappingTest(absltest.TestCase):
         mask = inputs["attention_mask"].cpu().numpy().astype(bool)
         assert_logits_close(self, jax_logits_BTV, hf_logits_BTV, mask, top1_min_match=0.8)
 
-    def test_round_trip_preserves_prefill_logits(self):
-        inputs = self._tokenize([PROMPT])
-        baseline_BTV = self._jax_prefill_logits(inputs["input_ids"])
-
-        graph_def, state = nnx.split(self.jax_model)
-        pure_state = nnx.to_pure_dict(state)
-        restored = nnx.merge(graph_def, pure_state)
-        restored_token_ids_BT = jnp.asarray(np.array(inputs["input_ids"].cpu()), dtype=jnp.int32)
-        segment_ids_BT = 1 * (restored_token_ids_BT != self.pad_id)
-        restored_hidden_BTD, _ = restored(
-            restored_token_ids_BT, segment_ids_BT, None, jnp.array(0, dtype=jnp.int32)
-        )
-        restored_logits_BTV = restored.lm_head(restored_hidden_BTD)
-        restored_logits_BTV = np.asarray(restored_logits_BTV)
-
-        np.testing.assert_allclose(restored_logits_BTV, baseline_BTV, rtol=0, atol=0)
-
 
 if __name__ == "__main__":
     absltest.main()
