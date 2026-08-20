@@ -18,6 +18,7 @@ from omegalax.trainers.perf import (
     per_device_step_flops,
     qwen3_vl_vision_flops,
     qwen3_vl_vision_training_flops,
+    resolve_peak_tflops,
     step_metrics,
     training_flops_per_token,
 )
@@ -246,9 +247,25 @@ class StepTimerTest(absltest.TestCase):
 
 
 class PeakTflopsTest(absltest.TestCase):
-    def test_peak_tflops_entries_positive(self):
-        for name, v in PEAK_TFLOPS.items():
-            self.assertGreater(v, 0, msg=name)
+    """``resolve_peak_tflops`` is what reads the table; the table itself is a literal."""
+
+    def test_every_preset_name_resolves_to_its_table_value(self):
+        for name, expected in PEAK_TFLOPS.items():
+            self.assertEqual(resolve_peak_tflops(name), expected, msg=name)
+
+    def test_h100_sxm_is_the_name_the_launchers_pass(self):
+        self.assertEqual(resolve_peak_tflops("h100_sxm"), 989.0)
+
+    def test_numeric_spec_passes_through(self):
+        self.assertEqual(resolve_peak_tflops("312"), 312.0)
+        self.assertEqual(resolve_peak_tflops(989.0), 989.0)
+
+    def test_none_disables_utilization(self):
+        self.assertIsNone(resolve_peak_tflops(None))
+
+    def test_unknown_name_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "Unknown peak_tflops 'h100'"):
+            resolve_peak_tflops("h100")
 
 
 if __name__ == "__main__":
