@@ -137,7 +137,8 @@ def create_qwen3_from_safetensors(
 
     with mesh_rules(mesh):
         model = nnx.eval_shape(lambda: Qwen3(cfg, rngs=nnx.Rngs(params=0)))
-    graph_def, abs_state = nnx.split(model)
+        graph_def, abs_state = nnx.split(model)
+        pspec_dict = nnx.to_pure_dict(nnx.get_partition_spec(abs_state))
     state_dict = nnx.to_pure_dict(abs_state)
 
     key_mapping = _get_key_mapping()
@@ -176,6 +177,8 @@ def create_qwen3_from_safetensors(
                     state_dict,
                     torch_key,
                     transform.value,
+                    mesh=mesh,
+                    pspec_dict=pspec_dict,
                 )
         gc.collect()
 
@@ -187,6 +190,8 @@ def create_qwen3_from_safetensors(
             state_dict,
             num_experts=cfg.num_experts,
             jax_layer_prefix="layers",
+            mesh=mesh,
+            pspec_dict=pspec_dict,
         )
     gc.collect()
 
