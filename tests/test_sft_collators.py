@@ -27,6 +27,13 @@ def _make_tokenizer():
     return AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B", trust_remote_code=True)
 
 
+def _runs(mask):
+    """Contiguous [start, end) spans where mask is nonzero."""
+    m = np.asarray(mask, dtype=bool)
+    edges = np.diff(np.concatenate(([False], m, [False])).astype(np.int8))
+    return list(zip(np.where(edges == 1)[0], np.where(edges == -1)[0], strict=True))
+
+
 class TextSFTCollatorTest(absltest.TestCase):
     def setUp(self):
         super().setUp()
@@ -71,26 +78,35 @@ class TextSFTCollatorTest(absltest.TestCase):
             {"role": "user", "content": "What is 2+2?"},
             {"role": "assistant", "content": "The answer is 4."},
         ]
-        examples = [{"messages": messages}]
-        batch = self.collator(examples)
-        mask = batch["loss_mask_BT"][0]
-        # At least some tokens should be supervised
-        self.assertGreater(np.sum(mask), 0)
-        # Supervised tokens should be fewer than non-padding tokens
-        attn = batch["attention_mask_BT"][0]
-        self.assertLess(np.sum(mask), np.sum(attn))
+        batch = self.collator([{"messages": messages}])
+        mask = batch["loss_mask_BT"][0].astype(bool)
+        # The whole supervised set, decoded: the assistant body (Qwen3's template
+        # prefixes the final turn with the empty think block) plus the stop token,
+        # and nothing from the user turn or the ChatML headers.
+        self.assertEqual(
+            self.tokenizer.decode(batch["token_ids_BT"][0][mask].tolist()),
+            "<think>\n\n</think>\n\nThe answer is 4.<|im_end|>",
+        )
 
     def test_multiturn_masks_all_assistant_spans(self):
+        """Historical assistant turns are supervised too, one contiguous run each."""
         messages = [
             {"role": "user", "content": "Hi"},
             {"role": "assistant", "content": "Hello!"},
             {"role": "user", "content": "How are you?"},
             {"role": "assistant", "content": "I am fine, thanks."},
         ]
-        examples = [{"messages": messages}]
-        batch = self.collator(examples)
+        batch = self.collator([{"messages": messages}])
+        ids = batch["token_ids_BT"][0]
         mask = batch["loss_mask_BT"][0]
-        self.assertGreater(np.sum(mask), 0)
+        runs = _runs(mask)
+        # The think block lands on the FINAL assistant turn only, so the two runs
+        # differ in shape; a single supervised-token sum would not see one go missing.
+        self.assertEqual(
+            [self.tokenizer.decode(ids[s:e].tolist()) for s, e in runs],
+            ["Hello!<|im_end|>", "<think>\n\n</think>\n\nI am fine, thanks.<|im_end|>"],
+        )
+        self.assertEqual(int(np.sum(mask)), sum(e - s for s, e in runs))
 
     def test_batch_size(self):
         examples = [
@@ -259,10 +275,16 @@ class VLMSFTCollatorTest(absltest.TestCase):
             },
         ]
         batch = self.collator(examples)
-        mask = batch["loss_mask_BT"][0]
-        self.assertGreater(np.sum(mask), 0)
-        attn = batch["attention_mask_BT"][0]
-        self.assertLess(np.sum(mask), np.sum(attn))
+        token_ids = batch["token_ids_BT"][0]
+        mask = batch["loss_mask_BT"][0].astype(bool)
+        self.assertEqual(
+            self.tokenizer.decode(token_ids[mask].tolist()), "Nothing special.<|im_end|>"
+        )
+        # The 64 image pads are the positive control for mask leakage: the
+        # pre-renderers encoder supervised every one of them.
+        is_pad = token_ids == self.tokenizer.convert_tokens_to_ids("<|image_pad|>")
+        self.assertEqual(int(np.sum(is_pad)), 64)
+        self.assertEqual(int(np.sum(mask[is_pad])), 0)
 
     def test_raises_on_overflow(self):
         from PIL import Image
