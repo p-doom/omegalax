@@ -34,11 +34,10 @@ def _resolve_backend():
         return explicit.lower()
     # Implicit default: pallas if a GPU is reachable, else xla. We check
     # ``jax.devices()`` lazily so import order doesn't force a backend choice.
-    try:
-        if any(d.platform != "cpu" for d in jax.devices()):
-            return "pallas"
-    except Exception:
-        pass
+    # A failing probe must propagate: swallowing it substituted the XLA
+    # reference on GPU runs and then reported that throughput as pallas.
+    if any(d.platform != "cpu" for d in jax.devices()):
+        return "pallas"
     return "xla"
 
 
