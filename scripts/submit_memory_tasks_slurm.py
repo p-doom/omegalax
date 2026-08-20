@@ -99,7 +99,7 @@ def render_sbatch(
 #SBATCH --cpus-per-task=24
 #SBATCH --mem=120G
 #SBATCH --gres=gpu:H100-SXM5:1
-#SBATCH --signal=B:USR1@1800
+#SBATCH --signal=USR1@1800
 #SBATCH --requeue
 #SBATCH --output={shlex.quote(str(log_dir / "%x-%j.out"))}
 #SBATCH --error={shlex.quote(str(log_dir / "%x-%j.err"))}
@@ -143,29 +143,8 @@ if subprocess.run(["git", "status", "--porcelain"], cwd=root, check=True, captur
 PY
 
 TRAIN_LOG="$LOG_DIR/train-${{SLURM_JOB_ID:-local}}.log"
-train_pid=""
-requeue_requested=0
-on_usr1() {{
-  requeue_requested=1
-  if [ -n "$train_pid" ]; then
-    kill -USR1 "$train_pid" || true
-  fi
-}}
-trap on_usr1 USR1
-set +e
 srun --cpu-bind=none --ntasks=1 --gpus-per-task=1 "$PYTHON_BIN" "$REPO_ROOT/scripts/train_memory_tasks.py" \\
-  {primary_command} >"$TRAIN_LOG" 2>&1 &
-train_pid=$!
-wait "$train_pid"
-status=$?
-set -e
-if [ "$requeue_requested" -eq 1 ]; then
-  scontrol requeue "$SLURM_JOB_ID"
-  exit 0
-fi
-if [ "$status" -ne 0 ]; then
-  exit "$status"
-fi
+  {primary_command} >"$TRAIN_LOG" 2>&1
 """
 
 

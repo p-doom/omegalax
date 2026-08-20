@@ -44,7 +44,8 @@ class MemoryTaskSubmitterTest(absltest.TestCase):
         self.assertIn("#SBATCH --cpus-per-task=24", script)
         self.assertIn("#SBATCH --mem=120G", script)
         self.assertIn("#SBATCH --gres=gpu:H100-SXM5:1", script)
-        self.assertIn("#SBATCH --signal=B:USR1@1800", script)
+        self.assertIn("#SBATCH --signal=USR1@1800", script)
+        self.assertNotIn("#SBATCH --signal=B:", script)
         self.assertIn("#SBATCH --requeue", script)
         self.assertIn("PYTHONPATH", script)
         self.assertIn("omegalax.__file__", script)
@@ -60,8 +61,10 @@ class MemoryTaskSubmitterTest(absltest.TestCase):
         self.assertIn("--text_attn_backend=mosaic_gpu", script)
         self.assertIn("--resume=if_present", script)
         self.assertIn("srun --cpu-bind=none", script)
-        self.assertIn("trap on_usr1 USR1", script)
-        self.assertIn('scontrol requeue "$SLURM_JOB_ID"', script)
+        self.assertNotIn("trap on_usr1 USR1", script)
+        self.assertNotIn("scontrol requeue", script)
+        self.assertIn('>"$TRAIN_LOG" 2>&1\n', script)
+        self.assertNotIn('>"$TRAIN_LOG" 2>&1 &', script)
 
     def test_default_cli_only_renders_and_never_submits(self):
         with test_temp_dir() as tmp:
