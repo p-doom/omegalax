@@ -376,6 +376,25 @@ def main(_) -> None:
                 f"(remainder {max_patches % ms2}). Adjust the flags so their "
                 f"product is a multiple of {ms2}."
             )
+        # The dataset build budgets tokens (max_length) and records nothing about
+        # patches, so it cannot refuse a sample this budget will. Below the ceiling
+        # a sample can satisfy max_length and still exceed us, and the collator
+        # only finds out on the batch that contains it -- thousands of steps in,
+        # taking any afterok chain with it. Not an error: `_pad_vision_arrays` pads
+        # to exactly max_patches, so the ceiling makes every batch pay maximum
+        # vision padding. The tightest safe value is a judgement, so say what the
+        # risk is and let the operator hold it.
+        ceiling = ms2 * FLAGS.max_length
+        if FLAGS.max_vision_patches_per_sample < ceiling:
+            startup_log(
+                f"WARNING max_vision_patches_per_sample="
+                f"{FLAGS.max_vision_patches_per_sample} is below the "
+                f"{ceiling} patches a {FLAGS.max_length}-token sample can "
+                f"physically hold at merge_size={merge_size}. Nothing upstream "
+                f"bounds patches, so a sample above the budget can reach the "
+                f"collator and kill the run mid-loop. Raise to {ceiling} to make "
+                f"that impossible, or keep it tight knowingly."
+            )
 
     collator = VLMSFTCollator(
         tokenizer,
