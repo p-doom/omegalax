@@ -18,6 +18,7 @@ from omegalax.data.grain_pipeline import (
     make_grain_iterator,
     make_grain_multiprocessing_options,
     make_grain_read_options,
+    parse_data_mix,
     pop_source_ids,
 )
 from omegalax.trainers import checkpoint_utils
@@ -222,6 +223,17 @@ class DataMixingTest(absltest.TestCase):
                     seen_b = True
                     break
             self.assertFalse(seen_b)
+
+    def test_mix_entry_without_a_weight_rejected(self):
+        """A misspelled weight key used to default to 1.0, which is a mixture the
+        recipe never asked for and that every downstream metric reports as its own.
+        """
+        self.assertEqual(
+            parse_data_mix('[{"path": "/a", "weight": 0.25}]'),
+            [MixSource(path="/a", weight=0.25)],
+        )
+        with self.assertRaisesRegex(ValueError, "'path' and 'weight'"):
+            parse_data_mix('[{"path": "/a", "wieght": 0.25}]')
 
     def test_negative_weight_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -56,15 +56,22 @@ class MixSource:
 
 
 def parse_data_mix(spec: str) -> list[MixSource]:
-    """Parse a ``--data_mix`` JSON spec into a list of MixSource."""
+    """Parse a ``--data_mix`` JSON spec into a list of MixSource.
+
+    ``weight`` is as required as ``path``: a defaulted weight turns a typo'd key
+    into a uniform mixture that trains and reports as the recipe's own, which is
+    the one failure mode a mixing run cannot detect from its metrics.
+    """
     raw = json.loads(spec)
     if not isinstance(raw, list) or not raw:
         raise ValueError("--data_mix must be a non-empty JSON list of {path, weight} objects")
     out: list[MixSource] = []
     for entry in raw:
-        if not isinstance(entry, dict) or "path" not in entry:
-            raise ValueError(f"--data_mix entry must be an object with a 'path' field: {entry!r}")
-        out.append(MixSource(path=str(entry["path"]), weight=float(entry.get("weight", 1.0))))
+        if not isinstance(entry, dict) or not {"path", "weight"} <= entry.keys():
+            raise ValueError(
+                f"--data_mix entry must be an object with 'path' and 'weight' fields: {entry!r}"
+            )
+        out.append(MixSource(path=str(entry["path"]), weight=float(entry["weight"])))
     return out
 
 
