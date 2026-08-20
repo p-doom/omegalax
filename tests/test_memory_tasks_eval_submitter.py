@@ -68,6 +68,27 @@ class MemoryTaskEvalSubmitterTest(absltest.TestCase):
         preflight = script.split("<<'PY'\n", maxsplit=1)[1].split("\nPY\n", maxsplit=1)[0]
         compile(preflight, "rendered_eval_preflight", "exec")
 
+    def test_renderer_preserves_an_explicit_venv_python_symlink(self):
+        with test_temp_dir() as tmp:
+            tmpdir = Path(tmp)
+            venv_python = tmpdir / "venv" / "bin" / "python"
+            venv_python.parent.mkdir(parents=True)
+            venv_python.symlink_to(tmpdir / "base-python")
+            script = submit_memory_tasks_eval_slurm.render_sbatch(
+                repo_root=tmpdir / "repo",
+                python_bin=venv_python,
+                job_name="memory-eval-test",
+                log_dir=tmpdir / "logs",
+                time_limit="02:00:00",
+                eval_args=self._eval_args(tmpdir / "checkpoint"),
+                expected_commit="test-commit",
+            )
+
+        rendered_python = next(
+            line for line in script.splitlines() if line.startswith("PYTHON_BIN=")
+        )
+        self.assertEqual(rendered_python, f"PYTHON_BIN={venv_python}")
+
     def test_renderer_requires_the_canonical_pair_manifest(self):
         with test_temp_dir() as tmp:
             tmpdir = Path(tmp)

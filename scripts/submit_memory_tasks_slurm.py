@@ -85,7 +85,7 @@ def render_sbatch(
 ) -> str:
     train_args = _validate_train_args(train_args)
     repo_root = repo_root.expanduser().resolve()
-    python_bin = python_bin.expanduser().resolve()
+    python_bin = python_bin.expanduser().absolute()
     log_dir = log_dir.expanduser().resolve()
     wandb_dir = log_dir / "wandb"
     wandb_cache_dir = log_dir.parent / "wandb_cache"

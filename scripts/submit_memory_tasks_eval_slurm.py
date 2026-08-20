@@ -97,7 +97,7 @@ def render_sbatch(
 ) -> str:
     eval_args = _validate_eval_args(eval_args)
     repo_root = repo_root.expanduser().resolve()
-    python_bin = python_bin.expanduser().resolve()
+    python_bin = python_bin.expanduser().absolute()
     log_dir = log_dir.expanduser().resolve()
     command = _command_line(eval_args)
     return f"""#!/usr/bin/env bash
