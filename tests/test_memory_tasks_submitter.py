@@ -75,6 +75,7 @@ class MemoryTaskSubmitterTest(absltest.TestCase):
                 submit_memory_tasks_slurm.main(argv)
             submit.assert_not_called()
             self.assertTrue((tmpdir / "job.sbatch").is_file())
+            self.assertTrue((tmpdir / "logs").is_dir())
 
     def test_renderer_rejects_non_sha256_run_plan_value(self):
         with test_temp_dir() as tmp:

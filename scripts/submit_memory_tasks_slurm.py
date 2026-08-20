@@ -176,11 +176,13 @@ def _git_commit(repo_root: Path) -> str:
 def main(argv: list[str] | None = None) -> None:
     args = _parser().parse_args(argv)
     expected_commit = args.expected_commit or _git_commit(args.repo_root)
+    log_dir = args.log_dir.expanduser().resolve()
+    log_dir.mkdir(parents=True, exist_ok=True)
     script = render_sbatch(
         repo_root=args.repo_root,
         python_bin=args.python_bin,
         job_name=args.job_name,
-        log_dir=args.log_dir,
+        log_dir=log_dir,
         time_limit=args.time_limit,
         train_args=args.train_args,
         expected_commit=expected_commit,

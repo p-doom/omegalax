@@ -322,6 +322,11 @@ def main(argv: list[str] | None = None) -> None:
             "adam_eps": args.adam_eps,
             "grad_accum_steps": args.grad_accum_steps,
         },
+        "execution": {
+            "save_every": args.save_every,
+            "keep_latest": args.keep_latest,
+            "log_every": args.log_every,
+        },
         "state": {
             "pass_gdn_state": layout.pass_gdn_state,
             "bptt_chunks": layout.bptt_chunks,

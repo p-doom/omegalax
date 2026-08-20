@@ -528,6 +528,10 @@ class MemoryTaskTest(parameterized.TestCase):
             self.assertEqual(contract["optimizer"]["adam_beta2"], 0.9)
             self.assertEqual(contract["optimizer"]["adam_eps"], 1e-6)
             self.assertEqual(
+                contract["execution"],
+                {"save_every": 100, "keep_latest": 3, "log_every": 0},
+            )
+            self.assertEqual(
                 contract["run_plan"],
                 {
                     "sha256": "a" * 64,
