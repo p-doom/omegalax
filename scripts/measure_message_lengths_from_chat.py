@@ -4,7 +4,7 @@ Payload-free analog of measure_message_lengths.py: tokenizes a raw chat.jsonl
 directly (no intermediate grain payload) and writes a ``message_lengths.jsonl``
 cache keyed by ``(conv_idx, msg_offset)``. Per-message lengths are the only
 tokenizer/processor-bound product of record building and are independent of
-max_length / overflow_mode / system_message, so running this once lets every
+max_length / overflow_mode / split, so running this once lets every
 build_sft_records_from_chat.py build over the same chat reuse the cache (via
 --message_lengths_path) instead of re-tokenizing per sequence length.
 

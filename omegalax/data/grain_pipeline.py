@@ -27,7 +27,7 @@ SEQUENCE_LENGTHS_FILENAME = "sequence_lengths.jsonl"
 # Per-message token-length cache for the payload-free inline path. Keyed by
 # (conv_idx, msg_offset) -- conv_idx is the 0-based index over non-empty
 # chat.jsonl rows (the no-payload analog of the payload record_idx). Independent
-# of max_length / overflow_mode / system_message, so it is measured once
+# of max_length / overflow_mode / split, so it is measured once
 # (measure_message_lengths_from_chat) and reused across every seq-length build.
 MESSAGE_LENGTHS_FILENAME = "message_lengths.jsonl"
 ARRAY_RECORD_SUFFIX = ".array_record"
@@ -498,7 +498,6 @@ def _emit_truncation_stats(
     *,
     overflow_mode: str,
     max_length: int,
-    system_message_length: int,
     effective_max: int,
     total_sessions: int,
     total_message_tokens: int,
@@ -521,7 +520,6 @@ def _emit_truncation_stats(
     summary = {
         "overflow_mode": overflow_mode,
         "max_length": max_length,
-        "system_message_length": system_message_length,
         "effective_max": effective_max,
         "sessions": {
             "total": total_sessions,
@@ -552,8 +550,8 @@ def _emit_truncation_stats(
     pct = summary["tokens"]["dropped_fraction"] * 100
     print(
         "[records] truncation summary "
-        f"(overflow_mode={overflow_mode}, effective_max={effective_max} "
-        f"= max_length={max_length} - system_tokens={system_message_length}):\n"
+        f"(overflow_mode={overflow_mode}, max_length={max_length}, "
+        f"effective_max={effective_max}):\n"
         f"  sessions: total={total_sessions} emitted={sessions_with_chunks} "
         f"split={sessions_split} truncated={len(truncated_sessions)} "
         f"(overflow={len(overflow_sessions)}, single_msg={len(prefix_sessions)}) "
@@ -622,7 +620,7 @@ def _process_conversation(
         example = dict(session_meta)
         example["messages"] = list(cur_msgs)
         example["_omegalax_session_id"] = session_id
-        example["_omegalax_measured_length"] = cur_len  # content-only; system added at load
+        example["_omegalax_measured_length"] = cur_len
         return example, (cur_len, cur_vt, cur_vp, cur_ni, len(cur_msgs))
 
     def _record(pair) -> None:
@@ -916,7 +914,6 @@ def build_records_from_chat(
         out_dir,
         overflow_mode=overflow_mode,
         max_length=max_length,
-        system_message_length=0,
         effective_max=effective_max,
         total_sessions=len(all_session_ids),
         total_message_tokens=total_message_tokens,

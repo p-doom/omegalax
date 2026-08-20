@@ -89,6 +89,49 @@ class GrainPipelineTest(absltest.TestCase):
             self.assertEqual(record["messages"][0], system_message)
             self.assertEqual(record["_omegalax_measured_length"], 3)
 
+    def test_truncation_stats_spend_the_whole_window_and_balance(self):
+        # A 78%-dropped build was read as a slicing bug because the summary
+        # claimed `effective_max = max_length - system_tokens`. There is no such
+        # reservation: the system turn is message 0 of the conversation and is
+        # budgeted like any other, so the window is spent in full and
+        # kept + dropped has to come back to what was measured.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src = Path(tmpdir) / "train.jsonl"
+            self._write_jsonl(
+                src,
+                [
+                    {
+                        "messages": [
+                            {"role": "system", "content": "SYS"},
+                            {"role": "user", "content": "10"},
+                            {"role": "assistant", "content": "11"},
+                            {"role": "user", "content": "12"},
+                            {"role": "assistant", "content": "13"},
+                        ],
+                    },
+                ],
+            )
+
+            records_dir = build_records_from_chat(
+                src,
+                Path(tmpdir) / "records",
+                max_length=3,
+                measure_message=_measure_one,
+                records_per_shard=8,
+                overflow_mode="truncate",
+            )
+
+            stats = json.loads((records_dir / "truncation_stats.json").read_text())
+            self.assertEqual(stats["effective_max"], 3)
+            self.assertEqual(stats["max_length"], 3)
+            self.assertEqual(stats["tokens"]["total_measured"], 5)
+            self.assertEqual(stats["tokens"]["kept"], 3)
+            self.assertEqual(stats["tokens"]["dropped"], 2)
+            self.assertEqual(
+                stats["tokens"]["kept"] + stats["tokens"]["dropped"],
+                stats["tokens"]["total_measured"],
+            )
+
     def test_make_grain_iterator_requires_inline_records_dataset(self):
         # Legacy pre-inline-records datasets still sit on disk; iterating one would
         # feed the trainer chunk descriptors instead of examples.
