@@ -2107,7 +2107,7 @@ requires-dist = [
     { name = "pillow" },
     { name = "renderers", specifier = "==0.1.9.dev1" },
     { name = "safetensors", specifier = ">=0.8.0" },
-    { name = "tokamax", git = "https://github.com/p-doom/tokamax.git?rev=nested-mask" },
+    { name = "tokamax", git = "https://github.com/p-doom/tokamax.git?rev=d81bc23bc80f01728984bcda5161ff2569cd7cc5" },
     { name = "torch", marker = "sys_platform == 'linux' and extra == 'torch-tests'", specifier = "==2.10.*" },
     { name = "torchvision", marker = "sys_platform == 'linux' and extra == 'torch-tests'" },
     { name = "transformers", specifier = "<5.4" },
@@ -3282,7 +3282,7 @@ wheels = [
 [[package]]
 name = "tokamax"
 version = "0.0.12"
-source = { git = "https://github.com/p-doom/tokamax.git?rev=nested-mask#d81bc23bc80f01728984bcda5161ff2569cd7cc5" }
+source = { git = "https://github.com/p-doom/tokamax.git?rev=d81bc23bc80f01728984bcda5161ff2569cd7cc5#d81bc23bc80f01728984bcda5161ff2569cd7cc5" }
 dependencies = [
     { name = "absl-py" },
     { name = "einshape" },
