@@ -1,10 +1,11 @@
 """Production-contract tests for the controlled symbolic memory tasks."""
 
+import dataclasses
 import json
 from pathlib import Path
 import tempfile
 
-from absl.testing import absltest
+from absl.testing import absltest, parameterized
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -12,6 +13,7 @@ import numpy as np
 from omegalax.data.memory_tasks import (
     MemoryTask,
     MemoryTaskConfig,
+    MemoryTaskCue,
     MemoryTaskSplit,
     build_memory_task_batch,
     make_memory_task_iterator,
@@ -54,7 +56,7 @@ def _tiny_gdn_config() -> Qwen3_5TextConfig:
     )
 
 
-class MemoryTaskTest(absltest.TestCase):
+class MemoryTaskTest(parameterized.TestCase):
     def test_eval_summary_keeps_answer_and_donor_metrics_separate(self):
         rows = [
             {
@@ -127,6 +129,118 @@ class MemoryTaskTest(absltest.TestCase):
         np.testing.assert_array_equal(flat["token_ids_BT"], batch["token_ids_BCT"].reshape(2, 32))
         np.testing.assert_array_equal(flat["loss_mask_BT"].sum(axis=1), [1, 1])
 
+    def test_multi_slot_pair_mutates_only_target_slot_value_between_worlds(self):
+        # Canary against the primary implementation risk of the multi-slot
+        # extension: independently resampling all K slots per world (instead
+        # of copy-then-mutate-one-slot) would make more than one position
+        # differ between worlds, breaking the paired-counterfactual causal
+        # isolation the evaluator depends on.
+        config = MemoryTaskConfig(
+            task=MemoryTask.EXACT,
+            seed=53,
+            segment_length=16,
+            num_segments=2,
+            num_exact_bindings=3,
+            relevance_cue=MemoryTaskCue.MARKED,
+        )
+        batch = build_memory_task_batch((4,), config, flatten=False)
+        tokens = batch["token_ids_BCT"]
+        target_slot = int(batch[BATCH_PRETRAIN_METADATA_KEY]["target_slot_B"][0])
+
+        segment0_world0 = tokens[0, 0]
+        segment0_world1 = tokens[1, 0]
+        differing_positions = np.flatnonzero(segment0_world0 != segment0_world1)
+
+        self.assertEqual(differing_positions.tolist(), [1 + 3 * target_slot + 2])
+        np.testing.assert_array_equal(tokens[0, -1, :-1], tokens[1, -1, :-1])
+        self.assertNotEqual(int(tokens[0, -1, -1]), int(tokens[1, -1, -1]))
+        revealed_key = int(tokens[0, -1, -3])
+        self.assertEqual(revealed_key, int(segment0_world0[1 + 3 * target_slot + 1]))
+
+    def test_multi_slot_target_slot_is_not_fixed_across_examples(self):
+        # Guards against a regression that silently collapses the surprise
+        # condition back into a marked task by always querying the same slot.
+        config = MemoryTaskConfig(
+            task=MemoryTask.EXACT,
+            seed=59,
+            segment_length=16,
+            num_segments=2,
+            num_exact_bindings=3,
+            relevance_cue=MemoryTaskCue.SURPRISE,
+        )
+        batch = build_memory_task_batch(tuple(range(40)), config, flatten=False)
+        target_slots = batch[BATCH_PRETRAIN_METADATA_KEY]["target_slot_B"][::2]
+
+        self.assertEqual({int(slot) for slot in target_slots}, {0, 1, 2})
+
+    def test_marked_and_surprise_share_latent_draws_and_differ_only_by_decoy_tag(self):
+        marked_config = MemoryTaskConfig(
+            task=MemoryTask.EXACT,
+            seed=61,
+            segment_length=16,
+            num_segments=2,
+            num_exact_bindings=3,
+            relevance_cue=MemoryTaskCue.MARKED,
+        )
+        surprise_config = dataclasses.replace(marked_config, relevance_cue=MemoryTaskCue.SURPRISE)
+
+        marked_batch = build_memory_task_batch((9,), marked_config, flatten=False)
+        surprise_batch = build_memory_task_batch((9,), surprise_config, flatten=False)
+        marked_tokens = marked_batch["token_ids_BCT"]
+        surprise_tokens = surprise_batch["token_ids_BCT"]
+        marked_slot = int(marked_batch[BATCH_PRETRAIN_METADATA_KEY]["target_slot_B"][0])
+        surprise_slot = int(surprise_batch[BATCH_PRETRAIN_METADATA_KEY]["target_slot_B"][0])
+
+        # Same seed/pair_index must yield the same target slot and the same
+        # final query regardless of cue condition -- the two conditions may
+        # only differ in how segment 0 tags the (already identical) slots.
+        self.assertEqual(marked_slot, surprise_slot)
+        np.testing.assert_array_equal(marked_tokens[:, -1], surprise_tokens[:, -1])
+        for slot in range(3):
+            start = 1 + 3 * slot
+            self.assertEqual(
+                int(marked_tokens[0, 0, start + 1]), int(surprise_tokens[0, 0, start + 1])
+            )
+            np.testing.assert_array_equal(
+                marked_tokens[:, 0, start + 2], surprise_tokens[:, 0, start + 2]
+            )
+            marked_tag = int(marked_tokens[0, 0, start])
+            surprise_tag = int(surprise_tokens[0, 0, start])
+            if slot == marked_slot:
+                self.assertEqual(marked_tag, surprise_tag)
+            else:
+                self.assertNotEqual(marked_tag, surprise_tag)
+                self.assertEqual(surprise_tag, int(surprise_tokens[0, 0, 1 + 3 * surprise_slot]))
+
+    def test_surprise_condition_requires_at_least_three_bindings(self):
+        with self.assertRaises(ValueError):
+            MemoryTaskConfig(
+                task=MemoryTask.EXACT,
+                seed=1,
+                segment_length=16,
+                num_segments=2,
+                num_exact_bindings=2,
+                relevance_cue=MemoryTaskCue.SURPRISE,
+            )
+
+    def test_multi_slot_bindings_and_surprise_are_scoped_to_exact_task(self):
+        with self.assertRaises(ValueError):
+            MemoryTaskConfig(
+                task=MemoryTask.DOMINANT_RULE,
+                seed=1,
+                segment_length=24,
+                num_segments=2,
+                num_exact_bindings=2,
+            )
+        with self.assertRaises(ValueError):
+            MemoryTaskConfig(
+                task=MemoryTask.DOMINANT_RULE,
+                seed=1,
+                segment_length=24,
+                num_segments=2,
+                relevance_cue=MemoryTaskCue.SURPRISE,
+            )
+
     def test_dominant_rule_pair_requires_the_majority_convention(self):
         config = MemoryTaskConfig(
             task=MemoryTask.DOMINANT_RULE,
@@ -173,13 +287,21 @@ class MemoryTaskTest(absltest.TestCase):
         np.testing.assert_array_equal(second["pair_index_B"], [2, 2, 3, 3])
         np.testing.assert_array_equal(second["world_B"], [0, 1, 0, 1])
 
-    def test_real_statepassing_trainer_consumes_answer_only_batch(self):
+    @parameterized.parameters(
+        dict(num_exact_bindings=1, relevance_cue=MemoryTaskCue.MARKED),
+        dict(num_exact_bindings=3, relevance_cue=MemoryTaskCue.SURPRISE),
+    )
+    def test_real_statepassing_trainer_consumes_answer_only_batch(
+        self, num_exact_bindings, relevance_cue
+    ):
         config = MemoryTaskConfig(
             task=MemoryTask.EXACT,
             seed=31,
             segment_length=16,
             num_segments=2,
             vocab_size=512,
+            num_exact_bindings=num_exact_bindings,
+            relevance_cue=relevance_cue,
         )
         iterator = make_memory_task_iterator(
             config,
@@ -217,13 +339,21 @@ class MemoryTaskTest(absltest.TestCase):
         self.assertTrue(np.isfinite(metrics["loss"]))
         self.assertEqual(metrics["supervised_tokens"], 2.0)
 
-    def test_real_model_evaluator_runs_all_causal_conditions(self):
+    @parameterized.parameters(
+        dict(num_exact_bindings=1, relevance_cue=MemoryTaskCue.MARKED),
+        dict(num_exact_bindings=3, relevance_cue=MemoryTaskCue.SURPRISE),
+    )
+    def test_real_model_evaluator_runs_all_causal_conditions(
+        self, num_exact_bindings, relevance_cue
+    ):
         config = MemoryTaskConfig(
             task=MemoryTask.EXACT,
             seed=37,
             segment_length=16,
             num_segments=2,
             vocab_size=512,
+            num_exact_bindings=num_exact_bindings,
+            relevance_cue=relevance_cue,
         )
         batch = build_memory_task_batch((0,), config, flatten=False)
         model, model_config = text_api.init_model(
@@ -353,21 +483,23 @@ class MemoryTaskTest(absltest.TestCase):
         with self.assertRaises(ValueError):
             evaluate_memory_batch(model, model_config, batch)
 
-    def test_train_and_eval_splits_generate_disjoint_streams_even_with_same_seed(self):
+    @parameterized.parameters(
+        dict(num_exact_bindings=1, relevance_cue=MemoryTaskCue.MARKED),
+        dict(num_exact_bindings=3, relevance_cue=MemoryTaskCue.SURPRISE),
+    )
+    def test_train_and_eval_splits_generate_disjoint_streams_even_with_same_seed(
+        self, num_exact_bindings, relevance_cue
+    ):
         train_config = MemoryTaskConfig(
             task=MemoryTask.EXACT,
             seed=5,
             segment_length=16,
             num_segments=2,
             split=MemoryTaskSplit.TRAIN,
+            num_exact_bindings=num_exact_bindings,
+            relevance_cue=relevance_cue,
         )
-        eval_config = MemoryTaskConfig(
-            task=MemoryTask.EXACT,
-            seed=5,
-            segment_length=16,
-            num_segments=2,
-            split=MemoryTaskSplit.EVAL,
-        )
+        eval_config = dataclasses.replace(train_config, split=MemoryTaskSplit.EVAL)
 
         train_batch = build_memory_task_batch((3,), train_config, flatten=False)
         eval_batch = build_memory_task_batch((3,), eval_config, flatten=False)
@@ -375,22 +507,83 @@ class MemoryTaskTest(absltest.TestCase):
         self.assertFalse(np.array_equal(train_batch["token_ids_BCT"], eval_batch["token_ids_BCT"]))
 
     def test_eval_contract_validation_rejects_task_or_split_mismatch(self):
+        base_config = MemoryTaskConfig(
+            task=MemoryTask.EXACT,
+            seed=0,
+            segment_length=16,
+            num_segments=2,
+            split=MemoryTaskSplit.TRAIN,
+        )
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "memory_task_contract.json").write_text(
-                json.dumps({"task": {"task": "exact", "split": "train"}})
+                json.dumps({"task": dataclasses.asdict(base_config)})
             )
 
-            _validate_training_contract(root, MemoryTask.EXACT)
+            _validate_training_contract(root, base_config)
+            # seed and split are intentionally allowed to differ between the
+            # trained contract and the requested eval config.
+            _validate_training_contract(
+                root, dataclasses.replace(base_config, seed=99, split=MemoryTaskSplit.EVAL)
+            )
 
             with self.assertRaises(ValueError):
-                _validate_training_contract(root, MemoryTask.DOMINANT_RULE)
+                _validate_training_contract(
+                    root, dataclasses.replace(base_config, task=MemoryTask.DOMINANT_RULE)
+                )
+            with self.assertRaises(ValueError):
+                _validate_training_contract(
+                    root,
+                    dataclasses.replace(
+                        base_config,
+                        num_exact_bindings=3,
+                        relevance_cue=MemoryTaskCue.SURPRISE,
+                    ),
+                )
 
             (root / "memory_task_contract.json").write_text(
-                json.dumps({"task": {"task": "exact", "split": "eval"}})
+                json.dumps(
+                    {
+                        "task": dataclasses.asdict(
+                            dataclasses.replace(base_config, split=MemoryTaskSplit.EVAL)
+                        )
+                    }
+                )
             )
             with self.assertRaises(ValueError):
-                _validate_training_contract(root, MemoryTask.EXACT)
+                _validate_training_contract(root, base_config)
+
+    def test_eval_contract_validation_backfills_legacy_contracts_missing_new_fields(self):
+        # A checkpoint trained before num_exact_bindings/relevance_cue existed
+        # only recorded the original fields; it is implicitly K=1/marked and
+        # must not be rejected for "missing" the new keys.
+        legacy_config = MemoryTaskConfig(
+            task=MemoryTask.EXACT,
+            seed=0,
+            segment_length=16,
+            num_segments=2,
+            split=MemoryTaskSplit.TRAIN,
+        )
+        legacy_task = dataclasses.asdict(legacy_config)
+        del legacy_task["num_exact_bindings"]
+        del legacy_task["relevance_cue"]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "memory_task_contract.json").write_text(json.dumps({"task": legacy_task}))
+
+            _validate_training_contract(
+                root, dataclasses.replace(legacy_config, split=MemoryTaskSplit.EVAL)
+            )
+            with self.assertRaises(ValueError):
+                _validate_training_contract(
+                    root,
+                    dataclasses.replace(
+                        legacy_config,
+                        split=MemoryTaskSplit.EVAL,
+                        num_exact_bindings=3,
+                        relevance_cue=MemoryTaskCue.SURPRISE,
+                    ),
+                )
 
 
 if __name__ == "__main__":

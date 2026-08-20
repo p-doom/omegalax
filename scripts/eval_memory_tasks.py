@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from collections import defaultdict
+import dataclasses
 import hashlib
 import json
 from pathlib import Path
@@ -17,6 +18,7 @@ import numpy as np
 from omegalax.data.memory_tasks import (
     MemoryTask,
     MemoryTaskConfig,
+    MemoryTaskCue,
     MemoryTaskSplit,
     build_memory_task_batch,
 )
@@ -31,16 +33,31 @@ def summarize_rows(rows: list[dict[str, Any]]) -> dict[str, dict[str, float]]:
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
         grouped[str(row["mode"])].append(row)
-    return {
-        mode: {
+    summary: dict[str, dict[str, float]] = {}
+    for mode, mode_rows in grouped.items():
+        by_slot: dict[int, list[dict[str, Any]]] = defaultdict(list)
+        for row in mode_rows:
+            if "target_slot" in row:
+                by_slot[int(row["target_slot"])].append(row)
+        mode_summary = {
             "num_examples": len(mode_rows),
             "accuracy": float(np.mean([row["correct"] for row in mode_rows])),
             "answer_nll": float(np.mean([row["answer_nll"] for row in mode_rows])),
             "donor_accuracy": float(np.mean([row["donor_correct"] for row in mode_rows])),
             "donor_answer_nll": float(np.mean([row["donor_answer_nll"] for row in mode_rows])),
         }
-        for mode, mode_rows in grouped.items()
-    }
+        if by_slot:
+            # Recency-stratified breakdown: slots are written in temporal order
+            # within segment 0, so the slot index doubles as recency rank.
+            # Separates "the state can't hold K items" (flat across slots) from
+            # "the model defaults to a recency policy" (accuracy skewed toward
+            # the most recently written slot).
+            mode_summary["accuracy_by_target_slot"] = {
+                str(slot): float(np.mean([row["correct"] for row in slot_rows]))
+                for slot, slot_rows in sorted(by_slot.items())
+            }
+        summary[mode] = mode_summary
+    return summary
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -52,13 +69,19 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--num_segments", type=int, default=2)
     parser.add_argument("--vocab_size", type=int, default=1024)
     parser.add_argument("--num_rule_examples", type=int, default=5)
+    parser.add_argument("--num_exact_bindings", type=int, default=1)
+    parser.add_argument(
+        "--relevance_cue",
+        choices=[cue.value for cue in MemoryTaskCue],
+        default=MemoryTaskCue.MARKED.value,
+    )
     parser.add_argument("--num_pairs", type=int, default=256)
     parser.add_argument("--pairs_per_batch", type=int, default=8)
     parser.add_argument("--tp_size", type=int, default=1)
     parser.add_argument("--fsdp_size", type=int, default=1)
     parser.add_argument("--dp_size", type=int, default=1)
     parser.add_argument("--text_attn_backend", default="xla")
-    parser.add_argument("--jax_cache_dir", type=Path, default=Path("/tmp/jax_cache"))
+    parser.add_argument("--jax_cache_dir", type=Path, required=True)
     return parser
 
 
@@ -78,28 +101,48 @@ def _manifest(config: MemoryTaskConfig, num_pairs: int) -> dict[str, Any]:
         "num_segments": config.num_segments,
         "vocab_size": config.vocab_size,
         "num_rule_examples": config.num_rule_examples,
+        "num_exact_bindings": config.num_exact_bindings,
+        "relevance_cue": str(config.relevance_cue),
         "pair_indices": list(range(num_pairs)),
     }
     payload = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
     return manifest | {"sha256": hashlib.sha256(payload).hexdigest()}
 
 
-def _validate_training_contract(checkpoint_root: Path, task: MemoryTask) -> None:
+# Checkpoints trained before num_exact_bindings/relevance_cue existed only
+# recorded the original fields; such a contract is implicitly K=1/marked.
+_LEGACY_MEMORY_TASK_CONFIG_DEFAULTS: dict[str, Any] = {
+    "num_exact_bindings": 1,
+    "relevance_cue": MemoryTaskCue.MARKED.value,
+}
+# seed/split are expected to differ between a training contract and the
+# requested eval config (eval always uses split=EVAL, and often a distinct
+# seed); every other field is part of the frozen task semantics.
+_MEMORY_TASK_CONTRACT_ALLOWED_DIFFERENCES = frozenset({"seed", "split"})
+
+
+def _validate_training_contract(checkpoint_root: Path, task_config: MemoryTaskConfig) -> None:
     contract_path = checkpoint_root / "memory_task_contract.json"
     if not contract_path.is_file():
         return
     contract = json.loads(contract_path.read_text())
-    trained_split = contract["task"]["split"]
+    trained_task = {**_LEGACY_MEMORY_TASK_CONFIG_DEFAULTS, **contract["task"]}
+    trained_split = trained_task["split"]
     if trained_split != MemoryTaskSplit.TRAIN.value:
         raise ValueError(
             f"Refusing to evaluate {checkpoint_root}: memory_task_contract.json records "
             f"split={trained_split!r}, expected {MemoryTaskSplit.TRAIN.value!r}"
         )
-    trained_task = contract["task"]["task"]
-    if trained_task != task.value:
+    requested_task = dataclasses.asdict(task_config)
+    mismatches = {
+        name: (trained_task[name], value)
+        for name, value in requested_task.items()
+        if name not in _MEMORY_TASK_CONTRACT_ALLOWED_DIFFERENCES and trained_task[name] != value
+    }
+    if mismatches:
         raise ValueError(
-            f"Refusing to evaluate {checkpoint_root} on task={task.value!r}: "
-            f"memory_task_contract.json was trained on task={trained_task!r}"
+            f"Refusing to evaluate {checkpoint_root} on a mismatched memory-task config: "
+            f"{mismatches!r}"
         )
 
 
@@ -186,10 +229,12 @@ def main(argv: list[str] | None = None) -> None:
         num_segments=args.num_segments,
         vocab_size=args.vocab_size,
         num_rule_examples=args.num_rule_examples,
+        num_exact_bindings=args.num_exact_bindings,
+        relevance_cue=args.relevance_cue,
         split=MemoryTaskSplit.EVAL,
     )
     resolved = resolve_checkpoint(args.checkpoint)
-    _validate_training_contract(resolved.root, task_config.task)
+    _validate_training_contract(resolved.root, task_config)
     model_config = text_api.resolve_config(str(resolved.config_path))
     if task_config.vocab_size > model_config.vocab_size:
         raise ValueError(
@@ -253,6 +298,7 @@ def main(argv: list[str] | None = None) -> None:
                         "donor_correct": prediction == int(donor_answers_B[idx]),
                         "answer_nll": float(result.answer_nll_B[idx]),
                         "donor_answer_nll": float(result.donor_answer_nll_B[idx]),
+                        "target_slot": int(metadata["target_slot_B"][idx]),
                     }
                 )
 

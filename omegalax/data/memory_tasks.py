@@ -25,6 +25,19 @@ class MemoryTaskSplit(StrEnum):
     EVAL = "eval"
 
 
+class MemoryTaskCue(StrEnum):
+    """Whether the to-be-remembered slot is flagged as relevant at encoding time.
+
+    MARKED tags the target slot so relevance is known immediately (today's
+    default, single-binding behavior at ``num_exact_bindings=1``). SURPRISE
+    tags every candidate slot identically, so relevance can only be resolved
+    once the final-segment query reveals which key mattered.
+    """
+
+    MARKED = "marked"
+    SURPRISE = "surprise"
+
+
 @dataclasses.dataclass(frozen=True, slots=True)
 class MemoryTaskConfig:
     task: MemoryTask | str
@@ -33,11 +46,14 @@ class MemoryTaskConfig:
     num_segments: int
     vocab_size: int = 1024
     num_rule_examples: int = 5
+    num_exact_bindings: int = 1
+    relevance_cue: MemoryTaskCue | str = MemoryTaskCue.MARKED
     split: MemoryTaskSplit | str = MemoryTaskSplit.TRAIN
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "task", MemoryTask(self.task))
         object.__setattr__(self, "split", MemoryTaskSplit(self.split))
+        object.__setattr__(self, "relevance_cue", MemoryTaskCue(self.relevance_cue))
         if self.seed < 0:
             raise ValueError("seed must be >= 0")
         if self.num_segments < 2:
@@ -48,12 +64,27 @@ class MemoryTaskConfig:
             raise ValueError("vocab_size must be > 256")
         if self.num_rule_examples < 3 or not self.num_rule_examples % 2:
             raise ValueError("num_rule_examples must be odd and >= 3")
+        if self.num_exact_bindings < 1:
+            raise ValueError("num_exact_bindings must be >= 1")
         if self.task is MemoryTask.DOMINANT_RULE:
             required = 1 + 3 * self.num_rule_examples
             if self.segment_length < required:
                 raise ValueError(
                     f"segment_length must be >= {required} for {self.num_rule_examples} examples"
                 )
+            if self.num_exact_bindings != 1 or self.relevance_cue is not MemoryTaskCue.MARKED:
+                raise ValueError(
+                    "num_exact_bindings/relevance_cue are only defined for MemoryTask.EXACT"
+                )
+        if self.task is MemoryTask.EXACT:
+            required = 1 + 3 * self.num_exact_bindings
+            if self.segment_length < required:
+                raise ValueError(
+                    f"segment_length must be >= {required} for "
+                    f"{self.num_exact_bindings} exact bindings"
+                )
+        if self.relevance_cue is MemoryTaskCue.SURPRISE and self.num_exact_bindings < 3:
+            raise ValueError("relevance_cue=surprise requires num_exact_bindings >= 3")
 
 
 _EXACT_TASK = 1
@@ -62,6 +93,7 @@ _BIND = 3
 _DEMO = 4
 _QUERY = 5
 _ANSWER = 6
+_DECOY_BIND = 7
 _KEYS = np.arange(32, 64, dtype=np.int32)
 _VALUES = np.arange(64, 96, dtype=np.int32)
 _RULE_ITEMS = np.arange(96, 160, dtype=np.int32)
@@ -77,7 +109,42 @@ def _rng(config: MemoryTaskConfig, pair_index: int) -> np.random.Generator:
     )
 
 
-def _paired_tokens(pair_index: int, config: MemoryTaskConfig) -> np.ndarray:
+def _multi_slot_exact_tokens(
+    rng: np.random.Generator, paired: np.ndarray, config: MemoryTaskConfig
+) -> tuple[np.ndarray, int]:
+    num_slots = config.num_exact_bindings
+    keys = rng.choice(_KEYS, size=num_slots, replace=False)
+    target_slot = int(rng.integers(0, num_slots))
+    target_values = rng.choice(_VALUES, size=2, replace=False)
+    decoy_values = rng.choice(_VALUES, size=num_slots - 1, replace=False)
+    # Surprise reuses _BIND on every slot (no differential cue); marked flags
+    # decoys with a distinct tag so only the target slot carries _BIND.
+    decoy_tag = _BIND if config.relevance_cue is MemoryTaskCue.SURPRISE else _DECOY_BIND
+
+    paired[:, 0, 0] = _EXACT_TASK
+    decoy_idx = 0
+    for slot in range(num_slots):
+        start = 1 + 3 * slot
+        if slot == target_slot:
+            for world in (0, 1):
+                paired[world, 0, start : start + 3] = (_BIND, keys[slot], target_values[world])
+        else:
+            # Written identically to both world planes: worlds must differ
+            # only in the target slot's value, never in a decoy.
+            paired[:, 0, start : start + 3] = (decoy_tag, keys[slot], decoy_values[decoy_idx])
+            decoy_idx += 1
+    for world in (0, 1):
+        paired[world, -1, -5:] = (
+            _EXACT_TASK,
+            _QUERY,
+            keys[target_slot],
+            _ANSWER,
+            target_values[world],
+        )
+    return paired, target_slot
+
+
+def _paired_tokens(pair_index: int, config: MemoryTaskConfig) -> tuple[np.ndarray, int]:
     if pair_index < 0:
         raise ValueError("pair_index must be >= 0")
     rng = _rng(config, pair_index)
@@ -90,18 +157,20 @@ def _paired_tokens(pair_index: int, config: MemoryTaskConfig) -> np.ndarray:
     paired = np.stack((shared.copy(), shared.copy()))
 
     if config.task is MemoryTask.EXACT:
-        key = int(rng.choice(_KEYS))
-        values = rng.choice(_VALUES, size=2, replace=False)
-        for world in (0, 1):
-            paired[world, 0, :4] = (_EXACT_TASK, _BIND, key, values[world])
-            paired[world, -1, -5:] = (
-                _EXACT_TASK,
-                _QUERY,
-                key,
-                _ANSWER,
-                values[world],
-            )
-        return paired
+        if config.num_exact_bindings == 1:
+            key = int(rng.choice(_KEYS))
+            values = rng.choice(_VALUES, size=2, replace=False)
+            for world in (0, 1):
+                paired[world, 0, :4] = (_EXACT_TASK, _BIND, key, values[world])
+                paired[world, -1, -5:] = (
+                    _EXACT_TASK,
+                    _QUERY,
+                    key,
+                    _ANSWER,
+                    values[world],
+                )
+            return paired, 0
+        return _multi_slot_exact_tokens(rng, paired, config)
 
     items = rng.choice(_RULE_ITEMS, size=config.num_rule_examples + 1, replace=False)
     majority_world_0 = int(rng.integers(0, 2))
@@ -130,7 +199,7 @@ def _paired_tokens(pair_index: int, config: MemoryTaskConfig) -> np.ndarray:
             _ANSWER,
             answers[world],
         )
-    return paired
+    return paired, 0
 
 
 def build_memory_task_batch(
@@ -142,9 +211,9 @@ def build_memory_task_batch(
     if not pair_indices:
         raise ValueError("pair_indices must not be empty")
     pair_indices = tuple(int(pair_index) for pair_index in pair_indices)
-    token_ids_BCT = np.concatenate(
-        [_paired_tokens(pair_index, config) for pair_index in pair_indices], axis=0
-    )
+    generated = [_paired_tokens(pair_index, config) for pair_index in pair_indices]
+    token_ids_BCT = np.concatenate([paired for paired, _ in generated], axis=0)
+    target_slots = [target_slot for _, target_slot in generated]
     num_windows = token_ids_BCT.shape[0]
     attention_mask_BCT = np.ones_like(token_ids_BCT, dtype=np.int32)
     loss_mask_BCT = np.zeros_like(token_ids_BCT, dtype=np.int32)
@@ -160,6 +229,7 @@ def build_memory_task_batch(
         "world_B": np.tile(np.asarray((0, 1), dtype=np.int32), len(pair_indices)),
         "answer_token_B": token_ids_BCT[:, -1, -1].copy(),
         "answer_position_B": np.full(num_windows, config.segment_length - 1, dtype=np.int32),
+        "target_slot_B": np.repeat(np.asarray(target_slots, dtype=np.int32), 2),
     }
 
     if flatten:

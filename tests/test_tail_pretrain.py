@@ -32,6 +32,7 @@ from omegalax.trainers.pretrain import PretrainMode
 from omegalax.trainers.tail_pretrain import (
     build_cosine_bridge,
     build_tail_optimizer,
+    build_tail_schedule,
     expected_lora_target_counts,
     inject_tail_lora,
     run_tail_pretrain,
@@ -203,8 +204,9 @@ class TailPretrainTest(absltest.TestCase):
                 seq_len=4,
                 num_steps=2,
                 global_step_offset=40000,
-                start_lr=1e-3,
-                end_lr=5e-4,
+                learning_rate=7e-4,
+                lr_schedule="linear",
+                warmup_steps=0,
                 weight_decay=0.0,
                 max_grad_norm=1.0,
                 grad_accum_steps=1,
@@ -235,6 +237,10 @@ class TailPretrainTest(absltest.TestCase):
             )
             self.assertEqual(metrics["step"], 40002)
             self.assertTrue(np.isfinite(metrics["loss"]))
+            # Regression for build_lr_schedule('linear', warmup_steps=0) returning a
+            # bare float: run_tail_pretrain used to call it unconditionally as
+            # schedule(step), which crashes on a non-callable schedule.
+            self.assertEqual(metrics["lr"], config.learning_rate)
             self.assertEqual(optimizer.wrt, LoRAParam)
 
             source_backbone = _direct_backbone_params(plain_model)
@@ -255,7 +261,7 @@ class TailPretrainTest(absltest.TestCase):
             with mesh_rules(mesh):
                 restored_optimizer = build_tail_optimizer(
                     restored_model,
-                    build_cosine_bridge(config),
+                    build_tail_schedule(config),
                     config,
                     wrt=LoRAParam,
                 )

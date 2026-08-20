@@ -15,6 +15,7 @@ import wandb
 from omegalax.data.memory_tasks import (
     MemoryTask,
     MemoryTaskConfig,
+    MemoryTaskCue,
     MemoryTaskSplit,
     make_memory_task_iterator,
 )
@@ -87,6 +88,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--num_segments", type=int, default=2)
     parser.add_argument("--vocab_size", type=int, default=1024)
     parser.add_argument("--num_rule_examples", type=int, default=5)
+    parser.add_argument("--num_exact_bindings", type=int, default=1)
+    parser.add_argument(
+        "--relevance_cue",
+        choices=[cue.value for cue in MemoryTaskCue],
+        default=MemoryTaskCue.MARKED.value,
+    )
     parser.add_argument("--pairs_per_batch", type=int, default=8)
     parser.add_argument("--num_steps", type=int, default=1000)
     parser.add_argument("--learning_rate", type=float, default=1e-3)
@@ -104,7 +111,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--log_every", type=int, default=10)
     parser.add_argument("--resume", choices=[mode.value for mode in ResumeMode], default="never")
     parser.add_argument("--text_attn_backend", default="xla")
-    parser.add_argument("--jax_cache_dir", type=Path, default=Path("/tmp/jax_cache"))
+    parser.add_argument("--jax_cache_dir", type=Path, required=True)
     parser.add_argument("--wandb_project")
     parser.add_argument("--wandb_entity")
     parser.add_argument("--wandb_group")
@@ -140,6 +147,8 @@ def main(argv: list[str] | None = None) -> None:
         num_segments=args.num_segments,
         vocab_size=args.vocab_size,
         num_rule_examples=args.num_rule_examples,
+        num_exact_bindings=args.num_exact_bindings,
+        relevance_cue=args.relevance_cue,
         split=MemoryTaskSplit.TRAIN,
     )
     layout = training_layout(
