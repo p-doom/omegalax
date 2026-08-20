@@ -4,6 +4,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import jax.numpy as jnp
+from flax import nnx
+
+from omegalax.models.params_utils import flatten_pure_state
 from omegalax.models.qwen3.config import Qwen3Config
 from omegalax.models.qwen3.model import Qwen3
 from omegalax.models.qwen3.params import export_qwen3_to_safetensors, qwen3_to_hf_config_dict
@@ -45,6 +49,24 @@ def export_model_to_hf(model, cfg, out_dir: str | Path) -> Path:
     raise ValueError(
         f"Unsupported model/config combination for export: {type(model)} / {type(cfg)}"
     )
+
+
+def param_fingerprint(model) -> dict[str, float]:
+    """Per-leaf sum over every parameter, for comparing a model against the base it came from.
+
+    Device-side reduction, so it costs one pass and no host transfer of the
+    weights. Compared before-restore against after-merge it answers the only
+    question the exporter cannot answer any other way: did the checkpoint
+    actually change the weights we are about to write? ``partial_restore=True``
+    drops leaves it cannot path-match without raising, and a LoRA adapter that
+    never got merged leaves the base kernels untouched -- both produce a
+    byte-perfect export of the pretrained model.
+    """
+    _, state = nnx.split(model)
+    return {
+        key: float(jnp.sum(leaf.astype(jnp.float32)))
+        for key, leaf in flatten_pure_state(nnx.to_pure_dict(state)).items()
+    }
 
 
 def model_config_to_hf_dict(cfg) -> dict:

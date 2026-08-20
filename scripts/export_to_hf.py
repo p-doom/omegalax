@@ -107,16 +107,29 @@ def load_model():
 
 
 def _read_lora_metadata(save_dir: Path) -> dict:
-    """Return LoRA settings persisted by the trainer next to the orbax tree.
+    """Return the LoRA settings the trainer persisted next to the orbax tree.
 
-    Absent file ⇒ checkpoint was full-FT (all defaults to off).
+    Never infers. ``vlm.run_sft`` writes this file for every checkpoint, full-FT
+    included, so an absent or incomplete one means we cannot know whether to
+    ``inject_lora`` before deriving the restore template -- and guessing "full-FT"
+    is the silent-corruption path: ``partial_restore=True`` then matches the base
+    subtree, drops every LoRA leaf without a word, and exports the base model.
     """
     import json
 
     p = save_dir / "lora_metadata.json"
     if not p.exists():
-        return {"enable_lora": False, "lora_rank": 32, "lora_alpha": 32.0}
-    return json.loads(p.read_text())
+        raise FileNotFoundError(
+            f"no lora_metadata.json next to the checkpoint at {save_dir}. Every "
+            "checkpoint written by omegalax.trainers.vlm has one; without it an "
+            "adapter checkpoint exports as the base model with no error. Write the "
+            "file from the training run's recipe (enable_lora, lora_rank, lora_alpha)."
+        )
+    meta = json.loads(p.read_text())
+    missing = {"enable_lora", "lora_rank", "lora_alpha"} - meta.keys()
+    if missing:
+        raise ValueError(f"{p} is missing {sorted(missing)}; refusing to guess a LoRA rank")
+    return meta
 
 
 def _restore_trained_weights(model, cfg, checkpoint_path: Path):
@@ -152,19 +165,17 @@ def _restore_trained_weights(model, cfg, checkpoint_path: Path):
     default_sharding = NamedSharding(mesh, P())
 
     with mesh_rules(mesh):
-        if bool(lora_meta.get("enable_lora", False)):
+        if bool(lora_meta["enable_lora"]):
             from omegalax.trainers.lora import inject_lora
 
+            rank = int(lora_meta["lora_rank"])
             n_wrapped = inject_lora(
                 model,
-                r=int(lora_meta.get("lora_rank", 32)),
-                alpha=float(lora_meta.get("lora_alpha", 32.0)),
+                r=rank,
+                alpha=float(lora_meta["lora_alpha"]),
                 rngs=nnx.Rngs(FLAGS.seed),
             )
-            print(
-                f"[export] re-injected LoRA into base for restore: "
-                f"r={int(lora_meta.get('lora_rank', 32))} wrapped={n_wrapped}"
-            )
+            print(f"[export] re-injected LoRA into base for restore: r={rank} wrapped={n_wrapped}")
 
         # Build abstract template for the model-params subtree only. The
         # saved tree stored it under ``train_state/optimizer/model``; we
@@ -224,13 +235,41 @@ def _restore_trained_weights(model, cfg, checkpoint_path: Path):
 def main(_) -> None:
     jax.distributed.initialize()
     model, cfg = load_model()
-    if FLAGS.checkpoint_path:
-        ckpt = Path(FLAGS.checkpoint_path).expanduser()
-        model = _restore_trained_weights(model, cfg, ckpt)
+    if not FLAGS.checkpoint_path:
+        out_dir = Path(FLAGS.out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        print(f"Exported safetensors to {export_lib.export_model_to_hf(model, cfg, out_dir)}")
+        return
+
+    base_fingerprint = export_lib.param_fingerprint(model)
+    model = _restore_trained_weights(model, cfg, Path(FLAGS.checkpoint_path).expanduser())
     out_dir = Path(FLAGS.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     path = export_lib.export_model_to_hf(model, cfg, out_dir)
+
+    # After the write, because export_model_to_hf owns the LoRA merge and a LoRA
+    # run trains no base leaf: pre-merge, a correct adapter export is legitimately
+    # base-identical on every shared key.
+    exported = export_lib.param_fingerprint(model)
+    if exported.keys() != base_fingerprint.keys():
+        raise ValueError(
+            f"{path} was written from a parameter tree that is not the base's: "
+            f"{sorted(exported.keys() - base_fingerprint.keys())[:3]}. An unmerged LoRA "
+            f"adapter exports its BASE kernel -- LoRALinear.kernel forwards to "
+            f"base.kernel -- so the trained delta is silently absent. Do NOT use it."
+        )
+    changed = [k for k, v in base_fingerprint.items() if exported[k] != v]
+    if not changed:
+        raise ValueError(
+            f"{path} is identical to the pretrained {FLAGS.model_id} on all "
+            f"{len(base_fingerprint)} parameter leaves. The restore matched nothing -- "
+            f"orbax partial_restore drops leaves without raising -- so this export is the "
+            f"base model. Do NOT use it. Check that "
+            f"{Path(FLAGS.checkpoint_path).expanduser().parent}/lora_metadata.json "
+            f"matches the training run."
+        )
     print(f"Exported safetensors to {path}")
+    print(f"[export] {len(changed)}/{len(base_fingerprint)} parameter leaves differ from the base")
 
 
 if __name__ == "__main__":
