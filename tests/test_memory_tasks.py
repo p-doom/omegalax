@@ -137,13 +137,13 @@ class MemoryTaskTest(parameterized.TestCase):
         # isolation the evaluator depends on.
         config = MemoryTaskConfig(
             task=MemoryTask.EXACT,
-            seed=53,
+            seed=0,
             segment_length=16,
             num_segments=2,
             num_exact_bindings=3,
             relevance_cue=MemoryTaskCue.MARKED,
         )
-        batch = build_memory_task_batch((4,), config, flatten=False)
+        batch = build_memory_task_batch((3,), config, flatten=False)
         tokens = batch["token_ids_BCT"]
         target_slot = int(batch[BATCH_PRETRAIN_METADATA_KEY]["target_slot_B"][0])
 
@@ -156,6 +156,30 @@ class MemoryTaskTest(parameterized.TestCase):
         self.assertNotEqual(int(tokens[0, -1, -1]), int(tokens[1, -1, -1]))
         revealed_key = int(tokens[0, -1, -3])
         self.assertEqual(revealed_key, int(segment0_world0[1 + 3 * target_slot + 1]))
+
+        # The two counterfactual target values and every decoy value must all
+        # be pairwise distinct: a decoy colliding with either target value
+        # would let a model score "correct" or "donor-correct" by parroting
+        # a decoy it attended to, instead of genuinely retrieving the target
+        # slot -- contaminating the donor/shortcut metrics the paired-world
+        # design exists to keep clean. seed=0/pair_index=3 is a known
+        # collision under independent-draw sampling; it must go green once
+        # the K+1 values are drawn from a single without-replacement pool.
+        target_values = (
+            int(segment0_world0[1 + 3 * target_slot + 2]),
+            int(segment0_world1[1 + 3 * target_slot + 2]),
+        )
+        decoy_values = [
+            int(segment0_world0[1 + 3 * slot + 2])
+            for slot in range(config.num_exact_bindings)
+            if slot != target_slot
+        ]
+        all_values = (*target_values, *decoy_values)
+        self.assertEqual(
+            len(set(all_values)),
+            len(all_values),
+            f"expected {len(all_values)} pairwise-distinct values, got {all_values}",
+        )
 
     def test_multi_slot_target_slot_is_not_fixed_across_examples(self):
         # Guards against a regression that silently collapses the surprise
@@ -288,12 +312,31 @@ class MemoryTaskTest(parameterized.TestCase):
         np.testing.assert_array_equal(second["world_B"], [0, 1, 0, 1])
 
     @parameterized.parameters(
-        dict(num_exact_bindings=1, relevance_cue=MemoryTaskCue.MARKED),
-        dict(num_exact_bindings=3, relevance_cue=MemoryTaskCue.SURPRISE),
+        dict(
+            condition=TrainingCondition.STATE,
+            num_exact_bindings=1,
+            relevance_cue=MemoryTaskCue.MARKED,
+        ),
+        dict(
+            condition=TrainingCondition.STATE,
+            num_exact_bindings=3,
+            relevance_cue=MemoryTaskCue.SURPRISE,
+        ),
+        dict(
+            condition=TrainingCondition.FULL_CONTEXT,
+            num_exact_bindings=3,
+            relevance_cue=MemoryTaskCue.SURPRISE,
+        ),
     )
-    def test_real_statepassing_trainer_consumes_answer_only_batch(
-        self, num_exact_bindings, relevance_cue
+    def test_real_trainer_consumes_answer_only_batch_across_conditions(
+        self, condition, num_exact_bindings, relevance_cue
     ):
+        # Layout (batch_size/seq_len/flatten/pretrain_mode/bptt_chunks/
+        # pass_gdn_state) comes from training_layout -- the same function
+        # scripts/train_memory_tasks.py uses -- rather than being
+        # hand-duplicated here, so this exercises the actual Grain iterator
+        # (flatten=True for FULL_CONTEXT, PretrainMode.IID_BASELINE) through
+        # the real run_pretrain path.
         config = MemoryTaskConfig(
             task=MemoryTask.EXACT,
             seed=31,
@@ -303,19 +346,25 @@ class MemoryTaskTest(parameterized.TestCase):
             num_exact_bindings=num_exact_bindings,
             relevance_cue=relevance_cue,
         )
+        layout = training_layout(
+            condition,
+            pairs_per_batch=1,
+            num_segments=config.num_segments,
+            segment_length=config.segment_length,
+        )
         iterator = make_memory_task_iterator(
             config,
-            global_batch_size=4,
+            global_batch_size=layout.batch_size,
             num_batches=1,
-            flatten=False,
+            flatten=layout.flatten,
             dp_size=1,
             fsdp_size=1,
             process_index=0,
         )
         train_config = pretrain_trainer.TrainConfig(
             seed=0,
-            batch_size=4,
-            seq_len=16,
+            batch_size=layout.batch_size,
+            seq_len=layout.seq_len,
             num_steps=1,
             learning_rate=1e-3,
             weight_decay=0.0,
@@ -326,14 +375,14 @@ class MemoryTaskTest(parameterized.TestCase):
             _tiny_gdn_config(),
             train_config,
             iterator,
-            pretrain_mode=pretrain_trainer.PretrainMode.STATEPASSING_BPTT,
+            pretrain_mode=layout.pretrain_mode,
             log_every=0,
             tp_size=1,
             fsdp_size=1,
             dp_size=1,
             text_attn_backend="xla",
-            bptt_chunks=None,
-            pass_gdn_state=True,
+            bptt_chunks=layout.bptt_chunks,
+            pass_gdn_state=layout.pass_gdn_state,
         )
 
         self.assertTrue(np.isfinite(metrics["loss"]))
@@ -552,38 +601,6 @@ class MemoryTaskTest(parameterized.TestCase):
             )
             with self.assertRaises(ValueError):
                 _validate_training_contract(root, base_config)
-
-    def test_eval_contract_validation_backfills_legacy_contracts_missing_new_fields(self):
-        # A checkpoint trained before num_exact_bindings/relevance_cue existed
-        # only recorded the original fields; it is implicitly K=1/marked and
-        # must not be rejected for "missing" the new keys.
-        legacy_config = MemoryTaskConfig(
-            task=MemoryTask.EXACT,
-            seed=0,
-            segment_length=16,
-            num_segments=2,
-            split=MemoryTaskSplit.TRAIN,
-        )
-        legacy_task = dataclasses.asdict(legacy_config)
-        del legacy_task["num_exact_bindings"]
-        del legacy_task["relevance_cue"]
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "memory_task_contract.json").write_text(json.dumps({"task": legacy_task}))
-
-            _validate_training_contract(
-                root, dataclasses.replace(legacy_config, split=MemoryTaskSplit.EVAL)
-            )
-            with self.assertRaises(ValueError):
-                _validate_training_contract(
-                    root,
-                    dataclasses.replace(
-                        legacy_config,
-                        split=MemoryTaskSplit.EVAL,
-                        num_exact_bindings=3,
-                        relevance_cue=MemoryTaskCue.SURPRISE,
-                    ),
-                )
 
 
 if __name__ == "__main__":

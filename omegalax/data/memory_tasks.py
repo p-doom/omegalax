@@ -83,6 +83,12 @@ class MemoryTaskConfig:
                     f"segment_length must be >= {required} for "
                     f"{self.num_exact_bindings} exact bindings"
                 )
+            if self.num_exact_bindings + 1 > _VALUES.size:
+                raise ValueError(
+                    f"num_exact_bindings={self.num_exact_bindings} needs "
+                    f"{self.num_exact_bindings + 1} pairwise-distinct values "
+                    f"but only {_VALUES.size} exist"
+                )
         if self.relevance_cue is MemoryTaskCue.SURPRISE and self.num_exact_bindings < 3:
             raise ValueError("relevance_cue=surprise requires num_exact_bindings >= 3")
 
@@ -115,8 +121,13 @@ def _multi_slot_exact_tokens(
     num_slots = config.num_exact_bindings
     keys = rng.choice(_KEYS, size=num_slots, replace=False)
     target_slot = int(rng.integers(0, num_slots))
-    target_values = rng.choice(_VALUES, size=2, replace=False)
-    decoy_values = rng.choice(_VALUES, size=num_slots - 1, replace=False)
+    # Both counterfactual target values and every decoy value must be drawn
+    # from a single without-replacement pool: drawing them from separate
+    # pools (as before) lets a decoy collide with a target value, which
+    # contaminates donor/shortcut scoring downstream.
+    all_values = rng.choice(_VALUES, size=num_slots + 1, replace=False)
+    target_values = all_values[:2]
+    decoy_values = all_values[2:]
     # Surprise reuses _BIND on every slot (no differential cue); marked flags
     # decoys with a distinct tag so only the target slot carries _BIND.
     decoy_tag = _BIND if config.relevance_cue is MemoryTaskCue.SURPRISE else _DECOY_BIND

@@ -29,17 +29,17 @@ from omegalax.text import api as text_api
 from omegalax.text.checkpoint import resolve_checkpoint, restore_model_params
 
 
-def summarize_rows(rows: list[dict[str, Any]]) -> dict[str, dict[str, float]]:
+def summarize_rows(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
         grouped[str(row["mode"])].append(row)
-    summary: dict[str, dict[str, float]] = {}
+    summary: dict[str, dict[str, Any]] = {}
     for mode, mode_rows in grouped.items():
         by_slot: dict[int, list[dict[str, Any]]] = defaultdict(list)
         for row in mode_rows:
             if "target_slot" in row:
                 by_slot[int(row["target_slot"])].append(row)
-        mode_summary = {
+        mode_summary: dict[str, Any] = {
             "num_examples": len(mode_rows),
             "accuracy": float(np.mean([row["correct"] for row in mode_rows])),
             "answer_nll": float(np.mean([row["answer_nll"] for row in mode_rows])),
@@ -109,12 +109,6 @@ def _manifest(config: MemoryTaskConfig, num_pairs: int) -> dict[str, Any]:
     return manifest | {"sha256": hashlib.sha256(payload).hexdigest()}
 
 
-# Checkpoints trained before num_exact_bindings/relevance_cue existed only
-# recorded the original fields; such a contract is implicitly K=1/marked.
-_LEGACY_MEMORY_TASK_CONFIG_DEFAULTS: dict[str, Any] = {
-    "num_exact_bindings": 1,
-    "relevance_cue": MemoryTaskCue.MARKED.value,
-}
 # seed/split are expected to differ between a training contract and the
 # requested eval config (eval always uses split=EVAL, and often a distinct
 # seed); every other field is part of the frozen task semantics.
@@ -126,7 +120,7 @@ def _validate_training_contract(checkpoint_root: Path, task_config: MemoryTaskCo
     if not contract_path.is_file():
         return
     contract = json.loads(contract_path.read_text())
-    trained_task = {**_LEGACY_MEMORY_TASK_CONFIG_DEFAULTS, **contract["task"]}
+    trained_task = contract["task"]
     trained_split = trained_task["split"]
     if trained_split != MemoryTaskSplit.TRAIN.value:
         raise ValueError(
