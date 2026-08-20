@@ -534,7 +534,7 @@ def run_tail_pretrain(
             accum_time += micro_delta
 
         with jax.default_device("cpu"):
-            current_lr = float(schedule(local_step_idx))
+            current_lr = float(schedule(local_step_idx)) if callable(schedule) else float(schedule)
         metrics = _finalize_accumulated_metrics(accum)
         metrics["grad_norm"] = accum_grad_norm / config.grad_accum_steps
         metrics["lr"] = current_lr
