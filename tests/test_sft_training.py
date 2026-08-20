@@ -212,6 +212,11 @@ class TextSFTTrainingTest(absltest.TestCase):
         self.assertIn("supervised_tokens", metrics)
         self.assertGreater(metrics["supervised_tokens"], 0)
         self.assertEqual(int(metrics["step"]), 1)
+        # `total_tokens` was a VLM-only metric, so the text log printed a literal 0
+        # for it every step. The batch is all-ones attention over 8 positions and
+        # supervises the second half, so the two numbers must differ.
+        self.assertEqual(int(metrics["total_tokens"]), 8)
+        self.assertEqual(int(metrics["supervised_tokens"]), 4)
 
 
 class VLMSFTTrainingTest(absltest.TestCase):

@@ -176,6 +176,7 @@ def make_sft_train_step(cfg, pad_id: int = 0):
     @nnx.jit(donate_argnums=0)
     def sft_train_step(optimizer: MixedPrecisionOptimizer, batch: dict[str, jax.Array]):
         token_ids_BT = batch["token_ids_BT"]
+        attention_mask_BT = batch["attention_mask_BT"]
         loss_mask_BT = batch["loss_mask_BT"]
 
         def loss_fn(model):
@@ -193,16 +194,18 @@ def make_sft_train_step(cfg, pad_id: int = 0):
                 + aux_loss
             )
             supervised_tokens = jnp.sum(loss_mask_BT[:, 1:].astype(jnp.float32))
-            return loss, supervised_tokens
+            total_tokens = jnp.sum(attention_mask_BT.astype(jnp.float32))
+            return loss, (supervised_tokens, total_tokens)
 
-        (loss, supervised_tokens), grads = nnx.value_and_grad(loss_fn, has_aux=True)(
-            optimizer.model
-        )
+        (loss, (supervised_tokens, total_tokens)), grads = nnx.value_and_grad(
+            loss_fn, has_aux=True
+        )(optimizer.model)
         optimizer.update(grads)
         metrics = {
             "loss": loss,
             "grad_norm": optax.tree.norm(grads),
             "supervised_tokens": supervised_tokens,
+            "total_tokens": total_tokens,
         }
         return loss, metrics
 
@@ -399,6 +402,7 @@ def run_sft(
 
         accum_loss = 0.0
         accum_sup_tokens = 0.0
+        accum_total_tokens = 0.0
         accum_grad_norm = 0.0
         accum_model_flops = 0.0
         accum_hardware_flops = 0.0
@@ -426,6 +430,7 @@ def run_sft(
 
             accum_loss = accum_loss + metrics["loss"]
             accum_sup_tokens = accum_sup_tokens + metrics["supervised_tokens"]
+            accum_total_tokens = accum_total_tokens + metrics["total_tokens"]
             accum_grad_norm = accum_grad_norm + metrics["grad_norm"]
             accum_model_flops += micro_flops.model
             accum_hardware_flops += micro_flops.hardware
@@ -441,6 +446,7 @@ def run_sft(
             "loss": accum_loss / accum_steps,
             "grad_norm": accum_grad_norm / accum_steps,
             "supervised_tokens": accum_sup_tokens,
+            "total_tokens": accum_total_tokens,
             "lr": current_lr,
         }
         # Surface realized mix ratios when training on >1 source.

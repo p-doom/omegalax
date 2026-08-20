@@ -235,7 +235,13 @@ class MaybeLogStepMetricsTest(absltest.TestCase):
     """
 
     #: What both trainers put in `window_metrics` (vlm.py, text.py).
-    _CALLER_METRICS = {"loss": 1.5, "grad_norm": 0.5, "supervised_tokens": 64.0, "lr": 1e-4}
+    _CALLER_METRICS = {
+        "loss": 1.5,
+        "grad_norm": 0.5,
+        "supervised_tokens": 64.0,
+        "total_tokens": 128.0,
+        "lr": 1e-4,
+    }
 
     def _log(self, metrics=None):
         return maybe_log_step_metrics(
@@ -264,7 +270,7 @@ class MaybeLogStepMetricsTest(absltest.TestCase):
                 self._log()
 
     def test_a_caller_metric_the_print_reads_is_required(self):
-        for key in ("lr", "supervised_tokens"):
+        for key in ("lr", "supervised_tokens", "total_tokens"):
             metrics = dict(self._CALLER_METRICS)
             metrics.pop(key)
             with self.assertRaisesRegex(KeyError, key):

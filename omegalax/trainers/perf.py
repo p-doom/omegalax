@@ -653,6 +653,7 @@ def maybe_log_step_metrics(
         "grad_norm",
         "lr",
         "supervised_tokens",
+        "total_tokens",
         "step_time_s",
         "global_tokens_per_sec",
         "tokens_per_sec_per_device",
@@ -682,7 +683,7 @@ def maybe_log_step_metrics(
             f"train/global_tokens_per_sec={host_metrics['global_tokens_per_sec']:.0f} "
             f"train/step_time_s={host_metrics['step_time_s']:.2f}s "
             f"train/supervised_tokens={host_metrics['supervised_tokens']:.0f} "
-            f"train/total_tokens={host_metrics.get('total_tokens', 0.0):.0f} "
+            f"train/total_tokens={host_metrics['total_tokens']:.0f} "
             f"train/lr={host_metrics['lr']:.2e} "
             f"train/model_tflops_per_device={host_metrics['model_tflops_per_device']:.2f} "
             f"train/hardware_tflops_per_device={host_metrics['hardware_tflops_per_device']:.2f} "
