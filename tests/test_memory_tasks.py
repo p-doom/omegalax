@@ -923,6 +923,7 @@ class MemoryTaskTest(parameterized.TestCase):
                     "--checkpoint=/unused",
                     "--task=exact",
                     "--num_pairs=2",
+                    "--pairs_per_batch=2",
                     "--wiki_mirror_dir=/unused",
                     "--tp_size=2",
                     "--jax_cache_dir=/unused",
