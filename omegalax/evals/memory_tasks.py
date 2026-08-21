@@ -9,6 +9,7 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 import numpy as np
+from flax import nnx
 
 from omegalax.data.pretrain_data_set import BATCH_PRETRAIN_METADATA_KEY
 from omegalax.text import api as text_api
@@ -147,11 +148,197 @@ def _score_answers(
     )
 
 
-def evaluate_memory_batch(
+def _score_answer_arrays(
+    output_weight_DV: jax.Array,
+    hidden_BTD: jax.Array,
+    positions_B: jax.Array,
+    answers_B: jax.Array,
+    donor_answers_B: jax.Array,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    batch_indices = jnp.arange(hidden_BTD.shape[0], dtype=jnp.int32)
+    answer_hidden_BD = hidden_BTD[batch_indices, positions_B - 1]
+    logits_BV = jnp.einsum("BD,DV->BV", answer_hidden_BD, output_weight_DV)
+    predictions_B = jnp.argmax(logits_BV, axis=-1)
+    log_normalizers_B = jax.nn.logsumexp(logits_BV, axis=-1)
+    answer_nll_B = log_normalizers_B - logits_BV[batch_indices, answers_B]
+    donor_answer_nll_B = log_normalizers_B - logits_BV[batch_indices, donor_answers_B]
+    return predictions_B, answer_nll_B, donor_answer_nll_B
+
+
+def make_memory_evaluator(model_config):
+    """Create reusable JITs for fixed-shape causal-memory eval batches.
+
+    The command-line evaluator creates this once after restoring a checkpoint and
+    then reuses it for every batch. Keeping the NNX transform alive is important:
+    recreating a transformed function in the batch loop defeats JAX's executable
+    cache. The prefix is evaluated once because RESET and ZERO_STATE depend only
+    on the final segment, while CORRECT_STATE and COUNTERFACTUAL_STATE share the
+    same pre-final state. Each model forward stays in a small JIT so the initial
+    compilation cost does not grow with all five conditions at once.
+    """
+
+    @nnx.jit
+    def run_full_context(
+        model,
+        token_ids_BT: jax.Array,
+        attention_mask_BT: jax.Array,
+    ):
+        hidden_BTD, _ = text_api.forward(
+            model,
+            token_ids_BT,
+            0,
+            model_config,
+            attention_mask_BT=attention_mask_BT,
+        )
+        return hidden_BTD
+
+    @nnx.jit
+    def run_initial_segment(
+        model,
+        token_ids_BT: jax.Array,
+        attention_mask_BT: jax.Array,
+    ):
+        return text_api.forward_with_gdn_state(
+            model,
+            token_ids_BT,
+            0,
+            model_config,
+            attention_mask_BT=attention_mask_BT,
+            initial_gdn_states=None,
+        )
+
+    @nnx.jit
+    def run_carried_segment(
+        model,
+        token_ids_BT: jax.Array,
+        attention_mask_BT: jax.Array,
+        initial_gdn_states: tuple[jax.Array, ...],
+    ):
+        return text_api.forward_with_gdn_state(
+            model,
+            token_ids_BT,
+            0,
+            model_config,
+            attention_mask_BT=attention_mask_BT,
+            initial_gdn_states=initial_gdn_states,
+        )
+
+    score_answers = jax.jit(_score_answer_arrays)
+
+    def evaluate(model, batch: dict[str, Any]) -> dict[MemoryEvalMode, MemoryEvalResult]:
+        token_ids_BCT = jnp.asarray(batch["token_ids_BCT"], dtype=jnp.int32)
+        attention_mask_BCT = jnp.asarray(batch["attention_mask_BCT"], dtype=jnp.int32)
+        reset_state_BC = np.asarray(batch["reset_state_BC"])
+        metadata = dict(batch[BATCH_PRETRAIN_METADATA_KEY])
+        pair_index_B = np.asarray(metadata["pair_index_B"])
+        world_B = np.asarray(metadata["world_B"])
+        donor_indices_B = jnp.asarray(
+            _counterfactual_indices(pair_index_B, world_B), dtype=jnp.int32
+        )
+        _assert_reset_only_at_segment_zero(reset_state_BC)
+        answers_B = jnp.asarray(metadata["answer_token_B"], dtype=jnp.int32)
+        donor_answers_B = answers_B[donor_indices_B]
+        local_positions_B = jnp.asarray(metadata["answer_position_B"], dtype=jnp.int32)
+
+        batch_size, num_segments, segment_length = token_ids_BCT.shape
+        full_hidden_BTD = run_full_context(
+            model,
+            token_ids_BCT.reshape(batch_size, num_segments * segment_length),
+            attention_mask_BCT.reshape(batch_size, num_segments * segment_length),
+        )
+        reset_hidden_BTD, _, _ = run_initial_segment(
+            model, token_ids_BCT[:, -1], attention_mask_BCT[:, -1]
+        )
+        if num_segments == 1:
+            correct_hidden_BTD = reset_hidden_BTD
+            zero_hidden_BTD = reset_hidden_BTD
+            counterfactual_hidden_BTD = reset_hidden_BTD
+        else:
+            _, _, correct_initial_states = run_initial_segment(
+                model, token_ids_BCT[:, 0], attention_mask_BCT[:, 0]
+            )
+            for segment_idx in range(1, num_segments - 1):
+                _, _, correct_initial_states = run_carried_segment(
+                    model,
+                    token_ids_BCT[:, segment_idx],
+                    attention_mask_BCT[:, segment_idx],
+                    correct_initial_states,
+                )
+            correct_hidden_BTD, _, _ = run_carried_segment(
+                model,
+                token_ids_BCT[:, -1],
+                attention_mask_BCT[:, -1],
+                correct_initial_states,
+            )
+            zero_hidden_BTD, _, _ = run_carried_segment(
+                model,
+                token_ids_BCT[:, -1],
+                attention_mask_BCT[:, -1],
+                tuple(jnp.zeros_like(state) for state in correct_initial_states),
+            )
+            counterfactual_hidden_BTD, _, _ = run_carried_segment(
+                model,
+                token_ids_BCT[:, -1],
+                attention_mask_BCT[:, -1],
+                tuple(state[donor_indices_B] for state in correct_initial_states),
+            )
+        output_weight_DV = model.output_weight()
+        raw_results = (
+            score_answers(
+                output_weight_DV,
+                full_hidden_BTD,
+                local_positions_B + (num_segments - 1) * segment_length,
+                answers_B,
+                donor_answers_B,
+            ),
+            score_answers(
+                output_weight_DV, reset_hidden_BTD, local_positions_B, answers_B, donor_answers_B
+            ),
+            score_answers(
+                output_weight_DV,
+                correct_hidden_BTD,
+                local_positions_B,
+                answers_B,
+                donor_answers_B,
+            ),
+            score_answers(
+                output_weight_DV, zero_hidden_BTD, local_positions_B, answers_B, donor_answers_B
+            ),
+            score_answers(
+                output_weight_DV,
+                counterfactual_hidden_BTD,
+                local_positions_B,
+                answers_B,
+                donor_answers_B,
+            ),
+        )
+        results: dict[MemoryEvalMode, MemoryEvalResult] = {}
+        for mode, (predictions_B, answer_nll_B, donor_answer_nll_B) in zip(
+            MemoryEvalMode, raw_results, strict=True
+        ):
+            predictions_B = np.asarray(jax.device_get(predictions_B))
+            answer_nll_B = np.asarray(jax.device_get(answer_nll_B))
+            donor_answer_nll_B = np.asarray(jax.device_get(donor_answer_nll_B))
+            results[mode] = MemoryEvalResult(
+                accuracy=float(np.mean(predictions_B == np.asarray(answers_B))),
+                answer_nll=float(np.mean(answer_nll_B)),
+                donor_accuracy=float(np.mean(predictions_B == np.asarray(donor_answers_B))),
+                donor_answer_nll=float(np.mean(donor_answer_nll_B)),
+                predictions_B=predictions_B,
+                answer_nll_B=answer_nll_B,
+                donor_answer_nll_B=donor_answer_nll_B,
+            )
+        return results
+
+    return evaluate
+
+
+def _evaluate_memory_batch_eager(
     model,
     model_config,
     batch: dict[str, Any],
 ) -> dict[MemoryEvalMode, MemoryEvalResult]:
+    """Pre-JIT reference path retained for numerical regression coverage."""
     token_ids_BCT = jnp.asarray(batch["token_ids_BCT"], dtype=jnp.int32)
     attention_mask_BCT = jnp.asarray(batch["attention_mask_BCT"], dtype=jnp.int32)
     reset_state_BC = np.asarray(batch["reset_state_BC"])
@@ -207,3 +394,12 @@ def evaluate_memory_batch(
             donor_answer_nll_B=donor_answer_nll_B,
         )
     return results
+
+
+def evaluate_memory_batch(
+    model,
+    model_config,
+    batch: dict[str, Any],
+) -> dict[MemoryEvalMode, MemoryEvalResult]:
+    """Evaluate one batch; callers looping over batches should reuse the factory."""
+    return make_memory_evaluator(model_config)(model, batch)

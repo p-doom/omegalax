@@ -678,6 +678,46 @@ class MemoryTaskTest(parameterized.TestCase):
             results[MemoryEvalMode.ZERO_STATE].answer_nll,
         )
 
+    def test_jitted_evaluator_matches_eager_qwen_path_for_every_mode(self):
+        """The reusable evaluator must preserve the established five-mode semantics."""
+        config = MemoryTaskConfig(
+            task=MemoryTask.EXACT,
+            seed=71,
+            segment_length=8,
+            num_segments=2,
+            vocab_size=512,
+            num_exact_bindings=1,
+            relevance_cue=MemoryTaskCue.MARKED,
+        )
+        model, model_config = text_api.init_model(
+            _tiny_gdn_config(),
+            jax.random.key(0),
+            tp_size=1,
+            fsdp_size=1,
+            dp_size=1,
+        )
+        evaluator = memory_evals.make_memory_evaluator(model_config)
+
+        batch = build_memory_task_batch((0,), config, flatten=False)
+        eager_results = memory_evals._evaluate_memory_batch_eager(model, model_config, batch)
+        jitted_results = evaluator(model, batch)
+
+        self.assertEqual(set(jitted_results), set(MemoryEvalMode))
+        for mode in MemoryEvalMode:
+            eager = eager_results[mode]
+            jitted = jitted_results[mode]
+            self.assertEqual(jitted.accuracy, eager.accuracy)
+            self.assertEqual(jitted.donor_accuracy, eager.donor_accuracy)
+            self.assertAlmostEqual(jitted.answer_nll, eager.answer_nll, places=6)
+            self.assertAlmostEqual(jitted.donor_answer_nll, eager.donor_answer_nll, places=6)
+            np.testing.assert_array_equal(jitted.predictions_B, eager.predictions_B)
+            np.testing.assert_allclose(
+                jitted.answer_nll_B, eager.answer_nll_B, rtol=1e-6, atol=1e-6
+            )
+            np.testing.assert_allclose(
+                jitted.donor_answer_nll_B, eager.donor_answer_nll_B, rtol=1e-6, atol=1e-6
+            )
+
     def test_counterfactual_swap_uses_the_other_world_in_each_pair(self):
         state = (jnp.asarray([[10], [20], [30], [40]]),)
         swapped = swap_counterfactual_pairs(

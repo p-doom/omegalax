@@ -23,7 +23,7 @@ from omegalax.data.memory_tasks import (
     build_memory_task_batch,
 )
 from omegalax.data.pretrain_data_set import BATCH_PRETRAIN_METADATA_KEY
-from omegalax.evals.memory_tasks import MemoryEvalMode, evaluate_memory_batch
+from omegalax.evals.memory_tasks import MemoryEvalMode, make_memory_evaluator
 from omegalax.models.qwen3_5.kernels import _resolve_backend
 from omegalax.models.sharding_runtime import set_attn_backend
 from omegalax.text import api as text_api
@@ -398,6 +398,7 @@ def main(argv: list[str] | None = None) -> None:
     )
     restore_model_params(model, resolved)
     set_attn_backend(model, text_backend=args.text_attn_backend)
+    evaluate_batch = make_memory_evaluator(model_config)
 
     rows: list[dict[str, Any]] = []
     for start in range(0, args.num_pairs, args.pairs_per_batch):
@@ -409,7 +410,7 @@ def main(argv: list[str] | None = None) -> None:
         metadata = dict(batch[BATCH_PRETRAIN_METADATA_KEY])
         answers_B = np.asarray(metadata["answer_token_B"])
         donor_answers_B = answers_B[np.arange(answers_B.size) ^ 1]
-        results = evaluate_memory_batch(model, model_config, batch)
+        results = evaluate_batch(model, batch)
         for mode, result in results.items():
             for idx in range(answers_B.size):
                 prediction = int(result.predictions_B[idx])
