@@ -14,7 +14,7 @@ Design follows the "LoRA Without Regret" recommendations:
   with the unwrapped model).
 * recommended LR ≈ 10× the FullFT LR.
 
-Vision tower is intentionally excluded by the ``skip_paths`` default:
+Vision tower is excluded by the ``skip_paths`` default:
 the BC objective is text-token-generation conditioned on visual features,
 and we want to preserve the base ViT's UI/document grounding intact.
 ``lm_head`` and embeddings are also skipped (not standard LoRA targets;
@@ -45,8 +45,7 @@ from jax.sharding import PartitionSpec as P, reshard
 # Match by attribute name on the *parent* module (e.g.
 # ``TextAttention.q_proj``). MoE feed-forward layers store gate/up/down
 # as raw ``nnx.Param`` (rank-3, expert-stacked), not ``nnx.Linear``, so
-# they fall through silently — Qwen3-VL-2B-Instruct is dense (no MoE
-# layers) so this doesn't bite us.
+# they fall through silently.
 DEFAULT_TARGET_MODULES: tuple[str, ...] = (
     "q_proj",
     "k_proj",

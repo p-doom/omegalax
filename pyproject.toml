@@ -20,19 +20,14 @@ dependencies = [
   "optax",
   "orbax-checkpoint",
   "Pillow",
-  # From the index, pinned exactly to the version prime-rl is on, so training and
-  # rollout share one renderer. It used to come from a path source into a personal
-  # clone of prime-rl, at that clone's pre-#44 layout: it resolved only while the
-  # clone stayed stale, and `uv.lock` recorded the dependency nowhere at all.
+  # Pinned exactly to the version prime-rl is on, so training and rollout share one
+  # renderer.
   "renderers==0.1.9.dev1",
-  # 0.8.0 stopped honouring strides in save_file (it copies straight off the raw
-  # pointer), which silently changed what a non-contiguous view serialized to.
-  # The exporter no longer relies on either behaviour, but floor it at the version
-  # whose semantics we write against so the change cannot happen under us again.
+  # Floored at the version whose `save_file` stride semantics the exporter is written
+  # against.
   "safetensors>=0.8.0",
-  # Pinned to a commit, not the `nested-mask` branch it was tracking: a branch ref
-  # lets `uv lock --upgrade` move the attention kernels under us, and this is the
-  # rev every measurement in the repo was taken against. Repoint when the fix is
+  # Pinned to a commit, not to the branch it tracks: a branch ref lets
+  # `uv lock --upgrade` move the attention kernels under us. Repoint when the fix is
   # upstreamed.
   "tokamax @ git+https://github.com/p-doom/tokamax.git@d81bc23bc80f01728984bcda5161ff2569cd7cc5",
   # 5.4.0 gave Qwen3VLMoeTextConfig `attribute_map = {"num_experts":
@@ -72,7 +67,6 @@ dev = [
 ]
 
 [tool.ruff]
-# Matches the codebase: p99 line length ~107, so 100 avoids gratuitous wrapping.
 line-length = 100
 target-version = "py311"
 extend-exclude = [".venv", "build", "dist"]

@@ -161,7 +161,6 @@ def export_qwen3_5_to_safetensors(
             hf_tensors["model.visual.patch_embed.proj.weight"] = hf_arr.astype(np.float32)
             return True
 
-        # FIXME (f.srambical)
         # Linear attention norm.weight (SCALE, no transform)
         m = re.fullmatch(r"text\.layers\.([0-9]+)\.linear_attn\.norm\.weight", jax_key)
         if m:

@@ -37,7 +37,7 @@ from transformers import BaseImageProcessor, PreTrainedTokenizer
 from omegalax.data.arrayrecord_images import resolve_message_images
 
 #: Probe conversation for the text-renderer template-parity self-check. Two
-#: assistant turns on purpose: Qwen3's template appends the empty
+#: assistant turns, because Qwen3's template appends the empty
 #: ``<think>\n\n</think>\n\n`` block to the FINAL assistant turn only, so a
 #: single-turn probe cannot tell a correct renderer from one that drops it.
 _TEXT_TEMPLATE_PROBE = [
@@ -148,8 +148,7 @@ class Qwen3RendererEncoder:
         self.image_processor = image_processor
         # image_cache_max=1, not the renderers default of 256: that cache keeps
         # materialised pixel_values (48.8 MB per entry on our frames) keyed by image
-        # hash, and Grain shuffles, so it hits ~0%. Measured 14.66 GB peak RSS per
-        # Grain worker against 2.44 GB, and worst-case 1.62 against 5.78 samples/s.
+        # hash, and Grain shuffles, so it hits ~0%.
         self.renderer_config = (
             Qwen3VLRendererConfig(image_cache_max=1)
             if renderer_config is None
@@ -182,7 +181,7 @@ class Qwen3RendererEncoder:
     def render(self, messages: list[dict[str, Any]]):
         """``messages -> RenderedTrainingSample``.
 
-        This class deliberately defines NO ``__call__``. ``_MessageLengthFn``
+        This class defines NO ``__call__``. ``_MessageLengthFn``
         subclasses it and is invoked as ``fn(message)`` with a different
         signature, so a base ``__call__`` that forwards to ``render`` plus an
         ``encode`` that self-calls via ``self(...)`` is unbounded mutual

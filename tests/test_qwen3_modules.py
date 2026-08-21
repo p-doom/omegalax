@@ -48,9 +48,7 @@ torch.backends.cudnn.allow_tf32 = False
 MODEL_ID = "Qwen/Qwen3-0.6B"
 PROMPT = "Why is the sky blue instead of another color like purple?"
 
-# Per-module absolute tolerances, derived from empirical measurements.
-# Each tolerance is set to ~2x the observed max_diff for that module to
-# guard against regressions while staying as tight as empirically feasible.
+# Per-module absolute tolerances: ~2x the observed max_diff for that module.
 NORM_ATOL = 2e-6  # RMSNorm: measured ~1e-6 (1 ULP)
 ROPE_ATOL = 1e-6  # RoPE: measured ~5e-7 (<1-2 ULPs)
 LINEAR_ATOL = 2e-5  # matmuls: measured ~7e-6 (6-13 ULPs)

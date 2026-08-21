@@ -382,8 +382,7 @@ def main(_) -> None:
         # only finds out on the batch that contains it -- thousands of steps in,
         # taking any afterok chain with it. Not an error: `_pad_vision_arrays` pads
         # to exactly max_patches, so the ceiling makes every batch pay maximum
-        # vision padding. The tightest safe value is a judgement, so say what the
-        # risk is and let the operator hold it.
+        # vision padding.
         ceiling = ms2 * FLAGS.max_length
         if FLAGS.max_vision_patches_per_sample < ceiling:
             startup_log(

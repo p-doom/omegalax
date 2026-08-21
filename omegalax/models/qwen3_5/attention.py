@@ -117,7 +117,7 @@ class Attention(nnx.Module):
         # Causal only: no key-validity mask, so pad positions are attended to. Under
         # left padding that is measurably wrong -- the padded row's logits land 96x
         # above the bf16 floor while its unpadded neighbour stays on it -- so this
-        # deliberately takes no segment ids rather than accepting them and ignoring
+        # takes no segment ids rather than accepting them and ignoring
         # them. Training right-pads, where causality already excludes the pads.
         attn_BTHK = dot_product_attention(
             q_BTHK,

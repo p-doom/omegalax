@@ -81,7 +81,7 @@ class TpAttentionTest(absltest.TestCase):
     Both tolerances are measured on this shape, because the max-abs one alone is
     a poor discriminator here: clean bf16 disagreement is already 0.0156 fwd /
     0.0078 bwd (the bf16 representation floor through the xla path alone is
-    0.0122), while a deliberate 1% error in ``scale`` reaches only 0.0313. The
+    0.0122), while an injected 1% error in ``scale`` reaches only 0.0313. The
     MEDIAN separates them by orders of magnitude -- exactly 0 when clean, 1e-3
     under that same 1% error -- so it is the assertion that bites.
     """

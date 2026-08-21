@@ -8,7 +8,7 @@ from typing import Any, TypeAlias, cast
 import grain
 import orbax.checkpoint as ocp
 
-# NOTE: plain `TypeAlias` (not the PEP 695 `type X = ...` statement) so the module
+# Plain `TypeAlias` (not the PEP 695 `type X = ...` statement) so the module
 # imports on Python 3.11, matching `requires-python = ">=3.11"`.
 GrainIterator: TypeAlias = grain.DataLoaderIterator | grain.DatasetIterator
 

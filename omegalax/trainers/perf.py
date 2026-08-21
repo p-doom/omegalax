@@ -652,8 +652,7 @@ def maybe_log_step_metrics(
         step_metrics(step_flops, step_delta, global_tokens_per_step, peak_tflops)
     )
     # Checked after step_metrics has filled its keys in, so a rename there is a
-    # missing metric and not a logged 0.0. An MFU figure was quoted for weeks
-    # before being found to be a blend of two things.
+    # missing metric and not a logged 0.0.
     required = (
         "loss",
         "grad_norm",
