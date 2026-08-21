@@ -697,7 +697,11 @@ def run_sft(
                 "grad_norm": accum_grad_norm / accum_steps,
                 "supervised_tokens": accum_sup_tokens,
                 "total_tokens": accum_total_tokens,
-                "lr": lr_schedule_fn(step_idx),
+                "lr": (
+                    float(lr_schedule_fn(step_idx))
+                    if callable(lr_schedule_fn)
+                    else float(lr_schedule_fn)
+                ),
             }
             if len(source_counts) > 1:
                 total = float(sum(source_counts.values()))
