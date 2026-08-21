@@ -19,6 +19,7 @@ class MemoryTask(StrEnum):
     EXACT = "exact"
     DOMINANT_RULE = "dominant_rule"
     ASSOCIATIVE_BANK = "associative_bank"
+    RULE_BANK = "rule_bank"
 
 
 class MemoryTaskSplit(StrEnum):
@@ -107,6 +108,17 @@ class MemoryTaskConfig:
                 raise ValueError(
                     "num_exact_bindings/relevance_cue are only defined for MemoryTask.EXACT"
                 )
+        if self.task is MemoryTask.RULE_BANK:
+            if self.segment_length != 64:
+                raise ValueError("segment_length must be == 64 for MemoryTask.RULE_BANK")
+            if self.num_segments != 5:
+                raise ValueError("num_segments must be == 5 for MemoryTask.RULE_BANK")
+            if self.vocab_size < 1024:
+                raise ValueError("vocab_size must be >= 1024 for MemoryTask.RULE_BANK")
+            if self.num_exact_bindings != 1 or self.relevance_cue is not MemoryTaskCue.MARKED:
+                raise ValueError(
+                    "num_exact_bindings/relevance_cue are only defined for MemoryTask.EXACT"
+                )
         if self.relevance_cue is MemoryTaskCue.SURPRISE and self.num_exact_bindings < 3:
             raise ValueError("relevance_cue=surprise requires num_exact_bindings >= 3")
 
@@ -130,6 +142,16 @@ _BANK_NUM_SLOTS = 24
 _BANK_SLOTS_PER_SEGMENT = 8
 _BANK_FILLER_START = 492
 _BANK_FILLER_END = 1024
+_RULE_BANK_TASK = 9
+_RULE_BANK_NAMESPACES = np.arange(352, 360, dtype=np.int32)
+_RULE_BANK_ITEMS = np.arange(360, 488, dtype=np.int32)
+_RULE_BANK_LABELS = np.arange(488, 492, dtype=np.int32)
+_RULE_BANK_NUM_NAMESPACES = 8
+_RULE_BANK_DEMOS_PER_NAMESPACE = 7
+_RULE_BANK_NUM_DEMOS = _RULE_BANK_NUM_NAMESPACES * _RULE_BANK_DEMOS_PER_NAMESPACE
+_RULE_BANK_DEMOS_PER_SEGMENT = 14
+_RULE_BANK_NUM_EARLY_SEGMENTS = 4
+_RULE_BANK_LABEL_COUNTS = (4, 1, 1, 1)
 
 
 def _rng(config: MemoryTaskConfig, pair_index: int) -> np.random.Generator:
@@ -139,6 +161,8 @@ def _rng(config: MemoryTaskConfig, pair_index: int) -> np.random.Generator:
         task_id = 1
     elif config.task is MemoryTask.ASSOCIATIVE_BANK:
         task_id = 2
+    elif config.task is MemoryTask.RULE_BANK:
+        task_id = 3
     else:
         raise ValueError(f"Unhandled MemoryTask: {config.task!r}")
     split_id = 0 if config.split is MemoryTaskSplit.TRAIN else 1
@@ -238,11 +262,93 @@ def _associative_bank_tokens(pair_index: int, config: MemoryTaskConfig) -> tuple
     return paired, target_slot
 
 
+def _rule_bank_tokens(pair_index: int, config: MemoryTaskConfig) -> tuple[np.ndarray, int]:
+    if config.split is MemoryTaskSplit.TRAIN:
+        bank_index = pair_index
+        fixed_namespace = None
+    else:
+        bank_index = pair_index // _RULE_BANK_NUM_NAMESPACES
+        fixed_namespace = pair_index % _RULE_BANK_NUM_NAMESPACES
+
+    rng = _rng(config, bank_index)
+    shared = rng.integers(
+        _BANK_FILLER_START,
+        _BANK_FILLER_END,
+        size=(config.num_segments, config.segment_length),
+        dtype=np.int32,
+    )
+    paired = np.stack((shared.copy(), shared.copy()))
+
+    items = rng.choice(_RULE_BANK_ITEMS, size=_RULE_BANK_NUM_DEMOS, replace=False)
+    namespaces = np.repeat(_RULE_BANK_NAMESPACES, _RULE_BANK_DEMOS_PER_NAMESPACE)
+    labels_world0 = np.empty(_RULE_BANK_NUM_DEMOS, dtype=np.int32)
+    base_dominant = np.empty(_RULE_BANK_NUM_NAMESPACES, dtype=np.int32)
+    alt_dominant = np.empty(_RULE_BANK_NUM_NAMESPACES, dtype=np.int32)
+    for namespace in range(_RULE_BANK_NUM_NAMESPACES):
+        label_order = rng.permutation(_RULE_BANK_LABELS)
+        base_dominant[namespace] = label_order[0]
+        alt_dominant[namespace] = label_order[1]
+        pos = namespace * _RULE_BANK_DEMOS_PER_NAMESPACE
+        for label, count in zip(label_order, _RULE_BANK_LABEL_COUNTS):
+            labels_world0[pos : pos + count] = label
+            pos += count
+
+    # All 56 demos are globally shuffled together (not shuffled per
+    # namespace) so a namespace's 7 demos land at scattered positions across
+    # segments 0..3, rather than as one contiguous, trivially-locatable block.
+    shuffle_order = rng.permutation(_RULE_BANK_NUM_DEMOS)
+    namespaces = namespaces[shuffle_order]
+    items = items[shuffle_order]
+    labels_world0 = labels_world0[shuffle_order]
+
+    query_namespace = (
+        int(rng.integers(0, _RULE_BANK_NUM_NAMESPACES))
+        if fixed_namespace is None
+        else fixed_namespace
+    )
+
+    paired[:, :_RULE_BANK_NUM_EARLY_SEGMENTS, 0] = _RULE_BANK_TASK
+    for demo_idx in range(_RULE_BANK_NUM_DEMOS):
+        segment, pos = divmod(demo_idx, _RULE_BANK_DEMOS_PER_SEGMENT)
+        start = 1 + 4 * pos
+        paired[:, segment, start : start + 4] = (
+            _DEMO,
+            namespaces[demo_idx],
+            items[demo_idx],
+            labels_world0[demo_idx],
+        )
+
+    # Worlds differ only in the queried namespace's demos: swap its base and
+    # alternate label wherever they occur so the 4/1/1/1 histogram survives
+    # with dominance flipped, leaving every other namespace byte-identical.
+    query_namespace_id = int(_RULE_BANK_NAMESPACES[query_namespace])
+    base_label = int(base_dominant[query_namespace])
+    alt_label = int(alt_dominant[query_namespace])
+    swap = {base_label: alt_label, alt_label: base_label}
+    for demo_idx in np.flatnonzero(namespaces == query_namespace_id):
+        segment, pos = divmod(int(demo_idx), _RULE_BANK_DEMOS_PER_SEGMENT)
+        label_position = 1 + 4 * pos + 3
+        current_label = int(paired[1, segment, label_position])
+        paired[1, segment, label_position] = swap.get(current_label, current_label)
+
+    for world, answer in enumerate((base_label, alt_label)):
+        paired[world, -1, -5:] = (
+            _RULE_BANK_TASK,
+            _QUERY,
+            query_namespace_id,
+            _ANSWER,
+            answer,
+        )
+    return paired, query_namespace
+
+
 def _paired_tokens(pair_index: int, config: MemoryTaskConfig) -> tuple[np.ndarray, int]:
     if pair_index < 0:
         raise ValueError("pair_index must be >= 0")
     if config.task is MemoryTask.ASSOCIATIVE_BANK:
         return _associative_bank_tokens(pair_index, config)
+    if config.task is MemoryTask.RULE_BANK:
+        return _rule_bank_tokens(pair_index, config)
 
     rng = _rng(config, pair_index)
     shared = rng.integers(
@@ -341,6 +447,8 @@ def build_memory_task_batch(
             ),
             2,
         )
+    if config.task is MemoryTask.RULE_BANK:
+        metadata["query_namespace_B"] = np.repeat(np.asarray(target_slots, dtype=np.int32), 2)
 
     if flatten:
         return {

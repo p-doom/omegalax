@@ -379,6 +379,77 @@ class MemoryTaskTest(parameterized.TestCase):
         train_tokens = build_memory_task_batch((0, 1), train_config, flatten=False)["token_ids_BCT"]
         self.assertFalse(np.array_equal(train_tokens[0, :3], train_tokens[2, :3]))
 
+    def test_rule_bank_eval_group_covers_every_namespace_with_shared_world0_evidence(self):
+        # rule_bank is only defined for a fixed C=5/L=64 geometry: the
+        # generator hardcodes segment 4 as the query segment and 56 demos
+        # (14 per segment) spread across segments 0..3, so a mismatched
+        # geometry must fail at config construction rather than
+        # corrupt/index-crash inside the generator.
+        with self.assertRaises(ValueError):
+            MemoryTaskConfig(
+                task=MemoryTask.RULE_BANK,
+                seed=13,
+                segment_length=64,
+                num_segments=4,
+                vocab_size=1024,
+            )
+
+        config = MemoryTaskConfig(
+            task=MemoryTask.RULE_BANK,
+            seed=13,
+            segment_length=64,
+            num_segments=5,
+            vocab_size=1024,
+            split=MemoryTaskSplit.EVAL,
+        )
+        batch = build_memory_task_batch(tuple(range(8)), config, flatten=False)
+        tokens = batch["token_ids_BCT"]
+        metadata = batch[BATCH_PRETRAIN_METADATA_KEY]
+        query_namespaces = metadata["query_namespace_B"][::2]
+
+        # base_index=pair_index//8 groups pair_index 0..7 into a single bank
+        # and query_namespace=pair_index%8 must therefore sweep every
+        # namespace once.
+        np.testing.assert_array_equal(query_namespaces, np.arange(8))
+        self.assertLess(int(tokens.max()), 1024)
+
+        # Every row in the 8-group shares the same world0 demo segments
+        # (0..3), since only the queried namespace's world1 labels and the
+        # final query segment differ across the group.
+        world0_demo_segments = tokens[0::2, :4]
+        for row in range(1, 8):
+            np.testing.assert_array_equal(world0_demo_segments[row], world0_demo_segments[0])
+
+        for pair in range(8):
+            demos = tokens[2 * pair, :4, 1:57].reshape(-1, 4)
+            world1_demos = tokens[2 * pair + 1, :4, 1:57].reshape(-1, 4)
+            namespace_id = 352 + int(query_namespaces[pair])
+            own_mask = demos[:, 1] == namespace_id
+
+            # Only the queried namespace's labels may change between worlds;
+            # every DEMO tag/namespace/item token is identical in both worlds.
+            np.testing.assert_array_equal(demos[:, :3], world1_demos[:, :3])
+            np.testing.assert_array_equal(demos[~own_mask], world1_demos[~own_mask])
+            self.assertEqual(int(own_mask.sum()), 7)
+
+            # Both worlds keep the symmetric 4/1/1/1 label histogram for the
+            # queried namespace, with base/alt dominance swapped between them.
+            _, world0_counts = np.unique(demos[own_mask, 3], return_counts=True)
+            _, world1_counts = np.unique(world1_demos[own_mask, 3], return_counts=True)
+            self.assertEqual(sorted(world0_counts.tolist()), [1, 1, 1, 4])
+            self.assertEqual(sorted(world1_counts.tolist()), [1, 1, 1, 4])
+
+            base_label = int(tokens[2 * pair, -1, -1])
+            alt_label = int(tokens[2 * pair + 1, -1, -1])
+            self.assertNotEqual(base_label, alt_label)
+            np.testing.assert_array_equal(tokens[2 * pair, -1, :-1], tokens[2 * pair + 1, -1, :-1])
+
+        # TRAIN draws a unique bank per pair_index, unlike EVAL's shared
+        # base_index grouping.
+        train_config = dataclasses.replace(config, split=MemoryTaskSplit.TRAIN)
+        train_tokens = build_memory_task_batch((0, 1), train_config, flatten=False)["token_ids_BCT"]
+        self.assertFalse(np.array_equal(train_tokens[0, :4], train_tokens[2, :4]))
+
     def test_grain_iterator_batches_and_shards_whole_pairs(self):
         config = MemoryTaskConfig(
             task=MemoryTask.EXACT,
