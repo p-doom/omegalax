@@ -30,16 +30,20 @@ from omegalax.text import api as text_api
 from omegalax.text.checkpoint import resolve_checkpoint, restore_model_params
 
 
+# target_slot/target_segment/target_age double as recency rank (segment 0 writes
+# slots in temporal order), separating "the state can't hold K items" (flat across
+# strata) from "the model defaults to a recency policy" (accuracy skewed toward the
+# most recent slot/segment/age). query_namespace has no such ordering and just
+# isolates per-namespace rule-bank performance.
+_STRATA_FIELDS = ("target_slot", "target_segment", "target_age", "query_namespace")
+
+
 def summarize_rows(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
         grouped[str(row["mode"])].append(row)
     summary: dict[str, dict[str, Any]] = {}
     for mode, mode_rows in grouped.items():
-        by_slot: dict[int, list[dict[str, Any]]] = defaultdict(list)
-        for row in mode_rows:
-            if "target_slot" in row:
-                by_slot[int(row["target_slot"])].append(row)
         mode_summary: dict[str, Any] = {
             "num_examples": len(mode_rows),
             "accuracy": float(np.mean([row["correct"] for row in mode_rows])),
@@ -47,16 +51,20 @@ def summarize_rows(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
             "donor_accuracy": float(np.mean([row["donor_correct"] for row in mode_rows])),
             "donor_answer_nll": float(np.mean([row["donor_answer_nll"] for row in mode_rows])),
         }
-        if by_slot:
-            # Recency-stratified breakdown: slots are written in temporal order
-            # within segment 0, so the slot index doubles as recency rank.
-            # Separates "the state can't hold K items" (flat across slots) from
-            # "the model defaults to a recency policy" (accuracy skewed toward
-            # the most recently written slot).
-            mode_summary["accuracy_by_target_slot"] = {
-                str(slot): float(np.mean([row["correct"] for row in slot_rows]))
-                for slot, slot_rows in sorted(by_slot.items())
-            }
+        for field in _STRATA_FIELDS:
+            by_value: dict[int, list[dict[str, Any]]] = defaultdict(list)
+            for row in mode_rows:
+                if field in row:
+                    by_value[int(row[field])].append(row)
+            if by_value:
+                mode_summary[f"accuracy_by_{field}"] = {
+                    str(value): float(np.mean([row["correct"] for row in value_rows]))
+                    for value, value_rows in sorted(by_value.items())
+                }
+                mode_summary[f"answer_nll_by_{field}"] = {
+                    str(value): float(np.mean([row["answer_nll"] for row in value_rows]))
+                    for value, value_rows in sorted(by_value.items())
+                }
         summary[mode] = mode_summary
     return summary
 
@@ -484,21 +492,27 @@ def main(argv: list[str] | None = None) -> None:
         for mode, result in results.items():
             for idx in range(answers_B.size):
                 prediction = int(result.predictions_B[idx])
-                rows.append(
-                    {
-                        "mode": mode.value,
-                        "pair_index": int(metadata["pair_index_B"][idx]),
-                        "world": int(metadata["world_B"][idx]),
-                        "answer_token": int(answers_B[idx]),
-                        "donor_answer_token": int(donor_answers_B[idx]),
-                        "prediction": prediction,
-                        "correct": prediction == int(answers_B[idx]),
-                        "donor_correct": prediction == int(donor_answers_B[idx]),
-                        "answer_nll": float(result.answer_nll_B[idx]),
-                        "donor_answer_nll": float(result.donor_answer_nll_B[idx]),
-                        "target_slot": int(metadata["target_slot_B"][idx]),
-                    }
-                )
+                row = {
+                    "mode": mode.value,
+                    "pair_index": int(metadata["pair_index_B"][idx]),
+                    "world": int(metadata["world_B"][idx]),
+                    "answer_token": int(answers_B[idx]),
+                    "donor_answer_token": int(donor_answers_B[idx]),
+                    "prediction": prediction,
+                    "correct": prediction == int(answers_B[idx]),
+                    "donor_correct": prediction == int(donor_answers_B[idx]),
+                    "answer_nll": float(result.answer_nll_B[idx]),
+                    "donor_answer_nll": float(result.donor_answer_nll_B[idx]),
+                    "target_slot": int(metadata["target_slot_B"][idx]),
+                }
+                for row_key, metadata_key in (
+                    ("target_segment", "target_segment_B"),
+                    ("target_age", "target_age_B"),
+                    ("query_namespace", "query_namespace_B"),
+                ):
+                    if metadata_key in metadata:
+                        row[row_key] = int(metadata[metadata_key][idx])
+                rows.append(row)
 
     raw_path = run_dir / "raw.jsonl"
     temporary = raw_path.with_suffix(".jsonl.tmp")

@@ -96,6 +96,65 @@ class MemoryTaskTest(parameterized.TestCase):
         self.assertAlmostEqual(summary["answer_nll"], 0.6)
         self.assertAlmostEqual(summary["donor_answer_nll"], 1.75)
 
+    def test_eval_summary_groups_accuracy_and_nll_by_associative_and_rule_bank_fields(self):
+        associative_rows = [
+            {
+                "mode": "correct_state",
+                "correct": True,
+                "donor_correct": False,
+                "answer_nll": 0.0,
+                "donor_answer_nll": 1.0,
+                "target_slot": 0,
+                "target_segment": 0,
+                "target_age": 1,
+            },
+            {
+                "mode": "correct_state",
+                "correct": False,
+                "donor_correct": True,
+                "answer_nll": 2.0,
+                "donor_answer_nll": 0.0,
+                "target_slot": 1,
+                "target_segment": 1,
+                "target_age": 0,
+            },
+        ]
+
+        associative_summary = summarize_rows(associative_rows)["correct_state"]
+
+        self.assertEqual(associative_summary["accuracy_by_target_slot"], {"0": 1.0, "1": 0.0})
+        self.assertEqual(associative_summary["answer_nll_by_target_slot"], {"0": 0.0, "1": 2.0})
+        self.assertEqual(associative_summary["accuracy_by_target_segment"], {"0": 1.0, "1": 0.0})
+        self.assertEqual(associative_summary["answer_nll_by_target_segment"], {"0": 0.0, "1": 2.0})
+        self.assertEqual(associative_summary["accuracy_by_target_age"], {"0": 0.0, "1": 1.0})
+        self.assertEqual(associative_summary["answer_nll_by_target_age"], {"0": 2.0, "1": 0.0})
+        self.assertNotIn("accuracy_by_query_namespace", associative_summary)
+
+        rule_bank_rows = [
+            {
+                "mode": "correct_state",
+                "correct": True,
+                "donor_correct": False,
+                "answer_nll": 0.5,
+                "donor_answer_nll": 1.5,
+                "query_namespace": 3,
+            },
+            {
+                "mode": "correct_state",
+                "correct": False,
+                "donor_correct": True,
+                "answer_nll": 1.5,
+                "donor_answer_nll": 0.5,
+                "query_namespace": 5,
+            },
+        ]
+
+        rule_bank_summary = summarize_rows(rule_bank_rows)["correct_state"]
+
+        self.assertEqual(rule_bank_summary["accuracy_by_query_namespace"], {"3": 1.0, "5": 0.0})
+        self.assertEqual(rule_bank_summary["answer_nll_by_query_namespace"], {"3": 0.5, "5": 1.5})
+        self.assertNotIn("accuracy_by_target_segment", rule_bank_summary)
+
     def test_training_conditions_have_matched_token_budgets(self):
         layouts = {
             condition: training_layout(
