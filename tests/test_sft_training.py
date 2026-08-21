@@ -9,6 +9,8 @@ os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
 from absl.testing import absltest
 
+import jax
+
 import numpy as np
 
 from omegalax.data.grain_pipeline import (
@@ -250,6 +252,12 @@ class VLMSFTTrainingTest(absltest.TestCase):
         self.assertGreater(metrics["supervised_tokens"], 0)
         self.assertEqual(int(metrics["step"]), 1)
 
+    # Unlike the text decoder, the vision tower has no backend to route: its
+    # attention is one direct cuDNN packed call, so on CPU this traces to a
+    # primitive with no lowering. Requiring a GPU is the honest reading; the
+    # alternative is a second, XLA packed implementation that only a test
+    # would ever select.
+    @absltest.skipUnless(jax.default_backend() == "gpu", "vision attention is cuDNN-only")
     def test_one_step_sft_multimodal_qwen3_vl(self):
         train_cfg = vlm_trainer.TrainConfig(
             seed=0,
