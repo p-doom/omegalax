@@ -22,6 +22,7 @@ import os
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
 import json
+import shutil
 from pathlib import Path
 
 from absl import app, flags
@@ -240,6 +241,36 @@ def _restore_trained_weights(model, cfg, checkpoint_path: Path):
 _DESCRIBES_BASE_WEIGHTS = ("quantization_config",)
 
 
+# Anything that describes or contains the base's weights: our export writes its own
+# single safetensors file, so a copied shard index would send the server looking for
+# `model-00001-of-00004.safetensors` that is not there. config.json is excluded
+# because the overlay below writes it.
+_WEIGHT_SUFFIXES = (".safetensors", ".bin", ".pt", ".pth", ".msgpack", ".h5", ".ckpt")
+
+
+def _copy_base_identity_assets(out_dir: Path, base_dir: Path) -> None:
+    """Copy the base's tokenizer / processor / chat-template files into the export.
+
+    Without them an export is not a servable directory: sglang refuses a Qwen3-VL
+    model with `Can't load image processor ... containing a preprocessor_config.json`,
+    and a missing chat_template.json is worse than a refusal -- the server starts and
+    renders every prompt wrong. They are model-identity assets, not training outputs,
+    so they come from the base for the same reason config.json's untouched fields do.
+
+    Deny-list rather than a list of the eight files Qwen3-VL happens to need, so a
+    family whose processor needs a ninth does not silently ship without it.
+    """
+    copied = []
+    for src in sorted(base_dir.iterdir()):
+        if not src.is_file() or src.name == "config.json":
+            continue
+        if src.suffix in _WEIGHT_SUFFIXES or src.name.endswith(".index.json"):
+            continue
+        shutil.copyfile(src, out_dir / src.name)
+        copied.append(src.name)
+    print(f"[export] copied {len(copied)} identity assets from the base: {copied}")
+
+
 def _write_servable_config(out_dir: Path, cfg) -> None:
     """Rewrite config.json as the base's, overlaid with what omegalax owns.
 
@@ -252,8 +283,9 @@ def _write_servable_config(out_dir: Path, cfg) -> None:
     """
     from huggingface_hub import snapshot_download
 
-    base_path = Path(snapshot_download(FLAGS.model_id)) / "config.json"
-    base = json.loads(base_path.read_text())
+    base_dir = Path(snapshot_download(FLAGS.model_id))
+    _copy_base_identity_assets(out_dir, base_dir)
+    base = json.loads((base_dir / "config.json").read_text())
     for key in _DESCRIBES_BASE_WEIGHTS:
         base.pop(key, None)
 
