@@ -210,15 +210,13 @@ class DecoderLayer(nnx.Module):
         hidden_BTD: jax.Array,
         cos_BTK: jax.Array,
         sin_BTK: jax.Array,
-        segment_ids_BT: jax.Array,
-        position_ids_BT: jax.Array,
         attention_mask_BT: jax.Array | None = None,
     ) -> tuple[jax.Array, jax.Array]:
         residual_BTD = hidden_BTD
         normed_BTD = self.input_layernorm(hidden_BTD)
 
         if self.layer_type == "full_attention":
-            attn_out_BTD = self.attn(normed_BTD, cos_BTK, sin_BTK, segment_ids_BT, position_ids_BT)
+            attn_out_BTD = self.attn(normed_BTD, cos_BTK, sin_BTK)
         else:
             attn_out_BTD = self.linear_attn(normed_BTD, attention_mask_BT)
 
@@ -296,7 +294,6 @@ class TextModel(nnx.Module):
         sin_BTK = sin_BTK.astype(cfg.dtype)
 
         attention_mask_BT = (segment_ids_BT != 0).astype(jnp.float32)
-        text_position_ids_BT = position_ids_ZBT[0]
 
         aux_losses = []
         for layer in self.layers:
@@ -304,8 +301,6 @@ class TextModel(nnx.Module):
                 hidden_BTD,
                 cos_BTK,
                 sin_BTK,
-                segment_ids_BT,
-                text_position_ids_BT,
                 attention_mask_BT,
             )
             aux_losses.append(aux)

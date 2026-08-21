@@ -84,8 +84,6 @@ class Attention(nnx.Module):
         hidden_BTD: jax.Array,
         cos_BTK: jax.Array,
         sin_BTK: jax.Array,
-        segment_ids_BT: jax.Array,
-        position_ids_BT: jax.Array,
     ) -> jax.Array:
         B, T, _ = hidden_BTD.shape
 
@@ -116,6 +114,11 @@ class Attention(nnx.Module):
 
         q_BTHK, k_BTGK = apply_text_rope(q_BTHK, k_BTGK, cos_BTK, sin_BTK)
 
+        # Causal only: no key-validity mask, so pad positions are attended to. Under
+        # left padding that is measurably wrong -- the padded row's logits land 96x
+        # above the bf16 floor while its unpadded neighbour stays on it -- so this
+        # deliberately takes no segment ids rather than accepting them and ignoring
+        # them. Training right-pads, where causality already excludes the pads.
         attn_BTHK = dot_product_attention(
             q_BTHK,
             k_BTGK,
