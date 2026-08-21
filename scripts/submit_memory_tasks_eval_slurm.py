@@ -17,6 +17,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--log_dir", type=Path, required=True)
     parser.add_argument("--time", dest="time_limit", default="02:00:00")
     parser.add_argument("--expected_commit")
+    parser.add_argument(
+        "--allow_zero_shot_horizon_override",
+        action="store_true",
+        help="Forward the evaluator's explicit C/L-only zero-shot horizon override.",
+    )
     parser.add_argument("--submit", action="store_true")
     parser.add_argument("eval_args", nargs=argparse.REMAINDER)
     return parser
@@ -67,16 +72,23 @@ def _validate_eval_args(args: list[str]) -> list[str]:
             raise ValueError(f"--{name} is required in eval_args")
     if _flag_value(args, "num_pairs") != "2048":
         raise ValueError("The canonical v1 renderer requires --num_pairs=2048")
+    horizon_override_flag = "--allow_zero_shot_horizon_override"
+    if any(
+        argument == horizon_override_flag or argument.startswith(f"{horizon_override_flag}=")
+        for argument in args
+    ):
+        raise ValueError(f"{horizon_override_flag} must be set on the renderer, before --")
     for name in ("tp_size", "fsdp_size", "dp_size", "text_attn_backend"):
         if _flag_value(args, name) is not None:
             raise ValueError(f"--{name} is set by the renderer and must not appear in eval_args")
     return args
 
 
-def _command_line(eval_args: list[str]) -> str:
+def _command_line(eval_args: list[str], *, allow_zero_shot_horizon_override: bool) -> str:
     return shlex.join(
         [
             *eval_args,
+            *(["--allow_zero_shot_horizon_override"] if allow_zero_shot_horizon_override else []),
             "--tp_size=1",
             "--fsdp_size=1",
             "--dp_size=1",
@@ -94,12 +106,16 @@ def render_sbatch(
     time_limit: str,
     eval_args: list[str],
     expected_commit: str = "UNSPECIFIED",
+    allow_zero_shot_horizon_override: bool = False,
 ) -> str:
     eval_args = _validate_eval_args(eval_args)
     repo_root = repo_root.expanduser().resolve()
     python_bin = python_bin.expanduser().absolute()
     log_dir = log_dir.expanduser().resolve()
-    command = _command_line(eval_args)
+    command = _command_line(
+        eval_args,
+        allow_zero_shot_horizon_override=allow_zero_shot_horizon_override,
+    )
     return f"""#!/usr/bin/env bash
 #SBATCH --job-name={shlex.quote(job_name)}
 #SBATCH --partition=standard
@@ -185,6 +201,7 @@ def main(argv: list[str] | None = None) -> None:
         time_limit=args.time_limit,
         eval_args=args.eval_args,
         expected_commit=expected_commit,
+        allow_zero_shot_horizon_override=args.allow_zero_shot_horizon_override,
     )
     args.job_script.parent.mkdir(parents=True, exist_ok=True)
     args.job_script.write_text(script)

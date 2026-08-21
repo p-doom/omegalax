@@ -76,6 +76,14 @@ def _parser() -> argparse.ArgumentParser:
         choices=[cue.value for cue in MemoryTaskCue],
         default=MemoryTaskCue.MARKED.value,
     )
+    parser.add_argument(
+        "--allow_zero_shot_horizon_override",
+        action="store_true",
+        help=(
+            "Allow only segment_length and/or num_segments to differ from the "
+            "checkpoint's training task contract."
+        ),
+    )
     parser.add_argument("--num_pairs", type=int, required=True)
     parser.add_argument("--pairs_per_batch", type=int, default=8)
     parser.add_argument("--tp_size", type=int, default=1)
@@ -128,35 +136,78 @@ def _file_sha256(path: Path) -> str:
 # requested eval config (eval always uses split=EVAL, and often a distinct
 # seed); every other field is part of the frozen task semantics.
 _MEMORY_TASK_CONTRACT_ALLOWED_DIFFERENCES = frozenset({"seed", "split"})
+_ZERO_SHOT_HORIZON_OVERRIDE_FIELDS = frozenset({"segment_length", "num_segments"})
 
 
-def _validate_training_contract(checkpoint_root: Path, task_config: MemoryTaskConfig) -> str:
+def _read_training_contract(checkpoint_root: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     contract_path = checkpoint_root / "memory_task_contract.json"
     if not contract_path.is_file():
         raise ValueError(f"Refusing to evaluate without memory_task_contract.json: {contract_path}")
     try:
         contract = json.loads(contract_path.read_text())
         trained_task = contract["task"]
-        trained_split = trained_task["split"]
     except (json.JSONDecodeError, KeyError, TypeError) as exc:
         raise ValueError(f"Unreadable memory-task contract: {contract_path}") from exc
+    if not isinstance(contract, dict) or not isinstance(trained_task, dict):
+        raise ValueError(f"Unreadable memory-task contract: {contract_path}")
+    return contract, trained_task
+
+
+def _validate_training_contract(
+    checkpoint_root: Path,
+    task_config: MemoryTaskConfig,
+    *,
+    allow_zero_shot_horizon_override: bool = False,
+) -> str:
+    contract, trained_task = _read_training_contract(checkpoint_root)
+    requested_task = dataclasses.asdict(task_config)
+    if set(trained_task) != set(requested_task):
+        raise ValueError(
+            f"Refusing to evaluate {checkpoint_root}: memory-task contract has a different "
+            f"task field set (trained={sorted(trained_task)!r}, requested={sorted(requested_task)!r})"
+        )
+    try:
+        trained_split = trained_task["split"]
+    except KeyError as exc:
+        raise ValueError(
+            f"Unreadable memory-task contract: {checkpoint_root / 'memory_task_contract.json'}"
+        ) from exc
     if trained_split != MemoryTaskSplit.TRAIN.value:
         raise ValueError(
             f"Refusing to evaluate {checkpoint_root}: memory_task_contract.json records "
             f"split={trained_split!r}, expected {MemoryTaskSplit.TRAIN.value!r}"
         )
-    requested_task = dataclasses.asdict(task_config)
+    allowed_differences = _MEMORY_TASK_CONTRACT_ALLOWED_DIFFERENCES
+    if allow_zero_shot_horizon_override:
+        allowed_differences = allowed_differences | _ZERO_SHOT_HORIZON_OVERRIDE_FIELDS
     mismatches = {
         name: (trained_task.get(name), value)
         for name, value in requested_task.items()
-        if name not in _MEMORY_TASK_CONTRACT_ALLOWED_DIFFERENCES and trained_task.get(name) != value
+        if name not in allowed_differences and trained_task.get(name) != value
     }
     if mismatches:
         raise ValueError(
             f"Refusing to evaluate {checkpoint_root} on a mismatched memory-task config: "
             f"{mismatches!r}"
         )
+    if allow_zero_shot_horizon_override and not any(
+        trained_task.get(name) != requested_task[name]
+        for name in _ZERO_SHOT_HORIZON_OVERRIDE_FIELDS
+    ):
+        raise ValueError(
+            "--allow_zero_shot_horizon_override requires segment_length and/or "
+            "num_segments to differ from the training task contract"
+        )
     return _canonical_json_sha256(contract)
+
+
+def _eval_name(task_config: MemoryTaskConfig, *, allow_zero_shot_horizon_override: bool) -> str:
+    if allow_zero_shot_horizon_override:
+        return (
+            f"memory_{task_config.task.value}_zero_shot_horizon_"
+            f"c{task_config.num_segments}_l{task_config.segment_length}_v1"
+        )
+    return f"memory_{task_config.task.value}_v1"
 
 
 def _revision() -> dict[str, Any]:
@@ -357,16 +408,35 @@ def main(argv: list[str] | None = None) -> None:
         split=MemoryTaskSplit.EVAL,
     )
     resolved = resolve_checkpoint(args.checkpoint)
-    training_contract_sha256 = _validate_training_contract(resolved.root, task_config)
-    eval_name = f"memory_{task_config.task.value}_v1"
+    training_contract_sha256 = _validate_training_contract(
+        resolved.root,
+        task_config,
+        allow_zero_shot_horizon_override=args.allow_zero_shot_horizon_override,
+    )
+    _, source_training_task = _read_training_contract(resolved.root)
+    eval_name = _eval_name(
+        task_config,
+        allow_zero_shot_horizon_override=args.allow_zero_shot_horizon_override,
+    )
     run_dir = resolved.root / "evals" / eval_name / f"step_{resolved.step}"
     manifest = _manifest(task_config, args.num_pairs)
     config = {
-        "schema_version": 2,
+        "schema_version": 3,
         "checkpoint_root": str(resolved.root),
         "checkpoint_step": resolved.step,
         "manifest_sha256": manifest["sha256"],
         "training_contract_sha256": training_contract_sha256,
+        "source_training_task": source_training_task,
+        "requested_eval_task": dataclasses.asdict(task_config),
+        "zero_shot_horizon_override": args.allow_zero_shot_horizon_override,
+        "allowed_training_task_differences": sorted(
+            _MEMORY_TASK_CONTRACT_ALLOWED_DIFFERENCES
+            | (
+                _ZERO_SHOT_HORIZON_OVERRIDE_FIELDS
+                if args.allow_zero_shot_horizon_override
+                else frozenset()
+            )
+        ),
         "pairs_per_batch": args.pairs_per_batch,
         "topology": {"tp_size": args.tp_size, "fsdp_size": args.fsdp_size, "dp_size": args.dp_size},
         "text_attn_backend": args.text_attn_backend,

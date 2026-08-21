@@ -637,6 +637,85 @@ class MemoryTaskTest(parameterized.TestCase):
             self.assertTrue((mirror_dir / "README.md").is_file())
             self.assertFalse((mirror_dir / "raw.jsonl").exists())
 
+    def test_zero_shot_horizon_override_runs_real_cli_and_preserves_immutable_outputs(self):
+        # This is deliberately end-to-end: train_memory_tasks creates the
+        # actual contract/checkpoint and eval_memory_tasks restores it before
+        # evaluating a longer C=4 horizon.  It protects the flag wiring and
+        # the generated artifact layout, not a parallel test-only evaluator.
+        with test_temp_dir() as tmp:
+            tmpdir = Path(tmp)
+            save_dir = tmpdir / "run"
+            train_argv = [
+                "--task=exact",
+                "--condition=state",
+                f"--save_dir={save_dir}",
+                "--model_id=qwen3.5-smoke-dense",
+                "--segment_length=16",
+                "--num_segments=2",
+                "--num_steps=1",
+                "--save_every=1",
+                "--pairs_per_batch=1",
+                "--log_every=0",
+                f"--jax_cache_dir={tmpdir / 'train_jax_cache'}",
+                "--text_attn_backend=xla",
+                f"--run_plan_sha256={'d' * 64}",
+                "--success_criterion=zero-shot horizon CLI contract test",
+            ]
+            with contextlib.redirect_stdout(io.StringIO()):
+                train_memory_tasks.main(train_argv)
+
+            base_eval_argv = [
+                f"--checkpoint={save_dir}",
+                "--task=exact",
+                "--segment_length=16",
+                "--num_segments=4",
+                "--num_pairs=2",
+                "--pairs_per_batch=1",
+                "--text_attn_backend=xla",
+                f"--jax_cache_dir={tmpdir / 'eval_jax_cache'}",
+                f"--wiki_mirror_dir={tmpdir / 'wiki_mirror'}",
+            ]
+
+            # C/L still fail closed unless the evaluator's explicit flag is
+            # present; this must happen before a model restore or output write.
+            with self.assertRaisesRegex(ValueError, "mismatched memory-task config"):
+                eval_memory_tasks.main(base_eval_argv)
+            with self.assertRaisesRegex(ValueError, "mismatched memory-task config"):
+                eval_memory_tasks.main(
+                    [*base_eval_argv, "--vocab_size=768", "--allow_zero_shot_horizon_override"]
+                )
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                eval_memory_tasks.main([*base_eval_argv, "--allow_zero_shot_horizon_override"])
+
+            eval_dir = save_dir / "evals" / "memory_exact_zero_shot_horizon_c4_l16_v1" / "step_1"
+            self.assertTrue(eval_dir.is_dir())
+            self.assertFalse((save_dir / "evals" / "memory_exact_v1").exists())
+            config = json.loads((eval_dir / "eval_config.json").read_text())
+            contract = json.loads((save_dir / "memory_task_contract.json").read_text())
+            self.assertEqual(config["source_training_task"], contract["task"])
+            self.assertEqual(config["requested_eval_task"]["segment_length"], 16)
+            self.assertEqual(config["requested_eval_task"]["num_segments"], 4)
+            self.assertTrue(config["zero_shot_horizon_override"])
+            self.assertEqual(
+                config["allowed_training_task_differences"],
+                ["num_segments", "seed", "segment_length", "split"],
+            )
+
+            rows = [json.loads(line) for line in (eval_dir / "raw.jsonl").read_text().splitlines()]
+            self.assertEqual({row["mode"] for row in rows}, {mode.value for mode in MemoryEvalMode})
+            self.assertTrue((eval_dir / "artifact_manifest.json").is_file())
+            self.assertTrue((eval_dir / "plots" / "accuracy.svg").is_file())
+            self.assertTrue((eval_dir / "plots" / "answer_nll.svg").is_file())
+            self.assertTrue((tmpdir / "wiki_mirror" / "accuracy.svg").is_file())
+            self.assertTrue((tmpdir / "wiki_mirror" / "answer_nll.svg").is_file())
+            self.assertTrue((tmpdir / "wiki_mirror" / "README.md").is_file())
+
+            # Same source/requested contract resolves to the same isolated
+            # horizon path and is immutable once its artifacts are complete.
+            with self.assertRaisesRegex(ValueError, "already complete"):
+                eval_memory_tasks.main([*base_eval_argv, "--allow_zero_shot_horizon_override"])
+
     @parameterized.parameters(
         dict(num_exact_bindings=1, relevance_cue=MemoryTaskCue.MARKED),
         dict(num_exact_bindings=3, relevance_cue=MemoryTaskCue.SURPRISE),
@@ -892,9 +971,42 @@ class MemoryTaskTest(parameterized.TestCase):
                 root, dataclasses.replace(base_config, seed=99, split=MemoryTaskSplit.EVAL)
             )
 
+            # Changing the horizon is deliberately rejected by default: a
+            # zero-shot horizon evaluation must be an explicit choice, never
+            # a silent relaxation of the task contract.
+            with self.assertRaisesRegex(ValueError, "mismatched memory-task config"):
+                _validate_training_contract(
+                    root,
+                    dataclasses.replace(base_config, num_segments=4),
+                )
+
+            # The one explicit override admits only the two geometry fields.
+            _validate_training_contract(
+                root,
+                dataclasses.replace(
+                    base_config,
+                    segment_length=24,
+                    num_segments=4,
+                    split=MemoryTaskSplit.EVAL,
+                ),
+                allow_zero_shot_horizon_override=True,
+            )
+            with self.assertRaisesRegex(ValueError, "requires segment_length and/or num_segments"):
+                _validate_training_contract(
+                    root,
+                    dataclasses.replace(base_config, split=MemoryTaskSplit.EVAL),
+                    allow_zero_shot_horizon_override=True,
+                )
+
             with self.assertRaises(ValueError):
                 _validate_training_contract(
                     root, dataclasses.replace(base_config, task=MemoryTask.DOMINANT_RULE)
+                )
+            with self.assertRaisesRegex(ValueError, "mismatched memory-task config"):
+                _validate_training_contract(
+                    root,
+                    dataclasses.replace(base_config, vocab_size=768),
+                    allow_zero_shot_horizon_override=True,
                 )
             with self.assertRaises(ValueError):
                 _validate_training_contract(

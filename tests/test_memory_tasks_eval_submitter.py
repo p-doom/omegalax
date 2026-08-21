@@ -105,6 +105,31 @@ class MemoryTaskEvalSubmitterTest(absltest.TestCase):
                     expected_commit="test-commit",
                 )
 
+    def test_renderer_forwards_the_explicit_zero_shot_horizon_override(self):
+        with test_temp_dir() as tmp:
+            tmpdir = Path(tmp)
+            script_path = tmpdir / "eval.sbatch"
+            submit_memory_tasks_eval_slurm.main(
+                [
+                    f"--repo_root={tmpdir / 'repo'}",
+                    f"--python_bin={tmpdir / 'python'}",
+                    "--job_name=memory-eval-horizon-test",
+                    f"--job_script={script_path}",
+                    f"--log_dir={tmpdir / 'logs'}",
+                    "--expected_commit=test-commit",
+                    "--allow_zero_shot_horizon_override",
+                    "--",
+                    *self._eval_args(tmpdir / "checkpoint"),
+                ]
+            )
+            script = script_path.read_text()
+
+        self.assertIn("--allow_zero_shot_horizon_override", script)
+        self.assertIn("#SBATCH --cpus-per-task=24", script)
+        self.assertIn("#SBATCH --mem=120G", script)
+        self.assertIn("--num_pairs=2048", script)
+        self.assertIn("--text_attn_backend=mosaic_gpu", script)
+
     def test_default_cli_only_renders_and_the_script_passes_bash_n(self):
         with test_temp_dir() as tmp:
             tmpdir = Path(tmp)
