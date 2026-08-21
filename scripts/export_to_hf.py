@@ -21,6 +21,7 @@ import os
 
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
+import json
 from pathlib import Path
 
 from absl import app, flags
@@ -232,6 +233,42 @@ def _restore_trained_weights(model, cfg, checkpoint_path: Path):
     return model
 
 
+# A base config field that describes how the *weights* are encoded, which this
+# export does not reproduce: Qwen3.5-35B-A3B-FP8 carries
+# quantization_config={"quant_method": "fp8", ...}, and inheriting it would label a
+# bf16 export as FP8.
+_DESCRIBES_BASE_WEIGHTS = ("quantization_config",)
+
+
+def _write_servable_config(out_dir: Path, cfg) -> None:
+    """Rewrite config.json as the base's, overlaid with what omegalax owns.
+
+    Deriving it from the runtime config alone is structurally short: that is a
+    *training* config, so a dense export omitted 15 keys -- max_position_embeddings,
+    eos_token_id, bos_token_id, hidden_act, sliding_window, use_cache among them --
+    and none of them can be recovered from it. The base has them right for
+    everything this export does not change, so start there and overwrite only the
+    fields the export actually determines.
+    """
+    from huggingface_hub import snapshot_download
+
+    base_path = Path(snapshot_download(FLAGS.model_id)) / "config.json"
+    base = json.loads(base_path.read_text())
+    for key in _DESCRIBES_BASE_WEIGHTS:
+        base.pop(key, None)
+
+    owned = export_lib.model_config_to_hf_dict(cfg)
+    merged = {**base, **owned}
+    # One level deep: omegalax owns the shapes inside these, the base owns the rest.
+    for sub in ("text_config", "vision_config"):
+        if isinstance(base.get(sub), dict) and isinstance(owned.get(sub), dict):
+            merged[sub] = {**base[sub], **owned[sub]}
+
+    (out_dir / "config.json").write_text(json.dumps(merged, indent=2) + "\n")
+    added = sorted(set(merged) - set(owned))
+    print(f"[export] config.json overlaid on {FLAGS.model_id}: +{len(added)} base keys {added}")
+
+
 def main(_) -> None:
     jax.distributed.initialize()
     model, cfg = load_model()
@@ -239,6 +276,7 @@ def main(_) -> None:
         out_dir = Path(FLAGS.out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
         print(f"Exported safetensors to {export_lib.export_model_to_hf(model, cfg, out_dir)}")
+        _write_servable_config(out_dir, cfg)
         return
 
     base_fingerprint = export_lib.param_fingerprint(model)
@@ -246,6 +284,7 @@ def main(_) -> None:
     out_dir = Path(FLAGS.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     path = export_lib.export_model_to_hf(model, cfg, out_dir)
+    _write_servable_config(out_dir, cfg)
 
     # After the write, because export_model_to_hf owns the LoRA merge and a LoRA
     # run trains no base leaf: pre-merge, a correct adapter export is legitimately
