@@ -18,6 +18,7 @@ from omegalax.data.pretrain_data_set import (
 class MemoryTask(StrEnum):
     EXACT = "exact"
     DOMINANT_RULE = "dominant_rule"
+    ASSOCIATIVE_BANK = "associative_bank"
 
 
 class MemoryTaskSplit(StrEnum):
@@ -95,6 +96,17 @@ class MemoryTaskConfig:
                     f"{self.num_exact_bindings + 1} pairwise-distinct values "
                     f"but only {_VALUES.size} exist"
                 )
+        if self.task is MemoryTask.ASSOCIATIVE_BANK:
+            if self.segment_length != 64:
+                raise ValueError("segment_length must be == 64 for MemoryTask.ASSOCIATIVE_BANK")
+            if self.num_segments != 4:
+                raise ValueError("num_segments must be == 4 for MemoryTask.ASSOCIATIVE_BANK")
+            if self.vocab_size < 1024:
+                raise ValueError("vocab_size must be >= 1024 for MemoryTask.ASSOCIATIVE_BANK")
+            if self.num_exact_bindings != 1 or self.relevance_cue is not MemoryTaskCue.MARKED:
+                raise ValueError(
+                    "num_exact_bindings/relevance_cue are only defined for MemoryTask.EXACT"
+                )
         if self.relevance_cue is MemoryTaskCue.SURPRISE and self.num_exact_bindings < 3:
             raise ValueError("relevance_cue=surprise requires num_exact_bindings >= 3")
 
@@ -106,15 +118,29 @@ _DEMO = 4
 _QUERY = 5
 _ANSWER = 6
 _DECOY_BIND = 7
+_BANK_TASK = 8
 _KEYS = np.arange(32, 64, dtype=np.int32)
 _VALUES = np.arange(64, 96, dtype=np.int32)
 _RULE_ITEMS = np.arange(96, 160, dtype=np.int32)
 _RULE_LABELS = np.asarray((160, 161), dtype=np.int32)
 _FILLER_START = 256
+_BANK_KEYS = np.arange(32, 96, dtype=np.int32)
+_BANK_VALUES = np.arange(96, 352, dtype=np.int32)
+_BANK_NUM_SLOTS = 24
+_BANK_SLOTS_PER_SEGMENT = 8
+_BANK_FILLER_START = 492
+_BANK_FILLER_END = 1024
 
 
 def _rng(config: MemoryTaskConfig, pair_index: int) -> np.random.Generator:
-    task_id = 0 if config.task is MemoryTask.EXACT else 1
+    if config.task is MemoryTask.EXACT:
+        task_id = 0
+    elif config.task is MemoryTask.DOMINANT_RULE:
+        task_id = 1
+    elif config.task is MemoryTask.ASSOCIATIVE_BANK:
+        task_id = 2
+    else:
+        raise ValueError(f"Unhandled MemoryTask: {config.task!r}")
     split_id = 0 if config.split is MemoryTaskSplit.TRAIN else 1
     return np.random.default_rng(
         np.random.SeedSequence((config.seed, pair_index, task_id, split_id))
@@ -161,9 +187,63 @@ def _multi_slot_exact_tokens(
     return paired, target_slot
 
 
+def _associative_bank_tokens(pair_index: int, config: MemoryTaskConfig) -> tuple[np.ndarray, int]:
+    if config.split is MemoryTaskSplit.TRAIN:
+        bank_index = pair_index
+        fixed_slot = None
+    else:
+        bank_index = pair_index // _BANK_NUM_SLOTS
+        fixed_slot = pair_index % _BANK_NUM_SLOTS
+
+    rng = _rng(config, bank_index)
+    shared = rng.integers(
+        _BANK_FILLER_START,
+        _BANK_FILLER_END,
+        size=(config.num_segments, config.segment_length),
+        dtype=np.int32,
+    )
+    paired = np.stack((shared.copy(), shared.copy()))
+
+    keys = rng.choice(_BANK_KEYS, size=_BANK_NUM_SLOTS, replace=False)
+    # Base and per-slot alternate values are drawn from a single
+    # without-replacement pool (as in _multi_slot_exact_tokens) so that no
+    # base value can ever collide with an alternate value.
+    all_values = rng.choice(_BANK_VALUES, size=2 * _BANK_NUM_SLOTS, replace=False)
+    base_values = all_values[:_BANK_NUM_SLOTS]
+    alt_values = all_values[_BANK_NUM_SLOTS:]
+    target_slot = int(rng.integers(0, _BANK_NUM_SLOTS)) if fixed_slot is None else fixed_slot
+
+    paired[:, 0, 0] = _BANK_TASK
+    for slot in range(_BANK_NUM_SLOTS):
+        segment = slot // _BANK_SLOTS_PER_SEGMENT
+        pos_in_segment = slot % _BANK_SLOTS_PER_SEGMENT
+        start = (1 if segment == 0 else 0) + 3 * pos_in_segment
+        if slot == target_slot:
+            for world, value in enumerate((base_values[slot], alt_values[slot])):
+                paired[world, segment, start : start + 3] = (_BIND, keys[slot], value)
+        else:
+            # Written identically to both world planes: worlds must differ
+            # only in the target slot's value, never in a non-target slot.
+            paired[:, segment, start : start + 3] = (_BIND, keys[slot], base_values[slot])
+
+    answer_values = (base_values[target_slot], alt_values[target_slot])
+    for world in (0, 1):
+        paired[world, -1, -5:] = (
+            _BANK_TASK,
+            _QUERY,
+            keys[target_slot],
+            _ANSWER,
+            answer_values[world],
+        )
+    return paired, target_slot
+
+
 def _paired_tokens(pair_index: int, config: MemoryTaskConfig) -> tuple[np.ndarray, int]:
     if pair_index < 0:
         raise ValueError("pair_index must be >= 0")
+    if config.task is MemoryTask.ASSOCIATIVE_BANK:
+        return _associative_bank_tokens(pair_index, config)
+
     rng = _rng(config, pair_index)
     shared = rng.integers(
         _FILLER_START,
@@ -189,34 +269,37 @@ def _paired_tokens(pair_index: int, config: MemoryTaskConfig) -> tuple[np.ndarra
             return paired, 0
         return _multi_slot_exact_tokens(rng, paired, config)
 
-    items = rng.choice(_RULE_ITEMS, size=config.num_rule_examples + 1, replace=False)
-    majority_world_0 = int(rng.integers(0, 2))
-    majority_count = config.num_rule_examples // 2 + 1
-    pattern = np.asarray(
-        [majority_world_0] * majority_count
-        + [1 - majority_world_0] * (config.num_rule_examples - majority_count),
-        dtype=np.int32,
-    )
-    rng.shuffle(pattern)
-    paired[:, 0, 0] = _RULE_TASK
-    for example_idx, item in enumerate(items[:-1]):
-        start = 1 + 3 * example_idx
-        paired[0, 0, start : start + 3] = (_DEMO, item, _RULE_LABELS[pattern[example_idx]])
-        paired[1, 0, start : start + 3] = (
-            _DEMO,
-            item,
-            _RULE_LABELS[1 - pattern[example_idx]],
+    if config.task is MemoryTask.DOMINANT_RULE:
+        items = rng.choice(_RULE_ITEMS, size=config.num_rule_examples + 1, replace=False)
+        majority_world_0 = int(rng.integers(0, 2))
+        majority_count = config.num_rule_examples // 2 + 1
+        pattern = np.asarray(
+            [majority_world_0] * majority_count
+            + [1 - majority_world_0] * (config.num_rule_examples - majority_count),
+            dtype=np.int32,
         )
-    answers = (_RULE_LABELS[majority_world_0], _RULE_LABELS[1 - majority_world_0])
-    for world in (0, 1):
-        paired[world, -1, -5:] = (
-            _RULE_TASK,
-            _QUERY,
-            items[-1],
-            _ANSWER,
-            answers[world],
-        )
-    return paired, 0
+        rng.shuffle(pattern)
+        paired[:, 0, 0] = _RULE_TASK
+        for example_idx, item in enumerate(items[:-1]):
+            start = 1 + 3 * example_idx
+            paired[0, 0, start : start + 3] = (_DEMO, item, _RULE_LABELS[pattern[example_idx]])
+            paired[1, 0, start : start + 3] = (
+                _DEMO,
+                item,
+                _RULE_LABELS[1 - pattern[example_idx]],
+            )
+        answers = (_RULE_LABELS[majority_world_0], _RULE_LABELS[1 - majority_world_0])
+        for world in (0, 1):
+            paired[world, -1, -5:] = (
+                _RULE_TASK,
+                _QUERY,
+                items[-1],
+                _ANSWER,
+                answers[world],
+            )
+        return paired, 0
+
+    raise ValueError(f"Unhandled MemoryTask: {config.task!r}")
 
 
 def build_memory_task_batch(
@@ -248,6 +331,16 @@ def build_memory_task_batch(
         "answer_position_B": np.full(num_windows, config.segment_length - 1, dtype=np.int32),
         "target_slot_B": np.repeat(np.asarray(target_slots, dtype=np.int32), 2),
     }
+    if config.task is MemoryTask.ASSOCIATIVE_BANK:
+        target_segments = [slot // _BANK_SLOTS_PER_SEGMENT for slot in target_slots]
+        metadata["target_segment_B"] = np.repeat(np.asarray(target_segments, dtype=np.int32), 2)
+        metadata["target_age_B"] = np.repeat(
+            np.asarray(
+                [config.num_segments - 1 - segment for segment in target_segments],
+                dtype=np.int32,
+            ),
+            2,
+        )
 
     if flatten:
         return {

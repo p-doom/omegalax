@@ -323,6 +323,62 @@ class MemoryTaskTest(parameterized.TestCase):
             self.assertEqual(int(np.sum(history == answers[1 - world])), 2)
             self.assertEqual(int(batch["token_ids_BCT"][world, -1, -1]), int(answers[world]))
 
+    def test_associative_bank_eval_covers_every_slot_with_shared_prefix_and_single_value_diff(
+        self,
+    ):
+        # associative_bank is only defined for a fixed C=4/L=64 geometry: the
+        # generator hardcodes segment 3 as the query segment and slots 0..23
+        # across segments 0..2, so a mismatched geometry must fail at config
+        # construction rather than corrupt/index-crash inside the generator.
+        with self.assertRaises(ValueError):
+            MemoryTaskConfig(
+                task=MemoryTask.ASSOCIATIVE_BANK,
+                seed=11,
+                segment_length=32,
+                num_segments=2,
+                vocab_size=1024,
+            )
+
+        config = MemoryTaskConfig(
+            task=MemoryTask.ASSOCIATIVE_BANK,
+            seed=11,
+            segment_length=64,
+            num_segments=4,
+            vocab_size=1024,
+            split=MemoryTaskSplit.EVAL,
+        )
+        batch = build_memory_task_batch(tuple(range(24)), config, flatten=False)
+        tokens = batch["token_ids_BCT"]
+        metadata = batch[BATCH_PRETRAIN_METADATA_KEY]
+        target_slots = metadata["target_slot_B"][::2]
+        target_segments = metadata["target_segment_B"][::2]
+        target_ages = metadata["target_age_B"][::2]
+
+        # base_index=pair_index//24 groups pair_index 0..23 into a single bank
+        # and query slot=pair_index%24 must therefore sweep every slot once.
+        np.testing.assert_array_equal(target_slots, np.arange(24))
+        np.testing.assert_array_equal(target_segments, target_slots // 8)
+        np.testing.assert_array_equal(target_ages, 3 - target_segments)
+        self.assertLess(int(tokens.max()), 1024)
+
+        # Every row in the 24-group shares the same world0 binding prefix
+        # (segments 0..2), since only the query slot changes across the group.
+        world0_prefix = tokens[0::2, :3]
+        for row in range(1, 24):
+            np.testing.assert_array_equal(world0_prefix[row], world0_prefix[0])
+
+        # world1 differs from world0 only at the queried slot's value token
+        # and the final answer token -- exactly two positions per pair.
+        for pair in range(24):
+            diff_positions = np.flatnonzero(tokens[2 * pair] != tokens[2 * pair + 1])
+            self.assertEqual(len(diff_positions), 2)
+
+        # TRAIN draws a unique bank per pair_index, unlike EVAL's shared
+        # base_index grouping.
+        train_config = dataclasses.replace(config, split=MemoryTaskSplit.TRAIN)
+        train_tokens = build_memory_task_batch((0, 1), train_config, flatten=False)["token_ids_BCT"]
+        self.assertFalse(np.array_equal(train_tokens[0, :3], train_tokens[2, :3]))
+
     def test_grain_iterator_batches_and_shards_whole_pairs(self):
         config = MemoryTaskConfig(
             task=MemoryTask.EXACT,
