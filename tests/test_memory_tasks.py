@@ -39,6 +39,7 @@ from scripts.eval_memory_tasks import (
     _canonical_json_sha256,
     _ensure_not_complete,
     _plot,
+    _require_canonical_num_pairs,
     _validate_training_contract,
     _write_artifact_manifest,
     _write_mirror_file,
@@ -154,6 +155,25 @@ class MemoryTaskTest(parameterized.TestCase):
         self.assertEqual(rule_bank_summary["accuracy_by_query_namespace"], {"3": 1.0, "5": 0.0})
         self.assertEqual(rule_bank_summary["answer_nll_by_query_namespace"], {"3": 0.5, "5": 1.5})
         self.assertNotIn("accuracy_by_target_segment", rule_bank_summary)
+
+    @parameterized.parameters(
+        dict(task=MemoryTask.EXACT, num_pairs=2048),
+        dict(task=MemoryTask.DOMINANT_RULE, num_pairs=2048),
+        dict(task=MemoryTask.RULE_BANK, num_pairs=2048),
+        dict(task=MemoryTask.ASSOCIATIVE_BANK, num_pairs=3072),
+    )
+    def test_canonical_num_pairs_gate_accepts_the_task_specific_count(self, task, num_pairs):
+        _require_canonical_num_pairs(task.value, num_pairs)
+
+    @parameterized.parameters(
+        dict(task=MemoryTask.EXACT, num_pairs=3072),
+        dict(task=MemoryTask.DOMINANT_RULE, num_pairs=3072),
+        dict(task=MemoryTask.RULE_BANK, num_pairs=3072),
+        dict(task=MemoryTask.ASSOCIATIVE_BANK, num_pairs=2048),
+    )
+    def test_canonical_num_pairs_gate_rejects_a_mismatched_count(self, task, num_pairs):
+        with self.assertRaisesRegex(ValueError, "num_pairs"):
+            _require_canonical_num_pairs(task.value, num_pairs)
 
     def test_training_conditions_have_matched_token_budgets(self):
         layouts = {

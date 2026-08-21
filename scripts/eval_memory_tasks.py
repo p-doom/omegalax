@@ -146,6 +146,24 @@ def _file_sha256(path: Path) -> str:
 _MEMORY_TASK_CONTRACT_ALLOWED_DIFFERENCES = frozenset({"seed", "split"})
 _ZERO_SHOT_HORIZON_OVERRIDE_FIELDS = frozenset({"segment_length", "num_segments"})
 
+# ASSOCIATIVE_BANK's larger slot/namespace space needs more pairs per eval to
+# keep per-stratum sample counts comparable to the other tasks; every other
+# task keeps the original G1 canonical count.
+_CANONICAL_NUM_PAIRS = {
+    MemoryTask.EXACT: 2048,
+    MemoryTask.DOMINANT_RULE: 2048,
+    MemoryTask.RULE_BANK: 2048,
+    MemoryTask.ASSOCIATIVE_BANK: 3072,
+}
+
+
+def _require_canonical_num_pairs(task: str, num_pairs: int) -> None:
+    expected = _CANONICAL_NUM_PAIRS[MemoryTask(task)]
+    if num_pairs != expected:
+        raise ValueError(
+            f"--num_pairs must be exactly {expected} for task={task!r}, got {num_pairs}"
+        )
+
 
 def _read_training_contract(checkpoint_root: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     contract_path = checkpoint_root / "memory_task_contract.json"
@@ -422,6 +440,7 @@ def main(argv: list[str] | None = None) -> None:
         allow_zero_shot_horizon_override=args.allow_zero_shot_horizon_override,
     )
     _, source_training_task = _read_training_contract(resolved.root)
+    _require_canonical_num_pairs(source_training_task["task"], args.num_pairs)
     eval_name = _eval_name(
         task_config,
         allow_zero_shot_horizon_override=args.allow_zero_shot_horizon_override,

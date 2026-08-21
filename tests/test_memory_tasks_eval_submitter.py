@@ -13,10 +13,12 @@ from tests.pretrain_real_data_test_utils import test_temp_dir
 
 
 class MemoryTaskEvalSubmitterTest(absltest.TestCase):
-    def _eval_args(self, checkpoint: Path) -> list[str]:
+    def _eval_args(
+        self, checkpoint: Path, *, task: str = "exact", num_pairs: int = 2048
+    ) -> list[str]:
         return [
             f"--checkpoint={checkpoint}",
-            "--task=exact",
+            f"--task={task}",
             "--seed=1",
             "--segment_length=16",
             "--num_segments=2",
@@ -24,7 +26,7 @@ class MemoryTaskEvalSubmitterTest(absltest.TestCase):
             "--num_rule_examples=5",
             "--num_exact_bindings=3",
             "--relevance_cue=marked",
-            "--num_pairs=2048",
+            f"--num_pairs={num_pairs}",
             "--pairs_per_batch=256",
             f"--jax_cache_dir={checkpoint.parent / 'jax_cache'}",
             f"--wiki_mirror_dir={checkpoint.parent / 'wiki_mirror'}",
@@ -104,6 +106,55 @@ class MemoryTaskEvalSubmitterTest(absltest.TestCase):
                     eval_args=eval_args,
                     expected_commit="test-commit",
                 )
+
+    def test_renderer_requires_the_canonical_pair_manifest_for_rule_bank(self):
+        with test_temp_dir() as tmp:
+            tmpdir = Path(tmp)
+            eval_args = self._eval_args(tmpdir / "checkpoint", task="rule_bank", num_pairs=3072)
+            with self.assertRaisesRegex(ValueError, "num_pairs=2048"):
+                submit_memory_tasks_eval_slurm.render_sbatch(
+                    repo_root=tmpdir / "repo",
+                    python_bin=tmpdir / "python",
+                    job_name="memory-eval-test",
+                    log_dir=tmpdir / "logs",
+                    time_limit="02:00:00",
+                    eval_args=eval_args,
+                    expected_commit="test-commit",
+                )
+
+    def test_renderer_requires_the_larger_pair_manifest_for_associative_bank(self):
+        with test_temp_dir() as tmp:
+            tmpdir = Path(tmp)
+            eval_args = self._eval_args(
+                tmpdir / "checkpoint", task="associative_bank", num_pairs=2048
+            )
+            with self.assertRaisesRegex(ValueError, "num_pairs=3072"):
+                submit_memory_tasks_eval_slurm.render_sbatch(
+                    repo_root=tmpdir / "repo",
+                    python_bin=tmpdir / "python",
+                    job_name="memory-eval-test",
+                    log_dir=tmpdir / "logs",
+                    time_limit="02:00:00",
+                    eval_args=eval_args,
+                    expected_commit="test-commit",
+                )
+
+    def test_renderer_accepts_the_associative_bank_pair_count(self):
+        with test_temp_dir() as tmp:
+            tmpdir = Path(tmp)
+            script = submit_memory_tasks_eval_slurm.render_sbatch(
+                repo_root=tmpdir / "repo",
+                python_bin=tmpdir / "python",
+                job_name="memory-eval-test",
+                log_dir=tmpdir / "logs",
+                time_limit="02:00:00",
+                eval_args=self._eval_args(
+                    tmpdir / "checkpoint", task="associative_bank", num_pairs=3072
+                ),
+                expected_commit="test-commit",
+            )
+
+        self.assertIn("--num_pairs=3072", script)
 
     def test_renderer_forwards_the_explicit_zero_shot_horizon_override(self):
         with test_temp_dir() as tmp:

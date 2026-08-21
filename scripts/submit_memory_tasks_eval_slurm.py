@@ -27,6 +27,18 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+# ASSOCIATIVE_BANK's larger slot/namespace space needs more pairs per eval to
+# keep per-stratum sample counts comparable to the other tasks; every other
+# task keeps the original G1 canonical count. Mirrors
+# eval_memory_tasks._CANONICAL_NUM_PAIRS without importing omegalax here.
+_CANONICAL_NUM_PAIRS_BY_TASK = {
+    "exact": "2048",
+    "dominant_rule": "2048",
+    "rule_bank": "2048",
+    "associative_bank": "3072",
+}
+
+
 def _flag_value(args: list[str], name: str) -> str | None:
     flag = f"--{name}"
     values = []
@@ -70,8 +82,15 @@ def _validate_eval_args(args: list[str]) -> list[str]:
     ):
         if not _flag_value(args, name):
             raise ValueError(f"--{name} is required in eval_args")
-    if _flag_value(args, "num_pairs") != "2048":
-        raise ValueError("The canonical v1 renderer requires --num_pairs=2048")
+    task = _flag_value(args, "task")
+    try:
+        expected_num_pairs = _CANONICAL_NUM_PAIRS_BY_TASK[task]
+    except KeyError as exc:
+        raise ValueError(f"Unknown --task for the canonical renderer: {task!r}") from exc
+    if _flag_value(args, "num_pairs") != expected_num_pairs:
+        raise ValueError(
+            f"The canonical v1 renderer requires --num_pairs={expected_num_pairs} for task={task!r}"
+        )
     horizon_override_flag = "--allow_zero_shot_horizon_override"
     if any(
         argument == horizon_override_flag or argument.startswith(f"{horizon_override_flag}=")
