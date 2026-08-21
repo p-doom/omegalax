@@ -27,10 +27,11 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-# ASSOCIATIVE_BANK's larger slot/namespace space needs more pairs per eval to
-# keep per-stratum sample counts comparable to the other tasks; every other
-# task keeps the original G1 canonical count. Mirrors
-# eval_memory_tasks._CANONICAL_NUM_PAIRS without importing omegalax here.
+# ASSOCIATIVE_BANK's 3072 is the frozen exhaustive 128 banks x 24 slots
+# design; RULE_BANK's 2048 is 256 banks x 8 namespaces (also the original G1
+# canonical count reused for EXACT/DOMINANT_RULE) -- not a generic
+# comparable-stratum rationale. Mirrors eval_memory_tasks._CANONICAL_NUM_PAIRS
+# without importing omegalax here.
 _CANONICAL_NUM_PAIRS_BY_TASK = {
     "exact": "2048",
     "dominant_rule": "2048",

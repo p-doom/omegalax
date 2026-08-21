@@ -435,8 +435,13 @@ def build_memory_task_batch(
         "world_B": np.tile(np.asarray((0, 1), dtype=np.int32), len(pair_indices)),
         "answer_token_B": token_ids_BCT[:, -1, -1].copy(),
         "answer_position_B": np.full(num_windows, config.segment_length - 1, dtype=np.int32),
-        "target_slot_B": np.repeat(np.asarray(target_slots, dtype=np.int32), 2),
     }
+    if config.task is MemoryTask.RULE_BANK:
+        # RULE_BANK's generic target_slot is the query namespace itself, so a
+        # separate target_slot_B would just duplicate query_namespace_B below.
+        metadata["query_namespace_B"] = np.repeat(np.asarray(target_slots, dtype=np.int32), 2)
+    else:
+        metadata["target_slot_B"] = np.repeat(np.asarray(target_slots, dtype=np.int32), 2)
     if config.task is MemoryTask.ASSOCIATIVE_BANK:
         target_segments = [slot // _BANK_SLOTS_PER_SEGMENT for slot in target_slots]
         metadata["target_segment_B"] = np.repeat(np.asarray(target_segments, dtype=np.int32), 2)
@@ -447,8 +452,6 @@ def build_memory_task_batch(
             ),
             2,
         )
-    if config.task is MemoryTask.RULE_BANK:
-        metadata["query_namespace_B"] = np.repeat(np.asarray(target_slots, dtype=np.int32), 2)
 
     if flatten:
         return {

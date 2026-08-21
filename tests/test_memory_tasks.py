@@ -484,6 +484,12 @@ class MemoryTaskTest(parameterized.TestCase):
         batch = build_memory_task_batch(tuple(range(8)), config, flatten=False)
         tokens = batch["token_ids_BCT"]
         metadata = batch[BATCH_PRETRAIN_METADATA_KEY]
+
+        # RULE_BANK's generic target_slot is the query namespace itself, so a
+        # separate target_slot_B would just be a misleading duplicate of
+        # query_namespace_B in raw rows/summaries; only query_namespace_B may
+        # exist for this task.
+        self.assertNotIn("target_slot_B", metadata)
         query_namespaces = metadata["query_namespace_B"][::2]
 
         # base_index=pair_index//8 groups pair_index 0..7 into a single bank

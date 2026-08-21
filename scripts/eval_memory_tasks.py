@@ -146,9 +146,10 @@ def _file_sha256(path: Path) -> str:
 _MEMORY_TASK_CONTRACT_ALLOWED_DIFFERENCES = frozenset({"seed", "split"})
 _ZERO_SHOT_HORIZON_OVERRIDE_FIELDS = frozenset({"segment_length", "num_segments"})
 
-# ASSOCIATIVE_BANK's larger slot/namespace space needs more pairs per eval to
-# keep per-stratum sample counts comparable to the other tasks; every other
-# task keeps the original G1 canonical count.
+# ASSOCIATIVE_BANK's 3072 is the frozen exhaustive 128 banks x 24 slots
+# design; RULE_BANK's 2048 is 256 banks x 8 namespaces (also the original G1
+# canonical count reused for EXACT/DOMINANT_RULE) -- not a generic
+# comparable-stratum rationale.
 _CANONICAL_NUM_PAIRS = {
     MemoryTask.EXACT: 2048,
     MemoryTask.DOMINANT_RULE: 2048,
@@ -522,9 +523,9 @@ def main(argv: list[str] | None = None) -> None:
                     "donor_correct": prediction == int(donor_answers_B[idx]),
                     "answer_nll": float(result.answer_nll_B[idx]),
                     "donor_answer_nll": float(result.donor_answer_nll_B[idx]),
-                    "target_slot": int(metadata["target_slot_B"][idx]),
                 }
                 for row_key, metadata_key in (
+                    ("target_slot", "target_slot_B"),
                     ("target_segment", "target_segment_B"),
                     ("target_age", "target_age_B"),
                     ("query_namespace", "query_namespace_B"),
