@@ -678,16 +678,27 @@ class MemoryTaskTest(parameterized.TestCase):
             results[MemoryEvalMode.ZERO_STATE].answer_nll,
         )
 
-    def test_jitted_evaluator_matches_eager_qwen_path_for_every_mode(self):
+    @parameterized.named_parameters(
+        ("c2_marked_k1", 8, 2, 1, MemoryTaskCue.MARKED, 1e-6),
+        ("c4_surprise_k3", 16, 4, 3, MemoryTaskCue.SURPRISE, 2e-5),
+    )
+    def test_jitted_evaluator_matches_eager_qwen_path_for_every_mode(
+        self,
+        segment_length,
+        num_segments,
+        num_exact_bindings,
+        relevance_cue,
+        nll_tolerance,
+    ):
         """The reusable evaluator must preserve the established five-mode semantics."""
         config = MemoryTaskConfig(
             task=MemoryTask.EXACT,
             seed=71,
-            segment_length=8,
-            num_segments=2,
+            segment_length=segment_length,
+            num_segments=num_segments,
             vocab_size=512,
-            num_exact_bindings=1,
-            relevance_cue=MemoryTaskCue.MARKED,
+            num_exact_bindings=num_exact_bindings,
+            relevance_cue=relevance_cue,
         )
         model, model_config = text_api.init_model(
             _tiny_gdn_config(),
@@ -708,14 +719,27 @@ class MemoryTaskTest(parameterized.TestCase):
             jitted = jitted_results[mode]
             self.assertEqual(jitted.accuracy, eager.accuracy)
             self.assertEqual(jitted.donor_accuracy, eager.donor_accuracy)
-            self.assertAlmostEqual(jitted.answer_nll, eager.answer_nll, places=6)
-            self.assertAlmostEqual(jitted.donor_answer_nll, eager.donor_answer_nll, places=6)
-            np.testing.assert_array_equal(jitted.predictions_B, eager.predictions_B)
             np.testing.assert_allclose(
-                jitted.answer_nll_B, eager.answer_nll_B, rtol=1e-6, atol=1e-6
+                jitted.answer_nll, eager.answer_nll, rtol=nll_tolerance, atol=nll_tolerance
             )
             np.testing.assert_allclose(
-                jitted.donor_answer_nll_B, eager.donor_answer_nll_B, rtol=1e-6, atol=1e-6
+                jitted.donor_answer_nll,
+                eager.donor_answer_nll,
+                rtol=nll_tolerance,
+                atol=nll_tolerance,
+            )
+            np.testing.assert_array_equal(jitted.predictions_B, eager.predictions_B)
+            np.testing.assert_allclose(
+                jitted.answer_nll_B,
+                eager.answer_nll_B,
+                rtol=nll_tolerance,
+                atol=nll_tolerance,
+            )
+            np.testing.assert_allclose(
+                jitted.donor_answer_nll_B,
+                eager.donor_answer_nll_B,
+                rtol=nll_tolerance,
+                atol=nll_tolerance,
             )
 
     def test_counterfactual_swap_uses_the_other_world_in_each_pair(self):
