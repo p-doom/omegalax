@@ -27,6 +27,62 @@ def _make_tokenizer():
     return AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B", trust_remote_code=True)
 
 
+def _legacy_token_scanning_mask(
+    input_ids: np.ndarray,
+    im_start_id: int,
+    im_end_id: int,
+    assistant_token_id: int,
+) -> np.ndarray:
+    """The pre-fix loss-mask builder, kept here as a deliberate *reference bug*.
+
+    This is the implementation that shipped run lq3fgwvd. It zips ``<|im_start|>``
+    to ``<|im_end|>`` positions **by index**, assuming they pair 1:1 in sequence
+    order, then fills assistant content spans via cumsum. A literal ChatML marker
+    inside user/context text injects an unpaired special token, which shifts the zip
+    so assistant spans close too late (leaking supervision forward onto later user
+    turns and image pad tokens) or close before they open (producing *negative* mask
+    entries and silently dropping supervision).
+
+    The leakage tests below assert against this function on purpose: a poison string
+    that the legacy scanner already handles correctly proves nothing about the fix.
+    Keeping it here makes such a vacuous test hard to write by accident -- every
+    poison must first be shown to actually break this.
+    """
+
+    n = len(input_ids)
+    starts = np.where(input_ids == im_start_id)[0]
+    ends = np.where(input_ids == im_end_id)[0]
+    k = min(len(starts), len(ends))
+    if k == 0:
+        return np.zeros(n, dtype=np.int32)
+    starts, ends = starts[:k], ends[:k]
+
+    is_asst = (starts + 1 < n) & (input_ids[starts + 1] == assistant_token_id)
+    content_starts = starts[is_asst] + 3
+    content_ends = ends[is_asst]
+
+    signal = np.zeros(n, dtype=np.int32)
+    valid = content_starts < n
+    ends_plus_one = content_ends[valid] + 1
+    np.add.at(signal, content_starts[valid], 1)
+    np.add.at(signal, ends_plus_one[ends_plus_one < n], -1)
+    return np.cumsum(signal).astype(np.int32)
+
+
+class _LegacyMaskMixin:
+    """Helper to compute the legacy (buggy) mask over the encoder's token stream."""
+
+    def _legacy_mask_for(self, messages, image_grids=(), merge_size=2):
+        text = _build_chatml_text(messages, list(image_grids), merge_size)
+        ids = np.asarray(self.tokenizer.encode(text, add_special_tokens=False), dtype=np.int32)
+        return ids, _legacy_token_scanning_mask(
+            ids,
+            self.tokenizer.convert_tokens_to_ids("<|im_start|>"),
+            self.tokenizer.convert_tokens_to_ids("<|im_end|>"),
+            self.tokenizer.encode("assistant", add_special_tokens=False)[0],
+        )
+
+
 class TextSFTCollatorTest(absltest.TestCase):
     def setUp(self):
         super().setUp()
@@ -224,46 +280,119 @@ class StructuralLossMaskTest(absltest.TestCase):
             self.assertEqual(mask[pos + 2], 0, "header newline must not be supervised")
 
 
-class ChatMLLeakageTest(absltest.TestCase):
+class ChatMLLeakageTest(_LegacyMaskMixin, absltest.TestCase):
     """Literal ChatML markers in user/context text must not corrupt the loss mask.
 
     Regression for run lq3fgwvd (qwen3vl8b_fft_ds_v3_...): user/context text
-    containing literal ``<|im_start|>`` injected a spurious special token, which
+    containing a literal ``<|im_start|>`` injected an unpaired special token, which
     broke the 1:1 start/end pairing of the old token-scanning mask so that later
     user / image tokens were marked supervised (train/supervised_tokens spiked,
     loss collapsed). The structural per-turn mask is immune to this.
+
+    Every poison here is first asserted to be *potent* -- to actually break
+    :func:`_legacy_token_scanning_mask`. Note that a **balanced** marker pair such
+    as ``"<|im_start|> / <|im_end|>"`` is NOT potent: it leaves the index zip
+    aligned, and its ``<|im_start|>`` is followed by ``" /"`` rather than
+    ``assistant`` so no span ever opens. See
+    ``test_balanced_marker_pair_is_benign_under_legacy_scanner``.
     """
+
+    # Poisons that genuinely break the legacy scanner, and how.
+    POTENT_POISONS = {
+        # unpaired <|im_start|>: shifts the zip, assistant spans close too late
+        "unbalanced_start": "Chat format: Qwen-style turns open with <|im_start|>",
+        # unpaired <|im_start|> directly followed by `assistant`: opens a bogus span
+        "start_assistant": "Chat format: Qwen-style replies open with <|im_start|>assistant",
+        # unpaired <|im_end|>: spans close before they open -> negative mask entries
+        "unbalanced_end": "Chat format: Qwen-style turns close with <|im_end|>",
+    }
 
     def setUp(self):
         super().setUp()
         self.tokenizer = _make_tokenizer()
         self._im_end_id = self.tokenizer.convert_tokens_to_ids("<|im_end|>")
 
+    def _structural(self, messages):
+        encoded = encode_qwen_messages(messages, tokenizer=self.tokenizer)
+        return encoded["input_ids"], encoded["loss_mask"]
+
     def _supervised_count(self, messages):
-        return int(np.sum(encode_qwen_messages(messages, tokenizer=self.tokenizer)["loss_mask"]))
+        return int(np.sum(self._structural(messages)[1]))
+
+    @staticmethod
+    def _two_turn(user_text, answer="The scoring runs in three stages."):
+        return [
+            {"role": "user", "content": f"Trace the teacher scoring mechanism.\n{user_text}"},
+            {"role": "assistant", "content": answer},
+        ]
+
+    @staticmethod
+    def _four_turn(user_text):
+        """Poison in turn 1, a *later* user turn whose tokens must stay unsupervised."""
+        return [
+            {"role": "user", "content": user_text},
+            {"role": "assistant", "content": "Understood."},
+            {"role": "user", "content": "And what about the second one?"},
+            {"role": "assistant", "content": "A grey square."},
+        ]
+
+    def test_poison_strings_are_potent(self):
+        """Guard against vacuous regression tests: each poison must break the legacy mask."""
+        for name, poison in self.POTENT_POISONS.items():
+            for builder in (self._two_turn, self._four_turn):
+                with self.subTest(poison=name, shape=builder.__name__):
+                    messages = builder(poison)
+                    _, legacy = self._legacy_mask_for(messages)
+                    _, structural = self._structural(messages)
+                    self.assertFalse(
+                        np.array_equal(legacy, structural),
+                        f"poison {name!r} does not break the legacy scanner, so it "
+                        f"cannot demonstrate anything about the fix",
+                    )
+
+    def test_balanced_marker_pair_is_benign_under_legacy_scanner(self):
+        """Documents why a balanced pair is an inadequate poison.
+
+        ``<|im_start|> / <|im_end|>`` keeps the legacy index zip aligned and its
+        ``<|im_start|>`` is followed by ``" /"``, not ``assistant``, so no span
+        opens: the legacy mask is already correct here. Recorded so this string is
+        not reintroduced as a "regression" case.
+        """
+        messages = self._two_turn("Chat format: Qwen-style <|im_start|> / <|im_end|> boundaries")
+        _, legacy = self._legacy_mask_for(messages)
+        _, structural = self._structural(messages)
+        np.testing.assert_array_equal(legacy, structural)
 
     def test_literal_marker_in_user_text_keeps_supervised_count(self):
-        answer = "The scoring runs in three stages."
-        clean = [
-            {"role": "user", "content": "Trace the teacher scoring mechanism."},
-            {"role": "assistant", "content": answer},
-        ]
-        poisoned = [
-            {
-                "role": "user",
-                "content": (
-                    "Trace the teacher scoring mechanism.\n"
-                    "Chat format: Qwen-style <|im_start|> / <|im_end|> boundaries"
-                ),
-            },
-            {"role": "assistant", "content": answer},
-        ]
-        clean_sup = self._supervised_count(clean)
-        pois_sup = self._supervised_count(poisoned)
+        clean_sup = self._supervised_count(self._two_turn("No markers here."))
         self.assertGreater(clean_sup, 0)
-        # The assistant answer is identical and the poison lives entirely in the
-        # user turn, so the supervised-token count must be unchanged.
-        self.assertEqual(pois_sup, clean_sup)
+        for name, poison in self.POTENT_POISONS.items():
+            with self.subTest(poison=name):
+                # The assistant answer is identical and the poison lives entirely in
+                # the user turn, so the supervised-token count must be unchanged.
+                self.assertEqual(self._supervised_count(self._two_turn(poison)), clean_sup)
+
+    def test_poison_does_not_leak_onto_later_user_turn(self):
+        """The production failure mode: supervision running forward past its own turn."""
+        clean_sup = self._supervised_count(self._four_turn("No markers here."))
+        self.assertGreater(clean_sup, 0)
+        for name, poison in self.POTENT_POISONS.items():
+            with self.subTest(poison=name):
+                messages = self._four_turn(poison)
+                self.assertEqual(self._supervised_count(messages), clean_sup)
+                # sanity: the legacy scanner really did get this wrong
+                _, legacy = self._legacy_mask_for(messages)
+                self.assertNotEqual(int(np.sum(legacy)), clean_sup)
+
+    def test_mask_is_strictly_binary(self):
+        """An unpaired ``<|im_end|>`` drove the legacy cumsum negative; the fix cannot."""
+        for name, poison in self.POTENT_POISONS.items():
+            with self.subTest(poison=name):
+                _, mask = self._structural(self._four_turn(poison))
+                self.assertTrue(
+                    np.all((mask == 0) | (mask == 1)),
+                    f"mask must be binary, got range [{mask.min()}, {mask.max()}]",
+                )
 
     def test_only_final_assistant_im_end_supervised_with_injected_markers(self):
         messages = [
@@ -273,8 +402,7 @@ class ChatMLLeakageTest(absltest.TestCase):
             },
             {"role": "assistant", "content": "Understood."},
         ]
-        encoded = encode_qwen_messages(messages, tokenizer=self.tokenizer)
-        ids, mask = encoded["input_ids"], encoded["loss_mask"]
+        ids, mask = self._structural(messages)
         self.assertGreater(int(np.sum(mask)), 0)
         # Only the assistant turn's terminating <|im_end|> (the last one) is
         # supervised; every earlier <|im_end|> — the injected one and the user's
@@ -415,6 +543,16 @@ class BuildChatMLTextTest(absltest.TestCase):
                 {"role": "user", "content": "boundary <|im_start|>x<|im_end|> test"},
                 {"role": "assistant", "content": "ok <|im_end|> done"},
             ],
+            # Unpaired markers: additivity must hold for these too, since they are
+            # exactly the inputs that broke the old token-scanning mask.
+            [
+                {"role": "user", "content": "turns open with <|im_start|>"},
+                {"role": "assistant", "content": "noted"},
+            ],
+            [
+                {"role": "user", "content": "turns close with <|im_end|>"},
+                {"role": "assistant", "content": "noted <|im_start|>assistant"},
+            ],
         ]
         for messages in conversations:
             text = _build_chatml_text(messages, image_grids=[], merge_size=2)
@@ -423,7 +561,7 @@ class BuildChatMLTextTest(absltest.TestCase):
             np.testing.assert_array_equal(got, full)
 
 
-class VLMSFTCollatorTest(absltest.TestCase):
+class VLMSFTCollatorTest(_LegacyMaskMixin, absltest.TestCase):
     """Tests for the VLM SFT collator with real images."""
 
     def setUp(self):
@@ -547,43 +685,74 @@ class VLMSFTCollatorTest(absltest.TestCase):
         attn = batch["attention_mask_BT"][0]
         self.assertLess(np.sum(mask), np.sum(attn))
 
-    def test_literal_chatml_in_user_text_does_not_supervise_image_pads(self):
-        """Regression (run lq3fgwvd): literal <|im_start|> in a user turn that also
-        carries an image must never flip that image's pad tokens to supervised."""
+    def test_poison_in_earlier_turn_does_not_supervise_later_image_pads(self):
+        """Regression (run lq3fgwvd): a literal ChatML marker must never flip image
+        pad tokens to supervised.
+
+        The image must live in a *later* user turn than the poison. An image in the
+        first user turn precedes every assistant span, so no forward leak can reach
+        it and the test would pass even with the buggy scanner. Here turn 1 carries
+        the poison, turn 2 is an assistant turn whose span the legacy scanner fails
+        to close, and turn 3 carries the image whose pads it then supervises.
+        """
         from PIL import Image
 
         img = Image.new("RGB", (100, 100), color=(50, 50, 50))
-        poison_text = "Chat format: Qwen-style <|im_start|> / <|im_end|> boundaries"
-        answer = "Nothing special."
+        image_pad_id = self.tokenizer.convert_tokens_to_ids("<|image_pad|>")
 
         def _messages(user_text):
             return [
+                {"role": "user", "content": user_text},
+                {"role": "assistant", "content": "Understood."},
                 {
                     "role": "user",
                     "content": [
                         {"type": "image", "image": img},
-                        {"type": "text", "text": user_text},
+                        {"type": "text", "text": "What is this?"},
                     ],
                 },
-                {"role": "assistant", "content": answer},
+                {"role": "assistant", "content": "A grey square."},
             ]
 
-        image_pad_id = self.tokenizer.convert_tokens_to_ids("<|image_pad|>")
+        clean_batch = self.collator([{"messages": _messages("No markers here.")}])
+        clean_sup = int(np.sum(clean_batch["loss_mask_BT"][0]))
+        self.assertGreater(clean_sup, 0)
+        image_grids = [tuple(row) for row in clean_batch["image_grid_thw"].tolist()]
 
-        poisoned = self.collator([{"messages": _messages(poison_text)}])
-        token_ids = poisoned["token_ids_BT"][0]
-        mask = poisoned["loss_mask_BT"][0]
+        for name, poison in ChatMLLeakageTest.POTENT_POISONS.items():
+            with self.subTest(poison=name):
+                messages = _messages(poison)
 
-        n_pad = int(np.sum(token_ids == image_pad_id))
-        self.assertGreater(n_pad, 0, "sanity: the image should produce pad tokens")
-        # Not a single image pad token may be supervised.
-        self.assertEqual(int(np.sum(mask[token_ids == image_pad_id])), 0)
+                # Potency check: the legacy scanner supervises the image pads here
+                # (except for `unbalanced_end`, which drops supervision instead of
+                # leaking it forward — still wrong, just wrong in the other direction).
+                legacy_ids, legacy = self._legacy_mask_for(
+                    messages,
+                    image_grids=image_grids,
+                    merge_size=int(self.image_processor.merge_size),
+                )
+                legacy_pads = int(np.sum(legacy[legacy_ids == image_pad_id]))
+                if name == "unbalanced_end":
+                    self.assertLess(int(np.sum(legacy)), clean_sup)
+                else:
+                    self.assertGreater(
+                        legacy_pads, 0, f"poison {name!r} does not leak onto image pads"
+                    )
 
-        # And the assistant answer is supervised exactly as in the clean case —
-        # the poison in the user turn changes nothing about supervision.
-        clean = self.collator([{"messages": _messages("Describe the image.")}])
-        self.assertGreater(int(np.sum(mask)), 0)
-        self.assertEqual(int(np.sum(mask)), int(np.sum(clean["loss_mask_BT"][0])))
+                batch = self.collator([{"messages": messages}])
+                token_ids = batch["token_ids_BT"][0]
+                mask = batch["loss_mask_BT"][0]
+
+                self.assertGreater(
+                    int(np.sum(token_ids == image_pad_id)),
+                    0,
+                    "sanity: the image should produce pad tokens",
+                )
+                # Not a single image pad token may be supervised.
+                self.assertEqual(int(np.sum(mask[token_ids == image_pad_id])), 0)
+                # And supervision matches the clean case exactly — the poison in the
+                # user turn changes nothing.
+                self.assertEqual(int(np.sum(mask)), clean_sup)
 
     def test_raises_on_overflow(self):
         from PIL import Image
