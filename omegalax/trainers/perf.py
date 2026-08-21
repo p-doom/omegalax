@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import dataclasses
 import datetime
+import time
 from typing import Any, Union
 
 import jax
@@ -518,20 +519,25 @@ def log_compiled_memory_analysis(name: str, jit_fn, save_dir: Any, *args, **kwar
 
 
 class StepTimer:
-    """Wall-clock timer between step dispatches (no device sync).
+    """Interval timer between step dispatches (no device sync).
 
     First `warmup` steps return zero delta; after that returns time since last
     step() call. Relies on pipeline saturation for accuracy.
+
+    `time.monotonic`, not `datetime.now`: the latter is CLOCK_REALTIME, which an
+    NTP step moves backwards, and a negative delta takes `step_metrics`'
+    ``sec <= 0`` branch -- reporting mfu, hfu, tflops and tokens/s as 0.0 under
+    every throughput number a run quotes.
     """
 
     def __init__(self, warmup: int = 2):
         self._warmup = warmup
         self._step_count = 0
-        self._last = datetime.datetime.now()
+        self._last = time.monotonic()
 
     def step(self) -> datetime.timedelta:
-        now = datetime.datetime.now()
-        delta = now - self._last
+        now = time.monotonic()
+        delta = datetime.timedelta(seconds=now - self._last)
         self._last = now
         self._step_count += 1
         if self._step_count <= self._warmup:

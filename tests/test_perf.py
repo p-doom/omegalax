@@ -313,6 +313,26 @@ class StepTimerTest(absltest.TestCase):
         self.assertGreaterEqual(first, pause)
         self.assertLess(second, pause)
 
+    def test_a_wall_clock_step_backwards_does_not_zero_the_metrics(self):
+        """The timer reads a monotonic clock, so wall time cannot reach it.
+
+        It used to read `datetime.now()` (CLOCK_REALTIME), which an NTP step moves
+        backwards. The delta then goes negative, `step_metrics` takes its
+        ``sec <= 0`` branch, and mfu / hfu / tflops / tokens-per-second are all
+        reported as 0.0 -- a false zero under every throughput number a run quotes,
+        for a reason nothing in the log would name.
+        """
+        timer = StepTimer(warmup=0)
+        time.sleep(0.01)
+        with mock.patch.object(datetime, "datetime", wraps=datetime.datetime) as wall_clock:
+            wall_clock.now.return_value = datetime.datetime(2000, 1, 1)
+            delta = timer.step()
+
+        self.assertGreater(delta.total_seconds(), 0)
+        metrics = step_metrics(StepFlops(model=1e12, hardware=2e12), delta, 64, 312.0)
+        for name in ("mfu", "hfu", "model_tflops_per_device", "tokens_per_sec_per_device"):
+            self.assertGreater(metrics[name], 0, msg=name)
+
 
 class PeakTflopsTest(absltest.TestCase):
     """``resolve_peak_tflops`` is what reads the table; the table itself is a literal."""
