@@ -69,12 +69,37 @@ def param_fingerprint(model) -> dict[str, float]:
     }
 
 
+# Keyed on the ``model_type`` each family emits, so the architecture cannot drift
+# away from the config class it is meant to name. Every serving stack resolves the
+# model class through ``architectures`` -- sglang subscripts it unconditionally
+# (`configs/model_config.py`), so an export without it dies at load with a
+# TypeError on None, not a readable error.
+_HF_ARCHITECTURES = {
+    "qwen3": "Qwen3ForCausalLM",
+    "qwen3_moe": "Qwen3MoeForCausalLM",
+    "qwen3_vl": "Qwen3VLForConditionalGeneration",
+    "qwen3_vl_moe": "Qwen3VLMoeForConditionalGeneration",
+    "qwen3_5": "Qwen3_5ForConditionalGeneration",
+    "qwen3_5_moe": "Qwen3_5MoeForConditionalGeneration",
+}
+
+
 def model_config_to_hf_dict(cfg) -> dict:
     """Serialize a runtime config to HF config.json format."""
     if isinstance(cfg, Qwen3Config):
-        return qwen3_to_hf_config_dict(cfg)
-    if isinstance(cfg, Qwen3VLConfig):
-        return qwen3_vl_to_hf_config_dict(cfg)
-    if isinstance(cfg, Qwen3_5Config):
-        return qwen3_5_to_hf_config_dict(cfg)
-    raise ValueError(f"Unsupported config type for HF serialization: {type(cfg)}")
+        hf_cfg = qwen3_to_hf_config_dict(cfg)
+    elif isinstance(cfg, Qwen3VLConfig):
+        hf_cfg = qwen3_vl_to_hf_config_dict(cfg)
+    elif isinstance(cfg, Qwen3_5Config):
+        hf_cfg = qwen3_5_to_hf_config_dict(cfg)
+    else:
+        raise ValueError(f"Unsupported config type for HF serialization: {type(cfg)}")
+
+    model_type = hf_cfg["model_type"]
+    if model_type not in _HF_ARCHITECTURES:
+        raise ValueError(
+            f"No HF architecture registered for model_type {model_type!r}. Add it to "
+            f"_HF_ARCHITECTURES; an export without `architectures` cannot be served."
+        )
+    hf_cfg["architectures"] = [_HF_ARCHITECTURES[model_type]]
+    return hf_cfg
