@@ -47,6 +47,7 @@ class Qwen3VLConfig:
     image_token_id: int
     video_token_id: int
     vision_start_token_id: int
+    vision_end_token_id: int
     # MoE settings; zero/empty means dense.
     moe_intermediate_size: int = 0
     num_experts: int = 0
@@ -82,6 +83,7 @@ _QWEN3_VL_SMOKE_SPECS: dict[str, dict[str, Any]] = {
         "image_token_id": 2,
         "video_token_id": 3,
         "vision_start_token_id": 4,
+        "vision_end_token_id": 5,
         "vision": {
             "hidden_size": 64,
             "intermediate_size": 256,
@@ -118,6 +120,7 @@ _QWEN3_VL_SMOKE_SPECS: dict[str, dict[str, Any]] = {
         "image_token_id": 2,
         "video_token_id": 3,
         "vision_start_token_id": 4,
+        "vision_end_token_id": 5,
         "vision": {
             "hidden_size": 64,
             "intermediate_size": 128,
@@ -221,6 +224,7 @@ def make_vl_config(model_id: str) -> Qwen3VLConfig:
             image_token_id=spec["image_token_id"],
             video_token_id=spec["video_token_id"],
             vision_start_token_id=spec["vision_start_token_id"],
+            vision_end_token_id=spec["vision_end_token_id"],
             vision=Qwen3VLVisionConfig(
                 hidden_size=vis["hidden_size"],
                 intermediate_size=vis["intermediate_size"],
@@ -305,6 +309,7 @@ def make_vl_config_from_hf(hf_cfg: dict[str, Any]) -> Qwen3VLConfig:
         image_token_id=_required(hf_cfg, "image_token_id", "hf_cfg"),
         video_token_id=_required(hf_cfg, "video_token_id", "hf_cfg"),
         vision_start_token_id=_required(hf_cfg, "vision_start_token_id", "hf_cfg"),
+        vision_end_token_id=_required(hf_cfg, "vision_end_token_id", "hf_cfg"),
         dtype=text_dtype,
         vision=Qwen3VLVisionConfig(
             hidden_size=_required(vis, "hidden_size", "hf_cfg['vision_config']"),

@@ -80,6 +80,7 @@ def qwen3_vl_to_hf_config_dict(cfg: Qwen3VLConfig) -> dict[str, Any]:
         "image_token_id": cfg.image_token_id,
         "video_token_id": cfg.video_token_id,
         "vision_start_token_id": cfg.vision_start_token_id,
+        "vision_end_token_id": cfg.vision_end_token_id,
         "vision_config": {
             "hidden_size": cfg.vision.hidden_size,
             "intermediate_size": cfg.vision.intermediate_size,
