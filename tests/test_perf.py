@@ -1,6 +1,7 @@
 """Tests for training FLOP counting and throughput metrics."""
 
 import datetime
+import time
 from unittest import mock
 
 from absl.testing import absltest
@@ -293,10 +294,24 @@ class StepTimerTest(absltest.TestCase):
         self.assertEqual(t.step().total_seconds(), 0)
         self.assertEqual(t.step().total_seconds(), 0)
 
-    def test_after_warmup_returns_positive_delta(self):
-        t = StepTimer(warmup=0)
-        d = t.step()
-        self.assertGreaterEqual(d.total_seconds(), 0)
+    def test_after_warmup_returns_the_interval_since_the_previous_step(self):
+        """`>= 0` holds for every timedelta, so this could not fail.
+
+        The interval is what every throughput number divides by, and the bug that
+        shape cannot see is a `step()` that measures from the wrong origin: one
+        that never advances `_last` returns the time since construction, which is
+        positive, grows every step, and deflates step time forever after. The
+        second step is taken with no pause, so only a timer that advanced its
+        origin can report less than the first pause.
+        """
+        pause = 0.05
+        timer = StepTimer(warmup=0)
+        time.sleep(pause)
+        first = timer.step().total_seconds()
+        second = timer.step().total_seconds()
+
+        self.assertGreaterEqual(first, pause)
+        self.assertLess(second, pause)
 
 
 class PeakTflopsTest(absltest.TestCase):
