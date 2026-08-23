@@ -1,7 +1,9 @@
 """Round-trip export/import smoke tests for all supported families."""
 
+import importlib.util
 import os
 import tempfile
+from pathlib import Path
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
@@ -27,6 +29,109 @@ from omegalax.models.qwen3_5.params import (
     create_qwen3_5_from_safetensors,
     export_qwen3_5_to_safetensors,
 )
+
+
+_EXPORT_SCRIPT_SPEC = importlib.util.spec_from_file_location(
+    "export_to_hf", Path(__file__).parents[1] / "scripts" / "export_to_hf.py"
+)
+assert _EXPORT_SCRIPT_SPEC is not None and _EXPORT_SCRIPT_SPEC.loader is not None
+export_to_hf = importlib.util.module_from_spec(_EXPORT_SCRIPT_SPEC)
+_EXPORT_SCRIPT_SPEC.loader.exec_module(export_to_hf)
+
+
+def _valid_export_step_env():
+    return {
+        "SLURM_JOB_ID": "1234",
+        "SLURM_STEP_ID": "0",
+        "SLURM_STEP_NUM_NODES": "1",
+        "SLURM_STEP_NUM_TASKS": "1",
+        "SLURM_STEP_NODELIST": "hai001",
+        "SLURM_NTASKS": "1",
+        "SLURM_PROCID": "0",
+        "SLURM_LOCALID": "0",
+        "SLURM_NODEID": "0",
+    }
+
+
+class ExportEntryTopologyTest(absltest.TestCase):
+    def test_plain_batch_launches_one_clean_step(self):
+        env = {
+            "SLURM_JOB_ID": "1234",
+            "SLURM_JOB_NODELIST": "hai001",
+            "SLURM_STEP_ID": "-5",
+            "SLURM_STEP_NODELIST": "hai009",
+            "SLURM_PROCID": "7",
+            "KEEP_ME": "yes",
+        }
+
+        argv, child_env = export_to_hf._step_launch(
+            env,
+            ["scripts/export_to_hf.py", "--model_id=x"],
+            "/venv/bin/python",
+            "/repo/scripts/export_to_hf.py",
+            "hai001",
+        )
+
+        self.assertEqual(
+            argv,
+            [
+                "srun",
+                "--nodes=1",
+                "--ntasks=1",
+                "--ntasks-per-node=1",
+                "--kill-on-bad-exit=1",
+                "/venv/bin/python",
+                "/repo/scripts/export_to_hf.py",
+                "--model_id=x",
+            ],
+        )
+        self.assertEqual(child_env["OMEGALAX_EXPORT_STEP_JOB_ID"], "1234")
+        self.assertEqual(child_env["KEEP_ME"], "yes")
+        self.assertNotIn("SLURM_STEP_NODELIST", child_env)
+        self.assertNotIn("SLURM_PROCID", child_env)
+
+    def test_valid_single_task_step_runs_export_directly(self):
+        self.assertIsNone(
+            export_to_hf._step_launch(
+                _valid_export_step_env(),
+                ["scripts/export_to_hf.py"],
+                "/venv/bin/python",
+                "/repo/scripts/export_to_hf.py",
+                "hai001",
+            )
+        )
+
+    def test_malformed_or_mismatched_step_fails(self):
+        cases = [
+            ({"SLURM_STEP_NUM_TASKS": "2", "SLURM_NTASKS": "2"}, "exactly one task"),
+            ({"SLURM_PROCID": "x"}, "SLURM_PROCID"),
+            ({"SLURM_STEP_NODELIST": "hai009"}, "runs on hai001"),
+            ({"SLURM_STEP_NUM_NODES": ""}, "SLURM_STEP_NUM_NODES"),
+        ]
+        for update, match in cases:
+            with self.subTest(update=update), self.assertRaisesRegex(ValueError, match):
+                export_to_hf._step_launch(
+                    {**_valid_export_step_env(), **update},
+                    ["scripts/export_to_hf.py"],
+                    "/venv/bin/python",
+                    "/repo/scripts/export_to_hf.py",
+                    "hai001",
+                )
+
+    def test_exporter_created_child_must_belong_to_same_job(self):
+        env = {
+            "SLURM_JOB_ID": "5678",
+            "OMEGALAX_EXPORT_STEP_JOB_ID": "1234",
+        }
+
+        with self.assertRaisesRegex(ValueError, "1234.*5678"):
+            export_to_hf._step_launch(
+                env,
+                ["scripts/export_to_hf.py"],
+                "/venv/bin/python",
+                "/repo/scripts/export_to_hf.py",
+                "hai001",
+            )
 
 
 def _flatten_model(model):
