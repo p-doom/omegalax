@@ -74,6 +74,8 @@ def init_model(
 
 
 def build_optimizer(model: nnx.Module, train_cfg: TrainConfig) -> MixedPrecisionOptimizer:
+    if train_cfg.grad_accum_steps < 1:
+        raise ValueError(f"grad_accum_steps must be at least 1, got {train_cfg.grad_accum_steps}.")
     lr = build_lr_schedule(
         peak_lr=train_cfg.learning_rate,
         num_steps=train_cfg.num_steps,
@@ -87,7 +89,8 @@ def build_optimizer(model: nnx.Module, train_cfg: TrainConfig) -> MixedPrecision
         chain.append(optax.clip_by_global_norm(train_cfg.max_grad_norm))
     chain.append(optax.adamw(lr, weight_decay=train_cfg.weight_decay))
     tx = optax.chain(*chain)
-    tx = optax.MultiSteps(tx, every_k_schedule=train_cfg.grad_accum_steps)
+    if train_cfg.grad_accum_steps > 1:
+        tx = optax.MultiSteps(tx, every_k_schedule=train_cfg.grad_accum_steps)
     opt = MixedPrecisionOptimizer(model, tx)
     return opt
 

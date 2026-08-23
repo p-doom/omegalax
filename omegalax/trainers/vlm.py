@@ -110,13 +110,16 @@ def build_optimizer(
     *,
     wrt=nnx.Param,
 ) -> MixedPrecisionOptimizer:
+    if train_cfg.grad_accum_steps < 1:
+        raise ValueError(f"grad_accum_steps must be at least 1, got {train_cfg.grad_accum_steps}.")
     chain = []
     if train_cfg.max_grad_norm > 0:
         chain.append(optax.clip_by_global_norm(train_cfg.max_grad_norm))
     wd = 0.0 if wrt is LoRAParam else train_cfg.weight_decay
     chain.append(optax.adamw(lr_schedule_fn, weight_decay=wd))
     tx = optax.chain(*chain)
-    tx = optax.MultiSteps(tx, every_k_schedule=train_cfg.grad_accum_steps)
+    if train_cfg.grad_accum_steps > 1:
+        tx = optax.MultiSteps(tx, every_k_schedule=train_cfg.grad_accum_steps)
     opt = MixedPrecisionOptimizer(model, tx, wrt=wrt)
     return opt
 

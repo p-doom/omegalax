@@ -113,6 +113,20 @@ uv run scripts/train_vlm_sft.py \
 ```
 Resume from the latest checkpoint with `--resume`. Training checkpoints also persist the Grain iterator state.
 
+Checkpoints written with the legacy `MultiSteps(k=1)` optimizer schema must be
+migrated before resuming with `grad_accum_steps=1`:
+
+```bash
+uv run scripts/migrate_multisteps_k1_checkpoint.py \
+  --source_root /path/to/legacy/checkpoints \
+  --destination_root /path/to/migrated/checkpoints \
+  --checkpoint_step 1000
+```
+
+The migration leaves the source untouched and requires a nonexistent destination.
+It accepts only a completed `k=1` state whose trainer, gradient, and optimizer
+counters match the checkpoint step; other optimizer schemas fail without writing.
+
 Export any supported model (Qwen3 dense/MoE, Qwen3.5, Qwen3-VL) to HuggingFace safetensors:
 ```bash
 uv run scripts/export_to_hf.py --model-id qwen3-smoke --out-dir /tmp/qwen3-smoke-export --tp-size 1 --fsdp-size 1
