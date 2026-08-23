@@ -15,13 +15,13 @@ import jax.numpy as jnp
 import numpy as np
 import torch
 from absl.testing import absltest
+from jax.sharding import PartitionSpec as P
 from transformers import Qwen3Config as HFQwen3Config
 from transformers import Qwen3ForCausalLM
 
 from omegalax.models.qwen3.config import make_config
 from omegalax.models.qwen3.loader import create_qwen3_from_safetensors
 from omegalax.models.sharding_runtime import set_attn_backend
-
 from tests.logits_assert import assert_logits_close
 
 torch.backends.cuda.matmul.allow_tf32 = False
@@ -99,6 +99,9 @@ class Qwen3DenseSmokeTest(absltest.TestCase):
 
     def test_weight_loading_succeeds(self):
         self.assertIsNotNone(self.jax_model)
+
+    def test_loader_drops_singleton_activation_axes(self):
+        self.assertEqual(self.jax_model.layers[0].attn.shd_cfg.act_btnh, P(None, None, None, None))
 
     def test_prefill_logits_match_hf(self):
         token_ids_BT = _random_input(batch_size=1, seq_len=16, vocab_size=HF_SMOKE_CFG.vocab_size)

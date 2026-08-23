@@ -30,6 +30,7 @@ torch.backends.cudnn.allow_tf32 = False
 
 MODEL_ID = "Qwen/Qwen3-0.6B"
 PROMPT = "Why is the sky blue instead of another color like purple?"
+SEQUENCE_LENGTH = 128
 
 
 def _flatten_leaf_keys(tree: dict, prefix: str = "") -> list[str]:
@@ -92,7 +93,13 @@ class Qwen3MappingTest(absltest.TestCase):
             )
             for t in texts
         ]
-        toks = self.tokenizer(chat_texts, return_tensors="pt", padding=True, padding_side="right")
+        toks = self.tokenizer(
+            chat_texts,
+            return_tensors="pt",
+            padding="max_length",
+            max_length=SEQUENCE_LENGTH,
+            padding_side="right",
+        )
         return {k: v.to(self.device) for k, v in toks.items()}
 
     def _jax_prefill_logits(self, input_ids: torch.Tensor) -> np.ndarray:

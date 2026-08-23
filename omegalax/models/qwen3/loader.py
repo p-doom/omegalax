@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import gc
 from typing import Any
 
@@ -23,6 +24,8 @@ from omegalax.models.params_utils import (
     map_to_bonsai_key,
     stoi,
 )
+from omegalax.models.shard_config import shard_config_for_mesh
+
 from .config import Qwen3Config, make_config_from_hf
 from .model import Qwen3
 
@@ -134,6 +137,7 @@ def create_qwen3_from_safetensors(
     hf_cfg = load_hf_config(epath.Path(file_dir))
     cfg = make_config_from_hf(hf_cfg)
     _assert_config(cfg, hf_cfg)
+    cfg = dataclasses.replace(cfg, shd_cfg=shard_config_for_mesh(cfg.shd_cfg, mesh))
 
     with mesh_rules(mesh):
         model = nnx.eval_shape(lambda: Qwen3(cfg, rngs=nnx.Rngs(params=0)))
