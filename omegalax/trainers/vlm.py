@@ -176,17 +176,13 @@ def _write_checkpoint_config(save_dir: Path, cfg) -> None:
 
 
 def _write_lora_metadata(save_dir: Path, train_cfg: TrainConfig) -> None:
-    """Persist LoRA settings alongside the orbax tree.
-
-    The export driver reads this file to reconstruct the same optimizer
-    shape at restore time. Absent file ⇒ checkpoint was full-FT.
-    """
+    """Persist LoRA settings alongside the orbax tree."""
     import json
 
     meta = {
         "enable_lora": bool(train_cfg.enable_lora),
-        "lora_rank": int(train_cfg.lora_rank),
-        "lora_alpha": float(train_cfg.lora_alpha),
+        "lora_rank": int(train_cfg.lora_rank) if train_cfg.enable_lora else None,
+        "lora_alpha": float(train_cfg.lora_alpha) if train_cfg.enable_lora else None,
     }
     (Path(save_dir) / "lora_metadata.json").write_text(json.dumps(meta, indent=2))
 
