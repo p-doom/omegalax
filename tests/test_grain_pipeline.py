@@ -38,6 +38,25 @@ def _measure_one(message):
     return 1
 
 
+def _measure_declared(message):
+    return message["measurement"]
+
+
+def _measured(role, content, length=1, vision_tokens=0):
+    return {
+        "role": role,
+        "content": content,
+        "measurement": {
+            "length": length,
+            "supervised_tokens": length if role == "assistant" else 0,
+            "vision_tokens": vision_tokens,
+            "vision_patches": vision_tokens * 4,
+            "num_images": int(vision_tokens > 0),
+            "image_grid_thw": [[1, 2, 2]] if vision_tokens else [],
+        },
+    }
+
+
 class GrainPipelineTest(absltest.TestCase):
     def _write_jsonl(self, path: Path, rows: list[dict]) -> None:
         with path.open("w") as f:
@@ -46,6 +65,48 @@ class GrainPipelineTest(absltest.TestCase):
 
     def _expected_session_id(self, path: Path, line_num: int) -> str:
         return f"{path.stem}-{line_num:09d}"
+
+    def _read_records(self, records_dir: Path) -> list[dict]:
+        count = json.loads((records_dir / "metadata.json").read_text())["num_records"]
+        iterator = make_grain_iterator(
+            records_dir,
+            batch_size=1,
+            batch_fn=lambda batch: batch[0],
+            shuffle=False,
+            seed=0,
+            read_options=make_grain_read_options(num_threads=1, prefetch_buffer_size=1),
+            multiprocessing_options=make_grain_multiprocessing_options(
+                num_workers=0, per_worker_buffer_size=1
+            ),
+            dp_size=1,
+            fsdp_size=1,
+        )
+        return [next(iterator) for _ in range(count)]
+
+    def _build_split(self, tmpdir, messages, max_length, marker=None, measure=_measure_one):
+        src = Path(tmpdir) / "train.jsonl"
+        cache = Path(tmpdir) / "message_lengths.jsonl"
+        row = {"messages": messages}
+        if marker is not None:
+            row["_omegalax_carry_messages"] = marker
+        self._write_jsonl(src, [row])
+        self._write_jsonl(
+            cache,
+            [
+                {"conv_idx": 0, "msg_offset": i, "measurement": measure(message)}
+                for i, message in enumerate(messages)
+            ],
+        )
+        records_dir = build_records_from_chat(
+            src,
+            Path(tmpdir) / "records",
+            max_length=max_length,
+            measure_message=measure,
+            records_per_shard=8,
+            overflow_mode="split",
+            message_lengths_path=cache,
+        )
+        return records_dir, self._read_records(records_dir)
 
     def test_system_turn_is_budgeted_and_carried_into_the_record(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -214,6 +275,91 @@ class GrainPipelineTest(absltest.TestCase):
             self.assertEqual(
                 [record["_omegalax_session_id"] for record in records], [expected_session_id] * 3
             )
+
+    def test_split_carries_a_marked_noninitial_nonsystem_message(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            messages = [
+                {"role": role, "content": str(i)}
+                for i, role in enumerate(["user", "assistant"] * 4)
+            ]
+            records_dir, records = self._build_split(tmpdir, messages, 3, marker=[2])
+            self.assertEqual(
+                [[message["content"] for message in record["messages"]] for record in records],
+                [["0", "1", "2"], ["2", "3", "4"], ["2", "5", "6"], ["2", "7"]],
+            )
+            self.assertTrue(all("_omegalax_carry_messages" not in record for record in records))
+            carry = json.loads((records_dir / "truncation_stats.json").read_text())["carry"]
+            self.assertEqual(carry["carried_tokens"], 3)
+            self.assertEqual(carry["respent_fraction"], round(3 / 11, 6))
+
+    def test_split_reserves_carry_budget_and_truncates_when_it_cannot_fit(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            lengths = [2, 1, 1, 1, 4, 1]
+            messages = [
+                {
+                    "role": "assistant" if i % 2 else "user",
+                    "content": str(i),
+                    "measurement": length,
+                }
+                for i, length in enumerate(lengths)
+            ]
+            records_dir, records = self._build_split(
+                tmpdir, messages, 4, marker=[0], measure=_measure_declared
+            )
+            self.assertEqual(
+                [[message["content"] for message in record["messages"]] for record in records],
+                [["0", "1", "2"], ["0", "3"]],
+            )
+            self.assertTrue(all(record["_omegalax_measured_length"] <= 4 for record in records))
+            stats = json.loads((records_dir / "truncation_stats.json").read_text())
+            self.assertEqual(stats["sessions"]["truncated_single_message"], 1)
+            self.assertEqual(stats["messages"]["dropped"], 2)
+            self.assertEqual(stats["tokens"]["dropped"], 5)
+            self.assertEqual(stats["supervision"]["dropped"], 1)
+
+    def test_split_reports_dropped_unsupervised_slices(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            messages = [
+                {"role": "user", "content": "0", "measurement": 1},
+                {"role": "assistant", "content": "1", "measurement": 1},
+                {"role": "user", "content": "2", "measurement": 2},
+                {"role": "assistant", "content": "3", "measurement": 1},
+            ]
+            records_dir, _ = self._build_split(tmpdir, messages, 2, measure=_measure_declared)
+            stats = json.loads((records_dir / "truncation_stats.json").read_text())
+            self.assertEqual(stats["tokens"]["dropped"], 2)
+            self.assertEqual(
+                stats["supervision"],
+                {
+                    "basis": "assistant_message_length_estimate",
+                    "total_measured": 2,
+                    "kept": 2,
+                    "dropped": 0,
+                    "dropped_fraction": 0.0,
+                },
+            )
+
+    def test_carried_image_measurements_remain_aligned_with_emitted_messages(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            image = [{"type": "image", "image": "frame.png"}]
+            messages = [
+                _measured("user", "0"),
+                _measured("assistant", "1"),
+                _measured("user", image, 2, vision_tokens=1),
+                _measured("assistant", "3"),
+                _measured("user", "4"),
+                _measured("assistant", "5"),
+            ]
+            records_dir, records = self._build_split(
+                tmpdir, messages, 4, marker=[2], measure=_measure_declared
+            )
+            self.assertEqual([record["_omegalax_measured_length"] for record in records], [4, 4, 3])
+            self.assertTrue(
+                all(sum(m["content"] == image for m in r["messages"]) == 1 for r in records)
+            )
+            token_stats = json.loads((records_dir / "token_stats.json").read_text())
+            self.assertEqual(token_stats["per_chunk"]["vision_tokens"]["sum"], 3)
+            self.assertEqual(token_stats["per_chunk"]["num_images"]["sum"], 3)
 
     def test_grain_iterator_checkpoint_restore_on_records(self):
         with tempfile.TemporaryDirectory() as tmpdir:
