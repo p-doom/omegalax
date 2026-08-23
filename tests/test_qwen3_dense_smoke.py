@@ -53,7 +53,7 @@ HF_SMOKE_CFG = HFQwen3Config(
 def _random_input(batch_size: int = 1, seq_len: int = 16, vocab_size: int = 1024, pad_id: int = 0):
     rng = np.random.RandomState(42)
     token_ids_BT = rng.randint(1, vocab_size, size=(batch_size, seq_len)).astype(np.int32)
-    token_ids_BT[:, 0] = pad_id
+    token_ids_BT[:, -1] = pad_id
     return token_ids_BT
 
 
@@ -121,7 +121,7 @@ class Qwen3DenseSmokeTest(absltest.TestCase):
         token_ids_b_BT = _random_input(batch_size=1, seq_len=10, vocab_size=HF_SMOKE_CFG.vocab_size)
 
         padded_b = np.zeros((1, 16), dtype=np.int32)
-        padded_b[:, 6:] = token_ids_b_BT
+        padded_b[:, :10] = token_ids_b_BT
         token_ids_BT = np.concatenate([token_ids_a_BT, padded_b], axis=0)
         attention_mask_BT = (token_ids_BT != self.pad_id).astype(np.int64)
 

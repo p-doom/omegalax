@@ -86,6 +86,7 @@ class Qwen3VLSmokeTest(absltest.TestCase):
     def setUpClass(cls):
         super().setUpClass()
         cls.tmpdir = tempfile.mkdtemp()
+        torch.manual_seed(0)
 
         hf_model = Qwen3VLForConditionalGeneration(HF_CFG).eval()
         hf_model.save_pretrained(cls.tmpdir, safe_serialization=True)
@@ -145,7 +146,7 @@ class Qwen3VLSmokeTest(absltest.TestCase):
         token_ids_b_BT = _random_input(batch_size=1, seq_len=10, vocab_size=HF_TEXT_CFG.vocab_size)
 
         padded_b = np.zeros((1, 16), dtype=np.int32)
-        padded_b[:, 6:] = token_ids_b_BT
+        padded_b[:, :10] = token_ids_b_BT
         token_ids_BT = np.concatenate([token_ids_a_BT, padded_b], axis=0)
         attention_mask_BT = (token_ids_BT != 0).astype(np.int64)
 

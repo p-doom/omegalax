@@ -92,7 +92,7 @@ _QWEN3_SMOKE_SPECS: dict[str, dict[str, Any]] = {
         "mlp_only_layers": (),
         "decoder_sparse_step": 1,
         "norm_topk_prob": True,
-        "rope_theta": 1_000_000,
+        "rope_theta": 10_000_000,
         "rope_scaling_factor": None,
         "local_rope_theta": None,
         "norm_eps": 1e-6,

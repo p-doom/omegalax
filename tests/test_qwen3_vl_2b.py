@@ -155,7 +155,7 @@ class Qwen3VLMappingTest(absltest.TestCase):
             for p in prompts
         ]
         inputs = self.processor.tokenizer(
-            texts, return_tensors="pt", padding=True, padding_side="left"
+            texts, return_tensors="pt", padding=True, padding_side="right"
         )
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
 

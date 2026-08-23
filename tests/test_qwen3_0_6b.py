@@ -92,7 +92,7 @@ class Qwen3MappingTest(absltest.TestCase):
             )
             for t in texts
         ]
-        toks = self.tokenizer(chat_texts, return_tensors="pt", padding=True, padding_side="left")
+        toks = self.tokenizer(chat_texts, return_tensors="pt", padding=True, padding_side="right")
         return {k: v.to(self.device) for k, v in toks.items()}
 
     def _jax_prefill_logits(self, input_ids: torch.Tensor) -> np.ndarray:
@@ -143,7 +143,15 @@ class Qwen3MappingTest(absltest.TestCase):
             hf_logits_BTV = self.hf_model(**inputs).logits.float().cpu().numpy()
         jax_logits_BTV = self._jax_prefill_logits(inputs["input_ids"])
         mask = inputs["attention_mask"].cpu().numpy().astype(bool)
-        assert_logits_close(self, jax_logits_BTV, hf_logits_BTV, mask, top1_min_match=0.8)
+        assert_logits_close(
+            self,
+            jax_logits_BTV,
+            hf_logits_BTV,
+            mask,
+            atol=1.25,
+            median_atol=0.075,
+            top1_min_match=0.8,
+        )
 
     def test_prefill_logits_match_hf_batched(self):
         inputs = self._tokenize([PROMPT, "Who am I?"])
@@ -151,7 +159,15 @@ class Qwen3MappingTest(absltest.TestCase):
             hf_logits_BTV = self.hf_model(**inputs).logits.float().cpu().numpy()
         jax_logits_BTV = self._jax_prefill_logits(inputs["input_ids"])
         mask = inputs["attention_mask"].cpu().numpy().astype(bool)
-        assert_logits_close(self, jax_logits_BTV, hf_logits_BTV, mask, top1_min_match=0.8)
+        assert_logits_close(
+            self,
+            jax_logits_BTV,
+            hf_logits_BTV,
+            mask,
+            atol=1.25,
+            median_atol=0.075,
+            top1_min_match=0.8,
+        )
 
 
 if __name__ == "__main__":

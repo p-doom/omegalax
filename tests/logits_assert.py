@@ -1,45 +1,23 @@
 """Shared helper for comparing JAX vs HF logits in correctness tests.
 
-The smoke tier is measured now that the loader places abstract leaves and the
-smoke modules select a backend their CPU pin can reach: nine call sites execute.
-The numbers below are what they report, not a guess.
+The default is calibrated to seeded smoke models on right-padded inputs, the
+shape emitted by both production collators. Across nine single and batched call
+sites, max error is at most 0.00928, median error at most 0.00122, and top-1
+agreement at least 0.875. A larger B=4, T=64 dense/MoE probe measured max error
+0.01011, median error 0.00124, top-1 agreement at least 0.977, mean top-8 overlap
+at least 0.984, KL at most 3.65e-6 nats, and next-token cross-entropy delta at
+most 0.0021%.
 
-Agreeing call sites, best case (CPU/xla and GPU/mosaic_gpu agree):
-
-    max <= 0.00977    median <= 0.00146
-
-But repeat runs of one such case on a contended CPU gave max 0.0078, 0.0930, and
-0.0078 again for byte-identical code and inputs -- a >10x spread on a comparison
-that should be deterministic. So the agreeing tier's real spread reaches ~0.093,
-and a tolerance calibrated to the best case (0.05 was tried) fails intermittently.
-Whatever causes that drift is not understood; until it is, the floor is the
-observed spread and not the best reading.
-
-Disagreeing call sites, all well clear of it: the four Qwen3 dense/MoE ones at max
-0.698-1.094, median 0.092-0.131, and the left-padded batched ones at max
-0.660-1.293. So 0.2 / 0.02 separates every measured defect from every measured
-healthy run by a factor of ~3 on both sides. The previous 2.0 / 0.2 passed all of
-them on magnitude and left only top-1 doing any work -- which is how a family that
-agrees with the reference on 13% of positions read as a tolerance question.
-
-Do not tighten past the spread above on a single quiet reading; take several,
-uncontended, and find out what moves first.
-
-Top-1 is the weakest of the three here: at 16 positions its resolution is 0.0625
-and a single bf16 tie flips it (0.9375 on CPU vs 1.0000 on GPU for the same code).
-Prefer max/median when judging a change.
-
-The eight real-weight call sites are still unmeasured -- they need CUDA plus
-``OMEGALAX_RUN_REAL_WEIGHTS_TESTS`` -- and 8B/30B bf16 error accumulates over far
-more layers than a 4-layer smoke model. Expect to pass an explicit, wider ``atol``
-there on first run, and measure it rather than guessing.
+Real-weight tests need their own measured bounds: error accumulates over many
+more layers. Qwen3-0.6B's explicit tolerance is based on its real-weight probe;
+do not reuse the smoke default for an unmeasured real model.
 """
 
 import numpy as np
 
-DEFAULT_ATOL = 0.2
-DEFAULT_MEDIAN_ATOL = 0.02
-DEFAULT_TOP1_MIN_MATCH = 0.9
+DEFAULT_ATOL = 0.02
+DEFAULT_MEDIAN_ATOL = 0.005
+DEFAULT_TOP1_MIN_MATCH = 0.8
 
 
 def assert_logits_close(

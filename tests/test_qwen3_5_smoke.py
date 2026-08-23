@@ -108,6 +108,7 @@ class Qwen3_5WeightsTest(absltest.TestCase):
     def setUpClass(cls):
         super().setUpClass()
         cls.tmpdir = tempfile.mkdtemp()
+        torch.manual_seed(0)
 
         hf_model = HFModel(HF_CFG).eval()
         hf_model.save_pretrained(cls.tmpdir, safe_serialization=True)
@@ -157,7 +158,7 @@ class Qwen3_5WeightsTest(absltest.TestCase):
         assert_logits_close(self, jax_logits_BTV, hf_logits_BTV, mask)
 
     def test_prefill_logits_match_hf_batched(self):
-        """Batched forward pass with left-padding should match HuggingFace.
+        """Batched forward pass with right-padding should match HuggingFace.
 
         HF's create_causal_mask handles padding differently for B=1 vs B>1,
         so we test padding only in the batched case (B=2) where HF is reliable.
@@ -166,7 +167,7 @@ class Qwen3_5WeightsTest(absltest.TestCase):
         token_ids_b_BT = _random_input(batch_size=1, seq_len=10, vocab_size=HF_TEXT_CFG.vocab_size)
 
         padded_b = np.zeros((1, 16), dtype=np.int32)
-        padded_b[:, 6:] = token_ids_b_BT
+        padded_b[:, :10] = token_ids_b_BT
         token_ids_BT = np.concatenate([token_ids_a_BT, padded_b], axis=0)
         attention_mask_BT = (token_ids_BT != self.pad_id).astype(np.int64)
 

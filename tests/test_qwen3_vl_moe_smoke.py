@@ -37,6 +37,7 @@ class Qwen3VLMoeSmokeTest(absltest.TestCase):
     def setUpClass(cls):
         super().setUpClass()
         cls.tmpdir = tempfile.mkdtemp()
+        torch.manual_seed(0)
 
         vision_cfg = {
             "hidden_size": 64,
