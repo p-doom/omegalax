@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import jax
 import jax.numpy as jnp
 from flax import nnx
 
@@ -51,8 +52,8 @@ def export_model_to_hf(model, cfg, out_dir: str | Path) -> Path:
     )
 
 
-def param_fingerprint(model) -> dict[str, float]:
-    """Per-leaf sum over every parameter, for comparing a model against the base it came from.
+def param_fingerprint(model) -> dict[str, int]:
+    """Per-leaf checksum for comparing a model against the base it came from.
 
     Device-side reduction, so it costs one pass and no host transfer of the
     weights. Compared before-restore against after-merge it answers the only
@@ -60,12 +61,20 @@ def param_fingerprint(model) -> dict[str, float]:
     actually change the weights we are about to write? ``partial_restore=True``
     drops leaves it cannot path-match without raising, and a LoRA adapter that
     never got merged leaves the base kernels untouched -- both produce a
-    byte-perfect export of the pretrained model.
+    base-identical export.
     """
+
+    def checksum(leaf) -> int:
+        # Mixing bits before reduction prevents equal-and-opposite updates from cancelling.
+        bits = jax.lax.bitcast_convert_type(leaf.astype(jnp.float32), jnp.uint32)
+        bits = bits ^ (bits >> jnp.uint32(16))
+        bits *= jnp.uint32(0x7FEB352D)
+        bits ^= bits >> jnp.uint32(15)
+        return int(jnp.sum(bits, dtype=jnp.uint32))
+
     _, state = nnx.split(model)
     return {
-        key: float(jnp.sum(leaf.astype(jnp.float32)))
-        for key, leaf in flatten_pure_state(nnx.to_pure_dict(state)).items()
+        key: checksum(leaf) for key, leaf in flatten_pure_state(nnx.to_pure_dict(state)).items()
     }
 
 
