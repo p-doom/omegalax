@@ -183,10 +183,13 @@ def _write_lora_metadata(save_dir: Path, train_cfg: TrainConfig) -> None:
     """
     import json
 
+    # A full-FT recipe sets no rank, so coercing one here crashed every full-FT
+    # run before its first step. The reader requires the keys to exist, not to
+    # hold numbers, and only reads them when enable_lora is true.
     meta = {
         "enable_lora": bool(train_cfg.enable_lora),
-        "lora_rank": int(train_cfg.lora_rank),
-        "lora_alpha": float(train_cfg.lora_alpha),
+        "lora_rank": int(train_cfg.lora_rank) if train_cfg.enable_lora else None,
+        "lora_alpha": float(train_cfg.lora_alpha) if train_cfg.enable_lora else None,
     }
     (Path(save_dir) / "lora_metadata.json").write_text(json.dumps(meta, indent=2))
 
