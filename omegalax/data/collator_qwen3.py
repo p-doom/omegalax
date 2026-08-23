@@ -251,6 +251,7 @@ class _MessageLengthFn(Qwen3RendererEncoder):
             vision_patches += t * h * w
         return {
             "length": int(len(encoded["input_ids"])),
+            "supervised_tokens": int(encoded["loss_mask"].sum()),
             "vision_tokens": vision_tokens,
             "vision_patches": vision_patches,
             "num_images": int(grid_thw.shape[0]),

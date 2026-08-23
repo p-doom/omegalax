@@ -483,8 +483,13 @@ class MessageLengthFnTest(absltest.TestCase):
         fn = make_message_length_fn(self.tokenizer)
         out = fn({"role": "user", "content": "hello world"})
         self.assertEqual(out["length"], 7)
+        self.assertEqual(out["supervised_tokens"], 0)
         self.assertEqual(out["vision_tokens"], 0)
         self.assertEqual(out["num_images"], 0)
+
+        message = {"role": "assistant", "content": "hello world"}
+        out = fn(message)
+        self.assertEqual(out["supervised_tokens"], int(fn.encode([message])["loss_mask"].sum()))
 
     def test_lengths_are_additive_at_message_boundaries(self):
         """The property the chunk index depends on: sum(per-message) == full."""
