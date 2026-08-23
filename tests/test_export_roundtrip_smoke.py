@@ -13,7 +13,7 @@ from absl.testing import absltest
 from flax import nnx
 
 from omegalax.distributed.mesh import mesh_rules_for
-from omegalax.export import model_config_to_hf_dict
+from omegalax.export import model_config_to_hf_dict, param_fingerprint
 from omegalax.models.params_utils import flatten_pure_state
 from omegalax.models.qwen3.config import make_config as make_qwen3_config
 from omegalax.models.qwen3.model import Qwen3
@@ -152,6 +152,16 @@ def _assert_params_equal(testcase: absltest.TestCase, model_a, model_b):
 
 
 class ExportRoundTripTest(absltest.TestCase):
+    def test_fingerprint_does_not_cancel_equal_and_opposite_changes(self):
+        with mesh_rules_for(tp_size=1, fsdp_size=1, dp_size=1):
+            cfg = make_qwen3_config("qwen3-smoke")
+            model = Qwen3(cfg, rngs=nnx.Rngs(params=jax.random.key(0)))
+        before = param_fingerprint(model)["lm_head.kernel"]
+        model.lm_head.kernel[0, 0] += 1.0
+        model.lm_head.kernel[0, 1] -= 1.0
+
+        self.assertNotEqual(param_fingerprint(model)["lm_head.kernel"], before)
+
     def test_qwen3_dense_round_trip(self):
         with mesh_rules_for(tp_size=1, fsdp_size=1, dp_size=1):
             cfg = make_qwen3_config("qwen3-smoke")
