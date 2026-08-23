@@ -3,8 +3,9 @@
 import contextlib
 import json
 import os
-from pathlib import Path
 import tempfile
+from pathlib import Path
+from unittest import mock
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
@@ -246,6 +247,29 @@ class TextSFTTrainingTest(absltest.TestCase):
 
 
 class VLMSFTTrainingTest(absltest.TestCase):
+    def test_checkpoint_saves_bound_host_staging(self):
+        handler = object()
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            mock.patch.object(
+                vlm_trainer.ocp.handlers,
+                "PyTreeCheckpointHandler",
+                return_value=handler,
+            ) as handler_cls,
+            mock.patch.object(vlm_trainer.ocp, "CheckpointManager") as manager_cls,
+        ):
+            vlm_trainer._make_checkpoint_manager(Path(tmpdir), save_interval=10)
+
+        handler_kwargs = handler_cls.call_args.kwargs
+        self.assertEqual(handler_kwargs["save_device_host_concurrent_gb"], 2)
+        self.assertFalse(handler_kwargs["is_prioritized_key_fn"](()))
+
+        manager_kwargs = manager_cls.call_args.kwargs
+        self.assertFalse(manager_kwargs["options"].enable_async_checkpointing)
+        registry = manager_kwargs["handler_registry"]
+        self.assertIs(registry.get("train_state", vlm_trainer.ocp.args.PyTreeSave), handler)
+        self.assertIs(registry.get("train_state", vlm_trainer.ocp.args.PyTreeRestore), handler)
+
     def test_one_step_sft_text_only(self):
         train_cfg = vlm_trainer.TrainConfig(
             seed=0,
