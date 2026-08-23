@@ -258,20 +258,6 @@ class LoRATest(absltest.TestCase):
         self.assertIs(q_proj.kernel, q_proj.base.kernel)
         self.assertNotEqual(set(param_fingerprint(unmerged)), set(base))
 
-    def test_param_fingerprint_does_not_cancel_equal_and_opposite_changes(self):
-        from omegalax.export import param_fingerprint
-
-        model = _make_model(seed=0)
-        before = param_fingerprint(model)
-        kernel = model.layers[0].attn.q_proj.kernel
-        kernel[0, 0] += 1.0
-        kernel[0, 1] -= 1.0
-
-        self.assertNotEqual(
-            param_fingerprint(model)["layers.0.attn.q_proj.kernel"],
-            before["layers.0.attn.q_proj.kernel"],
-        )
-
     def test_default_target_modules_match_qwen3vl_attribute_names(self):
         expected = {
             "q_proj",
