@@ -93,7 +93,7 @@ class Qwen3RopeDtypeTest(_RopeDtypeTestBase):
             attn(hidden, None, seg)
 
         self.assertLen(gen_calls, 1)
-        gen_out_sin, gen_out_cos = orig_gen(jnp.arange(T)[None, :], cfg.head_dim)
+        gen_out_sin, gen_out_cos = orig_gen(jnp.arange(T)[None, :], cfg.head_dim, cfg.rope_theta)
         self.assertEqual(
             gen_out_sin.dtype, jnp.float32, "generate_pos_embeddings must produce float32"
         )
