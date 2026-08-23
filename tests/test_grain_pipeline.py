@@ -83,12 +83,22 @@ class GrainPipelineTest(absltest.TestCase):
         )
         return [next(iterator) for _ in range(count)]
 
-    def _build_split(self, tmpdir, messages, max_length, marker=None, measure=_measure_one):
+    def _build_split(
+        self,
+        tmpdir,
+        messages,
+        max_length,
+        marker=None,
+        split_unit_ends=None,
+        measure=_measure_one,
+    ):
         src = Path(tmpdir) / "train.jsonl"
         cache = Path(tmpdir) / "message_lengths.jsonl"
         row = {"messages": messages}
         if marker is not None:
             row["_omegalax_carry_messages"] = marker
+        if split_unit_ends is not None:
+            row["_omegalax_split_unit_ends"] = split_unit_ends
         self._write_jsonl(src, [row])
         self._write_jsonl(
             cache,
@@ -335,9 +345,117 @@ class GrainPipelineTest(absltest.TestCase):
                     "total_measured": 2,
                     "kept": 2,
                     "dropped": 0,
+                    "repeated": 0,
+                    "emitted": 2,
                     "dropped_fraction": 0.0,
                 },
             )
+
+    def test_split_keeps_marked_units_indivisible(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            messages = [
+                _measured("system", "context"),
+                _measured("user", "observation-1"),
+                _measured("assistant", "action-1"),
+                _measured("user", "observation-2"),
+                _measured("assistant", "action-2"),
+                _measured("user", "observation-3"),
+                _measured("assistant", "action-3"),
+            ]
+            _, records = self._build_split(
+                tmpdir,
+                messages,
+                4,
+                marker=[0],
+                split_unit_ends=[1, 3, 5, 7],
+                measure=_measure_declared,
+            )
+            self.assertEqual(
+                [[message["content"] for message in record["messages"]] for record in records],
+                [
+                    ["context", "observation-1", "action-1"],
+                    ["context", "observation-2", "action-2"],
+                    ["context", "observation-3", "action-3"],
+                ],
+            )
+            for record in records:
+                noncarry = record["messages"][1:]
+                self.assertEqual([message["role"] for message in noncarry], ["user", "assistant"])
+                self.assertNotIn("_omegalax_split_unit_ends", record)
+
+    def test_split_prefix_truncates_before_an_impossible_unit(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            messages = [
+                _measured("system", "context", 2),
+                _measured("user", "observation-1"),
+                _measured("assistant", "action-1"),
+                _measured("user", "observation-2", 2),
+                _measured("assistant", "action-2"),
+            ]
+            records_dir, records = self._build_split(
+                tmpdir,
+                messages,
+                4,
+                marker=[0],
+                split_unit_ends=[1, 3, 5],
+                measure=_measure_declared,
+            )
+            self.assertEqual(
+                [[message["content"] for message in record["messages"]] for record in records],
+                [["context", "observation-1", "action-1"]],
+            )
+            stats = json.loads((records_dir / "truncation_stats.json").read_text())
+            self.assertEqual(stats["messages"]["dropped"], 2)
+            self.assertEqual(stats["tokens"]["dropped"], 3)
+            self.assertEqual(stats["supervision"]["dropped"], 1)
+
+    def test_split_reports_repeated_supervision_from_carried_messages(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            messages = [
+                _measured("user", "observation-1"),
+                _measured("assistant", "action-1"),
+                _measured("user", "observation-2"),
+                _measured("assistant", "action-2"),
+                _measured("user", "observation-3"),
+                _measured("assistant", "action-3"),
+            ]
+            records_dir, records = self._build_split(
+                tmpdir,
+                messages,
+                3,
+                marker=[1],
+                split_unit_ends=[2, 4, 6],
+                measure=_measure_declared,
+            )
+            self.assertEqual(len(records), 3)
+            stats = json.loads((records_dir / "truncation_stats.json").read_text())
+            self.assertEqual(
+                stats["supervision"],
+                {
+                    "basis": "loss_mask",
+                    "total_measured": 3,
+                    "kept": 3,
+                    "dropped": 0,
+                    "repeated": 2,
+                    "emitted": 5,
+                    "dropped_fraction": 0.0,
+                },
+            )
+
+    def test_split_rejects_unit_boundaries_that_do_not_partition_the_row(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            messages = [
+                _measured("user", "observation"),
+                _measured("assistant", "action"),
+            ]
+            with self.assertRaisesRegex(ValueError, "exclusive message offsets ending at 2"):
+                self._build_split(
+                    tmpdir,
+                    messages,
+                    4,
+                    split_unit_ends=[1],
+                    measure=_measure_declared,
+                )
 
     def test_carried_image_measurements_remain_aligned_with_emitted_messages(self):
         with tempfile.TemporaryDirectory() as tmpdir:
