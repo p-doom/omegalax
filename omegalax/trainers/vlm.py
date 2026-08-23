@@ -151,10 +151,12 @@ def _make_checkpoint_manager(
     """
     save_dir = Path(save_dir).expanduser().resolve()
     handler_registry = ocp.handlers.DefaultCheckpointHandlerRegistry()
-    handler_registry.add("train_state", ocp.args.PyTreeSave, ocp.handlers.PyTreeCheckpointHandler)
-    handler_registry.add(
-        "train_state", ocp.args.PyTreeRestore, ocp.handlers.PyTreeCheckpointHandler
+    train_state_handler = ocp.handlers.PyTreeCheckpointHandler(
+        save_device_host_concurrent_gb=2,
+        is_prioritized_key_fn=lambda _: False,
     )
+    handler_registry.add("train_state", ocp.args.PyTreeSave, train_state_handler)
+    handler_registry.add("train_state", ocp.args.PyTreeRestore, train_state_handler)
     checkpoint_utils.register_grain_iterator_handler(handler_registry)
     preservation_policy = None
     if keep_period:
@@ -167,6 +169,7 @@ def _make_checkpoint_manager(
         step_format_fixed_length=6,
         cleanup_tmp_directories=True,
         preservation_policy=preservation_policy,
+        enable_async_checkpointing=False,
     )
     return ocp.CheckpointManager(save_dir, options=options, handler_registry=handler_registry)
 
