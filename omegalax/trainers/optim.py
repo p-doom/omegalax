@@ -9,10 +9,20 @@ import optax
 from flax import nnx
 
 
+@jax.jit
+def initialize_gradient_sum(gradients):
+    """Start the device accumulator by upcasting every microgradient to fp32."""
+    return jax.tree.map(lambda gradient: gradient.astype(jnp.float32), gradients)
+
+
 @jax.jit(donate_argnums=0)
 def accumulate_gradient_sum(gradient_sum, gradients):
-    """Add one microbatch's unnormalized gradients to a donated device accumulator."""
-    return jax.tree.map(jnp.add, gradient_sum, gradients)
+    """Add one fp32-upcast microgradient to a donated device accumulator."""
+    return jax.tree.map(
+        lambda total, gradient: total + gradient.astype(jnp.float32),
+        gradient_sum,
+        gradients,
+    )
 
 
 @nnx.jit(donate_argnums=(0, 1))
@@ -23,13 +33,21 @@ def _apply_normalized_gradient_sum(optimizer, gradient_sum, supervised_tokens):
     return grad_norm
 
 
-def apply_normalized_gradient_sum(optimizer, gradient_sum, supervised_tokens):
+def apply_normalized_gradient_sum(
+    optimizer, gradient_sum, supervised_tokens, auxiliary_loss_abs_sum
+):
     """Normalize once by the global token count, then perform one optimizer update."""
     count = np.asarray(jax.device_get(supervised_tokens))
     if count.shape != () or not np.isfinite(count).item() or count.item() <= 0:
         raise ValueError(
             "Accumulated masked CE total supervised-token count must be positive and finite; "
             f"got {count!r}."
+        )
+    auxiliary = np.asarray(jax.device_get(auxiliary_loss_abs_sum))
+    if auxiliary.shape != () or not np.isfinite(auxiliary).item() or auxiliary.item() != 0.0:
+        raise ValueError(
+            "Accumulated router auxiliary loss must be finite and exactly zero before the "
+            f"optimizer update; got absolute sum {auxiliary!r}."
         )
     return _apply_normalized_gradient_sum(optimizer, gradient_sum, supervised_tokens)
 

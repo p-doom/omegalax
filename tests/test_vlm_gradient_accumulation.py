@@ -16,29 +16,29 @@ from absl.testing import absltest
 from flax import nnx
 
 from omegalax.models.qwen3_vl import make_vl_config
+from omegalax.models.sharding_runtime import set_attn_backend
 from omegalax.trainers import vlm as vlm_trainer
 from omegalax.trainers.loss import chunked_cross_entropy_loss, chunked_cross_entropy_loss_sum
 from omegalax.trainers.optim import (
     MixedPrecisionOptimizer,
     accumulate_gradient_sum,
     apply_normalized_gradient_sum,
+    initialize_gradient_sum,
 )
 from omegalax.trainers.vlm import require_zero_router_aux_loss
 
 
 class _TinyModel(nnx.Module):
-    def __init__(self):
-        self.weight = nnx.Param(
-            jnp.array([[0.75, -0.25, 0.5], [-0.4, 0.6, 0.2]], dtype=jnp.float32)
-        )
+    def __init__(self, dtype=jnp.float32):
+        self.weight = nnx.Param(jnp.array([[0.75, -0.25, 0.5], [-0.4, 0.6, 0.2]], dtype=dtype))
 
 
-def _make_optimizer(*, clip_norm: float = 0.0) -> MixedPrecisionOptimizer:
+def _make_optimizer(*, clip_norm: float = 0.0, dtype=jnp.float32) -> MixedPrecisionOptimizer:
     chain = []
     if clip_norm:
         chain.append(optax.clip_by_global_norm(clip_norm))
     chain.append(optax.adamw(0.03, b1=0.8, b2=0.9, weight_decay=0.02))
-    return MixedPrecisionOptimizer(_TinyModel(), optax.chain(*chain))
+    return MixedPrecisionOptimizer(_TinyModel(dtype=dtype), optax.chain(*chain))
 
 
 def _micro_gradient(optimizer, hidden, targets, mask):
@@ -65,6 +65,70 @@ def _assert_tree_allclose(testcase, actual, expected, *, atol=1e-7):
 
 
 class VLMGradientAccumulationTest(absltest.TestCase):
+    def test_bf16_microgradients_accumulate_in_fp32_before_cancellation(self):
+        candidate = _make_optimizer(clip_norm=0.15, dtype=jnp.bfloat16)
+        reference = _make_optimizer(clip_norm=0.15, dtype=jnp.bfloat16)
+        micros = (
+            (
+                jnp.array(
+                    [[[1.0, 0.5], [-0.5, 1.0], [0.25, -1.0], [1.5, 0.5]]],
+                    dtype=jnp.float32,
+                ),
+                jnp.array([[0, 1, 2, 1]], dtype=jnp.int32),
+                jnp.array([[0.0, 0.0, 0.0, 1.0]], dtype=jnp.float32),
+            ),
+            (
+                jnp.array(
+                    [[[2.0, -1.0], [0.25, 1.5], [-1.0, -0.5], [0.5, 0.75]]],
+                    dtype=jnp.float32,
+                ),
+                jnp.array([[2, 0, 1, 2]], dtype=jnp.int32),
+                jnp.array([[0.0, 1.0, 1.0, 1.0]], dtype=jnp.float32),
+            ),
+        )
+
+        raw_gradients = []
+        total_supervised = jnp.array(0.0, dtype=jnp.float32)
+        for micro in micros:
+            (_, supervised_tokens), gradients = _micro_gradient(candidate, *micro)
+            raw_gradients.append(gradients)
+            total_supervised += supervised_tokens
+        self.assertTrue(
+            all(leaf.dtype == jnp.bfloat16 for leaf in jax.tree.leaves(raw_gradients[0]))
+        )
+
+        candidate_sum = initialize_gradient_sum(raw_gradients[0])
+        candidate_sum = accumulate_gradient_sum(candidate_sum, raw_gradients[1])
+        concatenated_fp32_sum = jax.tree.map(
+            lambda first, second: jnp.sum(
+                jnp.stack([first.astype(jnp.float32), second.astype(jnp.float32)]), axis=0
+            ),
+            raw_gradients[0],
+            raw_gradients[1],
+        )
+        naive_bf16_sum = jax.tree.map(jnp.add, raw_gradients[0], raw_gradients[1])
+
+        self.assertTrue(all(leaf.dtype == jnp.float32 for leaf in jax.tree.leaves(candidate_sum)))
+        for accumulated, first in zip(
+            jax.tree.leaves(candidate_sum), jax.tree.leaves(raw_gradients[0])
+        ):
+            self.assertEqual(accumulated.sharding, first.sharding)
+        self.assertTrue(
+            any(
+                not np.array_equal(
+                    np.asarray(naive, dtype=np.float32), np.asarray(fp32_accumulated)
+                )
+                for naive, fp32_accumulated in zip(
+                    jax.tree.leaves(naive_bf16_sum), jax.tree.leaves(concatenated_fp32_sum)
+                )
+            )
+        )
+
+        zero_aux = jnp.array(0.0, dtype=jnp.float32)
+        apply_normalized_gradient_sum(candidate, candidate_sum, total_supervised, zero_aux)
+        apply_normalized_gradient_sum(reference, concatenated_fp32_sum, total_supervised, zero_aux)
+        _assert_tree_allclose(self, _snapshot(candidate), _snapshot(reference), atol=0.0)
+
     def test_tiled_ce_sum_and_count_define_the_existing_mean(self):
         hidden = jnp.arange(2 * 7 * 2, dtype=jnp.float32).reshape(2, 7, 2) / 10.0
         kernel = jnp.array([[0.2, -0.3, 0.5], [0.7, 0.1, -0.4]], dtype=jnp.float32)
@@ -178,13 +242,16 @@ class VLMGradientAccumulationTest(absltest.TestCase):
         for micro in micros:
             (_, supervised_tokens), gradients = _micro_gradient(candidate, *micro)
             gradient_sum = (
-                gradients
+                initialize_gradient_sum(gradients)
                 if gradient_sum is None
                 else accumulate_gradient_sum(gradient_sum, gradients)
             )
             total_supervised += supervised_tokens
         candidate_grad_norm = apply_normalized_gradient_sum(
-            candidate, gradient_sum, total_supervised
+            candidate,
+            gradient_sum,
+            total_supervised,
+            jnp.array(0.0, dtype=jnp.float32),
         )
 
         def combined_objective(model):
@@ -218,7 +285,12 @@ class VLMGradientAccumulationTest(absltest.TestCase):
         )
 
         (_, supervised_tokens), gradient_sum = _micro_gradient(candidate, *micro)
-        apply_normalized_gradient_sum(candidate, gradient_sum, supervised_tokens)
+        apply_normalized_gradient_sum(
+            candidate,
+            initialize_gradient_sum(gradient_sum),
+            supervised_tokens,
+            jnp.array(0.0, dtype=jnp.float32),
+        )
 
         def direct_objective(model):
             hidden, targets, mask = micro
@@ -241,8 +313,64 @@ class VLMGradientAccumulationTest(absltest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "total supervised-token count must be positive"):
             apply_normalized_gradient_sum(
-                optimizer, zero_gradients, jnp.array(0.0, dtype=jnp.float32)
+                optimizer,
+                initialize_gradient_sum(zero_gradients),
+                jnp.array(0.0, dtype=jnp.float32),
+                jnp.array(0.0, dtype=jnp.float32),
             )
+
+        after = _snapshot(optimizer)
+        self.assertEqual(jax.tree.structure(before), jax.tree.structure(after))
+        for before_leaf, after_leaf in zip(jax.tree.leaves(before), jax.tree.leaves(after)):
+            np.testing.assert_array_equal(before_leaf, after_leaf)
+
+    def test_unexpected_runtime_aux_is_rejected_before_optimizer_mutation(self):
+        cfg = make_vl_config("qwen3-vl-smoke")
+        require_zero_router_aux_loss(cfg)
+        model, cfg = vlm_trainer.vlm_api.init_model(
+            cfg,
+            jax.random.key(3),
+            tp_size=1,
+            fsdp_size=1,
+            dp_size=1,
+        )
+        set_attn_backend(model, text_backend="xla")
+        mesh = vlm_trainer.ensure_mesh(tp_size=1, fsdp_size=1, dp_size=1)
+        with vlm_trainer.mesh_rules(mesh):
+            optimizer = vlm_trainer.build_optimizer(
+                model,
+                1e-3,
+                vlm_trainer.TrainConfig(batch_size=1, seq_len=4, num_steps=1),
+            )
+        gradient_step = vlm_trainer.make_sft_gradient_step(cfg, num_loss_tiles=1)
+        batch = {
+            "token_ids_BT": jnp.array([[11, 12, 13, 14]], dtype=jnp.int32),
+            "attention_mask_BT": jnp.ones((1, 4), dtype=jnp.int32),
+            "loss_mask_BT": jnp.array([[0, 0, 1, 1]], dtype=jnp.int32),
+        }
+        real_forward = vlm_trainer.vlm_api.forward
+
+        def forward_with_unexpected_aux(*args, **kwargs):
+            hidden, _ = real_forward(*args, **kwargs)
+            return hidden, jnp.array(0.125, dtype=jnp.float32)
+
+        before = _snapshot(optimizer)
+        with mock.patch.object(
+            vlm_trainer.vlm_api, "forward", side_effect=forward_with_unexpected_aux
+        ):
+            gradients, metrics = gradient_step(optimizer.model, batch)
+        for invalid_aux in (
+            jnp.abs(metrics["aux_loss"]),
+            jnp.array(jnp.nan, dtype=jnp.float32),
+            jnp.array(jnp.inf, dtype=jnp.float32),
+        ):
+            with self.assertRaisesRegex(ValueError, "router auxiliary loss must be finite"):
+                apply_normalized_gradient_sum(
+                    optimizer,
+                    initialize_gradient_sum(gradients),
+                    metrics["supervised_tokens"],
+                    invalid_aux,
+                )
 
         after = _snapshot(optimizer)
         self.assertEqual(jax.tree.structure(before), jax.tree.structure(after))

@@ -36,6 +36,7 @@ from omegalax.trainers.optim import (
     MixedPrecisionOptimizer,
     accumulate_gradient_sum,
     apply_normalized_gradient_sum,
+    initialize_gradient_sum,
 )
 from omegalax.trainers.perf import (
     StepFlops,
@@ -655,6 +656,7 @@ def run_sft(
         gradient_sum = None
         accum_ce_loss_sum = 0.0
         accum_aux_loss = 0.0
+        accum_aux_loss_abs = 0.0
         accum_sup_tokens = 0.0
         accum_total_tokens = 0.0
         accum_model_flops = 0.0
@@ -687,7 +689,7 @@ def run_sft(
             batch = vlm_api.shard_batch_dict(batch, model_cfg, mesh)
             gradients, metrics = sft_gradient_step(optimizer.model, batch)
             gradient_sum = (
-                gradients
+                initialize_gradient_sum(gradients)
                 if gradient_sum is None
                 else accumulate_gradient_sum(gradient_sum, gradients)
             )
@@ -695,6 +697,7 @@ def run_sft(
 
             accum_ce_loss_sum = accum_ce_loss_sum + metrics["ce_loss_sum"]
             accum_aux_loss = accum_aux_loss + metrics["aux_loss"]
+            accum_aux_loss_abs = accum_aux_loss_abs + jnp.abs(metrics["aux_loss"])
             accum_sup_tokens = accum_sup_tokens + metrics["supervised_tokens"]
             accum_total_tokens = accum_total_tokens + metrics["total_tokens"]
             accum_model_flops += micro_flops.model
@@ -703,7 +706,12 @@ def run_sft(
 
         if gradient_sum is None:
             raise RuntimeError("Gradient accumulation produced no microbatches.")
-        grad_norm = apply_normalized_gradient_sum(optimizer, gradient_sum, accum_sup_tokens)
+        grad_norm = apply_normalized_gradient_sum(
+            optimizer,
+            gradient_sum,
+            accum_sup_tokens,
+            accum_aux_loss_abs,
+        )
         accum_time += timer.step()
 
         if not _mem_logged_after_first_step:
