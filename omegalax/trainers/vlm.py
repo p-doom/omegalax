@@ -10,6 +10,7 @@ import gc
 import json
 import os
 import signal
+import stat
 import subprocess
 from pathlib import Path
 
@@ -57,6 +58,7 @@ from omegalax.trainers.text import startup_log
 from omegalax.vlm import api as vlm_api
 
 P = PartitionSpec
+_MAX_GRAIN_CHECKPOINT_BYTES = 16 * 1024 * 1024
 
 
 def require_zero_router_aux_loss(cfg) -> None:
@@ -431,11 +433,59 @@ def _sft_checkpoint_schema(
     }
 
 
-def _validate_iterator_restore(
+def _read_iterator_checkpoint(state_path: Path) -> bytes:
+    try:
+        fd = os.open(state_path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    except OSError as error:
+        raise ValueError(
+            f"Grain iterator checkpoint must be a readable no-follow regular file: {state_path}."
+        ) from error
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError(f"Grain iterator checkpoint is not a regular file: {state_path}.")
+        if before.st_size > _MAX_GRAIN_CHECKPOINT_BYTES:
+            raise ValueError(
+                f"Grain iterator checkpoint exceeds {_MAX_GRAIN_CHECKPOINT_BYTES} bytes: "
+                f"{state_path} has {before.st_size}."
+            )
+        chunks = []
+        remaining = before.st_size
+        while remaining:
+            chunk = os.read(fd, min(remaining, 64 * 1024))
+            if not chunk:
+                raise ValueError(f"Grain iterator checkpoint changed while reading: {state_path}.")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if os.read(fd, 1):
+            raise ValueError(f"Grain iterator checkpoint changed while reading: {state_path}.")
+        after = os.fstat(fd)
+        before_identity = (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        )
+        after_identity = (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        )
+        if after_identity != before_identity:
+            raise ValueError(f"Grain iterator checkpoint changed while reading: {state_path}.")
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def _restore_iterator_checkpoint(
     checkpoint_manager: ocp.CheckpointManager,
     step: int,
     input_iter: checkpoint_utils.GrainIterator,
-) -> None:
+) -> checkpoint_utils.GrainIterator:
     expected = _iterator_state(input_iter)
     process_index = jax.process_index()
     process_count = jax.process_count()
@@ -445,10 +495,17 @@ def _validate_iterator_restore(
         / "input_iter"
         / f"process_{process_index}-of-{process_count}.json"
     )
-    if not state_path.is_file():
-        raise ValueError(f"Checkpoint {step} has no Grain iterator state at {state_path}.")
-    restored = _parse_iterator_state(state_path.read_text())
+    raw_state = _read_iterator_checkpoint(state_path)
+    restored = _parse_iterator_state(raw_state.decode("utf-8"))
     _validate_json_schema(expected, restored)
+    if isinstance(input_iter, grain.DatasetIterator):
+        input_iter.set_state(restored)
+    elif isinstance(input_iter, grain.DataLoaderIterator):
+        input_iter.set_state(raw_state)
+    else:
+        raise TypeError(f"Unsupported Grain iterator type: {type(input_iter).__name__}.")
+    input_iter.start_prefetch()
+    return input_iter
 
 
 def _restore_sft_checkpoint(
@@ -497,21 +554,7 @@ def _restore_sft_checkpoint(
         )
     _validate_optimizer_restore(expected_state, train_state["optimizer"])
     _validate_rng_restore(rng, train_state["rng"])
-    _validate_iterator_restore(checkpoint_manager, step, input_iter)
-
-    restored_iterator = checkpoint_manager.restore(
-        step,
-        args=ocp.args.Composite(
-            input_iter=grain.checkpoint.CheckpointRestore(input_iter),
-        ),
-    )
-    if set(restored_iterator.keys()) != {"input_iter"}:
-        raise ValueError(
-            f"Checkpoint {step} iterator restore returned keys {sorted(restored_iterator.keys())}."
-        )
-    restored_input_iter = restored_iterator["input_iter"]
-    if restored_input_iter is not input_iter:
-        raise ValueError(f"Checkpoint {step} replaced the supplied Grain iterator.")
+    restored_input_iter = _restore_iterator_checkpoint(checkpoint_manager, step, input_iter)
 
     nnx.update(optimizer, train_state["optimizer"])
     return (

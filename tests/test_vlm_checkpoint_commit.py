@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import tempfile
 from pathlib import Path
+from unittest import mock
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
@@ -405,6 +406,88 @@ class CheckpointCommitTest(absltest.TestCase):
                         )
                     _assert_tree_equal(self, _snapshot(optimizer), before_optimizer)
                     self.assertEqual(iterator.get_state(), before_iterator)
+            manager.close()
+
+    def test_restore_rejects_symlinked_iterator_checkpoint(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = vlm._make_checkpoint_manager(Path(tmpdir), save_interval=1)
+            self._commit(manager, 1, vlm._CheckpointCommitMode.PERIODIC)
+            iterator_path = Path(tmpdir) / "000001/input_iter/process_0-of-1.json"
+            target_path = Path(tmpdir) / "iterator-target.json"
+            target_path.write_bytes(iterator_path.read_bytes())
+            iterator_path.unlink()
+            iterator_path.symlink_to(target_path)
+
+            optimizer = _optimizer()
+            iterator = _iterator()
+            before_optimizer = _snapshot(optimizer)
+            before_iterator = iterator.get_state()
+            with self.assertRaisesRegex(ValueError, "no-follow regular file"):
+                vlm._restore_sft_checkpoint(
+                    manager,
+                    optimizer,
+                    jax.random.key(0),
+                    1,
+                    iterator,
+                )
+            _assert_tree_equal(self, _snapshot(optimizer), before_optimizer)
+            self.assertEqual(iterator.get_state(), before_iterator)
+            manager.close()
+
+    def test_restore_rejects_oversized_iterator_checkpoint(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = vlm._make_checkpoint_manager(Path(tmpdir), save_interval=1)
+            self._commit(manager, 1, vlm._CheckpointCommitMode.PERIODIC)
+            iterator_path = Path(tmpdir) / "000001/input_iter/process_0-of-1.json"
+            os.truncate(iterator_path, vlm._MAX_GRAIN_CHECKPOINT_BYTES + 1)
+
+            optimizer = _optimizer()
+            iterator = _iterator()
+            before_optimizer = _snapshot(optimizer)
+            before_iterator = iterator.get_state()
+            with self.assertRaisesRegex(ValueError, "exceeds"):
+                vlm._restore_sft_checkpoint(
+                    manager,
+                    optimizer,
+                    jax.random.key(0),
+                    1,
+                    iterator,
+                )
+            _assert_tree_equal(self, _snapshot(optimizer), before_optimizer)
+            self.assertEqual(iterator.get_state(), before_iterator)
+            manager.close()
+
+    def test_restore_uses_validated_bytes_after_path_replacement(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = vlm._make_checkpoint_manager(Path(tmpdir), save_interval=1)
+            self._commit(manager, 1, vlm._CheckpointCommitMode.PERIODIC)
+            iterator_path = Path(tmpdir) / "000001/input_iter/process_0-of-1.json"
+            replacement_path = Path(tmpdir) / "iterator-replacement.json"
+            original_validate = vlm._validate_json_schema
+            replaced = False
+
+            def replace_path(expected, restored, path="input_iter"):
+                nonlocal replaced
+                if not replaced:
+                    replacement_path.write_text('{"next_index": 3}')
+                    os.replace(replacement_path, iterator_path)
+                    replaced = True
+                return original_validate(expected, restored, path)
+
+            optimizer = _optimizer()
+            iterator = _iterator()
+            with mock.patch.object(vlm, "_validate_json_schema", side_effect=replace_path):
+                _, step, _, restored_iterator = vlm._restore_sft_checkpoint(
+                    manager,
+                    optimizer,
+                    jax.random.key(0),
+                    1,
+                    iterator,
+                )
+            self.assertEqual(step, 1)
+            self.assertTrue(replaced)
+            self.assertEqual(next(restored_iterator), 10)
+            self.assertEqual(iterator_path.read_text(), '{"next_index": 3}')
             manager.close()
 
     def test_vlm_resume_request_is_explicit(self):
