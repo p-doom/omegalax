@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import datetime
+import enum
 import gc
 import os
 import signal
@@ -214,16 +215,63 @@ def _write_lora_metadata(save_dir: Path, train_cfg: TrainConfig) -> None:
     (Path(save_dir) / "lora_metadata.json").write_text(json.dumps(meta, indent=2))
 
 
-def _save_sft_checkpoint(
+class _CheckpointCommitMode(enum.Enum):
+    PERIODIC = enum.auto()
+    FORCED = enum.auto()
+    REUSE = enum.auto()
+
+
+@dataclasses.dataclass(frozen=True)
+class _SFTCheckpointCommit:
+    step: int
+    optimizer: MixedPrecisionOptimizer
+    input_iter: checkpoint_utils.GrainIterator
+
+
+def _commit_sft_checkpoint(
     checkpoint_manager: ocp.CheckpointManager,
     optimizer: MixedPrecisionOptimizer,
     rng: jax.Array,
     step: int,
     input_iter: checkpoint_utils.GrainIterator,
-) -> None:
-    train_state = _train_state(optimizer, rng)
-    save_args = checkpoint_utils.make_grain_save_args(train_state, input_iter)
-    checkpoint_manager.save(step, args=save_args)
+    mode: _CheckpointCommitMode,
+    prior_commit: _SFTCheckpointCommit | None,
+) -> _SFTCheckpointCommit:
+    if mode is _CheckpointCommitMode.REUSE:
+        if (
+            prior_commit is None
+            or prior_commit.step != step
+            or prior_commit.optimizer is not optimizer
+            or prior_commit.input_iter is not input_iter
+        ):
+            raise ValueError(
+                "Checkpoint reuse requires a commit from the identical step, optimizer, "
+                "and train iterator boundary."
+            )
+        commit = prior_commit
+    elif mode in (_CheckpointCommitMode.PERIODIC, _CheckpointCommitMode.FORCED):
+        if prior_commit is not None:
+            raise ValueError("A new checkpoint save cannot reuse a prior commit.")
+        train_state = _train_state(optimizer, rng)
+        save_args = checkpoint_utils.make_grain_save_args(train_state, input_iter)
+        saved = checkpoint_manager.save(
+            step,
+            args=save_args,
+            force=mode is _CheckpointCommitMode.FORCED,
+        )
+        if saved is not True:
+            raise RuntimeError(f"Checkpoint manager did not save step {step}.")
+        commit = _SFTCheckpointCommit(step, optimizer, input_iter)
+    else:
+        raise ValueError(f"Unsupported checkpoint commit mode: {mode!r}.")
+
+    checkpoint_manager.wait_until_finished()
+    latest_step = checkpoint_manager.latest_step()
+    if latest_step != step:
+        raise RuntimeError(
+            f"Checkpoint commit mismatch: expected latest step {step}, got {latest_step}."
+        )
+    return commit
 
 
 def _restore_sft_checkpoint(
@@ -652,6 +700,7 @@ def run_sft(
 
     for step_idx in range(start_step, train_cfg.num_steps):
         step = step_idx + 1
+        checkpoint_commit = None
 
         gradient_sum = None
         accum_ce_loss_sum = 0.0
@@ -756,7 +805,15 @@ def run_sft(
             )
 
         if checkpoint_manager is not None and save_every and step % save_every == 0:
-            _save_sft_checkpoint(checkpoint_manager, optimizer, rng, step, data_iter)
+            checkpoint_commit = _commit_sft_checkpoint(
+                checkpoint_manager,
+                optimizer,
+                rng,
+                step,
+                data_iter,
+                _CheckpointCommitMode.PERIODIC,
+                None,
+            )
 
         if gc_period and step % gc_period == 0:
             gc.collect()
@@ -781,8 +838,19 @@ def run_sft(
         if requeue_requested:
             startup_log(f"[signal] saving checkpoint at step={step} and requeueing")
             if checkpoint_manager is not None:
-                _save_sft_checkpoint(checkpoint_manager, optimizer, rng, step, data_iter)
-                checkpoint_manager.wait_until_finished()
+                checkpoint_commit = _commit_sft_checkpoint(
+                    checkpoint_manager,
+                    optimizer,
+                    rng,
+                    step,
+                    data_iter,
+                    (
+                        _CheckpointCommitMode.REUSE
+                        if checkpoint_commit is not None
+                        else _CheckpointCommitMode.FORCED
+                    ),
+                    checkpoint_commit,
+                )
                 checkpoint_manager.close()
             slurm_job_id = os.environ.get("SLURM_JOB_ID")
             if slurm_job_id and is_primary_process:
@@ -795,8 +863,14 @@ def run_sft(
 
     if checkpoint_manager is not None:
         if last_metrics and (not save_every or last_metrics["step"] % save_every != 0):
-            _save_sft_checkpoint(
-                checkpoint_manager, optimizer, rng, int(last_metrics["step"]), data_iter
+            _commit_sft_checkpoint(
+                checkpoint_manager,
+                optimizer,
+                rng,
+                int(last_metrics["step"]),
+                data_iter,
+                _CheckpointCommitMode.FORCED,
+                None,
             )
         checkpoint_manager.wait_until_finished()
         checkpoint_manager.close()
