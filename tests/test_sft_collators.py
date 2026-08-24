@@ -15,9 +15,11 @@ from transformers import AutoImageProcessor
 from omegalax.data.collator_qwen3 import (
     TextSFTCollator,
     VLMSFTCollator,
-    _build_assistant_loss_mask,
 )
-from omegalax.data.qwen3_encoding import build_chatml_text as _build_chatml_text
+from omegalax.data.qwen3_encoding import (
+    build_chatml_text as _build_chatml_text,
+    encode_qwen_messages,
+)
 
 
 def _make_tokenizer():
@@ -138,65 +140,65 @@ class TextSFTCollatorTest(absltest.TestCase):
             collator(examples)
 
 
-class BuildAssistantLossMaskTest(absltest.TestCase):
-    """Direct tests for the token-scanning loss mask builder."""
+class StructuralLossMaskTest(absltest.TestCase):
+    """Tests for the structural assistant loss mask returned by encode_qwen_messages."""
 
     def setUp(self):
         super().setUp()
         self.tokenizer = _make_tokenizer()
-        self._im_start_id = self.tokenizer.convert_tokens_to_ids("<|im_start|>")
         self._im_end_id = self.tokenizer.convert_tokens_to_ids("<|im_end|>")
-        self._assistant_token_id = self.tokenizer.encode("assistant", add_special_tokens=False)[0]
 
-    def _apply_and_mask(self, messages):
-        result = self.tokenizer.apply_chat_template(
-            messages,
-            tokenize=True,
-            add_generation_prompt=False,
+    def _encode(self, messages):
+        encoded = encode_qwen_messages(messages, tokenizer=self.tokenizer)
+        return encoded["input_ids"], encoded["loss_mask"]
+
+    def test_mask_matches_input_length(self):
+        ids, mask = self._encode(
+            [
+                {"role": "user", "content": "Hello"},
+                {"role": "assistant", "content": "Hi!"},
+            ]
         )
-        ids = np.array(result["input_ids"], dtype=np.int32)
-        mask = _build_assistant_loss_mask(
-            ids,
-            self._im_start_id,
-            self._im_end_id,
-            self._assistant_token_id,
-        )
-        return ids, mask
+        self.assertEqual(len(ids), len(mask))
 
     def test_single_turn(self):
-        messages = [
-            {"role": "user", "content": "Hello"},
-            {"role": "assistant", "content": "Hi!"},
-        ]
-        ids, mask = self._apply_and_mask(messages)
+        ids, mask = self._encode(
+            [
+                {"role": "user", "content": "Hello"},
+                {"role": "assistant", "content": "Hi!"},
+            ]
+        )
         self.assertGreater(np.sum(mask), 0)
         # User tokens should not be supervised
         self.assertLess(np.sum(mask), len(ids))
 
     def test_multi_turn(self):
-        messages = [
-            {"role": "user", "content": "A"},
-            {"role": "assistant", "content": "B"},
-            {"role": "user", "content": "C"},
-            {"role": "assistant", "content": "D"},
-        ]
-        _, mask = self._apply_and_mask(messages)
+        _, mask = self._encode(
+            [
+                {"role": "user", "content": "A"},
+                {"role": "assistant", "content": "B"},
+                {"role": "user", "content": "C"},
+                {"role": "assistant", "content": "D"},
+            ]
+        )
         # Should have supervised tokens from both assistant turns
         self.assertGreater(np.sum(mask), 0)
 
     def test_no_assistant(self):
-        messages = [
-            {"role": "user", "content": "Hello"},
-        ]
-        _, mask = self._apply_and_mask(messages)
+        _, mask = self._encode(
+            [
+                {"role": "user", "content": "Hello"},
+            ]
+        )
         self.assertEqual(np.sum(mask), 0)
 
     def test_mask_includes_assistant_im_end(self):
-        messages = [
-            {"role": "user", "content": "X"},
-            {"role": "assistant", "content": "Y"},
-        ]
-        ids, mask = self._apply_and_mask(messages)
+        ids, mask = self._encode(
+            [
+                {"role": "user", "content": "X"},
+                {"role": "assistant", "content": "Y"},
+            ]
+        )
         # Assistant <|im_end|> should be supervised so the model learns to terminate.
         # User <|im_end|> should not be supervised.
         im_end_positions = np.where(ids == self._im_end_id)[0]
@@ -204,6 +206,83 @@ class BuildAssistantLossMaskTest(absltest.TestCase):
         self.assertEqual(mask[im_end_positions[0]], 0, "User <|im_end|> should not be supervised")
         # Second <|im_end|> is from assistant turn (supervised)
         self.assertEqual(mask[im_end_positions[1]], 1, "Assistant <|im_end|> should be supervised")
+
+    def test_header_tokens_not_supervised(self):
+        # The <|im_start|>assistant\n header must never be supervised — only the
+        # content and the terminating <|im_end|>.
+        im_start_id = self.tokenizer.convert_tokens_to_ids("<|im_start|>")
+        ids, mask = self._encode(
+            [
+                {"role": "user", "content": "Q"},
+                {"role": "assistant", "content": "A longer answer here."},
+            ]
+        )
+        for pos in np.where(ids == im_start_id)[0]:
+            self.assertEqual(mask[pos], 0, "<|im_start|> must not be supervised")
+            # role token and its trailing newline (the next two) are header, not content
+            self.assertEqual(mask[pos + 1], 0, "role token must not be supervised")
+            self.assertEqual(mask[pos + 2], 0, "header newline must not be supervised")
+
+
+class ChatMLLeakageTest(absltest.TestCase):
+    """Literal ChatML markers in user/context text must not corrupt the loss mask.
+
+    Regression for run lq3fgwvd (qwen3vl8b_fft_ds_v3_...): user/context text
+    containing literal ``<|im_start|>`` injected a spurious special token, which
+    broke the 1:1 start/end pairing of the old token-scanning mask so that later
+    user / image tokens were marked supervised (train/supervised_tokens spiked,
+    loss collapsed). The structural per-turn mask is immune to this.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.tokenizer = _make_tokenizer()
+        self._im_end_id = self.tokenizer.convert_tokens_to_ids("<|im_end|>")
+
+    def _supervised_count(self, messages):
+        return int(np.sum(encode_qwen_messages(messages, tokenizer=self.tokenizer)["loss_mask"]))
+
+    def test_literal_marker_in_user_text_keeps_supervised_count(self):
+        answer = "The scoring runs in three stages."
+        clean = [
+            {"role": "user", "content": "Trace the teacher scoring mechanism."},
+            {"role": "assistant", "content": answer},
+        ]
+        poisoned = [
+            {
+                "role": "user",
+                "content": (
+                    "Trace the teacher scoring mechanism.\n"
+                    "Chat format: Qwen-style <|im_start|> / <|im_end|> boundaries"
+                ),
+            },
+            {"role": "assistant", "content": answer},
+        ]
+        clean_sup = self._supervised_count(clean)
+        pois_sup = self._supervised_count(poisoned)
+        self.assertGreater(clean_sup, 0)
+        # The assistant answer is identical and the poison lives entirely in the
+        # user turn, so the supervised-token count must be unchanged.
+        self.assertEqual(pois_sup, clean_sup)
+
+    def test_only_final_assistant_im_end_supervised_with_injected_markers(self):
+        messages = [
+            {
+                "role": "user",
+                "content": "boundaries look like <|im_start|>assistant and <|im_end|>",
+            },
+            {"role": "assistant", "content": "Understood."},
+        ]
+        encoded = encode_qwen_messages(messages, tokenizer=self.tokenizer)
+        ids, mask = encoded["input_ids"], encoded["loss_mask"]
+        self.assertGreater(int(np.sum(mask)), 0)
+        # Only the assistant turn's terminating <|im_end|> (the last one) is
+        # supervised; every earlier <|im_end|> — the injected one and the user's
+        # own closer — must be masked out.
+        im_end_positions = np.where(ids == self._im_end_id)[0]
+        self.assertEqual(mask[im_end_positions[-1]], 1)
+        for pos in im_end_positions[:-1]:
+            self.assertEqual(mask[pos], 0)
 
 
 class BuildChatMLTextTest(absltest.TestCase):
@@ -317,6 +396,31 @@ class BuildChatMLTextTest(absltest.TestCase):
         self.assertEqual(ids.count(im_end_id), 2)
         n_expected = 1 * (4 // 2) * (4 // 2)  # = 4
         self.assertEqual(ids.count(image_pad_id), n_expected)
+
+    def test_per_block_encoding_matches_full_encoding(self):
+        """encode_qwen_messages ids must equal a single full tokenizer.encode.
+
+        Guards the additive property that structural per-turn masking relies on:
+        ``<|im_start|>``/``<|im_end|>`` are hard BPE split points, so concatenating
+        the per-block token ids must reproduce ``tokenizer.encode`` of the whole
+        ChatML string exactly — even when the text embeds literal ChatML markers.
+        """
+        conversations = [
+            [
+                {"role": "user", "content": "Hello there"},
+                {"role": "assistant", "content": "General Kenobi"},
+            ],
+            [
+                {"role": "system", "content": "sys prompt"},
+                {"role": "user", "content": "boundary <|im_start|>x<|im_end|> test"},
+                {"role": "assistant", "content": "ok <|im_end|> done"},
+            ],
+        ]
+        for messages in conversations:
+            text = _build_chatml_text(messages, image_grids=[], merge_size=2)
+            full = np.asarray(self.tokenizer.encode(text, add_special_tokens=False), dtype=np.int32)
+            got = encode_qwen_messages(messages, tokenizer=self.tokenizer)["input_ids"]
+            np.testing.assert_array_equal(got, full)
 
 
 class VLMSFTCollatorTest(absltest.TestCase):
@@ -442,6 +546,44 @@ class VLMSFTCollatorTest(absltest.TestCase):
         self.assertGreater(np.sum(mask), 0)
         attn = batch["attention_mask_BT"][0]
         self.assertLess(np.sum(mask), np.sum(attn))
+
+    def test_literal_chatml_in_user_text_does_not_supervise_image_pads(self):
+        """Regression (run lq3fgwvd): literal <|im_start|> in a user turn that also
+        carries an image must never flip that image's pad tokens to supervised."""
+        from PIL import Image
+
+        img = Image.new("RGB", (100, 100), color=(50, 50, 50))
+        poison_text = "Chat format: Qwen-style <|im_start|> / <|im_end|> boundaries"
+        answer = "Nothing special."
+
+        def _messages(user_text):
+            return [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": img},
+                        {"type": "text", "text": user_text},
+                    ],
+                },
+                {"role": "assistant", "content": answer},
+            ]
+
+        image_pad_id = self.tokenizer.convert_tokens_to_ids("<|image_pad|>")
+
+        poisoned = self.collator([{"messages": _messages(poison_text)}])
+        token_ids = poisoned["token_ids_BT"][0]
+        mask = poisoned["loss_mask_BT"][0]
+
+        n_pad = int(np.sum(token_ids == image_pad_id))
+        self.assertGreater(n_pad, 0, "sanity: the image should produce pad tokens")
+        # Not a single image pad token may be supervised.
+        self.assertEqual(int(np.sum(mask[token_ids == image_pad_id])), 0)
+
+        # And the assistant answer is supervised exactly as in the clean case —
+        # the poison in the user turn changes nothing about supervision.
+        clean = self.collator([{"messages": _messages("Describe the image.")}])
+        self.assertGreater(int(np.sum(mask)), 0)
+        self.assertEqual(int(np.sum(mask)), int(np.sum(clean["loss_mask_BT"][0])))
 
     def test_raises_on_overflow(self):
         from PIL import Image

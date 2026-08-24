@@ -19,43 +19,6 @@ from omegalax.data.qwen3_encoding import (
 )
 
 
-def _build_assistant_loss_mask(
-    input_ids: np.ndarray,
-    im_start_id: int,
-    im_end_id: int,
-    assistant_token_id: int,
-) -> np.ndarray:
-    """Mask with 1 on assistant-content tokens, 0 elsewhere.
-
-    ChatML ``<|im_start|>``/``<|im_end|>`` pair 1:1 in sequence order.
-    We find which pairs are assistant turns, then fill the content spans
-    via cumsum — no Python loops.
-    """
-    n = len(input_ids)
-    starts = np.where(input_ids == im_start_id)[0]
-    ends = np.where(input_ids == im_end_id)[0]
-    k = min(len(starts), len(ends))
-    if k == 0:
-        return np.zeros(n, dtype=np.int32)
-    starts, ends = starts[:k], ends[:k]
-
-    # Which <|im_start|> are followed by `assistant`?
-    is_asst = (starts + 1 < n) & (input_ids[starts + 1] == assistant_token_id)
-    # Content starts after <|im_start|> assistant \n  (3 tokens).
-    content_starts = starts[is_asst] + 3
-    content_ends = ends[is_asst]
-
-    # +1 at content start, -1 after <|im_end|> → cumsum gives the mask.
-    # content_ends points at <|im_end|> itself, which must be a supervised
-    # target so the model learns to terminate; the \n that follows is not.
-    signal = np.zeros(n, dtype=np.int32)
-    valid = content_starts < n
-    ends_plus_one = content_ends[valid] + 1
-    np.add.at(signal, content_starts[valid], 1)
-    np.add.at(signal, ends_plus_one[ends_plus_one < n], -1)
-    return np.cumsum(signal).astype(np.int32)
-
-
 class TextSFTCollator:
     """Collate Qwen ChatML chat examples into padded numpy arrays with loss masks.
 
@@ -69,10 +32,6 @@ class TextSFTCollator:
         assert tokenizer.pad_token_id is not None, (
             "tokenizer must have pad_token_id set (e.g. Qwen3-VL, Qwen3.5)"
         )
-
-        self._im_start_id = tokenizer.convert_tokens_to_ids("<|im_start|>")
-        self._im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
-        self._assistant_token_id = tokenizer.encode("assistant", add_special_tokens=False)[0]
 
     def __call__(self, examples: Sequence[dict[str, Any]]) -> dict[str, np.ndarray]:
         batch_ids: list[np.ndarray] = []
@@ -97,12 +56,9 @@ class TextSFTCollator:
             token_ids = np.array(full_ids, dtype=np.int32)
             attn_mask = np.ones(seq_len, dtype=np.int32)
 
-            loss_mask = _build_assistant_loss_mask(
-                token_ids,
-                self._im_start_id,
-                self._im_end_id,
-                self._assistant_token_id,
-            )
+            # Assistant loss mask built from message structure during encoding, so
+            # literal ChatML markers in user/context text can't leak supervision.
+            loss_mask = np.asarray(encoded["loss_mask"], dtype=np.int32)
 
             if pad_len > 0:
                 token_ids = np.pad(
@@ -248,10 +204,6 @@ class VLMSFTCollator:
             "tokenizer must have pad_token_id set (e.g. Qwen3-VL, Qwen3.5)"
         )
 
-        self._im_start_id = tokenizer.convert_tokens_to_ids("<|im_start|>")
-        self._im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
-        self._assistant_token_id = tokenizer.encode("assistant", add_special_tokens=False)[0]
-
         self._image_token_id = tokenizer.convert_tokens_to_ids("<|image_pad|>")
         self._video_token_id = tokenizer.convert_tokens_to_ids("<|video_pad|>")
         self._vision_start_token_id = tokenizer.convert_tokens_to_ids("<|vision_start|>")
@@ -299,12 +251,10 @@ class VLMSFTCollator:
             token_ids = np.array(full_ids, dtype=np.int32)
             attn_mask = np.ones(seq_len, dtype=np.int32)
 
-            loss_mask = _build_assistant_loss_mask(
-                token_ids,
-                self._im_start_id,
-                self._im_end_id,
-                self._assistant_token_id,
-            )
+            # Assistant loss mask built from message structure during encoding, so
+            # literal ChatML markers in user/context text can't leak supervision
+            # onto user turns or image pad tokens.
+            loss_mask = np.asarray(encoded["loss_mask"], dtype=np.int32)
 
             if pad_len > 0:
                 token_ids = np.pad(
