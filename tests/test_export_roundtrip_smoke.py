@@ -1,9 +1,7 @@
 """Round-trip export/import smoke tests for all supported families."""
 
-import importlib.util
 import os
 import tempfile
-from pathlib import Path
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
@@ -14,29 +12,22 @@ from flax import nnx
 
 from omegalax.distributed.mesh import mesh_rules_for
 from omegalax.export import model_config_to_hf_dict, param_fingerprint
+from omegalax.export_entry import resolve_export_step
 from omegalax.models.params_utils import flatten_pure_state
 from omegalax.models.qwen3.config import make_config as make_qwen3_config
-from omegalax.models.qwen3.model import Qwen3
 from omegalax.models.qwen3.loader import create_qwen3_from_safetensors
+from omegalax.models.qwen3.model import Qwen3
 from omegalax.models.qwen3.params import export_qwen3_to_safetensors
-from omegalax.models.qwen3_vl import Qwen3VL, make_vl_config
-from omegalax.models.qwen3_vl.params import (
-    create_qwen3_vl_from_safetensors,
-    export_qwen3_vl_to_safetensors,
-)
 from omegalax.models.qwen3_5 import Qwen3_5Config, Qwen3_5ForConditionalGeneration, make_config
 from omegalax.models.qwen3_5.params import (
     create_qwen3_5_from_safetensors,
     export_qwen3_5_to_safetensors,
 )
-
-
-_EXPORT_SCRIPT_SPEC = importlib.util.spec_from_file_location(
-    "export_to_hf", Path(__file__).parents[1] / "scripts" / "export_to_hf.py"
+from omegalax.models.qwen3_vl import Qwen3VL, make_vl_config
+from omegalax.models.qwen3_vl.params import (
+    create_qwen3_vl_from_safetensors,
+    export_qwen3_vl_to_safetensors,
 )
-assert _EXPORT_SCRIPT_SPEC is not None and _EXPORT_SCRIPT_SPEC.loader is not None
-export_to_hf = importlib.util.module_from_spec(_EXPORT_SCRIPT_SPEC)
-_EXPORT_SCRIPT_SPEC.loader.exec_module(export_to_hf)
 
 
 def _valid_export_step_env():
@@ -64,7 +55,7 @@ class ExportEntryTopologyTest(absltest.TestCase):
             "KEEP_ME": "yes",
         }
 
-        argv, child_env = export_to_hf._step_launch(
+        argv, child_env = resolve_export_step(
             env,
             ["scripts/export_to_hf.py", "--model_id=x"],
             "/venv/bin/python",
@@ -92,7 +83,7 @@ class ExportEntryTopologyTest(absltest.TestCase):
 
     def test_valid_single_task_step_runs_export_directly(self):
         self.assertIsNone(
-            export_to_hf._step_launch(
+            resolve_export_step(
                 _valid_export_step_env(),
                 ["scripts/export_to_hf.py"],
                 "/venv/bin/python",
@@ -110,7 +101,7 @@ class ExportEntryTopologyTest(absltest.TestCase):
         ]
         for update, match in cases:
             with self.subTest(update=update), self.assertRaisesRegex(ValueError, match):
-                export_to_hf._step_launch(
+                resolve_export_step(
                     {**_valid_export_step_env(), **update},
                     ["scripts/export_to_hf.py"],
                     "/venv/bin/python",
@@ -125,7 +116,7 @@ class ExportEntryTopologyTest(absltest.TestCase):
         }
 
         with self.assertRaisesRegex(ValueError, "1234.*5678"):
-            export_to_hf._step_launch(
+            resolve_export_step(
                 env,
                 ["scripts/export_to_hf.py"],
                 "/venv/bin/python",

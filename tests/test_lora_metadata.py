@@ -9,8 +9,8 @@ os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
 from absl.testing import absltest
 
+from omegalax.export import read_lora_metadata
 from omegalax.trainers import vlm as vlm_trainer
-from scripts.export_to_hf import _read_lora_metadata
 
 
 class LoraMetadataTest(absltest.TestCase):
@@ -36,7 +36,7 @@ class LoraMetadataTest(absltest.TestCase):
                     vlm_trainer._write_lora_metadata(save_dir, train_cfg)
                     raw = json.loads((save_dir / "lora_metadata.json").read_text())
                     self.assertEqual(raw, expected)
-                    self.assertEqual(_read_lora_metadata(save_dir), expected)
+                    self.assertEqual(read_lora_metadata(save_dir), expected)
 
                     if train_cfg.enable_lora:
                         self.assertIsInstance(raw["lora_rank"], int)

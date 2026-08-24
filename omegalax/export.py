@@ -24,6 +24,25 @@ from omegalax.models.qwen3_5.params import export_qwen3_5_to_safetensors, qwen3_
 from omegalax.trainers.lora import merge_lora_into_base
 
 
+def read_lora_metadata(save_dir: Path) -> dict:
+    """Return the LoRA settings persisted next to an Orbax checkpoint tree."""
+    import json
+
+    path = save_dir / "lora_metadata.json"
+    if not path.exists():
+        raise FileNotFoundError(
+            f"no lora_metadata.json next to the checkpoint at {save_dir}. Every "
+            "checkpoint written by omegalax.trainers.vlm has one; without it an "
+            "adapter checkpoint exports as the base model with no error. Write the "
+            "file from the training run's recipe (enable_lora, lora_rank, lora_alpha)."
+        )
+    metadata = json.loads(path.read_text())
+    missing = {"enable_lora", "lora_rank", "lora_alpha"} - metadata.keys()
+    if missing:
+        raise ValueError(f"{path} is missing {sorted(missing)}; refusing to guess a LoRA rank")
+    return metadata
+
+
 def export_model_to_hf(model, cfg, out_dir: str | Path) -> Path:
     """Route to the correct exporter based on model/config type.
 
