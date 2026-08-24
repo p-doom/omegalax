@@ -28,6 +28,17 @@ def _contract(tokenizer_digest: str = "a" * 64) -> dict:
     }
 
 
+def _measurement(length: int = 1) -> dict:
+    return {
+        "length": length,
+        "supervised_tokens": 0,
+        "vision_tokens": 0,
+        "vision_patches": 0,
+        "num_images": 0,
+        "image_grid_thw": [],
+    }
+
+
 class MessageLengthCacheContractTest(absltest.TestCase):
     def _write_chat(self, path: Path, contents: list[str]) -> None:
         with path.open("w") as f:
@@ -49,7 +60,9 @@ class MessageLengthCacheContractTest(absltest.TestCase):
             chat = Path(tmpdir) / "chat.jsonl"
             cache = Path(tmpdir) / "message_lengths.jsonl"
             self._write_chat(chat, ["aa", "bb"])
-            measurements = {(row, offset): 1 for row in range(2) for offset in range(2)}
+            measurements = {
+                (row, offset): _measurement() for row in range(2) for offset in range(2)
+            }
 
             _write_chat_message_lengths(cache, measurements, chat, _contract())
             header, loaded = _load_chat_message_lengths(cache)
@@ -62,7 +75,9 @@ class MessageLengthCacheContractTest(absltest.TestCase):
             chat = Path(tmpdir) / "chat.jsonl"
             cache = Path(tmpdir) / "message_lengths.jsonl"
             self._write_chat(chat, ["aa", "bb"])
-            measurements = {(row, offset): 1 for row in range(2) for offset in range(2)}
+            measurements = {
+                (row, offset): _measurement() for row in range(2) for offset in range(2)
+            }
             _write_chat_message_lengths(cache, measurements, chat, _contract())
             header, loaded = _load_chat_message_lengths(cache)
 
@@ -76,7 +91,9 @@ class MessageLengthCacheContractTest(absltest.TestCase):
             chat = Path(tmpdir) / "chat.jsonl"
             cache = Path(tmpdir) / "message_lengths.jsonl"
             self._write_chat(chat, ["aa", "bb"])
-            measurements = {(row, offset): 1 for row in range(2) for offset in range(2)}
+            measurements = {
+                (row, offset): _measurement() for row in range(2) for offset in range(2)
+            }
             _write_chat_message_lengths(cache, measurements, chat, _contract())
             header, loaded = _load_chat_message_lengths(cache)
 
@@ -90,7 +107,7 @@ class MessageLengthCacheContractTest(absltest.TestCase):
             chat = Path(tmpdir) / "chat.jsonl"
             cache = Path(tmpdir) / "message_lengths.jsonl"
             self._write_chat(chat, ["aa"])
-            measurements = {(0, 0): 1, (0, 1): 1}
+            measurements = {(0, 0): _measurement(), (0, 1): _measurement()}
             _write_chat_message_lengths(cache, measurements, chat, _contract())
             header, loaded = _load_chat_message_lengths(cache)
 
@@ -109,6 +126,41 @@ class MessageLengthCacheContractTest(absltest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "versioned header"):
                 _load_chat_message_lengths(cache)
+
+    def test_unsorted_or_extra_cache_row_rejects(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            chat = Path(tmpdir) / "chat.jsonl"
+            cache = Path(tmpdir) / "message_lengths.jsonl"
+            self._write_chat(chat, ["aa"])
+            _write_chat_message_lengths(
+                cache,
+                {(0, 0): _measurement(), (0, 1): _measurement()},
+                chat,
+                _contract(),
+            )
+            rows = cache.read_text().splitlines()
+            extra = json.loads(rows[2])
+            extra["unexpected"] = True
+            cache.write_text("\n".join([rows[0], json.dumps(extra), rows[1]]) + "\n")
+
+            with self.assertRaisesRegex(ValueError, "row schema|strictly sorted"):
+                _load_chat_message_lengths(cache)
+
+    def test_malformed_measurement_rejects(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            chat = Path(tmpdir) / "chat.jsonl"
+            cache = Path(tmpdir) / "message_lengths.jsonl"
+            self._write_chat(chat, ["aa"])
+            malformed = _measurement()
+            malformed["vision_patches"] = -1
+
+            with self.assertRaisesRegex(ValueError, "vision_patches"):
+                _write_chat_message_lengths(
+                    cache,
+                    {(0, 0): malformed, (0, 1): _measurement()},
+                    chat,
+                    _contract(),
+                )
 
 
 if __name__ == "__main__":

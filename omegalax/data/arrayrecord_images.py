@@ -60,7 +60,7 @@ def is_arrayrecord_image_uri(value: object) -> bool:
     return isinstance(value, str) and value.startswith(f"{_ARRAYRECORD_IMAGE_URI_SCHEME}://")
 
 
-def _parse_arrayrecord_image_uri(uri: str) -> tuple[Path, int]:
+def parse_arrayrecord_image_uri(uri: str) -> tuple[Path, int]:
     parsed = urlparse(uri)
     if parsed.scheme != _ARRAYRECORD_IMAGE_URI_SCHEME:
         raise ValueError(f"not an ArrayRecord image URI: {uri!r}")
@@ -80,7 +80,7 @@ def _parse_arrayrecord_image_uri(uri: str) -> tuple[Path, int]:
 
 
 def open_arrayrecord_image(uri: str) -> Image.Image:
-    shard_path, record_index = _parse_arrayrecord_image_uri(uri)
+    shard_path, record_index = parse_arrayrecord_image_uri(uri)
     key = str(shard_path)
     reader = _get_arrayrecord_image_reader(key)
     try:

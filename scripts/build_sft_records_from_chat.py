@@ -22,7 +22,6 @@ from transformers import AutoImageProcessor, AutoTokenizer
 from omegalax.data.artifact_contract import make_measurement_contract
 from omegalax.data.grain_pipeline import build_records_from_chat
 from omegalax.data.collator_qwen3 import make_message_length_fn
-from omegalax.registry import resolve_hf_repo_id
 
 FLAGS = flags.FLAGS
 
@@ -33,9 +32,14 @@ flags.DEFINE_string(
 flags.DEFINE_string(
     "model_id", None, "Model id used to resolve the default tokenizer.", required=True
 )
-flags.DEFINE_string("tokenizer", None, "HF tokenizer name/path (defaults to --model_id).")
 flags.DEFINE_string(
-    "processor", None, "HF repo to read image config from when the dataset contains images."
+    "tokenizer",
+    None,
+    "Absolute local sealed HF snapshot containing tokenizer assets.",
+    required=True,
+)
+flags.DEFINE_string(
+    "processor", None, "Absolute local sealed HF snapshot containing image processor assets."
 )
 flags.DEFINE_string(
     "preprocessor_config",
@@ -68,6 +72,11 @@ flags.DEFINE_string(
     "written there. Lets repeated builds over the same chat.jsonl (different "
     "max_length / overflow_mode) avoid re-tokenizing.",
 )
+flags.DEFINE_string(
+    "external_artifact_inventory",
+    None,
+    "Sealed JSON inventory for every ar:// ArrayRecord shard referenced by the chat.",
+)
 flags.DEFINE_float(
     "val_fraction",
     0.0,
@@ -92,8 +101,8 @@ flags.DEFINE_string(
 
 
 def main(_) -> None:
-    tokenizer_name = FLAGS.tokenizer or resolve_hf_repo_id(FLAGS.model_id)
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+    tokenizer_name = FLAGS.tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, local_files_only=True)
 
     image_processor = None
     processor_name = None
@@ -104,7 +113,7 @@ def main(_) -> None:
             with open(FLAGS.preprocessor_config) as f:
                 ip_kwargs = json.load(f)
         image_processor = AutoImageProcessor.from_pretrained(
-            processor_name, use_fast=False, **ip_kwargs
+            processor_name, use_fast=False, local_files_only=True, **ip_kwargs
         )
 
     measure_message = make_message_length_fn(tokenizer, image_processor)
@@ -128,6 +137,7 @@ def main(_) -> None:
         overflow_mode=FLAGS.overflow_mode,
         message_lengths_path=FLAGS.message_lengths_path,
         measurement_contract=measurement_contract,
+        external_artifact_inventory=FLAGS.external_artifact_inventory,
         val_fraction=FLAGS.val_fraction,
         split=FLAGS.split,
         profile_metadata={

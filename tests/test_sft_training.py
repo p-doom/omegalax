@@ -122,6 +122,20 @@ def _measure_one(message):
     return 1
 
 
+_TEST_MEASUREMENT_CONTRACT = {
+    "producer_sha": "1" * 40,
+    "tokenizer": {
+        "source": "test-tokenizer",
+        "revision": "2" * 40,
+        "behavior_sha256": "a" * 64,
+        "files": [{"path": "tokenizer.json", "size_bytes": 1, "sha256": "f" * 64}],
+    },
+    "processor": None,
+    "renderer": {"class": "test.Renderer", "config_sha256": "b" * 64},
+    "preprocessor": None,
+}
+
+
 def _make_grain_batch_iter(batch: dict[str, np.ndarray]):
     with tempfile.TemporaryDirectory() as tmpdir:
         src = Path(tmpdir) / "train.jsonl"
@@ -142,6 +156,7 @@ def _make_grain_batch_iter(batch: dict[str, np.ndarray]):
             Path(tmpdir) / "records",
             max_length=2,
             measure_message=_measure_one,
+            measurement_contract=_TEST_MEASUREMENT_CONTRACT,
             records_per_shard=1,
         )
         iterator = make_grain_iterator(

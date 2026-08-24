@@ -72,6 +72,20 @@ def _measured(role, content, length=1, vision_tokens=0):
     }
 
 
+def _cache_measurement(message, measure):
+    result = measure(message)
+    if isinstance(result, dict):
+        return result
+    return {
+        "length": result,
+        "supervised_tokens": result if message["role"] == "assistant" else 0,
+        "vision_tokens": 0,
+        "vision_patches": 0,
+        "num_images": 0,
+        "image_grid_thw": [],
+    }
+
+
 class GrainPipelineTest(absltest.TestCase):
     def _write_jsonl(self, path: Path, rows: list[dict]) -> None:
         with path.open("w") as f:
@@ -117,7 +131,7 @@ class GrainPipelineTest(absltest.TestCase):
         self._write_jsonl(src, [row])
         _write_chat_message_lengths(
             cache,
-            {(0, i): measure(message) for i, message in enumerate(messages)},
+            {(0, i): _cache_measurement(message, measure) for i, message in enumerate(messages)},
             src,
             _TEST_MEASUREMENT_CONTRACT,
         )
@@ -155,6 +169,7 @@ class GrainPipelineTest(absltest.TestCase):
                 Path(tmpdir) / "records",
                 max_length=3,
                 measure_message=_measure_one,
+                measurement_contract=_TEST_MEASUREMENT_CONTRACT,
                 records_per_shard=8,
             )
 
@@ -203,6 +218,7 @@ class GrainPipelineTest(absltest.TestCase):
                 Path(tmpdir) / "records",
                 max_length=3,
                 measure_message=_measure_one,
+                measurement_contract=_TEST_MEASUREMENT_CONTRACT,
                 records_per_shard=8,
                 overflow_mode="truncate",
             )
@@ -235,7 +251,8 @@ class GrainPipelineTest(absltest.TestCase):
                 )
             )
 
-            with self.assertRaisesRegex(ValueError, "inline-records dataset"):
+            (legacy / "metadata.json").chmod(0o440)
+            with self.assertRaisesRegex(ValueError, "compiled dataset schema"):
                 make_grain_iterator(
                     legacy,
                     batch_size=1,
@@ -274,6 +291,7 @@ class GrainPipelineTest(absltest.TestCase):
                 Path(tmpdir) / "records",
                 max_length=2,
                 measure_message=_measure_one,
+                measurement_contract=_TEST_MEASUREMENT_CONTRACT,
                 records_per_shard=8,
                 overflow_mode="split",
             )
@@ -356,7 +374,7 @@ class GrainPipelineTest(absltest.TestCase):
             self.assertEqual(
                 stats["supervision"],
                 {
-                    "basis": "assistant_message_length_estimate",
+                    "basis": "loss_mask",
                     "total_measured": 2,
                     "kept": 2,
                     "dropped": 0,
@@ -519,6 +537,7 @@ class GrainPipelineTest(absltest.TestCase):
                 Path(tmpdir) / "records",
                 max_length=2,
                 measure_message=_measure_one,
+                measurement_contract=_TEST_MEASUREMENT_CONTRACT,
                 records_per_shard=8,
                 overflow_mode="split",
             )
@@ -610,6 +629,7 @@ class GrainPipelineTest(absltest.TestCase):
                 Path(tmpdir) / "records",
                 max_length=2,
                 measure_message=_measure_one,
+                measurement_contract=_TEST_MEASUREMENT_CONTRACT,
                 records_per_shard=8,
                 overflow_mode="split",
             )
@@ -675,6 +695,7 @@ class GrainPipelineTest(absltest.TestCase):
                 # is satisfied (one chunk per session).
                 max_length=2,
                 measure_message=_measure_one,
+                measurement_contract=_TEST_MEASUREMENT_CONTRACT,
                 records_per_shard=8,
             )
 

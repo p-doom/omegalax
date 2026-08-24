@@ -22,12 +22,22 @@ import grain
 import jax
 
 from omegalax.data.artifact_contract import (
+    COMPILED_ARTIFACT_CONTRACT_VERSION,
+    COMPILED_DATASET_SCHEMA_VERSION,
     canonical_sha256,
     file_identity,
+    read_stable_regular_file,
+    validate_external_artifact_inventory,
     validate_measurement_contract,
+    validate_sha256,
+    verify_compiled_dataset,
+)
+from omegalax.data.arrayrecord_images import (
+    is_arrayrecord_image_uri,
+    parse_arrayrecord_image_uri,
 )
 
-COMPILED_DATASET_VERSION = 1
+COMPILED_DATASET_VERSION = COMPILED_DATASET_SCHEMA_VERSION
 COMPILED_METADATA_FILENAME = "metadata.json"
 TOKEN_STATS_FILENAME = "token_stats.json"
 TRUNCATION_STATS_FILENAME = "truncation_stats.json"
@@ -96,6 +106,33 @@ def _prepare_output_dir(out_dir: Path, *, overwrite: bool) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
 
+def _atomic_write_json(path: Path, value: Any) -> None:
+    fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(value, f, indent=2, sort_keys=True)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temporary_path, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+def _seal_compiled_output(out_dir: Path) -> None:
+    for path in out_dir.iterdir():
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(f"compiled output contains a non-regular entry: {path}")
+        path.chmod(0o440)
+    out_dir.chmod(0o550)
+
+
 def _write_arrayrecord_dataset(
     records: Iterable[dict[str, Any]],
     out_dir: Path,
@@ -110,6 +147,7 @@ def _write_arrayrecord_dataset(
     _prepare_output_dir(out_dir, overwrite=overwrite)
 
     shard_paths: list[str] = []
+    shard_record_counts: list[int] = []
     records_in_shard = 0
     total_records = 0
     shard_idx = 0
@@ -130,6 +168,7 @@ def _write_arrayrecord_dataset(
         for record in chain((first_record,), records_iter):
             if records_in_shard >= records_per_shard:
                 writer.close()
+                shard_record_counts.append(records_in_shard)
                 shard_idx += 1
                 writer = _open_writer(shard_idx)
                 records_in_shard = 0
@@ -140,8 +179,24 @@ def _write_arrayrecord_dataset(
             total_records += 1
     finally:
         writer.close()
+    shard_record_counts.append(records_in_shard)
 
     final_metadata = dict(metadata)
+    artifact_contract = final_metadata.get("artifact_contract")
+    if not isinstance(artifact_contract, dict):
+        raise ValueError("compiled dataset publication requires artifact_contract metadata")
+    shards = []
+    for relative_path, num_records in zip(shard_paths, shard_record_counts):
+        shards.append(
+            {
+                "path": relative_path,
+                **file_identity(out_dir / relative_path),
+                "num_records": num_records,
+                "max_record_index": num_records - 1,
+            }
+        )
+    artifact_contract["shards"] = shards
+    artifact_contract["shard_inventory_sha256"] = canonical_sha256(shards)
     final_metadata.update(
         {
             "version": COMPILED_DATASET_VERSION,
@@ -150,7 +205,7 @@ def _write_arrayrecord_dataset(
             "shard_paths": shard_paths,
         }
     )
-    (out_dir / COMPILED_METADATA_FILENAME).write_text(json.dumps(final_metadata, indent=2) + "\n")
+    _atomic_write_json(out_dir / COMPILED_METADATA_FILENAME, final_metadata)
     return out_dir
 
 
@@ -166,12 +221,8 @@ def resolve_arrayrecord_paths(path: str | Path) -> list[Path]:
                 f"Expected a compiled Grain shard ({ARRAY_RECORD_SUFFIX}) or dataset directory, got file: {path}"
             )
         return [path]
-    metadata_path = path / COMPILED_METADATA_FILENAME
-    assert metadata_path.is_file(), (
-        f"Compiled Grain dataset metadata does not exist: {metadata_path}"
-    )
-    metadata = json.loads(metadata_path.read_text())
-    shard_paths = [path / rel for rel in metadata["shard_paths"]]
+    metadata = verify_compiled_dataset(path)
+    shard_paths = [path / shard["path"] for shard in metadata["artifact_contract"]["shards"]]
 
     if not shard_paths:
         raise ValueError(f"No ArrayRecord shards found under: {path}")
@@ -183,10 +234,7 @@ def resolve_arrayrecord_paths(path: str | Path) -> list[Path]:
 
 def load_compiled_metadata(path: str | Path) -> dict[str, Any]:
     path = Path(path).expanduser().resolve()
-    metadata_path = path / COMPILED_METADATA_FILENAME
-    if not metadata_path.exists():
-        raise ValueError(f"Compiled Grain dataset metadata does not exist: {metadata_path}")
-    return json.loads(metadata_path.read_text())
+    return verify_compiled_dataset(path)
 
 
 def required_epochs_for_batches(
@@ -316,9 +364,8 @@ def _iter_chat_conversations(path: Path):
                 continue
             raw = json.loads(line)
             messages = raw["messages"]
-            assert isinstance(messages, list), (
-                f"Expected 'messages' to be a list at {path}:{line_num}"
-            )
+            if not isinstance(messages, list):
+                raise ValueError(f"Expected 'messages' to be a list at {path}:{line_num}")
             marker = raw.get(CARRY_KEY, [])
             valid = (
                 isinstance(marker, list)
@@ -453,6 +500,45 @@ def _message_lengths_header(chat_path: str | Path, measurement_contract: dict) -
     }
 
 
+def _validate_cached_measurement(measurement: Any, field: str) -> None:
+    required = {
+        "length",
+        "supervised_tokens",
+        "vision_tokens",
+        "vision_patches",
+        "num_images",
+        "image_grid_thw",
+    }
+    if not isinstance(measurement, dict) or set(measurement) != required:
+        raise ValueError(f"{field} has an invalid measurement schema")
+    for name in required - {"image_grid_thw"}:
+        value = measurement[name]
+        if type(value) is not int or value < 0:
+            raise ValueError(f"{field}.{name} must be a non-negative integer")
+    if measurement["supervised_tokens"] > measurement["length"]:
+        raise ValueError(f"{field}.supervised_tokens exceeds length")
+    grid = measurement["image_grid_thw"]
+    if not isinstance(grid, list) or len(grid) != measurement["num_images"]:
+        raise ValueError(f"{field}.image_grid_thw does not match num_images")
+    for index, row in enumerate(grid):
+        if (
+            not isinstance(row, list)
+            or len(row) != 3
+            or any(type(value) is not int or value <= 0 for value in row)
+        ):
+            raise ValueError(f"{field}.image_grid_thw[{index}] must contain three positive ints")
+
+
+def _validate_cache_key(key: Any, field: str) -> tuple[int, int]:
+    if (
+        not isinstance(key, tuple)
+        or len(key) != 2
+        or any(type(value) is not int or value < 0 for value in key)
+    ):
+        raise ValueError(f"{field} must be a pair of non-negative integers")
+    return key
+
+
 def _write_chat_message_lengths(
     path: str | Path,
     results: dict,
@@ -463,6 +549,9 @@ def _write_chat_message_lengths(
     path = Path(path).expanduser()
     path.parent.mkdir(parents=True, exist_ok=True)
     header = _message_lengths_header(chat_path, measurement_contract)
+    for key, measurement in results.items():
+        _validate_cache_key(key, "message-length cache key")
+        _validate_cached_measurement(measurement, f"message-length cache measurement {key}")
     fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     temporary_path = Path(temporary_name)
     try:
@@ -495,37 +584,67 @@ def _write_chat_message_lengths(
 def _load_chat_message_lengths(path: str | Path) -> tuple[dict, dict]:
     """Inverse of :func:`_write_chat_message_lengths`."""
     results: dict[tuple[int, int], Any] = {}
-    with Path(path).expanduser().open() as f:
-        first_line = f.readline()
-        if not first_line:
-            raise ValueError("message-length cache is empty")
-        first_row = json.loads(first_line)
-        header = first_row.get("header") if isinstance(first_row, dict) else None
-        if not isinstance(header, dict):
-            raise ValueError("message-length cache is missing its versioned header")
-        if (
-            header.get("type") != "omegalax_message_lengths"
-            or header.get("version") != MESSAGE_LENGTHS_VERSION
-        ):
-            raise ValueError(
-                f"unsupported message-length cache header: expected version {MESSAGE_LENGTHS_VERSION}"
-            )
-        identity = {
-            "source_chat": header.get("source_chat"),
-            "measurement_contract": header.get("measurement_contract"),
-        }
-        if header.get("contract_sha256") != canonical_sha256(identity):
-            raise ValueError("message-length cache header digest does not match its contents")
-        validate_measurement_contract(header.get("measurement_contract"))
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            row = json.loads(line)
-            key = (int(row["conv_idx"]), int(row["msg_offset"]))
-            if key in results:
-                raise ValueError(f"message-length cache contains duplicate key {key}")
-            results[key] = row["measurement"]
+    payload = read_stable_regular_file(path)
+    if not payload:
+        raise ValueError("message-length cache is empty")
+    if not payload.endswith(b"\n"):
+        raise ValueError("message-length cache must end with a newline")
+    try:
+        lines = payload.decode("utf-8").splitlines()
+    except UnicodeDecodeError as exc:
+        raise ValueError("message-length cache is not UTF-8") from exc
+    if not lines or any(not line for line in lines):
+        raise ValueError("message-length cache contains an empty row")
+    first_row = json.loads(lines[0])
+    if not isinstance(first_row, dict) or set(first_row) != {"header"}:
+        raise ValueError("message-length cache is missing its versioned header")
+    header = first_row["header"]
+    header_fields = {
+        "type",
+        "version",
+        "source_chat",
+        "measurement_contract",
+        "contract_sha256",
+    }
+    if not isinstance(header, dict) or set(header) != header_fields:
+        raise ValueError("message-length cache has an invalid versioned header schema")
+    if header["type"] != "omegalax_message_lengths" or header["version"] != MESSAGE_LENGTHS_VERSION:
+        raise ValueError(
+            f"unsupported message-length cache header: expected version {MESSAGE_LENGTHS_VERSION}"
+        )
+    source_chat = header["source_chat"]
+    if not isinstance(source_chat, dict) or set(source_chat) != {"size_bytes", "sha256"}:
+        raise ValueError("message-length cache source identity has an invalid schema")
+    if type(source_chat["size_bytes"]) is not int or source_chat["size_bytes"] < 0:
+        raise ValueError("message-length cache source size must be non-negative")
+    validate_sha256(source_chat["sha256"], "message-length cache source sha256")
+    validate_sha256(header["contract_sha256"], "message-length cache contract_sha256")
+    identity = {
+        "source_chat": source_chat,
+        "measurement_contract": header["measurement_contract"],
+    }
+    if header["contract_sha256"] != canonical_sha256(identity):
+        raise ValueError("message-length cache header digest does not match its contents")
+    validate_measurement_contract(header["measurement_contract"])
+    previous_key: tuple[int, int] | None = None
+    for row_number, line in enumerate(lines[1:], start=2):
+        row = json.loads(line)
+        if not isinstance(row, dict) or set(row) != {
+            "conv_idx",
+            "msg_offset",
+            "measurement",
+        }:
+            raise ValueError(f"message-length cache row schema is invalid at line {row_number}")
+        key = _validate_cache_key(
+            (row["conv_idx"], row["msg_offset"]), f"message-length cache line {row_number} key"
+        )
+        if previous_key is not None and key <= previous_key:
+            raise ValueError("message-length cache rows are not strictly sorted and unique")
+        _validate_cached_measurement(
+            row["measurement"], f"message-length cache line {row_number} measurement"
+        )
+        results[key] = row["measurement"]
+        previous_key = key
     return header, results
 
 
@@ -673,8 +792,10 @@ def _emit_truncation_stats(
     kept_tokens = total_message_tokens - dropped_tokens
     kept_supervised = total_supervised_tokens - dropped_supervised_tokens
     emitted_supervised = kept_supervised + repeated_supervised_tokens
-    assert emitted_tokens == kept_tokens + carried_tokens
-    assert total_supervised_tokens == kept_supervised + dropped_supervised_tokens
+    if emitted_tokens != kept_tokens + carried_tokens:
+        raise RuntimeError("emitted token accounting invariant failed")
+    if total_supervised_tokens != kept_supervised + dropped_supervised_tokens:
+        raise RuntimeError("supervision accounting invariant failed")
 
     summary = {
         "overflow_mode": overflow_mode,
@@ -814,10 +935,11 @@ def _process_conversation(
             return None
         chunk_msgs = carry_msgs + list(cur_msgs)
         chunk_len = carry_len + cur_len
-        assert chunk_len <= effective_max, (
-            f"emitted chunk over budget session={session_id} "
-            f"(carried={carry_len} + slice={cur_len} > effective_max={effective_max})"
-        )
+        if chunk_len > effective_max:
+            raise RuntimeError(
+                f"emitted chunk over budget session={session_id} "
+                f"(carried={carry_len} + slice={cur_len} > effective_max={effective_max})"
+            )
         example = dict(session_meta)
         example["messages"] = chunk_msgs
         example["_omegalax_session_id"] = session_id
@@ -895,11 +1017,12 @@ def _process_conversation(
                 for shape in grid:
                     image_shapes.append(str(tuple(shape)))
 
-        assert pending_len + unit_len <= effective_max, (
-            f"prefix-truncation pre-scan missed session={session_id} "
-            f"offset={unit_start} (unit_length={unit_len} + carried prefix {pending_len} "
-            f"> effective_max={effective_max})"
-        )
+        if pending_len + unit_len > effective_max:
+            raise RuntimeError(
+                f"prefix-truncation pre-scan missed session={session_id} "
+                f"offset={unit_start} (unit_length={unit_len} + carried prefix {pending_len} "
+                f"> effective_max={effective_max})"
+            )
 
         if not cur_msgs:
             pass
@@ -982,6 +1105,24 @@ def recording_split(recording_id: Any, val_fraction: float) -> str:
     return "val" if bucket < round(val_fraction * 1000) else "train"
 
 
+def _arrayrecord_references(messages: list[dict[str, Any]]) -> list[tuple[Path, int]]:
+    references: list[tuple[Path, int]] = []
+    for message in messages:
+        content = message.get("content", "")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") not in (
+                "image",
+                "image_url",
+            ):
+                continue
+            value = block.get("image", block.get("url"))
+            if is_arrayrecord_image_uri(value):
+                references.append(parse_arrayrecord_image_uri(value))
+    return references
+
+
 def build_records_from_chat(
     chat_path: str | Path,
     out_dir: str | Path,
@@ -995,6 +1136,7 @@ def build_records_from_chat(
     overflow_mode: str = "drop",
     message_lengths_path: str | Path | None = None,
     measurement_contract: dict[str, Any] | None = None,
+    external_artifact_inventory: dict[str, Any] | str | Path | None = None,
     val_fraction: float = 0.0,
     split: str | None = None,
     split_key: str = "recording_id",
@@ -1032,10 +1174,17 @@ def build_records_from_chat(
         raise ValueError(
             f"overflow_mode must be 'split', 'truncate', or 'drop', got {overflow_mode!r}"
         )
+    if not 0.0 <= val_fraction <= 1.0:
+        raise ValueError("val_fraction must be in [0, 1]")
+    if split not in (None, "train", "val"):
+        raise ValueError("split must be None, 'train', or 'val'")
+    if not isinstance(split_key, str) or not split_key:
+        raise ValueError("split_key must be a non-empty string")
 
     chat_path = Path(chat_path).expanduser().resolve()
     out_dir = Path(out_dir).expanduser().resolve()
     effective_max = max_length
+    validate_measurement_contract(measurement_contract)
 
     def _carry_of(carry: tuple[int, ...]) -> tuple[int, ...]:
         return carry if overflow_mode == "split" else ()
@@ -1047,6 +1196,80 @@ def build_records_from_chat(
         # conv_idx (and thus the cache key) is always over the full chat; this only
         # decides whether a conversation's records are emitted for this split.
         return split is None or recording_split(session_meta.get(split_key), val_fraction) == split
+
+    lineage_ids: set[str] = set()
+    references: list[tuple[Path, int]] = []
+    for _conv_idx, session_id, session_meta, messages in _iter_chat_conversations(chat_path):
+        if not _in_split(session_meta):
+            continue
+        lineage_id = session_meta.get(split_key)
+        if split is not None and (lineage_id is None or lineage_id == ""):
+            raise ValueError(
+                f"split={split!r} requires a non-empty {split_key!r} on every source row"
+            )
+        lineage_ids.add(session_id if lineage_id is None else str(lineage_id))
+        references.extend(_arrayrecord_references(messages))
+
+    external_contract = None
+    if references:
+        if external_artifact_inventory is None:
+            raise ValueError(
+                "chat rows contain ar:// image references but no external_artifact_inventory "
+                "was supplied"
+            )
+        inventory = (
+            json.loads(Path(external_artifact_inventory).expanduser().read_text())
+            if isinstance(external_artifact_inventory, (str, Path))
+            else external_artifact_inventory
+        )
+        inventory_by_path = validate_external_artifact_inventory(inventory, verify_files=True)
+        referenced_entries: dict[str, dict] = {}
+        root = Path(os.path.abspath(Path(inventory["root"])))
+        for shard_path, record_index in references:
+            absolute_path = os.path.abspath(shard_path.expanduser())
+            entry = inventory_by_path.get(absolute_path)
+            if entry is None:
+                raise ValueError(
+                    f"ArrayRecord reference is absent from external artifact inventory: {shard_path}"
+                )
+            if record_index > entry["max_record_index"]:
+                raise ValueError(
+                    f"ArrayRecord reference index {record_index} exceeds inventoried maximum "
+                    f"{entry['max_record_index']} for {shard_path}"
+                )
+            referenced_entries[entry["path"]] = entry
+        external_shards = [referenced_entries[path] for path in sorted(referenced_entries)]
+        external_identity = {
+            "schema_version": inventory["schema_version"],
+            "retention_pin_sha256": inventory["retention_pin_sha256"],
+            "shards": external_shards,
+        }
+        external_contract = {
+            **external_identity,
+            "root": str(root),
+            "inventory_sha256": canonical_sha256(external_identity),
+        }
+    elif external_artifact_inventory is not None:
+        raise ValueError("external_artifact_inventory was supplied but the chat has no ar:// refs")
+
+    artifact_contract: dict[str, Any] = {
+        "schema_version": COMPILED_ARTIFACT_CONTRACT_VERSION,
+        "producer_sha": measurement_contract["producer_sha"],
+        "source_chat": file_identity(chat_path),
+        "measurement_contract": measurement_contract,
+        "measurement_contract_sha256": canonical_sha256(measurement_contract),
+        "shards": [],
+        "shard_inventory_sha256": "",
+        "record_profile": {},
+        "lineage": {
+            "split": split or "unpartitioned",
+            "split_key": split_key,
+            "val_fraction": val_fraction,
+            "ids": sorted(lineage_ids),
+            "ids_sha256": canonical_sha256(sorted(lineage_ids)),
+        },
+        "external_dependencies": external_contract,
+    }
 
     precomputed = _resolve_chat_message_lengths(
         chat_path,
@@ -1214,6 +1437,12 @@ def build_records_from_chat(
             if res["examples"]:
                 _session_chunk_counts[session_id] = len(res["examples"])
             yield from res["examples"]
+        artifact_contract["record_profile"] = {
+            "num_records": len(_chunk_lengths),
+            "max_measured_length": max(_chunk_lengths, default=0),
+            "max_vision_patches": max(_chunk_vision_patches, default=0),
+            "max_images": max(_chunk_num_images, default=0),
+        }
 
     out_path = _write_arrayrecord_dataset(
         _iter_records(),
@@ -1228,6 +1457,7 @@ def build_records_from_chat(
             "split": split,
             "val_fraction": val_fraction,
             "profile_metadata": profile_metadata or {},
+            "artifact_contract": artifact_contract,
         },
     )
 
@@ -1268,6 +1498,7 @@ def build_records_from_chat(
             image_shape_counts=_image_shape_counts,
         )
 
+    _seal_compiled_output(out_dir)
     return out_path
 
 
