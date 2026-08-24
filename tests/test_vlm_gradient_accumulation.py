@@ -64,6 +64,12 @@ def _assert_tree_allclose(testcase, actual, expected, *, atol=1e-7):
         np.testing.assert_allclose(actual_leaf, expected_leaf, rtol=0.0, atol=atol)
 
 
+def _assert_tree_equal(testcase, actual, expected):
+    testcase.assertEqual(jax.tree.structure(actual), jax.tree.structure(expected))
+    for actual_leaf, expected_leaf in zip(jax.tree.leaves(actual), jax.tree.leaves(expected)):
+        np.testing.assert_array_equal(actual_leaf, expected_leaf)
+
+
 class VLMGradientAccumulationTest(absltest.TestCase):
     def test_bf16_microgradients_accumulate_in_fp32_before_cancellation(self):
         candidate = _make_optimizer(clip_norm=0.15, dtype=jnp.bfloat16)
@@ -88,10 +94,12 @@ class VLMGradientAccumulationTest(absltest.TestCase):
         )
 
         raw_gradients = []
+        total_ce_loss = jnp.array(0.0, dtype=jnp.float32)
         total_supervised = jnp.array(0.0, dtype=jnp.float32)
         for micro in micros:
-            (_, supervised_tokens), gradients = _micro_gradient(candidate, *micro)
+            (ce_loss_sum, supervised_tokens), gradients = _micro_gradient(candidate, *micro)
             raw_gradients.append(gradients)
+            total_ce_loss += ce_loss_sum
             total_supervised += supervised_tokens
         self.assertTrue(
             all(leaf.dtype == jnp.bfloat16 for leaf in jax.tree.leaves(raw_gradients[0]))
@@ -125,8 +133,12 @@ class VLMGradientAccumulationTest(absltest.TestCase):
         )
 
         zero_aux = jnp.array(0.0, dtype=jnp.float32)
-        apply_normalized_gradient_sum(candidate, candidate_sum, total_supervised, zero_aux)
-        apply_normalized_gradient_sum(reference, concatenated_fp32_sum, total_supervised, zero_aux)
+        apply_normalized_gradient_sum(
+            candidate, candidate_sum, total_ce_loss, total_supervised, zero_aux
+        )
+        apply_normalized_gradient_sum(
+            reference, concatenated_fp32_sum, total_ce_loss, total_supervised, zero_aux
+        )
         _assert_tree_allclose(self, _snapshot(candidate), _snapshot(reference), atol=0.0)
 
     def test_tiled_ce_sum_and_count_define_the_existing_mean(self):
@@ -238,18 +250,21 @@ class VLMGradientAccumulationTest(absltest.TestCase):
         )
 
         gradient_sum = None
+        total_ce_loss = jnp.array(0.0, dtype=jnp.float32)
         total_supervised = jnp.array(0.0, dtype=jnp.float32)
         for micro in micros:
-            (_, supervised_tokens), gradients = _micro_gradient(candidate, *micro)
+            (ce_loss_sum, supervised_tokens), gradients = _micro_gradient(candidate, *micro)
             gradient_sum = (
                 initialize_gradient_sum(gradients)
                 if gradient_sum is None
                 else accumulate_gradient_sum(gradient_sum, gradients)
             )
+            total_ce_loss += ce_loss_sum
             total_supervised += supervised_tokens
         candidate_grad_norm = apply_normalized_gradient_sum(
             candidate,
             gradient_sum,
+            total_ce_loss,
             total_supervised,
             jnp.array(0.0, dtype=jnp.float32),
         )
@@ -284,10 +299,11 @@ class VLMGradientAccumulationTest(absltest.TestCase):
             jnp.array([[0.0, 1.0, 1.0]], dtype=jnp.float32),
         )
 
-        (_, supervised_tokens), gradient_sum = _micro_gradient(candidate, *micro)
+        (ce_loss_sum, supervised_tokens), gradient_sum = _micro_gradient(candidate, *micro)
         apply_normalized_gradient_sum(
             candidate,
             initialize_gradient_sum(gradient_sum),
+            ce_loss_sum,
             supervised_tokens,
             jnp.array(0.0, dtype=jnp.float32),
         )
@@ -306,23 +322,58 @@ class VLMGradientAccumulationTest(absltest.TestCase):
         reference.update(nnx.grad(direct_objective)(reference.model))
         _assert_tree_allclose(self, _snapshot(candidate), _snapshot(reference))
 
-    def test_zero_total_rejected_before_optimizer_mutation(self):
+    def test_invalid_loss_or_count_rejected_before_optimizer_mutation(self):
         optimizer = _make_optimizer(clip_norm=0.15)
         before = _snapshot(optimizer)
         zero_gradients = jax.tree.map(jnp.zeros_like, nnx.state(optimizer.model, nnx.Param))
 
-        with self.assertRaisesRegex(ValueError, "total supervised-token count must be positive"):
-            apply_normalized_gradient_sum(
-                optimizer,
-                initialize_gradient_sum(zero_gradients),
-                jnp.array(0.0, dtype=jnp.float32),
-                jnp.array(0.0, dtype=jnp.float32),
-            )
+        cases = (
+            ("negative loss", -1.0, 1.0, "CE loss sum"),
+            ("NaN loss", jnp.nan, 1.0, "CE loss sum"),
+            ("infinite loss", jnp.inf, 1.0, "CE loss sum"),
+            ("zero count", 1.0, 0.0, "supervised-token count"),
+            ("negative count", 1.0, -1.0, "supervised-token count"),
+            ("NaN count", 1.0, jnp.nan, "supervised-token count"),
+            ("infinite count", 1.0, jnp.inf, "supervised-token count"),
+        )
+        for name, loss, count, message in cases:
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, message):
+                apply_normalized_gradient_sum(
+                    optimizer,
+                    initialize_gradient_sum(zero_gradients),
+                    jnp.array(loss, dtype=jnp.float32),
+                    jnp.array(count, dtype=jnp.float32),
+                    jnp.array(0.0, dtype=jnp.float32),
+                )
+            _assert_tree_equal(self, _snapshot(optimizer), before)
 
-        after = _snapshot(optimizer)
-        self.assertEqual(jax.tree.structure(before), jax.tree.structure(after))
-        for before_leaf, after_leaf in zip(jax.tree.leaves(before), jax.tree.leaves(after)):
-            np.testing.assert_array_equal(before_leaf, after_leaf)
+    def test_nonfinite_gradient_or_norm_rejected_before_optimizer_mutation(self):
+        optimizer = _make_optimizer(clip_norm=0.15)
+        before = _snapshot(optimizer)
+        gradient_template = nnx.state(optimizer.model, nnx.Param)
+
+        cases = (
+            ("NaN gradient", jnp.nan),
+            ("infinite gradient", jnp.inf),
+            ("overflowing norm", jnp.finfo(jnp.float32).max / 2),
+        )
+        for name, value in cases:
+            gradients = jax.tree.map(
+                lambda gradient, fill=value: jnp.full_like(gradient, fill), gradient_template
+            )
+            if name == "overflowing norm":
+                self.assertTrue(
+                    all(np.all(np.isfinite(leaf)) for leaf in jax.tree.leaves(gradients))
+                )
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, "global norm"):
+                apply_normalized_gradient_sum(
+                    optimizer,
+                    gradients,
+                    jnp.array(1.0, dtype=jnp.float32),
+                    jnp.array(1.0, dtype=jnp.float32),
+                    jnp.array(0.0, dtype=jnp.float32),
+                )
+            _assert_tree_equal(self, _snapshot(optimizer), before)
 
     def test_unexpected_runtime_aux_is_rejected_before_optimizer_mutation(self):
         cfg = make_vl_config("qwen3-vl-smoke")
@@ -368,14 +419,13 @@ class VLMGradientAccumulationTest(absltest.TestCase):
                 apply_normalized_gradient_sum(
                     optimizer,
                     initialize_gradient_sum(gradients),
+                    metrics["ce_loss_sum"],
                     metrics["supervised_tokens"],
                     invalid_aux,
                 )
 
         after = _snapshot(optimizer)
-        self.assertEqual(jax.tree.structure(before), jax.tree.structure(after))
-        for before_leaf, after_leaf in zip(jax.tree.leaves(before), jax.tree.leaves(after)):
-            np.testing.assert_array_equal(before_leaf, after_leaf)
+        _assert_tree_equal(self, after, before)
 
     def test_real_dense_target_is_supported_but_moe_aux_is_rejected(self):
         require_zero_router_aux_loss(make_vl_config("qwen3-vl-smoke"))

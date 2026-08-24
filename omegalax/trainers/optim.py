@@ -25,18 +25,31 @@ def accumulate_gradient_sum(gradient_sum, gradients):
     )
 
 
+@jax.jit
+def _normalized_gradient_health(gradient_sum, supervised_tokens):
+    normalized_gradients = jax.tree.map(lambda gradient: gradient / supervised_tokens, gradient_sum)
+    all_finite = jnp.array(True)
+    for gradient in jax.tree.leaves(normalized_gradients):
+        all_finite = jnp.logical_and(all_finite, jnp.all(jnp.isfinite(gradient)))
+    grad_norm = optax.tree.norm(normalized_gradients)
+    return jnp.logical_and(all_finite, jnp.isfinite(grad_norm)), grad_norm
+
+
 @nnx.jit(donate_argnums=(0, 1))
 def _apply_normalized_gradient_sum(optimizer, gradient_sum, supervised_tokens):
     normalized_gradients = jax.tree.map(lambda gradient: gradient / supervised_tokens, gradient_sum)
-    grad_norm = optax.tree.norm(normalized_gradients)
     optimizer.update(normalized_gradients)
-    return grad_norm
 
 
 def apply_normalized_gradient_sum(
-    optimizer, gradient_sum, supervised_tokens, auxiliary_loss_abs_sum
+    optimizer, gradient_sum, ce_loss_sum, supervised_tokens, auxiliary_loss_abs_sum
 ):
     """Normalize once by the global token count, then perform one optimizer update."""
+    loss = np.asarray(jax.device_get(ce_loss_sum))
+    if loss.shape != () or not np.isfinite(loss).item() or loss.item() < 0:
+        raise ValueError(
+            f"Accumulated masked CE loss sum must be finite and non-negative; got {loss!r}."
+        )
     count = np.asarray(jax.device_get(supervised_tokens))
     if count.shape != () or not np.isfinite(count).item() or count.item() <= 0:
         raise ValueError(
@@ -49,7 +62,15 @@ def apply_normalized_gradient_sum(
             "Accumulated router auxiliary loss must be finite and exactly zero before the "
             f"optimizer update; got absolute sum {auxiliary!r}."
         )
-    return _apply_normalized_gradient_sum(optimizer, gradient_sum, supervised_tokens)
+    gradient_is_finite, grad_norm = _normalized_gradient_health(gradient_sum, supervised_tokens)
+    host_gradient_is_finite, host_grad_norm = jax.device_get((gradient_is_finite, grad_norm))
+    if not bool(np.asarray(host_gradient_is_finite)):
+        raise ValueError(
+            "Normalized accumulated gradients and their global norm must be finite; "
+            f"got grad_norm={host_grad_norm!r}."
+        )
+    _apply_normalized_gradient_sum(optimizer, gradient_sum, supervised_tokens)
+    return grad_norm
 
 
 class MixedPrecisionOptimizer(nnx.ModelAndOptimizer):

@@ -709,6 +709,7 @@ def run_sft(
         grad_norm = apply_normalized_gradient_sum(
             optimizer,
             gradient_sum,
+            accum_ce_loss_sum,
             accum_sup_tokens,
             accum_aux_loss_abs,
         )
