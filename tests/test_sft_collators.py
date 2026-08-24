@@ -8,14 +8,12 @@ import dataclasses
 import pickle
 from unittest import mock
 
-from absl.testing import absltest
-
 import ml_dtypes
 import numpy as np
+from absl.testing import absltest
 from PIL import Image
-from transformers import AutoTokenizer
-
-from transformers import AutoImageProcessor
+from renderers import Qwen3RendererConfig
+from transformers import AutoImageProcessor, AutoTokenizer
 
 from omegalax.data import collator_qwen3
 from omegalax.data.collator_qwen3 import (
@@ -420,12 +418,21 @@ class TemplateParityTest(absltest.TestCase):
         with self.assertRaisesRegex(ValueError, "does not reproduce the chat template"):
             assert_text_template_parity(_make_tokenizer(), _VLCfg())
 
-    def test_explicit_renderer_config_bypasses_the_self_check(self):
-        """Escape hatch for a checkpoint whose template legitimately differs."""
+    def test_text_collator_rejects_a_vlm_renderer_config(self):
         from renderers import Qwen3VLRendererConfig as _VLCfg
 
-        collator = TextSFTCollator(_make_tokenizer(), max_length=256, renderer_config=_VLCfg())
-        self.assertIsInstance(collator._encoder.renderer_config, _VLCfg)
+        with self.assertRaisesRegex(TypeError, "text renderer config"):
+            TextSFTCollator(_make_tokenizer(), max_length=256, renderer_config=_VLCfg())
+
+    def test_explicit_text_config_still_checks_template_parity(self):
+        tokenizer = _make_tokenizer()
+        with mock.patch.object(tokenizer, "apply_chat_template", return_value="mismatch"):
+            with self.assertRaisesRegex(ValueError, "does not reproduce the chat template"):
+                TextSFTCollator(
+                    tokenizer,
+                    max_length=256,
+                    renderer_config=Qwen3RendererConfig(),
+                )
 
     def test_vlm_collator_matches_the_hf_processor_byte_for_byte(self):
         """Vision-placeholder expansion parity, incl. the image-pad count."""
@@ -465,6 +472,49 @@ class TemplateParityTest(absltest.TestCase):
         )
 
 
+class VLMSFTCollatorRendererContractTest(absltest.TestCase):
+    def setUp(self):
+        super().setUp()
+        self.tokenizer = mock.Mock(pad_token_id=0)
+
+    def test_rejects_a_missing_image_processor_at_construction(self):
+        with self.assertRaisesRegex(ValueError, "image_processor is required"):
+            VLMSFTCollator(self.tokenizer, max_length=8, image_processor=None)
+
+    def test_renderer_uses_the_supplied_image_processor(self):
+        image_processor = mock.Mock(
+            temporal_patch_size=2,
+            image_mean=(0.5, 0.5, 0.5),
+            patch_size=14,
+        )
+        rendered = mock.sentinel.renderer
+        with mock.patch.object(collator_qwen3, "Qwen3VLRenderer", return_value=rendered) as factory:
+            collator = VLMSFTCollator(
+                self.tokenizer,
+                max_length=8,
+                image_processor=image_processor,
+            )
+
+            self.assertIs(collator._encoder.renderer, rendered)
+
+        processor = factory.call_args.kwargs["processor"]
+        self.assertIs(processor.image_processor, image_processor)
+
+    def test_rejects_a_text_renderer_config(self):
+        image_processor = mock.Mock(
+            temporal_patch_size=2,
+            image_mean=(0.5, 0.5, 0.5),
+            patch_size=14,
+        )
+        with self.assertRaisesRegex(TypeError, "Qwen3-VL renderer config"):
+            VLMSFTCollator(
+                self.tokenizer,
+                max_length=8,
+                image_processor=image_processor,
+                renderer_config=Qwen3RendererConfig(),
+            )
+
+
 class MessageLengthFnTest(absltest.TestCase):
     """``make_message_length_fn`` is the record builders' measure fn.
 
@@ -478,18 +528,33 @@ class MessageLengthFnTest(absltest.TestCase):
     def setUp(self):
         super().setUp()
         self.tokenizer = _make_tokenizer()
+        self.image_processor = AutoImageProcessor.from_pretrained(
+            "Qwen/Qwen3-VL-2B-Instruct", use_fast=False
+        )
 
     def test_measures_a_single_text_message(self):
-        fn = make_message_length_fn(self.tokenizer)
+        fn = make_message_length_fn(self.tokenizer, self.image_processor)
         out = fn({"role": "user", "content": "hello world"})
         self.assertEqual(out["length"], 7)
         self.assertEqual(out["vision_tokens"], 0)
         self.assertEqual(out["num_images"], 0)
 
+    def test_rejects_an_image_processor_without_merge_size(self):
+        with self.assertRaisesRegex(ValueError, "merge_size must be a positive integer"):
+            make_message_length_fn(self.tokenizer, mock.Mock(spec=[]))
+
+    def test_rejects_an_invalid_merge_size(self):
+        for merge_size in (0, -1, True, 1.5, "2"):
+            with self.subTest(merge_size=merge_size):
+                with self.assertRaisesRegex(ValueError, "merge_size must be a positive integer"):
+                    make_message_length_fn(
+                        self.tokenizer,
+                        mock.Mock(merge_size=merge_size),
+                    )
+
     def test_lengths_are_additive_at_message_boundaries(self):
         """The property the chunk index depends on: sum(per-message) == full."""
-        fn = make_message_length_fn(self.tokenizer)
-        encoder = Qwen3RendererEncoder(self.tokenizer, None, None)
+        fn = make_message_length_fn(self.tokenizer, self.image_processor)
         conversation = [
             {"role": "system", "content": "sys"},
             {"role": "user", "content": "turn 0"},
@@ -498,13 +563,8 @@ class MessageLengthFnTest(absltest.TestCase):
             {"role": "assistant", "content": "TERMINATE"},
         ]
         per_message = sum(fn(m)["length"] for m in conversation)
-        full = len(encoder.encode(conversation)["input_ids"])
+        full = len(fn.encode(conversation)["input_ids"])
         self.assertEqual(per_message, full)
-
-    def test_raises_on_images_without_an_image_processor(self):
-        fn = make_message_length_fn(self.tokenizer)
-        with self.assertRaisesRegex(ValueError, "no image_processor"):
-            fn({"role": "user", "content": [{"type": "image", "image": "x.png"}]})
 
     def test_raises_when_the_renderer_drops_the_images(self):
         """A renderer that stops emitting image mm_items used to measure a VLM turn
@@ -536,8 +596,8 @@ class MessageLengthFnTest(absltest.TestCase):
 
     def test_survives_pickling_with_a_live_renderer(self):
         """Shipped to ``spawn`` workers via the pool initializer."""
-        fn = make_message_length_fn(self.tokenizer)
-        _ = fn.renderer  # force the lazy renderer to exist: the hard case
+        fn = make_message_length_fn(self.tokenizer, self.image_processor)
+        _ = fn.renderer
         restored = pickle.loads(pickle.dumps(fn))
         self.assertIsNone(restored._renderer)
         self.assertEqual(restored({"role": "user", "content": "hello world"})["length"], 7)

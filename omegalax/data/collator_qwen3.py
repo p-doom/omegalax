@@ -25,10 +25,10 @@ from typing import Any
 import ml_dtypes
 import numpy as np
 from renderers import (
-    Qwen35RendererConfig,
     Qwen3RendererConfig,
     Qwen3VLRenderer,
     Qwen3VLRendererConfig,
+    Qwen35RendererConfig,
     build_training_sample,
     create_renderer,
 )
@@ -79,15 +79,9 @@ def resolve_text_renderer_config(
 
 def assert_text_template_parity(
     tokenizer: PreTrainedTokenizer,
-    renderer_config: Any,
+    renderer_config: Qwen3RendererConfig | Qwen35RendererConfig,
 ) -> None:
-    """Fail at construction if the renderer diverges from the tokenizer's own template.
-
-    This is the property the module docstring promises and that nothing asserted:
-    what we train on must be what the serving stack renders. Checked only for the
-    auto-resolved default — passing ``renderer_config`` explicitly is the escape
-    hatch for a checkpoint whose chat template legitimately differs.
-    """
+    """Fail at construction if the renderer diverges from the tokenizer's own template."""
     reference = tokenizer.apply_chat_template(
         _TEXT_TEMPLATE_PROBE, tokenize=False, add_generation_prompt=False
     )
@@ -102,8 +96,6 @@ def assert_text_template_parity(
             f"different stream than the serving stack renders.\n"
             f"  renderer: {rendered!r}\n"
             f"  template: {reference!r}\n"
-            "Pass renderer_config= explicitly if this checkpoint's template really does "
-            "differ and you have confirmed the rollout side matches."
         )
 
 
@@ -124,60 +116,23 @@ class _ImageProcessorAsProcessor:
         self.image_processor = image_processor
 
 
-class Qwen3RendererEncoder:
-    """Picklable ``messages -> (token_ids, loss_mask, vision arrays)`` encoder.
+class _RendererEncoder:
+    """Picklable ``messages -> (token_ids, loss_mask, vision arrays)`` encoder core.
 
     Defined at module scope with a lazily-built renderer so it survives
     ``spawn`` multiprocessing (``grain_pipeline._compute_message_lengths_from_chat``
     re-pickles the measure fn into each worker; the HF tokenizer pickles, the
     renderer's caches need not travel).
-
-    The config is pinned here, never auto-resolved: ``AutoRendererConfig`` is an
-    exact match on ``tokenizer.name_or_path`` against ``MODEL_RENDERER_MAP`` and
-    *raises* for a VLM that misses the map, which is every fine-tuned checkpoint
-    export we train from.
     """
 
-    def __init__(
-        self,
-        tokenizer: PreTrainedTokenizer,
-        image_processor: BaseImageProcessor | None = None,
-        renderer_config: Qwen3VLRendererConfig | None = None,
-    ) -> None:
+    def __init__(self, tokenizer: PreTrainedTokenizer) -> None:
         self.tokenizer = tokenizer
-        self.image_processor = image_processor
-        # image_cache_max=1, not the renderers default of 256: that cache keeps
-        # materialised pixel_values (48.8 MB per entry on our frames) keyed by image
-        # hash, and Grain shuffles, so it hits ~0%. Measured 14.66 GB peak RSS per
-        # Grain worker against 2.44 GB, and worst-case 1.62 against 5.78 samples/s.
-        self.renderer_config = (
-            Qwen3VLRendererConfig(image_cache_max=1)
-            if renderer_config is None
-            else renderer_config
-        )
         self._renderer = None
 
     def __getstate__(self) -> dict[str, Any]:
         state = self.__dict__.copy()
         state["_renderer"] = None
         return state
-
-    @property
-    def renderer(self):
-        if self._renderer is None:
-            if self.image_processor is not None:
-                # Constructed directly so OUR image processor is the one used;
-                # ``create_renderer`` has no processor seam and the renderer would
-                # otherwise lazily ``AutoProcessor.from_pretrained`` a default,
-                # silently changing patch geometry.
-                self._renderer = Qwen3VLRenderer(
-                    self.tokenizer,
-                    self.renderer_config,
-                    processor=_ImageProcessorAsProcessor(self.image_processor),
-                )
-            else:
-                self._renderer = create_renderer(self.tokenizer, self.renderer_config)
-        return self._renderer
 
     def render(self, messages: list[dict[str, Any]]):
         """``messages -> RenderedTrainingSample``.
@@ -206,31 +161,81 @@ class Qwen3RendererEncoder:
         return out
 
 
+class _Qwen3TextRendererEncoder(_RendererEncoder):
+    def __init__(
+        self,
+        tokenizer: PreTrainedTokenizer,
+        renderer_config: Qwen3RendererConfig | Qwen35RendererConfig,
+    ) -> None:
+        if not isinstance(renderer_config, (Qwen3RendererConfig, Qwen35RendererConfig)):
+            raise TypeError("renderer_config must be a Qwen3 or Qwen3.5 text renderer config")
+        super().__init__(tokenizer)
+        self.renderer_config = renderer_config
+
+    @property
+    def renderer(self):
+        if self._renderer is None:
+            self._renderer = create_renderer(self.tokenizer, self.renderer_config)
+        return self._renderer
+
+
+class Qwen3RendererEncoder(_RendererEncoder):
+    """Qwen3-VL message encoder.
+
+    The config is pinned here, never auto-resolved: ``AutoRendererConfig`` is an
+    exact match on ``tokenizer.name_or_path`` against ``MODEL_RENDERER_MAP`` and
+    *raises* for a VLM that misses the map, which is every fine-tuned checkpoint
+    export we train from.
+    """
+
+    def __init__(
+        self,
+        tokenizer: PreTrainedTokenizer,
+        image_processor: BaseImageProcessor,
+        renderer_config: Qwen3VLRendererConfig | None = None,
+    ) -> None:
+        if image_processor is None:
+            raise ValueError("image_processor is required")
+        if renderer_config is not None and not isinstance(renderer_config, Qwen3VLRendererConfig):
+            raise TypeError("renderer_config must be a Qwen3-VL renderer config")
+        super().__init__(tokenizer)
+        self.image_processor = image_processor
+        # image_cache_max=1, not the renderers default of 256: that cache keeps
+        # materialised pixel_values (48.8 MB per entry on our frames) keyed by image
+        # hash, and Grain shuffles, so it hits ~0%. Measured 14.66 GB peak RSS per
+        # Grain worker against 2.44 GB, and worst-case 1.62 against 5.78 samples/s.
+        self.renderer_config = (
+            Qwen3VLRendererConfig(image_cache_max=1) if renderer_config is None else renderer_config
+        )
+
+    @property
+    def renderer(self):
+        if self._renderer is None:
+            self._renderer = Qwen3VLRenderer(
+                self.tokenizer,
+                self.renderer_config,
+                processor=_ImageProcessorAsProcessor(self.image_processor),
+            )
+        return self._renderer
+
+
 class _MessageLengthFn(Qwen3RendererEncoder):
     """Picklable ``message -> measurement`` callable (see ``make_message_length_fn``)."""
 
-    def reject_unmeasurable(self, message: dict[str, Any]) -> None:
-        """Raise if this fn cannot measure ``message``.
-
-        The single definition of measurability. ``grain_pipeline`` calls it over
-        the whole task list in the parent before spawning workers, so the failure
-        lands on the operator's terminal instead of inside a pool child; keeping
-        the predicate here means the two boundaries cannot drift apart.
-        """
-        if self.image_processor is None and _message_has_images(message):
-            raise ValueError(
-                "message has image content but the measure fn has no image_processor. "
-                "Pass --processor <hf-repo> (the scripts' flag; --preprocessor_config "
-                "to override its geometry), or image_processor= if calling "
-                "make_message_length_fn directly."
-            )
+    def __init__(
+        self,
+        tokenizer: PreTrainedTokenizer,
+        image_processor: BaseImageProcessor,
+        renderer_config: Qwen3VLRendererConfig | None = None,
+    ) -> None:
+        super().__init__(tokenizer, image_processor, renderer_config)
+        merge_size = getattr(image_processor, "merge_size", None)
+        if type(merge_size) is not int or merge_size <= 0:
+            raise ValueError("image_processor.merge_size must be a positive integer")
+        self._merge_size = merge_size
 
     def __call__(self, message: dict[str, Any]) -> int | dict[str, Any]:
-        self.reject_unmeasurable(message)
         encoded = self.encode([message])
-        merge_size = (
-            int(getattr(self.image_processor, "merge_size", 1)) if self.image_processor else 1
-        )
         if _message_has_images(message):
             # `encode` emits the key only when the renderer produced image mm_items,
             # so an absent one here is a message whose images the renderer dropped:
@@ -247,7 +252,7 @@ class _MessageLengthFn(Qwen3RendererEncoder):
         vision_patches = 0
         for row in grid_thw:
             t, h, w = int(row[0]), int(row[1]), int(row[2])
-            vision_tokens += t * (h // merge_size) * (w // merge_size)
+            vision_tokens += t * (h // self._merge_size) * (w // self._merge_size)
             vision_patches += t * h * w
         return {
             "length": int(len(encoded["input_ids"])),
@@ -267,16 +272,10 @@ def _message_has_images(message: dict[str, Any]) -> bool:
 
 def make_message_length_fn(
     tokenizer: PreTrainedTokenizer,
-    image_processor: BaseImageProcessor | None = None,
+    image_processor: BaseImageProcessor,
     renderer_config: Qwen3VLRendererConfig | None = None,
 ):
-    """Return a ``message -> measurement`` callable for the record builders.
-
-    Token lengths are exactly additive at message boundaries:
-    ``<|im_start|>``/``<|im_end|>`` are hard BPE split points, so
-    ``sum(lengths)`` equals the full-sequence length exactly. Returns a
-    picklable instance so it can be shipped to ``spawn`` workers.
-    """
+    """Return a VLM ``message -> measurement`` callable for the record builders."""
     return _MessageLengthFn(tokenizer, image_processor, renderer_config)
 
 
@@ -291,7 +290,7 @@ class TextSFTCollator:
         self,
         tokenizer: PreTrainedTokenizer,
         max_length: int,
-        renderer_config: Any | None = None,
+        renderer_config: Qwen3RendererConfig | Qwen35RendererConfig | None = None,
         model_id: str | None = None,
     ) -> None:
         self.tokenizer = tokenizer
@@ -301,8 +300,9 @@ class TextSFTCollator:
         )
         if renderer_config is None:
             renderer_config = resolve_text_renderer_config(model_id)
-            assert_text_template_parity(tokenizer, renderer_config)
-        self._encoder = Qwen3RendererEncoder(tokenizer, None, renderer_config)
+        encoder = _Qwen3TextRendererEncoder(tokenizer, renderer_config)
+        assert_text_template_parity(tokenizer, renderer_config)
+        self._encoder = encoder
 
     def __call__(self, examples: Sequence[dict[str, Any]]) -> dict[str, np.ndarray]:
         batch_ids: list[np.ndarray] = []

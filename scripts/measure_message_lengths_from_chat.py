@@ -20,11 +20,11 @@ from pathlib import Path
 from absl import app, flags
 from transformers import AutoImageProcessor, AutoTokenizer
 
+from omegalax.data.collator_qwen3 import make_message_length_fn
 from omegalax.data.grain_pipeline import (
     MESSAGE_LENGTHS_FILENAME,
     measure_message_lengths_from_chat,
 )
-from omegalax.data.collator_qwen3 import make_message_length_fn
 from omegalax.registry import resolve_hf_repo_id
 
 FLAGS = flags.FLAGS
@@ -40,9 +40,7 @@ flags.DEFINE_string(
     "model_id", None, "Model id used to resolve the default tokenizer.", required=True
 )
 flags.DEFINE_string("tokenizer", None, "HF tokenizer name/path (defaults to --model_id).")
-flags.DEFINE_string(
-    "processor", None, "HF repo to read image config from when the dataset contains images."
-)
+flags.DEFINE_string("processor", None, "HF repo to read image config from.", required=True)
 flags.DEFINE_string(
     "preprocessor_config",
     None,
@@ -57,22 +55,21 @@ def main(_) -> None:
     tokenizer_name = FLAGS.tokenizer or resolve_hf_repo_id(FLAGS.model_id)
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
 
-    image_processor = None
-    if FLAGS.processor:
-        ip_kwargs: dict = {}
-        if FLAGS.preprocessor_config:
-            with open(FLAGS.preprocessor_config) as f:
-                ip_kwargs = json.load(f)
-        image_processor = AutoImageProcessor.from_pretrained(
-            FLAGS.processor, use_fast=False, **ip_kwargs
-        )
+    ip_kwargs: dict = {}
+    if FLAGS.preprocessor_config:
+        with open(FLAGS.preprocessor_config) as f:
+            ip_kwargs = json.load(f)
+    image_processor = AutoImageProcessor.from_pretrained(
+        FLAGS.processor, use_fast=False, **ip_kwargs
+    )
+    measure_message = make_message_length_fn(tokenizer, image_processor)
 
     out_dir = Path(FLAGS.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = measure_message_lengths_from_chat(
         FLAGS.data_path,
         out_dir / MESSAGE_LENGTHS_FILENAME,
-        measure_message=make_message_length_fn(tokenizer, image_processor),
+        measure_message=measure_message,
         num_workers=FLAGS.num_workers,
     )
     print(out_path)

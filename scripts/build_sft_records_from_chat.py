@@ -19,8 +19,8 @@ import json
 from absl import app, flags
 from transformers import AutoImageProcessor, AutoTokenizer
 
-from omegalax.data.grain_pipeline import build_records_from_chat
 from omegalax.data.collator_qwen3 import make_message_length_fn
+from omegalax.data.grain_pipeline import build_records_from_chat
 from omegalax.registry import resolve_hf_repo_id
 
 FLAGS = flags.FLAGS
@@ -33,9 +33,7 @@ flags.DEFINE_string(
     "model_id", None, "Model id used to resolve the default tokenizer.", required=True
 )
 flags.DEFINE_string("tokenizer", None, "HF tokenizer name/path (defaults to --model_id).")
-flags.DEFINE_string(
-    "processor", None, "HF repo to read image config from when the dataset contains images."
-)
+flags.DEFINE_string("processor", None, "HF repo to read image config from.", required=True)
 flags.DEFINE_string(
     "preprocessor_config",
     None,
@@ -88,23 +86,20 @@ def main(_) -> None:
     tokenizer_name = FLAGS.tokenizer or resolve_hf_repo_id(FLAGS.model_id)
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
 
-    image_processor = None
-    processor_name = None
-    if FLAGS.processor:
-        processor_name = FLAGS.processor
-        ip_kwargs: dict = {}
-        if FLAGS.preprocessor_config:
-            with open(FLAGS.preprocessor_config) as f:
-                ip_kwargs = json.load(f)
-        image_processor = AutoImageProcessor.from_pretrained(
-            processor_name, use_fast=False, **ip_kwargs
-        )
+    ip_kwargs: dict = {}
+    if FLAGS.preprocessor_config:
+        with open(FLAGS.preprocessor_config) as f:
+            ip_kwargs = json.load(f)
+    image_processor = AutoImageProcessor.from_pretrained(
+        FLAGS.processor, use_fast=False, **ip_kwargs
+    )
+    measure_message = make_message_length_fn(tokenizer, image_processor)
 
     out_dir = build_records_from_chat(
         FLAGS.data_path,
         FLAGS.out_dir,
         max_length=FLAGS.max_length,
-        measure_message=make_message_length_fn(tokenizer, image_processor),
+        measure_message=measure_message,
         records_per_shard=FLAGS.records_per_shard,
         overwrite=FLAGS.overwrite,
         num_workers=FLAGS.num_workers,
@@ -115,7 +110,7 @@ def main(_) -> None:
         profile_metadata={
             "model_id": FLAGS.model_id,
             "tokenizer": tokenizer_name,
-            "processor": processor_name,
+            "processor": FLAGS.processor,
             "preprocessor_config": FLAGS.preprocessor_config,
         },
     )

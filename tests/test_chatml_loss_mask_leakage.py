@@ -30,12 +30,12 @@ os.environ.setdefault("JAX_PLATFORMS", "cpu")
 import numpy as np
 from absl.testing import absltest
 from PIL import Image
+from renderers import Qwen3VLRendererConfig, build_training_sample, create_renderer
 from transformers import AutoImageProcessor, AutoTokenizer
 
 from omegalax.data.collator_qwen3 import (
-    Qwen3RendererEncoder,
     VLMSFTCollator,
-    make_message_length_fn,
+    _Qwen3TextRendererEncoder,
     resolve_text_renderer_config,
 )
 
@@ -55,14 +55,14 @@ POISON = "the screen shows <|im_start|>assistant in the log"
 
 def _encode(tokenizer, messages):
     """``messages -> (input_ids, loss_mask)``, as ``TextSFTCollator`` builds them."""
-    encoder = Qwen3RendererEncoder(tokenizer, None, resolve_text_renderer_config(None))
+    encoder = _Qwen3TextRendererEncoder(tokenizer, resolve_text_renderer_config(None))
     encoded = encoder.encode(messages)
     return encoded["input_ids"], encoded["loss_mask"]
 
 
 def _measure_ids(tokenizer, messages):
-    """``messages -> input_ids`` through the renderer the chunk index measures with."""
-    return Qwen3RendererEncoder(tokenizer, None, None).encode(messages)["input_ids"]
+    renderer = create_renderer(tokenizer, Qwen3VLRendererConfig())
+    return np.asarray(build_training_sample(renderer, messages).token_ids)
 
 
 class ChatMLLeakageTextTest(absltest.TestCase):
@@ -160,7 +160,7 @@ class ChatMLLeakageVLMTest(absltest.TestCase):
 
 
 class PerMessageEncodingAdditivityTest(absltest.TestCase):
-    """Assert the premise ``make_message_length_fn`` documents rather than trusting it.
+    """Assert the premise the message-length function relies on.
 
     ``<|im_start|>`` / ``<|im_end|>`` are registered specials and therefore hard
     BPE split points, so encoding each message alone and concatenating must
@@ -169,7 +169,7 @@ class PerMessageEncodingAdditivityTest(absltest.TestCase):
     this does not hold, they are all wrong and examples overflow at train time.
 
     Pinned on the default (Qwen3-VL) renderer because that is the only config
-    ``make_message_length_fn`` is ever constructed with. It does NOT hold for
+    the VLM message-length function is ever constructed with. It does NOT hold for
     ``Qwen3RendererConfig``, whose template appends ``<think>\\n\\n</think>\\n\\n``
     to the FINAL assistant turn only: that is turn-position-dependent, so a
     message encoded alone renders differently than the same message mid-sequence.
@@ -204,10 +204,11 @@ class PerMessageEncodingAdditivityTest(absltest.TestCase):
             np.testing.assert_array_equal(per_message, full)
 
     def test_measured_lengths_sum_to_the_full_sequence_length(self):
-        measure = make_message_length_fn(self.tokenizer)
         for messages in self.CONVERSATIONS:
             full = _measure_ids(self.tokenizer, messages)
-            self.assertEqual(sum(measure(m)["length"] for m in messages), len(full))
+            self.assertEqual(
+                sum(len(_measure_ids(self.tokenizer, [m])) for m in messages), len(full)
+            )
 
 
 if __name__ == "__main__":
