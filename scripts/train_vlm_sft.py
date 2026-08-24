@@ -5,12 +5,13 @@ from __future__ import annotations
 import gc
 import importlib
 import json
+import math
 from pathlib import Path
 
-from absl import app, flags
 import grain
 import jax
 import wandb
+from absl import app, flags
 from transformers import AutoImageProcessor, AutoTokenizer
 
 from omegalax.data.collator_qwen3 import VLMSFTCollator
@@ -23,11 +24,11 @@ from omegalax.data.grain_pipeline import (
     required_epochs_for_batches,
 )
 from omegalax.distributed.mesh import process_local_batch_size
+from omegalax.registry import resolve_hf_repo_id
 from omegalax.trainers import vlm as vlm_trainer
 from omegalax.trainers.checkpoint_utils import ResumeMode
-from omegalax.registry import resolve_hf_repo_id
-from omegalax.trainers.text import startup_log
 from omegalax.trainers.perf import resolve_peak_tflops
+from omegalax.trainers.text import startup_log
 
 FLAGS = flags.FLAGS
 
@@ -51,7 +52,12 @@ flags.DEFINE_string(
     "Path to JSON file whose keys override default image processor config.",
 )
 flags.DEFINE_integer("max_length", None, "Maximum sequence length.")
-flags.DEFINE_integer("num_steps", None, "Number of training steps.")
+flags.DEFINE_integer("schedule_horizon", None, "Immutable learning-rate schedule horizon.")
+flags.DEFINE_integer(
+    "invocation_end_step",
+    None,
+    "Required final optimizer generation for this invocation phase.",
+)
 flags.DEFINE_integer("batch_size", None, "Global batch size across all JAX processes.")
 flags.DEFINE_float("learning_rate", None, "Learning rate.")
 flags.DEFINE_float("weight_decay", None, "Weight decay.")
@@ -72,7 +78,7 @@ flags.DEFINE_float(
     None,
     "Fraction of post-warmup steps at peak LR (wsd only). Required for wsd.",
 )
-flags.DEFINE_float("max_grad_norm", None, "Max gradient norm for clipping (0 = no clipping).")
+flags.DEFINE_float("max_grad_norm", None, "Positive finite gradient clipping norm.")
 flags.DEFINE_integer("grad_accum_steps", None, "Gradient accumulation steps (1 = no accumulation).")
 flags.DEFINE_integer(
     "gc_period", None, "If >0, disable Python GC and collect every N training steps."
@@ -160,12 +166,14 @@ flags.DEFINE_boolean(
     "--enable_lora (which already freezes vision).",
 )
 flags.DEFINE_string(
-    "extra_transform", None,
+    "extra_transform",
+    None,
     'A single {"class": "module:ClassName", "kwargs": {...}} object applied '
     "as a grain RandomMap augmentation to the train iterator only. The class "
     "must subclass grain.transforms.RandomMap and be importable in worker "
     "processes — set PYTHONPATH in the launch environment if the module lives "
-    "outside the installed venv.")
+    "outside the installed venv.",
+)
 flags.DEFINE_integer(
     "num_loss_tiles",
     None,
@@ -187,7 +195,8 @@ flags.DEFINE_enum(
 _REQUIRED = [
     "model_id",
     "max_length",
-    "num_steps",
+    "schedule_horizon",
+    "invocation_end_step",
     "batch_size",
     "learning_rate",
     "weight_decay",
@@ -235,6 +244,29 @@ def _validate_flags() -> None:
     for name in _REQUIRED:
         if FLAGS[name].value is None:
             problems.append(name)
+
+    if FLAGS.max_grad_norm is not None and (
+        not math.isfinite(FLAGS.max_grad_norm) or FLAGS.max_grad_norm <= 0
+    ):
+        problems.append("max_grad_norm (must be positive and finite)")
+
+    int32_max = 2_147_483_647
+    if FLAGS.schedule_horizon is not None and not (0 < FLAGS.schedule_horizon <= int32_max):
+        problems.append(f"schedule_horizon (must be an integer in [1, {int32_max}])")
+    if (
+        FLAGS.invocation_end_step is not None
+        and FLAGS.schedule_horizon is not None
+        and not (0 < FLAGS.invocation_end_step <= FLAGS.schedule_horizon)
+    ):
+        problems.append(
+            "invocation_end_step (must be positive and no greater than schedule_horizon)"
+        )
+    if (
+        FLAGS.resume_step is not None
+        and FLAGS.invocation_end_step is not None
+        and FLAGS.resume_step >= FLAGS.invocation_end_step
+    ):
+        problems.append("resume_step (must be less than invocation_end_step)")
 
     if (FLAGS.data_path is None) == (FLAGS.data_mix is None):
         problems.append("exactly one of {data_path, data_mix} (got neither or both)")
@@ -299,8 +331,7 @@ def _parse_extra_transform(
     module_path, _, class_name = entry["class"].partition(":")
     cls = getattr(importlib.import_module(module_path), class_name)
     assert issubclass(cls, grain.transforms.RandomMap), (
-        f"--extra_transform {entry['class']!r} is not a "
-        "grain.transforms.RandomMap subclass"
+        f"--extra_transform {entry['class']!r} is not a grain.transforms.RandomMap subclass"
     )
     return cls(**entry["kwargs"])
 
@@ -427,7 +458,7 @@ def main(_) -> None:
             f"per_process_batch_size={per_process_batch}"
         )
 
-    total_micro_batches = FLAGS.num_steps * FLAGS.grad_accum_steps
+    total_micro_batches = FLAGS.schedule_horizon * FLAGS.grad_accum_steps
     extra_transform = _parse_extra_transform(FLAGS.extra_transform)
     if extra_transform is not None:
         startup_log(f"loaded extra train transform: {type(extra_transform).__name__}")
@@ -455,7 +486,9 @@ def main(_) -> None:
             shuffle=False,
             seed=FLAGS.seed,
             num_batches=max(
-                1, (FLAGS.num_steps // max(FLAGS.val_every or FLAGS.num_steps, 1)) * FLAGS.val_steps
+                1,
+                (FLAGS.schedule_horizon // max(FLAGS.val_every or FLAGS.schedule_horizon, 1))
+                * FLAGS.val_steps,
             ),
             dp_size=FLAGS.dp_size,
             fsdp_size=FLAGS.fsdp_size,
@@ -467,7 +500,7 @@ def main(_) -> None:
         seed=FLAGS.seed,
         batch_size=FLAGS.batch_size,
         seq_len=FLAGS.max_length,
-        num_steps=FLAGS.num_steps,
+        schedule_horizon=FLAGS.schedule_horizon,
         learning_rate=FLAGS.learning_rate,
         weight_decay=FLAGS.weight_decay,
         warmup_steps=FLAGS.warmup_steps,
@@ -508,6 +541,7 @@ def main(_) -> None:
             FLAGS.model_id,
             train_cfg,
             data_iter,
+            invocation_end_step=FLAGS.invocation_end_step,
             save_dir=save_dir,
             save_every=FLAGS.save_every,
             keep_period=FLAGS.keep_period,

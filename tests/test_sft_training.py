@@ -8,11 +8,9 @@ from unittest import mock
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
-from absl.testing import absltest
-
 import jax
-
 import numpy as np
+from absl.testing import absltest
 
 from omegalax.data.grain_pipeline import (
     build_records_from_chat,
@@ -23,8 +21,8 @@ from omegalax.data.grain_pipeline import (
 from omegalax.distributed.mesh import ensure_mesh
 from omegalax.models.qwen3_vl.config import make_vl_config
 from omegalax.models.qwen3_vl.model import get_rope_index
-from omegalax.models.sharding_runtime import shard_batch_dict
 from omegalax.models.shard_config import ShardConfig
+from omegalax.models.sharding_runtime import shard_batch_dict
 from omegalax.trainers import text as text_trainer
 from omegalax.trainers import vlm as vlm_trainer
 
@@ -266,7 +264,7 @@ class VLMSFTTrainingTest(absltest.TestCase):
             seed=0,
             batch_size=1,
             seq_len=4,
-            num_steps=1,
+            schedule_horizon=1,
             learning_rate=1e-3,
             weight_decay=0.0,
             print_every=0,
@@ -278,6 +276,7 @@ class VLMSFTTrainingTest(absltest.TestCase):
             make_vl_config("qwen3-vl-smoke"),
             train_cfg,
             data_iter,
+            invocation_end_step=1,
             log_every=0,
             tp_size=1,
             fsdp_size=1,
@@ -302,7 +301,7 @@ class VLMSFTTrainingTest(absltest.TestCase):
             seed=0,
             batch_size=1,
             seq_len=8,
-            num_steps=1,
+            schedule_horizon=1,
             learning_rate=1e-3,
             weight_decay=0.0,
             print_every=0,
@@ -314,6 +313,7 @@ class VLMSFTTrainingTest(absltest.TestCase):
             make_vl_config("qwen3-vl-smoke"),
             train_cfg,
             data_iter,
+            invocation_end_step=1,
             log_every=0,
             tp_size=1,
             fsdp_size=1,

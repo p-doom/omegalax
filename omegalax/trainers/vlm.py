@@ -12,12 +12,13 @@ import os
 import signal
 import stat
 import subprocess
+import sys
 from pathlib import Path
 
 import grain
 import jax
 import jax.numpy as jnp
-import optax
+import numpy as np
 import orbax.checkpoint as ocp
 from flax import nnx
 from jax.sharding import NamedSharding, PartitionSpec
@@ -38,9 +39,13 @@ from omegalax.trainers.loss import chunked_cross_entropy_loss, chunked_cross_ent
 from omegalax.trainers.lr_schedule import build_lr_schedule
 from omegalax.trainers.optim import (
     MixedPrecisionOptimizer,
+    OptimizerFatalStatus,
+    OptimizerStatusBoundary,
     accumulate_gradient_sum,
     apply_normalized_gradient_sum,
+    generation_adamw,
     initialize_gradient_sum,
+    require_healthy_optimizer_status,
 )
 from omegalax.trainers.perf import (
     StepFlops,
@@ -98,14 +103,14 @@ class TrainConfig:
     seed: int = 0
     batch_size: int = 8
     seq_len: int = 64
-    num_steps: int = 20
+    schedule_horizon: int = 20
     learning_rate: float = 3e-4
     weight_decay: float = 0.01
     warmup_steps: int = 0
     lr_schedule: str = "linear"
     lr_end_factor: float = 0.0
     lr_stable_fraction: float = 0.8
-    max_grad_norm: float = 0.0
+    max_grad_norm: float = 1.0
     grad_accum_steps: int = 1
     print_every: int = 1
     enable_lora: bool = False
@@ -135,32 +140,28 @@ def init_model(
 
 def build_optimizer(
     model: nnx.Module,
-    lr_schedule_fn: optax.Schedule | float,
     train_cfg: TrainConfig,
     *,
     wrt=nnx.Param,
 ) -> MixedPrecisionOptimizer:
-    chain = []
-    if train_cfg.max_grad_norm > 0:
-        chain.append(optax.clip_by_global_norm(train_cfg.max_grad_norm))
+    if not np.isfinite(train_cfg.max_grad_norm) or train_cfg.max_grad_norm <= 0:
+        raise ValueError("VLM training requires a positive finite max_grad_norm.")
     wd = 0.0 if wrt is LoRAParam else train_cfg.weight_decay
-    chain.append(optax.adamw(lr_schedule_fn, weight_decay=wd))
-    tx = optax.chain(*chain)
+    tx = generation_adamw(weight_decay=wd)
     opt = MixedPrecisionOptimizer(model, tx, wrt=wrt)
     return opt
 
 
-def _train_state(optimizer: MixedPrecisionOptimizer, rng: jax.Array) -> dict[str, object]:
-    return {"optimizer": nnx.state(optimizer), "rng": rng}
+def _train_state(optimizer: MixedPrecisionOptimizer) -> dict[str, object]:
+    return {"optimizer": nnx.state(optimizer)}
 
 
-def _abstract_train_state(optimizer: MixedPrecisionOptimizer, rng: jax.Array) -> dict[str, object]:
+def _abstract_train_state(optimizer: MixedPrecisionOptimizer) -> dict[str, object]:
     return {
         "optimizer": jax.tree.map(
             lambda value: jax.ShapeDtypeStruct(value.shape, value.dtype, sharding=value.sharding),
             nnx.state(optimizer),
         ),
-        "rng": jax.ShapeDtypeStruct(rng.shape, rng.dtype, sharding=rng.sharding),
     }
 
 
@@ -233,40 +234,53 @@ class _SFTCheckpointCommit:
     step: int
     checkpoint_manager: ocp.CheckpointManager
     optimizer: MixedPrecisionOptimizer
-    rng: jax.Array
     input_iter: checkpoint_utils.GrainIterator
+    schedule_horizon: int
+    invocation_end_step: int
 
 
 def _commit_sft_checkpoint(
     checkpoint_manager: ocp.CheckpointManager,
     optimizer: MixedPrecisionOptimizer,
-    rng: jax.Array,
     step: int,
     input_iter: checkpoint_utils.GrainIterator,
+    schedule_horizon: int,
+    invocation_end_step: int,
+    optimizer_status: jax.Array,
+    boundary: OptimizerStatusBoundary,
     mode: _CheckpointCommitMode,
     prior_commit: _SFTCheckpointCommit | None,
 ) -> _SFTCheckpointCommit:
+    require_healthy_optimizer_status(optimizer_status, boundary)
     if mode is _CheckpointCommitMode.REUSE:
         if (
             prior_commit is None
             or prior_commit.step != step
             or prior_commit.checkpoint_manager is not checkpoint_manager
             or prior_commit.optimizer is not optimizer
-            or prior_commit.rng is not rng
             or prior_commit.input_iter is not input_iter
+            or prior_commit.schedule_horizon != schedule_horizon
+            or prior_commit.invocation_end_step != invocation_end_step
         ):
             raise ValueError(
                 "Checkpoint reuse requires a commit from the identical step, checkpoint manager, "
-                "optimizer, RNG, and train iterator boundary."
+                "optimizer, train iterator, schedule horizon, and invocation boundary."
             )
         commit = prior_commit
     elif mode in (_CheckpointCommitMode.PERIODIC, _CheckpointCommitMode.FORCED):
         if prior_commit is not None:
             raise ValueError("A new checkpoint save cannot reuse a prior commit.")
         save_args = ocp.args.Composite(
-            train_state=ocp.args.PyTreeSave(_train_state(optimizer, rng)),
+            train_state=ocp.args.PyTreeSave(_train_state(optimizer)),
             input_iter=grain.checkpoint.CheckpointSave(input_iter),
-            schema=ocp.args.JsonSave(_sft_checkpoint_schema(optimizer, rng, input_iter)),
+            schema=ocp.args.JsonSave(
+                _sft_checkpoint_schema(
+                    optimizer,
+                    input_iter,
+                    schedule_horizon,
+                    invocation_end_step,
+                )
+            ),
         )
         saved = checkpoint_manager.save(
             step,
@@ -275,7 +289,14 @@ def _commit_sft_checkpoint(
         )
         if saved is not True:
             raise RuntimeError(f"Checkpoint manager did not save step {step}.")
-        commit = _SFTCheckpointCommit(step, checkpoint_manager, optimizer, rng, input_iter)
+        commit = _SFTCheckpointCommit(
+            step,
+            checkpoint_manager,
+            optimizer,
+            input_iter,
+            schedule_horizon,
+            invocation_end_step,
+        )
     else:
         raise ValueError(f"Unsupported checkpoint commit mode: {mode!r}.")
 
@@ -286,6 +307,32 @@ def _commit_sft_checkpoint(
             f"Checkpoint commit mismatch: expected latest step {step}, got {latest_step}."
         )
     return commit
+
+
+def _commit_phase_end(
+    checkpoint_manager: ocp.CheckpointManager | None,
+    optimizer: MixedPrecisionOptimizer,
+    input_iter: checkpoint_utils.GrainIterator,
+    schedule_horizon: int,
+    invocation_end_step: int,
+    save_every: int,
+    optimizer_status: jax.Array,
+) -> _SFTCheckpointCommit | None:
+    require_healthy_optimizer_status(optimizer_status, OptimizerStatusBoundary.FINAL)
+    if checkpoint_manager is None or (save_every and invocation_end_step % save_every == 0):
+        return None
+    return _commit_sft_checkpoint(
+        checkpoint_manager,
+        optimizer,
+        invocation_end_step,
+        input_iter,
+        schedule_horizon,
+        invocation_end_step,
+        optimizer_status,
+        OptimizerStatusBoundary.FINAL,
+        _CheckpointCommitMode.FORCED,
+        None,
+    )
 
 
 def _state_path(path: tuple[object, ...]) -> str:
@@ -326,17 +373,6 @@ def _validate_optimizer_restore(expected: nnx.State, restored: object) -> None:
                 f"Checkpoint optimizer variable {name} dtype must be "
                 f"{expected_leaf.dtype}, got {restored_leaf.dtype}."
             )
-
-
-def _validate_rng_restore(expected: jax.Array, restored: object) -> None:
-    if type(restored) is not type(expected):
-        raise ValueError(
-            f"Checkpoint RNG type must be {type(expected).__name__}, got {type(restored).__name__}."
-        )
-    if restored.shape != expected.shape:
-        raise ValueError(f"Checkpoint RNG shape must be {expected.shape}, got {restored.shape}.")
-    if restored.dtype != expected.dtype:
-        raise ValueError(f"Checkpoint RNG dtype must be {expected.dtype}, got {restored.dtype}.")
 
 
 def _json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -407,8 +443,9 @@ def _iterator_schema(value: object) -> object:
 
 def _sft_checkpoint_schema(
     optimizer: MixedPrecisionOptimizer,
-    rng: jax.Array,
     input_iter: checkpoint_utils.GrainIterator,
+    schedule_horizon: int,
+    invocation_end_step: int,
 ) -> dict[str, object]:
     optimizer_state = nnx.state(optimizer).flat_state()
     optimizer_leaves = []
@@ -422,15 +459,55 @@ def _sft_checkpoint_schema(
             }
         )
     return {
-        "version": 1,
+        "version": 2,
         "optimizer": optimizer_leaves,
-        "rng": {
-            "array_type": _type_name(rng),
-            "shape": list(rng.shape),
-            "dtype": str(rng.dtype),
+        "phase": {
+            "schedule_horizon": schedule_horizon,
+            "invocation_end_step": invocation_end_step,
         },
         "input_iter": _iterator_schema(_iterator_state(input_iter)),
     }
+
+
+def _validate_checkpoint_phase(
+    restored_schema: object,
+    expected_schema: dict[str, object],
+    step: int,
+    invocation_end_step: int,
+) -> None:
+    if type(restored_schema) is not dict or set(restored_schema) != set(expected_schema):
+        raise ValueError("Checkpoint schema does not match the initialized training contract.")
+    restored_phase = restored_schema.get("phase")
+    if type(restored_phase) is not dict or set(restored_phase) != {
+        "schedule_horizon",
+        "invocation_end_step",
+    }:
+        raise ValueError("Checkpoint phase schema is invalid.")
+    stored_horizon = restored_phase["schedule_horizon"]
+    stored_end = restored_phase["invocation_end_step"]
+    if (
+        type(stored_horizon) is not int
+        or type(stored_end) is not int
+        or stored_horizon <= 0
+        or stored_end <= 0
+        or stored_end > stored_horizon
+    ):
+        raise ValueError("Checkpoint phase fields must be bounded positive integers.")
+    comparable = dict(expected_schema)
+    comparable["phase"] = {
+        "schedule_horizon": expected_schema["phase"]["schedule_horizon"],
+        "invocation_end_step": stored_end,
+    }
+    if restored_schema != comparable:
+        raise ValueError("Checkpoint schema does not match the initialized training contract.")
+    if stored_end == invocation_end_step:
+        return
+    if step == stored_end and invocation_end_step > stored_end:
+        return
+    raise ValueError(
+        "A phase extension must restore its parent exactly at the parent's invocation_end_step; "
+        f"checkpoint step={step}, stored end={stored_end}, requested end={invocation_end_step}."
+    )
 
 
 def _read_iterator_checkpoint(state_path: Path) -> bytes:
@@ -511,11 +588,12 @@ def _restore_iterator_checkpoint(
 def _restore_sft_checkpoint(
     checkpoint_manager: ocp.CheckpointManager,
     optimizer: MixedPrecisionOptimizer,
-    rng: jax.Array,
     step: int,
     input_iter: checkpoint_utils.GrainIterator,
-) -> tuple[MixedPrecisionOptimizer, int, jax.Array, checkpoint_utils.GrainIterator]:
-    abstract_state = _abstract_train_state(optimizer, rng)
+    schedule_horizon: int,
+    invocation_end_step: int,
+) -> tuple[MixedPrecisionOptimizer, int, checkpoint_utils.GrainIterator]:
+    abstract_state = _abstract_train_state(optimizer)
     expected_state = nnx.state(optimizer)
     metadata = checkpoint_manager.item_metadata(step)
     if set(metadata.keys()) != {"input_iter", "schema", "train_state"}:
@@ -532,11 +610,18 @@ def _restore_sft_checkpoint(
         raise ValueError(
             f"Checkpoint {step} schema restore returned keys {sorted(restored_schema.keys())}."
         )
-    expected_schema = _sft_checkpoint_schema(optimizer, rng, input_iter)
-    if restored_schema["schema"] != expected_schema:
-        raise ValueError(
-            f"Checkpoint {step} schema does not match the initialized optimizer, RNG, and iterator."
-        )
+    expected_schema = _sft_checkpoint_schema(
+        optimizer,
+        input_iter,
+        schedule_horizon,
+        invocation_end_step,
+    )
+    _validate_checkpoint_phase(
+        restored_schema["schema"],
+        expected_schema,
+        step,
+        invocation_end_step,
+    )
 
     restored = checkpoint_manager.restore(
         step,
@@ -547,22 +632,16 @@ def _restore_sft_checkpoint(
             f"Checkpoint {step} train-state restore returned keys {sorted(restored.keys())}."
         )
     train_state = restored["train_state"]
-    if type(train_state) is not dict or set(train_state) != {"optimizer", "rng"}:
+    if type(train_state) is not dict or set(train_state) != {"optimizer"}:
         keys = sorted(train_state) if isinstance(train_state, dict) else type(train_state).__name__
         raise ValueError(
-            f"Checkpoint {step} train_state must contain exactly optimizer and rng, got {keys}."
+            f"Checkpoint {step} train_state must contain exactly optimizer, got {keys}."
         )
     _validate_optimizer_restore(expected_state, train_state["optimizer"])
-    _validate_rng_restore(rng, train_state["rng"])
     restored_input_iter = _restore_iterator_checkpoint(checkpoint_manager, step, input_iter)
 
     nnx.update(optimizer, train_state["optimizer"])
-    return (
-        optimizer,
-        step,
-        train_state["rng"],
-        restored_input_iter,
-    )
+    return optimizer, step, restored_input_iter
 
 
 def make_sft_gradient_step(cfg, pad_id: int = 0, *, wrt=nnx.Param, num_loss_tiles: int = 4):
@@ -676,7 +755,7 @@ def _validate_resume_request(
     resume: checkpoint_utils.ResumeMode,
     resume_step: int | None,
     save_path: Path | None,
-    num_steps: int,
+    invocation_end_step: int,
 ) -> bool:
     if type(resume) is not checkpoint_utils.ResumeMode:
         raise TypeError(f"resume must be ResumeMode, got {type(resume).__name__}.")
@@ -703,9 +782,27 @@ def _validate_resume_request(
         )
     if type(resume_step) is not int or resume_step <= 0:
         raise ValueError("resume='required' requires a positive integer resume_step.")
-    if resume_step >= num_steps:
-        raise ValueError(f"resume_step={resume_step} must be less than num_steps={num_steps}.")
+    if resume_step >= invocation_end_step:
+        raise ValueError(
+            f"resume_step={resume_step} must be less than "
+            f"invocation_end_step={invocation_end_step}."
+        )
     return True
+
+
+def _validate_training_phase(train_cfg: TrainConfig, invocation_end_step: int) -> None:
+    int32_max = int(np.iinfo(np.int32).max)
+    if type(train_cfg.schedule_horizon) is not int or not (
+        0 < train_cfg.schedule_horizon <= int32_max
+    ):
+        raise ValueError(f"schedule_horizon must be an integer in [1, {int32_max}].")
+    if type(invocation_end_step) is not int or not (
+        0 < invocation_end_step <= train_cfg.schedule_horizon
+    ):
+        raise ValueError(
+            "invocation_end_step must be a positive integer no greater than "
+            f"schedule_horizon={train_cfg.schedule_horizon}."
+        )
 
 
 def _require_checkpoint_frontier(
@@ -722,11 +819,58 @@ def _require_checkpoint_frontier(
         )
 
 
-def run_sft(
+@dataclasses.dataclass
+class _TrainingCleanup:
+    checkpoint_manager: ocp.CheckpointManager | None = None
+    autotune_context: object | None = None
+    signal_handlers: list[tuple[int, object]] = dataclasses.field(default_factory=list)
+
+    def install_signal_handler(self, signum: int, handler) -> None:
+        prior = signal.signal(signum, handler)
+        self.signal_handlers.append((signum, prior))
+
+    def close(
+        self,
+        active_error: BaseException | None,
+        exc_info: tuple[type[BaseException] | None, BaseException | None, object | None],
+    ) -> None:
+        errors: list[Exception] = []
+        for signum, handler in reversed(self.signal_handlers):
+            try:
+                signal.signal(signum, handler)
+            except Exception as error:  # noqa: BLE001
+                errors.append(error)
+        if self.checkpoint_manager is not None:
+            try:
+                self.checkpoint_manager.wait_until_finished()
+            except Exception as error:  # noqa: BLE001
+                errors.append(error)
+            try:
+                self.checkpoint_manager.close()
+            except Exception as error:  # noqa: BLE001
+                errors.append(error)
+        if self.autotune_context is not None:
+            try:
+                self.autotune_context.__exit__(*exc_info)
+            except Exception as error:  # noqa: BLE001
+                errors.append(error)
+        if not errors:
+            return
+        if active_error is not None:
+            for error in errors:
+                active_error.add_note(f"Training cleanup also failed: {error!r}")
+            return
+        if len(errors) == 1:
+            raise errors[0]
+        raise ExceptionGroup("Training cleanup failed", errors)
+
+
+def _run_sft(
     model_id_or_cfg,
     train_cfg: TrainConfig,
     data_iter: checkpoint_utils.GrainIterator,
     *,
+    invocation_end_step: int,
     save_dir: str | Path | None = None,
     save_every: int = 0,
     keep_period: int = 0,
@@ -747,6 +891,7 @@ def run_sft(
     gc_period: int = 0,
     log_memory: bool = False,
     tokamax_cache_dir: str | Path | None = None,
+    _cleanup: _TrainingCleanup,
 ) -> tuple[MixedPrecisionOptimizer, dict[str, float]]:
     """SFT a VLM from a Grain iterator; returns final optimizer + last metrics.
 
@@ -760,8 +905,9 @@ def run_sft(
     A fresh run uses ``resume=never`` and a new ``save_dir``. A continuation uses
     ``resume=required`` and names the exact committed frontier with ``resume_step``.
     """
+    _validate_training_phase(train_cfg, invocation_end_step)
     save_path = Path(save_dir).expanduser().resolve() if save_dir is not None else None
-    will_resume = _validate_resume_request(resume, resume_step, save_path, train_cfg.num_steps)
+    will_resume = _validate_resume_request(resume, resume_step, save_path, invocation_end_step)
 
     checkpoint_manager: ocp.CheckpointManager | None = None
     if save_path is not None:
@@ -773,12 +919,9 @@ def run_sft(
             keep_period=keep_period or None,
             keep_latest=keep_latest or None,
         )
+        _cleanup.checkpoint_manager = checkpoint_manager
         if will_resume:
-            try:
-                _require_checkpoint_frontier(checkpoint_manager, resume_step, save_path)
-            except ValueError:
-                checkpoint_manager.close()
-                raise
+            _require_checkpoint_frontier(checkpoint_manager, resume_step, save_path)
 
     if will_resume:
         model_cfg = vlm_api.resolve_config(str(save_path))
@@ -798,18 +941,15 @@ def run_sft(
             f"{batch_multiple}."
         )
 
-    replicated_rng_sharding = NamedSharding(mesh, P())
-    root_rng = jax.device_put(jax.random.key(train_cfg.seed), replicated_rng_sharding)
-    init_rng, rng = jax.random.split(root_rng)
-    init_rng = jax.device_put(init_rng, replicated_rng_sharding)
-    rng = jax.device_put(rng, replicated_rng_sharding)
-    startup_log("placed training rng on device mesh")
+    replicated_sharding = NamedSharding(mesh, P())
+    init_rng = jax.device_put(jax.random.key(train_cfg.seed), replicated_sharding)
+    startup_log("placed initialization rng on device mesh")
 
     is_primary_process = jax.process_index() == 0
 
     lr_schedule_fn = build_lr_schedule(
         peak_lr=train_cfg.learning_rate,
-        num_steps=train_cfg.num_steps,
+        num_steps=train_cfg.schedule_horizon,
         warmup_steps=train_cfg.warmup_steps,
         schedule=train_cfg.lr_schedule,
         end_factor=train_cfg.lr_end_factor,
@@ -877,7 +1017,7 @@ def run_sft(
         log_device_memory("after model load", save_dir=save_path)
 
     with mesh_rules(mesh):
-        optimizer = build_optimizer(model, lr_schedule_fn, train_cfg, wrt=wrt_filter)
+        optimizer = build_optimizer(model, train_cfg, wrt=wrt_filter)
 
     startup_log("built optimizer")
     if log_memory:
@@ -918,20 +1058,42 @@ def run_sft(
 
     start_step = 0
     if will_resume:
-        optimizer, start_step, rng, data_iter = _restore_sft_checkpoint(
-            checkpoint_manager, optimizer, rng, resume_step, data_iter
+        optimizer, start_step, data_iter = _restore_sft_checkpoint(
+            checkpoint_manager,
+            optimizer,
+            resume_step,
+            data_iter,
+            train_cfg.schedule_horizon,
+            invocation_end_step,
         )
-        rng = jax.device_put(rng, replicated_rng_sharding)
         startup_log(f"restored checkpoint at step {start_step}")
 
+    optimizer_status = jax.device_put(
+        jnp.asarray(OptimizerFatalStatus.HEALTHY, dtype=jnp.uint8),
+        replicated_sharding,
+    )
     last_metrics: dict[str, float] = {}
-    prev_metrics: tuple[int, dict[str, jax.Array], datetime.timedelta, float] | None = None
+    prev_metrics: (
+        tuple[
+            int,
+            dict[str, jax.Array],
+            datetime.timedelta,
+            float,
+            jax.Array,
+        ]
+        | None
+    ) = None
 
     def _log_prev_metrics(force: bool = False) -> None:
         nonlocal last_metrics
         if prev_metrics is None:
             return
-        step_to_log, metrics_to_log, step_delta, step_flops = prev_metrics
+        step_to_log, metrics_to_log, step_delta, step_flops, status_to_log = prev_metrics
+        if force or (log_every and step_to_log % log_every == 0):
+            require_healthy_optimizer_status(
+                status_to_log,
+                OptimizerStatusBoundary.FINAL if force else OptimizerStatusBoundary.LOG,
+            )
         result = maybe_log_step_metrics(
             step_to_log,
             metrics_to_log,
@@ -959,8 +1121,8 @@ def run_sft(
             startup_log(f"[signal] received {signum}; will requeue after current step")
         requeue_requested = True
 
-    signal.signal(signal.SIGUSR1, _request_requeue)
-    signal.signal(signal.SIGTERM, _request_requeue)
+    _cleanup.install_signal_handler(signal.SIGUSR1, _request_requeue)
+    _cleanup.install_signal_handler(signal.SIGTERM, _request_requeue)
 
     autotune_result = None
     pending_batch = None
@@ -978,6 +1140,7 @@ def run_sft(
     # of training; this keeps the for-loop indentation unchanged.
     _autotune_ctx = autotune_result if autotune_result is not None else contextlib.nullcontext()
     _autotune_ctx.__enter__()
+    _cleanup.autotune_context = _autotune_ctx
 
     startup_log("entering training loop")
     if log_memory:
@@ -985,7 +1148,8 @@ def run_sft(
     _mem_logged_after_first_step = not log_memory
     _mem_logged_steady_state = not log_memory
 
-    for step_idx in range(start_step, train_cfg.num_steps):
+    for step_idx in range(start_step, invocation_end_step):
+        _log_prev_metrics()
         step = step_idx + 1
         checkpoint_commit = None
 
@@ -1042,16 +1206,26 @@ def run_sft(
 
         if gradient_sum is None:
             raise RuntimeError("Gradient accumulation produced no microbatches.")
-        grad_norm = apply_normalized_gradient_sum(
+        learning_rate = (
+            lr_schedule_fn(step_idx)
+            if callable(lr_schedule_fn)
+            else jnp.asarray(lr_schedule_fn, dtype=jnp.float32)
+        )
+        optimizer_status, grad_norm = apply_normalized_gradient_sum(
             optimizer,
             gradient_sum,
             accum_ce_loss_sum,
             accum_sup_tokens,
             accum_aux_loss_abs,
+            optimizer_status,
+            train_cfg.max_grad_norm,
+            learning_rate,
+            jnp.asarray(step, dtype=jnp.int32),
         )
         accum_time += timer.step()
 
         if not _mem_logged_after_first_step:
+            require_healthy_optimizer_status(optimizer_status, OptimizerStatusBoundary.LOG)
             jax.block_until_ready(grad_norm)
             log_device_memory("after first step (compile done)", save_dir=save_path)
             log_live_arrays("after first step (compile done)", save_dir=save_path)
@@ -1060,6 +1234,7 @@ def run_sft(
             )
             _mem_logged_after_first_step = True
         elif not _mem_logged_steady_state and step_idx >= 4:
+            require_healthy_optimizer_status(optimizer_status, OptimizerStatusBoundary.LOG)
             jax.block_until_ready(grad_norm)
             log_device_memory("after step 5 (steady state)", save_dir=save_path)
             _mem_logged_steady_state = True
@@ -1072,32 +1247,30 @@ def run_sft(
                 "grad_norm": grad_norm,
                 "supervised_tokens": accum_sup_tokens,
                 "total_tokens": accum_total_tokens,
-                "lr": (
-                    float(lr_schedule_fn(step_idx))
-                    if callable(lr_schedule_fn)
-                    else float(lr_schedule_fn)
-                ),
+                "lr": learning_rate,
             }
             if len(source_counts) > 1:
                 total = float(sum(source_counts.values()))
                 for sid, cnt in source_counts.items():
                     window_metrics[f"data_source_{sid}_frac"] = cnt / total
-            _log_prev_metrics()
-
             prev_metrics = (
                 step,
                 window_metrics,
                 accum_time,
                 StepFlops(model=accum_model_flops, hardware=accum_hardware_flops),
+                optimizer_status,
             )
 
         if checkpoint_manager is not None and save_every and step % save_every == 0:
             checkpoint_commit = _commit_sft_checkpoint(
                 checkpoint_manager,
                 optimizer,
-                rng,
                 step,
                 data_iter,
+                train_cfg.schedule_horizon,
+                invocation_end_step,
+                optimizer_status,
+                OptimizerStatusBoundary.CHECKPOINT,
                 _CheckpointCommitMode.PERIODIC,
                 None,
             )
@@ -1106,6 +1279,7 @@ def run_sft(
             gc.collect()
 
         if eval_step is not None and val_every and step % val_every == 0:
+            require_healthy_optimizer_status(optimizer_status, OptimizerStatusBoundary.VALIDATION)
             total_val_loss = 0.0
             total_val_sup_tokens = 0.0
             for _ in range(val_steps):
@@ -1128,9 +1302,12 @@ def run_sft(
                 checkpoint_commit = _commit_sft_checkpoint(
                     checkpoint_manager,
                     optimizer,
-                    rng,
                     step,
                     data_iter,
+                    train_cfg.schedule_horizon,
+                    invocation_end_step,
+                    optimizer_status,
+                    OptimizerStatusBoundary.PREEMPTION,
                     (
                         _CheckpointCommitMode.REUSE
                         if checkpoint_commit is not None
@@ -1138,29 +1315,91 @@ def run_sft(
                     ),
                     checkpoint_commit,
                 )
-                checkpoint_manager.close()
+            else:
+                require_healthy_optimizer_status(
+                    optimizer_status, OptimizerStatusBoundary.PREEMPTION
+                )
             slurm_job_id = os.environ.get("SLURM_JOB_ID")
             if slurm_job_id and is_primary_process:
                 startup_log(f"[signal] scontrol requeue {slurm_job_id}")
                 subprocess.run(["scontrol", "requeue", slurm_job_id], check=False)
-            _autotune_ctx.__exit__(None, None, None)
             return optimizer, last_metrics
 
     _log_prev_metrics(force=True)
 
-    if checkpoint_manager is not None:
-        if last_metrics and (not save_every or last_metrics["step"] % save_every != 0):
-            _commit_sft_checkpoint(
-                checkpoint_manager,
-                optimizer,
-                rng,
-                int(last_metrics["step"]),
-                data_iter,
-                _CheckpointCommitMode.FORCED,
-                None,
-            )
-        checkpoint_manager.wait_until_finished()
-        checkpoint_manager.close()
+    _commit_phase_end(
+        checkpoint_manager,
+        optimizer,
+        data_iter,
+        train_cfg.schedule_horizon,
+        invocation_end_step,
+        save_every,
+        optimizer_status,
+    )
 
-    _autotune_ctx.__exit__(None, None, None)
     return optimizer, last_metrics
+
+
+def run_sft(
+    model_id_or_cfg,
+    train_cfg: TrainConfig,
+    data_iter: checkpoint_utils.GrainIterator,
+    *,
+    invocation_end_step: int,
+    save_dir: str | Path | None = None,
+    save_every: int = 0,
+    keep_period: int = 0,
+    keep_latest: int = 1,
+    log_every: int = 1,
+    resume: checkpoint_utils.ResumeMode = checkpoint_utils.ResumeMode.NEVER,
+    resume_step: int | None = None,
+    pad_id: int = 0,
+    peak_tflops: float | None = None,
+    tp_size: int | None = None,
+    fsdp_size: int | None = None,
+    dp_size: int | None = None,
+    wandb_run=None,
+    val_data_iter: checkpoint_utils.GrainIterator | None = None,
+    val_every: int | None = None,
+    val_steps: int = 10,
+    text_attn_backend: str = "mosaic_gpu",
+    gc_period: int = 0,
+    log_memory: bool = False,
+    tokamax_cache_dir: str | Path | None = None,
+) -> tuple[MixedPrecisionOptimizer, dict[str, float]]:
+    """Run one explicitly bounded phase with exception-safe resource cleanup."""
+    cleanup = _TrainingCleanup()
+    active_error: BaseException | None = None
+    try:
+        return _run_sft(
+            model_id_or_cfg,
+            train_cfg,
+            data_iter,
+            invocation_end_step=invocation_end_step,
+            save_dir=save_dir,
+            save_every=save_every,
+            keep_period=keep_period,
+            keep_latest=keep_latest,
+            log_every=log_every,
+            resume=resume,
+            resume_step=resume_step,
+            pad_id=pad_id,
+            peak_tflops=peak_tflops,
+            tp_size=tp_size,
+            fsdp_size=fsdp_size,
+            dp_size=dp_size,
+            wandb_run=wandb_run,
+            val_data_iter=val_data_iter,
+            val_every=val_every,
+            val_steps=val_steps,
+            text_attn_backend=text_attn_backend,
+            gc_period=gc_period,
+            log_memory=log_memory,
+            tokamax_cache_dir=tokamax_cache_dir,
+            _cleanup=cleanup,
+        )
+    except BaseException as error:
+        active_error = error
+        raise
+    finally:
+        cleanup.close(active_error, sys.exc_info())

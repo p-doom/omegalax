@@ -21,9 +21,13 @@ from omegalax.trainers import vlm as vlm_trainer
 from omegalax.trainers.loss import chunked_cross_entropy_loss, chunked_cross_entropy_loss_sum
 from omegalax.trainers.optim import (
     MixedPrecisionOptimizer,
+    OptimizerFatalStatus,
+    OptimizerStatusBoundary,
     accumulate_gradient_sum,
     apply_normalized_gradient_sum,
+    generation_adamw,
     initialize_gradient_sum,
+    require_healthy_optimizer_status,
 )
 from omegalax.trainers.vlm import require_zero_router_aux_loss
 
@@ -34,11 +38,30 @@ class _TinyModel(nnx.Module):
 
 
 def _make_optimizer(*, clip_norm: float = 0.0, dtype=jnp.float32) -> MixedPrecisionOptimizer:
-    chain = []
-    if clip_norm:
-        chain.append(optax.clip_by_global_norm(clip_norm))
-    chain.append(optax.adamw(0.03, b1=0.8, b2=0.9, weight_decay=0.02))
-    return MixedPrecisionOptimizer(_TinyModel(dtype=dtype), optax.chain(*chain))
+    del clip_norm
+    return MixedPrecisionOptimizer(_TinyModel(dtype=dtype), generation_adamw(weight_decay=0.02))
+
+
+def _apply_transaction(
+    optimizer,
+    gradients,
+    ce_loss_sum,
+    supervised_tokens,
+    auxiliary_loss_abs_sum,
+    *,
+    clip_norm=1e30,
+):
+    return apply_normalized_gradient_sum(
+        optimizer,
+        gradients,
+        ce_loss_sum,
+        supervised_tokens,
+        auxiliary_loss_abs_sum,
+        jnp.asarray(OptimizerFatalStatus.HEALTHY, dtype=jnp.uint8),
+        clip_norm,
+        jnp.asarray(0.03, dtype=jnp.float32),
+        jnp.asarray(1, dtype=jnp.int32),
+    )
 
 
 def _micro_gradient(optimizer, hidden, targets, mask):
@@ -133,12 +156,24 @@ class VLMGradientAccumulationTest(absltest.TestCase):
         )
 
         zero_aux = jnp.array(0.0, dtype=jnp.float32)
-        apply_normalized_gradient_sum(
-            candidate, candidate_sum, total_ce_loss, total_supervised, zero_aux
+        status, _ = _apply_transaction(
+            candidate,
+            candidate_sum,
+            total_ce_loss,
+            total_supervised,
+            zero_aux,
+            clip_norm=0.15,
         )
-        apply_normalized_gradient_sum(
-            reference, concatenated_fp32_sum, total_ce_loss, total_supervised, zero_aux
+        reference_status, _ = _apply_transaction(
+            reference,
+            concatenated_fp32_sum,
+            total_ce_loss,
+            total_supervised,
+            zero_aux,
+            clip_norm=0.15,
         )
+        self.assertEqual(int(status), OptimizerFatalStatus.HEALTHY)
+        self.assertEqual(int(reference_status), OptimizerFatalStatus.HEALTHY)
         _assert_tree_allclose(self, _snapshot(candidate), _snapshot(reference), atol=0.0)
 
     def test_tiled_ce_sum_and_count_define_the_existing_mean(self):
@@ -187,7 +222,7 @@ class VLMGradientAccumulationTest(absltest.TestCase):
         common = {
             "seed": 7,
             "seq_len": 4,
-            "num_steps": 1,
+            "schedule_horizon": 1,
             "learning_rate": 3e-3,
             "weight_decay": 0.01,
             "max_grad_norm": 0.2,
@@ -198,6 +233,7 @@ class VLMGradientAccumulationTest(absltest.TestCase):
             cfg,
             vlm_trainer.TrainConfig(batch_size=1, grad_accum_steps=2, **common),
             iter(micros),
+            invocation_end_step=1,
             log_every=0,
             tp_size=1,
             fsdp_size=1,
@@ -208,6 +244,7 @@ class VLMGradientAccumulationTest(absltest.TestCase):
             cfg,
             vlm_trainer.TrainConfig(batch_size=2, grad_accum_steps=1, **common),
             iter([combined]),
+            invocation_end_step=1,
             log_every=0,
             tp_size=1,
             fsdp_size=1,
@@ -261,12 +298,13 @@ class VLMGradientAccumulationTest(absltest.TestCase):
             )
             total_ce_loss += ce_loss_sum
             total_supervised += supervised_tokens
-        candidate_grad_norm = apply_normalized_gradient_sum(
+        status, candidate_grad_norm = _apply_transaction(
             candidate,
             gradient_sum,
             total_ce_loss,
             total_supervised,
             jnp.array(0.0, dtype=jnp.float32),
+            clip_norm=0.15,
         )
 
         def combined_objective(model):
@@ -284,8 +322,10 @@ class VLMGradientAccumulationTest(absltest.TestCase):
 
         reference_gradient = nnx.grad(combined_objective)(reference.model)
         reference_grad_norm = optax.tree.norm(reference_gradient)
-        reference.update(reference_gradient)
+        clipped, _ = optax.clip_by_global_norm(0.15).update(reference_gradient, ())
+        reference.update(clipped, learning_rate=jnp.asarray(0.03))
 
+        self.assertEqual(int(status), OptimizerFatalStatus.HEALTHY)
         np.testing.assert_allclose(candidate_grad_norm, reference_grad_norm, rtol=0.0, atol=1e-7)
         _assert_tree_allclose(self, _snapshot(candidate), _snapshot(reference))
         self.assertEqual(int(candidate.step[...]), 1)
@@ -300,7 +340,7 @@ class VLMGradientAccumulationTest(absltest.TestCase):
         )
 
         (ce_loss_sum, supervised_tokens), gradient_sum = _micro_gradient(candidate, *micro)
-        apply_normalized_gradient_sum(
+        status, _ = _apply_transaction(
             candidate,
             initialize_gradient_sum(gradient_sum),
             ce_loss_sum,
@@ -319,7 +359,11 @@ class VLMGradientAccumulationTest(absltest.TestCase):
             )
             return ce_loss_sum / supervised_tokens
 
-        reference.update(nnx.grad(direct_objective)(reference.model))
+        reference.update(
+            nnx.grad(direct_objective)(reference.model),
+            learning_rate=jnp.asarray(0.03),
+        )
+        self.assertEqual(int(status), OptimizerFatalStatus.HEALTHY)
         _assert_tree_allclose(self, _snapshot(candidate), _snapshot(reference))
 
     def test_invalid_loss_or_count_rejected_before_optimizer_mutation(self):
@@ -328,23 +372,24 @@ class VLMGradientAccumulationTest(absltest.TestCase):
         zero_gradients = jax.tree.map(jnp.zeros_like, nnx.state(optimizer.model, nnx.Param))
 
         cases = (
-            ("negative loss", -1.0, 1.0, "CE loss sum"),
-            ("NaN loss", jnp.nan, 1.0, "CE loss sum"),
-            ("infinite loss", jnp.inf, 1.0, "CE loss sum"),
-            ("zero count", 1.0, 0.0, "supervised-token count"),
-            ("negative count", 1.0, -1.0, "supervised-token count"),
-            ("NaN count", 1.0, jnp.nan, "supervised-token count"),
-            ("infinite count", 1.0, jnp.inf, "supervised-token count"),
+            ("negative loss", -1.0, 1.0, OptimizerFatalStatus.INVALID_LOSS),
+            ("NaN loss", jnp.nan, 1.0, OptimizerFatalStatus.INVALID_LOSS),
+            ("infinite loss", jnp.inf, 1.0, OptimizerFatalStatus.INVALID_LOSS),
+            ("zero count", 1.0, 0.0, OptimizerFatalStatus.INVALID_SUPERVISION),
+            ("negative count", 1.0, -1.0, OptimizerFatalStatus.INVALID_SUPERVISION),
+            ("NaN count", 1.0, jnp.nan, OptimizerFatalStatus.INVALID_SUPERVISION),
+            ("infinite count", 1.0, jnp.inf, OptimizerFatalStatus.INVALID_SUPERVISION),
         )
-        for name, loss, count, message in cases:
-            with self.subTest(name=name), self.assertRaisesRegex(ValueError, message):
-                apply_normalized_gradient_sum(
+        for name, loss, count, expected_status in cases:
+            with self.subTest(name=name):
+                status, _ = _apply_transaction(
                     optimizer,
                     initialize_gradient_sum(zero_gradients),
                     jnp.array(loss, dtype=jnp.float32),
                     jnp.array(count, dtype=jnp.float32),
                     jnp.array(0.0, dtype=jnp.float32),
                 )
+                self.assertEqual(int(status), expected_status)
             _assert_tree_equal(self, _snapshot(optimizer), before)
 
     def test_nonfinite_gradient_or_norm_rejected_before_optimizer_mutation(self):
@@ -365,13 +410,21 @@ class VLMGradientAccumulationTest(absltest.TestCase):
                 self.assertTrue(
                     all(np.all(np.isfinite(leaf)) for leaf in jax.tree.leaves(gradients))
                 )
-            with self.subTest(name=name), self.assertRaisesRegex(ValueError, "global norm"):
-                apply_normalized_gradient_sum(
+            with self.subTest(name=name):
+                status, _ = _apply_transaction(
                     optimizer,
                     gradients,
                     jnp.array(1.0, dtype=jnp.float32),
                     jnp.array(1.0, dtype=jnp.float32),
                     jnp.array(0.0, dtype=jnp.float32),
+                )
+                self.assertEqual(
+                    int(status),
+                    (
+                        OptimizerFatalStatus.INVALID_GRADIENT_NORM
+                        if name == "overflowing norm"
+                        else OptimizerFatalStatus.INVALID_GRADIENT
+                    ),
                 )
             _assert_tree_equal(self, _snapshot(optimizer), before)
 
@@ -390,8 +443,7 @@ class VLMGradientAccumulationTest(absltest.TestCase):
         with vlm_trainer.mesh_rules(mesh):
             optimizer = vlm_trainer.build_optimizer(
                 model,
-                1e-3,
-                vlm_trainer.TrainConfig(batch_size=1, seq_len=4, num_steps=1),
+                vlm_trainer.TrainConfig(batch_size=1, seq_len=4, schedule_horizon=1),
             )
         gradient_step = vlm_trainer.make_sft_gradient_step(cfg, num_loss_tiles=1)
         batch = {
@@ -415,14 +467,16 @@ class VLMGradientAccumulationTest(absltest.TestCase):
             jnp.array(jnp.nan, dtype=jnp.float32),
             jnp.array(jnp.inf, dtype=jnp.float32),
         ):
-            with self.assertRaisesRegex(ValueError, "router auxiliary loss must be finite"):
-                apply_normalized_gradient_sum(
-                    optimizer,
-                    initialize_gradient_sum(gradients),
-                    metrics["ce_loss_sum"],
-                    metrics["supervised_tokens"],
-                    invalid_aux,
-                )
+            status, _ = _apply_transaction(
+                optimizer,
+                initialize_gradient_sum(gradients),
+                metrics["ce_loss_sum"],
+                metrics["supervised_tokens"],
+                invalid_aux,
+            )
+            self.assertEqual(int(status), OptimizerFatalStatus.INVALID_AUXILIARY_LOSS)
+            with self.assertRaisesRegex(FloatingPointError, "invalid_auxiliary_loss"):
+                require_healthy_optimizer_status(status, OptimizerStatusBoundary.FINAL)
 
         after = _snapshot(optimizer)
         _assert_tree_equal(self, after, before)
@@ -436,8 +490,9 @@ class VLMGradientAccumulationTest(absltest.TestCase):
         ):
             vlm_trainer.run_sft(
                 make_vl_config("qwen3-vl-smoke-moe"),
-                vlm_trainer.TrainConfig(num_steps=1),
+                vlm_trainer.TrainConfig(schedule_horizon=1),
                 iter(()),
+                invocation_end_step=1,
             )
         init_model.assert_not_called()
 

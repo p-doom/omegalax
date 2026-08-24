@@ -13,7 +13,6 @@ import grain
 import jax
 import jax.numpy as jnp
 import numpy as np
-import optax
 import orbax.checkpoint as ocp
 from absl.testing import absltest
 from flax import nnx
@@ -28,7 +27,7 @@ class _TinyModel(nnx.Module):
 
 
 def _optimizer() -> MixedPrecisionOptimizer:
-    return MixedPrecisionOptimizer(_TinyModel(), optax.adamw(0.03))
+    return MixedPrecisionOptimizer(_TinyModel(), vlm.generation_adamw(weight_decay=0.0))
 
 
 def _iterator():
@@ -96,16 +95,19 @@ class CheckpointCommitTest(absltest.TestCase):
     def setUp(self):
         super().setUp()
         self.optimizer = _optimizer()
-        self.rng = jax.random.key(7)
         self.iterator = _iterator()
+        self.status = jnp.asarray(vlm.OptimizerFatalStatus.HEALTHY, dtype=jnp.uint8)
 
     def _commit(self, manager, step, mode, prior_commit=None):
         return vlm._commit_sft_checkpoint(
             manager,
             self.optimizer,
-            self.rng,
             step,
             self.iterator,
+            20,
+            20,
+            self.status,
+            vlm.OptimizerStatusBoundary.CHECKPOINT,
             mode,
             prior_commit,
         )
@@ -165,9 +167,12 @@ class CheckpointCommitTest(absltest.TestCase):
             vlm._commit_sft_checkpoint(
                 manager,
                 self.optimizer,
-                self.rng,
                 10,
                 _iterator(),
+                20,
+                20,
+                self.status,
+                vlm.OptimizerStatusBoundary.CHECKPOINT,
                 vlm._CheckpointCommitMode.REUSE,
                 commit,
             )
@@ -175,9 +180,12 @@ class CheckpointCommitTest(absltest.TestCase):
             vlm._commit_sft_checkpoint(
                 _FakeManager(latest=10),
                 self.optimizer,
-                self.rng,
                 10,
                 self.iterator,
+                20,
+                20,
+                self.status,
+                vlm.OptimizerStatusBoundary.CHECKPOINT,
                 vlm._CheckpointCommitMode.REUSE,
                 commit,
             )
@@ -185,9 +193,12 @@ class CheckpointCommitTest(absltest.TestCase):
             vlm._commit_sft_checkpoint(
                 manager,
                 self.optimizer,
-                jax.random.key(7),
                 10,
                 self.iterator,
+                21,
+                20,
+                self.status,
+                vlm.OptimizerStatusBoundary.CHECKPOINT,
                 vlm._CheckpointCommitMode.REUSE,
                 commit,
             )
@@ -216,7 +227,7 @@ class CheckpointCommitTest(absltest.TestCase):
 
     def test_real_orbax_restore_preserves_exact_boundary(self):
         gradients = nnx.State({"weight": nnx.Param(jnp.array([0.2, -0.4], dtype=jnp.float32))})
-        self.optimizer.update(gradients)
+        self.optimizer.update(gradients, learning_rate=jnp.asarray(0.03))
         self.assertEqual(int(self.optimizer.step[...]), 1)
         self.assertEqual(next(self.iterator), 10)
 
@@ -224,22 +235,56 @@ class CheckpointCommitTest(absltest.TestCase):
             manager = vlm._make_checkpoint_manager(Path(tmpdir), save_interval=1)
             self._commit(manager, 1, vlm._CheckpointCommitMode.PERIODIC)
             expected_state = _snapshot(self.optimizer)
-            expected_rng = np.asarray(jax.random.key_data(self.rng))
             expected_next = next(self.iterator)
 
             restored_optimizer = _optimizer()
             restored_iterator = _iterator()
-            restored_optimizer, step, restored_rng, restored_iterator = vlm._restore_sft_checkpoint(
+            restored_optimizer, step, restored_iterator = vlm._restore_sft_checkpoint(
                 manager,
                 restored_optimizer,
-                jax.random.key(0),
                 1,
                 restored_iterator,
+                20,
+                20,
             )
             self.assertEqual(step, 1)
             _assert_tree_equal(self, _snapshot(restored_optimizer), expected_state)
-            np.testing.assert_array_equal(jax.random.key_data(restored_rng), expected_rng)
             self.assertEqual(next(restored_iterator), expected_next)
+            manager.close()
+
+    def test_parent_phase_extension_continues_exact_optimizer_and_iterator_boundary(self):
+        gradients = nnx.State({"weight": nnx.Param(jnp.array([0.2, -0.4], dtype=jnp.float32))})
+        self.optimizer.update(gradients, learning_rate=jnp.asarray(0.03))
+        self.assertEqual(next(self.iterator), 10)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = vlm._make_checkpoint_manager(Path(tmpdir), save_interval=10)
+            vlm._commit_sft_checkpoint(
+                manager,
+                self.optimizer,
+                1,
+                self.iterator,
+                3,
+                1,
+                self.status,
+                vlm.OptimizerStatusBoundary.FINAL,
+                vlm._CheckpointCommitMode.FORCED,
+                None,
+            )
+            restored, step, restored_iterator = vlm._restore_sft_checkpoint(
+                manager,
+                _optimizer(),
+                1,
+                _iterator(),
+                3,
+                3,
+            )
+            self.assertEqual(step, 1)
+            self.assertEqual(next(restored_iterator), next(self.iterator))
+
+            self.optimizer.update(gradients, learning_rate=jnp.asarray(0.01))
+            restored.update(gradients, learning_rate=jnp.asarray(0.01))
+            _assert_tree_equal(self, _snapshot(restored), _snapshot(self.optimizer))
             manager.close()
 
     def test_restore_rejects_optimizer_schema_without_mutation(self):
@@ -281,45 +326,17 @@ class CheckpointCommitTest(absltest.TestCase):
                 before_optimizer = _snapshot(optimizer)
                 before_iterator = iterator.get_state()
                 manager = _FakeRestoreManager(
-                    {"optimizer": restored_state, "rng": jax.random.key(7)},
-                    vlm._sft_checkpoint_schema(optimizer, jax.random.key(0), iterator),
+                    {"optimizer": restored_state},
+                    vlm._sft_checkpoint_schema(optimizer, iterator, 20, 20),
                 )
                 with self.assertRaisesRegex(ValueError, f"optimizer .*{name}"):
                     vlm._restore_sft_checkpoint(
                         manager,
                         optimizer,
-                        jax.random.key(0),
                         1,
                         iterator,
-                    )
-                _assert_tree_equal(self, _snapshot(optimizer), before_optimizer)
-                self.assertEqual(iterator.get_state(), before_iterator)
-                self.assertLen(manager.restores, 2)
-
-    def test_restore_rejects_rng_schema_without_mutation(self):
-        restored_optimizer = nnx.state(_optimizer())
-        cases = {
-            "type": jnp.array([0, 7], dtype=jnp.uint32),
-            "shape": jax.random.split(jax.random.key(7), 2),
-            "dtype": jax.random.key(7, impl="rbg"),
-        }
-        for name, restored_rng in cases.items():
-            with self.subTest(name=name):
-                optimizer = _optimizer()
-                iterator = _iterator()
-                before_optimizer = _snapshot(optimizer)
-                before_iterator = iterator.get_state()
-                manager = _FakeRestoreManager(
-                    {"optimizer": restored_optimizer, "rng": restored_rng},
-                    vlm._sft_checkpoint_schema(optimizer, jax.random.key(0), iterator),
-                )
-                with self.assertRaisesRegex(ValueError, f"RNG {name}"):
-                    vlm._restore_sft_checkpoint(
-                        manager,
-                        optimizer,
-                        jax.random.key(0),
-                        1,
-                        iterator,
+                        20,
+                        20,
                     )
                 _assert_tree_equal(self, _snapshot(optimizer), before_optimizer)
                 self.assertEqual(iterator.get_state(), before_iterator)
@@ -330,19 +347,20 @@ class CheckpointCommitTest(absltest.TestCase):
         iterator = _iterator()
         before_optimizer = _snapshot(optimizer)
         before_iterator = iterator.get_state()
-        schema = vlm._sft_checkpoint_schema(optimizer, jax.random.key(0), iterator)
+        schema = vlm._sft_checkpoint_schema(optimizer, iterator, 20, 20)
         schema["optimizer"][0]["variable_type"] = "flax.nnx.variablelib.BatchStat"
         manager = _FakeRestoreManager(
-            {"optimizer": nnx.state(_optimizer()), "rng": jax.random.key(7)},
+            {"optimizer": nnx.state(_optimizer())},
             schema,
         )
         with self.assertRaisesRegex(ValueError, "schema does not match"):
             vlm._restore_sft_checkpoint(
                 manager,
                 optimizer,
-                jax.random.key(0),
                 1,
                 iterator,
+                20,
+                20,
             )
         _assert_tree_equal(self, _snapshot(optimizer), before_optimizer)
         self.assertEqual(iterator.get_state(), before_iterator)
@@ -355,13 +373,13 @@ class CheckpointCommitTest(absltest.TestCase):
         before_iterator = iterator.get_state()
         cases = (
             _FakeRestoreManager(
-                {"optimizer": nnx.state(_optimizer()), "rng": jax.random.key(7)},
+                {"optimizer": nnx.state(_optimizer())},
                 {},
                 items=("train_state",),
             ),
             _FakeRestoreManager(
-                {"optimizer": nnx.state(_optimizer())},
-                vlm._sft_checkpoint_schema(optimizer, jax.random.key(0), iterator),
+                {"optimizer": nnx.state(_optimizer()), "extra": 1},
+                vlm._sft_checkpoint_schema(optimizer, iterator, 20, 20),
             ),
         )
         for manager in cases:
@@ -372,9 +390,10 @@ class CheckpointCommitTest(absltest.TestCase):
                 vlm._restore_sft_checkpoint(
                     manager,
                     optimizer,
-                    jax.random.key(0),
                     1,
                     iterator,
+                    20,
+                    20,
                 )
             _assert_tree_equal(self, _snapshot(optimizer), before_optimizer)
             self.assertEqual(iterator.get_state(), before_iterator)
@@ -400,9 +419,10 @@ class CheckpointCommitTest(absltest.TestCase):
                         vlm._restore_sft_checkpoint(
                             manager,
                             optimizer,
-                            jax.random.key(0),
                             1,
                             iterator,
+                            20,
+                            20,
                         )
                     _assert_tree_equal(self, _snapshot(optimizer), before_optimizer)
                     self.assertEqual(iterator.get_state(), before_iterator)
@@ -426,9 +446,10 @@ class CheckpointCommitTest(absltest.TestCase):
                 vlm._restore_sft_checkpoint(
                     manager,
                     optimizer,
-                    jax.random.key(0),
                     1,
                     iterator,
+                    20,
+                    20,
                 )
             _assert_tree_equal(self, _snapshot(optimizer), before_optimizer)
             self.assertEqual(iterator.get_state(), before_iterator)
@@ -449,9 +470,10 @@ class CheckpointCommitTest(absltest.TestCase):
                 vlm._restore_sft_checkpoint(
                     manager,
                     optimizer,
-                    jax.random.key(0),
                     1,
                     iterator,
+                    20,
+                    20,
                 )
             _assert_tree_equal(self, _snapshot(optimizer), before_optimizer)
             self.assertEqual(iterator.get_state(), before_iterator)
@@ -477,12 +499,13 @@ class CheckpointCommitTest(absltest.TestCase):
             optimizer = _optimizer()
             iterator = _iterator()
             with mock.patch.object(vlm, "_validate_json_schema", side_effect=replace_path):
-                _, step, _, restored_iterator = vlm._restore_sft_checkpoint(
+                _, step, restored_iterator = vlm._restore_sft_checkpoint(
                     manager,
                     optimizer,
-                    jax.random.key(0),
                     1,
                     iterator,
+                    20,
+                    20,
                 )
             self.assertEqual(step, 1)
             self.assertTrue(replaced)
