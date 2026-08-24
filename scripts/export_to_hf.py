@@ -115,7 +115,12 @@ def _read_lora_metadata(save_dir: Path) -> dict:
 
     p = save_dir / "lora_metadata.json"
     if not p.exists():
-        return {"enable_lora": False, "lora_rank": 32, "lora_alpha": 32.0}
+        return {
+            "enable_lora": False,
+            "lora_rank": 32,
+            "lora_alpha": 32.0,
+            "lora_extra_target_modules": [],
+        }
     return json.loads(p.read_text())
 
 
@@ -153,13 +158,17 @@ def _restore_trained_weights(model, cfg, checkpoint_path: Path):
 
     with mesh_rules(mesh):
         if bool(lora_meta.get("enable_lora", False)):
-            from omegalax.trainers.lora import inject_lora
+            from omegalax.trainers.lora import DEFAULT_TARGET_MODULES, inject_lora
 
             n_wrapped = inject_lora(
                 model,
                 r=int(lora_meta.get("lora_rank", 32)),
                 alpha=float(lora_meta.get("lora_alpha", 32.0)),
                 rngs=nnx.Rngs(FLAGS.seed),
+                target_modules=(
+                    *DEFAULT_TARGET_MODULES,
+                    *lora_meta.get("lora_extra_target_modules", []),
+                ),
             )
             print(
                 f"[export] re-injected LoRA into base for restore: "

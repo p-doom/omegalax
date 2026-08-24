@@ -146,6 +146,14 @@ flags.DEFINE_boolean(
     "lm_head and layernorms remain fully frozen.",
 )
 flags.DEFINE_integer("lora_rank", None, "LoRA rank (required if --enable_lora).")
+flags.DEFINE_list(
+    "lora_extra_target_modules",
+    None,
+    "Extra module attribute names to LoRA-wrap in addition to the "
+    "defaults (q/k/v/o + gate/up/down), comma-separated. E.g. for "
+    "qwen3_5 gated-deltanet layers: "
+    "in_proj_qkv,in_proj_z,in_proj_b,in_proj_a,out_proj.",
+)
 flags.DEFINE_float(
     "lora_alpha",
     None,
@@ -436,6 +444,7 @@ def main(_) -> None:
         enable_lora=FLAGS.enable_lora,
         lora_rank=FLAGS.lora_rank,
         lora_alpha=FLAGS.lora_alpha,
+        lora_extra_target_modules=tuple(FLAGS.lora_extra_target_modules or ()),
         freeze_vision_tower=FLAGS.freeze_vision_tower,
         num_loss_tiles=FLAGS.num_loss_tiles,
     )

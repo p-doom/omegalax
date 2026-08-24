@@ -38,7 +38,7 @@ from omegalax.trainers.perf import (
     StepTimer,
 )
 from omegalax.trainers.optim import MixedPrecisionOptimizer
-from omegalax.trainers.lora import LoRAParam, inject_lora
+from omegalax.trainers.lora import DEFAULT_TARGET_MODULES, LoRAParam, inject_lora
 from omegalax.trainers.text import startup_log
 from omegalax.models.qwen3_vl.model import DECODER_LAYER_REMAT
 from omegalax.models.qwen3_vl.vision import VISION_BLOCK_REMAT
@@ -80,6 +80,7 @@ class TrainConfig:
     enable_lora: bool = False
     lora_rank: int = 32
     lora_alpha: float = 32.0
+    lora_extra_target_modules: tuple[str, ...] = ()
     freeze_vision_tower: bool = False
     num_loss_tiles: int = 4
 
@@ -186,6 +187,7 @@ def _write_lora_metadata(save_dir: Path, train_cfg: TrainConfig) -> None:
         "enable_lora": bool(train_cfg.enable_lora),
         "lora_rank": int(train_cfg.lora_rank),
         "lora_alpha": float(train_cfg.lora_alpha),
+        "lora_extra_target_modules": list(train_cfg.lora_extra_target_modules),
     }
     (Path(save_dir) / "lora_metadata.json").write_text(json.dumps(meta, indent=2))
 
@@ -504,9 +506,14 @@ def run_sft(
                 r=train_cfg.lora_rank,
                 alpha=train_cfg.lora_alpha,
                 rngs=nnx.Rngs(train_cfg.seed),
+                target_modules=(
+                    *DEFAULT_TARGET_MODULES,
+                    *train_cfg.lora_extra_target_modules,
+                ),
             )
         startup_log(
             f"LoRA enabled: r={train_cfg.lora_rank} alpha={train_cfg.lora_alpha} "
+            f"extra_targets={list(train_cfg.lora_extra_target_modules)} "
             f"wrapped {n_wrapped} text-decoder Linear projections; vision frozen"
         )
         wrt_filter = LoRAParam
