@@ -4,7 +4,7 @@ import unittest
 import jax.numpy as jnp
 
 from omegalax.models.qwen3_5.config import make_config_from_hf
-from omegalax.models.qwen3_vl.config import make_vl_config_from_hf
+from omegalax.models.qwen3_vl.config import make_vl_config, make_vl_config_from_hf
 
 
 def _qwen3_vl_hf_cfg() -> dict:
@@ -14,6 +14,7 @@ def _qwen3_vl_hf_cfg() -> dict:
         "image_token_id": 2,
         "video_token_id": 3,
         "vision_start_token_id": 4,
+        "vision_end_token_id": make_vl_config("qwen3-vl-smoke").vision_end_token_id,
         "text_config": {
             "dtype": "bfloat16",
             "num_hidden_layers": 2,
