@@ -224,7 +224,9 @@ class _CheckpointCommitMode(enum.Enum):
 @dataclasses.dataclass(frozen=True)
 class _SFTCheckpointCommit:
     step: int
+    checkpoint_manager: ocp.CheckpointManager
     optimizer: MixedPrecisionOptimizer
+    rng: jax.Array
     input_iter: checkpoint_utils.GrainIterator
 
 
@@ -241,12 +243,14 @@ def _commit_sft_checkpoint(
         if (
             prior_commit is None
             or prior_commit.step != step
+            or prior_commit.checkpoint_manager is not checkpoint_manager
             or prior_commit.optimizer is not optimizer
+            or prior_commit.rng is not rng
             or prior_commit.input_iter is not input_iter
         ):
             raise ValueError(
-                "Checkpoint reuse requires a commit from the identical step, optimizer, "
-                "and train iterator boundary."
+                "Checkpoint reuse requires a commit from the identical step, checkpoint manager, "
+                "optimizer, RNG, and train iterator boundary."
             )
         commit = prior_commit
     elif mode in (_CheckpointCommitMode.PERIODIC, _CheckpointCommitMode.FORCED):
@@ -261,7 +265,7 @@ def _commit_sft_checkpoint(
         )
         if saved is not True:
             raise RuntimeError(f"Checkpoint manager did not save step {step}.")
-        commit = _SFTCheckpointCommit(step, optimizer, input_iter)
+        commit = _SFTCheckpointCommit(step, checkpoint_manager, optimizer, rng, input_iter)
     else:
         raise ValueError(f"Unsupported checkpoint commit mode: {mode!r}.")
 

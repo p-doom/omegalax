@@ -147,6 +147,26 @@ class CheckpointCommitTest(absltest.TestCase):
                 vlm._CheckpointCommitMode.REUSE,
                 commit,
             )
+        with self.assertRaisesRegex(ValueError, "identical step"):
+            vlm._commit_sft_checkpoint(
+                _FakeManager(latest=10),
+                self.optimizer,
+                self.rng,
+                10,
+                self.iterator,
+                vlm._CheckpointCommitMode.REUSE,
+                commit,
+            )
+        with self.assertRaisesRegex(ValueError, "identical step"):
+            vlm._commit_sft_checkpoint(
+                manager,
+                self.optimizer,
+                jax.random.key(7),
+                10,
+                self.iterator,
+                vlm._CheckpointCommitMode.REUSE,
+                commit,
+            )
 
         manager.latest = 9
         with self.assertRaisesRegex(RuntimeError, "commit mismatch"):
