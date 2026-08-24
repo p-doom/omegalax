@@ -17,6 +17,7 @@ from omegalax.data.collator_qwen3 import (
     VLMSFTCollator,
 )
 from omegalax.data.qwen3_encoding import (
+    build_chatml_blocks as _build_chatml_blocks,
     build_chatml_text as _build_chatml_text,
     encode_qwen_messages,
 )
@@ -283,6 +284,118 @@ class ChatMLLeakageTest(absltest.TestCase):
         self.assertEqual(mask[im_end_positions[-1]], 1)
         for pos in im_end_positions[:-1]:
             self.assertEqual(mask[pos], 0)
+
+
+class PerMessageLossFieldTest(absltest.TestCase):
+    """Tests for the optional per-message ``loss`` field on assistant turns.
+
+    Per-step CUA records carry earlier assistant turns as context, not targets:
+    an assistant message with ``"loss": false`` must be masked like a user turn,
+    while an absent field keeps the historical supervise-every-assistant-turn
+    behavior. Token accounting (header/trailing offsets, input_ids) must be
+    byte-identical with or without the field.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.tokenizer = _make_tokenizer()
+
+    def _encode(self, messages):
+        encoded = encode_qwen_messages(messages, tokenizer=self.tokenizer)
+        return encoded["input_ids"], encoded["loss_mask"]
+
+    def _block_bounds(self, messages):
+        bounds = []
+        start = 0
+        for _, block_text in _build_chatml_blocks(messages, image_grids=[], merge_size=2):
+            n = len(self.tokenizer.encode(block_text, add_special_tokens=False))
+            bounds.append((start, start + n))
+            start += n
+        return bounds
+
+    def _multiturn(self, first_loss=None, second_loss=None):
+        first = {"role": "assistant", "content": "Hello!"}
+        second = {"role": "assistant", "content": "I am fine, thanks."}
+        if first_loss is not None:
+            first["loss"] = first_loss
+        if second_loss is not None:
+            second["loss"] = second_loss
+        return [
+            {"role": "user", "content": "Hi"},
+            first,
+            {"role": "user", "content": "How are you?"},
+            second,
+        ]
+
+    def test_loss_false_on_earlier_assistant_supervises_only_final(self):
+        messages = self._multiturn(first_loss=False)
+        ids, mask = self._encode(messages)
+        bounds = self._block_bounds(messages)
+        for lo, hi in bounds[:3]:
+            self.assertEqual(int(np.sum(mask[lo:hi])), 0)
+        lo, hi = bounds[3]
+        expected = np.zeros(hi - lo, dtype=np.int32)
+        expected[3 : hi - lo - 1] = 1
+        np.testing.assert_array_equal(mask[lo:hi], expected)
+
+    def test_loss_false_does_not_change_input_ids(self):
+        clean_ids, _ = self._encode(self._multiturn())
+        marked_ids, _ = self._encode(self._multiturn(first_loss=False))
+        np.testing.assert_array_equal(marked_ids, clean_ids)
+
+    def test_absent_field_matches_explicit_true(self):
+        _, absent_mask = self._encode(self._multiturn())
+        _, explicit_mask = self._encode(self._multiturn(first_loss=True, second_loss=True))
+        np.testing.assert_array_equal(explicit_mask, absent_mask)
+
+    def test_absent_field_supervises_every_assistant_turn(self):
+        messages = self._multiturn()
+        _, mask = self._encode(messages)
+        bounds = self._block_bounds(messages)
+        for i in (1, 3):
+            lo, hi = bounds[i]
+            expected = np.zeros(hi - lo, dtype=np.int32)
+            expected[3 : hi - lo - 1] = 1
+            np.testing.assert_array_equal(mask[lo:hi], expected)
+        for i in (0, 2):
+            lo, hi = bounds[i]
+            self.assertEqual(int(np.sum(mask[lo:hi])), 0)
+
+    def test_loss_field_ignored_on_non_assistant_roles(self):
+        clean = [
+            {"role": "user", "content": "Q"},
+            {"role": "assistant", "content": "A"},
+        ]
+        marked = [
+            {"role": "user", "content": "Q", "loss": True},
+            {"role": "assistant", "content": "A"},
+        ]
+        _, clean_mask = self._encode(clean)
+        _, marked_mask = self._encode(marked)
+        np.testing.assert_array_equal(marked_mask, clean_mask)
+
+    def test_all_assistants_loss_false_yields_all_zero_mask(self):
+        ids, mask = self._encode(self._multiturn(first_loss=False, second_loss=False))
+        self.assertEqual(len(ids), len(mask))
+        self.assertEqual(int(np.sum(mask)), 0)
+
+    def test_collator_handles_all_zero_mask_record(self):
+        collator = TextSFTCollator(self.tokenizer, max_length=128)
+        batch = collator(
+            [{"messages": self._multiturn(first_loss=False, second_loss=False)}]
+        )
+        self.assertEqual(int(np.sum(batch["loss_mask_BT"])), 0)
+        self.assertGreater(int(np.sum(batch["attention_mask_BT"])), 0)
+
+    def test_collator_multiturn_context_only_history(self):
+        collator = TextSFTCollator(self.tokenizer, max_length=128)
+        clean = collator([{"messages": self._multiturn()}])
+        marked = collator([{"messages": self._multiturn(first_loss=False)}])
+        np.testing.assert_array_equal(marked["token_ids_BT"], clean["token_ids_BT"])
+        self.assertGreater(int(np.sum(marked["loss_mask_BT"])), 0)
+        self.assertLess(
+            int(np.sum(marked["loss_mask_BT"])), int(np.sum(clean["loss_mask_BT"]))
+        )
 
 
 class BuildChatMLTextTest(absltest.TestCase):

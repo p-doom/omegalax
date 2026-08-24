@@ -15,6 +15,7 @@ import numpy as np
 import orbax.checkpoint as ocp
 
 from omegalax.data.grain_pipeline import (
+    _process_conversation,
     build_chunk_index,
     compile_jsonl_to_arrayrecord,
     make_grain_iterator,
@@ -512,6 +513,56 @@ class GrainPipelineTest(absltest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "compiled Grain shard"):
                 resolve_arrayrecord_paths(src)
+
+
+class ProcessConversationLossFieldTest(absltest.TestCase):
+    """The inline record builder must not emit chunks whose loss mask would be
+    all zeros: assistant turns marked ``"loss": false`` are context, so a chunk
+    whose only assistant turns are context-only is skipped exactly like a chunk
+    with no assistant turn at all."""
+
+    def _run(self, messages):
+        precomputed = {(0, off): 1 for off in range(len(messages))}
+        return _process_conversation(
+            0,
+            "session-0",
+            {},
+            messages,
+            precomputed,
+            effective_max=100,
+            overflow_mode="split",
+            truncate_offset=None,
+        )
+
+    def test_supervised_assistant_emits_chunk(self):
+        res = self._run(
+            [
+                {"role": "user", "content": "q"},
+                {"role": "assistant", "content": "a"},
+            ]
+        )
+        self.assertLen(res["examples"], 1)
+
+    def test_all_context_assistants_skips_chunk(self):
+        res = self._run(
+            [
+                {"role": "user", "content": "q"},
+                {"role": "assistant", "content": "a", "loss": False},
+            ]
+        )
+        self.assertEmpty(res["examples"])
+
+    def test_mixed_chunk_kept_with_loss_field_preserved(self):
+        messages = [
+            {"role": "user", "content": "q1"},
+            {"role": "assistant", "content": "a1", "loss": False},
+            {"role": "user", "content": "q2"},
+            {"role": "assistant", "content": "a2"},
+        ]
+        res = self._run(messages)
+        self.assertLen(res["examples"], 1)
+        self.assertEqual(res["examples"][0]["messages"], messages)
+        self.assertIs(res["examples"][0]["messages"][1]["loss"], False)
 
 
 if __name__ == "__main__":

@@ -56,8 +56,21 @@ def _get_arrayrecord_image_reader(path: str) -> Any:
 # exactly three tokens and the ``<|im_end|>\n`` footer to two, independent of the
 # surrounding text. These offsets let us mask assistant content structurally.
 _ASSISTANT_ROLE = "assistant"
+_LOSS_KEY = "loss"
 _CHATML_HEADER_TOKENS = 3  # <|im_start|> , role , \n
 _CHATML_TRAILING_TOKENS = 1  # the \n after <|im_end|> (the <|im_end|> itself is supervised)
+
+
+def message_is_supervised(message: dict[str, Any]) -> bool:
+    """True iff this message's tokens should receive loss.
+
+    Only assistant turns are ever supervised. An assistant message may opt out of
+    supervision by carrying ``"loss": false`` (message-level field, travels inside
+    the messages list so it survives record slicing); absent or truthy means
+    supervised. The field is ignored on non-assistant roles.
+    """
+
+    return message.get("role") == _ASSISTANT_ROLE and bool(message.get(_LOSS_KEY, True))
 
 
 def build_chatml_blocks(
@@ -116,13 +129,15 @@ def build_chatml_text(
     )
 
 
-def _assistant_block_loss_mask(block_ids: np.ndarray, is_assistant: bool) -> np.ndarray:
+def _assistant_block_loss_mask(block_ids: np.ndarray, supervised: bool) -> np.ndarray:
     """Loss mask for a single ChatML block: 1 on supervised tokens, 0 elsewhere.
 
-    A block is ``<|im_start|>{role}\n{content}<|im_end|>\n``. Non-assistant turns are
-    never supervised. For assistant turns everything between the 3-token header
-    (``<|im_start|>``, ``assistant``, ``\n``) and the trailing ``\n`` is supervised --
-    i.e. the content plus the terminating ``<|im_end|>`` so the model learns to stop.
+    A block is ``<|im_start|>{role}\n{content}<|im_end|>\n``. Non-assistant turns --
+    and assistant turns opted out via ``"loss": false`` (see
+    :func:`message_is_supervised`) -- are never supervised. For supervised assistant
+    turns everything between the 3-token header (``<|im_start|>``, ``assistant``,
+    ``\n``) and the trailing ``\n`` is supervised -- i.e. the content plus the
+    terminating ``<|im_end|>`` so the model learns to stop.
 
     Because the mask is scoped to one block built from message structure, literal
     ``<|im_start|>`` / ``<|im_end|>`` markers appearing inside ``content`` cannot flip
@@ -130,7 +145,7 @@ def _assistant_block_loss_mask(block_ids: np.ndarray, is_assistant: bool) -> np.
     """
 
     mask = np.zeros(len(block_ids), dtype=np.int32)
-    if not is_assistant:
+    if not supervised:
         return mask
     start = _CHATML_HEADER_TOKENS
     end = len(block_ids) - _CHATML_TRAILING_TOKENS  # exclude trailing \n, keep <|im_end|>
@@ -294,6 +309,8 @@ def encode_qwen_messages(
     plus ``image_grid_thw`` / ``pixel_values`` when an image processor is given. The
     loss mask is built from message structure per ChatML turn, so it is unaffected by
     literal ``<|im_start|>`` / ``<|im_end|>`` markers embedded in user/context text.
+    Assistant messages carrying ``"loss": false`` are treated as context (mask 0,
+    like a user turn); the field is optional and absent means supervised.
     """
 
     image_grids: list[tuple[int, int, int]] = []
@@ -317,13 +334,13 @@ def encode_qwen_messages(
     # is immune to literal ``<|im_start|>`` / ``<|im_end|>`` markers in user text.
     id_parts: list[np.ndarray] = []
     mask_parts: list[np.ndarray] = []
-    for role, block_text in blocks:
+    for msg, (_, block_text) in zip(messages, blocks, strict=True):
         block_ids = np.asarray(
             tokenizer.encode(block_text, add_special_tokens=False),
             dtype=np.int32,
         )
         id_parts.append(block_ids)
-        mask_parts.append(_assistant_block_loss_mask(block_ids, role == _ASSISTANT_ROLE))
+        mask_parts.append(_assistant_block_loss_mask(block_ids, message_is_supervised(msg)))
 
     result["input_ids"] = np.concatenate(id_parts) if id_parts else np.zeros(0, dtype=np.int32)
     result["loss_mask"] = np.concatenate(mask_parts) if mask_parts else np.zeros(0, dtype=np.int32)
