@@ -6,7 +6,9 @@ import hashlib
 import json
 import multiprocessing as mp
 import numpy as np
+import os
 import shutil
+import tempfile
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from itertools import chain
@@ -19,6 +21,12 @@ from array_record.python.array_record_module import ArrayRecordWriter
 import grain
 import jax
 
+from omegalax.data.artifact_contract import (
+    canonical_sha256,
+    file_identity,
+    validate_measurement_contract,
+)
+
 COMPILED_DATASET_VERSION = 1
 COMPILED_METADATA_FILENAME = "metadata.json"
 TOKEN_STATS_FILENAME = "token_stats.json"
@@ -30,6 +38,7 @@ SEQUENCE_LENGTHS_FILENAME = "sequence_lengths.jsonl"
 # of max_length / overflow_mode / split, so it is measured once
 # (measure_message_lengths_from_chat) and reused across every seq-length build.
 MESSAGE_LENGTHS_FILENAME = "message_lengths.jsonl"
+MESSAGE_LENGTHS_VERSION = 2
 ARRAY_RECORD_SUFFIX = ".array_record"
 
 SOURCE_ID_KEY = "_omegalax_source_id"
@@ -430,35 +439,110 @@ def _compute_message_lengths_from_chat(chat_path, measure_message, num_workers) 
     return results
 
 
-def _write_chat_message_lengths(path: str | Path, results: dict) -> None:
-    """Persist the ``(conv_idx, msg_offset) -> measurement`` map as JSONL."""
+def _message_lengths_header(chat_path: str | Path, measurement_contract: dict) -> dict:
+    validate_measurement_contract(measurement_contract)
+    identity = {
+        "source_chat": file_identity(chat_path),
+        "measurement_contract": measurement_contract,
+    }
+    return {
+        "type": "omegalax_message_lengths",
+        "version": MESSAGE_LENGTHS_VERSION,
+        **identity,
+        "contract_sha256": canonical_sha256(identity),
+    }
+
+
+def _write_chat_message_lengths(
+    path: str | Path,
+    results: dict,
+    chat_path: str | Path,
+    measurement_contract: dict,
+) -> None:
+    """Atomically persist a source- and processor-bound message-length cache."""
     path = Path(path).expanduser()
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w") as f:
-        for (conv_idx, msg_offset), measurement in sorted(results.items()):
-            f.write(
-                json.dumps(
-                    {"conv_idx": conv_idx, "msg_offset": msg_offset, "measurement": measurement}
+    header = _message_lengths_header(chat_path, measurement_contract)
+    fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(json.dumps({"header": header}, sort_keys=True) + "\n")
+            for (conv_idx, msg_offset), measurement in sorted(results.items()):
+                f.write(
+                    json.dumps(
+                        {
+                            "conv_idx": conv_idx,
+                            "msg_offset": msg_offset,
+                            "measurement": measurement,
+                        },
+                        sort_keys=True,
+                    )
+                    + "\n"
                 )
-                + "\n"
-            )
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temporary_path, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        temporary_path.unlink(missing_ok=True)
 
 
-def _load_chat_message_lengths(path: str | Path) -> dict:
+def _load_chat_message_lengths(path: str | Path) -> tuple[dict, dict]:
     """Inverse of :func:`_write_chat_message_lengths`."""
     results: dict[tuple[int, int], Any] = {}
     with Path(path).expanduser().open() as f:
+        first_line = f.readline()
+        if not first_line:
+            raise ValueError("message-length cache is empty")
+        first_row = json.loads(first_line)
+        header = first_row.get("header") if isinstance(first_row, dict) else None
+        if not isinstance(header, dict):
+            raise ValueError("message-length cache is missing its versioned header")
+        if (
+            header.get("type") != "omegalax_message_lengths"
+            or header.get("version") != MESSAGE_LENGTHS_VERSION
+        ):
+            raise ValueError(
+                f"unsupported message-length cache header: expected version {MESSAGE_LENGTHS_VERSION}"
+            )
+        identity = {
+            "source_chat": header.get("source_chat"),
+            "measurement_contract": header.get("measurement_contract"),
+        }
+        if header.get("contract_sha256") != canonical_sha256(identity):
+            raise ValueError("message-length cache header digest does not match its contents")
+        validate_measurement_contract(header.get("measurement_contract"))
         for line in f:
             line = line.strip()
             if not line:
                 continue
             row = json.loads(line)
-            results[(int(row["conv_idx"]), int(row["msg_offset"]))] = row["measurement"]
-    return results
+            key = (int(row["conv_idx"]), int(row["msg_offset"]))
+            if key in results:
+                raise ValueError(f"message-length cache contains duplicate key {key}")
+            results[key] = row["measurement"]
+    return header, results
 
 
-def _validate_chat_message_lengths(chat_path, results: dict) -> None:
+def _validate_chat_message_lengths(
+    chat_path,
+    header: dict,
+    results: dict,
+    measurement_contract: dict,
+) -> None:
     """Fail loudly if a cached length map does not match chat_path exactly."""
+    validate_measurement_contract(measurement_contract)
+    if header["source_chat"] != file_identity(chat_path):
+        raise ValueError(
+            f"cached message lengths do not match source chat identity for {chat_path}"
+        )
+    if header["measurement_contract"] != measurement_contract:
+        raise ValueError("cached message lengths do not match the measurement contract")
     expected = 0
     missing: list[tuple[int, int]] = []
     for conv_idx, _sid, _meta, messages in _iter_chat_conversations(chat_path):
@@ -475,24 +559,32 @@ def _validate_chat_message_lengths(chat_path, results: dict) -> None:
         )
 
 
-def _resolve_chat_message_lengths(chat_path, measure_message, num_workers, message_lengths_path):
+def _resolve_chat_message_lengths(
+    chat_path,
+    measure_message,
+    num_workers,
+    message_lengths_path,
+    measurement_contract,
+):
     """Load-or-compute the per-message length map for the inline path.
 
     Mirrors the payload path's cache semantics: cache present -> load + validate;
     requested but absent -> compute then write; None -> compute in-memory.
     """
     if message_lengths_path is not None:
+        if not measurement_contract:
+            raise ValueError("message_lengths_path requires an explicit measurement_contract")
         cache_path = Path(message_lengths_path).expanduser()
         if cache_path.exists():
             print(f"[records] loading cached message lengths from {cache_path}", flush=True)
-            results = _load_chat_message_lengths(cache_path)
-            _validate_chat_message_lengths(chat_path, results)
+            header, results = _load_chat_message_lengths(cache_path)
+            _validate_chat_message_lengths(chat_path, header, results, measurement_contract)
             return results
 
     results = _compute_message_lengths_from_chat(chat_path, measure_message, num_workers)
 
     if message_lengths_path is not None:
-        _write_chat_message_lengths(message_lengths_path, results)
+        _write_chat_message_lengths(message_lengths_path, results, chat_path, measurement_contract)
         print(f"[records] wrote message-length cache to {message_lengths_path}", flush=True)
     return results
 
@@ -502,6 +594,7 @@ def measure_message_lengths_from_chat(
     out_path: str | Path,
     *,
     measure_message,
+    measurement_contract: dict,
     num_workers: int = 2,
 ) -> Path:
     """Tokenize every message in a chat.jsonl once and write the length cache.
@@ -515,7 +608,7 @@ def measure_message_lengths_from_chat(
     chat_path = Path(chat_path).expanduser().resolve()
     out_path = Path(out_path).expanduser()
     results = _compute_message_lengths_from_chat(chat_path, measure_message, num_workers)
-    _write_chat_message_lengths(out_path, results)
+    _write_chat_message_lengths(out_path, results, chat_path, measurement_contract)
     print(f"[measure] wrote {len(results)} message lengths to {out_path}", flush=True)
     return out_path
 
@@ -901,6 +994,7 @@ def build_records_from_chat(
     num_workers: int = 2,
     overflow_mode: str = "drop",
     message_lengths_path: str | Path | None = None,
+    measurement_contract: dict[str, Any] | None = None,
     val_fraction: float = 0.0,
     split: str | None = None,
     split_key: str = "recording_id",
@@ -955,7 +1049,11 @@ def build_records_from_chat(
         return split is None or recording_split(session_meta.get(split_key), val_fraction) == split
 
     precomputed = _resolve_chat_message_lengths(
-        chat_path, measure_message, num_workers, message_lengths_path
+        chat_path,
+        measure_message,
+        num_workers,
+        message_lengths_path,
+        measurement_contract,
     )
     supervision_fields = {
         isinstance(result, dict) and "supervised_tokens" in result
@@ -1370,9 +1468,7 @@ def make_grain_iterator(
         # Optional user-supplied augmentation (a RandomMap), with a deterministic
         # per-source seed so resume-from-checkpoint reproduces it.
         if extra_transform is not None:
-            ds = ds.random_map(
-                extra_transform, seed=seed + 10_000 * (original_idx + 1)
-            )
+            ds = ds.random_map(extra_transform, seed=seed + 10_000 * (original_idx + 1))
         per_source.append(ds)
 
     mixed = (

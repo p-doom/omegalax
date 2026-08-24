@@ -20,6 +20,7 @@ from pathlib import Path
 from absl import app, flags
 from transformers import AutoImageProcessor, AutoTokenizer
 
+from omegalax.data.artifact_contract import make_measurement_contract
 from omegalax.data.grain_pipeline import (
     MESSAGE_LENGTHS_FILENAME,
     measure_message_lengths_from_chat,
@@ -51,6 +52,12 @@ flags.DEFINE_string(
 flags.DEFINE_integer(
     "num_workers", 2, "Number of parallel workers for message length measurement.", lower_bound=2
 )
+flags.DEFINE_string(
+    "producer_sha",
+    None,
+    "Exact Omegalax Git SHA whose renderer and preprocessing code produced the cache.",
+    required=True,
+)
 
 
 def main(_) -> None:
@@ -69,10 +76,21 @@ def main(_) -> None:
 
     out_dir = Path(FLAGS.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    measure_message = make_message_length_fn(tokenizer, image_processor)
+    measurement_contract = make_measurement_contract(
+        producer_sha=FLAGS.producer_sha,
+        tokenizer=tokenizer,
+        tokenizer_source=tokenizer_name,
+        image_processor=image_processor,
+        processor_source=FLAGS.processor,
+        renderer_config=measure_message.renderer_config,
+        preprocessor_config_path=FLAGS.preprocessor_config,
+    )
     out_path = measure_message_lengths_from_chat(
         FLAGS.data_path,
         out_dir / MESSAGE_LENGTHS_FILENAME,
-        measure_message=make_message_length_fn(tokenizer, image_processor),
+        measure_message=measure_message,
+        measurement_contract=measurement_contract,
         num_workers=FLAGS.num_workers,
     )
     print(out_path)

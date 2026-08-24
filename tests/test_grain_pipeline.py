@@ -15,6 +15,7 @@ import numpy as np
 import orbax.checkpoint as ocp
 
 from omegalax.data.grain_pipeline import (
+    _write_chat_message_lengths,
     build_records_from_chat,
     make_grain_iterator,
     make_grain_multiprocessing_options,
@@ -40,6 +41,20 @@ def _measure_one(message):
 
 def _measure_declared(message):
     return message["measurement"]
+
+
+_TEST_MEASUREMENT_CONTRACT = {
+    "producer_sha": "1" * 40,
+    "tokenizer": {
+        "source": "test-tokenizer",
+        "revision": "2" * 40,
+        "behavior_sha256": "a" * 64,
+        "files": [{"path": "tokenizer.json", "size_bytes": 1, "sha256": "f" * 64}],
+    },
+    "processor": None,
+    "renderer": {"class": "test.Renderer", "config_sha256": "b" * 64},
+    "preprocessor": None,
+}
 
 
 def _measured(role, content, length=1, vision_tokens=0):
@@ -100,12 +115,11 @@ class GrainPipelineTest(absltest.TestCase):
         if split_unit_ends is not None:
             row["_omegalax_split_unit_ends"] = split_unit_ends
         self._write_jsonl(src, [row])
-        self._write_jsonl(
+        _write_chat_message_lengths(
             cache,
-            [
-                {"conv_idx": 0, "msg_offset": i, "measurement": measure(message)}
-                for i, message in enumerate(messages)
-            ],
+            {(0, i): measure(message) for i, message in enumerate(messages)},
+            src,
+            _TEST_MEASUREMENT_CONTRACT,
         )
         records_dir = build_records_from_chat(
             src,
@@ -115,6 +129,7 @@ class GrainPipelineTest(absltest.TestCase):
             records_per_shard=8,
             overflow_mode="split",
             message_lengths_path=cache,
+            measurement_contract=_TEST_MEASUREMENT_CONTRACT,
         )
         return records_dir, self._read_records(records_dir)
 
