@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import inspect
 import os
+import subprocess
+import sys
 from unittest import mock
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
@@ -14,6 +16,8 @@ import numpy as np
 import optax
 from absl.testing import absltest
 from flax import nnx
+from jax.sharding import Mesh, NamedSharding
+from jax.sharding import PartitionSpec as P
 
 from omegalax.trainers import optim as optim_lib
 
@@ -308,6 +312,81 @@ class OptimizerFailStopTest(absltest.TestCase):
         ):
             optim_lib.require_healthy_optimizer_status(
                 status, optim_lib.OptimizerStatusBoundary.FINAL
+            )
+
+    def test_nonfinite_local_shard_fails_every_device_without_mutation(self):
+        if len(jax.devices()) < 2:
+            env = dict(os.environ)
+            env["JAX_PLATFORMS"] = "cpu"
+            env["XLA_FLAGS"] = "--xla_force_host_platform_device_count=2"
+            command = [sys.executable]
+            if sys.flags.optimize:
+                command.append("-O")
+            command.extend(
+                [
+                    "-m",
+                    "pytest",
+                    "-q",
+                    f"{__file__}::{type(self).__name__}::{self._testMethodName}",
+                ]
+            )
+            subprocess.run(command, env=env, check=True, timeout=180)
+            return
+
+        mesh = Mesh(np.asarray(jax.devices()[:2]), ("fsdp",))
+        sharded = NamedSharding(mesh, P("fsdp"))
+        replicated = NamedSharding(mesh, P())
+
+        class _ShardedModel(nnx.Module):
+            def __init__(self):
+                self.weight = nnx.Param(
+                    jax.device_put(
+                        np.asarray([-0.25, 0.0, 0.25, 0.75], dtype=np.float32),
+                        sharded,
+                    )
+                )
+
+        optimizer = optim_lib.MixedPrecisionOptimizer(
+            _ShardedModel(),
+            optim_lib.generation_adamw(weight_decay=0.02),
+        )
+        gradient_array = jax.device_put(
+            np.asarray([0.2, -0.4, np.nan, 0.1], dtype=np.float32),
+            sharded,
+        )
+        self.assertLen(
+            [
+                shard
+                for shard in gradient_array.addressable_shards
+                if not np.all(np.isfinite(np.asarray(shard.data)))
+            ],
+            1,
+        )
+        gradients = nnx.State({"weight": nnx.Param(gradient_array)})
+        before = _snapshot(optimizer)
+        status, _ = optim_lib.apply_normalized_gradient_sum(
+            optimizer,
+            gradients,
+            jax.device_put(jnp.asarray(1.0, dtype=jnp.float32), replicated),
+            jax.device_put(jnp.asarray(4.0, dtype=jnp.float32), replicated),
+            jax.device_put(jnp.asarray(0.0, dtype=jnp.float32), replicated),
+            jax.device_put(_healthy_status(), replicated),
+            0.15,
+            jax.device_put(jnp.asarray(0.03, dtype=jnp.float32), replicated),
+            jax.device_put(jnp.asarray(1, dtype=jnp.int32), replicated),
+        )
+
+        self.assertEqual(status.sharding.spec, P())
+        self.assertLen(status.addressable_shards, 2)
+        for shard in status.addressable_shards:
+            self.assertEqual(
+                int(np.asarray(shard.data)),
+                optim_lib.OptimizerFatalStatus.INVALID_GRADIENT,
+            )
+        _assert_tree_bit_equal(self, _snapshot(optimizer), before)
+        with self.assertRaisesRegex(FloatingPointError, "checkpoint: invalid_gradient"):
+            optim_lib.require_healthy_optimizer_status(
+                status, optim_lib.OptimizerStatusBoundary.CHECKPOINT
             )
 
     def test_compiled_transaction_donates_state_and_gradient(self):

@@ -89,12 +89,6 @@ flags.DEFINE_integer("fsdp_size", None, "FSDP parallelism size.")
 flags.DEFINE_integer("dp_size", None, "Data parallelism size.")
 flags.DEFINE_string("save_dir", None, "Checkpoint save directory.")
 flags.DEFINE_string("jax_cache_dir", None, "Directory for JAX persistent compilation cache.")
-flags.DEFINE_string(
-    "tokamax_cache_dir",
-    None,
-    "Directory for the persistent tokamax autotuning cache. If unset, autotuning runs "
-    "every launch with no persistence.",
-)
 flags.DEFINE_integer("save_every", None, "Save checkpoint every N steps.")
 flags.DEFINE_integer(
     "keep_period",
@@ -383,6 +377,8 @@ def main(_) -> None:
     _validate_flags()
     jax.config.update("jax_compilation_cache_dir", FLAGS.jax_cache_dir)
     jax.distributed.initialize()
+    vlm_trainer._require_single_jax_process()
+    vlm_trainer._require_registrar_compiled_executable_capability()
     startup_log(f"jax_compilation_cache_dir={FLAGS.jax_cache_dir}")
     startup_log("jax.distributed initialized")
 
@@ -561,7 +557,6 @@ def main(_) -> None:
             text_attn_backend=FLAGS.text_attn_backend,
             gc_period=FLAGS.gc_period,
             log_memory=FLAGS.log_memory,
-            tokamax_cache_dir=FLAGS.tokamax_cache_dir,
         )
     finally:
         if FLAGS.gc_period:

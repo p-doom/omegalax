@@ -44,7 +44,6 @@ class OptimizerFatalStatus(enum.IntEnum):
 class OptimizerStatusBoundary(enum.StrEnum):
     LOG = "log"
     CHECKPOINT = "checkpoint"
-    PREEMPTION = "preemption"
     VALIDATION = "validation"
     FINAL = "final"
 

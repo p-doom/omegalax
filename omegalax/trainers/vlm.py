@@ -2,17 +2,13 @@
 
 from __future__ import annotations
 
-import contextlib
 import dataclasses
 import datetime
 import enum
 import gc
 import json
 import os
-import signal
 import stat
-import subprocess
-import sys
 from pathlib import Path
 
 import grain
@@ -33,7 +29,6 @@ from omegalax.models.qwen3_vl import Qwen3VLConfig
 from omegalax.models.qwen3_vl.model import DECODER_LAYER_REMAT
 from omegalax.models.qwen3_vl.vision import VISION_BLOCK_REMAT
 from omegalax.trainers import checkpoint_utils
-from omegalax.trainers import tokamax_cache as tokamax_cache_lib
 from omegalax.trainers.lora import LoRAParam, inject_lora
 from omegalax.trainers.loss import chunked_cross_entropy_loss, chunked_cross_entropy_loss_sum
 from omegalax.trainers.lr_schedule import build_lr_schedule
@@ -848,6 +843,22 @@ def _validate_training_phase(train_cfg: TrainConfig, invocation_end_step: int) -
         )
 
 
+def _require_single_jax_process() -> None:
+    process_count = jax.process_count()
+    if type(process_count) is not int or process_count != 1:
+        raise RuntimeError(
+            "Production VLM training requires exactly one JAX process; "
+            f"got process_count={process_count!r}."
+        )
+
+
+def _require_registrar_compiled_executable_capability() -> None:
+    raise RuntimeError(
+        "Production VLM training requires a registrar-authorized compiled-executable "
+        "capability; the authority adapter is not available."
+    )
+
+
 def _require_checkpoint_frontier(
     checkpoint_manager: ocp.CheckpointManager,
     resume_step: int,
@@ -865,37 +876,20 @@ def _require_checkpoint_frontier(
 @dataclasses.dataclass
 class _TrainingCleanup:
     checkpoint_manager: ocp.CheckpointManager | None = None
-    autotune_context: object | None = None
-    signal_handlers: list[tuple[int, object]] = dataclasses.field(default_factory=list)
-
-    def install_signal_handler(self, signum: int, handler) -> None:
-        prior = signal.signal(signum, handler)
-        self.signal_handlers.append((signum, prior))
 
     def close(
         self,
         active_error: BaseException | None,
-        exc_info: tuple[type[BaseException] | None, BaseException | None, object | None],
     ) -> None:
-        errors: list[Exception] = []
-        for signum, handler in reversed(self.signal_handlers):
-            try:
-                signal.signal(signum, handler)
-            except Exception as error:  # noqa: BLE001
-                errors.append(error)
+        errors: list[BaseException] = []
         if self.checkpoint_manager is not None:
             try:
                 self.checkpoint_manager.wait_until_finished()
-            except Exception as error:  # noqa: BLE001
+            except BaseException as error:  # noqa: BLE001
                 errors.append(error)
             try:
                 self.checkpoint_manager.close()
-            except Exception as error:  # noqa: BLE001
-                errors.append(error)
-        if self.autotune_context is not None:
-            try:
-                self.autotune_context.__exit__(*exc_info)
-            except Exception as error:  # noqa: BLE001
+            except BaseException as error:  # noqa: BLE001
                 errors.append(error)
         if not errors:
             return
@@ -905,7 +899,7 @@ class _TrainingCleanup:
             return
         if len(errors) == 1:
             raise errors[0]
-        raise ExceptionGroup("Training cleanup failed", errors)
+        raise BaseExceptionGroup("Training cleanup failed", errors)
 
 
 def _run_sft(
@@ -933,7 +927,6 @@ def _run_sft(
     text_attn_backend: str = "mosaic_gpu",
     gc_period: int = 0,
     log_memory: bool = False,
-    tokamax_cache_dir: str | Path | None = None,
     _cleanup: _TrainingCleanup,
 ) -> tuple[MixedPrecisionOptimizer, dict[str, float]]:
     """SFT a VLM from a Grain iterator; returns final optimizer + last metrics.
@@ -1153,38 +1146,6 @@ def _run_sft(
         if result is not None:
             last_metrics = result
 
-    # Flag-only handler: doing an orbax save or JAX collective from inside
-    # the signal handler deadlocks (handlers run on arbitrary threads and
-    # re-enter the runtime). The flag is read at a safe per-step point.
-    requeue_requested = False
-
-    def _request_requeue(signum, _frame):
-        nonlocal requeue_requested
-        if not requeue_requested:
-            startup_log(f"[signal] received {signum}; will requeue after current step")
-        requeue_requested = True
-
-    _cleanup.install_signal_handler(signal.SIGUSR1, _request_requeue)
-    _cleanup.install_signal_handler(signal.SIGTERM, _request_requeue)
-
-    autotune_result = None
-    pending_batch = None
-    if tokamax_cache_dir is not None:
-        autotune_result = tokamax_cache_lib.try_load(tokamax_cache_dir)
-        if autotune_result is None:
-            startup_log("priming tokamax autotuning with first training batch")
-            pending_batch = next(data_iter)
-            pending_batch_sharded = vlm_api.shard_batch_dict(pending_batch, model_cfg, mesh)
-            autotune_result = tokamax_cache_lib.autotune_and_save(
-                tokamax_cache_dir, sft_gradient_step, optimizer.model, pending_batch_sharded
-            )
-
-    # Push the autotuning overlay onto tokamax's lookup stack for the duration
-    # of training; this keeps the for-loop indentation unchanged.
-    _autotune_ctx = autotune_result if autotune_result is not None else contextlib.nullcontext()
-    _autotune_ctx.__enter__()
-    _cleanup.autotune_context = _autotune_ctx
-
     startup_log("entering training loop")
     if log_memory:
         log_device_memory("before first step", save_dir=save_path)
@@ -1194,7 +1155,6 @@ def _run_sft(
     for step_idx in range(start_step, invocation_end_step):
         _log_prev_metrics()
         step = step_idx + 1
-        checkpoint_commit = None
 
         gradient_sum = None
         accum_ce_loss_sum = 0.0
@@ -1208,11 +1168,7 @@ def _run_sft(
         source_counts: dict[int, int] = {}
 
         for _micro in range(accum_steps):
-            if pending_batch is not None:
-                batch = pending_batch
-                pending_batch = None
-            else:
-                batch = next(data_iter)
+            batch = next(data_iter)
             sids = pop_source_ids(batch)
             if sids is not None:
                 for sid in sids.tolist():
@@ -1304,20 +1260,6 @@ def _run_sft(
                 optimizer_status,
             )
 
-        if checkpoint_manager is not None and save_every and step % save_every == 0:
-            checkpoint_commit = _commit_sft_checkpoint(
-                checkpoint_manager,
-                optimizer,
-                step,
-                data_iter,
-                train_cfg.schedule_horizon,
-                invocation_end_step,
-                optimizer_status,
-                OptimizerStatusBoundary.CHECKPOINT,
-                _CheckpointCommitMode.PERIODIC,
-                None,
-            )
-
         if gc_period and step % gc_period == 0:
             gc.collect()
 
@@ -1339,34 +1281,19 @@ def _run_sft(
                     step=step,
                 )
 
-        if requeue_requested:
-            startup_log(f"[signal] saving checkpoint at step={step} and requeueing")
-            if checkpoint_manager is not None:
-                checkpoint_commit = _commit_sft_checkpoint(
-                    checkpoint_manager,
-                    optimizer,
-                    step,
-                    data_iter,
-                    train_cfg.schedule_horizon,
-                    invocation_end_step,
-                    optimizer_status,
-                    OptimizerStatusBoundary.PREEMPTION,
-                    (
-                        _CheckpointCommitMode.REUSE
-                        if checkpoint_commit is not None
-                        else _CheckpointCommitMode.FORCED
-                    ),
-                    checkpoint_commit,
-                )
-            else:
-                require_healthy_optimizer_status(
-                    optimizer_status, OptimizerStatusBoundary.PREEMPTION
-                )
-            slurm_job_id = os.environ.get("SLURM_JOB_ID")
-            if slurm_job_id and is_primary_process:
-                startup_log(f"[signal] scontrol requeue {slurm_job_id}")
-                subprocess.run(["scontrol", "requeue", slurm_job_id], check=False)
-            return optimizer, last_metrics
+        if checkpoint_manager is not None and save_every and step % save_every == 0:
+            _commit_sft_checkpoint(
+                checkpoint_manager,
+                optimizer,
+                step,
+                data_iter,
+                train_cfg.schedule_horizon,
+                invocation_end_step,
+                optimizer_status,
+                OptimizerStatusBoundary.CHECKPOINT,
+                _CheckpointCommitMode.PERIODIC,
+                None,
+            )
 
     _log_prev_metrics(force=True)
 
@@ -1408,9 +1335,10 @@ def run_sft(
     text_attn_backend: str = "mosaic_gpu",
     gc_period: int = 0,
     log_memory: bool = False,
-    tokamax_cache_dir: str | Path | None = None,
 ) -> tuple[MixedPrecisionOptimizer, dict[str, float]]:
     """Run one explicitly bounded phase with exception-safe resource cleanup."""
+    _require_single_jax_process()
+    _require_registrar_compiled_executable_capability()
     cleanup = _TrainingCleanup()
     active_error: BaseException | None = None
     try:
@@ -1438,11 +1366,10 @@ def run_sft(
             text_attn_backend=text_attn_backend,
             gc_period=gc_period,
             log_memory=log_memory,
-            tokamax_cache_dir=tokamax_cache_dir,
             _cleanup=cleanup,
         )
     except BaseException as error:
         active_error = error
         raise
     finally:
-        cleanup.close(active_error, sys.exc_info())
+        cleanup.close(active_error)

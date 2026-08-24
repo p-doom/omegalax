@@ -27,6 +27,14 @@ from omegalax.trainers import text as text_trainer
 from omegalax.trainers import vlm as vlm_trainer
 
 
+def _run_vlm_sft_cpu_semantics(*args, **kwargs):
+    with mock.patch.object(
+        vlm_trainer,
+        "_require_registrar_compiled_executable_capability",
+    ):
+        return vlm_trainer.run_sft(*args, **kwargs)
+
+
 def _make_synthetic_sft_batch(
     batch_size: int, seq_len: int, vocab_size: int
 ) -> dict[str, np.ndarray]:
@@ -272,7 +280,7 @@ class VLMSFTTrainingTest(absltest.TestCase):
         batch = _make_synthetic_sft_batch(1, 4, 32000)
         data_iter = _make_grain_batch_iter(batch)
 
-        _, metrics = vlm_trainer.run_sft(
+        _, metrics = _run_vlm_sft_cpu_semantics(
             make_vl_config("qwen3-vl-smoke"),
             train_cfg,
             data_iter,
@@ -309,7 +317,7 @@ class VLMSFTTrainingTest(absltest.TestCase):
         batch = _make_multimodal_qwen3_vl_smoke_batch(seq_len=8)
         data_iter = _make_grain_batch_iter(batch)
 
-        _, metrics = vlm_trainer.run_sft(
+        _, metrics = _run_vlm_sft_cpu_semantics(
             make_vl_config("qwen3-vl-smoke"),
             train_cfg,
             data_iter,

@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import ast
+import contextlib
 import inspect
 import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from unittest import mock
 
@@ -36,15 +38,38 @@ class _Resource:
             raise self.close_error
 
 
-class _Context:
-    def __init__(self, error=None):
-        self.error = error
-        self.exit_args = None
+class _CountingIterator:
+    def __init__(self):
+        self.count = 0
 
-    def __exit__(self, *args):
-        self.exit_args = args
-        if self.error is not None:
-            raise self.error
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        self.count += 1
+        return {
+            "token_ids_BT": jnp.ones((1, 4), dtype=jnp.int32),
+            "attention_mask_BT": jnp.ones((1, 4), dtype=jnp.int32),
+            "loss_mask_BT": jnp.ones((1, 4), dtype=jnp.int32),
+        }
+
+
+class _LoopManager(_Resource):
+    def __init__(self):
+        super().__init__(
+            wait_error=KeyboardInterrupt("wait failed"),
+            close_error=SystemExit("close failed"),
+        )
+        self.saves = []
+        self.frontier = 0
+
+    def save(self, step, *, args, force):
+        self.saves.append((step, args, force))
+        self.frontier = step
+        return True
+
+    def latest_step(self):
+        return self.frontier
 
 
 class VLMPhaseContractTest(absltest.TestCase):
@@ -79,40 +104,267 @@ class VLMPhaseContractTest(absltest.TestCase):
 
     def test_cleanup_preserves_typed_fatal_and_drains_every_resource(self):
         manager = _Resource(
-            wait_error=OSError("wait failed"),
-            close_error=RuntimeError("close failed"),
+            wait_error=KeyboardInterrupt("wait failed"),
+            close_error=SystemExit("close failed"),
         )
-        context = _Context(ValueError("exit failed"))
-        cleanup = vlm._TrainingCleanup(manager, context)
+        cleanup = vlm._TrainingCleanup(manager)
         fatal = FloatingPointError("invalid_candidate_state")
 
-        cleanup.close(fatal, (FloatingPointError, fatal, None))
+        cleanup.close(fatal)
 
         self.assertEqual(manager.waits, 1)
         self.assertEqual(manager.closes, 1)
-        self.assertIs(context.exit_args[1], fatal)
-        self.assertLen(fatal.__notes__, 3)
+        self.assertLen(fatal.__notes__, 2)
 
     def test_cleanup_failure_without_active_error_is_typed(self):
-        cleanup = vlm._TrainingCleanup(_Resource(close_error=OSError("close failed")), None)
+        cleanup = vlm._TrainingCleanup(_Resource(close_error=OSError("close failed")))
         with self.assertRaisesRegex(OSError, "close failed"):
-            cleanup.close(None, (None, None, None))
+            cleanup.close(None)
 
-    def test_cleanup_restores_prior_signal_handlers_in_reverse_order(self):
-        cleanup = vlm._TrainingCleanup()
-        usr_handler = object()
-        term_handler = object()
-        with mock.patch.object(
-            vlm.signal,
-            "signal",
-            side_effect=[usr_handler, term_handler, None, None],
-        ) as set_handler:
-            cleanup.install_signal_handler(vlm.signal.SIGUSR1, object())
-            cleanup.install_signal_handler(vlm.signal.SIGTERM, object())
-            cleanup.close(None, (None, None, None))
+    def test_public_cleanup_owner_preserves_primary_fatal(self):
+        manager = _Resource()
+        fatal = FloatingPointError("invalid_candidate_state")
 
-        self.assertEqual(set_handler.call_args_list[-2].args, (vlm.signal.SIGTERM, term_handler))
-        self.assertEqual(set_handler.call_args_list[-1].args, (vlm.signal.SIGUSR1, usr_handler))
+        def fail(*args, _cleanup, **kwargs):
+            del args, kwargs
+            _cleanup.checkpoint_manager = manager
+            raise fatal
+
+        with (
+            mock.patch.object(
+                vlm,
+                "_require_registrar_compiled_executable_capability",
+            ),
+            mock.patch.object(vlm, "_run_sft", side_effect=fail),
+            self.assertRaises(FloatingPointError) as raised,
+        ):
+            vlm.run_sft(
+                object(),
+                vlm.TrainConfig(schedule_horizon=1),
+                object(),
+                invocation_end_step=1,
+            )
+
+        self.assertIs(raised.exception, fatal)
+        self.assertEqual(manager.waits, 1)
+        self.assertEqual(manager.closes, 1)
+
+    def test_run_loop_fatal_boundaries_never_save_and_cleanup_once(self):
+        mesh = vlm.ensure_mesh(tp_size=1, fsdp_size=1, dp_size=1)
+        model = object()
+        optimizer = mock.Mock(model=model)
+        gradient = object()
+        metrics = {
+            "ce_loss_sum": jnp.asarray(1.0, dtype=jnp.float32),
+            "aux_loss": jnp.asarray(0.0, dtype=jnp.float32),
+            "supervised_tokens": jnp.asarray(1.0, dtype=jnp.float32),
+            "total_tokens": jnp.asarray(4.0, dtype=jnp.float32),
+        }
+        fatal_status = jnp.asarray(
+            vlm.OptimizerFatalStatus.INVALID_GRADIENT,
+            dtype=jnp.uint8,
+        )
+        cases = (
+            ("log", 2, 1, None),
+            ("validation", 1, 1, 1),
+            ("checkpoint", 1, 0, None),
+        )
+
+        for boundary, invocation_end, log_every, val_every in cases:
+            with self.subTest(boundary=boundary), tempfile.TemporaryDirectory() as tmpdir:
+                manager = _LoopManager()
+                train_iterator = _CountingIterator()
+                val_iterator = _CountingIterator() if val_every is not None else None
+                save_every = 2 if boundary == "log" else 1
+                patchers = (
+                    mock.patch.object(vlm, "_make_checkpoint_manager", return_value=manager),
+                    mock.patch.object(
+                        vlm,
+                        "_require_registrar_compiled_executable_capability",
+                    ),
+                    mock.patch.object(vlm, "_write_checkpoint_config"),
+                    mock.patch.object(vlm, "_write_lora_metadata"),
+                    mock.patch.object(vlm.vlm_api, "resolve_config", return_value=object()),
+                    mock.patch.object(vlm, "require_zero_router_aux_loss"),
+                    mock.patch.object(vlm, "ensure_mesh", return_value=mesh),
+                    mock.patch.object(
+                        vlm.vlm_api, "align_config_to_mesh", side_effect=lambda cfg, _: cfg
+                    ),
+                    mock.patch.object(vlm.vlm_api, "batch_partition_spec", return_value=vlm.P()),
+                    mock.patch.object(vlm, "required_batch_multiple", return_value=1),
+                    mock.patch.object(vlm.vlm_api, "init_model", return_value=(model, object())),
+                    mock.patch(
+                        "omegalax.models.sharding_runtime.set_attn_backend",
+                    ),
+                    mock.patch.object(vlm, "record_deltanet_kernel", return_value=None),
+                    mock.patch.object(vlm, "build_optimizer", return_value=optimizer),
+                    mock.patch.object(
+                        vlm,
+                        "make_sft_gradient_step",
+                        return_value=lambda _model, _batch: (gradient, metrics),
+                    ),
+                    mock.patch.object(
+                        vlm,
+                        "make_sft_eval_step",
+                        return_value=lambda _model, _batch: (
+                            jnp.asarray(1.0),
+                            jnp.asarray(1.0),
+                        ),
+                    ),
+                    mock.patch.object(
+                        vlm.vlm_api, "shard_batch_dict", side_effect=lambda batch, *_: batch
+                    ),
+                    mock.patch.object(
+                        vlm, "per_device_step_flops", return_value=vlm.StepFlops(0.0, 0.0)
+                    ),
+                    mock.patch.object(vlm, "initialize_gradient_sum", return_value=gradient),
+                    mock.patch.object(
+                        vlm,
+                        "apply_normalized_gradient_sum",
+                        return_value=(fatal_status, jnp.asarray(1.0, dtype=jnp.float32)),
+                    ),
+                    mock.patch.object(vlm, "startup_log"),
+                )
+                with contextlib.ExitStack() as stack:
+                    for patcher in patchers:
+                        stack.enter_context(patcher)
+                    with self.assertRaisesRegex(
+                        FloatingPointError, f"{boundary}: invalid_gradient"
+                    ) as raised:
+                        vlm.run_sft(
+                            object(),
+                            vlm.TrainConfig(
+                                batch_size=1,
+                                seq_len=4,
+                                schedule_horizon=invocation_end,
+                            ),
+                            train_iterator,
+                            invocation_end_step=invocation_end,
+                            save_dir=Path(tmpdir) / "run",
+                            save_every=save_every,
+                            log_every=log_every,
+                            val_data_iter=val_iterator,
+                            val_every=val_every,
+                            val_steps=1,
+                            tp_size=1,
+                            fsdp_size=1,
+                            dp_size=1,
+                        )
+
+                self.assertLen(raised.exception.__notes__, 2)
+                self.assertEqual(manager.waits, 1)
+                self.assertEqual(manager.closes, 1)
+                self.assertEmpty(manager.saves)
+                self.assertEqual(manager.frontier, 0)
+                self.assertEqual(train_iterator.count, 1)
+                if val_iterator is not None:
+                    self.assertEqual(val_iterator.count, 0)
+
+    def test_single_process_preflight_precedes_library_and_cli_resources(self):
+        with (
+            mock.patch.object(vlm.jax, "process_count", return_value=2),
+            mock.patch.object(vlm, "_run_sft") as private_run,
+            self.assertRaisesRegex(RuntimeError, "exactly one JAX process"),
+        ):
+            vlm.run_sft(
+                object(),
+                vlm.TrainConfig(schedule_horizon=1),
+                object(),
+                invocation_end_step=1,
+            )
+        private_run.assert_not_called()
+
+        with (
+            mock.patch.object(vlm.jax, "process_count", return_value=1),
+            mock.patch.object(vlm, "_run_sft") as private_run,
+            self.assertRaisesRegex(RuntimeError, "registrar-authorized"),
+        ):
+            vlm.run_sft(
+                object(),
+                vlm.TrainConfig(schedule_horizon=1),
+                object(),
+                invocation_end_step=1,
+            )
+        private_run.assert_not_called()
+
+        code = """
+from unittest import mock
+from scripts import train_vlm_sft as script
+with (
+    mock.patch.object(script, "FLAGS") as flag_values,
+    mock.patch.object(script, "_validate_flags"),
+    mock.patch.object(script.jax.config, "update"),
+    mock.patch.object(script.jax.distributed, "initialize"),
+    mock.patch.object(
+        script.vlm_trainer,
+        "_require_single_jax_process",
+        side_effect=RuntimeError("exactly one JAX process"),
+    ),
+    mock.patch.object(
+        script.AutoTokenizer,
+        "from_pretrained",
+        side_effect=AssertionError("tokenizer loaded before topology gate"),
+    ),
+    mock.patch.object(
+        script,
+        "_grain_iter",
+        side_effect=AssertionError("iterator built before topology gate"),
+    ),
+    mock.patch.object(
+        script.vlm_trainer,
+        "run_sft",
+        side_effect=AssertionError("trainer entered before topology gate"),
+    ),
+):
+    flag_values.jax_cache_dir = "/tmp/unused"
+    try:
+        script.main(None)
+    except RuntimeError as error:
+        if "exactly one JAX process" not in str(error):
+            raise
+    else:
+        raise AssertionError("multi-process CLI topology was accepted")
+
+with (
+    mock.patch.object(script, "FLAGS") as flag_values,
+    mock.patch.object(script, "_validate_flags"),
+    mock.patch.object(script.jax.config, "update"),
+    mock.patch.object(script.jax.distributed, "initialize"),
+    mock.patch.object(script.vlm_trainer, "_require_single_jax_process"),
+    mock.patch.object(
+        script.AutoTokenizer,
+        "from_pretrained",
+        side_effect=AssertionError("tokenizer loaded before capability gate"),
+    ),
+    mock.patch.object(
+        script,
+        "_grain_iter",
+        side_effect=AssertionError("iterator built before capability gate"),
+    ),
+    mock.patch.object(
+        script.vlm_trainer,
+        "run_sft",
+        side_effect=AssertionError("trainer entered before capability gate"),
+    ),
+):
+    flag_values.jax_cache_dir = "/tmp/unused"
+    try:
+        script.main(None)
+    except RuntimeError as error:
+        if "registrar-authorized" not in str(error):
+            raise
+    else:
+        raise AssertionError("missing registrar capability was accepted")
+"""
+        env = dict(os.environ)
+        env["JAX_PLATFORMS"] = "cpu"
+        for optimized in (False, True):
+            command = [sys.executable]
+            if optimized:
+                command.append("-O")
+            command.extend(["-c", code])
+            with self.subTest(optimized=optimized):
+                subprocess.run(command, env=env, check=True, timeout=120)
 
     def test_checkpoint_rng_is_absent_and_fused_path_has_no_host_sync(self):
         checkpoint_source = "\n".join(

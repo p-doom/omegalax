@@ -81,6 +81,14 @@ def _snapshot(optimizer):
     return jax.tree.map(lambda value: np.asarray(value).copy(), nnx.pure(nnx.state(optimizer)))
 
 
+def _run_sft_cpu_semantics(*args, **kwargs):
+    with mock.patch.object(
+        vlm_trainer,
+        "_require_registrar_compiled_executable_capability",
+    ):
+        return vlm_trainer.run_sft(*args, **kwargs)
+
+
 def _assert_tree_allclose(testcase, actual, expected, *, atol=1e-7):
     testcase.assertEqual(jax.tree.structure(actual), jax.tree.structure(expected))
     for actual_leaf, expected_leaf in zip(jax.tree.leaves(actual), jax.tree.leaves(expected)):
@@ -229,7 +237,7 @@ class VLMGradientAccumulationTest(absltest.TestCase):
             "print_every": 0,
         }
 
-        accumulated, accumulated_metrics = vlm_trainer.run_sft(
+        accumulated, accumulated_metrics = _run_sft_cpu_semantics(
             cfg,
             vlm_trainer.TrainConfig(batch_size=1, grad_accum_steps=2, **common),
             iter(micros),
@@ -240,7 +248,7 @@ class VLMGradientAccumulationTest(absltest.TestCase):
             dp_size=1,
             text_attn_backend="xla",
         )
-        reference, reference_metrics = vlm_trainer.run_sft(
+        reference, reference_metrics = _run_sft_cpu_semantics(
             cfg,
             vlm_trainer.TrainConfig(batch_size=2, grad_accum_steps=1, **common),
             iter([combined]),
@@ -488,7 +496,7 @@ class VLMGradientAccumulationTest(absltest.TestCase):
             mock.patch.object(vlm_trainer.vlm_api, "init_model") as init_model,
             self.assertRaisesRegex(ValueError, "router auxiliary loss"),
         ):
-            vlm_trainer.run_sft(
+            _run_sft_cpu_semantics(
                 make_vl_config("qwen3-vl-smoke-moe"),
                 vlm_trainer.TrainConfig(schedule_horizon=1),
                 iter(()),
