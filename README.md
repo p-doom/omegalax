@@ -111,7 +111,9 @@ uv run scripts/train_vlm_sft.py \
   --tp-size 1 \
   --fsdp-size 1
 ```
-Resume from the latest checkpoint with `--resume`. Training checkpoints also persist the Grain iterator state.
+Resume VLM training only by naming the committed frontier explicitly with
+`--resume=required --resume_step=<step>`. Training checkpoints also persist the Grain iterator
+state. A fresh VLM run uses `--resume=never` and a checkpoint directory that does not exist yet.
 
 Export any supported model (Qwen3 dense/MoE, Qwen3.5, Qwen3-VL) to HuggingFace safetensors:
 ```bash

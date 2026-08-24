@@ -68,6 +68,29 @@ class _FakeManager:
         return self.latest
 
 
+class _FakeRestoreManager:
+    def __init__(
+        self,
+        train_state,
+        schema,
+        *,
+        items=("input_iter", "schema", "train_state"),
+    ):
+        self.train_state = train_state
+        self.schema = schema
+        self.items = items
+        self.restores = []
+
+    def item_metadata(self, step):
+        return {item: None for item in self.items}
+
+    def restore(self, step, *, args):
+        self.restores.append((step, args))
+        if set(args.keys()) == {"schema"}:
+            return {"schema": self.schema}
+        return {"train_state": self.train_state}
+
+
 class CheckpointCommitTest(absltest.TestCase):
     def setUp(self):
         super().setUp()
@@ -182,6 +205,9 @@ class CheckpointCommitTest(absltest.TestCase):
             forced = self._commit(manager, 13, vlm._CheckpointCommitMode.FORCED)
             self.assertEqual(forced.step, 13)
             self.assertEqual(manager.all_steps(), [10, 13])
+            vlm._require_checkpoint_frontier(manager, 13, Path(tmpdir))
+            with self.assertRaisesRegex(ValueError, "does not match.*frontier 13"):
+                vlm._require_checkpoint_frontier(manager, 10, Path(tmpdir))
 
             with self.assertRaises(ocp.checkpoint_manager.StepAlreadyExistsError):
                 self._commit(manager, 13, vlm._CheckpointCommitMode.FORCED)
@@ -206,6 +232,7 @@ class CheckpointCommitTest(absltest.TestCase):
                 manager,
                 restored_optimizer,
                 jax.random.key(0),
+                1,
                 restored_iterator,
             )
             self.assertEqual(step, 1)
@@ -213,6 +240,214 @@ class CheckpointCommitTest(absltest.TestCase):
             np.testing.assert_array_equal(jax.random.key_data(restored_rng), expected_rng)
             self.assertEqual(next(restored_iterator), expected_next)
             manager.close()
+
+    def test_restore_rejects_optimizer_schema_without_mutation(self):
+        expected = nnx.state(_optimizer())
+        cases = {
+            "paths": nnx.State(
+                {
+                    "model": {},
+                    "opt_state": expected["opt_state"],
+                    "step": expected["step"],
+                }
+            ),
+            "variable": nnx.State(
+                {
+                    "model": {"weight": nnx.BatchStat(jnp.array([0.75, -0.25], dtype=jnp.float32))},
+                    "opt_state": expected["opt_state"],
+                    "step": expected["step"],
+                }
+            ),
+            "shape": nnx.State(
+                {
+                    "model": {"weight": nnx.Param(jnp.ones(3, dtype=jnp.float32))},
+                    "opt_state": expected["opt_state"],
+                    "step": expected["step"],
+                }
+            ),
+            "dtype": nnx.State(
+                {
+                    "model": {"weight": nnx.Param(jnp.ones(2, dtype=jnp.bfloat16))},
+                    "opt_state": expected["opt_state"],
+                    "step": expected["step"],
+                }
+            ),
+        }
+        for name, restored_state in cases.items():
+            with self.subTest(name=name):
+                optimizer = _optimizer()
+                iterator = _iterator()
+                before_optimizer = _snapshot(optimizer)
+                before_iterator = iterator.get_state()
+                manager = _FakeRestoreManager(
+                    {"optimizer": restored_state, "rng": jax.random.key(7)},
+                    vlm._sft_checkpoint_schema(optimizer, jax.random.key(0), iterator),
+                )
+                with self.assertRaisesRegex(ValueError, f"optimizer .*{name}"):
+                    vlm._restore_sft_checkpoint(
+                        manager,
+                        optimizer,
+                        jax.random.key(0),
+                        1,
+                        iterator,
+                    )
+                _assert_tree_equal(self, _snapshot(optimizer), before_optimizer)
+                self.assertEqual(iterator.get_state(), before_iterator)
+                self.assertLen(manager.restores, 2)
+
+    def test_restore_rejects_rng_schema_without_mutation(self):
+        restored_optimizer = nnx.state(_optimizer())
+        cases = {
+            "type": jnp.array([0, 7], dtype=jnp.uint32),
+            "shape": jax.random.split(jax.random.key(7), 2),
+            "dtype": jax.random.key(7, impl="rbg"),
+        }
+        for name, restored_rng in cases.items():
+            with self.subTest(name=name):
+                optimizer = _optimizer()
+                iterator = _iterator()
+                before_optimizer = _snapshot(optimizer)
+                before_iterator = iterator.get_state()
+                manager = _FakeRestoreManager(
+                    {"optimizer": restored_optimizer, "rng": restored_rng},
+                    vlm._sft_checkpoint_schema(optimizer, jax.random.key(0), iterator),
+                )
+                with self.assertRaisesRegex(ValueError, f"RNG {name}"):
+                    vlm._restore_sft_checkpoint(
+                        manager,
+                        optimizer,
+                        jax.random.key(0),
+                        1,
+                        iterator,
+                    )
+                _assert_tree_equal(self, _snapshot(optimizer), before_optimizer)
+                self.assertEqual(iterator.get_state(), before_iterator)
+                self.assertLen(manager.restores, 2)
+
+    def test_restore_rejects_saved_variable_subtype_without_mutation(self):
+        optimizer = _optimizer()
+        iterator = _iterator()
+        before_optimizer = _snapshot(optimizer)
+        before_iterator = iterator.get_state()
+        schema = vlm._sft_checkpoint_schema(optimizer, jax.random.key(0), iterator)
+        schema["optimizer"][0]["variable_type"] = "flax.nnx.variablelib.BatchStat"
+        manager = _FakeRestoreManager(
+            {"optimizer": nnx.state(_optimizer()), "rng": jax.random.key(7)},
+            schema,
+        )
+        with self.assertRaisesRegex(ValueError, "schema does not match"):
+            vlm._restore_sft_checkpoint(
+                manager,
+                optimizer,
+                jax.random.key(0),
+                1,
+                iterator,
+            )
+        _assert_tree_equal(self, _snapshot(optimizer), before_optimizer)
+        self.assertEqual(iterator.get_state(), before_iterator)
+        self.assertLen(manager.restores, 1)
+
+    def test_restore_rejects_outer_schema_without_mutation(self):
+        optimizer = _optimizer()
+        iterator = _iterator()
+        before_optimizer = _snapshot(optimizer)
+        before_iterator = iterator.get_state()
+        cases = (
+            _FakeRestoreManager(
+                {"optimizer": nnx.state(_optimizer()), "rng": jax.random.key(7)},
+                {},
+                items=("train_state",),
+            ),
+            _FakeRestoreManager(
+                {"optimizer": nnx.state(_optimizer())},
+                vlm._sft_checkpoint_schema(optimizer, jax.random.key(0), iterator),
+            ),
+        )
+        for manager in cases:
+            with (
+                self.subTest(items=manager.items),
+                self.assertRaisesRegex(ValueError, "items|train_state"),
+            ):
+                vlm._restore_sft_checkpoint(
+                    manager,
+                    optimizer,
+                    jax.random.key(0),
+                    1,
+                    iterator,
+                )
+            _assert_tree_equal(self, _snapshot(optimizer), before_optimizer)
+            self.assertEqual(iterator.get_state(), before_iterator)
+
+    def test_restore_rejects_corrupt_iterator_before_mutation(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = vlm._make_checkpoint_manager(Path(tmpdir), save_interval=1)
+            self._commit(manager, 1, vlm._CheckpointCommitMode.PERIODIC)
+            iterator_path = Path(tmpdir) / "000001/input_iter/process_0-of-1.json"
+            cases = {
+                "type": '{"next_index": "1"}',
+                "keys": '{"wrong": 1}',
+                "duplicate": '{"next_index": 1, "next_index": 2}',
+            }
+            for name, raw in cases.items():
+                with self.subTest(name=name):
+                    iterator_path.write_text(raw)
+                    optimizer = _optimizer()
+                    iterator = _iterator()
+                    before_optimizer = _snapshot(optimizer)
+                    before_iterator = iterator.get_state()
+                    with self.assertRaisesRegex(ValueError, "input_iter|Duplicate"):
+                        vlm._restore_sft_checkpoint(
+                            manager,
+                            optimizer,
+                            jax.random.key(0),
+                            1,
+                            iterator,
+                        )
+                    _assert_tree_equal(self, _snapshot(optimizer), before_optimizer)
+                    self.assertEqual(iterator.get_state(), before_iterator)
+            manager.close()
+
+    def test_vlm_resume_request_is_explicit(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            missing = root / "missing"
+            self.assertFalse(
+                vlm._validate_resume_request(
+                    vlm.checkpoint_utils.ResumeMode.NEVER,
+                    None,
+                    missing,
+                    10,
+                )
+            )
+            with self.assertRaisesRegex(ValueError, "new checkpoint root"):
+                vlm._validate_resume_request(
+                    vlm.checkpoint_utils.ResumeMode.NEVER,
+                    None,
+                    root,
+                    10,
+                )
+            with self.assertRaisesRegex(ValueError, "does not support if_present"):
+                vlm._validate_resume_request(
+                    vlm.checkpoint_utils.ResumeMode.IF_PRESENT,
+                    None,
+                    root,
+                    10,
+                )
+            with self.assertRaisesRegex(ValueError, "positive integer"):
+                vlm._validate_resume_request(
+                    vlm.checkpoint_utils.ResumeMode.REQUIRED,
+                    None,
+                    root,
+                    10,
+                )
+            self.assertTrue(
+                vlm._validate_resume_request(
+                    vlm.checkpoint_utils.ResumeMode.REQUIRED,
+                    3,
+                    root,
+                    10,
+                )
+            )
 
 
 if __name__ == "__main__":

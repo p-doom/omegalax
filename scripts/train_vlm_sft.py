@@ -107,12 +107,11 @@ flags.DEFINE_bool("log_memory", None, "Log per-process JAX/HBM memory at init an
 flags.DEFINE_enum(
     "resume",
     None,
-    [m.value for m in ResumeMode],
-    "Checkpoint resume policy: 'never' (fresh start), 'if_present' "
-    "(resume if a checkpoint exists at --save_dir, else start fresh — right "
-    "mode for SLURM time-limit resubmits), 'required' (resume; error if no "
-    "checkpoint).",
+    [ResumeMode.NEVER.value, ResumeMode.REQUIRED.value],
+    "Checkpoint policy: 'never' creates a new checkpoint root; 'required' restores "
+    "the exact --resume_step frontier.",
 )
+flags.DEFINE_integer("resume_step", None, "Exact committed step required for resume='required'.")
 flags.DEFINE_integer("pad_id", None, "Padding token id.")
 flags.DEFINE_string("peak_tflops", None, "Peak TFLOPS for MFU calculation.")
 flags.DEFINE_string("wandb_entity", None, "Weights & Biases entity (team/user).")
@@ -248,6 +247,12 @@ def _validate_flags() -> None:
         for name in ("lora_rank", "lora_alpha"):
             if FLAGS[name].value is None:
                 problems.append(f"{name} (required when enable_lora=true)")
+
+    if FLAGS.resume == ResumeMode.REQUIRED.value:
+        if FLAGS.resume_step is None or FLAGS.resume_step <= 0:
+            problems.append("resume_step (positive integer required when resume=required)")
+    elif FLAGS.resume_step is not None:
+        problems.append("resume_step (must be unset when resume=never)")
 
     if FLAGS.val_data_path:
         for name in ("val_every", "val_steps"):
@@ -509,6 +514,7 @@ def main(_) -> None:
             keep_latest=FLAGS.keep_latest,
             log_every=FLAGS.log_every,
             resume=resume_mode,
+            resume_step=FLAGS.resume_step,
             pad_id=FLAGS.pad_id,
             peak_tflops=peak_tflops,
             tp_size=FLAGS.tp_size,

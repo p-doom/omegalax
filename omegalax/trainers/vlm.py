@@ -7,11 +7,13 @@ import dataclasses
 import datetime
 import enum
 import gc
+import json
 import os
 import signal
 import subprocess
 from pathlib import Path
 
+import grain
 import jax
 import jax.numpy as jnp
 import optax
@@ -182,6 +184,9 @@ def _make_checkpoint_manager(
     )
     handler_registry.add("train_state", ocp.args.PyTreeSave, train_state_handler)
     handler_registry.add("train_state", ocp.args.PyTreeRestore, train_state_handler)
+    schema_handler = ocp.handlers.JsonCheckpointHandler()
+    handler_registry.add("schema", ocp.args.JsonSave, schema_handler)
+    handler_registry.add("schema", ocp.args.JsonRestore, schema_handler)
     checkpoint_utils.register_grain_iterator_handler(handler_registry)
     preservation_policy = None
     if keep_period:
@@ -256,8 +261,11 @@ def _commit_sft_checkpoint(
     elif mode in (_CheckpointCommitMode.PERIODIC, _CheckpointCommitMode.FORCED):
         if prior_commit is not None:
             raise ValueError("A new checkpoint save cannot reuse a prior commit.")
-        train_state = _train_state(optimizer, rng)
-        save_args = checkpoint_utils.make_grain_save_args(train_state, input_iter)
+        save_args = ocp.args.Composite(
+            train_state=ocp.args.PyTreeSave(_train_state(optimizer, rng)),
+            input_iter=grain.checkpoint.CheckpointSave(input_iter),
+            schema=ocp.args.JsonSave(_sft_checkpoint_schema(optimizer, rng, input_iter)),
+        )
         saved = checkpoint_manager.save(
             step,
             args=save_args,
@@ -278,35 +286,239 @@ def _commit_sft_checkpoint(
     return commit
 
 
+def _state_path(path: tuple[object, ...]) -> str:
+    return ".".join(str(part) for part in path)
+
+
+def _validate_optimizer_restore(expected: nnx.State, restored: object) -> None:
+    if type(restored) is not type(expected):
+        raise ValueError(
+            f"Checkpoint optimizer must be {type(expected).__name__}, got "
+            f"{type(restored).__name__}."
+        )
+    expected_flat = expected.flat_state()
+    restored_flat = restored.flat_state()
+    expected_paths = tuple(expected_flat.paths)
+    restored_paths = tuple(restored_flat.paths)
+    if restored_paths != expected_paths:
+        raise ValueError(
+            "Checkpoint optimizer paths do not match the initialized optimizer: "
+            f"expected {expected_paths}, got {restored_paths}."
+        )
+    for path, expected_leaf, restored_leaf in zip(
+        expected_paths, expected_flat.leaves, restored_flat.leaves, strict=True
+    ):
+        name = _state_path(path)
+        if type(restored_leaf) is not type(expected_leaf):
+            raise ValueError(
+                f"Checkpoint optimizer variable {name} must be "
+                f"{type(expected_leaf).__name__}, got {type(restored_leaf).__name__}."
+            )
+        if restored_leaf.shape != expected_leaf.shape:
+            raise ValueError(
+                f"Checkpoint optimizer variable {name} shape must be "
+                f"{expected_leaf.shape}, got {restored_leaf.shape}."
+            )
+        if restored_leaf.dtype != expected_leaf.dtype:
+            raise ValueError(
+                f"Checkpoint optimizer variable {name} dtype must be "
+                f"{expected_leaf.dtype}, got {restored_leaf.dtype}."
+            )
+
+
+def _validate_rng_restore(expected: jax.Array, restored: object) -> None:
+    if type(restored) is not type(expected):
+        raise ValueError(
+            f"Checkpoint RNG type must be {type(expected).__name__}, got {type(restored).__name__}."
+        )
+    if restored.shape != expected.shape:
+        raise ValueError(f"Checkpoint RNG shape must be {expected.shape}, got {restored.shape}.")
+    if restored.dtype != expected.dtype:
+        raise ValueError(f"Checkpoint RNG dtype must be {expected.dtype}, got {restored.dtype}.")
+
+
+def _json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"Duplicate key {key!r} in Grain iterator checkpoint.")
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"Invalid JSON constant {value!r} in Grain iterator checkpoint.")
+
+
+def _parse_iterator_state(raw: str) -> object:
+    return json.loads(
+        raw,
+        object_pairs_hook=_json_object,
+        parse_constant=_reject_json_constant,
+    )
+
+
+def _validate_json_schema(expected: object, restored: object, path: str = "input_iter") -> None:
+    if type(restored) is not type(expected):
+        raise ValueError(
+            f"Checkpoint {path} type must be {type(expected).__name__}, got "
+            f"{type(restored).__name__}."
+        )
+    if isinstance(expected, dict):
+        if set(restored) != set(expected):
+            raise ValueError(
+                f"Checkpoint {path} keys must be {sorted(expected)}, got {sorted(restored)}."
+            )
+        for key in expected:
+            _validate_json_schema(expected[key], restored[key], f"{path}.{key}")
+    elif isinstance(expected, list):
+        if len(restored) != len(expected):
+            raise ValueError(
+                f"Checkpoint {path} length must be {len(expected)}, got {len(restored)}."
+            )
+        for index, (expected_value, restored_value) in enumerate(zip(expected, restored)):
+            _validate_json_schema(expected_value, restored_value, f"{path}[{index}]")
+
+
+def _type_name(value: object) -> str:
+    value_type = type(value)
+    return f"{value_type.__module__}.{value_type.__qualname__}"
+
+
+def _iterator_state(input_iter: checkpoint_utils.GrainIterator) -> object:
+    state = input_iter.get_state()
+    if isinstance(state, bytes):
+        return _parse_iterator_state(state.decode("utf-8"))
+    return _parse_iterator_state(json.dumps(state))
+
+
+def _iterator_schema(value: object) -> object:
+    if isinstance(value, dict):
+        return {
+            "type": "dict",
+            "items": [[key, _iterator_schema(value[key])] for key in sorted(value)],
+        }
+    if isinstance(value, list):
+        return {"type": "list", "items": [_iterator_schema(item) for item in value]}
+    return {"type": _type_name(value)}
+
+
+def _sft_checkpoint_schema(
+    optimizer: MixedPrecisionOptimizer,
+    rng: jax.Array,
+    input_iter: checkpoint_utils.GrainIterator,
+) -> dict[str, object]:
+    optimizer_state = nnx.state(optimizer).flat_state()
+    optimizer_leaves = []
+    for path, leaf in zip(optimizer_state.paths, optimizer_state.leaves, strict=True):
+        optimizer_leaves.append(
+            {
+                "path": list(path),
+                "variable_type": _type_name(leaf),
+                "shape": list(leaf.shape),
+                "dtype": str(leaf.dtype),
+            }
+        )
+    return {
+        "version": 1,
+        "optimizer": optimizer_leaves,
+        "rng": {
+            "array_type": _type_name(rng),
+            "shape": list(rng.shape),
+            "dtype": str(rng.dtype),
+        },
+        "input_iter": _iterator_schema(_iterator_state(input_iter)),
+    }
+
+
+def _validate_iterator_restore(
+    checkpoint_manager: ocp.CheckpointManager,
+    step: int,
+    input_iter: checkpoint_utils.GrainIterator,
+) -> None:
+    expected = _iterator_state(input_iter)
+    process_index = jax.process_index()
+    process_count = jax.process_count()
+    state_path = (
+        Path(checkpoint_manager.directory)
+        / f"{step:06d}"
+        / "input_iter"
+        / f"process_{process_index}-of-{process_count}.json"
+    )
+    if not state_path.is_file():
+        raise ValueError(f"Checkpoint {step} has no Grain iterator state at {state_path}.")
+    restored = _parse_iterator_state(state_path.read_text())
+    _validate_json_schema(expected, restored)
+
+
 def _restore_sft_checkpoint(
     checkpoint_manager: ocp.CheckpointManager,
     optimizer: MixedPrecisionOptimizer,
     rng: jax.Array,
+    step: int,
     input_iter: checkpoint_utils.GrainIterator,
 ) -> tuple[MixedPrecisionOptimizer, int, jax.Array, checkpoint_utils.GrainIterator]:
-    latest_step = checkpoint_manager.latest_step()
-    if latest_step is None:
-        raise ValueError("No checkpoint found to restore.")
-
     abstract_state = _abstract_train_state(optimizer, rng)
-    restore_args = checkpoint_utils.make_grain_restore_args(abstract_state, input_iter)
-    restored = checkpoint_manager.restore(latest_step, args=restore_args)
-    train_state = restored["train_state"]
-    # Canonicalize restored opt-state dtypes against the freshly-built
-    # optimizer's expectations: some prior checkpoints stored Adam's first
-    # moment in bf16 while the optimizer now uses optax's fp32 default.
     expected_state = nnx.state(optimizer)
-    restored_state = jax.tree.map(
-        lambda exp, got: got.astype(exp.dtype) if exp.dtype != got.dtype else got,
-        expected_state,
-        train_state["optimizer"],
+    metadata = checkpoint_manager.item_metadata(step)
+    if set(metadata.keys()) != {"input_iter", "schema", "train_state"}:
+        raise ValueError(
+            f"Checkpoint {step} items must be exactly input_iter, schema, and train_state, got "
+            f"{sorted(metadata.keys())}."
+        )
+
+    restored_schema = checkpoint_manager.restore(
+        step,
+        args=ocp.args.Composite(schema=ocp.args.JsonRestore()),
     )
-    nnx.update(optimizer, restored_state)
+    if set(restored_schema.keys()) != {"schema"}:
+        raise ValueError(
+            f"Checkpoint {step} schema restore returned keys {sorted(restored_schema.keys())}."
+        )
+    expected_schema = _sft_checkpoint_schema(optimizer, rng, input_iter)
+    if restored_schema["schema"] != expected_schema:
+        raise ValueError(
+            f"Checkpoint {step} schema does not match the initialized optimizer, RNG, and iterator."
+        )
+
+    restored = checkpoint_manager.restore(
+        step,
+        args=ocp.args.Composite(train_state=ocp.args.PyTreeRestore(abstract_state)),
+    )
+    if set(restored.keys()) != {"train_state"}:
+        raise ValueError(
+            f"Checkpoint {step} train-state restore returned keys {sorted(restored.keys())}."
+        )
+    train_state = restored["train_state"]
+    if type(train_state) is not dict or set(train_state) != {"optimizer", "rng"}:
+        keys = sorted(train_state) if isinstance(train_state, dict) else type(train_state).__name__
+        raise ValueError(
+            f"Checkpoint {step} train_state must contain exactly optimizer and rng, got {keys}."
+        )
+    _validate_optimizer_restore(expected_state, train_state["optimizer"])
+    _validate_rng_restore(rng, train_state["rng"])
+    _validate_iterator_restore(checkpoint_manager, step, input_iter)
+
+    restored_iterator = checkpoint_manager.restore(
+        step,
+        args=ocp.args.Composite(
+            input_iter=grain.checkpoint.CheckpointRestore(input_iter),
+        ),
+    )
+    if set(restored_iterator.keys()) != {"input_iter"}:
+        raise ValueError(
+            f"Checkpoint {step} iterator restore returned keys {sorted(restored_iterator.keys())}."
+        )
+    restored_input_iter = restored_iterator["input_iter"]
+    if restored_input_iter is not input_iter:
+        raise ValueError(f"Checkpoint {step} replaced the supplied Grain iterator.")
+
+    nnx.update(optimizer, train_state["optimizer"])
     return (
         optimizer,
-        int(latest_step),
+        step,
         train_state["rng"],
-        checkpoint_utils.restored_input_iter(restored),
+        restored_input_iter,
     )
 
 
@@ -417,6 +629,56 @@ def make_sft_eval_step(cfg, pad_id: int = 0, *, num_loss_tiles: int = 4):
     return sft_eval_step
 
 
+def _validate_resume_request(
+    resume: checkpoint_utils.ResumeMode,
+    resume_step: int | None,
+    save_path: Path | None,
+    num_steps: int,
+) -> bool:
+    if type(resume) is not checkpoint_utils.ResumeMode:
+        raise TypeError(f"resume must be ResumeMode, got {type(resume).__name__}.")
+    if resume is checkpoint_utils.ResumeMode.IF_PRESENT:
+        raise ValueError(
+            "VLM resume does not support if_present; choose never for a new checkpoint root or "
+            "required with an explicit resume_step."
+        )
+    if resume is checkpoint_utils.ResumeMode.NEVER:
+        if resume_step is not None:
+            raise ValueError("resume_step must be unset when resume='never'.")
+        if save_path is not None and save_path.exists():
+            raise ValueError(
+                f"resume='never' requires a new checkpoint root, but {save_path} already exists."
+            )
+        return False
+    if resume is not checkpoint_utils.ResumeMode.REQUIRED:
+        raise ValueError(f"Unsupported VLM resume mode: {resume!r}.")
+    if save_path is None:
+        raise ValueError("resume='required' requires save_dir.")
+    if not save_path.is_dir():
+        raise ValueError(
+            f"resume='required' requires an existing checkpoint root, got {save_path}."
+        )
+    if type(resume_step) is not int or resume_step <= 0:
+        raise ValueError("resume='required' requires a positive integer resume_step.")
+    if resume_step >= num_steps:
+        raise ValueError(f"resume_step={resume_step} must be less than num_steps={num_steps}.")
+    return True
+
+
+def _require_checkpoint_frontier(
+    checkpoint_manager: ocp.CheckpointManager,
+    resume_step: int,
+    save_path: Path,
+) -> None:
+    committed_steps = checkpoint_manager.all_steps()
+    committed_frontier = max(committed_steps, default=None)
+    if committed_frontier != resume_step:
+        raise ValueError(
+            f"resume_step={resume_step} does not match the committed checkpoint frontier "
+            f"{committed_frontier} at {save_path}."
+        )
+
+
 def run_sft(
     model_id_or_cfg,
     train_cfg: TrainConfig,
@@ -428,6 +690,7 @@ def run_sft(
     keep_latest: int = 1,
     log_every: int = 1,
     resume: checkpoint_utils.ResumeMode = checkpoint_utils.ResumeMode.NEVER,
+    resume_step: int | None = None,
     pad_id: int = 0,
     peak_tflops: float | None = None,
     tp_size: int | None = None,
@@ -451,51 +714,28 @@ def run_sft(
     If ``val_data_iter`` is provided, runs ``val_steps`` forward-only batches
     every ``val_every`` training steps and logs the average validation loss.
 
-    See :class:`omegalax.trainers.checkpoint_utils.ResumeMode` for the meaning of
-    each ``resume`` mode.
+    A fresh run uses ``resume=never`` and a new ``save_dir``. A continuation uses
+    ``resume=required`` and names the exact committed frontier with ``resume_step``.
     """
     save_path = Path(save_dir).expanduser().resolve() if save_dir is not None else None
+    will_resume = _validate_resume_request(resume, resume_step, save_path, train_cfg.num_steps)
 
-    # Build the canonical CheckpointManager up-front so a single ``latest_step()``
-    # query drives both the model_cfg-source decision and the eventual restore.
     checkpoint_manager: ocp.CheckpointManager | None = None
     if save_path is not None:
-        save_path.mkdir(parents=True, exist_ok=True)
+        if not will_resume:
+            save_path.mkdir(parents=True)
         checkpoint_manager = _make_checkpoint_manager(
             save_path,
             save_interval=save_every or None,
             keep_period=keep_period or None,
             keep_latest=keep_latest or None,
         )
-
-    latest_step = checkpoint_manager.latest_step() if checkpoint_manager is not None else None
-
-    if (
-        latest_step is not None
-        and latest_step >= train_cfg.num_steps
-        and resume in (checkpoint_utils.ResumeMode.IF_PRESENT, checkpoint_utils.ResumeMode.REQUIRED)
-    ):
-        startup_log(f"latest_step={latest_step} >= num_steps={train_cfg.num_steps}; exiting")
-        if checkpoint_manager is not None:
-            checkpoint_manager.close()
-        return None, None
-
-    if resume == checkpoint_utils.ResumeMode.REQUIRED and latest_step is None:
-        raise ValueError(
-            f"resume='required' but no checkpoint found at "
-            f"{save_path if save_path is not None else '<no save_dir provided>'}"
-        )
-
-    will_resume = (
-        resume in (checkpoint_utils.ResumeMode.IF_PRESENT, checkpoint_utils.ResumeMode.REQUIRED)
-        and latest_step is not None
-    )
-    if resume == checkpoint_utils.ResumeMode.IF_PRESENT:
-        startup_log(
-            f"resume=if_present: existing checkpoint detected at {save_path}; resuming"
-            if will_resume
-            else f"resume=if_present: no checkpoint at {save_path}; starting fresh"
-        )
+        if will_resume:
+            try:
+                _require_checkpoint_frontier(checkpoint_manager, resume_step, save_path)
+            except ValueError:
+                checkpoint_manager.close()
+                raise
 
     if will_resume:
         model_cfg = vlm_api.resolve_config(str(save_path))
@@ -636,7 +876,7 @@ def run_sft(
     start_step = 0
     if will_resume:
         optimizer, start_step, rng, data_iter = _restore_sft_checkpoint(
-            checkpoint_manager, optimizer, rng, data_iter
+            checkpoint_manager, optimizer, rng, resume_step, data_iter
         )
         rng = jax.device_put(rng, replicated_rng_sharding)
         startup_log(f"restored checkpoint at step {start_step}")
