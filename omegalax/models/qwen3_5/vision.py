@@ -23,19 +23,13 @@ from .norms import LayerNorm
 from .rope import apply_vision_rope
 
 
-def _cudnn_packed_vision_attention(
+def _cudnn_packed_vision_attention_local(
     q_NHK: jax.Array,
     k_NHK: jax.Array,
     v_NHK: jax.Array,
     cu_seqlens: jax.Array,
     scale: float,
 ) -> jax.Array:
-    """Run vision attention via cuDNN's packed (THD) kernel.
-
-    All image tokens are concatenated along the sequence dim. ``cu_seqlens``
-    describes per-image segment boundaries; cuDNN uses these to skip
-    cross-segment tiles entirely rather than materializing a full [T, S] mask.
-    """
     cu = cu_seqlens.astype(jnp.int32)
     q_offsets = cu[None]
     kv_offsets = cu[None]
@@ -54,6 +48,36 @@ def _cudnn_packed_vision_attention(
         qkv_layout="BTNH",
     )
     return out[0]
+
+
+def _cudnn_packed_vision_attention(
+    q_NHK: jax.Array,
+    k_NHK: jax.Array,
+    v_NHK: jax.Array,
+    cu_seqlens: jax.Array,
+    scale: float,
+) -> jax.Array:
+    """Run vision attention via cuDNN's packed (THD) kernel.
+
+    All image tokens are concatenated along the sequence dim. ``cu_seqlens``
+    describes per-image segment boundaries; cuDNN uses these to skip
+    cross-segment tiles entirely rather than materializing a full [T, S] mask.
+    """
+    sharding = jax.typeof(q_NHK).sharding
+    dp_axis = sharding.spec[0]
+    if dp_axis is None:
+        return _cudnn_packed_vision_attention_local(q_NHK, k_NHK, v_NHK, cu_seqlens, scale)
+
+    q_spec = P(*sharding.spec)
+    cu_spec = P(dp_axis)
+    cu_seqlens = reshard(cu_seqlens, cu_spec)
+    return jax.shard_map(
+        lambda q, k, v, cu: _cudnn_packed_vision_attention_local(q, k, v, cu, scale),
+        mesh=sharding.mesh,
+        in_specs=(q_spec, q_spec, q_spec, cu_spec),
+        out_specs=q_spec,
+        check_vma=False,
+    )(q_NHK, k_NHK, v_NHK, cu_seqlens)
 
 
 def _token_spatial_coords(
@@ -368,13 +392,16 @@ class VisionModel(nnx.Module):
         grid_thw: jax.Array,
         cu_seqlens: jax.Array | None = None,
     ) -> jax.Array:
+        grid_thw = reshard(grid_thw, P())
         hidden_ND = self.patch_embed(pixel_values)
         total_tokens: int = hidden_ND.shape[0]
 
         pos_embeds_ND = self._fast_pos_embed_interpolate(grid_thw, total_tokens)
+        pos_embeds_ND = reshard(pos_embeds_ND, self.hidden_shd)
         hidden_ND = hidden_ND + pos_embeds_ND
 
         rotary_emb_NK = self._rot_pos_emb(grid_thw, total_tokens)
+        rotary_emb_NK = reshard(rotary_emb_NK, P(self.hidden_shd[0], None))
         emb_NK = jnp.concatenate([rotary_emb_NK, rotary_emb_NK], axis=-1)
         cos_NK, sin_NK = jnp.cos(emb_NK), jnp.sin(emb_NK)
         cos_NK = cos_NK.astype(self.cfg.dtype)

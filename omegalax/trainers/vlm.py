@@ -558,7 +558,8 @@ def run_sft(
         # on resume the file was written by the original run and matches by
         # construction (we just resolved model_cfg from it).
         _write_checkpoint_config(save_path, model_cfg)
-        _write_lora_metadata(save_path, train_cfg)
+        if train_cfg.enable_lora:
+            _write_lora_metadata(save_path, train_cfg)
     if checkpoint_manager is not None:
         startup_log(f"checkpoint manager ready at {save_path!r}")
 

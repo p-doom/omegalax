@@ -269,10 +269,9 @@ class TextModel(nnx.Module):
         cfg = self.cfg
 
         if inputs_embeds_BTD is None:
-            hidden_BTD = jnp.astype(
-                self.embedder.embedding[...].at[(token_ids_BT,)].get(out_sharding=self.out_emb_shd),
-                self.embedder.dtype,
-            )
+            embedding_VD = jnp.astype(self.embedder.embedding[...], self.embedder.dtype)
+            embedding_VD = reshard(embedding_VD, P())
+            hidden_BTD = embedding_VD.at[(token_ids_BT,)].get(out_sharding=self.out_emb_shd)
         else:
             hidden_BTD = inputs_embeds_BTD
 
@@ -287,6 +286,10 @@ class TextModel(nnx.Module):
             position_ids_ZBT = jnp.stack([position_ids_BT] * 3, axis=0)
         elif position_ids_ZBT.ndim == 2:
             position_ids_ZBT = jnp.stack([position_ids_ZBT] * 3, axis=0)
+
+        batch_axis = cfg.shd_cfg.act_btd[0]
+        segment_ids_BT = reshard(segment_ids_BT, P(batch_axis, None))
+        position_ids_ZBT = reshard(position_ids_ZBT, P(None, batch_axis, None))
 
         cos_BTK, sin_BTK = generate_text_rope(
             position_ids_ZBT,
@@ -359,6 +362,10 @@ class Qwen3_5ForConditionalGeneration(nnx.Module):
             kernel_init=wp(lm_head_init, ("embed", "vocab")),
         )
 
+    def output_weight(self) -> jax.Array:
+        """Weight matrix used as the LM output projection: (emb_dim, vocab)."""
+        return self.lm_head.kernel[...]
+
     def __call__(
         self,
         token_ids_BT: jax.Array,
@@ -371,34 +378,27 @@ class Qwen3_5ForConditionalGeneration(nnx.Module):
         position_ids_ZBT: jax.Array | None = None,
     ):
         del cache, num_right_pads
-        inputs_embeds_BTD = jnp.astype(
-            self.text.embedder.embedding[...]
-            .at[(token_ids_BT,)]
-            .get(out_sharding=self.text.out_emb_shd),
-            self.text.embedder.dtype,
+        embedding_VD = jnp.astype(self.text.embedder.embedding[...], self.text.embedder.dtype)
+        embedding_VD = reshard(embedding_VD, P())
+        inputs_embeds_BTD = embedding_VD.at[(token_ids_BT,)].get(
+            out_sharding=self.text.out_emb_shd
         )
 
         if pixel_values is not None and image_grid_thw is not None:
             image_embeds_ND = self.vision(pixel_values, image_grid_thw, vision_cu_seqlens)
             image_mask_BT = token_ids_BT == self.cfg.image_token_id
-            image_mask_BTD = jnp.broadcast_to(image_mask_BT[:, :, None], inputs_embeds_BTD.shape)
-            inputs_embeds_BTD = jnp.where(image_mask_BTD, 0.0, inputs_embeds_BTD)
             n_embeds = image_embeds_ND.shape[0]  # static after padding
             seq_len = token_ids_BT.shape[1]
+            image_mask_replicated = reshard(image_mask_BT, P())
             batch_indices, seq_indices = jnp.where(
-                image_mask_BT,
+                image_mask_replicated,
                 size=n_embeds,
-                fill_value=(0, seq_len - 1),
+                fill_value=(0, seq_len),
             )
-            num_real = jnp.sum(image_mask_BT)
-            valid = jnp.arange(n_embeds) < num_real
-            safe_embeds = jnp.where(
-                valid[:, None],
-                image_embeds_ND,
-                0.0,
-            ).astype(inputs_embeds_BTD.dtype)
+            image_embeds_replicated = reshard(image_embeds_ND, P())
             inputs_embeds_BTD = inputs_embeds_BTD.at[batch_indices, seq_indices].set(
-                safe_embeds,
+                image_embeds_replicated.astype(inputs_embeds_BTD.dtype),
+                mode="drop",
                 out_sharding=self.text.out_emb_shd,
             )
 
