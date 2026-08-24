@@ -252,6 +252,7 @@ def _commit_sft_checkpoint(
     prior_commit: _SFTCheckpointCommit | None,
 ) -> _SFTCheckpointCommit:
     require_healthy_optimizer_status(optimizer_status, boundary)
+    _validate_optimizer_generation(nnx.state(optimizer), step)
     if mode is _CheckpointCommitMode.REUSE:
         if (
             prior_commit is None
@@ -373,6 +374,36 @@ def _validate_optimizer_restore(expected: nnx.State, restored: object) -> None:
                 f"Checkpoint optimizer variable {name} dtype must be "
                 f"{expected_leaf.dtype}, got {restored_leaf.dtype}."
             )
+
+
+def _validate_optimizer_generation(optimizer_state: nnx.State, generation: int) -> None:
+    if type(generation) is not int or not (0 < generation <= np.iinfo(np.int32).max):
+        raise ValueError("Checkpoint generation must be a positive int32-range integer.")
+    step = optimizer_state["step"][...]
+    if step.shape != () or step.dtype != jnp.uint32:
+        raise ValueError(
+            f"Checkpoint NNX step must be scalar uint32, got shape={step.shape} dtype={step.dtype}."
+        )
+    exact_opt_leaves = [
+        value
+        for value in jax.tree.leaves(nnx.pure(optimizer_state["opt_state"]))
+        if not jnp.issubdtype(value.dtype, jnp.inexact)
+    ]
+    if (
+        len(exact_opt_leaves) != 1
+        or exact_opt_leaves[0].shape != ()
+        or exact_opt_leaves[0].dtype != jnp.int32
+    ):
+        raise ValueError(
+            "Checkpoint optimizer state must contain exactly one scalar int32 Adam count; "
+            f"got {[(value.shape, value.dtype) for value in exact_opt_leaves]}."
+        )
+    host_step, host_count = jax.device_get((step, exact_opt_leaves[0]))
+    if int(host_step) != generation or int(host_count) != generation:
+        raise ValueError(
+            f"Checkpoint generation {generation} must equal NNX step and Adam count; "
+            f"got step={int(host_step)} count={int(host_count)}."
+        )
 
 
 def _json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -610,6 +641,14 @@ def _restore_sft_checkpoint(
         raise ValueError(
             f"Checkpoint {step} schema restore returned keys {sorted(restored_schema.keys())}."
         )
+    schema = restored_schema["schema"]
+    if type(schema) is not dict or type(schema.get("version")) is not int or schema["version"] != 2:
+        version = schema.get("version") if isinstance(schema, dict) else None
+        raise ValueError(
+            f"Checkpoint schema version {version!r} is incompatible with fresh-run schema 2; "
+            "historical scheduled-optimizer checkpoints require the separate writer-lineage "
+            "recovery path."
+        )
     expected_schema = _sft_checkpoint_schema(
         optimizer,
         input_iter,
@@ -617,7 +656,7 @@ def _restore_sft_checkpoint(
         invocation_end_step,
     )
     _validate_checkpoint_phase(
-        restored_schema["schema"],
+        schema,
         expected_schema,
         step,
         invocation_end_step,
@@ -638,6 +677,7 @@ def _restore_sft_checkpoint(
             f"Checkpoint {step} train_state must contain exactly optimizer, got {keys}."
         )
     _validate_optimizer_restore(expected_state, train_state["optimizer"])
+    _validate_optimizer_generation(train_state["optimizer"], step)
     restored_input_iter = _restore_iterator_checkpoint(checkpoint_manager, step, input_iter)
 
     nnx.update(optimizer, train_state["optimizer"])

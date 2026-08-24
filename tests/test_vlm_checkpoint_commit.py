@@ -38,6 +38,11 @@ def _snapshot(optimizer):
     return jax.tree.map(lambda value: np.asarray(value).copy(), nnx.pure(nnx.state(optimizer)))
 
 
+def _set_generation(optimizer, generation):
+    optimizer.step[...] = jnp.asarray(generation, dtype=jnp.uint32)
+    optimizer.opt_state[0].count[...] = jnp.asarray(generation, dtype=jnp.int32)
+
+
 def _assert_tree_equal(testcase, actual, expected):
     testcase.assertEqual(jax.tree.structure(actual), jax.tree.structure(expected))
     for actual_leaf, expected_leaf in zip(jax.tree.leaves(actual), jax.tree.leaves(expected)):
@@ -114,6 +119,7 @@ class CheckpointCommitTest(absltest.TestCase):
 
     def test_periodic_and_forced_save_flags(self):
         periodic = _FakeManager()
+        _set_generation(self.optimizer, 10)
         commit = self._commit(periodic, 10, vlm._CheckpointCommitMode.PERIODIC)
         self.assertEqual(commit.step, 10)
         self.assertLen(periodic.saves, 1)
@@ -121,6 +127,7 @@ class CheckpointCommitTest(absltest.TestCase):
         self.assertEqual(periodic.waits, 1)
 
         forced = _FakeManager(latest=10)
+        _set_generation(self.optimizer, 13)
         commit = self._commit(forced, 13, vlm._CheckpointCommitMode.FORCED)
         self.assertEqual(commit.step, 13)
         self.assertLen(forced.saves, 1)
@@ -128,6 +135,7 @@ class CheckpointCommitTest(absltest.TestCase):
         self.assertEqual(forced.waits, 1)
 
     def test_false_exception_partial_and_latest_mismatch_fail(self):
+        _set_generation(self.optimizer, 10)
         with self.assertRaisesRegex(RuntimeError, "did not save"):
             self._commit(
                 _FakeManager(save_result=False),
@@ -135,6 +143,7 @@ class CheckpointCommitTest(absltest.TestCase):
                 vlm._CheckpointCommitMode.PERIODIC,
             )
 
+        _set_generation(self.optimizer, 3)
         with self.assertRaisesRegex(OSError, "write failed"):
             self._commit(
                 _FakeManager(error=OSError("write failed")),
@@ -143,6 +152,7 @@ class CheckpointCommitTest(absltest.TestCase):
             )
 
         for latest in (None, 9, 11):
+            _set_generation(self.optimizer, 10)
             with (
                 self.subTest(latest=latest),
                 self.assertRaisesRegex(RuntimeError, "commit mismatch"),
@@ -155,6 +165,7 @@ class CheckpointCommitTest(absltest.TestCase):
 
     def test_reuse_requires_the_identical_saved_boundary(self):
         manager = _FakeManager()
+        _set_generation(self.optimizer, 10)
         commit = self._commit(manager, 10, vlm._CheckpointCommitMode.PERIODIC)
         reused = self._commit(manager, 10, vlm._CheckpointCommitMode.REUSE, commit)
         self.assertIs(reused, commit)
@@ -207,13 +218,51 @@ class CheckpointCommitTest(absltest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "commit mismatch"):
             self._commit(manager, 10, vlm._CheckpointCommitMode.REUSE, commit)
 
+    def test_save_rejects_counter_mismatch_before_serialization(self):
+        for name, nnx_step, adam_count in (("nnx", 0, 1), ("adam", 1, 0)):
+            with self.subTest(name=name):
+                optimizer = _optimizer()
+                optimizer.step[...] = jnp.asarray(nnx_step, dtype=jnp.uint32)
+                optimizer.opt_state[0].count[...] = jnp.asarray(adam_count, dtype=jnp.int32)
+                iterator = _iterator()
+                manager = _FakeManager()
+                before_optimizer = _snapshot(optimizer)
+                before_iterator = iterator.get_state()
+                with (
+                    mock.patch.object(
+                        vlm,
+                        "_sft_checkpoint_schema",
+                        side_effect=AssertionError("invalid generation reached serialization"),
+                    ) as checkpoint_schema,
+                    self.assertRaisesRegex(ValueError, "must equal NNX step and Adam count"),
+                ):
+                    vlm._commit_sft_checkpoint(
+                        manager,
+                        optimizer,
+                        1,
+                        iterator,
+                        20,
+                        20,
+                        self.status,
+                        vlm.OptimizerStatusBoundary.CHECKPOINT,
+                        vlm._CheckpointCommitMode.PERIODIC,
+                        None,
+                    )
+                checkpoint_schema.assert_not_called()
+                self.assertEmpty(manager.saves)
+                self.assertEqual(manager.waits, 0)
+                _assert_tree_equal(self, _snapshot(optimizer), before_optimizer)
+                self.assertEqual(iterator.get_state(), before_iterator)
+
     def test_real_orbax_forces_off_interval_and_reuses_exact_step(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             manager = vlm._make_checkpoint_manager(Path(tmpdir), save_interval=10)
+            _set_generation(self.optimizer, 10)
             periodic = self._commit(manager, 10, vlm._CheckpointCommitMode.PERIODIC)
             reused = self._commit(manager, 10, vlm._CheckpointCommitMode.REUSE, periodic)
             self.assertIs(reused, periodic)
 
+            _set_generation(self.optimizer, 13)
             forced = self._commit(manager, 13, vlm._CheckpointCommitMode.FORCED)
             self.assertEqual(forced.step, 13)
             self.assertEqual(manager.all_steps(), [10, 13])
@@ -252,7 +301,7 @@ class CheckpointCommitTest(absltest.TestCase):
             self.assertEqual(next(restored_iterator), expected_next)
             manager.close()
 
-    def test_parent_phase_extension_continues_exact_optimizer_and_iterator_boundary(self):
+    def test_same_phase_restore_continues_exact_optimizer_and_iterator_boundary(self):
         gradients = nnx.State({"weight": nnx.Param(jnp.array([0.2, -0.4], dtype=jnp.float32))})
         self.optimizer.update(gradients, learning_rate=jnp.asarray(0.03))
         self.assertEqual(next(self.iterator), 10)
@@ -265,7 +314,7 @@ class CheckpointCommitTest(absltest.TestCase):
                 1,
                 self.iterator,
                 3,
-                1,
+                3,
                 self.status,
                 vlm.OptimizerStatusBoundary.FINAL,
                 vlm._CheckpointCommitMode.FORCED,
@@ -286,6 +335,74 @@ class CheckpointCommitTest(absltest.TestCase):
             restored.update(gradients, learning_rate=jnp.asarray(0.01))
             _assert_tree_equal(self, _snapshot(restored), _snapshot(self.optimizer))
             manager.close()
+
+    def test_restore_rejects_generation_mismatch_before_iterator_mutation(self):
+        for name, nnx_step in (("both", 0), ("adam", 1)):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmpdir:
+                source_optimizer = _optimizer()
+                source_optimizer.step[...] = nnx_step
+                source_iterator = _iterator()
+                manager = vlm._make_checkpoint_manager(Path(tmpdir), save_interval=1)
+                saved = manager.save(
+                    1,
+                    args=ocp.args.Composite(
+                        train_state=ocp.args.PyTreeSave(vlm._train_state(source_optimizer)),
+                        input_iter=grain.checkpoint.CheckpointSave(source_iterator),
+                        schema=ocp.args.JsonSave(
+                            vlm._sft_checkpoint_schema(source_optimizer, source_iterator, 20, 20)
+                        ),
+                    ),
+                )
+                self.assertTrue(saved)
+                manager.wait_until_finished()
+
+                optimizer = _optimizer()
+                iterator = _iterator()
+                before_optimizer = _snapshot(optimizer)
+                before_iterator = iterator.get_state()
+                with (
+                    mock.patch.object(
+                        vlm,
+                        "_restore_iterator_checkpoint",
+                        wraps=vlm._restore_iterator_checkpoint,
+                    ) as restore_iterator,
+                    self.assertRaisesRegex(ValueError, "must equal NNX step and Adam count"),
+                ):
+                    vlm._restore_sft_checkpoint(
+                        manager,
+                        optimizer,
+                        1,
+                        iterator,
+                        20,
+                        20,
+                    )
+                restore_iterator.assert_not_called()
+                _assert_tree_equal(self, _snapshot(optimizer), before_optimizer)
+                self.assertEqual(iterator.get_state(), before_iterator)
+                manager.close()
+
+    def test_restore_rejects_historical_schema_before_state_restore(self):
+        optimizer = _optimizer()
+        iterator = _iterator()
+        before_optimizer = _snapshot(optimizer)
+        before_iterator = iterator.get_state()
+        for version in (1, 2.0, True, None):
+            with self.subTest(version=version):
+                schema = vlm._sft_checkpoint_schema(optimizer, iterator, 20, 20)
+                schema["version"] = version
+                manager = _FakeRestoreManager({"optimizer": nnx.state(_optimizer())}, schema)
+                with self.assertRaisesRegex(ValueError, "incompatible with fresh-run schema 2"):
+                    vlm._restore_sft_checkpoint(
+                        manager,
+                        optimizer,
+                        1,
+                        iterator,
+                        20,
+                        20,
+                    )
+                _assert_tree_equal(self, _snapshot(optimizer), before_optimizer)
+                self.assertEqual(iterator.get_state(), before_iterator)
+                self.assertLen(manager.restores, 1)
 
     def test_restore_rejects_optimizer_schema_without_mutation(self):
         expected = nnx.state(_optimizer())
@@ -399,6 +516,8 @@ class CheckpointCommitTest(absltest.TestCase):
             self.assertEqual(iterator.get_state(), before_iterator)
 
     def test_restore_rejects_corrupt_iterator_before_mutation(self):
+        gradients = nnx.State({"weight": nnx.Param(jnp.array([0.2, -0.4], dtype=jnp.float32))})
+        self.optimizer.update(gradients, learning_rate=jnp.asarray(0.03))
         with tempfile.TemporaryDirectory() as tmpdir:
             manager = vlm._make_checkpoint_manager(Path(tmpdir), save_interval=1)
             self._commit(manager, 1, vlm._CheckpointCommitMode.PERIODIC)
@@ -429,6 +548,8 @@ class CheckpointCommitTest(absltest.TestCase):
             manager.close()
 
     def test_restore_rejects_symlinked_iterator_checkpoint(self):
+        gradients = nnx.State({"weight": nnx.Param(jnp.array([0.2, -0.4], dtype=jnp.float32))})
+        self.optimizer.update(gradients, learning_rate=jnp.asarray(0.03))
         with tempfile.TemporaryDirectory() as tmpdir:
             manager = vlm._make_checkpoint_manager(Path(tmpdir), save_interval=1)
             self._commit(manager, 1, vlm._CheckpointCommitMode.PERIODIC)
@@ -456,6 +577,8 @@ class CheckpointCommitTest(absltest.TestCase):
             manager.close()
 
     def test_restore_rejects_oversized_iterator_checkpoint(self):
+        gradients = nnx.State({"weight": nnx.Param(jnp.array([0.2, -0.4], dtype=jnp.float32))})
+        self.optimizer.update(gradients, learning_rate=jnp.asarray(0.03))
         with tempfile.TemporaryDirectory() as tmpdir:
             manager = vlm._make_checkpoint_manager(Path(tmpdir), save_interval=1)
             self._commit(manager, 1, vlm._CheckpointCommitMode.PERIODIC)
@@ -480,6 +603,8 @@ class CheckpointCommitTest(absltest.TestCase):
             manager.close()
 
     def test_restore_uses_validated_bytes_after_path_replacement(self):
+        gradients = nnx.State({"weight": nnx.Param(jnp.array([0.2, -0.4], dtype=jnp.float32))})
+        self.optimizer.update(gradients, learning_rate=jnp.asarray(0.03))
         with tempfile.TemporaryDirectory() as tmpdir:
             manager = vlm._make_checkpoint_manager(Path(tmpdir), save_interval=1)
             self._commit(manager, 1, vlm._CheckpointCommitMode.PERIODIC)
