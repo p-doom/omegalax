@@ -135,6 +135,7 @@ class VLMPhaseContractTest(absltest.TestCase):
                 vlm,
                 "_require_registrar_compiled_executable_capability",
             ),
+            mock.patch.object(vlm, "_require_production_jax_topology"),
             mock.patch.object(vlm, "_run_sft", side_effect=fail),
             self.assertRaises(FloatingPointError) as raised,
         ):
@@ -182,6 +183,7 @@ class VLMPhaseContractTest(absltest.TestCase):
                         vlm,
                         "_require_registrar_compiled_executable_capability",
                     ),
+                    mock.patch.object(vlm, "_require_production_jax_topology"),
                     mock.patch.object(vlm, "_write_checkpoint_config"),
                     mock.patch.object(vlm, "_write_lora_metadata"),
                     mock.patch.object(vlm.vlm_api, "resolve_config", return_value=object()),
@@ -261,21 +263,28 @@ class VLMPhaseContractTest(absltest.TestCase):
                     self.assertEqual(val_iterator.count, 0)
 
     def test_single_process_preflight_precedes_library_and_cli_resources(self):
+        train_input = _Resource()
+        val_input = _Resource()
         with (
-            mock.patch.object(vlm.jax, "process_count", return_value=2),
+            mock.patch.object(
+                vlm, "_require_production_jax_topology", side_effect=RuntimeError("process_count=1")
+            ),
             mock.patch.object(vlm, "_run_sft") as private_run,
-            self.assertRaisesRegex(RuntimeError, "exactly one JAX process"),
+            self.assertRaisesRegex(RuntimeError, "process_count=1"),
         ):
             vlm.run_sft(
                 object(),
                 vlm.TrainConfig(schedule_horizon=1),
-                object(),
+                train_input,
                 invocation_end_step=1,
+                val_data_iter=val_input,
             )
         private_run.assert_not_called()
+        self.assertEqual(train_input.closes, 1)
+        self.assertEqual(val_input.closes, 1)
 
         with (
-            mock.patch.object(vlm.jax, "process_count", return_value=1),
+            mock.patch.object(vlm, "_require_production_jax_topology"),
             mock.patch.object(vlm, "_run_sft") as private_run,
             self.assertRaisesRegex(RuntimeError, "registrar-authorized"),
         ):

@@ -843,12 +843,53 @@ def _validate_training_phase(train_cfg: TrainConfig, invocation_end_step: int) -
         )
 
 
-def _require_single_jax_process() -> None:
+def _require_production_jax_topology(
+    *,
+    global_batch_size: int,
+    tp_size: int | None,
+    fsdp_size: int | None,
+    dp_size: int | None,
+) -> None:
+    topology = {"tp_size": tp_size, "fsdp_size": fsdp_size, "dp_size": dp_size}
+    if any(type(value) is not int or value <= 0 for value in topology.values()):
+        raise ValueError(f"Production VLM mesh sizes must be positive integers, got {topology}.")
+    if topology != {"tp_size": 1, "fsdp_size": 8, "dp_size": 1}:
+        raise ValueError(
+            "Production VLM mesh must be exactly tp_size=1, fsdp_size=8, dp_size=1 for the "
+            f"logical-eight input contract, got {topology}."
+        )
+    if type(global_batch_size) is not int or global_batch_size <= 0:
+        raise ValueError(
+            f"Production VLM global batch size must be a positive integer, got {global_batch_size!r}."
+        )
     process_count = jax.process_count()
-    if type(process_count) is not int or process_count != 1:
+    process_index = jax.process_index()
+    local_device_count = jax.local_device_count()
+    device_count = jax.device_count()
+    mesh_device_count = tp_size * fsdp_size * dp_size
+    if (
+        type(process_count) is not int
+        or type(process_index) is not int
+        or type(local_device_count) is not int
+        or type(device_count) is not int
+        or process_count != 1
+        or process_index != 0
+        or local_device_count != 8
+        or device_count != 8
+        or mesh_device_count != 8
+    ):
         raise RuntimeError(
-            "Production VLM training requires exactly one JAX process; "
-            f"got process_count={process_count!r}."
+            "Production VLM training requires process_count=1, process_index=0, "
+            "local_device_count=device_count=mesh_device_count=8; "
+            f"got process_count={process_count!r}, process_index={process_index!r}, "
+            f"local_device_count={local_device_count!r}, device_count={device_count!r}, "
+            f"mesh_device_count={mesh_device_count!r}."
+        )
+    batch_shards = fsdp_size * dp_size
+    if global_batch_size % batch_shards != 0:
+        raise ValueError(
+            f"Production VLM global batch size {global_batch_size} must be divisible by the "
+            f"local data shard count fsdp_size*dp_size={batch_shards}."
         )
 
 
@@ -876,6 +917,8 @@ def _require_checkpoint_frontier(
 @dataclasses.dataclass
 class _TrainingCleanup:
     checkpoint_manager: ocp.CheckpointManager | None = None
+    input_iter: object | None = None
+    val_input_iter: object | None = None
 
     def close(
         self,
@@ -889,6 +932,18 @@ class _TrainingCleanup:
                 errors.append(error)
             try:
                 self.checkpoint_manager.close()
+            except BaseException as error:  # noqa: BLE001
+                errors.append(error)
+        seen_inputs: set[int] = set()
+        for input_iter in (self.input_iter, self.val_input_iter):
+            if input_iter is None or id(input_iter) in seen_inputs:
+                continue
+            seen_inputs.add(id(input_iter))
+            close_input = getattr(input_iter, "close", None)
+            if close_input is None:
+                continue
+            try:
+                close_input()
             except BaseException as error:  # noqa: BLE001
                 errors.append(error)
         if not errors:
@@ -1337,11 +1392,16 @@ def run_sft(
     log_memory: bool = False,
 ) -> tuple[MixedPrecisionOptimizer, dict[str, float]]:
     """Run one explicitly bounded phase with exception-safe resource cleanup."""
-    _require_single_jax_process()
-    _require_registrar_compiled_executable_capability()
-    cleanup = _TrainingCleanup()
+    cleanup = _TrainingCleanup(input_iter=data_iter, val_input_iter=val_data_iter)
     active_error: BaseException | None = None
     try:
+        _require_production_jax_topology(
+            global_batch_size=train_cfg.batch_size,
+            tp_size=tp_size,
+            fsdp_size=fsdp_size,
+            dp_size=dp_size,
+        )
+        _require_registrar_compiled_executable_capability()
         return _run_sft(
             model_id_or_cfg,
             train_cfg,
