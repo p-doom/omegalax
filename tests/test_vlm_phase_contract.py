@@ -48,7 +48,7 @@ class _Context:
 
 
 class VLMPhaseContractTest(absltest.TestCase):
-    def test_phase_fields_are_strict_and_parent_extension_is_exact(self):
+    def test_phase_fields_are_strict_and_extension_requires_registrar_authority(self):
         cfg = vlm.TrainConfig(schedule_horizon=20)
         vlm._validate_training_phase(cfg, 10)
         for horizon, end in ((True, 1), (0, 1), (20, True), (20, 0), (20, 21)):
@@ -66,7 +66,8 @@ class VLMPhaseContractTest(absltest.TestCase):
         }
         parent = dict(expected)
         parent["phase"] = {"schedule_horizon": 20, "invocation_end_step": 10}
-        vlm._validate_checkpoint_phase(parent, expected, 10, 20)
+        with self.assertRaisesRegex(PermissionError, "registrar-authorized"):
+            vlm._validate_checkpoint_phase(parent, expected, 10, 20)
         vlm._validate_checkpoint_phase(parent, parent, 7, 10)
         for step, end in ((9, 20), (10, 9), (7, 20)):
             with self.subTest(step=step, end=end), self.assertRaises(ValueError):

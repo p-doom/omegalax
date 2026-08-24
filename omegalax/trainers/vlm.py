@@ -534,7 +534,10 @@ def _validate_checkpoint_phase(
     if stored_end == invocation_end_step:
         return
     if step == stored_end and invocation_end_step > stored_end:
-        return
+        raise PermissionError(
+            "Extending invocation_end_step requires a registrar-authorized parent/child phase "
+            "capability; local checkpoint arithmetic is not phase authority."
+        )
     raise ValueError(
         "A phase extension must restore its parent exactly at the parent's invocation_end_step; "
         f"checkpoint step={step}, stored end={stored_end}, requested end={invocation_end_step}."
