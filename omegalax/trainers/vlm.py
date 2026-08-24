@@ -10,23 +10,36 @@ import os
 import signal
 import subprocess
 from pathlib import Path
-from flax import nnx
+
 import jax
 import jax.numpy as jnp
-from jax.sharding import NamedSharding, PartitionSpec
 import optax
 import orbax.checkpoint as ocp
+from flax import nnx
+from jax.sharding import NamedSharding, PartitionSpec
 from orbax.checkpoint import checkpoint_managers as ocm
 
 from omegalax import export as export_lib
 from omegalax.data.grain_pipeline import pop_source_ids
 from omegalax.distributed.mesh import ensure_mesh, mesh_rules, required_batch_multiple
 from omegalax.models.params_utils import save_hf_config
+from omegalax.models.qwen3_5 import Qwen3_5Config
+from omegalax.models.qwen3_vl import Qwen3VLConfig
+from omegalax.models.qwen3_vl.model import DECODER_LAYER_REMAT
+from omegalax.models.qwen3_vl.vision import VISION_BLOCK_REMAT
 from omegalax.trainers import checkpoint_utils
 from omegalax.trainers import tokamax_cache as tokamax_cache_lib
-from omegalax.trainers.loss import chunked_cross_entropy_loss
+from omegalax.trainers.lora import LoRAParam, inject_lora
+from omegalax.trainers.loss import chunked_cross_entropy_loss, chunked_cross_entropy_loss_sum
 from omegalax.trainers.lr_schedule import build_lr_schedule
+from omegalax.trainers.optim import (
+    MixedPrecisionOptimizer,
+    accumulate_gradient_sum,
+    apply_normalized_gradient_sum,
+)
 from omegalax.trainers.perf import (
+    StepFlops,
+    StepTimer,
     log_compiled_memory_analysis,
     log_device_memory,
     log_live_arrays,
@@ -35,17 +48,28 @@ from omegalax.trainers.perf import (
     maybe_log_step_metrics,
     per_device_step_flops,
     record_deltanet_kernel,
-    StepFlops,
-    StepTimer,
 )
-from omegalax.trainers.optim import MixedPrecisionOptimizer
-from omegalax.trainers.lora import LoRAParam, inject_lora
 from omegalax.trainers.text import startup_log
-from omegalax.models.qwen3_vl.model import DECODER_LAYER_REMAT
-from omegalax.models.qwen3_vl.vision import VISION_BLOCK_REMAT
 from omegalax.vlm import api as vlm_api
 
 P = PartitionSpec
+
+
+def require_zero_router_aux_loss(cfg) -> None:
+    """Reject models whose nonlinear router objective cannot be micro-accumulated exactly."""
+    if isinstance(cfg, Qwen3_5Config):
+        text_cfg = cfg.text_config
+        has_nonzero_aux = bool(text_cfg.num_experts) and text_cfg.router_aux_loss_coef != 0.0
+    elif isinstance(cfg, Qwen3VLConfig):
+        has_nonzero_aux = any(cfg.is_moe_layer(layer_idx) for layer_idx in range(cfg.num_layers))
+    else:
+        raise TypeError(f"Unsupported VLM config type: {type(cfg)}")
+    if has_nonzero_aux:
+        raise ValueError(
+            "Gradient accumulation does not support a nonzero router auxiliary loss: "
+            "router statistics are nonlinear across microbatches. Use a dense model until "
+            "the trainer accumulates exact router sufficient statistics."
+        )
 
 
 def _trainable_non_vision(path, x):
@@ -116,7 +140,6 @@ def build_optimizer(
     wd = 0.0 if wrt is LoRAParam else train_cfg.weight_decay
     chain.append(optax.adamw(lr_schedule_fn, weight_decay=wd))
     tx = optax.chain(*chain)
-    tx = optax.MultiSteps(tx, every_k_schedule=train_cfg.grad_accum_steps)
     opt = MixedPrecisionOptimizer(model, tx, wrt=wrt)
     return opt
 
@@ -218,10 +241,7 @@ def _restore_sft_checkpoint(
     train_state = restored["train_state"]
     # Canonicalize restored opt-state dtypes against the freshly-built
     # optimizer's expectations: some prior checkpoints stored Adam's first
-    # moment in bf16; the optimizer now uses optax's default (fp32), so
-    # MultiSteps (grad_accum) would otherwise see a dtype mismatch between
-    # the passthrough branch (restored dtype) and the active-step branch
-    # (optax's expected dtype) and lax.cond would reject it at trace time.
+    # moment in bf16 while the optimizer now uses optax's fp32 default.
     expected_state = nnx.state(optimizer)
     restored_state = jax.tree.map(
         lambda exp, got: got.astype(exp.dtype) if exp.dtype != got.dtype else got,
@@ -237,8 +257,8 @@ def _restore_sft_checkpoint(
     )
 
 
-def make_sft_train_step(cfg, pad_id: int = 0, *, wrt=nnx.Param, num_loss_tiles: int = 4):
-    """Build a JIT-compiled VLM SFT train step that consumes a batch dict.
+def make_sft_gradient_step(cfg, pad_id: int = 0, *, wrt=nnx.Param, num_loss_tiles: int = 4):
+    """Build a read-only JIT step returning the masked-CE gradient sum for one batch.
 
     The batch dict must contain ``token_ids_BT``, ``attention_mask_BT``, and
     ``loss_mask_BT``.  It may also contain ``pixel_values`` and
@@ -252,8 +272,8 @@ def make_sft_train_step(cfg, pad_id: int = 0, *, wrt=nnx.Param, num_loss_tiles: 
 
     diff_state = nnx.DiffState(0, wrt)
 
-    @nnx.jit(donate_argnums=0)
-    def sft_train_step(optimizer: MixedPrecisionOptimizer, batch: dict[str, jax.Array]):
+    @nnx.jit
+    def sft_gradient_step(model: nnx.Module, batch: dict[str, jax.Array]):
         token_ids_BT = batch["token_ids_BT"]
         attention_mask_BT = batch["attention_mask_BT"]
         loss_mask_BT = batch["loss_mask_BT"]
@@ -275,36 +295,31 @@ def make_sft_train_step(cfg, pad_id: int = 0, *, wrt=nnx.Param, num_loss_tiles: 
                 position_ids_ZBT=position_ids_ZBT,
             )
             lm_weight = model.output_weight()
-            loss = (
-                chunked_cross_entropy_loss(
-                    hidden_BTD,
-                    lm_weight,
-                    token_ids_BT,
-                    loss_mask_BT,
-                    num_tiles=num_loss_tiles,
-                    logits_out_sharding=cfg.shd_cfg.logits_btv,
-                )
-                + aux_loss
+            ce_loss_sum, supervised_tokens = chunked_cross_entropy_loss_sum(
+                hidden_BTD,
+                lm_weight,
+                token_ids_BT,
+                loss_mask_BT,
+                num_tiles=num_loss_tiles,
+                logits_out_sharding=cfg.shd_cfg.logits_btv,
             )
-            supervised_tokens = jnp.sum(loss_mask_BT[:, 1:].astype(jnp.float32))
             total_tokens = jnp.sum(attention_mask_BT.astype(jnp.float32))
-            return loss, (supervised_tokens, total_tokens)
+            return ce_loss_sum, (supervised_tokens, total_tokens, aux_loss)
 
-        (loss, (supervised_tokens, total_tokens)), grads = nnx.value_and_grad(
+        (ce_loss_sum, (supervised_tokens, total_tokens, aux_loss)), grads = nnx.value_and_grad(
             loss_fn,
             argnums=diff_state,
             has_aux=True,
-        )(optimizer.model)
-        optimizer.update(grads)
+        )(model)
         metrics = {
-            "loss": loss,
-            "grad_norm": optax.tree.norm(grads),
+            "ce_loss_sum": ce_loss_sum,
+            "aux_loss": aux_loss,
             "supervised_tokens": supervised_tokens,
             "total_tokens": total_tokens,
         }
-        return loss, metrics
+        return grads, metrics
 
-    return sft_train_step
+    return sft_gradient_step
 
 
 def make_sft_eval_step(cfg, pad_id: int = 0, *, num_loss_tiles: int = 4):
@@ -435,6 +450,7 @@ def run_sft(
     else:
         model_cfg = vlm_api.resolve_config(model_id_or_cfg)
         startup_log("resolved model config")
+    require_zero_router_aux_loss(model_cfg)
     startup_log(f"model_cfg={model_cfg}")
     mesh = ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size)
     model_cfg = vlm_api.align_config_to_mesh(model_cfg, mesh)
@@ -536,7 +552,7 @@ def run_sft(
         )
         log_device_memory("after optimizer build", save_dir=save_path)
 
-    sft_step = make_sft_train_step(
+    sft_gradient_step = make_sft_gradient_step(
         model_cfg,
         pad_id=pad_id,
         wrt=wrt_filter,
@@ -548,7 +564,7 @@ def run_sft(
         else None
     )
     startup_log(
-        "built train step (jit)" + (" and eval step (jit)" if eval_step is not None else "")
+        "built gradient step (jit)" + (" and eval step (jit)" if eval_step is not None else "")
     )
 
     accum_steps = train_cfg.grad_accum_steps
@@ -619,7 +635,7 @@ def run_sft(
             pending_batch = next(data_iter)
             pending_batch_sharded = vlm_api.shard_batch_dict(pending_batch, model_cfg, mesh)
             autotune_result = tokamax_cache_lib.autotune_and_save(
-                tokamax_cache_dir, sft_step, optimizer, pending_batch_sharded
+                tokamax_cache_dir, sft_gradient_step, optimizer.model, pending_batch_sharded
             )
 
     # Push the autotuning overlay onto tokamax's lookup stack for the duration
@@ -636,10 +652,11 @@ def run_sft(
     for step_idx in range(start_step, train_cfg.num_steps):
         step = step_idx + 1
 
-        accum_loss = 0.0
+        gradient_sum = None
+        accum_ce_loss_sum = 0.0
+        accum_aux_loss = 0.0
         accum_sup_tokens = 0.0
         accum_total_tokens = 0.0
-        accum_grad_norm = 0.0
         accum_model_flops = 0.0
         accum_hardware_flops = 0.0
         accum_time = datetime.timedelta(0)
@@ -668,32 +685,46 @@ def run_sft(
                 vision_remat=VISION_BLOCK_REMAT,
             )
             batch = vlm_api.shard_batch_dict(batch, model_cfg, mesh)
-            _, metrics = sft_step(optimizer, batch)
+            gradients, metrics = sft_gradient_step(optimizer.model, batch)
+            gradient_sum = (
+                gradients
+                if gradient_sum is None
+                else accumulate_gradient_sum(gradient_sum, gradients)
+            )
             micro_delta = timer.step()
 
-            accum_loss = accum_loss + metrics["loss"]
+            accum_ce_loss_sum = accum_ce_loss_sum + metrics["ce_loss_sum"]
+            accum_aux_loss = accum_aux_loss + metrics["aux_loss"]
             accum_sup_tokens = accum_sup_tokens + metrics["supervised_tokens"]
             accum_total_tokens = accum_total_tokens + metrics["total_tokens"]
-            accum_grad_norm = accum_grad_norm + metrics["grad_norm"]
             accum_model_flops += micro_flops.model
             accum_hardware_flops += micro_flops.hardware
             accum_time += micro_delta
 
+        if gradient_sum is None:
+            raise RuntimeError("Gradient accumulation produced no microbatches.")
+        grad_norm = apply_normalized_gradient_sum(optimizer, gradient_sum, accum_sup_tokens)
+        accum_time += timer.step()
+
         if not _mem_logged_after_first_step:
-            jax.block_until_ready(metrics["loss"])
+            jax.block_until_ready(grad_norm)
             log_device_memory("after first step (compile done)", save_dir=save_path)
             log_live_arrays("after first step (compile done)", save_dir=save_path)
-            log_compiled_memory_analysis("sft_step", sft_step, save_path, optimizer, batch)
+            log_compiled_memory_analysis(
+                "sft_gradient_step", sft_gradient_step, save_path, optimizer.model, batch
+            )
             _mem_logged_after_first_step = True
         elif not _mem_logged_steady_state and step_idx >= 4:
-            jax.block_until_ready(metrics["loss"])
+            jax.block_until_ready(grad_norm)
             log_device_memory("after step 5 (steady state)", save_dir=save_path)
             _mem_logged_steady_state = True
 
         with jax.default_device("cpu"):
             window_metrics = {
-                "loss": accum_loss / accum_steps,
-                "grad_norm": accum_grad_norm / accum_steps,
+                "loss": accum_ce_loss_sum / accum_sup_tokens,
+                "ce_loss": accum_ce_loss_sum / accum_sup_tokens,
+                "aux_loss": accum_aux_loss / accum_steps,
+                "grad_norm": grad_norm,
                 "supervised_tokens": accum_sup_tokens,
                 "total_tokens": accum_total_tokens,
                 "lr": (

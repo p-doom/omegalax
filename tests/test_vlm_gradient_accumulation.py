@@ -1,0 +1,268 @@
+"""CPU properties for the VLM token-normalized accumulation contract."""
+
+from __future__ import annotations
+
+import dataclasses
+import os
+from unittest import mock
+
+os.environ.setdefault("JAX_PLATFORMS", "cpu")
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+import optax
+from absl.testing import absltest
+from flax import nnx
+
+from omegalax.models.qwen3_vl import make_vl_config
+from omegalax.trainers import vlm as vlm_trainer
+from omegalax.trainers.loss import chunked_cross_entropy_loss, chunked_cross_entropy_loss_sum
+from omegalax.trainers.optim import (
+    MixedPrecisionOptimizer,
+    accumulate_gradient_sum,
+    apply_normalized_gradient_sum,
+)
+from omegalax.trainers.vlm import require_zero_router_aux_loss
+
+
+class _TinyModel(nnx.Module):
+    def __init__(self):
+        self.weight = nnx.Param(
+            jnp.array([[0.75, -0.25, 0.5], [-0.4, 0.6, 0.2]], dtype=jnp.float32)
+        )
+
+
+def _make_optimizer(*, clip_norm: float = 0.0) -> MixedPrecisionOptimizer:
+    chain = []
+    if clip_norm:
+        chain.append(optax.clip_by_global_norm(clip_norm))
+    chain.append(optax.adamw(0.03, b1=0.8, b2=0.9, weight_decay=0.02))
+    return MixedPrecisionOptimizer(_TinyModel(), optax.chain(*chain))
+
+
+def _micro_gradient(optimizer, hidden, targets, mask):
+    def loss_fn(model):
+        return chunked_cross_entropy_loss_sum(
+            hidden,
+            model.weight[...],
+            targets,
+            mask,
+            num_tiles=1,
+        )
+
+    return nnx.value_and_grad(loss_fn, has_aux=True)(optimizer.model)
+
+
+def _snapshot(optimizer):
+    return jax.tree.map(lambda value: np.asarray(value).copy(), nnx.pure(nnx.state(optimizer)))
+
+
+def _assert_tree_allclose(testcase, actual, expected, *, atol=1e-7):
+    testcase.assertEqual(jax.tree.structure(actual), jax.tree.structure(expected))
+    for actual_leaf, expected_leaf in zip(jax.tree.leaves(actual), jax.tree.leaves(expected)):
+        np.testing.assert_allclose(actual_leaf, expected_leaf, rtol=0.0, atol=atol)
+
+
+class VLMGradientAccumulationTest(absltest.TestCase):
+    def test_tiled_ce_sum_and_count_define_the_existing_mean(self):
+        hidden = jnp.arange(2 * 7 * 2, dtype=jnp.float32).reshape(2, 7, 2) / 10.0
+        kernel = jnp.array([[0.2, -0.3, 0.5], [0.7, 0.1, -0.4]], dtype=jnp.float32)
+        targets = jnp.array([[0, 1, 2, 1, 0, 2, 1], [2, 0, 1, 2, 1, 0, 2]], dtype=jnp.int32)
+        mask = jnp.array([[0, 1, 0, 0, 0, 0, 0], [0, 1, 1, 1, 1, 1, 1]], dtype=jnp.float32)
+
+        loss_sum, supervised_tokens = chunked_cross_entropy_loss_sum(
+            hidden, kernel, targets, mask, num_tiles=3
+        )
+        mean_loss = chunked_cross_entropy_loss(hidden, kernel, targets, mask, num_tiles=3)
+
+        self.assertEqual(float(supervised_tokens), 7.0)
+        np.testing.assert_allclose(mean_loss, loss_sum / supervised_tokens, rtol=0.0, atol=1e-7)
+
+    def test_real_dense_vlm_unequal_masks_equal_concatenated_update(self):
+        cfg = make_vl_config("qwen3-vl-smoke")
+        cfg = dataclasses.replace(
+            cfg,
+            dtype=jnp.float32,
+            vision=dataclasses.replace(cfg.vision, dtype=jnp.float32),
+        )
+        token_ids = np.array(
+            [[11, 12, 13, 14], [21, 22, 23, 24]],
+            dtype=np.int32,
+        )
+        attention_mask = np.ones_like(token_ids)
+        loss_mask = np.array(
+            [[0, 0, 0, 1], [0, 1, 1, 1]],
+            dtype=np.int32,
+        )
+        micros = [
+            {
+                "token_ids_BT": token_ids[index : index + 1],
+                "attention_mask_BT": attention_mask[index : index + 1],
+                "loss_mask_BT": loss_mask[index : index + 1],
+            }
+            for index in range(2)
+        ]
+        combined = {
+            "token_ids_BT": token_ids,
+            "attention_mask_BT": attention_mask,
+            "loss_mask_BT": loss_mask,
+        }
+        common = {
+            "seed": 7,
+            "seq_len": 4,
+            "num_steps": 1,
+            "learning_rate": 3e-3,
+            "weight_decay": 0.01,
+            "max_grad_norm": 0.2,
+            "print_every": 0,
+        }
+
+        accumulated, accumulated_metrics = vlm_trainer.run_sft(
+            cfg,
+            vlm_trainer.TrainConfig(batch_size=1, grad_accum_steps=2, **common),
+            iter(micros),
+            log_every=0,
+            tp_size=1,
+            fsdp_size=1,
+            dp_size=1,
+            text_attn_backend="xla",
+        )
+        reference, reference_metrics = vlm_trainer.run_sft(
+            cfg,
+            vlm_trainer.TrainConfig(batch_size=2, grad_accum_steps=1, **common),
+            iter([combined]),
+            log_every=0,
+            tp_size=1,
+            fsdp_size=1,
+            dp_size=1,
+            text_attn_backend="xla",
+        )
+
+        _assert_tree_allclose(
+            self,
+            _snapshot(accumulated),
+            _snapshot(reference),
+            atol=2e-6,
+        )
+        np.testing.assert_allclose(
+            accumulated_metrics["loss"], reference_metrics["loss"], rtol=0.0, atol=2e-6
+        )
+        self.assertEqual(int(accumulated.step[...]), 1)
+        self.assertEqual(float(accumulated_metrics["aux_loss"]), 0.0)
+
+    def test_unequal_masks_equal_one_combined_clipped_update(self):
+        candidate = _make_optimizer(clip_norm=0.15)
+        reference = _make_optimizer(clip_norm=0.15)
+        micros = (
+            (
+                jnp.array(
+                    [[[1.0, 0.5], [-0.5, 1.0], [0.25, -1.0], [1.5, 0.5]]],
+                    dtype=jnp.float32,
+                ),
+                jnp.array([[0, 1, 2, 1]], dtype=jnp.int32),
+                jnp.array([[0.0, 0.0, 0.0, 1.0]], dtype=jnp.float32),
+            ),
+            (
+                jnp.array(
+                    [[[2.0, -1.0], [0.25, 1.5], [-1.0, -0.5], [0.5, 0.75]]],
+                    dtype=jnp.float32,
+                ),
+                jnp.array([[2, 0, 1, 2]], dtype=jnp.int32),
+                jnp.array([[0.0, 1.0, 1.0, 1.0]], dtype=jnp.float32),
+            ),
+        )
+
+        gradient_sum = None
+        total_supervised = jnp.array(0.0, dtype=jnp.float32)
+        for micro in micros:
+            (_, supervised_tokens), gradients = _micro_gradient(candidate, *micro)
+            gradient_sum = (
+                gradients
+                if gradient_sum is None
+                else accumulate_gradient_sum(gradient_sum, gradients)
+            )
+            total_supervised += supervised_tokens
+        candidate_grad_norm = apply_normalized_gradient_sum(
+            candidate, gradient_sum, total_supervised
+        )
+
+        def combined_objective(model):
+            hidden = jnp.concatenate([micro[0] for micro in micros], axis=0)
+            targets = jnp.concatenate([micro[1] for micro in micros], axis=0)
+            mask = jnp.concatenate([micro[2] for micro in micros], axis=0)
+            ce_loss_sum, supervised_tokens = chunked_cross_entropy_loss_sum(
+                hidden,
+                model.weight[...],
+                targets,
+                mask,
+                num_tiles=1,
+            )
+            return ce_loss_sum / supervised_tokens
+
+        reference_gradient = nnx.grad(combined_objective)(reference.model)
+        reference_grad_norm = optax.tree.norm(reference_gradient)
+        reference.update(reference_gradient)
+
+        np.testing.assert_allclose(candidate_grad_norm, reference_grad_norm, rtol=0.0, atol=1e-7)
+        _assert_tree_allclose(self, _snapshot(candidate), _snapshot(reference))
+        self.assertEqual(int(candidate.step[...]), 1)
+
+    def test_grad_accum_one_equals_direct_update(self):
+        candidate = _make_optimizer()
+        reference = _make_optimizer()
+        micro = (
+            jnp.array([[[1.0, -2.0], [0.5, 1.5], [-0.25, 0.75]]], dtype=jnp.float32),
+            jnp.array([[0, 2, 1]], dtype=jnp.int32),
+            jnp.array([[0.0, 1.0, 1.0]], dtype=jnp.float32),
+        )
+
+        (_, supervised_tokens), gradient_sum = _micro_gradient(candidate, *micro)
+        apply_normalized_gradient_sum(candidate, gradient_sum, supervised_tokens)
+
+        def direct_objective(model):
+            hidden, targets, mask = micro
+            ce_loss_sum, supervised_tokens = chunked_cross_entropy_loss_sum(
+                hidden,
+                model.weight[...],
+                targets,
+                mask,
+                num_tiles=1,
+            )
+            return ce_loss_sum / supervised_tokens
+
+        reference.update(nnx.grad(direct_objective)(reference.model))
+        _assert_tree_allclose(self, _snapshot(candidate), _snapshot(reference))
+
+    def test_zero_total_rejected_before_optimizer_mutation(self):
+        optimizer = _make_optimizer(clip_norm=0.15)
+        before = _snapshot(optimizer)
+        zero_gradients = jax.tree.map(jnp.zeros_like, nnx.state(optimizer.model, nnx.Param))
+
+        with self.assertRaisesRegex(ValueError, "total supervised-token count must be positive"):
+            apply_normalized_gradient_sum(
+                optimizer, zero_gradients, jnp.array(0.0, dtype=jnp.float32)
+            )
+
+        after = _snapshot(optimizer)
+        self.assertEqual(jax.tree.structure(before), jax.tree.structure(after))
+        for before_leaf, after_leaf in zip(jax.tree.leaves(before), jax.tree.leaves(after)):
+            np.testing.assert_array_equal(before_leaf, after_leaf)
+
+    def test_real_dense_target_is_supported_but_moe_aux_is_rejected(self):
+        require_zero_router_aux_loss(make_vl_config("qwen3-vl-smoke"))
+
+        with (
+            mock.patch.object(vlm_trainer.vlm_api, "init_model") as init_model,
+            self.assertRaisesRegex(ValueError, "router auxiliary loss"),
+        ):
+            vlm_trainer.run_sft(
+                make_vl_config("qwen3-vl-smoke-moe"),
+                vlm_trainer.TrainConfig(num_steps=1),
+                iter(()),
+            )
+        init_model.assert_not_called()
+
+
+if __name__ == "__main__":
+    absltest.main()
