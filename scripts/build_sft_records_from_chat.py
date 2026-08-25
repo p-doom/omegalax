@@ -19,8 +19,9 @@ import json
 from absl import app, flags
 from transformers import AutoImageProcessor, AutoTokenizer
 
-from omegalax.data.grain_pipeline import build_records_from_chat
+from omegalax.data.artifact_contract import make_measurement_contract
 from omegalax.data.collator_qwen3 import make_message_length_fn
+from omegalax.data.grain_pipeline import build_records_from_chat
 from omegalax.registry import resolve_hf_repo_id
 
 FLAGS = flags.FLAGS
@@ -100,16 +101,23 @@ def main(_) -> None:
             processor_name, use_fast=False, **ip_kwargs
         )
 
+    measure_message = make_message_length_fn(tokenizer, image_processor)
+    measurement_contract = make_measurement_contract(
+        tokenizer=tokenizer,
+        image_processor=image_processor,
+        preprocessor_config_path=FLAGS.preprocessor_config,
+    )
     out_dir = build_records_from_chat(
         FLAGS.data_path,
         FLAGS.out_dir,
         max_length=FLAGS.max_length,
-        measure_message=make_message_length_fn(tokenizer, image_processor),
+        measure_message=measure_message,
         records_per_shard=FLAGS.records_per_shard,
         overwrite=FLAGS.overwrite,
         num_workers=FLAGS.num_workers,
         overflow_mode=FLAGS.overflow_mode,
         message_lengths_path=FLAGS.message_lengths_path,
+        measurement_contract=measurement_contract,
         val_fraction=FLAGS.val_fraction,
         split=FLAGS.split,
         profile_metadata={

@@ -8,11 +8,9 @@ from unittest import mock
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
-from absl.testing import absltest
-
 import jax
-
 import numpy as np
+from absl.testing import absltest
 
 from omegalax.data.grain_pipeline import (
     build_records_from_chat,
@@ -23,8 +21,8 @@ from omegalax.data.grain_pipeline import (
 from omegalax.distributed.mesh import ensure_mesh
 from omegalax.models.qwen3_vl.config import make_vl_config
 from omegalax.models.qwen3_vl.model import get_rope_index
-from omegalax.models.sharding_runtime import shard_batch_dict
 from omegalax.models.shard_config import ShardConfig
+from omegalax.models.sharding_runtime import shard_batch_dict
 from omegalax.trainers import text as text_trainer
 from omegalax.trainers import vlm as vlm_trainer
 
@@ -122,6 +120,14 @@ def _measure_one(message):
     return 1
 
 
+_TEST_MEASUREMENT_CONTRACT = {
+    "version": 1,
+    "tokenizer_sha256": "a" * 64,
+    "processor_sha256": None,
+    "preprocessor_sha256": None,
+}
+
+
 def _make_grain_batch_iter(batch: dict[str, np.ndarray]):
     with tempfile.TemporaryDirectory() as tmpdir:
         src = Path(tmpdir) / "train.jsonl"
@@ -143,6 +149,7 @@ def _make_grain_batch_iter(batch: dict[str, np.ndarray]):
             max_length=2,
             measure_message=_measure_one,
             records_per_shard=1,
+            measurement_contract=_TEST_MEASUREMENT_CONTRACT,
         )
         iterator = make_grain_iterator(
             compiled,

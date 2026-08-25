@@ -8,13 +8,14 @@ from unittest import mock
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
-from absl.testing import absltest
 import jax
 import jax.numpy as jnp
 import numpy as np
 import orbax.checkpoint as ocp
+from absl.testing import absltest
 
 from omegalax.data.grain_pipeline import (
+    _write_chat_message_lengths,
     build_records_from_chat,
     make_grain_iterator,
     make_grain_multiprocessing_options,
@@ -40,6 +41,14 @@ def _measure_one(message):
 
 def _measure_declared(message):
     return message["measurement"]
+
+
+_TEST_MEASUREMENT_CONTRACT = {
+    "version": 1,
+    "tokenizer_sha256": "a" * 64,
+    "processor_sha256": None,
+    "preprocessor_sha256": None,
+}
 
 
 def _measured(role, content, length=1, vision_tokens=0):
@@ -100,12 +109,11 @@ class GrainPipelineTest(absltest.TestCase):
         if split_unit_ends is not None:
             row["_omegalax_split_unit_ends"] = split_unit_ends
         self._write_jsonl(src, [row])
-        self._write_jsonl(
+        _write_chat_message_lengths(
             cache,
-            [
-                {"conv_idx": 0, "msg_offset": i, "measurement": measure(message)}
-                for i, message in enumerate(messages)
-            ],
+            {(0, i): measure(message) for i, message in enumerate(messages)},
+            src,
+            _TEST_MEASUREMENT_CONTRACT,
         )
         records_dir = build_records_from_chat(
             src,
@@ -115,6 +123,7 @@ class GrainPipelineTest(absltest.TestCase):
             records_per_shard=8,
             overflow_mode="split",
             message_lengths_path=cache,
+            measurement_contract=_TEST_MEASUREMENT_CONTRACT,
         )
         return records_dir, self._read_records(records_dir)
 
@@ -141,6 +150,7 @@ class GrainPipelineTest(absltest.TestCase):
                 max_length=3,
                 measure_message=_measure_one,
                 records_per_shard=8,
+                measurement_contract=_TEST_MEASUREMENT_CONTRACT,
             )
 
             iterator = make_grain_iterator(
@@ -190,6 +200,7 @@ class GrainPipelineTest(absltest.TestCase):
                 measure_message=_measure_one,
                 records_per_shard=8,
                 overflow_mode="truncate",
+                measurement_contract=_TEST_MEASUREMENT_CONTRACT,
             )
 
             stats = json.loads((records_dir / "truncation_stats.json").read_text())
@@ -220,7 +231,7 @@ class GrainPipelineTest(absltest.TestCase):
                 )
             )
 
-            with self.assertRaisesRegex(ValueError, "inline-records dataset"):
+            with self.assertRaisesRegex(ValueError, "incomplete or has unsupported version"):
                 make_grain_iterator(
                     legacy,
                     batch_size=1,
@@ -261,6 +272,7 @@ class GrainPipelineTest(absltest.TestCase):
                 measure_message=_measure_one,
                 records_per_shard=8,
                 overflow_mode="split",
+                measurement_contract=_TEST_MEASUREMENT_CONTRACT,
             )
 
             iterator = make_grain_iterator(
@@ -506,6 +518,7 @@ class GrainPipelineTest(absltest.TestCase):
                 measure_message=_measure_one,
                 records_per_shard=8,
                 overflow_mode="split",
+                measurement_contract=_TEST_MEASUREMENT_CONTRACT,
             )
 
             iterator = make_grain_iterator(
@@ -597,6 +610,7 @@ class GrainPipelineTest(absltest.TestCase):
                 measure_message=_measure_one,
                 records_per_shard=8,
                 overflow_mode="split",
+                measurement_contract=_TEST_MEASUREMENT_CONTRACT,
             )
 
             with mock.patch("jax.process_index", return_value=0):
@@ -661,6 +675,7 @@ class GrainPipelineTest(absltest.TestCase):
                 max_length=2,
                 measure_message=_measure_one,
                 records_per_shard=8,
+                measurement_contract=_TEST_MEASUREMENT_CONTRACT,
             )
 
             def collect_process_order(process_index: int, seed: int) -> list[str]:
@@ -699,7 +714,7 @@ class GrainPipelineTest(absltest.TestCase):
             src = Path(tmpdir) / "train.jsonl"
             self._write_jsonl(src, [{"messages": [{"role": "user", "content": "a"}]}])
 
-            with self.assertRaisesRegex(ValueError, "compiled Grain shard"):
+            with self.assertRaisesRegex(ValueError, "metadata does not exist"):
                 resolve_arrayrecord_paths(src)
 
 
