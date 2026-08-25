@@ -128,13 +128,12 @@ def _train_state(
     optimizer: MixedPrecisionOptimizer,
     rng: jax.Array,
     schedule_horizon: int,
-    model_identity: jax.Array,
 ) -> dict[str, object]:
     return {
-        "optimizer": nnx.state(optimizer),
+        "opt_state": nnx.state(optimizer.opt_state),
+        "step": optimizer.step[...],
         "rng": rng,
         "schedule_horizon": jnp.asarray(schedule_horizon, dtype=jnp.int32),
-        "model_identity": model_identity,
     }
 
 
@@ -142,11 +141,21 @@ def _abstract_train_state(
     optimizer: MixedPrecisionOptimizer,
     rng: jax.Array,
     schedule_horizon: int,
-    model_identity: jax.Array,
 ) -> dict[str, object]:
     return jax.tree.map(
         lambda value: jax.ShapeDtypeStruct(value.shape, value.dtype, sharding=value.sharding),
-        _train_state(optimizer, rng, schedule_horizon, model_identity),
+        _train_state(optimizer, rng, schedule_horizon),
+    )
+
+
+def _model_item(optimizer: MixedPrecisionOptimizer, model_identity: jax.Array):
+    return {"state": nnx.state(optimizer.model), "identity": model_identity}
+
+
+def _abstract_model_item(optimizer: MixedPrecisionOptimizer, model_identity: jax.Array):
+    return jax.tree.map(
+        lambda value: jax.ShapeDtypeStruct(value.shape, value.dtype, sharding=value.sharding),
+        _model_item(optimizer, model_identity),
     )
 
 
@@ -180,6 +189,8 @@ def _make_checkpoint_manager(
     )
     handler_registry.add("train_state", ocp.args.PyTreeSave, train_state_handler)
     handler_registry.add("train_state", ocp.args.PyTreeRestore, train_state_handler)
+    handler_registry.add("model", ocp.args.PyTreeSave, train_state_handler)
+    handler_registry.add("model", ocp.args.PyTreeRestore, train_state_handler)
     checkpoint_utils.register_grain_iterator_handler(handler_registry)
     preservation_policy = None
     if keep_period:
@@ -224,15 +235,19 @@ def _save_sft_checkpoint(
     healthy: jax.Array,
 ) -> None:
     _require_healthy_at_boundary(healthy, step)
-    _validate_optimizer_generation(nnx.state(optimizer), step)
-    train_state = _train_state(optimizer, rng, schedule_horizon, model_identity)
-    save_args = checkpoint_utils.make_grain_save_args(train_state, input_iter)
+    train_state = _train_state(optimizer, rng, schedule_horizon)
+    _validate_optimizer_generation(train_state, step)
+    save_args = checkpoint_utils.make_grain_save_args(
+        train_state,
+        input_iter,
+        model=_model_item(optimizer, model_identity),
+    )
     if not checkpoint_manager.save(step, args=save_args, force=True):
         raise RuntimeError(f"Checkpoint {step} was not accepted")
     checkpoint_manager.wait_until_finished()
 
 
-def _validate_optimizer_generation(optimizer_state: nnx.State, generation: int) -> None:
+def _validate_optimizer_generation(optimizer_state, generation: int) -> None:
     step = optimizer_state["step"][...]
     counts = [
         leaf
@@ -258,12 +273,18 @@ def _restore_sft_checkpoint(
     schedule_horizon: int,
     model_identity: jax.Array,
 ) -> tuple[MixedPrecisionOptimizer, int, jax.Array, checkpoint_utils.GrainIterator]:
-    abstract_state = _abstract_train_state(optimizer, rng, schedule_horizon, model_identity)
-    restore_args = checkpoint_utils.make_grain_restore_args(abstract_state, input_iter)
+    abstract_state = _abstract_train_state(optimizer, rng, schedule_horizon)
+    abstract_model = _abstract_model_item(optimizer, model_identity)
+    restore_args = checkpoint_utils.make_grain_restore_args(
+        abstract_state,
+        input_iter,
+        model=abstract_model,
+    )
     restored = checkpoint_manager.restore(step, args=restore_args)
     train_state = restored["train_state"]
+    model_item = restored["model"]
     restored_horizon, restored_identity = jax.device_get(
-        (train_state["schedule_horizon"], train_state["model_identity"])
+        (train_state["schedule_horizon"], model_item["identity"])
     )
     restored_horizon = int(restored_horizon)
     if restored_horizon != schedule_horizon:
@@ -272,8 +293,10 @@ def _restore_sft_checkpoint(
         )
     if bytes(restored_identity) != bytes(jax.device_get(model_identity)):
         raise ValueError("Checkpoint model snapshot does not match the requested snapshot")
-    _validate_optimizer_generation(train_state["optimizer"], step)
-    nnx.update(optimizer, train_state["optimizer"])
+    _validate_optimizer_generation(train_state, step)
+    nnx.update(optimizer.model, model_item["state"])
+    nnx.update(optimizer.opt_state, train_state["opt_state"])
+    optimizer.step[...] = train_state["step"]
     return (
         optimizer,
         step,

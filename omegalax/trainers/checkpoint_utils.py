@@ -34,21 +34,33 @@ def register_grain_iterator_handler(
     )
 
 
-def make_grain_save_args(train_state: Any, input_iter: GrainIterator) -> ocp.args.Composite:
+def make_grain_save_args(
+    train_state: Any,
+    input_iter: GrainIterator,
+    *,
+    model: Any | None = None,
+) -> ocp.args.Composite:
     items: dict[str, Any] = {
         "train_state": ocp.args.PyTreeSave(train_state),
         "input_iter": grain.checkpoint.CheckpointSave(input_iter),
     }
+    if model is not None:
+        items["model"] = ocp.args.PyTreeSave(model)
     return ocp.args.Composite(**items)
 
 
 def make_grain_restore_args(
-    abstract_train_state: Any, input_iter: GrainIterator
+    abstract_train_state: Any,
+    input_iter: GrainIterator,
+    *,
+    model: Any | None = None,
 ) -> ocp.args.Composite:
     items: dict[str, Any] = {
         "train_state": ocp.args.PyTreeRestore(abstract_train_state),
         "input_iter": grain.checkpoint.CheckpointRestore(input_iter),
     }
+    if model is not None:
+        items["model"] = ocp.args.PyTreeRestore(model)
     return ocp.args.Composite(**items)
 
 

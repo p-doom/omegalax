@@ -95,9 +95,9 @@ def _restore_trained_weights(
             ),
             model_state,
         )
-        params_only_abstract = {
-            "optimizer": {"model": model_abstract},
-            "model_identity": jax.ShapeDtypeStruct(
+        model_item_abstract = {
+            "state": model_abstract,
+            "identity": jax.ShapeDtypeStruct(
                 (32,),
                 jnp.uint8,
                 sharding=default_sharding,
@@ -113,16 +113,14 @@ def _restore_trained_weights(
                 )
             return s
 
-        params_only_restore_args = jax.tree.map(
+        model_restore_args = jax.tree.map(
             _to_restore_args,
-            params_only_abstract,
+            model_item_abstract,
             is_leaf=lambda x: isinstance(x, jax.ShapeDtypeStruct),
         )
 
         handler_registry = ocp.handlers.DefaultCheckpointHandlerRegistry()
-        handler_registry.add(
-            "train_state", ocp.args.PyTreeRestore, ocp.handlers.PyTreeCheckpointHandler
-        )
+        handler_registry.add("model", ocp.args.PyTreeRestore, ocp.handlers.PyTreeCheckpointHandler)
         options = ocp.CheckpointManagerOptions(step_format_fixed_length=6)
         cm = ocp.CheckpointManager(save_dir, options=options, handler_registry=handler_registry)
 
@@ -131,10 +129,9 @@ def _restore_trained_weights(
             restored = cm.restore(
                 step,
                 args=ocp.args.Composite(
-                    train_state=ocp.args.PyTreeRestore(
-                        params_only_abstract,
-                        restore_args=params_only_restore_args,
-                        partial_restore=True,
+                    model=ocp.args.PyTreeRestore(
+                        model_item_abstract,
+                        restore_args=model_restore_args,
                     ),
                 ),
             )
@@ -148,13 +145,10 @@ def _restore_trained_weights(
                 if active_error is None:
                     raise
                 active_error.add_note(f"Checkpoint cleanup also failed: {cleanup_error!r}")
-        train_state = restored["train_state"]
-        if bytes(jax.device_get(train_state["model_identity"])) != bytes.fromhex(
-            model_snapshot.sha256
-        ):
+        model_item = restored["model"]
+        if bytes(jax.device_get(model_item["identity"])) != bytes.fromhex(model_snapshot.sha256):
             raise ValueError("Checkpoint model snapshot does not match --model_snapshot")
-        restored_model_state = train_state["optimizer"]["model"]
-        nnx.update(model, restored_model_state)
+        nnx.update(model, model_item["state"])
     print(f"Restored model params from step {step} at {save_dir}")
     return model
 
