@@ -6,10 +6,13 @@ import dataclasses
 import datetime
 import enum
 import gc
+import hashlib
 import json
 import math
 import os
+import signal
 import stat
+import tempfile
 from pathlib import Path
 
 import grain
@@ -148,17 +151,50 @@ def build_optimizer(
     return opt
 
 
-def _train_state(optimizer: MixedPrecisionOptimizer) -> dict[str, object]:
-    return {"optimizer": nnx.state(optimizer)}
+def _train_state(
+    optimizer: MixedPrecisionOptimizer,
+    rng: jax.Array,
+    optimizer_status: jax.Array,
+) -> dict[str, object]:
+    return {
+        "optimizer": nnx.state(optimizer),
+        "rng": rng,
+        "optimizer_status": optimizer_status,
+    }
 
 
-def _abstract_train_state(optimizer: MixedPrecisionOptimizer) -> dict[str, object]:
+def _abstract_train_state(
+    optimizer: MixedPrecisionOptimizer,
+    rng: jax.Array,
+    optimizer_status: jax.Array,
+) -> dict[str, object]:
     return {
         "optimizer": jax.tree.map(
             lambda value: jax.ShapeDtypeStruct(value.shape, value.dtype, sharding=value.sharding),
             nnx.state(optimizer),
         ),
+        "rng": jax.ShapeDtypeStruct(rng.shape, rng.dtype, sharding=rng.sharding),
+        "optimizer_status": jax.ShapeDtypeStruct(
+            optimizer_status.shape,
+            optimizer_status.dtype,
+            sharding=optimizer_status.sharding,
+        ),
     }
+
+
+def _checkpoint_handler_registry() -> ocp.handlers.CheckpointHandlerRegistry:
+    handler_registry = ocp.handlers.DefaultCheckpointHandlerRegistry()
+    train_state_handler = ocp.handlers.PyTreeCheckpointHandler(
+        save_device_host_concurrent_gb=2,
+        is_prioritized_key_fn=lambda _: False,
+    )
+    handler_registry.add("train_state", ocp.args.PyTreeSave, train_state_handler)
+    handler_registry.add("train_state", ocp.args.PyTreeRestore, train_state_handler)
+    schema_handler = ocp.handlers.JsonCheckpointHandler()
+    handler_registry.add("schema", ocp.args.JsonSave, schema_handler)
+    handler_registry.add("schema", ocp.args.JsonRestore, schema_handler)
+    checkpoint_utils.register_grain_iterator_handler(handler_registry)
+    return handler_registry
 
 
 def _make_checkpoint_manager(
@@ -176,17 +212,6 @@ def _make_checkpoint_manager(
     ``keep_period`` is unset the manager keeps every checkpoint (prior behavior).
     """
     save_dir = Path(save_dir).expanduser().resolve()
-    handler_registry = ocp.handlers.DefaultCheckpointHandlerRegistry()
-    train_state_handler = ocp.handlers.PyTreeCheckpointHandler(
-        save_device_host_concurrent_gb=2,
-        is_prioritized_key_fn=lambda _: False,
-    )
-    handler_registry.add("train_state", ocp.args.PyTreeSave, train_state_handler)
-    handler_registry.add("train_state", ocp.args.PyTreeRestore, train_state_handler)
-    schema_handler = ocp.handlers.JsonCheckpointHandler()
-    handler_registry.add("schema", ocp.args.JsonSave, schema_handler)
-    handler_registry.add("schema", ocp.args.JsonRestore, schema_handler)
-    checkpoint_utils.register_grain_iterator_handler(handler_registry)
     preservation_policy = None
     if keep_period:
         policies = [ocm.EveryNSteps(keep_period, exact_interval=True)]
@@ -200,7 +225,189 @@ def _make_checkpoint_manager(
         preservation_policy=preservation_policy,
         enable_async_checkpointing=False,
     )
-    return ocp.CheckpointManager(save_dir, options=options, handler_registry=handler_registry)
+    return ocp.CheckpointManager(
+        save_dir,
+        options=options,
+        handler_registry=_checkpoint_handler_registry(),
+    )
+
+
+class _SFTCheckpointStore:
+    def __init__(
+        self,
+        directory: Path,
+        save_interval: int | None,
+        keep_period: int | None = None,
+        keep_latest: int | None = None,
+    ) -> None:
+        self.directory = Path(directory)
+        if save_interval is not None and (type(save_interval) is not int or save_interval <= 0):
+            raise ValueError("Checkpoint save_interval must be a positive integer when set.")
+        if keep_period is not None and (type(keep_period) is not int or keep_period <= 0):
+            raise ValueError("Checkpoint keep_period must be a positive integer when set.")
+        if keep_latest is not None and (type(keep_latest) is not int or keep_latest <= 0):
+            raise ValueError("Checkpoint keep_latest must be a positive integer when set.")
+        self._save_interval = save_interval
+        self._keep_period = keep_period
+        self._keep_latest = keep_latest
+        self._manager = _make_checkpoint_manager(
+            self.directory,
+            save_interval,
+            keep_period,
+            keep_latest,
+        )
+        self._restore_handler = ocp.handlers.CompositeCheckpointHandler(
+            handler_registry=_checkpoint_handler_registry()
+        )
+
+    def _prune(self) -> None:
+        if self._keep_period is None:
+            return
+        steps = list(checkpoint_utils.list_checkpoint_steps(self.directory))
+        latest = set(steps[-self._keep_latest :]) if self._keep_latest is not None else set()
+        retained = latest | {step for step in steps if step % self._keep_period == 0}
+        if steps:
+            retained.add(steps[-1])
+        for step in steps:
+            if step not in retained:
+                self._manager.delete(step)
+        root_fd = os.open(
+            self.directory,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+        )
+        try:
+            os.fsync(root_fd)
+        finally:
+            os.close(root_fd)
+
+    def _refresh(self) -> None:
+        self._manager.close()
+        self._manager = _make_checkpoint_manager(
+            self.directory,
+            self._save_interval,
+            self._keep_period,
+            self._keep_latest,
+        )
+
+    def save(
+        self,
+        step: int,
+        *,
+        args: ocp.args.Composite,
+        force: bool,
+        phase: dict[str, int],
+        identities: checkpoint_utils.CheckpointIdentities,
+        rng_sha256: str,
+        validation: checkpoint_utils.ValidationReceipt,
+    ) -> checkpoint_utils.VerifiedCheckpoint:
+        if not force and (self._save_interval is None or step % self._save_interval != 0):
+            raise ValueError(f"Step {step} is not a configured periodic checkpoint boundary.")
+        manager_prefix = f".pending-manager-{step:06d}-"
+        manager_root = Path(tempfile.mkdtemp(prefix=manager_prefix, dir=self.directory))
+        pending_manager = _make_checkpoint_manager(manager_root, save_interval=1)
+        active_error: BaseException | None = None
+        try:
+            saved = pending_manager.save(step, args=args, force=True)
+            if saved is not True:
+                raise RuntimeError(f"Orbax did not stage checkpoint step {step}.")
+            pending_manager.wait_until_finished()
+        except BaseException as error:
+            active_error = error
+            raise
+        finally:
+            try:
+                pending_manager.close()
+            except BaseException as close_error:
+                if active_error is None:
+                    raise
+                active_error.add_note(f"Staging checkpoint cleanup also failed: {close_error!r}")
+        staging_path = self.directory / (
+            f".pending-{step:06d}-{manager_root.name.removeprefix(manager_prefix)}"
+        )
+        manager_root_fd = os.open(
+            manager_root,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+        )
+        root_fd = os.open(
+            self.directory,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+        )
+        try:
+            checkpoint_utils._rename_noreplace(
+                f"{step:06d}",
+                staging_path.name,
+                source_directory_fd=manager_root_fd,
+                destination_directory_fd=root_fd,
+            )
+            os.fsync(manager_root_fd)
+            os.fsync(root_fd)
+        finally:
+            os.close(manager_root_fd)
+            os.close(root_fd)
+        manager_root.rmdir()
+        verified = checkpoint_utils.publish_checkpoint(
+            staging_path,
+            self.directory / f"{step:06d}",
+            phase=phase,
+            identities=identities,
+            rng_sha256=rng_sha256,
+            validation=validation,
+        )
+        root_fd = os.open(
+            self.directory,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+        )
+        try:
+            os.fsync(root_fd)
+        finally:
+            os.close(root_fd)
+        self._refresh()
+        self._prune()
+        return verified
+
+    def verify(self, step: int) -> checkpoint_utils.VerifiedCheckpoint:
+        return checkpoint_utils.verify_checkpoint(self.directory / f"{step:06d}")
+
+    def open(self, step: int):
+        return checkpoint_utils.open_verified_checkpoint(self.directory / f"{step:06d}")
+
+    def restore(
+        self,
+        checkpoint: checkpoint_utils.VerifiedCheckpointHandle,
+        *,
+        args: ocp.args.Composite,
+    ):
+        return self._restore_handler.restore(checkpoint.descriptor_path, args=args)
+
+    def item_metadata(self, checkpoint: checkpoint_utils.VerifiedCheckpointHandle):
+        return self._restore_handler.metadata(checkpoint.descriptor_path).item_metadata
+
+    def all_steps(self) -> list[int]:
+        return list(checkpoint_utils.list_checkpoint_steps(self.directory))
+
+    def latest_step(self) -> int | None:
+        steps = self.all_steps()
+        if not steps:
+            return None
+        return steps[-1]
+
+    def wait_until_finished(self) -> None:
+        self._manager.wait_until_finished()
+
+    def close(self) -> None:
+        active_error: BaseException | None = None
+        try:
+            self._manager.close()
+        except BaseException as error:
+            active_error = error
+            raise
+        finally:
+            try:
+                self._restore_handler.close()
+            except BaseException as close_error:
+                if active_error is None:
+                    raise
+                active_error.add_note(f"Restore handler cleanup also failed: {close_error!r}")
 
 
 def _write_checkpoint_config(save_dir: Path, cfg) -> None:
@@ -219,6 +426,30 @@ def _write_lora_metadata(save_dir: Path, train_cfg: TrainConfig) -> None:
     (Path(save_dir) / "lora_metadata.json").write_text(json.dumps(meta, indent=2))
 
 
+def _array_sha256(value: jax.Array) -> str:
+    host_value = jax.device_get(value)
+    try:
+        storage = np.asarray(host_value)
+    except TypeError:
+        storage = np.asarray(jax.device_get(jax.random.key_data(value)))
+    header = json.dumps(
+        {
+            "dtype": str(value.dtype),
+            "shape": list(value.shape),
+            "storage_dtype": str(storage.dtype),
+            "storage_shape": list(storage.shape),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode()
+    digest = hashlib.sha256()
+    digest.update(header)
+    digest.update(b"\0")
+    digest.update(storage.tobytes(order="C"))
+    return digest.hexdigest()
+
+
 class _CheckpointCommitMode(enum.Enum):
     PERIODIC = enum.auto()
     FORCED = enum.auto()
@@ -228,27 +459,35 @@ class _CheckpointCommitMode(enum.Enum):
 @dataclasses.dataclass(frozen=True)
 class _SFTCheckpointCommit:
     step: int
-    checkpoint_manager: ocp.CheckpointManager
+    checkpoint_manager: _SFTCheckpointStore
     optimizer: MixedPrecisionOptimizer
     input_iter: checkpoint_utils.GrainIterator
     schedule_horizon: int
     invocation_end_step: int
+    verified: checkpoint_utils.VerifiedCheckpoint
 
 
 def _commit_sft_checkpoint(
-    checkpoint_manager: ocp.CheckpointManager,
+    checkpoint_manager: _SFTCheckpointStore,
     optimizer: MixedPrecisionOptimizer,
+    rng: jax.Array,
     step: int,
     input_iter: checkpoint_utils.GrainIterator,
     schedule_horizon: int,
     invocation_end_step: int,
     optimizer_status: jax.Array,
+    identities: checkpoint_utils.CheckpointIdentities,
+    validation: checkpoint_utils.ValidationReceipt,
     boundary: OptimizerStatusBoundary,
     mode: _CheckpointCommitMode,
     prior_commit: _SFTCheckpointCommit | None,
 ) -> _SFTCheckpointCommit:
     require_healthy_optimizer_status(optimizer_status, boundary)
     _validate_optimizer_generation(nnx.state(optimizer), step)
+    if type(identities) is not checkpoint_utils.CheckpointIdentities:
+        raise TypeError("Checkpoint commit requires exact CheckpointIdentities.")
+    if type(validation) is not checkpoint_utils.ValidationReceipt or validation.step != step:
+        raise ValueError("Checkpoint validation receipt step must match the commit step.")
     if mode is _CheckpointCommitMode.REUSE:
         if (
             prior_commit is None
@@ -258,6 +497,8 @@ def _commit_sft_checkpoint(
             or prior_commit.input_iter is not input_iter
             or prior_commit.schedule_horizon != schedule_horizon
             or prior_commit.invocation_end_step != invocation_end_step
+            or prior_commit.verified.identities != identities
+            or prior_commit.verified.manifest["validation"] != dataclasses.asdict(validation)
         ):
             raise ValueError(
                 "Checkpoint reuse requires a commit from the identical step, checkpoint manager, "
@@ -267,25 +508,37 @@ def _commit_sft_checkpoint(
     elif mode in (_CheckpointCommitMode.PERIODIC, _CheckpointCommitMode.FORCED):
         if prior_commit is not None:
             raise ValueError("A new checkpoint save cannot reuse a prior commit.")
+        _require_eight_shard_iterator(input_iter)
         save_args = ocp.args.Composite(
-            train_state=ocp.args.PyTreeSave(_train_state(optimizer)),
+            train_state=ocp.args.PyTreeSave(_train_state(optimizer, rng, optimizer_status)),
             input_iter=grain.checkpoint.CheckpointSave(input_iter),
             schema=ocp.args.JsonSave(
                 _sft_checkpoint_schema(
                     optimizer,
+                    rng,
+                    optimizer_status,
                     input_iter,
                     schedule_horizon,
                     invocation_end_step,
                 )
             ),
         )
-        saved = checkpoint_manager.save(
+        verified = checkpoint_manager.save(
             step,
             args=save_args,
             force=mode is _CheckpointCommitMode.FORCED,
+            phase={
+                "schedule_horizon": schedule_horizon,
+                "invocation_end_step": invocation_end_step,
+            },
+            identities=identities,
+            rng_sha256=_array_sha256(rng),
+            validation=validation,
         )
-        if saved is not True:
-            raise RuntimeError(f"Checkpoint manager did not save step {step}.")
+        if verified.step != step:
+            raise RuntimeError(
+                f"Checkpoint store published step {verified.step} for requested step {step}."
+            )
         commit = _SFTCheckpointCommit(
             step,
             checkpoint_manager,
@@ -293,6 +546,7 @@ def _commit_sft_checkpoint(
             input_iter,
             schedule_horizon,
             invocation_end_step,
+            verified,
         )
     else:
         raise ValueError(f"Unsupported checkpoint commit mode: {mode!r}.")
@@ -307,13 +561,16 @@ def _commit_sft_checkpoint(
 
 
 def _commit_phase_end(
-    checkpoint_manager: ocp.CheckpointManager | None,
+    checkpoint_manager: _SFTCheckpointStore | None,
     optimizer: MixedPrecisionOptimizer,
+    rng: jax.Array,
     input_iter: checkpoint_utils.GrainIterator,
     schedule_horizon: int,
     invocation_end_step: int,
     save_every: int,
     optimizer_status: jax.Array,
+    identities: checkpoint_utils.CheckpointIdentities,
+    validation: checkpoint_utils.ValidationReceipt,
 ) -> _SFTCheckpointCommit | None:
     require_healthy_optimizer_status(optimizer_status, OptimizerStatusBoundary.FINAL)
     if checkpoint_manager is None or (save_every and invocation_end_step % save_every == 0):
@@ -321,11 +578,14 @@ def _commit_phase_end(
     return _commit_sft_checkpoint(
         checkpoint_manager,
         optimizer,
+        rng,
         invocation_end_step,
         input_iter,
         schedule_horizon,
         invocation_end_step,
         optimizer_status,
+        identities,
+        validation,
         OptimizerStatusBoundary.FINAL,
         _CheckpointCommitMode.FORCED,
         None,
@@ -370,6 +630,16 @@ def _validate_optimizer_restore(expected: nnx.State, restored: object) -> None:
                 f"Checkpoint optimizer variable {name} dtype must be "
                 f"{expected_leaf.dtype}, got {restored_leaf.dtype}."
             )
+
+
+def _validate_array_restore(expected: jax.Array, restored: object, field: str) -> None:
+    if not isinstance(restored, jax.Array):
+        raise TypeError(f"Checkpoint {field} must be a JAX array, got {type(restored).__name__}.")
+    if restored.shape != expected.shape or restored.dtype != expected.dtype:
+        raise ValueError(
+            f"Checkpoint {field} must have shape={expected.shape} dtype={expected.dtype}, got "
+            f"shape={restored.shape} dtype={restored.dtype}."
+        )
 
 
 def _validate_optimizer_generation(optimizer_state: nnx.State, generation: int) -> None:
@@ -457,6 +727,25 @@ def _iterator_state(input_iter: checkpoint_utils.GrainIterator) -> object:
     return _parse_iterator_state(json.dumps(state))
 
 
+def _require_eight_shard_iterator(
+    input_iter: checkpoint_utils.GrainIterator,
+) -> dict[str, object]:
+    state = _iterator_state(input_iter)
+    if (
+        type(state) is not dict
+        or set(state) != {"schema_version", "logical_shards", "states"}
+        or type(state["schema_version"]) is not int
+        or state["schema_version"] != 1
+        or type(state["logical_shards"]) is not int
+        or state["logical_shards"] != 8
+        or type(state["states"]) is not list
+        or len(state["states"]) != 8
+        or any(type(shard_state) is not dict for shard_state in state["states"])
+    ):
+        raise ValueError("Checkpoint input must expose exactly eight canonical logical shards.")
+    return state
+
+
 def _iterator_schema(value: object) -> object:
     if isinstance(value, dict):
         return {
@@ -470,6 +759,8 @@ def _iterator_schema(value: object) -> object:
 
 def _sft_checkpoint_schema(
     optimizer: MixedPrecisionOptimizer,
+    rng: jax.Array,
+    optimizer_status: jax.Array,
     input_iter: checkpoint_utils.GrainIterator,
     schedule_horizon: int,
     invocation_end_step: int,
@@ -486,13 +777,21 @@ def _sft_checkpoint_schema(
             }
         )
     return {
-        "version": 2,
+        "version": 3,
         "optimizer": optimizer_leaves,
+        "rng": {
+            "shape": list(rng.shape),
+            "dtype": str(rng.dtype),
+        },
+        "optimizer_status": {
+            "shape": list(optimizer_status.shape),
+            "dtype": str(optimizer_status.dtype),
+        },
         "phase": {
             "schedule_horizon": schedule_horizon,
             "invocation_end_step": invocation_end_step,
         },
-        "input_iter": _iterator_schema(_iterator_state(input_iter)),
+        "input_iter": _iterator_schema(_require_eight_shard_iterator(input_iter)),
     }
 
 
@@ -588,23 +887,26 @@ def _read_iterator_checkpoint(state_path: Path) -> bytes:
         os.close(fd)
 
 
-def _restore_iterator_checkpoint(
-    checkpoint_manager: ocp.CheckpointManager,
+def _read_iterator_checkpoint_state(
+    checkpoint_path: Path,
     step: int,
     input_iter: checkpoint_utils.GrainIterator,
-) -> checkpoint_utils.GrainIterator:
+) -> tuple[bytes, object]:
     expected = _iterator_state(input_iter)
     process_index = jax.process_index()
     process_count = jax.process_count()
-    state_path = (
-        Path(checkpoint_manager.directory)
-        / f"{step:06d}"
-        / "input_iter"
-        / f"process_{process_index}-of-{process_count}.json"
-    )
+    state_path = checkpoint_path / "input_iter" / f"process_{process_index}-of-{process_count}.json"
     raw_state = _read_iterator_checkpoint(state_path)
     restored = _parse_iterator_state(raw_state.decode("utf-8"))
     _validate_json_schema(expected, restored)
+    return raw_state, restored
+
+
+def _apply_iterator_checkpoint_state(
+    input_iter: checkpoint_utils.GrainIterator,
+    raw_state: bytes,
+    restored: object,
+) -> checkpoint_utils.GrainIterator:
     if isinstance(input_iter, grain.DatasetIterator):
         input_iter.set_state(restored)
     elif isinstance(input_iter, grain.DataLoaderIterator):
@@ -616,71 +918,125 @@ def _restore_iterator_checkpoint(
 
 
 def _restore_sft_checkpoint(
-    checkpoint_manager: ocp.CheckpointManager,
+    checkpoint_manager: _SFTCheckpointStore,
     optimizer: MixedPrecisionOptimizer,
+    rng: jax.Array,
+    optimizer_status: jax.Array,
     step: int,
     input_iter: checkpoint_utils.GrainIterator,
     schedule_horizon: int,
     invocation_end_step: int,
-) -> tuple[MixedPrecisionOptimizer, int, checkpoint_utils.GrainIterator]:
-    abstract_state = _abstract_train_state(optimizer)
+    verified_checkpoint: checkpoint_utils.VerifiedCheckpoint | None = None,
+) -> tuple[
+    MixedPrecisionOptimizer,
+    int,
+    jax.Array,
+    jax.Array,
+    checkpoint_utils.GrainIterator,
+]:
+    abstract_state = _abstract_train_state(optimizer, rng, optimizer_status)
     expected_state = nnx.state(optimizer)
-    metadata = checkpoint_manager.item_metadata(step)
-    if set(metadata.keys()) != {"input_iter", "schema", "train_state"}:
-        raise ValueError(
-            f"Checkpoint {step} items must be exactly input_iter, schema, and train_state, got "
-            f"{sorted(metadata.keys())}."
+    with checkpoint_manager.open(step) as open_checkpoint:
+        before = open_checkpoint.checkpoint
+        if verified_checkpoint is not None and before != verified_checkpoint:
+            raise ValueError(f"Checkpoint {step} changed before restore.")
+        metadata = checkpoint_manager.item_metadata(open_checkpoint)
+        if set(metadata.keys()) != {"input_iter", "schema", "train_state"}:
+            raise ValueError(
+                f"Checkpoint {step} items must be exactly input_iter, schema, and train_state, got "
+                f"{sorted(metadata.keys())}."
+            )
+
+        restored_schema = checkpoint_manager.restore(
+            open_checkpoint,
+            args=ocp.args.Composite(schema=ocp.args.JsonRestore()),
+        )
+        if set(restored_schema.keys()) != {"schema"}:
+            raise ValueError(
+                f"Checkpoint {step} schema restore returned keys {sorted(restored_schema.keys())}."
+            )
+        schema = restored_schema["schema"]
+        if (
+            type(schema) is not dict
+            or type(schema.get("version")) is not int
+            or schema["version"] != 3
+        ):
+            version = schema.get("version") if isinstance(schema, dict) else None
+            raise ValueError(
+                f"Checkpoint schema version {version!r} is incompatible with fresh-run schema 3; "
+                "historical scheduled-optimizer checkpoints require the separate writer-lineage "
+                "recovery path."
+            )
+        expected_schema = _sft_checkpoint_schema(
+            optimizer,
+            rng,
+            optimizer_status,
+            input_iter,
+            schedule_horizon,
+            invocation_end_step,
+        )
+        _validate_checkpoint_phase(
+            schema,
+            expected_schema,
+            step,
+            invocation_end_step,
         )
 
-    restored_schema = checkpoint_manager.restore(
-        step,
-        args=ocp.args.Composite(schema=ocp.args.JsonRestore()),
-    )
-    if set(restored_schema.keys()) != {"schema"}:
-        raise ValueError(
-            f"Checkpoint {step} schema restore returned keys {sorted(restored_schema.keys())}."
+        restored = checkpoint_manager.restore(
+            open_checkpoint,
+            args=ocp.args.Composite(train_state=ocp.args.PyTreeRestore(abstract_state)),
         )
-    schema = restored_schema["schema"]
-    if type(schema) is not dict or type(schema.get("version")) is not int or schema["version"] != 2:
-        version = schema.get("version") if isinstance(schema, dict) else None
-        raise ValueError(
-            f"Checkpoint schema version {version!r} is incompatible with fresh-run schema 2; "
-            "historical scheduled-optimizer checkpoints require the separate writer-lineage "
-            "recovery path."
+        if set(restored.keys()) != {"train_state"}:
+            raise ValueError(
+                f"Checkpoint {step} train-state restore returned keys {sorted(restored.keys())}."
+            )
+        train_state = restored["train_state"]
+        if type(train_state) is not dict or set(train_state) != {
+            "optimizer",
+            "rng",
+            "optimizer_status",
+        }:
+            keys = (
+                sorted(train_state) if isinstance(train_state, dict) else type(train_state).__name__
+            )
+            raise ValueError(
+                f"Checkpoint {step} train_state must contain exactly optimizer, rng, and "
+                f"optimizer_status, got {keys}."
+            )
+        _validate_optimizer_restore(expected_state, train_state["optimizer"])
+        _validate_optimizer_generation(train_state["optimizer"], step)
+        _validate_array_restore(rng, train_state["rng"], "rng")
+        _validate_array_restore(
+            optimizer_status,
+            train_state["optimizer_status"],
+            "optimizer_status",
         )
-    expected_schema = _sft_checkpoint_schema(
-        optimizer,
+        require_healthy_optimizer_status(
+            train_state["optimizer_status"],
+            OptimizerStatusBoundary.CHECKPOINT,
+        )
+        raw_iterator_state, restored_iterator_state = _read_iterator_checkpoint_state(
+            open_checkpoint.descriptor_path,
+            step,
+            input_iter,
+        )
+        after = open_checkpoint.verify()
+        if after != before:
+            raise ValueError(f"Checkpoint {step} changed while restoring.")
+
+    restored_input_iter = _apply_iterator_checkpoint_state(
         input_iter,
-        schedule_horizon,
-        invocation_end_step,
+        raw_iterator_state,
+        restored_iterator_state,
     )
-    _validate_checkpoint_phase(
-        schema,
-        expected_schema,
-        step,
-        invocation_end_step,
-    )
-
-    restored = checkpoint_manager.restore(
-        step,
-        args=ocp.args.Composite(train_state=ocp.args.PyTreeRestore(abstract_state)),
-    )
-    if set(restored.keys()) != {"train_state"}:
-        raise ValueError(
-            f"Checkpoint {step} train-state restore returned keys {sorted(restored.keys())}."
-        )
-    train_state = restored["train_state"]
-    if type(train_state) is not dict or set(train_state) != {"optimizer"}:
-        keys = sorted(train_state) if isinstance(train_state, dict) else type(train_state).__name__
-        raise ValueError(
-            f"Checkpoint {step} train_state must contain exactly optimizer, got {keys}."
-        )
-    _validate_optimizer_restore(expected_state, train_state["optimizer"])
-    _validate_optimizer_generation(train_state["optimizer"], step)
-    restored_input_iter = _restore_iterator_checkpoint(checkpoint_manager, step, input_iter)
-
     nnx.update(optimizer, train_state["optimizer"])
-    return optimizer, step, restored_input_iter
+    return (
+        optimizer,
+        step,
+        train_state["rng"],
+        train_state["optimizer_status"],
+        restored_input_iter,
+    )
 
 
 def make_sft_gradient_step(cfg, pad_id: int = 0, *, wrt=nnx.Param, num_loss_tiles: int = 4):
@@ -876,10 +1232,11 @@ def _require_registrar_compiled_executable_capability() -> None:
 
 
 def _require_checkpoint_frontier(
-    checkpoint_manager: ocp.CheckpointManager,
+    checkpoint_manager: _SFTCheckpointStore,
     resume_step: int,
     save_path: Path,
-) -> None:
+    identities: checkpoint_utils.CheckpointIdentities,
+) -> checkpoint_utils.VerifiedCheckpoint:
     committed_steps = checkpoint_manager.all_steps()
     committed_frontier = max(committed_steps, default=None)
     if committed_frontier != resume_step:
@@ -887,11 +1244,57 @@ def _require_checkpoint_frontier(
             f"resume_step={resume_step} does not match the committed checkpoint frontier "
             f"{committed_frontier} at {save_path}."
         )
+    verified = checkpoint_manager.verify(resume_step)
+    if verified.identities != identities:
+        raise ValueError("Checkpoint identities do not match the requested training invocation.")
+    return verified
+
+
+class RequeueRequired(RuntimeError):
+    def __init__(self, checkpoint: checkpoint_utils.VerifiedCheckpoint) -> None:
+        self.checkpoint = checkpoint
+        super().__init__(
+            f"Requeue from verified checkpoint step {checkpoint.step} ({checkpoint.sha256})."
+        )
+
+
+class _PreemptionController:
+    def __init__(self) -> None:
+        self.requested = False
+        self._prior_handlers = {}
+
+    def __enter__(self):
+        for signum in (signal.SIGUSR1, signal.SIGTERM):
+            self._prior_handlers[signum] = signal.getsignal(signum)
+            signal.signal(signum, self._request)
+        return self
+
+    def _request(self, signum, frame) -> None:
+        del signum, frame
+        self.requested = True
+
+    def __exit__(self, exc_type, error, traceback) -> bool:
+        del exc_type, traceback
+        errors = []
+        for signum, handler in self._prior_handlers.items():
+            try:
+                signal.signal(signum, handler)
+            except BaseException as restore_error:  # noqa: BLE001
+                errors.append(restore_error)
+        if error is not None:
+            for restore_error in errors:
+                error.add_note(f"Signal-handler restoration also failed: {restore_error!r}")
+            return False
+        if len(errors) == 1:
+            raise errors[0]
+        if errors:
+            raise BaseExceptionGroup("Signal-handler restoration failed", errors)
+        return False
 
 
 @dataclasses.dataclass
 class _TrainingCleanup:
-    checkpoint_manager: ocp.CheckpointManager | None = None
+    checkpoint_manager: _SFTCheckpointStore | None = None
 
     def close(
         self,
@@ -910,6 +1313,11 @@ class _TrainingCleanup:
         if not errors:
             return
         if active_error is not None:
+            if isinstance(active_error, RequeueRequired):
+                raise BaseExceptionGroup(
+                    "Preemption checkpoint cleanup failed",
+                    [active_error, *errors],
+                )
             for error in errors:
                 active_error.add_note(f"Training cleanup also failed: {error!r}")
             return
@@ -940,10 +1348,13 @@ def _run_sft(
     val_data_iter: checkpoint_utils.GrainIterator | None = None,
     val_every: int | None = None,
     val_steps: int = 10,
+    checkpoint_identities: checkpoint_utils.CheckpointIdentities | None = None,
+    validation_dataset_sha256: str | None = None,
     text_attn_backend: str = "mosaic_gpu",
     gc_period: int = 0,
     log_memory: bool = False,
     _cleanup: _TrainingCleanup,
+    _preemption: _PreemptionController,
 ) -> tuple[MixedPrecisionOptimizer, dict[str, float]]:
     """SFT a VLM from a Grain iterator; returns final optimizer + last metrics.
 
@@ -960,20 +1371,37 @@ def _run_sft(
     _validate_training_phase(train_cfg, invocation_end_step)
     save_path = Path(save_dir).expanduser().resolve() if save_dir is not None else None
     will_resume = _validate_resume_request(resume, resume_step, save_path, invocation_end_step)
+    if save_path is not None:
+        if type(checkpoint_identities) is not checkpoint_utils.CheckpointIdentities:
+            raise TypeError("Checkpointing requires exact CheckpointIdentities.")
+        checkpoint_utils.validate_sha256(
+            validation_dataset_sha256,
+            "validation_dataset_sha256",
+        )
+        if val_data_iter is None or type(val_every) is not int or val_every <= 0:
+            raise ValueError("Checkpointing requires a validation iterator and positive val_every.")
+        if type(val_steps) is not int or val_steps <= 0:
+            raise ValueError("Checkpointing requires positive val_steps.")
 
-    checkpoint_manager: ocp.CheckpointManager | None = None
+    checkpoint_manager: _SFTCheckpointStore | None = None
+    resume_checkpoint: checkpoint_utils.VerifiedCheckpoint | None = None
     if save_path is not None:
         if not will_resume:
             save_path.mkdir(parents=True)
-        checkpoint_manager = _make_checkpoint_manager(
+        checkpoint_manager = _SFTCheckpointStore(
             save_path,
-            save_interval=save_every or None,
-            keep_period=keep_period or None,
-            keep_latest=keep_latest or None,
+            save_every or None,
+            keep_period or None,
+            keep_latest or None,
         )
         _cleanup.checkpoint_manager = checkpoint_manager
         if will_resume:
-            _require_checkpoint_frontier(checkpoint_manager, resume_step, save_path)
+            resume_checkpoint = _require_checkpoint_frontier(
+                checkpoint_manager,
+                resume_step,
+                save_path,
+                checkpoint_identities,
+            )
 
     if will_resume:
         model_cfg = vlm_api.resolve_config(str(save_path))
@@ -995,6 +1423,10 @@ def _run_sft(
 
     replicated_sharding = NamedSharding(mesh, P())
     init_rng = jax.device_put(jax.random.key(train_cfg.seed), replicated_sharding)
+    training_rng = jax.device_put(
+        jax.random.fold_in(jax.random.key(train_cfg.seed), np.uint32(0xFFFFFFFF)),
+        replicated_sharding,
+    )
     startup_log("placed initialization rng on device mesh")
 
     is_primary_process = jax.process_index() == 0
@@ -1109,21 +1541,24 @@ def _run_sft(
         startup_log(f"checkpoint manager ready at {save_path!r}")
 
     start_step = 0
-    if will_resume:
-        optimizer, start_step, data_iter = _restore_sft_checkpoint(
-            checkpoint_manager,
-            optimizer,
-            resume_step,
-            data_iter,
-            train_cfg.schedule_horizon,
-            invocation_end_step,
-        )
-        startup_log(f"restored checkpoint at step {start_step}")
-
     optimizer_status = jax.device_put(
         jnp.asarray(OptimizerFatalStatus.HEALTHY, dtype=jnp.uint8),
         replicated_sharding,
     )
+    if will_resume:
+        optimizer, start_step, training_rng, optimizer_status, data_iter = _restore_sft_checkpoint(
+            checkpoint_manager,
+            optimizer,
+            training_rng,
+            optimizer_status,
+            resume_step,
+            data_iter,
+            train_cfg.schedule_horizon,
+            invocation_end_step,
+            resume_checkpoint,
+        )
+        startup_log(f"restored checkpoint at step {start_step}")
+
     last_metrics: dict[str, float] = {}
     prev_metrics: (
         tuple[
@@ -1135,6 +1570,7 @@ def _run_sft(
         ]
         | None
     ) = None
+    last_validation_receipt: checkpoint_utils.ValidationReceipt | None = None
 
     def _log_prev_metrics(force: bool = False) -> None:
         nonlocal last_metrics
@@ -1162,6 +1598,61 @@ def _run_sft(
         if result is not None:
             last_metrics = result
 
+    def _validate_at_step(step: int) -> checkpoint_utils.ValidationReceipt:
+        if eval_step is None or val_data_iter is None:
+            raise RuntimeError("Checkpoint validation is unavailable.")
+        require_healthy_optimizer_status(
+            optimizer_status,
+            OptimizerStatusBoundary.VALIDATION,
+        )
+        initial_state = val_data_iter.get_state()
+        active_error: BaseException | None = None
+        total_ce_loss_sum = 0.0
+        total_supervised_tokens = 0
+        total_aux_loss = 0.0
+        try:
+            for _ in range(val_steps):
+                val_batch = next(val_data_iter)
+                pop_source_ids(val_batch)
+                val_batch = vlm_api.shard_batch_dict(val_batch, model_cfg, mesh)
+                ce_loss_sum, supervised_tokens, aux_loss = eval_step(
+                    optimizer.model,
+                    val_batch,
+                )
+                total_ce_loss_sum += ce_loss_sum
+                total_supervised_tokens += supervised_tokens
+                total_aux_loss += aux_loss
+        except BaseException as error:
+            active_error = error
+            raise
+        finally:
+            try:
+                val_data_iter.set_state(initial_state)
+                val_data_iter.start_prefetch()
+            except BaseException as restore_error:
+                if active_error is None:
+                    raise
+                active_error.add_note(f"Validation iterator reset also failed: {restore_error!r}")
+        avg_ce_loss = total_ce_loss_sum / total_supervised_tokens
+        avg_aux_loss = total_aux_loss / val_steps
+        if wandb_run is not None and is_primary_process:
+            wandb_run.log(
+                {
+                    "val/loss": avg_ce_loss + avg_aux_loss,
+                    "val/ce_loss": avg_ce_loss,
+                    "val/aux_loss": avg_aux_loss,
+                    "val/sup_tokens": total_supervised_tokens,
+                },
+                step=step,
+            )
+        return checkpoint_utils.ValidationReceipt(
+            step=step,
+            batches=val_steps,
+            loss_sum_hex=total_ce_loss_sum.hex(),
+            supervised_tokens=total_supervised_tokens,
+            dataset_sha256=validation_dataset_sha256,
+        )
+
     startup_log("entering training loop")
     if log_memory:
         log_device_memory("before first step", save_dir=save_path)
@@ -1169,6 +1660,7 @@ def _run_sft(
     _mem_logged_steady_state = not log_memory
 
     for step_idx in range(start_step, invocation_end_step):
+        checkpoint_commit = None
         _log_prev_metrics()
         step = step_idx + 1
 
@@ -1280,59 +1772,88 @@ def _run_sft(
             gc.collect()
 
         if eval_step is not None and val_every and step % val_every == 0:
-            require_healthy_optimizer_status(optimizer_status, OptimizerStatusBoundary.VALIDATION)
-            total_val_ce_loss_sum = 0.0
-            total_val_sup_tokens = 0.0
-            total_val_aux_loss = 0.0
-            for _ in range(val_steps):
-                val_batch = next(val_data_iter)
-                pop_source_ids(val_batch)
-                val_batch = vlm_api.shard_batch_dict(val_batch, model_cfg, mesh)
-                val_ce_loss_sum, val_sup_tokens, val_aux_loss = eval_step(
-                    optimizer.model, val_batch
-                )
-                total_val_ce_loss_sum += float(val_ce_loss_sum)
-                total_val_sup_tokens += float(val_sup_tokens)
-                total_val_aux_loss += float(val_aux_loss)
-            avg_val_ce_loss = total_val_ce_loss_sum / total_val_sup_tokens
-            avg_val_aux_loss = total_val_aux_loss / val_steps
-            avg_val_loss = avg_val_ce_loss + avg_val_aux_loss
-            if wandb_run is not None and is_primary_process:
-                wandb_run.log(
-                    {
-                        "val/loss": avg_val_loss,
-                        "val/ce_loss": avg_val_ce_loss,
-                        "val/aux_loss": avg_val_aux_loss,
-                        "val/sup_tokens": total_val_sup_tokens,
-                    },
-                    step=step,
-                )
+            last_validation_receipt = _validate_at_step(step)
 
         if checkpoint_manager is not None and save_every and step % save_every == 0:
-            _commit_sft_checkpoint(
+            require_healthy_optimizer_status(
+                optimizer_status,
+                OptimizerStatusBoundary.CHECKPOINT,
+            )
+            if last_validation_receipt is None or last_validation_receipt.step != step:
+                last_validation_receipt = _validate_at_step(step)
+            checkpoint_commit = _commit_sft_checkpoint(
                 checkpoint_manager,
                 optimizer,
+                training_rng,
                 step,
                 data_iter,
                 train_cfg.schedule_horizon,
                 invocation_end_step,
                 optimizer_status,
+                checkpoint_identities,
+                last_validation_receipt,
                 OptimizerStatusBoundary.CHECKPOINT,
                 _CheckpointCommitMode.PERIODIC,
                 None,
             )
 
+        if _preemption.requested:
+            if checkpoint_manager is None:
+                raise RuntimeError("Preemption requires an enabled checkpoint store.")
+            require_healthy_optimizer_status(
+                optimizer_status,
+                OptimizerStatusBoundary.CHECKPOINT,
+            )
+            if last_validation_receipt is None or last_validation_receipt.step != step:
+                last_validation_receipt = _validate_at_step(step)
+            checkpoint_commit = _commit_sft_checkpoint(
+                checkpoint_manager,
+                optimizer,
+                training_rng,
+                step,
+                data_iter,
+                train_cfg.schedule_horizon,
+                invocation_end_step,
+                optimizer_status,
+                checkpoint_identities,
+                last_validation_receipt,
+                OptimizerStatusBoundary.CHECKPOINT,
+                (
+                    _CheckpointCommitMode.REUSE
+                    if checkpoint_commit is not None
+                    else _CheckpointCommitMode.FORCED
+                ),
+                checkpoint_commit,
+            )
+            raise RequeueRequired(checkpoint_commit.verified)
+
     _log_prev_metrics(force=True)
 
-    _commit_phase_end(
+    if checkpoint_manager is not None and (
+        last_validation_receipt is None or last_validation_receipt.step != invocation_end_step
+    ):
+        last_validation_receipt = _validate_at_step(invocation_end_step)
+
+    phase_end_commit = _commit_phase_end(
         checkpoint_manager,
         optimizer,
+        training_rng,
         data_iter,
         train_cfg.schedule_horizon,
         invocation_end_step,
         save_every,
         optimizer_status,
+        checkpoint_identities,
+        last_validation_receipt,
     )
+    if _preemption.requested:
+        if checkpoint_manager is None:
+            raise RuntimeError("Preemption requires an enabled checkpoint store.")
+        if phase_end_commit is None:
+            verified = checkpoint_manager.verify(invocation_end_step)
+        else:
+            verified = phase_end_commit.verified
+        raise RequeueRequired(verified)
 
     return optimizer, last_metrics
 
@@ -1359,6 +1880,8 @@ def run_sft(
     val_data_iter: checkpoint_utils.GrainIterator | None = None,
     val_every: int | None = None,
     val_steps: int = 10,
+    checkpoint_identities: checkpoint_utils.CheckpointIdentities | None = None,
+    validation_dataset_sha256: str | None = None,
     text_attn_backend: str = "mosaic_gpu",
     gc_period: int = 0,
     log_memory: bool = False,
@@ -1369,32 +1892,36 @@ def run_sft(
     cleanup = _TrainingCleanup()
     active_error: BaseException | None = None
     try:
-        return _run_sft(
-            model_id_or_cfg,
-            train_cfg,
-            data_iter,
-            invocation_end_step=invocation_end_step,
-            save_dir=save_dir,
-            save_every=save_every,
-            keep_period=keep_period,
-            keep_latest=keep_latest,
-            log_every=log_every,
-            resume=resume,
-            resume_step=resume_step,
-            pad_id=pad_id,
-            peak_tflops=peak_tflops,
-            tp_size=tp_size,
-            fsdp_size=fsdp_size,
-            dp_size=dp_size,
-            wandb_run=wandb_run,
-            val_data_iter=val_data_iter,
-            val_every=val_every,
-            val_steps=val_steps,
-            text_attn_backend=text_attn_backend,
-            gc_period=gc_period,
-            log_memory=log_memory,
-            _cleanup=cleanup,
-        )
+        with _PreemptionController() as preemption:
+            return _run_sft(
+                model_id_or_cfg,
+                train_cfg,
+                data_iter,
+                invocation_end_step=invocation_end_step,
+                save_dir=save_dir,
+                save_every=save_every,
+                keep_period=keep_period,
+                keep_latest=keep_latest,
+                log_every=log_every,
+                resume=resume,
+                resume_step=resume_step,
+                pad_id=pad_id,
+                peak_tflops=peak_tflops,
+                tp_size=tp_size,
+                fsdp_size=fsdp_size,
+                dp_size=dp_size,
+                wandb_run=wandb_run,
+                val_data_iter=val_data_iter,
+                val_every=val_every,
+                val_steps=val_steps,
+                checkpoint_identities=checkpoint_identities,
+                validation_dataset_sha256=validation_dataset_sha256,
+                text_attn_backend=text_attn_backend,
+                gc_period=gc_period,
+                log_memory=log_memory,
+                _cleanup=cleanup,
+                _preemption=preemption,
+            )
     except BaseException as error:
         active_error = error
         raise

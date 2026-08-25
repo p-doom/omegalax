@@ -25,8 +25,8 @@ from omegalax.data.grain_pipeline import (
 )
 from omegalax.distributed.mesh import process_local_batch_size
 from omegalax.registry import resolve_hf_repo_id
+from omegalax.trainers import checkpoint_utils
 from omegalax.trainers import vlm as vlm_trainer
-from omegalax.trainers.checkpoint_utils import ResumeMode
 from omegalax.trainers.perf import resolve_peak_tflops
 from omegalax.trainers.text import startup_log
 
@@ -107,7 +107,7 @@ flags.DEFINE_bool("log_memory", None, "Log per-process JAX/HBM memory at init an
 flags.DEFINE_enum(
     "resume",
     None,
-    [ResumeMode.NEVER.value, ResumeMode.REQUIRED.value],
+    [checkpoint_utils.ResumeMode.NEVER.value, checkpoint_utils.ResumeMode.REQUIRED.value],
     "Checkpoint policy: 'never' creates a new checkpoint root; 'required' restores "
     "the exact --resume_step frontier.",
 )
@@ -274,7 +274,7 @@ def _validate_flags() -> None:
             if FLAGS[name].value is None:
                 problems.append(f"{name} (required when enable_lora=true)")
 
-    if FLAGS.resume == ResumeMode.REQUIRED.value:
+    if FLAGS.resume == checkpoint_utils.ResumeMode.REQUIRED.value:
         if FLAGS.resume_step is None or FLAGS.resume_step <= 0:
             problems.append("resume_step (positive integer required when resume=required)")
     elif FLAGS.resume_step is not None:
@@ -512,7 +512,7 @@ def main(_) -> None:
         freeze_vision_tower=FLAGS.freeze_vision_tower,
         num_loss_tiles=FLAGS.num_loss_tiles,
     )
-    resume_mode = ResumeMode(FLAGS.resume)
+    resume_mode = checkpoint_utils.ResumeMode(FLAGS.resume)
     save_dir = Path(FLAGS.save_dir)
     peak_tflops = resolve_peak_tflops(FLAGS.peak_tflops)
 
@@ -532,6 +532,7 @@ def main(_) -> None:
             f"gc_period={FLAGS.gc_period}: Python GC disabled, will collect every {FLAGS.gc_period} steps"
         )
 
+    requeue_request = None
     try:
         _, last_metrics = vlm_trainer.run_sft(
             FLAGS.model_id,
@@ -558,6 +559,8 @@ def main(_) -> None:
             gc_period=FLAGS.gc_period,
             log_memory=FLAGS.log_memory,
         )
+    except vlm_trainer.RequeueRequired as error:
+        requeue_request = error
     finally:
         if FLAGS.gc_period:
             gc.enable()
@@ -565,6 +568,14 @@ def main(_) -> None:
 
         if wandb_run is not None:
             wandb_run.finish()
+
+    if requeue_request is not None:
+        receipt_path = checkpoint_utils.write_requeue_receipt(requeue_request.checkpoint)
+        print(
+            f"requeue required step={requeue_request.checkpoint.step} "
+            f"checkpoint_sha256={requeue_request.checkpoint.sha256} receipt={receipt_path}"
+        )
+        raise SystemExit(checkpoint_utils.REQUEUE_EXIT_CODE)
 
     if last_metrics:
         print(f"finished step={int(last_metrics['step'])} loss={last_metrics['loss']:.4f}")

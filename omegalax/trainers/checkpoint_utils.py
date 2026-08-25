@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+import contextlib
+import ctypes
 import dataclasses
+import errno
 import hashlib
 import json
 import math
 import os
 import re
+import secrets
 import stat
+from collections.abc import Iterator
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, TypeAlias, cast
@@ -21,11 +26,14 @@ import orbax.checkpoint as ocp
 GrainIterator: TypeAlias = grain.DataLoaderIterator | grain.DatasetIterator
 
 CHECKPOINT_MANIFEST_FILENAME = "checkpoint.manifest.json"
+REQUEUE_RECEIPT_FILENAME = "requeue-required.json"
+REQUEUE_EXIT_CODE = 75
 _CHECKPOINT_MANIFEST_SCHEMA = "omegalax.sft-checkpoint"
 _CHECKPOINT_MANIFEST_VERSION = 1
 _MAX_MANIFEST_BYTES = 16 * 1024 * 1024
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 _STEP_RE = re.compile(r"[0-9]{6,}\Z")
+_RENAME_NOREPLACE = 1
 
 
 @dataclasses.dataclass(frozen=True)
@@ -37,7 +45,7 @@ class CheckpointIdentities:
 
     def __post_init__(self) -> None:
         for field in dataclasses.fields(self):
-            _validate_sha256(getattr(self, field.name), field.name)
+            validate_sha256(getattr(self, field.name), field.name)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -68,7 +76,7 @@ class ValidationReceipt:
                 "Validation receipt loss_sum_hex must be the canonical hexadecimal form of a "
                 "finite non-negative float."
             )
-        _validate_sha256(self.dataset_sha256, "validation.dataset_sha256")
+        validate_sha256(self.dataset_sha256, "validation.dataset_sha256")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -80,7 +88,50 @@ class VerifiedCheckpoint:
     identities: CheckpointIdentities
 
 
-def _validate_sha256(value: object, field: str) -> str:
+@dataclasses.dataclass
+class VerifiedCheckpointHandle:
+    checkpoint: VerifiedCheckpoint
+    _directory_fd: int | None = dataclasses.field(repr=False)
+
+    def _require_open_fd(self) -> int:
+        if self._directory_fd is None:
+            raise RuntimeError("Verified checkpoint handle is closed.")
+        return self._directory_fd
+
+    @property
+    def descriptor_path(self) -> Path:
+        return Path(f"/proc/self/fd/{self._require_open_fd()}")
+
+    def verify(self) -> VerifiedCheckpoint:
+        return _verify_checkpoint_directory(
+            self._require_open_fd(),
+            self.checkpoint.path,
+            self.checkpoint.step,
+        )
+
+    def _close(self) -> None:
+        directory_fd = self._directory_fd
+        if directory_fd is None:
+            return
+        self._directory_fd = None
+        os.close(directory_fd)
+
+
+@dataclasses.dataclass(frozen=True)
+class RequeueReceipt:
+    checkpoint_step: int
+    checkpoint_sha256: str
+    exit_code: int = REQUEUE_EXIT_CODE
+
+    def __post_init__(self) -> None:
+        if type(self.checkpoint_step) is not int or self.checkpoint_step <= 0:
+            raise ValueError("Requeue receipt checkpoint_step must be a positive integer.")
+        validate_sha256(self.checkpoint_sha256, "requeue.checkpoint_sha256")
+        if type(self.exit_code) is not int or self.exit_code != REQUEUE_EXIT_CODE:
+            raise ValueError(f"Requeue receipt exit_code must be {REQUEUE_EXIT_CODE}.")
+
+
+def validate_sha256(value: object, field: str) -> str:
     if type(value) is not str or _SHA256_RE.fullmatch(value) is None:
         raise ValueError(f"{field} must be a lowercase SHA-256 digest.")
     return value
@@ -110,6 +161,44 @@ def _canonical_json(value: object) -> bytes:
         )
         + "\n"
     ).encode("ascii")
+
+
+def _rename_noreplace(
+    source: str,
+    destination: str,
+    *,
+    source_directory_fd: int,
+    destination_directory_fd: int,
+) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    try:
+        renameat2 = libc.renameat2
+    except AttributeError as error:
+        raise RuntimeError(
+            "Checkpoint publication requires renameat2(RENAME_NOREPLACE)."
+        ) from error
+    renameat2.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    renameat2.restype = ctypes.c_int
+    if (
+        renameat2(
+            source_directory_fd,
+            os.fsencode(source),
+            destination_directory_fd,
+            os.fsencode(destination),
+            _RENAME_NOREPLACE,
+        )
+        != 0
+    ):
+        error_number = ctypes.get_errno()
+        if error_number == errno.ENOSYS:
+            raise RuntimeError("Checkpoint publication requires renameat2(RENAME_NOREPLACE).")
+        raise OSError(error_number, os.strerror(error_number), destination)
 
 
 def _read_regular_file(parent_fd: int, name: str, *, max_bytes: int | None = None) -> bytes:
@@ -271,7 +360,7 @@ def _inventory_directory(
                     )
                 )
                 if make_durable:
-                    os.fchmod(child_fd, 0o550)
+                    os.fchmod(child_fd, 0o750)
                     os.fsync(child_fd)
             finally:
                 os.close(child_fd)
@@ -350,7 +439,7 @@ def _validate_manifest(manifest: dict[str, object], step: int) -> CheckpointIden
         raise ValueError("Checkpoint manifest optimizer generation does not match its step.")
     if type(state["input_logical_shards"]) is not int or state["input_logical_shards"] != 8:
         raise ValueError("Checkpoint manifest must bind exactly eight logical input shards.")
-    _validate_sha256(state["rng_sha256"], "state.rng_sha256")
+    validate_sha256(state["rng_sha256"], "state.rng_sha256")
     if state["optimizer_fatal_status"] != "healthy":
         raise ValueError("Checkpoint manifest optimizer status must be healthy.")
 
@@ -381,11 +470,43 @@ def _validate_manifest(manifest: dict[str, object], step: int) -> CheckpointIden
         prior_path = relative_path
         if type(item["size"]) is not int or item["size"] < 0:
             raise ValueError(f"Checkpoint manifest file size is invalid: {relative_path}.")
-        _validate_sha256(item["sha256"], f"files[{relative_path}].sha256")
+        validate_sha256(item["sha256"], f"files[{relative_path}].sha256")
     return identities
 
 
-def verify_checkpoint(path: str | Path) -> VerifiedCheckpoint:
+def _verify_checkpoint_directory(
+    directory_fd: int,
+    checkpoint_path: Path,
+    step: int,
+) -> VerifiedCheckpoint:
+    manifest_raw = _read_regular_file(
+        directory_fd,
+        CHECKPOINT_MANIFEST_FILENAME,
+        max_bytes=_MAX_MANIFEST_BYTES,
+    )
+    manifest = _parse_manifest(manifest_raw)
+    identities = _validate_manifest(manifest, step)
+    files = _inventory_directory(directory_fd, make_durable=False)
+    if files != manifest["files"]:
+        raise ValueError("Checkpoint payload does not match its exhaustive file inventory.")
+    manifest_again = _read_regular_file(
+        directory_fd,
+        CHECKPOINT_MANIFEST_FILENAME,
+        max_bytes=_MAX_MANIFEST_BYTES,
+    )
+    if manifest_again != manifest_raw:
+        raise ValueError("Checkpoint manifest changed while verifying.")
+    return VerifiedCheckpoint(
+        path=checkpoint_path,
+        manifest=manifest,
+        sha256=hashlib.sha256(manifest_raw).hexdigest(),
+        step=step,
+        identities=identities,
+    )
+
+
+@contextlib.contextmanager
+def open_verified_checkpoint(path: str | Path) -> Iterator[VerifiedCheckpointHandle]:
     checkpoint_path = Path(path)
     if not checkpoint_path.is_absolute():
         raise ValueError("Checkpoint path must be absolute.")
@@ -400,37 +521,44 @@ def verify_checkpoint(path: str | Path) -> VerifiedCheckpoint:
             os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
             dir_fd=parent_fd,
         )
-    except BaseException:
-        os.close(parent_fd)
-        raise
-    try:
-        manifest_raw = _read_regular_file(
-            directory_fd,
-            CHECKPOINT_MANIFEST_FILENAME,
-            max_bytes=_MAX_MANIFEST_BYTES,
-        )
-        manifest = _parse_manifest(manifest_raw)
-        identities = _validate_manifest(manifest, step)
-        files = _inventory_directory(directory_fd, make_durable=False)
-        if files != manifest["files"]:
-            raise ValueError("Checkpoint payload does not match its exhaustive file inventory.")
-        manifest_again = _read_regular_file(
-            directory_fd,
-            CHECKPOINT_MANIFEST_FILENAME,
-            max_bytes=_MAX_MANIFEST_BYTES,
-        )
-        if manifest_again != manifest_raw:
-            raise ValueError("Checkpoint manifest changed while verifying.")
-        return VerifiedCheckpoint(
-            path=checkpoint_path,
-            manifest=manifest,
-            sha256=hashlib.sha256(manifest_raw).hexdigest(),
-            step=step,
-            identities=identities,
-        )
     finally:
-        os.close(directory_fd)
         os.close(parent_fd)
+    handle: VerifiedCheckpointHandle | None = None
+    try:
+        verified = _verify_checkpoint_directory(directory_fd, checkpoint_path, step)
+        handle = VerifiedCheckpointHandle(verified, directory_fd)
+        yield handle
+    finally:
+        if handle is not None:
+            handle._close()
+        else:
+            os.close(directory_fd)
+
+
+def verify_checkpoint(path: str | Path) -> VerifiedCheckpoint:
+    with open_verified_checkpoint(path) as handle:
+        return handle.checkpoint
+
+
+def list_checkpoint_steps(checkpoint_root: str | Path) -> tuple[int, ...]:
+    root = Path(checkpoint_root)
+    if not root.is_absolute():
+        raise ValueError("Checkpoint root must be absolute.")
+    root_fd = os.open(root, os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        with os.scandir(root_fd) as entries:
+            names = tuple(entry.name for entry in entries)
+    finally:
+        os.close(root_fd)
+    steps = []
+    for name in names:
+        if name.startswith(".pending-") or not name.isdigit():
+            continue
+        step = int(name)
+        if step <= 0 or str(step).zfill(6) != name:
+            raise ValueError(f"Checkpoint root contains a non-canonical step: {name!r}.")
+        steps.append(step)
+    return tuple(sorted(steps))
 
 
 def publish_checkpoint(
@@ -447,33 +575,23 @@ def publish_checkpoint(
     if not staging_path.is_absolute() or not final_path.is_absolute():
         raise ValueError("Checkpoint publication paths must be absolute.")
     step = _manifest_step(final_path)
-    if staging_path.parent.parent != final_path.parent or not staging_path.parent.name.startswith(
+    if staging_path.parent != final_path.parent or not staging_path.name.startswith(
         f".pending-{final_path.name}-"
     ):
         raise ValueError("Checkpoint staging directory is not the expected hidden sibling.")
     if validation.step != step:
         raise ValueError("Checkpoint validation receipt step does not match the publication step.")
-    _validate_sha256(rng_sha256, "state.rng_sha256")
+    validate_sha256(rng_sha256, "state.rng_sha256")
 
     root_fd = os.open(
         final_path.parent,
         os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
     )
-    staging_root_fd = os.open(
-        staging_path.parent,
-        os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
-    )
     try:
-        try:
-            os.stat(final_path.name, dir_fd=root_fd, follow_symlinks=False)
-        except FileNotFoundError:
-            pass
-        else:
-            raise FileExistsError(f"Checkpoint step already exists: {final_path}.")
         staging_fd = os.open(
             staging_path.name,
             os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
-            dir_fd=staging_root_fd,
+            dir_fd=root_fd,
         )
         try:
             try:
@@ -500,9 +618,8 @@ def publish_checkpoint(
             }
             _validate_manifest(manifest, step)
             manifest_raw = _canonical_json(manifest)
-            temporary_name = f".{CHECKPOINT_MANIFEST_FILENAME}.{os.getpid()}.tmp"
             manifest_fd = os.open(
-                temporary_name,
+                CHECKPOINT_MANIFEST_FILENAME,
                 os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
                 0o440,
                 dir_fd=staging_fd,
@@ -517,29 +634,130 @@ def publish_checkpoint(
                 os.fsync(manifest_fd)
             finally:
                 os.close(manifest_fd)
-            os.rename(
-                temporary_name,
-                CHECKPOINT_MANIFEST_FILENAME,
-                src_dir_fd=staging_fd,
-                dst_dir_fd=staging_fd,
-            )
             os.fchmod(staging_fd, 0o750)
             os.fsync(staging_fd)
-            os.rename(
+            staged = VerifiedCheckpoint(
+                path=staging_path,
+                manifest=manifest,
+                sha256=hashlib.sha256(manifest_raw).hexdigest(),
+                step=step,
+                identities=identities,
+            )
+            _rename_noreplace(
                 staging_path.name,
                 final_path.name,
-                src_dir_fd=staging_root_fd,
-                dst_dir_fd=root_fd,
+                source_directory_fd=root_fd,
+                destination_directory_fd=root_fd,
             )
-            os.fchmod(staging_fd, 0o550)
-            os.fsync(staging_fd)
             os.fsync(root_fd)
         finally:
             os.close(staging_fd)
     finally:
-        os.close(staging_root_fd)
         os.close(root_fd)
-    return verify_checkpoint(final_path)
+    return dataclasses.replace(staged, path=final_path)
+
+
+def write_requeue_receipt(checkpoint: VerifiedCheckpoint) -> Path:
+    verified = verify_checkpoint(checkpoint.path)
+    if verified != checkpoint:
+        raise ValueError("Requeue checkpoint changed before receipt publication.")
+    receipt = {
+        "schema": "omegalax.requeue-required",
+        "version": 1,
+        **dataclasses.asdict(
+            RequeueReceipt(
+                checkpoint_step=checkpoint.step,
+                checkpoint_sha256=checkpoint.sha256,
+            )
+        ),
+    }
+    raw = _canonical_json(receipt)
+    root = checkpoint.path.parent
+    root_fd = os.open(root, os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW)
+    temporary_name = f".{REQUEUE_RECEIPT_FILENAME}.{os.getpid()}-{secrets.token_hex(8)}.pending"
+    published = False
+    try:
+        receipt_fd = os.open(
+            temporary_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o440,
+            dir_fd=root_fd,
+        )
+        try:
+            view = memoryview(raw)
+            while view:
+                written = os.write(receipt_fd, view)
+                if written <= 0:
+                    raise OSError("Requeue receipt write made no progress.")
+                view = view[written:]
+            os.fsync(receipt_fd)
+        finally:
+            os.close(receipt_fd)
+        _rename_noreplace(
+            temporary_name,
+            REQUEUE_RECEIPT_FILENAME,
+            source_directory_fd=root_fd,
+            destination_directory_fd=root_fd,
+        )
+        published = True
+        os.fsync(root_fd)
+    finally:
+        if not published:
+            try:
+                os.unlink(temporary_name, dir_fd=root_fd)
+            except FileNotFoundError:
+                pass
+        os.close(root_fd)
+    if read_requeue_receipt(root) != RequeueReceipt(
+        checkpoint_step=checkpoint.step,
+        checkpoint_sha256=checkpoint.sha256,
+    ):
+        raise ValueError("Requeue receipt read-back did not reproduce its publication.")
+    return root / REQUEUE_RECEIPT_FILENAME
+
+
+def read_requeue_receipt(checkpoint_root: str | Path) -> RequeueReceipt:
+    root = Path(checkpoint_root)
+    if not root.is_absolute():
+        raise ValueError("Checkpoint root must be absolute.")
+    root_fd = os.open(root, os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        raw = _read_regular_file(
+            root_fd,
+            REQUEUE_RECEIPT_FILENAME,
+            max_bytes=_MAX_MANIFEST_BYTES,
+        )
+    finally:
+        os.close(root_fd)
+    payload = _parse_manifest(raw)
+    if type(payload) is not dict or set(payload) != {
+        "schema",
+        "version",
+        "checkpoint_step",
+        "checkpoint_sha256",
+        "exit_code",
+    }:
+        raise ValueError("Requeue receipt schema is invalid.")
+    if payload["schema"] != "omegalax.requeue-required" or payload["version"] != 1:
+        raise ValueError("Requeue receipt version is incompatible.")
+    receipt = RequeueReceipt(
+        checkpoint_step=payload["checkpoint_step"],
+        checkpoint_sha256=payload["checkpoint_sha256"],
+        exit_code=payload["exit_code"],
+    )
+    steps = list_checkpoint_steps(root)
+    frontier = steps[-1] if steps else None
+    if frontier != receipt.checkpoint_step:
+        raise ValueError(
+            f"Requeue receipt step {receipt.checkpoint_step} does not match checkpoint frontier "
+            f"{frontier}."
+        )
+    verified = verify_checkpoint(root / f"{receipt.checkpoint_step:06d}")
+    if verified.sha256 != receipt.checkpoint_sha256:
+        raise ValueError("Requeue receipt digest does not match its checkpoint manifest.")
+    if list_checkpoint_steps(root) != steps:
+        raise ValueError("Checkpoint frontier changed while reading its requeue receipt.")
+    return receipt
 
 
 class ResumeMode(StrEnum):

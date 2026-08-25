@@ -6,6 +6,7 @@ import ast
 import contextlib
 import inspect
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -84,8 +85,10 @@ class VLMPhaseContractTest(absltest.TestCase):
                 )
 
         expected = {
-            "version": 2,
+            "version": 3,
             "optimizer": [],
+            "rng": {},
+            "optimizer_status": {},
             "phase": {"schedule_horizon": 20, "invocation_end_step": 20},
             "input_iter": {},
         }
@@ -120,6 +123,68 @@ class VLMPhaseContractTest(absltest.TestCase):
         cleanup = vlm._TrainingCleanup(_Resource(close_error=OSError("close failed")))
         with self.assertRaisesRegex(OSError, "close failed"):
             cleanup.close(None)
+
+    def test_preemption_controller_records_supported_signals_and_restores_handlers(self):
+        prior = {signum: signal.getsignal(signum) for signum in (signal.SIGUSR1, signal.SIGTERM)}
+        for signum in (signal.SIGUSR1, signal.SIGTERM):
+            with self.subTest(signum=signum), vlm._PreemptionController() as controller:
+                signal.raise_signal(signum)
+                self.assertTrue(controller.requested)
+            self.assertEqual(signal.getsignal(signum), prior[signum])
+
+    def test_requeue_cleanup_must_drain_before_typed_outcome(self):
+        checkpoint = vlm.checkpoint_utils.VerifiedCheckpoint(
+            path=Path("/checkpoint/000001"),
+            manifest={},
+            sha256="1" * 64,
+            step=1,
+            identities=vlm.checkpoint_utils.CheckpointIdentities(
+                model_sha256="2" * 64,
+                dataset_sha256="3" * 64,
+                source_sha256="4" * 64,
+                runtime_sha256="5" * 64,
+            ),
+        )
+        manager = _Resource()
+
+        def request_requeue(*args, _cleanup, **kwargs):
+            del args, kwargs
+            _cleanup.checkpoint_manager = manager
+            raise vlm.RequeueRequired(checkpoint)
+
+        with (
+            mock.patch.object(vlm, "_require_registrar_compiled_executable_capability"),
+            mock.patch.object(vlm, "_run_sft", side_effect=request_requeue),
+            self.assertRaises(vlm.RequeueRequired) as raised,
+        ):
+            vlm.run_sft(
+                object(),
+                vlm.TrainConfig(schedule_horizon=1),
+                object(),
+                invocation_end_step=1,
+            )
+        self.assertIs(raised.exception.checkpoint, checkpoint)
+        self.assertEqual(manager.waits, 1)
+        self.assertEqual(manager.closes, 1)
+
+        failing_manager = _Resource(wait_error=OSError("drain failed"))
+
+        def fail_requeue_cleanup(*args, _cleanup, **kwargs):
+            del args, kwargs
+            _cleanup.checkpoint_manager = failing_manager
+            raise vlm.RequeueRequired(checkpoint)
+
+        with (
+            mock.patch.object(vlm, "_require_registrar_compiled_executable_capability"),
+            mock.patch.object(vlm, "_run_sft", side_effect=fail_requeue_cleanup),
+            self.assertRaisesRegex(BaseExceptionGroup, "Preemption checkpoint cleanup failed"),
+        ):
+            vlm.run_sft(
+                object(),
+                vlm.TrainConfig(schedule_horizon=1),
+                object(),
+                invocation_end_step=1,
+            )
 
     def test_public_cleanup_owner_preserves_primary_fatal(self):
         manager = _Resource()
@@ -174,10 +239,11 @@ class VLMPhaseContractTest(absltest.TestCase):
             with self.subTest(boundary=boundary), tempfile.TemporaryDirectory() as tmpdir:
                 manager = _LoopManager()
                 train_iterator = _CountingIterator()
-                val_iterator = _CountingIterator() if val_every is not None else None
+                val_iterator = _CountingIterator()
+                effective_val_every = val_every if val_every is not None else 100
                 save_every = 2 if boundary == "log" else 1
                 patchers = (
-                    mock.patch.object(vlm, "_make_checkpoint_manager", return_value=manager),
+                    mock.patch.object(vlm, "_SFTCheckpointStore", return_value=manager),
                     mock.patch.object(
                         vlm,
                         "_require_registrar_compiled_executable_capability",
@@ -207,8 +273,9 @@ class VLMPhaseContractTest(absltest.TestCase):
                         vlm,
                         "make_sft_eval_step",
                         return_value=lambda _model, _batch: (
-                            jnp.asarray(1.0),
-                            jnp.asarray(1.0),
+                            1.0,
+                            1,
+                            0.0,
                         ),
                     ),
                     mock.patch.object(
@@ -244,8 +311,15 @@ class VLMPhaseContractTest(absltest.TestCase):
                             save_every=save_every,
                             log_every=log_every,
                             val_data_iter=val_iterator,
-                            val_every=val_every,
+                            val_every=effective_val_every,
                             val_steps=1,
+                            checkpoint_identities=vlm.checkpoint_utils.CheckpointIdentities(
+                                model_sha256="1" * 64,
+                                dataset_sha256="2" * 64,
+                                source_sha256="3" * 64,
+                                runtime_sha256="4" * 64,
+                            ),
+                            validation_dataset_sha256="5" * 64,
                             tp_size=1,
                             fsdp_size=1,
                             dp_size=1,
@@ -366,7 +440,7 @@ with (
             with self.subTest(optimized=optimized):
                 subprocess.run(command, env=env, check=True, timeout=120)
 
-    def test_checkpoint_rng_is_absent_and_fused_path_has_no_host_sync(self):
+    def test_checkpoint_contains_rng_and_fused_update_has_no_host_sync(self):
         checkpoint_source = "\n".join(
             inspect.getsource(function)
             for function in (
@@ -377,7 +451,8 @@ with (
                 vlm._commit_sft_checkpoint,
             )
         )
-        self.assertNotIn('"rng"', checkpoint_source)
+        self.assertIn('"rng"', checkpoint_source)
+        self.assertIn('"optimizer_status"', checkpoint_source)
         update_source = inspect.getsource(vlm.apply_normalized_gradient_sum)
         self.assertNotIn("device_get", update_source)
         self.assertNotIn("block_until_ready", update_source)
@@ -436,6 +511,7 @@ for horizon, end in cases:
                 _NoSave(),
                 object(),
                 object(),
+                object(),
                 20,
                 13,
                 10,
@@ -443,6 +519,8 @@ for horizon, end in cases:
                     vlm.OptimizerFatalStatus.INVALID_CANDIDATE_STATE,
                     dtype=jnp.uint8,
                 ),
+                object(),
+                object(),
             )
 
 
