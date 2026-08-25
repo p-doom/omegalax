@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 
 import jax
 import jax.numpy as jnp
@@ -10,55 +11,53 @@ from flax import nnx
 from jax.sharding import Mesh, PartitionSpec
 
 from omegalax.distributed.mesh import ensure_mesh
-from omegalax.models.shard_config import axis_rules_for_mesh, shard_config_for_mesh
-from omegalax.models.sharding_runtime import (
-    batch_partition_spec as runtime_batch_partition_spec,
-    init_model_sharded,
-    shard_batch as runtime_shard_batch,
-    shard_batch_dict as runtime_shard_batch_dict,
-)
-from omegalax.models.qwen3_vl import Qwen3VL, make_vl_config
-from omegalax.models.qwen3_vl.config import (
-    Qwen3VLConfig,
-    is_supported_qwen3_vl_model_id,
-    list_supported_qwen3_vl_model_ids,
-    make_vl_config_from_hf,
-)
 from omegalax.models.qwen3_5 import Qwen3_5Config
-from omegalax.models.qwen3_5 import make_config as make_qwen3_5_config
 from omegalax.models.qwen3_5.config import (
-    is_supported_qwen3_5_model_id,
-    list_supported_qwen3_5_model_ids,
     make_config_from_hf as make_qwen3_5_config_from_hf,
 )
 from omegalax.models.qwen3_5.model import Qwen3_5ForConditionalGeneration
-from omegalax.models.params_utils import load_hf_config_from_source
+from omegalax.models.qwen3_vl import Qwen3VL
+from omegalax.models.qwen3_vl.config import (
+    Qwen3VLConfig,
+    make_vl_config_from_hf,
+)
+from omegalax.models.qwen3_vl.loader import create_qwen3_vl_from_safetensor_files
+from omegalax.models.shard_config import axis_rules_for_mesh, shard_config_for_mesh
+from omegalax.models.sharding_runtime import (
+    batch_partition_spec as runtime_batch_partition_spec,
+)
+from omegalax.models.sharding_runtime import (
+    init_model_sharded,
+)
+from omegalax.models.sharding_runtime import (
+    shard_batch as runtime_shard_batch,
+)
+from omegalax.models.sharding_runtime import (
+    shard_batch_dict as runtime_shard_batch_dict,
+)
+from omegalax.vlm.local_snapshot import LocalVLMSnapshot
 
 VLMConfig = Qwen3_5Config | Qwen3VLConfig
 
 
-def resolve_config(model_or_id: str | VLMConfig) -> VLMConfig:
-    """Resolve VLM config from model id (Qwen3.5 or Qwen3-VL) or pass through."""
-    if not isinstance(model_or_id, str):
-        return model_or_id
-
-    if is_supported_qwen3_5_model_id(model_or_id):
-        return make_qwen3_5_config(model_or_id)
-    if is_supported_qwen3_vl_model_id(model_or_id):
-        return make_vl_config(model_or_id)
-
-    hf_cfg = load_hf_config_from_source(model_or_id)
+def _config_from_hf(hf_cfg: dict, source: str) -> VLMConfig:
     model_type = hf_cfg.get("model_type")
     if model_type in {"qwen3_5", "qwen3_5_moe"}:
         return make_qwen3_5_config_from_hf(hf_cfg)
     if model_type in {"qwen3_vl", "qwen3_vl_moe"}:
         return make_vl_config_from_hf(hf_cfg)
+    raise ValueError(f"Unsupported VLM config at {source!r}: model_type={model_type!r}")
 
-    raise ValueError(
-        f"Unsupported VLM model/config source '{model_or_id}'. "
-        f"Supported Qwen3.5 ids: {list_supported_qwen3_5_model_ids()}; "
-        f"supported Qwen3-VL ids: {list_supported_qwen3_vl_model_ids()}."
-    )
+
+def resolve_config(model_source: VLMConfig | LocalVLMSnapshot) -> VLMConfig:
+    """Resolve an explicit config or a verified local snapshot."""
+    if isinstance(model_source, LocalVLMSnapshot):
+        config_path = model_source.files()["config.json"]
+        with open(config_path, encoding="utf-8") as stream:
+            return _config_from_hf(json.load(stream), str(model_source.path))
+    if isinstance(model_source, (Qwen3_5Config, Qwen3VLConfig)):
+        return model_source
+    raise TypeError("VLM config resolution requires a LocalVLMSnapshot or explicit VLMConfig")
 
 
 def align_config_to_mesh(cfg: VLMConfig, mesh: Mesh) -> VLMConfig:
@@ -110,7 +109,7 @@ def vocab_size(cfg: VLMConfig) -> int:
 
 
 def init_model(
-    model_or_id: str | VLMConfig,
+    config: VLMConfig,
     rng: jax.Array,
     *,
     tp_size: int | None = None,
@@ -118,7 +117,7 @@ def init_model(
     dp_size: int | None = None,
 ) -> tuple[nnx.Module, VLMConfig]:
     """Initialize a vision-language model."""
-    cfg = resolve_config(model_or_id)
+    cfg = resolve_config(config)
     mesh = ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size)
     cfg = align_config_to_mesh(cfg, mesh)
 
@@ -175,39 +174,34 @@ def forward(
 
 
 def load_pretrained(
-    model_id: str,
+    model_snapshot: LocalVLMSnapshot,
     *,
     tp_size: int | None = None,
     fsdp_size: int | None = None,
     dp_size: int | None = None,
 ) -> tuple[nnx.Module, VLMConfig]:
-    """Load a pretrained VLM from HuggingFace safetensors."""
-    from huggingface_hub import snapshot_download
-
-    from omegalax.models.qwen3_5 import create_qwen3_5_from_safetensors
-    from omegalax.models.qwen3_vl import create_qwen3_vl_from_safetensors
-
-    local_dir = snapshot_download(model_id)
-    cfg = resolve_config(model_id)
-    # Validates any active mesh matches the requested (tp, fsdp, dp); the loaders
-    # below build their own mesh from these sizes, so the return value is unused.
+    """Load a pretrained dense Qwen3-VL from verified local files."""
+    if not isinstance(model_snapshot, LocalVLMSnapshot):
+        raise TypeError("load_pretrained requires an open LocalVLMSnapshot")
+    cfg = resolve_config(model_snapshot)
+    if not isinstance(cfg, Qwen3VLConfig) or cfg.num_experts:
+        raise NotImplementedError("Local snapshot loading currently supports dense Qwen3-VL")
     ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size)
-    if isinstance(cfg, Qwen3VLConfig):
-        model, cfg = create_qwen3_vl_from_safetensors(
-            local_dir, tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size
-        )
-        return model, cfg
-    if isinstance(cfg, Qwen3_5Config):
-        model, cfg = create_qwen3_5_from_safetensors(
-            local_dir, tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size
-        )
-        return model, cfg
-    raise ValueError(f"Unsupported VLM config type for pretrained loading: {type(cfg)}")
+    files = model_snapshot.files()
+    with open(files["config.json"], encoding="utf-8") as stream:
+        hf_cfg = json.load(stream)
+    weights = [files[name] for name in model_snapshot.names if name.endswith(".safetensors")]
+    return create_qwen3_vl_from_safetensor_files(
+        weights,
+        hf_cfg,
+        tp_size=tp_size,
+        fsdp_size=fsdp_size,
+        dp_size=dp_size,
+    )
 
 
 def make_cache(*_args, **_kwargs):
     """Placeholder for cache creation to keep the interface symmetric."""
-    return None
 
 
 def decode(*_args, **_kwargs):

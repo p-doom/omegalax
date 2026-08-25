@@ -2,18 +2,16 @@
 
 from __future__ import annotations
 
+import dataclasses
 import gc
+from collections.abc import Sequence
 from typing import Any
 
 import safetensors
 from etils import epath
 from flax import nnx
 
-import dataclasses
-
 from omegalax.distributed.mesh import ensure_mesh, mesh_rules
-from omegalax.models.shard_config import shard_config_for_mesh
-from omegalax.models.sharding_runtime import _finalize_q_shardings
 from omegalax.models.params_utils import (
     Transform,
     assign_weights_from_eval_shape,
@@ -26,6 +24,9 @@ from omegalax.models.params_utils import (
     map_to_bonsai_key,
     stoi,
 )
+from omegalax.models.shard_config import shard_config_for_mesh
+from omegalax.models.sharding_runtime import _finalize_q_shardings
+
 from .config import Qwen3VLConfig, make_vl_config_from_hf
 from .model import Qwen3VL
 
@@ -152,12 +153,30 @@ def create_qwen3_vl_from_safetensors(
     dp_size: int | None = None,
 ) -> tuple[Qwen3VL, Qwen3VLConfig]:
     """Load HuggingFace Qwen3-VL safetensors into a JAX Qwen3-VL model."""
-    mesh = ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size)
-
     path = epath.Path(file_dir).expanduser()
     files = find_safetensors(file_dir)
-
     hf_cfg = load_hf_config(path)
+    return create_qwen3_vl_from_safetensor_files(
+        files,
+        hf_cfg,
+        tp_size=tp_size,
+        fsdp_size=fsdp_size,
+        dp_size=dp_size,
+    )
+
+
+def create_qwen3_vl_from_safetensor_files(
+    files: Sequence[str | epath.Path],
+    hf_cfg: dict,
+    *,
+    tp_size: int | None = None,
+    fsdp_size: int | None = None,
+    dp_size: int | None = None,
+) -> tuple[Qwen3VL, Qwen3VLConfig]:
+    """Load exact Qwen3-VL safetensor files into a JAX model."""
+    if not files:
+        raise ValueError("Qwen3-VL snapshot has no safetensors files")
+    mesh = ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size)
     cfg = make_vl_config_from_hf(hf_cfg)
     _assert_vl_config(cfg, hf_cfg)
     cfg = dataclasses.replace(cfg, shd_cfg=shard_config_for_mesh(cfg.shd_cfg, mesh))
@@ -190,7 +209,7 @@ def create_qwen3_vl_from_safetensors(
 
     for f in files:
         with safetensors.safe_open(f, framework="numpy") as sf:
-            for torch_key in sf.keys():
+            for torch_key in sf:
                 if is_moe and handle_moe_key(
                     torch_key,
                     sf.get_tensor,

@@ -6,6 +6,8 @@ import contextlib
 import dataclasses
 import datetime
 import gc
+import hashlib
+import json
 import signal
 from pathlib import Path
 
@@ -48,6 +50,7 @@ from omegalax.trainers.perf import (
 )
 from omegalax.trainers.text import startup_log
 from omegalax.vlm import api as vlm_api
+from omegalax.vlm.local_snapshot import LocalVLMSnapshot
 
 P = PartitionSpec
 
@@ -91,7 +94,7 @@ class TrainConfig:
 
 
 def init_model(
-    cfg_or_model_id,
+    config,
     rng: jax.Array,
     *,
     tp_size: int | None = None,
@@ -99,7 +102,7 @@ def init_model(
     dp_size: int | None = None,
 ) -> nnx.Module:
     model, _ = vlm_api.init_model(
-        cfg_or_model_id,
+        config,
         rng,
         tp_size=tp_size,
         fsdp_size=fsdp_size,
@@ -129,11 +132,13 @@ def _train_state(
     optimizer: MixedPrecisionOptimizer,
     rng: jax.Array,
     schedule_horizon: int,
+    model_identity: jax.Array,
 ) -> dict[str, object]:
     return {
         "optimizer": nnx.state(optimizer),
         "rng": rng,
         "schedule_horizon": jnp.asarray(schedule_horizon, dtype=jnp.int32),
+        "model_identity": model_identity,
     }
 
 
@@ -141,11 +146,25 @@ def _abstract_train_state(
     optimizer: MixedPrecisionOptimizer,
     rng: jax.Array,
     schedule_horizon: int,
+    model_identity: jax.Array,
 ) -> dict[str, object]:
     return jax.tree.map(
         lambda value: jax.ShapeDtypeStruct(value.shape, value.dtype, sharding=value.sharding),
-        _train_state(optimizer, rng, schedule_horizon),
+        _train_state(optimizer, rng, schedule_horizon, model_identity),
     )
+
+
+def _model_identity(model_source, model_cfg) -> jax.Array:
+    if isinstance(model_source, LocalVLMSnapshot):
+        digest = bytes.fromhex(model_source.sha256)
+    else:
+        payload = json.dumps(
+            export_lib.model_config_to_hf_dict(model_cfg),
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+        digest = hashlib.sha256(payload).digest()
+    return jnp.asarray(list(digest), dtype=jnp.uint8)
 
 
 def _make_checkpoint_manager(
@@ -210,11 +229,12 @@ def _save_sft_checkpoint(
     step: int,
     input_iter: checkpoint_utils.GrainIterator,
     schedule_horizon: int,
+    model_identity: jax.Array,
     healthy: jax.Array,
 ) -> None:
     _require_healthy_at_boundary(healthy, step)
     _validate_optimizer_generation(nnx.state(optimizer), step)
-    train_state = _train_state(optimizer, rng, schedule_horizon)
+    train_state = _train_state(optimizer, rng, schedule_horizon, model_identity)
     save_args = checkpoint_utils.make_grain_save_args(train_state, input_iter)
     if not checkpoint_manager.save(step, args=save_args, force=True):
         raise RuntimeError(f"Checkpoint {step} was not accepted")
@@ -245,16 +265,22 @@ def _restore_sft_checkpoint(
     input_iter: checkpoint_utils.GrainIterator,
     step: int,
     schedule_horizon: int,
+    model_identity: jax.Array,
 ) -> tuple[MixedPrecisionOptimizer, int, jax.Array, checkpoint_utils.GrainIterator]:
-    abstract_state = _abstract_train_state(optimizer, rng, schedule_horizon)
+    abstract_state = _abstract_train_state(optimizer, rng, schedule_horizon, model_identity)
     restore_args = checkpoint_utils.make_grain_restore_args(abstract_state, input_iter)
     restored = checkpoint_manager.restore(step, args=restore_args)
     train_state = restored["train_state"]
-    restored_horizon = int(jax.device_get(train_state["schedule_horizon"]))
+    restored_horizon, restored_identity = jax.device_get(
+        (train_state["schedule_horizon"], train_state["model_identity"])
+    )
+    restored_horizon = int(restored_horizon)
     if restored_horizon != schedule_horizon:
         raise ValueError(
             f"Checkpoint schedule horizon is {restored_horizon}, requested {schedule_horizon}"
         )
+    if bytes(restored_identity) != bytes(jax.device_get(model_identity)):
+        raise ValueError("Checkpoint model snapshot does not match the requested snapshot")
     _validate_optimizer_generation(train_state["optimizer"], step)
     nnx.update(optimizer, train_state["optimizer"])
     return (
@@ -368,6 +394,41 @@ def make_sft_eval_step(cfg, pad_id: int = 0, *, num_loss_tiles: int = 4):
     return sft_eval_step
 
 
+def _evaluate_validation_panel(eval_step, model, val_data_iter, val_steps, model_cfg, mesh):
+    total_loss_sum = 0.0
+    total_supervised_tokens = 0.0
+    initial_state = val_data_iter.get_state()
+    validation_error = None
+    try:
+        for _ in range(val_steps):
+            batch = next(val_data_iter)
+            pop_source_ids(batch)
+            batch = vlm_api.shard_batch_dict(batch, model_cfg, mesh)
+            loss_sum, supervised_tokens = eval_step(model, batch)
+            total_loss_sum = total_loss_sum + loss_sum
+            total_supervised_tokens = total_supervised_tokens + supervised_tokens
+    except BaseException as error:
+        validation_error = error
+        raise
+    finally:
+        try:
+            val_data_iter.set_state(initial_state)
+        except BaseException as reset_error:
+            if validation_error is None:
+                raise
+            validation_error.add_note(f"Validation iterator reset also failed: {reset_error!r}")
+    healthy = (
+        jnp.isfinite(total_loss_sum)
+        & jnp.isfinite(total_supervised_tokens)
+        & (total_supervised_tokens > 0)
+    )
+    return (
+        total_loss_sum / jnp.maximum(total_supervised_tokens, 1.0),
+        (total_supervised_tokens),
+        healthy,
+    )
+
+
 def _validate_training_request(
     train_cfg: TrainConfig,
     resume: checkpoint_utils.ResumeMode,
@@ -444,7 +505,7 @@ class _TrainingCleanup:
 
 
 def _run_sft(
-    model_id_or_cfg,
+    model_source,
     train_cfg: TrainConfig,
     data_iter: checkpoint_utils.GrainIterator,
     *,
@@ -484,14 +545,14 @@ def _run_sft(
     save_path = Path(save_dir).expanduser().resolve() if save_dir is not None else None
     will_resume = resume == checkpoint_utils.ResumeMode.REQUIRED
 
-    if will_resume:
-        model_cfg = vlm_api.resolve_config(str(save_path))
-        startup_log(f"resolved model config from checkpoint {save_path!r}")
-    else:
-        model_cfg = vlm_api.resolve_config(model_id_or_cfg)
-        startup_log("resolved model config")
+    if isinstance(model_source, str):
+        raise TypeError("VLM training requires a LocalVLMSnapshot or an explicit test config")
+    model_cfg = vlm_api.resolve_config(model_source)
+    model_identity = _model_identity(model_source, model_cfg)
+    startup_log("resolved model config")
     startup_log(f"model_cfg={model_cfg}")
     mesh = ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size)
+    model_identity = jax.device_put(model_identity, NamedSharding(mesh, P()))
     model_cfg = vlm_api.align_config_to_mesh(model_cfg, mesh)
     startup_log("mesh ready (tp/fsdp/dp)")
     batch_multiple = required_batch_multiple(vlm_api.batch_partition_spec(model_cfg), mesh)
@@ -538,9 +599,9 @@ def _run_sft(
         stable_fraction=train_cfg.lr_stable_fraction,
     )
 
-    if not will_resume and isinstance(model_id_or_cfg, str):
+    if not will_resume and isinstance(model_source, LocalVLMSnapshot):
         model, model_cfg = vlm_api.load_pretrained(
-            model_id_or_cfg,
+            model_source,
             tp_size=tp_size,
             fsdp_size=fsdp_size,
             dp_size=dp_size,
@@ -630,9 +691,6 @@ def _run_sft(
     global_tokens_per_step = train_cfg.seq_len * train_cfg.batch_size * accum_steps
 
     if checkpoint_manager is not None and not will_resume:
-        # Write the HF config alongside the orbax tree only on a fresh start;
-        # on resume the file was written by the original run and matches by
-        # construction (we just resolved model_cfg from it).
         _write_checkpoint_config(save_path, model_cfg)
         _write_lora_metadata(save_path, train_cfg)
     if checkpoint_manager is not None:
@@ -647,6 +705,7 @@ def _run_sft(
             data_iter,
             resume_step,
             train_cfg.schedule_horizon,
+            model_identity,
         )
         _cleanup.own_iterator(data_iter)
         rng = jax.device_put(rng, replicated_rng_sharding)
@@ -825,20 +884,13 @@ def _run_sft(
 
         if eval_step is not None and val_every and step % val_every == 0:
             _require_healthy_at_boundary(optimizer_healthy_since_boundary, step)
-            total_val_loss_sum = 0.0
-            total_val_sup_tokens = 0.0
-            for _ in range(val_steps):
-                val_batch = next(val_data_iter)
-                pop_source_ids(val_batch)
-                val_batch = vlm_api.shard_batch_dict(val_batch, model_cfg, mesh)
-                val_loss_sum, val_sup_tokens = eval_step(optimizer.model, val_batch)
-                total_val_loss_sum = total_val_loss_sum + val_loss_sum
-                total_val_sup_tokens = total_val_sup_tokens + val_sup_tokens
-            val_loss = total_val_loss_sum / jnp.maximum(total_val_sup_tokens, 1.0)
-            val_healthy = (
-                jnp.isfinite(total_val_loss_sum)
-                & jnp.isfinite(total_val_sup_tokens)
-                & (total_val_sup_tokens > 0)
+            val_loss, total_val_sup_tokens, val_healthy = _evaluate_validation_panel(
+                eval_step,
+                optimizer.model,
+                val_data_iter,
+                val_steps,
+                model_cfg,
+                mesh,
             )
             _require_healthy_at_boundary(val_healthy, step)
             if wandb_run is not None and is_primary_process:
@@ -864,6 +916,7 @@ def _run_sft(
                 step,
                 data_iter,
                 train_cfg.schedule_horizon,
+                model_identity,
                 optimizer_healthy_since_boundary,
             )
             last_saved_step = step
@@ -882,13 +935,14 @@ def _run_sft(
             int(last_metrics["step"]),
             data_iter,
             train_cfg.schedule_horizon,
+            model_identity,
             optimizer_healthy_since_boundary,
         )
     return optimizer, last_metrics
 
 
 def run_sft(
-    model_id_or_cfg,
+    model_source,
     train_cfg: TrainConfig,
     data_iter: checkpoint_utils.GrainIterator,
     *,
@@ -920,9 +974,11 @@ def run_sft(
     active_error: BaseException | None = None
     try:
         _validate_training_request(train_cfg, resume, resume_step, save_path)
+        if jax.process_count() != 1:
+            raise ValueError("VLM training requires one JAX process")
         ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size)
         return _run_sft(
-            model_id_or_cfg,
+            model_source,
             train_cfg,
             data_iter,
             save_dir=save_dir,
