@@ -161,7 +161,7 @@ flags.DEFINE_integer(
     "num_loss_tiles",
     None,
     "Number of tiles for chunked cross-entropy along the "
-    "sequence axis. Must evenly divide (max_length - 1).",
+    "sequence axis; the final tile is padded when needed.",
 )
 
 _ATTN_BACKENDS = [
@@ -228,6 +228,51 @@ def _validate_flags() -> None:
         if FLAGS[name].value is None:
             problems.append(name)
 
+    for name in (
+        "max_length",
+        "num_steps",
+        "schedule_horizon",
+        "batch_size",
+        "learning_rate",
+        "grad_accum_steps",
+        "tp_size",
+        "fsdp_size",
+        "dp_size",
+        "grain_read_threads",
+        "grain_read_buffer_size",
+        "grain_worker_buffer_size",
+        "num_loss_tiles",
+    ):
+        value = FLAGS[name].value
+        if value is not None and value <= 0:
+            problems.append(f"{name} must be > 0")
+    for name in (
+        "weight_decay",
+        "warmup_steps",
+        "max_grad_norm",
+        "gc_period",
+        "save_every",
+        "keep_period",
+        "keep_latest",
+        "log_every",
+        "grain_workers",
+        "max_vision_patches_per_sample",
+        "max_vision_images_per_sample",
+    ):
+        value = FLAGS[name].value
+        if value is not None and value < 0:
+            problems.append(f"{name} must be >= 0")
+    if FLAGS.max_length is not None and FLAGS.max_length <= 1:
+        problems.append("max_length must be greater than 1")
+    if (
+        FLAGS.warmup_steps is not None
+        and FLAGS.schedule_horizon is not None
+        and FLAGS.warmup_steps > FLAGS.schedule_horizon
+    ):
+        problems.append("warmup_steps must not exceed schedule_horizon")
+    if FLAGS.keep_period and FLAGS.save_every and FLAGS.keep_period % FLAGS.save_every:
+        problems.append("keep_period must be a multiple of save_every")
+
     if (FLAGS.data_path is None) == (FLAGS.data_mix is None):
         problems.append("exactly one of {data_path, data_mix} (got neither or both)")
 
@@ -250,21 +295,42 @@ def _validate_flags() -> None:
         for name in ("lora_rank", "lora_alpha"):
             if FLAGS[name].value is None:
                 problems.append(f"{name} (required when enable_lora=true)")
+            elif FLAGS[name].value <= 0:
+                problems.append(f"{name} must be > 0")
+    elif FLAGS.lora_rank is not None or FLAGS.lora_alpha is not None:
+        problems.append("lora_rank and lora_alpha require enable_lora=true")
 
     if FLAGS.val_data_path:
         for name in ("val_every", "val_steps"):
             if FLAGS[name].value is None:
                 problems.append(f"{name} (required when val_data_path is set)")
+            elif FLAGS[name].value <= 0:
+                problems.append(f"{name} must be > 0")
+    elif FLAGS.val_every is not None or FLAGS.val_steps is not None:
+        problems.append("val_every and val_steps require val_data_path")
 
     if FLAGS.lr_schedule in ("cosine", "wsd") and FLAGS.lr_end_factor is None:
         problems.append(f"lr_end_factor (required when lr_schedule={FLAGS.lr_schedule})")
     if FLAGS.lr_schedule == "wsd" and FLAGS.lr_stable_fraction is None:
         problems.append("lr_stable_fraction (required when lr_schedule=wsd)")
+    if FLAGS.lr_schedule == "linear" and FLAGS.lr_end_factor is not None:
+        problems.append("lr_end_factor is only valid for cosine or wsd")
+    if FLAGS.lr_schedule != "wsd" and FLAGS.lr_stable_fraction is not None:
+        problems.append("lr_stable_fraction is only valid for wsd")
+    if FLAGS.lr_end_factor is not None and not 0.0 <= FLAGS.lr_end_factor <= 1.0:
+        problems.append("lr_end_factor must be in [0, 1]")
+    if FLAGS.lr_stable_fraction is not None and not 0.0 <= FLAGS.lr_stable_fraction <= 1.0:
+        problems.append("lr_stable_fraction must be in [0, 1]")
 
     if FLAGS.wandb_project:
         for name in ("wandb_entity", "wandb_group", "wandb_name"):
             if FLAGS[name].value is None:
                 problems.append(f"{name} (required when wandb_project is set)")
+    elif any(
+        FLAGS[name].value is not None
+        for name in ("wandb_entity", "wandb_group", "wandb_name", "wandb_tags")
+    ):
+        problems.append("wandb metadata requires wandb_project")
 
     if problems:
         raise ValueError(

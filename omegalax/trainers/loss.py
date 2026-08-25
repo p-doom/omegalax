@@ -55,7 +55,7 @@ def chunked_cross_entropy_loss_sum(
         targets_BT: Target token ids, shape ``(B, T)``, int32.
         mask_BT: Loss mask, shape ``(B, T)``, int32/float32.
         num_tiles: Number of tiles to split B*T into. Higher = less memory.
-            Must evenly divide ``B * T``.
+            The final tile is padded when needed.
 
     Returns:
         Masked loss sum and supervised-token count.

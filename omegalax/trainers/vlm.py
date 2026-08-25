@@ -449,10 +449,24 @@ def _validate_training_request(
     resume_step: int | None,
     save_path: Path | None,
 ) -> bool:
-    if train_cfg.num_steps <= 0:
-        raise ValueError(f"num_steps must be > 0, got {train_cfg.num_steps}")
-    if train_cfg.schedule_horizon <= 0:
-        raise ValueError(f"schedule_horizon must be > 0, got {train_cfg.schedule_horizon}")
+    positive = {
+        "batch_size": train_cfg.batch_size,
+        "seq_len": train_cfg.seq_len,
+        "num_steps": train_cfg.num_steps,
+        "schedule_horizon": train_cfg.schedule_horizon,
+        "learning_rate": train_cfg.learning_rate,
+        "grad_accum_steps": train_cfg.grad_accum_steps,
+        "num_loss_tiles": train_cfg.num_loss_tiles,
+    }
+    invalid = {name: value for name, value in positive.items() if value <= 0}
+    if invalid:
+        raise ValueError(f"Training values must be > 0: {invalid}")
+    if train_cfg.seq_len <= 1:
+        raise ValueError("seq_len must be greater than 1")
+    if train_cfg.warmup_steps < 0 or train_cfg.warmup_steps > train_cfg.schedule_horizon:
+        raise ValueError("warmup_steps must be between 0 and schedule_horizon")
+    if train_cfg.weight_decay < 0 or train_cfg.max_grad_norm < 0:
+        raise ValueError("weight_decay and max_grad_norm must be non-negative")
     if train_cfg.num_steps > train_cfg.schedule_horizon:
         raise ValueError(
             f"num_steps={train_cfg.num_steps} exceeds schedule_horizon={train_cfg.schedule_horizon}"
