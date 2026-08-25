@@ -70,7 +70,6 @@ def qwen3_to_hf_config_dict(cfg: Qwen3Config) -> dict[str, Any]:
     if cfg.is_moe:
         result.update(
             num_experts=cfg.num_experts,
-            num_local_experts=cfg.num_experts,
             num_experts_per_tok=cfg.num_experts_per_tok,
             moe_intermediate_size=cfg.moe_intermediate_size,
             mlp_only_layers=list(cfg.mlp_only_layers),

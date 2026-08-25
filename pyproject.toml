@@ -30,10 +30,7 @@ dependencies = [
   # rev every measurement in the repo was taken against. Repoint when the fix is
   # upstreamed.
   "tokamax @ git+https://github.com/p-doom/tokamax.git@d81bc23bc80f01728984bcda5161ff2569cd7cc5",
-  # 5.4.0 gave Qwen3VLMoeTextConfig `attribute_map = {"num_experts":
-  # "num_local_experts"}`, so `to_dict()` stops writing the `text_config.num_experts`
-  # the Qwen3-VL MoE loader requires and every config on the Hub carries.
-  "transformers<5.4",
+  "transformers==5.15.1",
   "triton", 
   "huggingface-hub",
   "wandb",

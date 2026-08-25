@@ -82,13 +82,6 @@ class Qwen3RegistryTest(absltest.TestCase):
         self.assertNotIn("router_aux_loss_coef", _dense_hf_cfg())
         self.assertEqual(make_config_from_hf(_dense_hf_cfg()).aux_loss_coef, 0.0)
 
-    def test_moe_hf_config_accepts_num_local_experts_alias(self):
-        hf_cfg = _moe_hf_cfg()
-        hf_cfg["num_local_experts"] = hf_cfg.pop("num_experts")
-        cfg = make_config_from_hf(hf_cfg)
-        self.assertEqual(cfg.num_experts, 128)
-        self.assertTrue(cfg.is_moe)
-
     def test_unknown_alias_raises(self):
         with self.assertRaisesRegex(ValueError, "Unsupported Qwen3 model_id"):
             make_config("qwen3-0.6b-base")

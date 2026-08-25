@@ -333,7 +333,30 @@ def load_hf_config(path: str | epath.Path) -> dict[str, Any]:
     if not cfg_path.exists():
         raise ValueError(f"Expected HuggingFace config.json under {path}")
     with cfg_path.open() as f:
-        return json.load(f)
+        return _normalize_hf_config(json.load(f))
+
+
+def _normalize_hf_config(hf_cfg: dict[str, Any]) -> dict[str, Any]:
+    model_type = hf_cfg.get("model_type")
+    if model_type not in {"qwen3_moe", "qwen3_vl_moe"}:
+        return hf_cfg
+
+    target = hf_cfg["text_config"] if model_type == "qwen3_vl_moe" else hf_cfg
+    names = {"num_experts", "num_local_experts"}.intersection(target)
+    if len(names) != 1:
+        raise ValueError(
+            f"Expected exactly one expert-count field in {model_type} config, found {sorted(names)}"
+        )
+
+    from transformers import AutoConfig
+
+    kwargs = dict(hf_cfg)
+    kwargs.pop("model_type")
+    typed_cfg = AutoConfig.for_model(model_type, **kwargs)
+    typed_target = typed_cfg.text_config if model_type == "qwen3_vl_moe" else typed_cfg
+    target["num_experts"] = typed_target.num_experts
+    target.pop("num_local_experts", None)
+    return hf_cfg
 
 
 def load_hf_config_from_source(source: str | epath.Path) -> dict[str, Any]:
@@ -343,13 +366,11 @@ def load_hf_config_from_source(source: str | epath.Path) -> dict[str, Any]:
         if source_path.is_dir():
             return load_hf_config(source_path)
         if source_path.name == "config.json":
-            with source_path.open() as f:
-                return json.load(f)
+            return load_hf_config(source_path.parent)
         raise ValueError(f"Expected a directory or config.json path, got {source_path}")
 
     cfg_file = hf_hub_download(repo_id=str(source), filename="config.json")
-    with epath.Path(cfg_file).open() as f:
-        return json.load(f)
+    return load_hf_config(epath.Path(cfg_file).parent)
 
 
 def inverse_transform(value, transform_rule: TransformRule):
