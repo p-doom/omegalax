@@ -31,7 +31,7 @@ def _canonical_directory(value: str, label: str) -> Path:
         resolved = Path(os.path.realpath(path, strict=True))
     except OSError as error:
         raise ValueError(f"--{label} does not exist: {path}") from error
-    if lexical != resolved or not resolved.is_dir():
+    if path != lexical or lexical != resolved or not resolved.is_dir():
         raise ValueError(f"--{label} must be a canonical directory without symlinks")
     return resolved
 
@@ -111,7 +111,10 @@ def seal_snapshot(source_dir: str, out_dir: str) -> Path:
     destination = Path(out_dir)
     if not destination.is_absolute():
         raise ValueError("--out_dir must be absolute")
-    destination = Path(os.path.normpath(os.fspath(destination)))
+    normalized_destination = Path(os.path.normpath(os.fspath(destination)))
+    if destination != normalized_destination:
+        raise ValueError("--out_dir must be canonical")
+    destination = normalized_destination
     parent = _canonical_directory(str(destination.parent), "out_dir parent")
     destination = parent / destination.name
     if destination.exists() or destination.is_symlink():

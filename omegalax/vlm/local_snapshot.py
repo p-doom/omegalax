@@ -52,8 +52,10 @@ def _canonical_absolute_directory(path: str | os.PathLike[str]) -> Path:
         resolved = Path(os.path.realpath(candidate, strict=True))
     except OSError as error:
         raise ValueError(f"VLM snapshot does not exist: {candidate}") from error
-    if lexical != resolved:
-        raise ValueError(f"VLM snapshot path must not traverse symlinks: {candidate}")
+    if candidate != lexical or lexical != resolved:
+        raise ValueError(
+            f"VLM snapshot path must be canonical and contain no symlinks: {candidate}"
+        )
     return resolved
 
 

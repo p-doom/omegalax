@@ -110,6 +110,11 @@ class LocalVLMSnapshotTest(absltest.TestCase):
             destination.mkdir()
             with self.assertRaisesRegex(ValueError, "already exists"):
                 seal_snapshot(str(source), str(destination))
+            with self.assertRaisesRegex(ValueError, "canonical"):
+                seal_snapshot(
+                    str(source),
+                    str(root_path / "nested" / ".." / "escaped"),
+                )
 
     def test_failed_sealer_cleanup_never_removes_a_replaced_destination(self):
         with tempfile.TemporaryDirectory() as root:
@@ -172,6 +177,9 @@ class LocalVLMSnapshotTest(absltest.TestCase):
             link.symlink_to(snapshot, target_is_directory=True)
             with self.assertRaisesRegex(ValueError, "symlinks"):
                 local_snapshot.open_local_vlm_snapshot(link)
+            escaped = snapshot / ".." / snapshot.name
+            with self.assertRaisesRegex(ValueError, "canonical"):
+                local_snapshot.open_local_vlm_snapshot(escaped)
 
     def test_rejects_writable_artifacts_and_directories(self):
         with tempfile.TemporaryDirectory() as root:
