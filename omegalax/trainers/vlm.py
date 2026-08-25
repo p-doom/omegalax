@@ -6,27 +6,39 @@ import contextlib
 import dataclasses
 import datetime
 import gc
-import os
 import signal
-import subprocess
 from pathlib import Path
-from flax import nnx
+
 import jax
 import jax.numpy as jnp
-from jax.sharding import NamedSharding, PartitionSpec
 import optax
 import orbax.checkpoint as ocp
+from flax import nnx
+from jax.sharding import NamedSharding, PartitionSpec
 from orbax.checkpoint import checkpoint_managers as ocm
 
 from omegalax import export as export_lib
 from omegalax.data.grain_pipeline import pop_source_ids
 from omegalax.distributed.mesh import ensure_mesh, mesh_rules, required_batch_multiple
 from omegalax.models.params_utils import save_hf_config
+from omegalax.models.qwen3_5 import Qwen3_5Config
+from omegalax.models.qwen3_vl import Qwen3VLConfig
+from omegalax.models.qwen3_vl.model import DECODER_LAYER_REMAT
+from omegalax.models.qwen3_vl.vision import VISION_BLOCK_REMAT
 from omegalax.trainers import checkpoint_utils
 from omegalax.trainers import tokamax_cache as tokamax_cache_lib
-from omegalax.trainers.loss import chunked_cross_entropy_loss
+from omegalax.trainers.lora import LoRAParam, inject_lora
+from omegalax.trainers.loss import chunked_cross_entropy_loss, chunked_cross_entropy_loss_sum
 from omegalax.trainers.lr_schedule import build_lr_schedule
+from omegalax.trainers.optim import (
+    MixedPrecisionOptimizer,
+    accumulate_gradient_sum,
+    apply_normalized_gradient_sum,
+    initialize_gradient_sum,
+)
 from omegalax.trainers.perf import (
+    StepFlops,
+    StepTimer,
     log_compiled_memory_analysis,
     log_device_memory,
     log_live_arrays,
@@ -35,17 +47,58 @@ from omegalax.trainers.perf import (
     maybe_log_step_metrics,
     per_device_step_flops,
     record_deltanet_kernel,
-    StepFlops,
-    StepTimer,
 )
-from omegalax.trainers.optim import MixedPrecisionOptimizer
-from omegalax.trainers.lora import LoRAParam, inject_lora
 from omegalax.trainers.text import startup_log
-from omegalax.models.qwen3_vl.model import DECODER_LAYER_REMAT
-from omegalax.models.qwen3_vl.vision import VISION_BLOCK_REMAT
 from omegalax.vlm import api as vlm_api
 
 P = PartitionSpec
+
+
+def require_zero_router_aux_loss(cfg) -> None:
+    if isinstance(cfg, Qwen3_5Config):
+        text_cfg = cfg.text_config
+        has_nonzero_aux = bool(text_cfg.num_experts) and text_cfg.router_aux_loss_coef != 0.0
+    elif isinstance(cfg, Qwen3VLConfig):
+        has_nonzero_aux = any(cfg.is_moe_layer(layer_idx) for layer_idx in range(cfg.num_layers))
+    else:
+        raise TypeError(f"Unsupported VLM config type: {type(cfg)}")
+    if has_nonzero_aux:
+        raise ValueError("Gradient accumulation requires zero router auxiliary loss")
+
+
+def _require_healthy_at_boundary(healthy: jax.Array, step: int) -> None:
+    if not bool(jax.device_get(healthy)):
+        raise FloatingPointError(f"Non-finite optimizer inputs at step {step}")
+
+
+def _validate_resume_request(
+    resume: checkpoint_utils.ResumeMode,
+    resume_step: int | None,
+    save_path: Path | None,
+    num_steps: int,
+) -> bool:
+    if resume not in (checkpoint_utils.ResumeMode.NEVER, checkpoint_utils.ResumeMode.REQUIRED):
+        raise ValueError(f"VLM training does not support resume={resume.value!r}")
+    will_resume = resume == checkpoint_utils.ResumeMode.REQUIRED
+    if will_resume:
+        if save_path is None or resume_step is None:
+            raise ValueError("resume='required' requires save_dir and resume_step")
+        if resume_step <= 0 or resume_step >= num_steps:
+            raise ValueError(f"resume_step must be in [1, {num_steps}), got {resume_step}")
+    elif resume_step is not None:
+        raise ValueError("resume_step is only valid with resume='required'")
+    return will_resume
+
+
+def _validate_train_config(train_cfg: TrainConfig) -> None:
+    if train_cfg.num_steps <= 0:
+        raise ValueError(f"num_steps must be > 0, got {train_cfg.num_steps}")
+    if train_cfg.schedule_horizon <= 0:
+        raise ValueError(f"schedule_horizon must be > 0, got {train_cfg.schedule_horizon}")
+    if train_cfg.num_steps > train_cfg.schedule_horizon:
+        raise ValueError(
+            f"num_steps={train_cfg.num_steps} exceeds schedule_horizon={train_cfg.schedule_horizon}"
+        )
 
 
 def _trainable_non_vision(path, x):
@@ -69,6 +122,7 @@ class TrainConfig:
     batch_size: int = 8
     seq_len: int = 64
     num_steps: int = 20
+    schedule_horizon: int = 20
     learning_rate: float = 3e-4
     weight_decay: float = 0.01
     warmup_steps: int = 0
@@ -116,23 +170,31 @@ def build_optimizer(
     wd = 0.0 if wrt is LoRAParam else train_cfg.weight_decay
     chain.append(optax.adamw(lr_schedule_fn, weight_decay=wd))
     tx = optax.chain(*chain)
-    tx = optax.MultiSteps(tx, every_k_schedule=train_cfg.grad_accum_steps)
     opt = MixedPrecisionOptimizer(model, tx, wrt=wrt)
     return opt
 
 
-def _train_state(optimizer: MixedPrecisionOptimizer, rng: jax.Array) -> dict[str, object]:
-    return {"optimizer": nnx.state(optimizer), "rng": rng}
-
-
-def _abstract_train_state(optimizer: MixedPrecisionOptimizer, rng: jax.Array) -> dict[str, object]:
+def _train_state(
+    optimizer: MixedPrecisionOptimizer,
+    rng: jax.Array,
+    schedule_num_steps: int,
+) -> dict[str, object]:
     return {
-        "optimizer": jax.tree.map(
-            lambda value: jax.ShapeDtypeStruct(value.shape, value.dtype, sharding=value.sharding),
-            nnx.state(optimizer),
-        ),
-        "rng": jax.ShapeDtypeStruct(rng.shape, rng.dtype, sharding=rng.sharding),
+        "optimizer": nnx.state(optimizer),
+        "rng": rng,
+        "schedule_num_steps": jnp.asarray(schedule_num_steps, dtype=jnp.int32),
     }
+
+
+def _abstract_train_state(
+    optimizer: MixedPrecisionOptimizer,
+    rng: jax.Array,
+    schedule_num_steps: int,
+) -> dict[str, object]:
+    return jax.tree.map(
+        lambda value: jax.ShapeDtypeStruct(value.shape, value.dtype, sharding=value.sharding),
+        _train_state(optimizer, rng, schedule_num_steps),
+    )
 
 
 def _make_checkpoint_manager(
@@ -196,10 +258,31 @@ def _save_sft_checkpoint(
     rng: jax.Array,
     step: int,
     input_iter: checkpoint_utils.GrainIterator,
+    schedule_num_steps: int,
 ) -> None:
-    train_state = _train_state(optimizer, rng)
+    _validate_optimizer_generation(nnx.state(optimizer), step)
+    train_state = _train_state(optimizer, rng, schedule_num_steps)
     save_args = checkpoint_utils.make_grain_save_args(train_state, input_iter)
-    checkpoint_manager.save(step, args=save_args)
+    if not checkpoint_manager.save(step, args=save_args, force=True):
+        raise RuntimeError(f"Checkpoint {step} was not accepted")
+    checkpoint_manager.wait_until_finished()
+
+
+def _validate_optimizer_generation(optimizer_state: nnx.State, generation: int) -> None:
+    step = optimizer_state["step"][...]
+    counts = [
+        leaf
+        for leaf in jax.tree.leaves(nnx.pure(optimizer_state["opt_state"]))
+        if leaf.shape == () and jnp.issubdtype(leaf.dtype, jnp.integer)
+    ]
+    if not counts:
+        raise ValueError("Optimizer state has no integer update count")
+    host_step, host_counts = jax.device_get((step, counts))
+    values = [int(host_step), *(int(count) for count in host_counts)]
+    if any(value != generation for value in values):
+        raise ValueError(
+            f"Checkpoint generation {generation} does not match optimizer counters {values}"
+        )
 
 
 def _restore_sft_checkpoint(
@@ -207,38 +290,34 @@ def _restore_sft_checkpoint(
     optimizer: MixedPrecisionOptimizer,
     rng: jax.Array,
     input_iter: checkpoint_utils.GrainIterator,
+    step: int,
+    schedule_num_steps: int,
 ) -> tuple[MixedPrecisionOptimizer, int, jax.Array, checkpoint_utils.GrainIterator]:
-    latest_step = checkpoint_manager.latest_step()
-    if latest_step is None:
-        raise ValueError("No checkpoint found to restore.")
+    if step not in checkpoint_manager.all_steps():
+        raise ValueError(f"Checkpoint {step} does not exist")
 
-    abstract_state = _abstract_train_state(optimizer, rng)
+    abstract_state = _abstract_train_state(optimizer, rng, schedule_num_steps)
     restore_args = checkpoint_utils.make_grain_restore_args(abstract_state, input_iter)
-    restored = checkpoint_manager.restore(latest_step, args=restore_args)
+    restored = checkpoint_manager.restore(step, args=restore_args)
     train_state = restored["train_state"]
-    # Canonicalize restored opt-state dtypes against the freshly-built
-    # optimizer's expectations: some prior checkpoints stored Adam's first
-    # moment in bf16; the optimizer now uses optax's default (fp32), so
-    # MultiSteps (grad_accum) would otherwise see a dtype mismatch between
-    # the passthrough branch (restored dtype) and the active-step branch
-    # (optax's expected dtype) and lax.cond would reject it at trace time.
-    expected_state = nnx.state(optimizer)
-    restored_state = jax.tree.map(
-        lambda exp, got: got.astype(exp.dtype) if exp.dtype != got.dtype else got,
-        expected_state,
-        train_state["optimizer"],
-    )
-    nnx.update(optimizer, restored_state)
+    restored_schedule_num_steps = int(jax.device_get(train_state["schedule_num_steps"]))
+    if restored_schedule_num_steps != schedule_num_steps:
+        raise ValueError(
+            f"Checkpoint schedule horizon is {restored_schedule_num_steps}, "
+            f"requested {schedule_num_steps}"
+        )
+    _validate_optimizer_generation(train_state["optimizer"], step)
+    nnx.update(optimizer, train_state["optimizer"])
     return (
         optimizer,
-        int(latest_step),
+        step,
         train_state["rng"],
         checkpoint_utils.restored_input_iter(restored),
     )
 
 
-def make_sft_train_step(cfg, pad_id: int = 0, *, wrt=nnx.Param, num_loss_tiles: int = 4):
-    """Build a JIT-compiled VLM SFT train step that consumes a batch dict.
+def make_sft_gradient_step(cfg, pad_id: int = 0, *, wrt=nnx.Param, num_loss_tiles: int = 4):
+    """Build a read-only JIT step returning one batch's masked-CE gradient sum.
 
     The batch dict must contain ``token_ids_BT``, ``attention_mask_BT``, and
     ``loss_mask_BT``.  It may also contain ``pixel_values`` and
@@ -252,8 +331,8 @@ def make_sft_train_step(cfg, pad_id: int = 0, *, wrt=nnx.Param, num_loss_tiles: 
 
     diff_state = nnx.DiffState(0, wrt)
 
-    @nnx.jit(donate_argnums=0)
-    def sft_train_step(optimizer: MixedPrecisionOptimizer, batch: dict[str, jax.Array]):
+    @nnx.jit
+    def sft_gradient_step(model: nnx.Module, batch: dict[str, jax.Array]):
         token_ids_BT = batch["token_ids_BT"]
         attention_mask_BT = batch["attention_mask_BT"]
         loss_mask_BT = batch["loss_mask_BT"]
@@ -275,36 +354,31 @@ def make_sft_train_step(cfg, pad_id: int = 0, *, wrt=nnx.Param, num_loss_tiles: 
                 position_ids_ZBT=position_ids_ZBT,
             )
             lm_weight = model.output_weight()
-            loss = (
-                chunked_cross_entropy_loss(
-                    hidden_BTD,
-                    lm_weight,
-                    token_ids_BT,
-                    loss_mask_BT,
-                    num_tiles=num_loss_tiles,
-                    logits_out_sharding=cfg.shd_cfg.logits_btv,
-                )
-                + aux_loss
+            loss_sum, supervised_tokens = chunked_cross_entropy_loss_sum(
+                hidden_BTD,
+                lm_weight,
+                token_ids_BT,
+                loss_mask_BT,
+                num_tiles=num_loss_tiles,
+                logits_out_sharding=cfg.shd_cfg.logits_btv,
             )
-            supervised_tokens = jnp.sum(loss_mask_BT[:, 1:].astype(jnp.float32))
             total_tokens = jnp.sum(attention_mask_BT.astype(jnp.float32))
-            return loss, (supervised_tokens, total_tokens)
+            return loss_sum, (supervised_tokens, total_tokens, aux_loss)
 
-        (loss, (supervised_tokens, total_tokens)), grads = nnx.value_and_grad(
+        (loss_sum, (supervised_tokens, total_tokens, aux_loss)), grads = nnx.value_and_grad(
             loss_fn,
             argnums=diff_state,
             has_aux=True,
-        )(optimizer.model)
-        optimizer.update(grads)
+        )(model)
         metrics = {
-            "loss": loss,
-            "grad_norm": optax.tree.norm(grads),
+            "loss_sum": loss_sum,
+            "aux_loss": aux_loss,
             "supervised_tokens": supervised_tokens,
             "total_tokens": total_tokens,
         }
-        return loss, metrics
+        return grads, metrics
 
-    return sft_train_step
+    return sft_gradient_step
 
 
 def make_sft_eval_step(cfg, pad_id: int = 0, *, num_loss_tiles: int = 4):
@@ -349,7 +423,57 @@ def make_sft_eval_step(cfg, pad_id: int = 0, *, num_loss_tiles: int = 4):
     return sft_eval_step
 
 
-def run_sft(
+@dataclasses.dataclass
+class _TrainingCleanup:
+    data_iter: object
+    val_data_iter: object | None
+    checkpoint_manager: ocp.CheckpointManager | None = None
+    autotune_context: object | None = None
+    signal_handlers: dict[int, object] = dataclasses.field(default_factory=dict)
+
+    def close(self, active_error: BaseException | None) -> None:
+        errors: list[BaseException] = []
+        if self.autotune_context is not None:
+            try:
+                self.autotune_context.__exit__(None, None, None)
+            except BaseException as error:  # noqa: BLE001
+                errors.append(error)
+        if self.checkpoint_manager is not None:
+            try:
+                self.checkpoint_manager.wait_until_finished()
+            except BaseException as error:  # noqa: BLE001
+                errors.append(error)
+            try:
+                self.checkpoint_manager.close()
+            except BaseException as error:  # noqa: BLE001
+                errors.append(error)
+        for signum, handler in self.signal_handlers.items():
+            try:
+                signal.signal(signum, handler)
+            except BaseException as error:  # noqa: BLE001
+                errors.append(error)
+        closed: set[int] = set()
+        for iterator in (self.data_iter, self.val_data_iter):
+            close = getattr(iterator, "close", None)
+            if close is None or id(iterator) in closed:
+                continue
+            closed.add(id(iterator))
+            try:
+                close()
+            except BaseException as error:  # noqa: BLE001
+                errors.append(error)
+        if not errors:
+            return
+        if active_error is not None:
+            for error in errors:
+                active_error.add_note(f"Training cleanup also failed: {error!r}")
+            return
+        if len(errors) == 1:
+            raise errors[0]
+        raise BaseExceptionGroup("Training cleanup failed", errors)
+
+
+def _run_sft(
     model_id_or_cfg,
     train_cfg: TrainConfig,
     data_iter: checkpoint_utils.GrainIterator,
@@ -360,6 +484,7 @@ def run_sft(
     keep_latest: int = 1,
     log_every: int = 1,
     resume: checkpoint_utils.ResumeMode = checkpoint_utils.ResumeMode.NEVER,
+    resume_step: int | None = None,
     pad_id: int = 0,
     peak_tflops: float | None = None,
     tp_size: int | None = None,
@@ -373,6 +498,7 @@ def run_sft(
     gc_period: int = 0,
     log_memory: bool = False,
     tokamax_cache_dir: str | Path | None = None,
+    _cleanup: _TrainingCleanup,
 ) -> tuple[MixedPrecisionOptimizer, dict[str, float]]:
     """SFT a VLM from a Grain iterator; returns final optimizer + last metrics.
 
@@ -383,51 +509,27 @@ def run_sft(
     If ``val_data_iter`` is provided, runs ``val_steps`` forward-only batches
     every ``val_every`` training steps and logs the average validation loss.
 
-    See :class:`omegalax.trainers.checkpoint_utils.ResumeMode` for the meaning of
-    each ``resume`` mode.
+    Required resumes name one exact checkpoint generation with ``resume_step``.
     """
     save_path = Path(save_dir).expanduser().resolve() if save_dir is not None else None
+    will_resume = _validate_resume_request(resume, resume_step, save_path, train_cfg.num_steps)
 
-    # Build the canonical CheckpointManager up-front so a single ``latest_step()``
-    # query drives both the model_cfg-source decision and the eventual restore.
     checkpoint_manager: ocp.CheckpointManager | None = None
     if save_path is not None:
-        save_path.mkdir(parents=True, exist_ok=True)
+        if will_resume:
+            if not save_path.is_dir():
+                raise ValueError(f"Checkpoint directory does not exist: {save_path}")
+        else:
+            if save_path.exists() and any(save_path.iterdir()):
+                raise ValueError(f"Fresh checkpoint directory is not empty: {save_path}")
+            save_path.mkdir(parents=True, exist_ok=True)
         checkpoint_manager = _make_checkpoint_manager(
             save_path,
             save_interval=save_every or None,
             keep_period=keep_period or None,
             keep_latest=keep_latest or None,
         )
-
-    latest_step = checkpoint_manager.latest_step() if checkpoint_manager is not None else None
-
-    if (
-        latest_step is not None
-        and latest_step >= train_cfg.num_steps
-        and resume in (checkpoint_utils.ResumeMode.IF_PRESENT, checkpoint_utils.ResumeMode.REQUIRED)
-    ):
-        startup_log(f"latest_step={latest_step} >= num_steps={train_cfg.num_steps}; exiting")
-        if checkpoint_manager is not None:
-            checkpoint_manager.close()
-        return None, None
-
-    if resume == checkpoint_utils.ResumeMode.REQUIRED and latest_step is None:
-        raise ValueError(
-            f"resume='required' but no checkpoint found at "
-            f"{save_path if save_path is not None else '<no save_dir provided>'}"
-        )
-
-    will_resume = (
-        resume in (checkpoint_utils.ResumeMode.IF_PRESENT, checkpoint_utils.ResumeMode.REQUIRED)
-        and latest_step is not None
-    )
-    if resume == checkpoint_utils.ResumeMode.IF_PRESENT:
-        startup_log(
-            f"resume=if_present: existing checkpoint detected at {save_path}; resuming"
-            if will_resume
-            else f"resume=if_present: no checkpoint at {save_path}; starting fresh"
-        )
+        _cleanup.checkpoint_manager = checkpoint_manager
 
     if will_resume:
         model_cfg = vlm_api.resolve_config(str(save_path))
@@ -435,6 +537,7 @@ def run_sft(
     else:
         model_cfg = vlm_api.resolve_config(model_id_or_cfg)
         startup_log("resolved model config")
+    require_zero_router_aux_loss(model_cfg)
     startup_log(f"model_cfg={model_cfg}")
     mesh = ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size)
     model_cfg = vlm_api.align_config_to_mesh(model_cfg, mesh)
@@ -457,7 +560,7 @@ def run_sft(
 
     lr_schedule_fn = build_lr_schedule(
         peak_lr=train_cfg.learning_rate,
-        num_steps=train_cfg.num_steps,
+        num_steps=train_cfg.schedule_horizon,
         warmup_steps=train_cfg.warmup_steps,
         schedule=train_cfg.lr_schedule,
         end_factor=train_cfg.lr_end_factor,
@@ -536,7 +639,7 @@ def run_sft(
         )
         log_device_memory("after optimizer build", save_dir=save_path)
 
-    sft_step = make_sft_train_step(
+    sft_gradient_step = make_sft_gradient_step(
         model_cfg,
         pad_id=pad_id,
         wrt=wrt_filter,
@@ -548,7 +651,7 @@ def run_sft(
         else None
     )
     startup_log(
-        "built train step (jit)" + (" and eval step (jit)" if eval_step is not None else "")
+        "built gradient step (jit)" + (" and eval step (jit)" if eval_step is not None else "")
     )
 
     accum_steps = train_cfg.grad_accum_steps
@@ -567,7 +670,12 @@ def run_sft(
     start_step = 0
     if will_resume:
         optimizer, start_step, rng, data_iter = _restore_sft_checkpoint(
-            checkpoint_manager, optimizer, rng, data_iter
+            checkpoint_manager,
+            optimizer,
+            rng,
+            data_iter,
+            resume_step,
+            train_cfg.schedule_horizon,
         )
         rng = jax.device_put(rng, replicated_rng_sharding)
         startup_log(f"restored checkpoint at step {start_step}")
@@ -575,10 +683,10 @@ def run_sft(
     last_metrics: dict[str, float] = {}
     prev_metrics: tuple[int, dict[str, jax.Array], datetime.timedelta, float] | None = None
 
-    def _log_prev_metrics(force: bool = False) -> None:
+    def _log_prev_metrics(force: bool = False) -> bool:
         nonlocal last_metrics
         if prev_metrics is None:
-            return
+            return False
         step_to_log, metrics_to_log, step_delta, step_flops = prev_metrics
         result = maybe_log_step_metrics(
             step_to_log,
@@ -594,21 +702,26 @@ def run_sft(
             batch_size=train_cfg.batch_size * accum_steps,
         )
         if result is not None:
+            if not result.pop("optimizer_healthy"):
+                raise FloatingPointError(f"Non-finite optimizer inputs at step {step_to_log}")
             last_metrics = result
+            return True
+        return False
 
     # Flag-only handler: doing an orbax save or JAX collective from inside
     # the signal handler deadlocks (handlers run on arbitrary threads and
     # re-enter the runtime). The flag is read at a safe per-step point.
-    requeue_requested = False
+    stop_requested = False
 
-    def _request_requeue(signum, _frame):
-        nonlocal requeue_requested
-        if not requeue_requested:
-            startup_log(f"[signal] received {signum}; will requeue after current step")
-        requeue_requested = True
+    def _request_stop(signum, _frame):
+        nonlocal stop_requested
+        if not stop_requested:
+            startup_log(f"[signal] received {signum}; will stop after current step")
+        stop_requested = True
 
-    signal.signal(signal.SIGUSR1, _request_requeue)
-    signal.signal(signal.SIGTERM, _request_requeue)
+    for signum in (signal.SIGUSR1, signal.SIGTERM):
+        _cleanup.signal_handlers[signum] = signal.getsignal(signum)
+        signal.signal(signum, _request_stop)
 
     autotune_result = None
     pending_batch = None
@@ -619,27 +732,28 @@ def run_sft(
             pending_batch = next(data_iter)
             pending_batch_sharded = vlm_api.shard_batch_dict(pending_batch, model_cfg, mesh)
             autotune_result = tokamax_cache_lib.autotune_and_save(
-                tokamax_cache_dir, sft_step, optimizer, pending_batch_sharded
+                tokamax_cache_dir, sft_gradient_step, optimizer.model, pending_batch_sharded
             )
 
-    # Push the autotuning overlay onto tokamax's lookup stack for the duration
-    # of training; this keeps the for-loop indentation unchanged.
     _autotune_ctx = autotune_result if autotune_result is not None else contextlib.nullcontext()
     _autotune_ctx.__enter__()
+    _cleanup.autotune_context = _autotune_ctx
 
     startup_log("entering training loop")
     if log_memory:
         log_device_memory("before first step", save_dir=save_path)
     _mem_logged_after_first_step = not log_memory
     _mem_logged_steady_state = not log_memory
+    last_saved_step = start_step if will_resume else None
+    optimizer_healthy_since_boundary = None
 
     for step_idx in range(start_step, train_cfg.num_steps):
         step = step_idx + 1
 
-        accum_loss = 0.0
+        gradient_sum = None
+        accum_loss_sum = 0.0
         accum_sup_tokens = 0.0
         accum_total_tokens = 0.0
-        accum_grad_norm = 0.0
         accum_model_flops = 0.0
         accum_hardware_flops = 0.0
         accum_time = datetime.timedelta(0)
@@ -668,34 +782,57 @@ def run_sft(
                 vision_remat=VISION_BLOCK_REMAT,
             )
             batch = vlm_api.shard_batch_dict(batch, model_cfg, mesh)
-            _, metrics = sft_step(optimizer, batch)
+            gradients, metrics = sft_gradient_step(optimizer.model, batch)
+            gradient_sum = (
+                initialize_gradient_sum(gradients)
+                if gradient_sum is None
+                else accumulate_gradient_sum(gradient_sum, gradients)
+            )
             micro_delta = timer.step()
 
-            accum_loss = accum_loss + metrics["loss"]
+            accum_loss_sum = accum_loss_sum + metrics["loss_sum"]
             accum_sup_tokens = accum_sup_tokens + metrics["supervised_tokens"]
             accum_total_tokens = accum_total_tokens + metrics["total_tokens"]
-            accum_grad_norm = accum_grad_norm + metrics["grad_norm"]
             accum_model_flops += micro_flops.model
             accum_hardware_flops += micro_flops.hardware
             accum_time += micro_delta
 
+        if gradient_sum is None:
+            raise RuntimeError("Gradient accumulation produced no microbatches")
+        grad_norm, loss, optimizer_healthy = apply_normalized_gradient_sum(
+            optimizer,
+            gradient_sum,
+            accum_sup_tokens,
+            accum_loss_sum,
+        )
+        accum_time += timer.step()
+
         if not _mem_logged_after_first_step:
-            jax.block_until_ready(metrics["loss"])
+            jax.block_until_ready(grad_norm)
             log_device_memory("after first step (compile done)", save_dir=save_path)
             log_live_arrays("after first step (compile done)", save_dir=save_path)
-            log_compiled_memory_analysis("sft_step", sft_step, save_path, optimizer, batch)
+            log_compiled_memory_analysis(
+                "sft_gradient_step", sft_gradient_step, save_path, optimizer.model, batch
+            )
             _mem_logged_after_first_step = True
         elif not _mem_logged_steady_state and step_idx >= 4:
-            jax.block_until_ready(metrics["loss"])
+            jax.block_until_ready(grad_norm)
             log_device_memory("after step 5 (steady state)", save_dir=save_path)
             _mem_logged_steady_state = True
 
+        logged = _log_prev_metrics()
+        if logged or optimizer_healthy_since_boundary is None:
+            optimizer_healthy_since_boundary = optimizer_healthy
+        else:
+            optimizer_healthy_since_boundary = optimizer_healthy_since_boundary & optimizer_healthy
+
         with jax.default_device("cpu"):
             window_metrics = {
-                "loss": accum_loss / accum_steps,
-                "grad_norm": accum_grad_norm / accum_steps,
+                "loss": loss,
+                "grad_norm": grad_norm,
                 "supervised_tokens": accum_sup_tokens,
                 "total_tokens": accum_total_tokens,
+                "optimizer_healthy": optimizer_healthy_since_boundary,
                 "lr": (
                     float(lr_schedule_fn(step_idx))
                     if callable(lr_schedule_fn)
@@ -706,8 +843,6 @@ def run_sft(
                 total = float(sum(source_counts.values()))
                 for sid, cnt in source_counts.items():
                     window_metrics[f"data_source_{sid}_frac"] = cnt / total
-            _log_prev_metrics()
-
             prev_metrics = (
                 step,
                 window_metrics,
@@ -716,7 +851,16 @@ def run_sft(
             )
 
         if checkpoint_manager is not None and save_every and step % save_every == 0:
-            _save_sft_checkpoint(checkpoint_manager, optimizer, rng, step, data_iter)
+            _require_healthy_at_boundary(optimizer_healthy_since_boundary, step)
+            _save_sft_checkpoint(
+                checkpoint_manager,
+                optimizer,
+                rng,
+                step,
+                data_iter,
+                train_cfg.schedule_horizon,
+            )
+            last_saved_step = step
 
         if gc_period and step % gc_period == 0:
             gc.collect()
@@ -738,28 +882,95 @@ def run_sft(
                     step=step,
                 )
 
-        if requeue_requested:
-            startup_log(f"[signal] saving checkpoint at step={step} and requeueing")
-            if checkpoint_manager is not None:
-                _save_sft_checkpoint(checkpoint_manager, optimizer, rng, step, data_iter)
-                checkpoint_manager.wait_until_finished()
-                checkpoint_manager.close()
-            slurm_job_id = os.environ.get("SLURM_JOB_ID")
-            if slurm_job_id and is_primary_process:
-                startup_log(f"[signal] scontrol requeue {slurm_job_id}")
-                subprocess.run(["scontrol", "requeue", slurm_job_id], check=False)
-            _autotune_ctx.__exit__(None, None, None)
+        if stop_requested:
+            startup_log(f"[signal] saving checkpoint at step={step} and stopping")
+            if checkpoint_manager is not None and last_saved_step != step:
+                _require_healthy_at_boundary(optimizer_healthy_since_boundary, step)
+                _save_sft_checkpoint(
+                    checkpoint_manager,
+                    optimizer,
+                    rng,
+                    step,
+                    data_iter,
+                    train_cfg.schedule_horizon,
+                )
             return optimizer, last_metrics
 
     _log_prev_metrics(force=True)
 
-    if checkpoint_manager is not None:
-        if last_metrics and (not save_every or last_metrics["step"] % save_every != 0):
-            _save_sft_checkpoint(
-                checkpoint_manager, optimizer, rng, int(last_metrics["step"]), data_iter
-            )
-        checkpoint_manager.wait_until_finished()
-        checkpoint_manager.close()
-
-    _autotune_ctx.__exit__(None, None, None)
+    if (
+        checkpoint_manager is not None
+        and last_metrics
+        and last_saved_step != int(last_metrics["step"])
+    ):
+        _save_sft_checkpoint(
+            checkpoint_manager,
+            optimizer,
+            rng,
+            int(last_metrics["step"]),
+            data_iter,
+            train_cfg.schedule_horizon,
+        )
     return optimizer, last_metrics
+
+
+def run_sft(
+    model_id_or_cfg,
+    train_cfg: TrainConfig,
+    data_iter: checkpoint_utils.GrainIterator,
+    *,
+    save_dir: str | Path | None = None,
+    save_every: int = 0,
+    keep_period: int = 0,
+    keep_latest: int = 1,
+    log_every: int = 1,
+    resume: checkpoint_utils.ResumeMode = checkpoint_utils.ResumeMode.NEVER,
+    resume_step: int | None = None,
+    pad_id: int = 0,
+    peak_tflops: float | None = None,
+    tp_size: int | None = None,
+    fsdp_size: int | None = None,
+    dp_size: int | None = None,
+    wandb_run=None,
+    val_data_iter: checkpoint_utils.GrainIterator | None = None,
+    val_every: int | None = None,
+    val_steps: int = 10,
+    text_attn_backend: str = "mosaic_gpu",
+    gc_period: int = 0,
+    log_memory: bool = False,
+    tokamax_cache_dir: str | Path | None = None,
+) -> tuple[MixedPrecisionOptimizer, dict[str, float]]:
+    cleanup = _TrainingCleanup(data_iter, val_data_iter)
+    active_error: BaseException | None = None
+    try:
+        return _run_sft(
+            model_id_or_cfg,
+            train_cfg,
+            data_iter,
+            save_dir=save_dir,
+            save_every=save_every,
+            keep_period=keep_period,
+            keep_latest=keep_latest,
+            log_every=log_every,
+            resume=resume,
+            resume_step=resume_step,
+            pad_id=pad_id,
+            peak_tflops=peak_tflops,
+            tp_size=tp_size,
+            fsdp_size=fsdp_size,
+            dp_size=dp_size,
+            wandb_run=wandb_run,
+            val_data_iter=val_data_iter,
+            val_every=val_every,
+            val_steps=val_steps,
+            text_attn_backend=text_attn_backend,
+            gc_period=gc_period,
+            log_memory=log_memory,
+            tokamax_cache_dir=tokamax_cache_dir,
+            _cleanup=cleanup,
+        )
+    except BaseException as error:
+        active_error = error
+        raise
+    finally:
+        cleanup.close(active_error)
