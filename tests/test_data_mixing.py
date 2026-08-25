@@ -7,15 +7,16 @@ from pathlib import Path
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
-from absl.testing import absltest
 import numpy as np
 import orbax.checkpoint as ocp
+from absl.testing import absltest
 
 from omegalax.data.grain_pipeline import (
     BATCH_SOURCE_IDS_KEY,
     MixSource,
     build_records_from_chat,
     make_grain_iterator,
+    make_grain_iterator_for_data_shard,
     make_grain_multiprocessing_options,
     make_grain_read_options,
     parse_data_mix,
@@ -107,6 +108,32 @@ _FAST_OPTS = dict(
 
 
 class DataMixingTest(absltest.TestCase):
+    def test_explicit_logical_data_shards_select_disjoint_contiguous_records(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = _build_chunked_source(
+                Path(tmp), name="logical", contents=[str(value) for value in range(16)]
+            )
+            values = []
+            for shard_index in (0, 1):
+                iterator = make_grain_iterator_for_data_shard(
+                    source,
+                    batch_size=2,
+                    batch_fn=_batch_starts,
+                    shuffle=False,
+                    seed=0,
+                    num_epochs=1,
+                    read_options=make_grain_read_options(num_threads=1, prefetch_buffer_size=1),
+                    multiprocessing_options=make_grain_multiprocessing_options(
+                        num_workers=0, per_worker_buffer_size=1
+                    ),
+                    data_shard_count=2,
+                    data_shard_index=shard_index,
+                    extra_transform=None,
+                )
+                values.append(next(iterator)["starts"].tolist())
+                iterator.close()
+            self.assertEqual(values, [[0, 1], [8, 9]])
+
     def test_single_source_passes_through_unchanged(self):
         """A scalar path or single MixSource produces identical output."""
         with tempfile.TemporaryDirectory() as tmp:

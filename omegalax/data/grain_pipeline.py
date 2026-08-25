@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 import multiprocessing as mp
-import numpy as np
 import os
 import shutil
 import tempfile
@@ -15,12 +14,16 @@ from itertools import chain
 from pathlib import Path
 from typing import Any
 
-from tqdm import tqdm
-
-from array_record.python.array_record_module import ArrayRecordWriter
 import grain
 import jax
+import numpy as np
+from array_record.python.array_record_module import ArrayRecordWriter
+from tqdm import tqdm
 
+from omegalax.data.arrayrecord_images import (
+    is_arrayrecord_image_uri,
+    parse_arrayrecord_image_uri,
+)
 from omegalax.data.artifact_contract import (
     COMPILED_ARTIFACT_CONTRACT_VERSION,
     COMPILED_DATASET_SCHEMA_VERSION,
@@ -31,10 +34,6 @@ from omegalax.data.artifact_contract import (
     validate_measurement_contract,
     validate_sha256,
     verify_compiled_dataset,
-)
-from omegalax.data.arrayrecord_images import (
-    is_arrayrecord_image_uri,
-    parse_arrayrecord_image_uri,
 )
 
 COMPILED_DATASET_VERSION = COMPILED_DATASET_SCHEMA_VERSION
@@ -1623,6 +1622,65 @@ def make_grain_iterator(
     fsdp_size: int,
     extra_transform: grain.transforms.RandomMap | None = None,
 ):
+    data_shard_count = dp_size * fsdp_size
+    return _make_grain_iterator(
+        sources,
+        batch_size=batch_size,
+        batch_fn=batch_fn,
+        shuffle=shuffle,
+        seed=seed,
+        num_epochs=num_epochs,
+        read_options=read_options,
+        multiprocessing_options=multiprocessing_options,
+        data_shard_count=data_shard_count,
+        data_shard_index=jax.process_index() % data_shard_count,
+        extra_transform=extra_transform,
+    )
+
+
+def make_grain_iterator_for_data_shard(
+    sources: str | Path | MixSource | Sequence[str | Path | MixSource],
+    *,
+    batch_size: int,
+    batch_fn,
+    shuffle: bool,
+    seed: int,
+    num_epochs: int | None,
+    read_options: grain.ReadOptions,
+    multiprocessing_options: grain.MultiprocessingOptions,
+    data_shard_count: int,
+    data_shard_index: int,
+    extra_transform: grain.transforms.RandomMap | None,
+):
+    return _make_grain_iterator(
+        sources,
+        batch_size=batch_size,
+        batch_fn=batch_fn,
+        shuffle=shuffle,
+        seed=seed,
+        num_epochs=num_epochs,
+        read_options=read_options,
+        multiprocessing_options=multiprocessing_options,
+        data_shard_count=data_shard_count,
+        data_shard_index=data_shard_index,
+        extra_transform=extra_transform,
+    )
+
+
+def _make_grain_iterator(
+    sources: str | Path | MixSource | Sequence[str | Path | MixSource],
+    *,
+    batch_size: int,
+    batch_fn,
+    shuffle: bool = True,
+    seed: int = 0,
+    num_epochs: int | None = 1,
+    read_options: grain.ReadOptions | None = None,
+    multiprocessing_options: grain.MultiprocessingOptions | None = None,
+    data_shard_count: int,
+    data_shard_index: int,
+    extra_transform: grain.transforms.RandomMap | None = None,
+):
     """Create a checkpointable Grain iterator over one or more inline-records datasets.
 
     Each source is a :func:`build_records_from_chat` dataset whose records ARE
@@ -1634,9 +1692,6 @@ def make_grain_iterator(
     every batch is a stochastic mix at the configured ratio, not a per-batch
     round-robin. ``num_epochs=None`` repeats each source indefinitely; set a
     finite value (per source) only for validation-style finite iteration.
-
-    Data-parallel sharding spans both axes: ``dp = dp_size * fsdp_size``. The
-    process's slot is ``jax.process_index() % dp``.
 
     ``extra_transform`` is an optional dataset-specific augmentation
     (e.g. action-magnitude scaling): a ``grain.transforms.RandomMap`` applied
@@ -1650,6 +1705,16 @@ def make_grain_iterator(
     """
     if batch_size <= 0:
         raise ValueError("batch_size must be > 0")
+    if (
+        type(data_shard_count) is not int
+        or type(data_shard_index) is not int
+        or data_shard_count <= 0
+        or not 0 <= data_shard_index < data_shard_count
+    ):
+        raise ValueError(
+            "Data shard count/index must be exact integers satisfying "
+            f"0 <= index < count, got index={data_shard_index!r} count={data_shard_count!r}."
+        )
 
     mix_sources = _coerce_sources(sources)
     if any(s.weight < 0.0 for s in mix_sources):
@@ -1675,19 +1740,16 @@ def make_grain_iterator(
 
     mp_options = multiprocessing_options or make_grain_multiprocessing_options()
     read_options = read_options or make_grain_read_options()
-    dp = dp_size * fsdp_size
-    dp_index = jax.process_index() % dp
-
     per_source: list[grain.MapDataset] = []
     for original_idx in active_indices:
         s = mix_sources[original_idx]
         shard_paths = [str(p) for p in resolve_arrayrecord_paths(s.path)]
         ds = grain.MapDataset.source(grain.sources.ArrayRecordDataSource(shard_paths))
-        if dp > 1:
+        if data_shard_count > 1:
             # Contiguous-block DP shards with drop_remainder, matching the
             # legacy IndexSampler(ShardOptions(drop_remainder=True)) behavior.
-            per_rank = len(ds) // dp
-            ds = ds[dp_index * per_rank : (dp_index + 1) * per_rank]
+            per_rank = len(ds) // data_shard_count
+            ds = ds[data_shard_index * per_rank : (data_shard_index + 1) * per_rank]
         if shuffle:
             ds = ds.shuffle(seed=seed + original_idx)
         ds = ds.repeat(num_epochs)
