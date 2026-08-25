@@ -2,12 +2,9 @@
 
 from __future__ import annotations
 
-import contextlib
 import dataclasses
 import datetime
 import gc
-import hashlib
-import json
 import signal
 from pathlib import Path
 
@@ -26,7 +23,6 @@ from omegalax.models.params_utils import save_hf_config
 from omegalax.models.qwen3_vl.model import DECODER_LAYER_REMAT
 from omegalax.models.qwen3_vl.vision import VISION_BLOCK_REMAT
 from omegalax.trainers import checkpoint_utils
-from omegalax.trainers import tokamax_cache as tokamax_cache_lib
 from omegalax.trainers.lora import LoRAParam, inject_lora
 from omegalax.trainers.loss import chunked_cross_entropy_loss_sum
 from omegalax.trainers.lr_schedule import build_lr_schedule
@@ -154,16 +150,11 @@ def _abstract_train_state(
     )
 
 
-def _model_identity(model_source, model_cfg) -> jax.Array:
+def _model_identity(model_source) -> jax.Array:
     if isinstance(model_source, LocalVLMSnapshot):
         digest = bytes.fromhex(model_source.sha256)
     else:
-        payload = json.dumps(
-            export_lib.model_config_to_hf_dict(model_cfg),
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode()
-        digest = hashlib.sha256(payload).digest()
+        digest = bytes(32)
     return jnp.asarray(list(digest), dtype=jnp.uint8)
 
 
@@ -467,7 +458,6 @@ def _require_healthy_at_boundary(healthy: jax.Array, step: int) -> None:
 class _TrainingCleanup:
     iterators: list[object] = dataclasses.field(default_factory=list)
     checkpoint_manager: ocp.CheckpointManager | None = None
-    autotune_context: object | None = None
     signal_handlers: dict[int, object] = dataclasses.field(default_factory=dict)
 
     def own_iterator(self, iterator: object | None) -> None:
@@ -483,8 +473,6 @@ class _TrainingCleanup:
             except BaseException as error:  # noqa: BLE001
                 errors.append(error)
 
-        if self.autotune_context is not None:
-            attempt(lambda: self.autotune_context.__exit__(None, None, None))
         if self.checkpoint_manager is not None:
             attempt(self.checkpoint_manager.wait_until_finished)
             attempt(self.checkpoint_manager.close)
@@ -528,7 +516,6 @@ def _run_sft(
     text_attn_backend: str = "mosaic_gpu",
     gc_period: int = 0,
     log_memory: bool = False,
-    tokamax_cache_dir: str | Path | None = None,
     _cleanup: _TrainingCleanup,
 ) -> tuple[MixedPrecisionOptimizer, dict[str, float]]:
     """SFT a VLM from a Grain iterator; returns final optimizer + last metrics.
@@ -548,7 +535,7 @@ def _run_sft(
     if isinstance(model_source, str):
         raise TypeError("VLM training requires a LocalVLMSnapshot or an explicit test config")
     model_cfg = vlm_api.resolve_config(model_source)
-    model_identity = _model_identity(model_source, model_cfg)
+    model_identity = _model_identity(model_source)
     startup_log("resolved model config")
     startup_log(f"model_cfg={model_cfg}")
     mesh = ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size)
@@ -749,25 +736,6 @@ def _run_sft(
         _cleanup.signal_handlers[signum] = signal.getsignal(signum)
         signal.signal(signum, _request_stop)
 
-    autotune_result = None
-    pending_batch = None
-    if tokamax_cache_dir is not None:
-        autotune_result = tokamax_cache_lib.try_load(tokamax_cache_dir)
-        if autotune_result is None:
-            startup_log("priming tokamax autotuning with first training batch")
-            pending_batch = next(data_iter)
-            pending_batch_sharded = vlm_api.shard_batch_dict(pending_batch, model_cfg, mesh)
-            autotune_result = tokamax_cache_lib.autotune_and_save(
-                tokamax_cache_dir,
-                sft_gradient_step,
-                optimizer.model,
-                pending_batch_sharded,
-            )
-
-    _autotune_ctx = autotune_result if autotune_result is not None else contextlib.nullcontext()
-    _autotune_ctx.__enter__()
-    _cleanup.autotune_context = _autotune_ctx
-
     startup_log("entering training loop")
     if log_memory:
         log_device_memory("before first step", save_dir=save_path)
@@ -789,11 +757,7 @@ def _run_sft(
         source_counts: dict[int, int] = {}
 
         for _micro in range(accum_steps):
-            if pending_batch is not None:
-                batch = pending_batch
-                pending_batch = None
-            else:
-                batch = next(data_iter)
+            batch = next(data_iter)
             sids = pop_source_ids(batch)
             if sids is not None:
                 for sid in sids.tolist():
@@ -965,7 +929,6 @@ def run_sft(
     text_attn_backend: str = "mosaic_gpu",
     gc_period: int = 0,
     log_memory: bool = False,
-    tokamax_cache_dir: str | Path | None = None,
 ) -> tuple[MixedPrecisionOptimizer, dict[str, float]]:
     save_path = Path(save_dir).expanduser().resolve() if save_dir is not None else None
     cleanup = _TrainingCleanup()
@@ -1000,7 +963,6 @@ def run_sft(
             text_attn_backend=text_attn_backend,
             gc_period=gc_period,
             log_memory=log_memory,
-            tokamax_cache_dir=tokamax_cache_dir,
             _cleanup=cleanup,
         )
     except BaseException as error:
