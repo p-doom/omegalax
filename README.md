@@ -103,9 +103,8 @@ uv run scripts/train_text_sft.py \
 Run VLM SFT from the compiled Grain chunk-index dataset:
 ```bash
 uv run scripts/train_vlm_sft.py \
-  --model-id qwen3-vl-smoke \
+  --model-snapshot /absolute/path/to/sealed-qwen3-vl \
   --data-path /path/to/train_chunks \
-  --processor Qwen/Qwen3-VL-2B-Instruct \
   --max-length 512 \
   --batch-size 4 \
   --tp-size 1 \
@@ -115,9 +114,20 @@ Resume VLM training only by naming the committed frontier explicitly with
 `--resume=required --resume_step=<step>`. Training checkpoints also persist the Grain iterator
 state. A fresh VLM run uses `--resume=never` and a checkpoint directory that does not exist yet.
 
-Export any supported model (Qwen3 dense/MoE, Qwen3.5, Qwen3-VL) to HuggingFace safetensors:
+Create the required sealed snapshot from regular files already present locally:
 ```bash
-uv run scripts/export_to_hf.py --model-id qwen3-smoke --out-dir /tmp/qwen3-smoke-export --tp-size 1 --fsdp-size 1
+uv run scripts/seal_vlm_snapshot.py \
+  --source-dir /absolute/path/to/local-hf-files \
+  --out-dir /absolute/path/to/sealed-qwen3-vl
+```
+
+Export a Qwen3.5 or Qwen3-VL snapshot to Hugging Face safetensors:
+```bash
+uv run scripts/export_to_hf.py \
+  --model-snapshot /absolute/path/to/sealed-qwen3-vl \
+  --out-dir /absolute/path/to/export \
+  --tp-size 1 \
+  --fsdp-size 1
 ```
 
 ## Quickstart (vision-language)

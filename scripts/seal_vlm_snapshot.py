@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import shutil
 import stat
 from pathlib import Path
 
@@ -85,6 +84,28 @@ def _copy_regular(source_fd: int, destination_fd: int, name: str) -> None:
         os.close(input_fd)
 
 
+def _remove_owned_output(
+    parent_fd: int,
+    destination_fd: int,
+    name: str,
+    identity: tuple[int, int],
+) -> None:
+    metadata = os.fstat(destination_fd)
+    if (metadata.st_dev, metadata.st_ino) != identity:
+        raise RuntimeError("Destination snapshot changed during failed sealing")
+    os.fchmod(destination_fd, 0o700)
+    for child in os.listdir(destination_fd):
+        metadata = os.stat(child, dir_fd=destination_fd, follow_symlinks=False)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise RuntimeError("Destination snapshot gained a non-regular child")
+        os.unlink(child, dir_fd=destination_fd)
+    current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if (current.st_dev, current.st_ino) != identity:
+        raise RuntimeError("Destination snapshot path changed during failed sealing")
+    os.rmdir(name, dir_fd=parent_fd)
+    os.fsync(parent_fd)
+
+
 def seal_snapshot(source_dir: str, out_dir: str) -> Path:
     source = _canonical_directory(source_dir, "source_dir")
     destination = Path(out_dir)
@@ -96,17 +117,25 @@ def seal_snapshot(source_dir: str, out_dir: str) -> Path:
     if destination.exists() or destination.is_symlink():
         raise ValueError(f"--out_dir already exists: {destination}")
 
-    os.mkdir(destination, 0o700)
+    parent_fd = os.open(
+        parent,
+        os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+    )
     complete = False
     source_fd = -1
     destination_fd = -1
+    destination_identity = None
     try:
+        os.mkdir(destination.name, 0o700, dir_fd=parent_fd)
+        destination_fd = os.open(
+            destination.name,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=parent_fd,
+        )
+        destination_metadata = os.fstat(destination_fd)
+        destination_identity = (destination_metadata.st_dev, destination_metadata.st_ino)
         source_fd = os.open(
             source,
-            os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
-        )
-        destination_fd = os.open(
-            destination,
             os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
         )
         source_before = os.fstat(source_fd)
@@ -132,20 +161,26 @@ def seal_snapshot(source_dir: str, out_dir: str) -> Path:
             sorted(os.listdir(source_fd)),
         ):
             raise ValueError("Source snapshot directory changed while copying")
-        os.close(destination_fd)
-        destination_fd = -1
         write_local_vlm_snapshot_manifest(destination)
         with open_local_vlm_snapshot(destination):
             pass
         complete = True
         return destination
     finally:
-        if destination_fd >= 0:
-            os.close(destination_fd)
-        if source_fd >= 0:
-            os.close(source_fd)
-        if not complete:
-            shutil.rmtree(destination)
+        try:
+            if source_fd >= 0:
+                os.close(source_fd)
+            if not complete and destination_fd >= 0 and destination_identity is not None:
+                _remove_owned_output(
+                    parent_fd,
+                    destination_fd,
+                    destination.name,
+                    destination_identity,
+                )
+        finally:
+            if destination_fd >= 0:
+                os.close(destination_fd)
+            os.close(parent_fd)
 
 
 def main(_) -> None:

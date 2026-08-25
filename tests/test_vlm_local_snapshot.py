@@ -13,8 +13,9 @@ import numpy as np
 from absl.testing import absltest
 from safetensors.numpy import save_file
 
+from omegalax.vlm import api as vlm_api
 from omegalax.vlm import local_snapshot
-from scripts.seal_vlm_snapshot import seal_snapshot
+from scripts.seal_vlm_snapshot import _remove_owned_output, seal_snapshot
 
 
 def _snapshot_files() -> dict[str, bytes]:
@@ -48,7 +49,36 @@ def _rewrite_manifest(snapshot: Path, update) -> None:
     os.chmod(snapshot, 0o550)
 
 
+def _rewrite_file_and_identity(snapshot: Path, name: str, data: bytes) -> None:
+    target = snapshot / name
+    manifest_path = snapshot / "omegalax-vlm-snapshot.json"
+    os.chmod(snapshot, 0o750)
+    os.chmod(target, 0o640)
+    target.write_bytes(data)
+    os.chmod(target, 0o440)
+    os.chmod(manifest_path, 0o640)
+    value = json.loads(manifest_path.read_bytes())
+    value["files"][name] = {
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "size_bytes": len(data),
+    }
+    manifest_path.write_text(json.dumps(value, separators=(",", ":")) + "\n")
+    os.chmod(manifest_path, 0o440)
+    os.chmod(snapshot, 0o550)
+
+
 class LocalVLMSnapshotTest(absltest.TestCase):
+    def test_pretrained_loader_rejects_ids_and_raw_paths(self):
+        for value in ("Qwen/Qwen3-VL-8B-Instruct", "/local/model"):
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(
+                    TypeError,
+                    "LocalVLMSnapshot",
+                ),
+            ):
+                vlm_api.load_pretrained(value)
+
     def test_sealer_creates_the_only_accepted_artifact_shape(self):
         with tempfile.TemporaryDirectory() as root:
             root_path = Path(root)
@@ -81,11 +111,43 @@ class LocalVLMSnapshotTest(absltest.TestCase):
             with self.assertRaisesRegex(ValueError, "already exists"):
                 seal_snapshot(str(source), str(destination))
 
+    def test_failed_sealer_cleanup_never_removes_a_replaced_destination(self):
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            destination = root_path / "sealed"
+            destination.mkdir()
+            (destination / "partial").write_text("partial")
+            parent_fd = os.open(root_path, os.O_RDONLY | os.O_DIRECTORY)
+            destination_fd = os.open(destination, os.O_RDONLY | os.O_DIRECTORY)
+            metadata = os.fstat(destination_fd)
+            destination.rename(root_path / "moved")
+            destination.mkdir()
+            sentinel = destination / "sentinel"
+            sentinel.write_text("keep")
+            try:
+                with self.assertRaisesRegex(RuntimeError, "path changed"):
+                    _remove_owned_output(
+                        parent_fd,
+                        destination_fd,
+                        destination.name,
+                        (metadata.st_dev, metadata.st_ino),
+                    )
+                self.assertEqual(sentinel.read_text(), "keep")
+            finally:
+                os.close(destination_fd)
+                os.close(parent_fd)
+
     def test_pins_every_consumer_file_and_closes_cleanly(self):
         with tempfile.TemporaryDirectory() as root:
             snapshot_path = _make_snapshot(Path(root))
             with local_snapshot.open_local_vlm_snapshot(snapshot_path) as snapshot:
                 self.assertEqual(snapshot.path, snapshot_path)
+                self.assertEqual(
+                    snapshot.sha256,
+                    hashlib.sha256(
+                        (snapshot_path / "omegalax-vlm-snapshot.json").read_bytes()
+                    ).hexdigest(),
+                )
                 with snapshot.consume() as consumer:
                     self.assertEqual(
                         (Path(consumer) / "config.json").read_bytes(),
@@ -98,7 +160,7 @@ class LocalVLMSnapshotTest(absltest.TestCase):
 
     def test_constructor_is_not_a_bypass(self):
         with self.assertRaisesRegex(TypeError, "open_local_vlm_snapshot"):
-            local_snapshot.LocalVLMSnapshot(None, Path("/tmp/x"), -1, {}, {})
+            local_snapshot.LocalVLMSnapshot(None, Path("/tmp/x"), -1, -1, "0" * 64, {})
 
     def test_rejects_relative_and_symlinked_snapshot_paths(self):
         with self.assertRaisesRegex(ValueError, "absolute"):
@@ -173,6 +235,25 @@ class LocalVLMSnapshotTest(absltest.TestCase):
             with self.assertRaisesRegex(ValueError, "invalid schema"):
                 local_snapshot.open_local_vlm_snapshot(snapshot)
 
+    def test_rejects_invalid_and_oversized_identity_json(self):
+        with tempfile.TemporaryDirectory() as root:
+            snapshot = _make_snapshot(Path(root))
+            _rewrite_file_and_identity(
+                snapshot,
+                "tokenizer_config.json",
+                b'{"x":1,"x":2}',
+            )
+            with self.assertRaisesRegex(ValueError, "Duplicate JSON key"):
+                local_snapshot.open_local_vlm_snapshot(snapshot)
+
+        with tempfile.TemporaryDirectory() as root:
+            snapshot = _make_snapshot(Path(root))
+            with (
+                mock.patch.object(local_snapshot, "_MAX_JSON_ASSET_BYTES", 1),
+                self.assertRaisesRegex(ValueError, "exceeds 1 byte"),
+            ):
+                local_snapshot.open_local_vlm_snapshot(snapshot)
+
     def test_rejects_oversized_manifest_before_parsing(self):
         with tempfile.TemporaryDirectory() as root:
             snapshot = _make_snapshot(Path(root))
@@ -244,6 +325,18 @@ class LocalVLMSnapshotTest(absltest.TestCase):
                     os.chmod(config, 0o640)
                     config.write_text('{"model_type":"qwen3_5"}\n')
 
+    def test_manifest_mutation_is_detected_before_consumer_returns(self):
+        with tempfile.TemporaryDirectory() as root:
+            snapshot_path = _make_snapshot(Path(root))
+            with local_snapshot.open_local_vlm_snapshot(snapshot_path) as snapshot:
+                manifest = snapshot_path / "omegalax-vlm-snapshot.json"
+                with (
+                    self.assertRaisesRegex(RuntimeError, "manifest changed"),
+                    snapshot.consume(),
+                ):
+                    os.chmod(manifest, 0o640)
+                    manifest.write_bytes(manifest.read_bytes() + b" ")
+
     def test_contract_is_identical_under_python_optimization(self):
         source = """
 import tempfile
@@ -254,7 +347,8 @@ with tempfile.TemporaryDirectory() as root:
     snapshot_path = _make_snapshot(Path(root))
     with open_local_vlm_snapshot(snapshot_path) as snapshot:
         with snapshot.consume() as consumer:
-            assert Path(consumer, 'config.json').is_file()
+            if not Path(consumer, 'config.json').is_file():
+                raise RuntimeError('validated config is unavailable')
 """
         env = dict(os.environ)
         env["PYTHONPATH"] = os.getcwd()

@@ -24,15 +24,16 @@ from omegalax.data.grain_pipeline import (
     required_epochs_for_batches,
 )
 from omegalax.distributed.mesh import process_local_batch_size
-from omegalax.registry import resolve_hf_repo_id
 from omegalax.trainers import vlm as vlm_trainer
 from omegalax.trainers.checkpoint_utils import ResumeMode
 from omegalax.trainers.perf import resolve_peak_tflops
 from omegalax.trainers.text import startup_log
+from omegalax.vlm import api as vlm_api
+from omegalax.vlm.local_snapshot import LocalVLMSnapshot, open_local_vlm_snapshot
 
 FLAGS = flags.FLAGS
 
-flags.DEFINE_string("model_id", None, "HF model id.")
+flags.DEFINE_string("model_snapshot", None, "Absolute sealed local Hugging Face VLM snapshot.")
 flags.DEFINE_string("data_path", None, "Path to compiled Grain chunk-index dataset directory.")
 flags.DEFINE_string(
     "data_mix",
@@ -42,14 +43,6 @@ flags.DEFINE_string(
     "Use this OR --data_path, not both. Mixed sources may freely combine "
     "multimodal and text-only datasets — heterogeneous batches are handled "
     "by the VLM collator and forward path.",
-)
-flags.DEFINE_string(
-    "processor", None, "HF repo to read tokenizer and image config from (defaults to --model_id)."
-)
-flags.DEFINE_string(
-    "preprocessor_config",
-    None,
-    "Path to JSON file whose keys override default image processor config.",
 )
 flags.DEFINE_integer("max_length", None, "Maximum sequence length.")
 flags.DEFINE_integer("schedule_horizon", None, "Immutable learning-rate schedule horizon.")
@@ -187,7 +180,7 @@ flags.DEFINE_enum(
 )
 
 _REQUIRED = [
-    "model_id",
+    "model_snapshot",
     "max_length",
     "schedule_horizon",
     "invocation_end_step",
@@ -373,8 +366,18 @@ def _grain_iter(
     )
 
 
-def main(_) -> None:
-    _validate_flags()
+def _load_snapshot_assets(model_snapshot: LocalVLMSnapshot):
+    with model_snapshot.consume() as source:
+        tokenizer = AutoTokenizer.from_pretrained(source, local_files_only=True)
+        image_processor = AutoImageProcessor.from_pretrained(
+            source,
+            local_files_only=True,
+            use_fast=False,
+        )
+    return tokenizer, image_processor
+
+
+def _run(model_snapshot: LocalVLMSnapshot, tokenizer, image_processor) -> None:
     jax.config.update("jax_compilation_cache_dir", FLAGS.jax_cache_dir)
     jax.distributed.initialize()
     vlm_trainer._require_single_jax_process()
@@ -382,19 +385,7 @@ def main(_) -> None:
     startup_log(f"jax_compilation_cache_dir={FLAGS.jax_cache_dir}")
     startup_log("jax.distributed initialized")
 
-    repo_id = FLAGS.processor or resolve_hf_repo_id(FLAGS.model_id)
-    tokenizer = AutoTokenizer.from_pretrained(repo_id)
-    startup_log(f"loaded tokenizer from {repo_id!r}")
-    assert FLAGS.max_length <= tokenizer.model_max_length, (
-        f"--max_length={FLAGS.max_length} exceeds tokenizer.model_max_length={tokenizer.model_max_length}"
-    )
-
-    ip_kwargs: dict = {}
-    if FLAGS.preprocessor_config:
-        with open(FLAGS.preprocessor_config) as f:
-            ip_kwargs = json.load(f)
-    image_processor = AutoImageProcessor.from_pretrained(repo_id, use_fast=False, **ip_kwargs)
-    startup_log(f"loaded image processor from {repo_id!r}")
+    startup_log(f"loaded tokenizer and image processor from {model_snapshot.path!s}")
 
     if FLAGS.max_vision_patches_per_sample:
         merge_size = int(image_processor.merge_size)
@@ -444,7 +435,7 @@ def main(_) -> None:
     )
     sources_repr = ", ".join(f"{s.path}@{s.weight:g}" for s in train_sources)
     startup_log(
-        f"model_id={FLAGS.model_id!r} data_sources=[{sources_repr}] "
+        f"model_snapshot={model_snapshot.path!s} data_sources=[{sources_repr}] "
         f"jax_compilation_cache_dir={FLAGS.jax_cache_dir!r} "
         f"process_count={jax.process_count()} local_device_count={jax.local_device_count()}"
     )
@@ -534,7 +525,7 @@ def main(_) -> None:
 
     try:
         _, last_metrics = vlm_trainer.run_sft(
-            FLAGS.model_id,
+            model_snapshot,
             train_cfg,
             data_iter,
             invocation_end_step=FLAGS.invocation_end_step,
@@ -568,6 +559,19 @@ def main(_) -> None:
 
     if last_metrics:
         print(f"finished step={int(last_metrics['step'])} loss={last_metrics['loss']:.4f}")
+
+
+def main(_) -> None:
+    _validate_flags()
+    with open_local_vlm_snapshot(FLAGS.model_snapshot) as model_snapshot:
+        vlm_api.resolve_config(model_snapshot)
+        tokenizer, image_processor = _load_snapshot_assets(model_snapshot)
+        if FLAGS.max_length > tokenizer.model_max_length:
+            raise ValueError(
+                f"--max_length={FLAGS.max_length} exceeds "
+                f"tokenizer.model_max_length={tokenizer.model_max_length}"
+            )
+        _run(model_snapshot, tokenizer, image_processor)
 
 
 if __name__ == "__main__":

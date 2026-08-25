@@ -1,7 +1,10 @@
 """Round-trip export/import smoke tests for all supported families."""
 
 import os
+import subprocess
+import sys
 import tempfile
+from pathlib import Path
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
@@ -45,6 +48,45 @@ def _valid_export_step_env():
 
 
 class ExportEntryTopologyTest(absltest.TestCase):
+    def test_snapshot_validation_precedes_jax_export_entrypoint(self):
+        code = """
+from unittest import mock
+from scripts import export_to_hf as script
+events = []
+snapshot = mock.Mock()
+snapshot_context = mock.MagicMock()
+snapshot_context.__enter__.side_effect = lambda: events.append("open") or snapshot
+snapshot_context.__exit__.side_effect = lambda *_: events.append("close")
+with (
+    mock.patch.object(script, "FLAGS") as flag_values,
+    mock.patch.object(script, "open_local_vlm_snapshot", return_value=snapshot_context),
+    mock.patch.object(
+        script.vlm_api,
+        "resolve_config",
+        side_effect=lambda *_: events.append("config"),
+    ),
+    mock.patch.object(script, "_run", side_effect=lambda *_: events.append("jax")),
+):
+    flag_values.model_snapshot = "/sealed/model"
+    script.main(None)
+if events != ["open", "config", "jax", "close"]:
+    raise AssertionError(events)
+"""
+        env = dict(os.environ)
+        env["JAX_PLATFORMS"] = "cpu"
+        for optimized in (False, True):
+            command = [sys.executable]
+            if optimized:
+                command.append("-O")
+            command.extend(["-c", code])
+            with self.subTest(optimized=optimized):
+                subprocess.run(command, env=env, check=True, timeout=180)
+
+    def test_export_input_has_no_network_fallback(self):
+        source = (Path(__file__).parents[1] / "scripts" / "export_to_hf.py").read_text()
+        self.assertNotIn("snapshot_download", source)
+        self.assertIn("open_local_vlm_snapshot", source)
+
     def test_plain_batch_launches_one_clean_step(self):
         env = {
             "SLURM_JOB_ID": "1234",
@@ -57,7 +99,7 @@ class ExportEntryTopologyTest(absltest.TestCase):
 
         argv, child_env = resolve_export_step(
             env,
-            ["scripts/export_to_hf.py", "--model_id=x"],
+            ["scripts/export_to_hf.py", "--model_snapshot=/sealed/x"],
             "/venv/bin/python",
             "/repo/scripts/export_to_hf.py",
             "hai001",
@@ -73,7 +115,7 @@ class ExportEntryTopologyTest(absltest.TestCase):
                 "--kill-on-bad-exit=1",
                 "/venv/bin/python",
                 "/repo/scripts/export_to_hf.py",
-                "--model_id=x",
+                "--model_snapshot=/sealed/x",
             ],
         )
         self.assertEqual(child_env["OMEGALAX_EXPORT_STEP_JOB_ID"], "1234")

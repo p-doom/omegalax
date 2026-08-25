@@ -260,7 +260,7 @@ class VLMPhaseContractTest(absltest.TestCase):
                 if val_iterator is not None:
                     self.assertEqual(val_iterator.count, 0)
 
-    def test_single_process_preflight_precedes_library_and_cli_resources(self):
+    def test_single_process_preflight_precedes_iterators_and_trainer(self):
         with (
             mock.patch.object(vlm.jax, "process_count", return_value=2),
             mock.patch.object(vlm, "_run_sft") as private_run,
@@ -293,17 +293,15 @@ from scripts import train_vlm_sft as script
 with (
     mock.patch.object(script, "FLAGS") as flag_values,
     mock.patch.object(script, "_validate_flags"),
+    mock.patch.object(script, "open_local_vlm_snapshot") as open_snapshot,
+    mock.patch.object(script.vlm_api, "resolve_config"),
+    mock.patch.object(script, "_load_snapshot_assets", return_value=(mock.Mock(), mock.Mock())),
     mock.patch.object(script.jax.config, "update"),
     mock.patch.object(script.jax.distributed, "initialize"),
     mock.patch.object(
         script.vlm_trainer,
         "_require_single_jax_process",
         side_effect=RuntimeError("exactly one JAX process"),
-    ),
-    mock.patch.object(
-        script.AutoTokenizer,
-        "from_pretrained",
-        side_effect=AssertionError("tokenizer loaded before topology gate"),
     ),
     mock.patch.object(
         script,
@@ -317,6 +315,10 @@ with (
     ),
 ):
     flag_values.jax_cache_dir = "/tmp/unused"
+    flag_values.model_snapshot = "/sealed/model"
+    flag_values.max_length = 1
+    open_snapshot.return_value.__enter__.return_value = mock.Mock()
+    script._load_snapshot_assets.return_value[0].model_max_length = 2
     try:
         script.main(None)
     except RuntimeError as error:
@@ -328,14 +330,12 @@ with (
 with (
     mock.patch.object(script, "FLAGS") as flag_values,
     mock.patch.object(script, "_validate_flags"),
+    mock.patch.object(script, "open_local_vlm_snapshot") as open_snapshot,
+    mock.patch.object(script.vlm_api, "resolve_config"),
+    mock.patch.object(script, "_load_snapshot_assets", return_value=(mock.Mock(), mock.Mock())),
     mock.patch.object(script.jax.config, "update"),
     mock.patch.object(script.jax.distributed, "initialize"),
     mock.patch.object(script.vlm_trainer, "_require_single_jax_process"),
-    mock.patch.object(
-        script.AutoTokenizer,
-        "from_pretrained",
-        side_effect=AssertionError("tokenizer loaded before capability gate"),
-    ),
     mock.patch.object(
         script,
         "_grain_iter",
@@ -348,6 +348,10 @@ with (
     ),
 ):
     flag_values.jax_cache_dir = "/tmp/unused"
+    flag_values.model_snapshot = "/sealed/model"
+    flag_values.max_length = 1
+    open_snapshot.return_value.__enter__.return_value = mock.Mock()
+    script._load_snapshot_assets.return_value[0].model_max_length = 2
     try:
         script.main(None)
     except RuntimeError as error:
@@ -365,6 +369,82 @@ with (
             command.extend(["-c", code])
             with self.subTest(optimized=optimized):
                 subprocess.run(command, env=env, check=True, timeout=120)
+
+    def test_snapshot_validation_precedes_jax_entrypoint(self):
+        from scripts import train_vlm_sft as script
+
+        events = []
+        snapshot = mock.Mock()
+        snapshot_context = mock.MagicMock()
+        snapshot_context.__enter__.side_effect = lambda: events.append("open") or snapshot
+        snapshot_context.__exit__.side_effect = lambda *_: events.append("close")
+        with (
+            mock.patch.object(script, "FLAGS") as flag_values,
+            mock.patch.object(
+                script, "_validate_flags", side_effect=lambda: events.append("flags")
+            ),
+            mock.patch.object(
+                script,
+                "open_local_vlm_snapshot",
+                return_value=snapshot_context,
+            ),
+            mock.patch.object(
+                script.vlm_api,
+                "resolve_config",
+                side_effect=lambda *_: events.append("config"),
+            ),
+            mock.patch.object(
+                script,
+                "_load_snapshot_assets",
+                side_effect=lambda *_: (
+                    events.append("assets") or (mock.Mock(model_max_length=2), mock.Mock())
+                ),
+            ),
+            mock.patch.object(script, "_run", side_effect=lambda *_: events.append("jax")),
+        ):
+            flag_values.model_snapshot = "/sealed/model"
+            flag_values.max_length = 1
+            script.main(None)
+
+        self.assertEqual(events, ["flags", "open", "config", "assets", "jax", "close"])
+
+    def test_snapshot_assets_use_one_pinned_local_source(self):
+        from scripts import train_vlm_sft as script
+
+        snapshot = mock.Mock()
+        snapshot.consume.return_value = mock.MagicMock()
+        snapshot.consume.return_value.__enter__.return_value = "/proc/pinned"
+        with (
+            mock.patch.object(script.AutoTokenizer, "from_pretrained") as tokenizer_load,
+            mock.patch.object(script.AutoImageProcessor, "from_pretrained") as processor_load,
+        ):
+            tokenizer, processor = script._load_snapshot_assets(snapshot)
+
+        tokenizer_load.assert_called_once_with("/proc/pinned", local_files_only=True)
+        processor_load.assert_called_once_with(
+            "/proc/pinned",
+            local_files_only=True,
+            use_fast=False,
+        )
+        self.assertIs(tokenizer, tokenizer_load.return_value)
+        self.assertIs(processor, processor_load.return_value)
+
+    def test_fresh_string_source_is_rejected_before_resolution(self):
+        with (
+            mock.patch.object(
+                vlm.vlm_api,
+                "resolve_config",
+                side_effect=AssertionError("raw source was resolved"),
+            ),
+            self.assertRaisesRegex(TypeError, "LocalVLMSnapshot"),
+        ):
+            vlm._run_sft(
+                "Qwen/Qwen3-VL-8B-Instruct",
+                vlm.TrainConfig(schedule_horizon=1),
+                object(),
+                invocation_end_step=1,
+                _cleanup=vlm._TrainingCleanup(),
+            )
 
     def test_checkpoint_rng_is_absent_and_fused_path_has_no_host_sync(self):
         checkpoint_source = "\n".join(

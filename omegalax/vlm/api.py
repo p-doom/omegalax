@@ -33,12 +33,16 @@ from omegalax.models.qwen3_5.config import (
 )
 from omegalax.models.qwen3_5.model import Qwen3_5ForConditionalGeneration
 from omegalax.models.params_utils import load_hf_config_from_source
+from omegalax.vlm.local_snapshot import LocalVLMSnapshot
 
 VLMConfig = Qwen3_5Config | Qwen3VLConfig
 
 
-def resolve_config(model_or_id: str | VLMConfig) -> VLMConfig:
+def resolve_config(model_or_id: str | VLMConfig | LocalVLMSnapshot) -> VLMConfig:
     """Resolve VLM config from model id (Qwen3.5 or Qwen3-VL) or pass through."""
+    if type(model_or_id) is LocalVLMSnapshot:
+        with model_or_id.consume() as source:
+            return _config_from_hf(load_hf_config_from_source(source), source)
     if not isinstance(model_or_id, str):
         return model_or_id
 
@@ -47,7 +51,10 @@ def resolve_config(model_or_id: str | VLMConfig) -> VLMConfig:
     if is_supported_qwen3_vl_model_id(model_or_id):
         return make_vl_config(model_or_id)
 
-    hf_cfg = load_hf_config_from_source(model_or_id)
+    return _config_from_hf(load_hf_config_from_source(model_or_id), model_or_id)
+
+
+def _config_from_hf(hf_cfg: dict, source: str) -> VLMConfig:
     model_type = hf_cfg.get("model_type")
     if model_type in {"qwen3_5", "qwen3_5_moe"}:
         return make_qwen3_5_config_from_hf(hf_cfg)
@@ -55,7 +62,7 @@ def resolve_config(model_or_id: str | VLMConfig) -> VLMConfig:
         return make_vl_config_from_hf(hf_cfg)
 
     raise ValueError(
-        f"Unsupported VLM model/config source '{model_or_id}'. "
+        f"Unsupported VLM model/config source '{source}'. "
         f"Supported Qwen3.5 ids: {list_supported_qwen3_5_model_ids()}; "
         f"supported Qwen3-VL ids: {list_supported_qwen3_vl_model_ids()}."
     )
@@ -175,33 +182,33 @@ def forward(
 
 
 def load_pretrained(
-    model_id: str,
+    model_snapshot: LocalVLMSnapshot,
     *,
     tp_size: int | None = None,
     fsdp_size: int | None = None,
     dp_size: int | None = None,
 ) -> tuple[nnx.Module, VLMConfig]:
-    """Load a pretrained VLM from HuggingFace safetensors."""
-    from huggingface_hub import snapshot_download
-
+    """Load a pretrained VLM from a validated local snapshot."""
     from omegalax.models.qwen3_5 import create_qwen3_5_from_safetensors
     from omegalax.models.qwen3_vl import create_qwen3_vl_from_safetensors
 
-    local_dir = snapshot_download(model_id)
-    cfg = resolve_config(model_id)
+    if type(model_snapshot) is not LocalVLMSnapshot:
+        raise TypeError("load_pretrained requires an open LocalVLMSnapshot")
+    cfg = resolve_config(model_snapshot)
     # Validates any active mesh matches the requested (tp, fsdp, dp); the loaders
     # below build their own mesh from these sizes, so the return value is unused.
     ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size)
-    if isinstance(cfg, Qwen3VLConfig):
-        model, cfg = create_qwen3_vl_from_safetensors(
-            local_dir, tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size
-        )
-        return model, cfg
-    if isinstance(cfg, Qwen3_5Config):
-        model, cfg = create_qwen3_5_from_safetensors(
-            local_dir, tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size
-        )
-        return model, cfg
+    with model_snapshot.consume() as source:
+        if isinstance(cfg, Qwen3VLConfig):
+            model, cfg = create_qwen3_vl_from_safetensors(
+                source, tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size
+            )
+            return model, cfg
+        if isinstance(cfg, Qwen3_5Config):
+            model, cfg = create_qwen3_5_from_safetensors(
+                source, tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size
+            )
+            return model, cfg
     raise ValueError(f"Unsupported VLM config type for pretrained loading: {type(cfg)}")
 
 

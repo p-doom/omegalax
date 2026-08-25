@@ -1,11 +1,11 @@
-"""Export any supported omegalax model to HuggingFace safetensors.
+"""Export a supported Omegalax VLM to Hugging Face safetensors.
 
 The entrypoint runs as one task in a one-node Slurm step, creating that step
 itself when called directly from an sbatch script.
 
 Two modes:
-  * Default: export the off-the-shelf pretrained weights for ``--model_id``.
-  * With ``--checkpoint_path``: load architecture from ``--model_id``, then
+  * Default: export the weights from ``--model_snapshot``.
+  * With ``--checkpoint_path``: load architecture from ``--model_snapshot``, then
     restore trained weights from an orbax checkpoint directory (one of the
     step subdirs written by ``omegalax.trainers.vlm`` during SFT) and export
     those.
@@ -64,13 +64,18 @@ import orbax.checkpoint as ocp
 from flax import nnx
 
 from omegalax import export as export_lib
-from omegalax import registry
 from omegalax.distributed.mesh import ensure_mesh, mesh_rules
 from omegalax.vlm import api as vlm_api
+from omegalax.vlm.local_snapshot import LocalVLMSnapshot, open_local_vlm_snapshot
 
 FLAGS = flags.FLAGS
 
-flags.DEFINE_string("model_id", None, "Model id to export.", required=True)
+flags.DEFINE_string(
+    "model_snapshot",
+    None,
+    "Absolute sealed local Hugging Face VLM snapshot.",
+    required=True,
+)
 flags.DEFINE_string("out_dir", None, "Destination directory for safetensors+config.", required=True)
 flags.DEFINE_integer("seed", 0, "RNG seed used when initializing the model.")
 flags.DEFINE_integer("tp_size", None, "Tensor parallelism size.")
@@ -107,37 +112,14 @@ flags.DEFINE_float("lr_stable_fraction", 0.9, "LR-schedule stable fraction (not 
 flags.DEFINE_float("lr_end_factor", 0.0, "LR-schedule end factor (not saved).")
 
 
-def _load_text_model():
-    # NB: text_api currently has no load_pretrained; re-using init_model here
-    # would silently export random weights (cf. the VLM-path fix below).
-    # If text export becomes needed, mirror vlm_api.load_pretrained: snapshot
-    # download + create_qwen3{,_5}_from_safetensors.
-    raise NotImplementedError(
-        "Text export not yet wired to load_pretrained; would silently export "
-        "random weights. Add text_api.load_pretrained first."
-    )
-
-
-def _load_vlm_model():
-    # IMPORTANT: vlm_api.init_model() does *random* sharded init, not weight
-    # loading. Calling it here produced syntactically-valid safetensors with
-    # untrained weights — a silent corruption. Use load_pretrained instead.
+def load_model(model_snapshot: LocalVLMSnapshot):
     model, cfg = vlm_api.load_pretrained(
-        FLAGS.model_id,
+        model_snapshot,
         tp_size=FLAGS.tp_size,
         fsdp_size=FLAGS.fsdp_size,
         dp_size=FLAGS.dp_size,
     )
     return model, cfg
-
-
-def load_model():
-    arch = registry.resolve(FLAGS.model_id)
-    if arch == registry.Arch.TEXT:
-        return _load_text_model()
-    if arch == registry.Arch.VLM:
-        return _load_vlm_model()
-    raise ValueError(f"Unsupported architecture for model id '{FLAGS.model_id}'")
 
 
 def _restore_trained_weights(model, cfg, checkpoint_path: Path):
@@ -255,20 +237,10 @@ _WEIGHT_SUFFIXES = (".safetensors", ".bin", ".pt", ".pth", ".msgpack", ".h5", ".
 
 
 def _copy_base_identity_assets(out_dir: Path, base_dir: Path) -> None:
-    """Copy the base's tokenizer / processor / chat-template files into the export.
-
-    Without them an export is not a servable directory: sglang refuses a Qwen3-VL
-    model with `Can't load image processor ... containing a preprocessor_config.json`,
-    and a missing chat_template.json is worse than a refusal -- the server starts and
-    renders every prompt wrong. They are model-identity assets, not training outputs,
-    so they come from the base for the same reason config.json's untouched fields do.
-
-    Deny-list rather than a list of the eight files Qwen3-VL happens to need, so a
-    family whose processor needs a ninth does not silently ship without it.
-    """
+    """Copy non-weight HF identity assets from the pinned base snapshot."""
     copied = []
     for src in sorted(base_dir.iterdir()):
-        if not src.is_file() or src.name == "config.json":
+        if not src.is_file() or src.name in {"config.json", "omegalax-vlm-snapshot.json"}:
             continue
         if src.suffix in _WEIGHT_SUFFIXES or src.name.endswith(".index.json"):
             continue
@@ -277,21 +249,16 @@ def _copy_base_identity_assets(out_dir: Path, base_dir: Path) -> None:
     print(f"[export] copied {len(copied)} identity assets from the base: {copied}")
 
 
-def _write_servable_config(out_dir: Path, cfg) -> None:
-    """Rewrite config.json as the base's, overlaid with what omegalax owns.
-
-    Deriving it from the runtime config alone is structurally short: that is a
-    *training* config, so a dense export omitted 15 keys -- max_position_embeddings,
-    eos_token_id, bos_token_id, hidden_act, sliding_window, use_cache among them --
-    and none of them can be recovered from it. The base has them right for
-    everything this export does not change, so start there and overwrite only the
-    fields the export actually determines.
-    """
-    from huggingface_hub import snapshot_download
-
-    base_dir = Path(snapshot_download(FLAGS.model_id))
-    _copy_base_identity_assets(out_dir, base_dir)
-    base = json.loads((base_dir / "config.json").read_text())
+def _write_servable_config(
+    out_dir: Path,
+    cfg,
+    model_snapshot: LocalVLMSnapshot,
+) -> None:
+    """Overlay owned fields without dropping serving fields absent from the runtime config."""
+    with model_snapshot.consume() as source:
+        base_dir = Path(source)
+        _copy_base_identity_assets(out_dir, base_dir)
+        base = json.loads((base_dir / "config.json").read_text())
     for key in _DESCRIBES_BASE_WEIGHTS:
         base.pop(key, None)
 
@@ -304,17 +271,19 @@ def _write_servable_config(out_dir: Path, cfg) -> None:
 
     (out_dir / "config.json").write_text(json.dumps(merged, indent=2) + "\n")
     added = sorted(set(merged) - set(owned))
-    print(f"[export] config.json overlaid on {FLAGS.model_id}: +{len(added)} base keys {added}")
+    print(
+        f"[export] config.json overlaid on {model_snapshot.path!s}: +{len(added)} base keys {added}"
+    )
 
 
-def main(_) -> None:
+def _run(model_snapshot: LocalVLMSnapshot) -> None:
     jax.distributed.initialize()
-    model, cfg = load_model()
+    model, cfg = load_model(model_snapshot)
     if not FLAGS.checkpoint_path:
         out_dir = Path(FLAGS.out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
         print(f"Exported safetensors to {export_lib.export_model_to_hf(model, cfg, out_dir)}")
-        _write_servable_config(out_dir, cfg)
+        _write_servable_config(out_dir, cfg, model_snapshot)
         return
 
     base_fingerprint = export_lib.param_fingerprint(model)
@@ -322,7 +291,7 @@ def main(_) -> None:
     out_dir = Path(FLAGS.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     path = export_lib.export_model_to_hf(model, cfg, out_dir)
-    _write_servable_config(out_dir, cfg)
+    _write_servable_config(out_dir, cfg, model_snapshot)
 
     # After the write, because export_model_to_hf owns the LoRA merge and a LoRA
     # run trains no base leaf: pre-merge, a correct adapter export is legitimately
@@ -338,7 +307,7 @@ def main(_) -> None:
     changed = [k for k, v in base_fingerprint.items() if exported[k] != v]
     if not changed:
         raise ValueError(
-            f"{path} is identical to the pretrained {FLAGS.model_id} on all "
+            f"{path} is identical to the pretrained snapshot on all "
             f"{len(base_fingerprint)} parameter leaves. The restore matched nothing -- "
             f"orbax partial_restore drops leaves without raising -- so this export is the "
             f"base model. Do NOT use it. Check that "
@@ -350,6 +319,12 @@ def main(_) -> None:
         f"[export] {len(changed)}/{len(base_fingerprint)} parameter-leaf checksums "
         "differ from the base"
     )
+
+
+def main(_) -> None:
+    with open_local_vlm_snapshot(FLAGS.model_snapshot) as model_snapshot:
+        vlm_api.resolve_config(model_snapshot)
+        _run(model_snapshot)
 
 
 if __name__ == "__main__":

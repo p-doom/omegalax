@@ -193,8 +193,10 @@ class LocalVLMSnapshot:
         "_directory_identity",
         "_file_fds",
         "_file_identities",
-        "_manifest",
+        "_manifest_fd",
+        "_manifest_identity",
         "_path",
+        "_sha256",
     )
 
     def __init__(
@@ -202,17 +204,20 @@ class LocalVLMSnapshot:
         token: object,
         path: Path,
         directory_fd: int,
+        manifest_fd: int,
+        manifest_sha256: str,
         file_fds: dict[str, int],
-        manifest: dict[str, tuple[int, str]],
     ) -> None:
         if token is not _TOKEN:
             raise TypeError("LocalVLMSnapshot must be created by open_local_vlm_snapshot")
         self._path = path
         self._directory_fd = directory_fd
         self._directory_identity = _identity(os.fstat(directory_fd))
+        self._manifest_fd = manifest_fd
+        self._manifest_identity = _identity(os.fstat(manifest_fd))
+        self._sha256 = manifest_sha256
         self._file_fds = file_fds
         self._file_identities = {name: _identity(os.fstat(fd)) for name, fd in file_fds.items()}
-        self._manifest = manifest
         self._consumer_directory = tempfile.TemporaryDirectory(prefix="omegalax-vlm-snapshot-")
         self._closed = False
         alias = Path(self._consumer_directory.name)
@@ -224,6 +229,10 @@ class LocalVLMSnapshot:
     def path(self) -> Path:
         return self._path
 
+    @property
+    def sha256(self) -> str:
+        return self._sha256
+
     def _require_open(self) -> None:
         if self._closed:
             raise RuntimeError("VLM snapshot handle is closed")
@@ -234,13 +243,20 @@ class LocalVLMSnapshot:
             raise RuntimeError("VLM snapshot directory changed after validation")
         if set(os.listdir(self._directory_fd)) != set(self._file_fds) | {_MANIFEST_NAME}:
             raise RuntimeError("VLM snapshot inventory changed after validation")
+        manifest_metadata = os.fstat(self._manifest_fd)
+        if (
+            _identity(manifest_metadata) != self._manifest_identity
+            or _sha256(
+                self._manifest_fd,
+                manifest_metadata.st_size,
+            )
+            != self._sha256
+        ):
+            raise RuntimeError("VLM snapshot manifest changed after validation")
         for name, fd in self._file_fds.items():
             metadata = os.fstat(fd)
             if _identity(metadata) != self._file_identities[name]:
                 raise RuntimeError(f"VLM snapshot child changed after validation: {name!r}")
-            expected_size, expected_digest = self._manifest[name]
-            if metadata.st_size != expected_size or _sha256(fd, expected_size) != expected_digest:
-                raise RuntimeError(f"VLM snapshot child content changed after validation: {name!r}")
 
     @contextlib.contextmanager
     def consume(self) -> Iterator[str]:
@@ -258,6 +274,7 @@ class LocalVLMSnapshot:
         self._consumer_directory.cleanup()
         for fd in self._file_fds.values():
             os.close(fd)
+        os.close(self._manifest_fd)
         os.close(self._directory_fd)
 
     def __enter__(self) -> Self:
@@ -271,23 +288,19 @@ class LocalVLMSnapshot:
 def open_local_vlm_snapshot(path: str | os.PathLike[str]) -> LocalVLMSnapshot:
     resolved = _canonical_absolute_directory(path)
     directory_fd = _open_directory(resolved)
+    manifest_fd = -1
     file_fds: dict[str, int] = {}
     try:
         names = set(os.listdir(directory_fd))
         manifest_fd = _open_regular_at(directory_fd, _MANIFEST_NAME, require_read_only=True)
-        try:
-            manifest_metadata = os.fstat(manifest_fd)
-            manifest_value = _parse_json(
-                _read_bounded(
-                    manifest_fd,
-                    manifest_metadata.st_size,
-                    _MAX_MANIFEST_BYTES,
-                    "VLM snapshot manifest",
-                ),
-                "VLM snapshot manifest",
-            )
-        finally:
-            os.close(manifest_fd)
+        manifest_metadata = os.fstat(manifest_fd)
+        manifest_bytes = _read_bounded(
+            manifest_fd,
+            manifest_metadata.st_size,
+            _MAX_MANIFEST_BYTES,
+            "VLM snapshot manifest",
+        )
+        manifest_value = _parse_json(manifest_bytes, "VLM snapshot manifest")
         manifest = _validate_manifest(manifest_value)
         _validate_inventory(manifest)
         if names != set(manifest) | {_MANIFEST_NAME}:
@@ -301,17 +314,23 @@ def open_local_vlm_snapshot(path: str | os.PathLike[str]) -> LocalVLMSnapshot:
                 raise ValueError(f"VLM snapshot identity mismatch for {name!r}")
             file_fds[name] = fd
 
-        config_fd = file_fds["config.json"]
-        config_metadata = os.fstat(config_fd)
-        config = _parse_json(
-            _read_bounded(
-                config_fd,
-                config_metadata.st_size,
-                _MAX_JSON_ASSET_BYTES,
-                "VLM snapshot config.json",
-            ),
-            "VLM snapshot config.json",
-        )
+        config = None
+        for name in sorted(name for name in manifest if name.endswith(".json")):
+            fd = file_fds[name]
+            metadata = os.fstat(fd)
+            value = _parse_json(
+                _read_bounded(
+                    fd,
+                    metadata.st_size,
+                    _MAX_JSON_ASSET_BYTES,
+                    f"VLM snapshot {name}",
+                ),
+                f"VLM snapshot {name}",
+            )
+            if name == "config.json":
+                config = value
+        if config is None:
+            raise ValueError("VLM snapshot has no parsed config.json")
         if config.get("model_type") not in {"qwen3_5", "qwen3_5_moe", "qwen3_vl", "qwen3_vl_moe"}:
             raise ValueError(f"Unsupported VLM snapshot model_type: {config.get('model_type')!r}")
 
@@ -331,10 +350,19 @@ def open_local_vlm_snapshot(path: str | os.PathLike[str]) -> LocalVLMSnapshot:
                 )
             tensor_names.update(current_names)
 
-        return LocalVLMSnapshot(_TOKEN, resolved, directory_fd, file_fds, manifest)
+        return LocalVLMSnapshot(
+            _TOKEN,
+            resolved,
+            directory_fd,
+            manifest_fd,
+            hashlib.sha256(manifest_bytes).hexdigest(),
+            file_fds,
+        )
     except BaseException:
         for fd in file_fds.values():
             os.close(fd)
+        if manifest_fd >= 0:
+            os.close(manifest_fd)
         os.close(directory_fd)
         raise
 

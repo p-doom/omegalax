@@ -944,6 +944,8 @@ def _run_sft(
     _validate_training_phase(train_cfg, invocation_end_step)
     save_path = Path(save_dir).expanduser().resolve() if save_dir is not None else None
     will_resume = _validate_resume_request(resume, resume_step, save_path, invocation_end_step)
+    if not will_resume and isinstance(model_id_or_cfg, str):
+        raise TypeError("Fresh VLM training requires an open LocalVLMSnapshot")
 
     checkpoint_manager: ocp.CheckpointManager | None = None
     if save_path is not None:
@@ -992,7 +994,7 @@ def _run_sft(
         stable_fraction=train_cfg.lr_stable_fraction,
     )
 
-    if not will_resume and isinstance(model_id_or_cfg, str):
+    if not will_resume and type(model_id_or_cfg) is vlm_api.LocalVLMSnapshot:
         model, model_cfg = vlm_api.load_pretrained(
             model_id_or_cfg,
             tp_size=tp_size,
