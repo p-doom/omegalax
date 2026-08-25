@@ -23,7 +23,6 @@ def _contract(tokenizer_digest: str = "a" * 64) -> dict:
             "files": [{"path": "tokenizer.json", "size_bytes": 1, "sha256": "f" * 64}],
         },
         "processor": None,
-        "renderer": {"class": "test.Renderer", "config_sha256": "c" * 64},
         "preprocessor": None,
     }
 
@@ -31,7 +30,9 @@ def _contract(tokenizer_digest: str = "a" * 64) -> dict:
 def _measurement(length: int = 1) -> dict:
     return {
         "length": length,
+        "terminal_length_delta": 0,
         "supervised_tokens": 0,
+        "terminal_supervised_tokens_delta": 0,
         "vision_tokens": 0,
         "vision_patches": 0,
         "num_images": 0,

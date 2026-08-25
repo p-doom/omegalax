@@ -25,8 +25,8 @@ PROCESSOR_ASSET_NAMES = (
     "processor_config.json",
     "image_processor_config.json",
 )
-COMPILED_DATASET_SCHEMA_VERSION = 2
-COMPILED_ARTIFACT_CONTRACT_VERSION = 1
+COMPILED_DATASET_SCHEMA_VERSION = 3
+COMPILED_ARTIFACT_CONTRACT_VERSION = 2
 EXTERNAL_ARTIFACT_INVENTORY_VERSION = 1
 
 
@@ -77,7 +77,7 @@ def _validate_asset_contract(value: Any, field: str) -> None:
 def validate_measurement_contract(contract: Any) -> None:
     if not isinstance(contract, dict):
         raise TypeError("measurement contract must be an object")
-    required = {"producer_sha", "tokenizer", "processor", "renderer", "preprocessor"}
+    required = {"producer_sha", "tokenizer", "processor", "preprocessor"}
     if set(contract) != required:
         raise ValueError(f"measurement contract fields must be exactly {sorted(required)}")
     producer_sha = contract["producer_sha"]
@@ -91,12 +91,6 @@ def validate_measurement_contract(contract: Any) -> None:
     _validate_asset_contract(contract["tokenizer"], "measurement contract tokenizer")
     if contract["processor"] is not None:
         _validate_asset_contract(contract["processor"], "measurement contract processor")
-    renderer = contract["renderer"]
-    if not isinstance(renderer, dict) or set(renderer) != {"class", "config_sha256"}:
-        raise ValueError("measurement contract renderer has an invalid schema")
-    if not isinstance(renderer["class"], str) or not renderer["class"]:
-        raise ValueError("measurement contract renderer.class must be non-empty")
-    validate_sha256(renderer["config_sha256"], "measurement contract renderer.config_sha256")
     preprocessor = contract["preprocessor"]
     if preprocessor is not None:
         if not isinstance(preprocessor, dict) or set(preprocessor) != {
@@ -474,7 +468,6 @@ def make_measurement_contract(
     tokenizer_source: str,
     image_processor,
     processor_source: str | None,
-    renderer_config,
     preprocessor_config_path: str | Path | None,
 ) -> dict:
     if (
@@ -507,15 +500,10 @@ def make_measurement_contract(
             **file_identity(preprocessor_config_path),
         }
     )
-    renderer = {
-        "class": f"{type(renderer_config).__module__}.{type(renderer_config).__qualname__}",
-        "config_sha256": canonical_sha256(_jsonable(renderer_config)),
-    }
     contract = {
         "producer_sha": producer_sha.lower(),
         "tokenizer": tokenizer_assets,
         "processor": processor,
-        "renderer": renderer,
         "preprocessor": preprocessor,
     }
     validate_measurement_contract(contract)

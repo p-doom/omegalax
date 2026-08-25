@@ -5,9 +5,9 @@ from __future__ import annotations
 import gc
 from pathlib import Path
 
-from absl import app, flags
 import jax
 import wandb
+from absl import app, flags
 from transformers import AutoTokenizer
 
 from omegalax.data.collator_qwen3 import TextSFTCollator
@@ -252,7 +252,7 @@ def main(_) -> None:
     assert FLAGS.max_length <= tokenizer.model_max_length, (
         f"--max_length={FLAGS.max_length} exceeds tokenizer.model_max_length={tokenizer.model_max_length}"
     )
-    collator = TextSFTCollator(tokenizer, max_length=FLAGS.max_length, model_id=FLAGS.model_id)
+    collator = TextSFTCollator(tokenizer, max_length=FLAGS.max_length)
     startup_log("built TextSFTCollator")
     train_sources = _resolve_train_sources()
     per_process_batch = process_local_batch_size(

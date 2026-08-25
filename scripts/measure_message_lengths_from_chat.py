@@ -25,7 +25,7 @@ from omegalax.data.grain_pipeline import (
     MESSAGE_LENGTHS_FILENAME,
     measure_message_lengths_from_chat,
 )
-from omegalax.data.collator_qwen3 import make_message_length_fn
+from omegalax.data.qwen3_encoding import make_message_length_fn
 
 FLAGS = flags.FLAGS
 
@@ -59,7 +59,7 @@ flags.DEFINE_integer(
 flags.DEFINE_string(
     "producer_sha",
     None,
-    "Exact Omegalax Git SHA whose renderer and preprocessing code produced the cache.",
+    "Exact Omegalax Git SHA whose tokenization and preprocessing code produced the cache.",
     required=True,
 )
 
@@ -80,20 +80,19 @@ def main(_) -> None:
 
     out_dir = Path(FLAGS.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    measure_message = make_message_length_fn(tokenizer, image_processor)
+    measure_conversation = make_message_length_fn(tokenizer, image_processor)
     measurement_contract = make_measurement_contract(
         producer_sha=FLAGS.producer_sha,
         tokenizer=tokenizer,
         tokenizer_source=tokenizer_name,
         image_processor=image_processor,
         processor_source=FLAGS.processor,
-        renderer_config=measure_message.renderer_config,
         preprocessor_config_path=FLAGS.preprocessor_config,
     )
     out_path = measure_message_lengths_from_chat(
         FLAGS.data_path,
         out_dir / MESSAGE_LENGTHS_FILENAME,
-        measure_message=measure_message,
+        measure_message=measure_conversation,
         measurement_contract=measurement_contract,
         num_workers=FLAGS.num_workers,
     )

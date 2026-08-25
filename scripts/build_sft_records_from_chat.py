@@ -21,7 +21,7 @@ from transformers import AutoImageProcessor, AutoTokenizer
 
 from omegalax.data.artifact_contract import make_measurement_contract
 from omegalax.data.grain_pipeline import build_records_from_chat
-from omegalax.data.collator_qwen3 import make_message_length_fn
+from omegalax.data.qwen3_encoding import make_message_length_fn
 
 FLAGS = flags.FLAGS
 
@@ -95,7 +95,7 @@ flags.DEFINE_string(
 flags.DEFINE_string(
     "producer_sha",
     None,
-    "Exact Omegalax Git SHA whose renderer and preprocessing code produced the records.",
+    "Exact Omegalax Git SHA whose tokenization and preprocessing code produced the records.",
     required=True,
 )
 
@@ -116,21 +116,20 @@ def main(_) -> None:
             processor_name, use_fast=False, local_files_only=True, **ip_kwargs
         )
 
-    measure_message = make_message_length_fn(tokenizer, image_processor)
+    measure_conversation = make_message_length_fn(tokenizer, image_processor)
     measurement_contract = make_measurement_contract(
         producer_sha=FLAGS.producer_sha,
         tokenizer=tokenizer,
         tokenizer_source=tokenizer_name,
         image_processor=image_processor,
         processor_source=processor_name,
-        renderer_config=measure_message.renderer_config,
         preprocessor_config_path=FLAGS.preprocessor_config,
     )
     out_dir = build_records_from_chat(
         FLAGS.data_path,
         FLAGS.out_dir,
         max_length=FLAGS.max_length,
-        measure_message=measure_message,
+        measure_message=measure_conversation,
         records_per_shard=FLAGS.records_per_shard,
         overwrite=FLAGS.overwrite,
         num_workers=FLAGS.num_workers,

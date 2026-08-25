@@ -1,12 +1,4 @@
-"""ArrayRecord (``ar://``) image-reference resolution.
-
-``renderers`` resolves ``ImagePart`` sources that PIL understands (a PIL image,
-a filesystem path, an http(s) URL, a base64 data URI) but has no notion of our
-grain image store's ``ar:///shard.array_record#42`` URIs, so the seam is
-"resolve refs, then render": :func:`resolve_message_images` rewrites every
-``ar://`` reference into a live PIL image and the renderer sees an ordinary
-``{"type": "image", "image": <PIL.Image>}`` part.
-"""
+"""ArrayRecord image-reference resolution."""
 
 from __future__ import annotations
 
@@ -43,7 +35,7 @@ def _get_arrayrecord_image_reader(path: str) -> Any:
         _ARRAYRECORD_IMAGE_SOURCES.move_to_end(path)
         return reader
 
-    from array_record.python.array_record_module import ArrayRecordReader  # noqa: PLC0415
+    from array_record.python.array_record_module import ArrayRecordReader
 
     reader = ArrayRecordReader(path)
     if _ARRAYRECORD_IMAGE_CACHE_SIZE <= 0:
@@ -96,8 +88,6 @@ atexit.register(_close_arrayrecord_image_sources)
 
 
 def extract_images(messages: list[dict[str, Any]]) -> list[Image.Image]:
-    """Pull PIL images out of Qwen structured-content blocks (``ar://`` aware)."""
-
     images: list[Image.Image] = []
     for msg in messages:
         content = msg.get("content", "")
@@ -106,9 +96,16 @@ def extract_images(messages: list[dict[str, Any]]) -> list[Image.Image]:
         for block in content:
             if not isinstance(block, dict) or block.get("type") not in ("image", "image_url"):
                 continue
-            ref = block.get("image", block.get("url"))
-            if ref is None:
-                continue
+            if block.get("type") == "image":
+                if set(block) != {"type", "image"}:
+                    raise ValueError("image parts must contain exactly type and image")
+                ref = block["image"]
+            else:
+                if set(block) != {"type", "image_url"}:
+                    raise ValueError("image_url parts must contain exactly type and image_url")
+                ref = block["image_url"]
+                if isinstance(ref, dict) and set(ref) == {"url"}:
+                    ref = ref["url"]
             images.append(ref if isinstance(ref, Image.Image) else _open_image_ref(ref))
     return images
 
@@ -118,41 +115,8 @@ def _open_image_ref(ref: Any) -> Image.Image:
         return ref
     if is_arrayrecord_image_uri(ref):
         return open_arrayrecord_image(ref)
+    if not isinstance(ref, (str, os.PathLike)):
+        raise TypeError("image reference must be a PIL image, local path, or ar:// URI")
+    if isinstance(ref, str) and "://" in ref:
+        raise ValueError("remote image references are not supported")
     return Image.open(ref)
-
-
-def resolve_message_images(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Return ``messages`` with every ``ar://`` image reference replaced by a PIL image.
-
-    Non-``ar://`` references (paths, URLs, already-loaded PIL images) are left
-    untouched — ``renderers`` resolves those itself. Copies only the messages /
-    blocks it has to rewrite, so the common all-``ar://`` and all-path cases both
-    stay cheap and the caller's list is never mutated.
-    """
-    out: list[dict[str, Any]] = []
-    for msg in messages:
-        content = msg.get("content", "")
-        if isinstance(content, str) or not content:
-            out.append(msg)
-            continue
-        new_content: list[Any] = []
-        touched = False
-        for block in content:
-            if isinstance(block, dict) and block.get("type") in ("image", "image_url"):
-                key = "image" if "image" in block else ("url" if "url" in block else None)
-                if key is not None and is_arrayrecord_image_uri(block[key]):
-                    new_block = dict(block)
-                    new_block.pop("url", None)
-                    new_block["type"] = "image"
-                    new_block["image"] = open_arrayrecord_image(block[key])
-                    new_content.append(new_block)
-                    touched = True
-                    continue
-            new_content.append(block)
-        if touched:
-            new_msg = dict(msg)
-            new_msg["content"] = new_content
-            out.append(new_msg)
-        else:
-            out.append(msg)
-    return out

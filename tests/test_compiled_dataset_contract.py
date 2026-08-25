@@ -28,13 +28,12 @@ _MEASUREMENT_CONTRACT = {
         "files": [{"path": "tokenizer.json", "size_bytes": 1, "sha256": "f" * 64}],
     },
     "processor": None,
-    "renderer": {"class": "test.Renderer", "config_sha256": "b" * 64},
     "preprocessor": None,
 }
 
 
-def _measure(message):
-    return message["measurement"]
+def _measure(messages):
+    return [message["measurement"] for message in messages]
 
 
 class CompiledDatasetContractTest(absltest.TestCase):
@@ -49,7 +48,9 @@ class CompiledDatasetContractTest(absltest.TestCase):
                         "content": "do it",
                         "measurement": {
                             "length": 2,
+                            "terminal_length_delta": 0,
                             "supervised_tokens": 0,
+                            "terminal_supervised_tokens_delta": 0,
                             "vision_tokens": patches // 4,
                             "vision_patches": patches,
                             "num_images": images,
@@ -61,7 +62,9 @@ class CompiledDatasetContractTest(absltest.TestCase):
                         "content": "ok",
                         "measurement": {
                             "length": 1,
+                            "terminal_length_delta": 0,
                             "supervised_tokens": 1,
+                            "terminal_supervised_tokens_delta": 0,
                             "vision_tokens": 0,
                             "vision_patches": 0,
                             "num_images": 0,
@@ -134,7 +137,9 @@ class CompiledDatasetContractTest(absltest.TestCase):
             {
                 (0, 0): {
                     "length": 2,
+                    "terminal_length_delta": 0,
                     "supervised_tokens": 0,
+                    "terminal_supervised_tokens_delta": 0,
                     "vision_tokens": 1,
                     "vision_patches": 4,
                     "num_images": 1,
@@ -142,7 +147,9 @@ class CompiledDatasetContractTest(absltest.TestCase):
                 },
                 (0, 1): {
                     "length": 1,
+                    "terminal_length_delta": 0,
                     "supervised_tokens": 1,
+                    "terminal_supervised_tokens_delta": 0,
                     "vision_tokens": 0,
                     "vision_patches": 0,
                     "num_images": 0,
