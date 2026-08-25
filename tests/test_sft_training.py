@@ -234,9 +234,6 @@ class TextSFTTrainingTest(absltest.TestCase):
         self.assertIn("supervised_tokens", metrics)
         self.assertGreater(metrics["supervised_tokens"], 0)
         self.assertEqual(int(metrics["step"]), 1)
-        # `total_tokens` was a VLM-only metric, so the text log printed a literal 0
-        # for it every step. The batch is all-ones attention over 8 positions and
-        # supervises the second half, so the two numbers must differ.
         self.assertEqual(int(metrics["total_tokens"]), 8)
         self.assertEqual(int(metrics["supervised_tokens"]), 4)
 
@@ -295,11 +292,6 @@ class VLMSFTTrainingTest(absltest.TestCase):
         self.assertGreater(metrics["supervised_tokens"], 0)
         self.assertEqual(int(metrics["step"]), 1)
 
-    # Unlike the text decoder, the vision tower has no backend to route: its
-    # attention is one direct cuDNN packed call, so on CPU this traces to a
-    # primitive with no lowering. Requiring a GPU is the honest reading; the
-    # alternative is a second, XLA packed implementation that only a test
-    # would ever select.
     @absltest.skipUnless(jax.default_backend() == "gpu", "vision attention is cuDNN-only")
     def test_one_step_sft_multimodal_qwen3_vl(self):
         train_cfg = vlm_trainer.TrainConfig(

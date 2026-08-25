@@ -20,15 +20,7 @@ dependencies = [
   "optax",
   "orbax-checkpoint",
   "Pillow",
-  # 0.8.0 stopped honouring strides in save_file (it copies straight off the raw
-  # pointer), which silently changed what a non-contiguous view serialized to.
-  # The exporter no longer relies on either behaviour, but floor it at the version
-  # whose semantics we write against so the change cannot happen under us again.
   "safetensors>=0.8.0",
-  # Pinned to a commit, not the `nested-mask` branch it was tracking: a branch ref
-  # lets `uv lock --upgrade` move the attention kernels under us, and this is the
-  # rev every measurement in the repo was taken against. Repoint when the fix is
-  # upstreamed.
   "tokamax @ git+https://github.com/p-doom/tokamax.git@d81bc23bc80f01728984bcda5161ff2569cd7cc5",
   "torch==2.10.* ; platform_system == \"Linux\"",
   "torchvision ; platform_system == \"Linux\"",

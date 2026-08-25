@@ -66,11 +66,6 @@ def export_model_to_hf(model, cfg, out_dir: str | Path) -> Path:
     )
 
 
-# Keyed on the ``model_type`` each family emits, so the architecture cannot drift
-# away from the config class it is meant to name. Every serving stack resolves the
-# model class through ``architectures`` -- sglang subscripts it unconditionally
-# (`configs/model_config.py`), so an export without it dies at load with a
-# TypeError on None, not a readable error.
 _HF_ARCHITECTURES = {
     "qwen3": "Qwen3ForCausalLM",
     "qwen3_moe": "Qwen3MoeForCausalLM",
