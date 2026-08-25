@@ -139,7 +139,11 @@ class Qwen3_5TextRopeDtypeTest(_RopeDtypeTestBase):
         gen_spy = _make_spy(orig_gen, gen_calls)
 
         layer_calls = []
-        layer_spy = _make_spy(model_mod.DecoderLayer.__call__, layer_calls)
+        orig_layer = model_mod.DecoderLayer.__call__
+
+        def layer_spy(*args, **kwargs):
+            bound = _bind_and_capture(orig_layer, layer_calls, args, kwargs)
+            return bound.arguments["hidden_BTD"], jnp.array(0.0, dtype=jnp.float32)
 
         B, T = 1, 8
         tokens = jnp.ones((B, T), dtype=jnp.int32)
