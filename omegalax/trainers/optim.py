@@ -119,7 +119,7 @@ def _current_optimizer_state_is_healthy(optimizer, generation):
     return result, counters_match
 
 
-def _candidate_optimizer_state_is_healthy(optimizer, gradients, learning_rate, generation):
+def _candidate_optimizer_state(optimizer, gradients, learning_rate, generation):
     params = nnx.pure(nnx.state(optimizer.model, optimizer.wrt))
     gradient_arrays = nnx.pure(nnx.state(gradients, optimizer.wrt))
     current_opt_state = nnx.pure(optimizer.opt_state)
@@ -155,7 +155,7 @@ def _candidate_optimizer_state_is_healthy(optimizer, gradients, learning_rate, g
         candidate_step == generation.astype(jnp.uint32),
         candidate_adam_count == generation,
     )
-    return result, generation_matches
+    return candidate_params, candidate_opt_state, result, generation_matches
 
 
 @nnx.jit(donate_argnums=(0, 1))
@@ -243,12 +243,11 @@ def apply_normalized_gradient_sum(
         jnp.logical_or(generation <= 0, ~current_generation_matches),
         OptimizerFatalStatus.INVALID_GENERATION,
     )
-    candidate_is_healthy, candidate_generation_matches = jax.lax.cond(
-        status == OptimizerFatalStatus.HEALTHY,
-        lambda: _candidate_optimizer_state_is_healthy(
-            optimizer, clipped_gradients, learning_rate, generation
-        ),
-        lambda: (jnp.array(False), jnp.array(False)),
+    current_params = nnx.pure(nnx.state(optimizer.model, optimizer.wrt))
+    current_opt_state = nnx.pure(optimizer.opt_state)
+    current_step = optimizer.step[...]
+    candidate_params, candidate_opt_state, candidate_is_healthy, generation_matches = (
+        _candidate_optimizer_state(optimizer, clipped_gradients, learning_rate, generation)
     )
     status = _record_fatal(
         status,
@@ -257,23 +256,28 @@ def apply_normalized_gradient_sum(
     )
     status = _record_fatal(
         status,
-        ~candidate_generation_matches,
+        ~generation_matches,
         OptimizerFatalStatus.INVALID_GENERATION,
     )
-
-    def commit(candidate_optimizer, candidate_gradients):
-        candidate_optimizer.update(candidate_gradients, learning_rate=learning_rate)
-
-    def preserve(candidate_optimizer, candidate_gradients):
-        del candidate_optimizer, candidate_gradients
-
-    nnx.cond(
-        status == OptimizerFatalStatus.HEALTHY,
-        commit,
-        preserve,
-        optimizer,
-        clipped_gradients,
+    commit_candidate = status == OptimizerFatalStatus.HEALTHY
+    next_params = jax.tree.map(
+        lambda current, candidate: jax.lax.select(commit_candidate, candidate, current),
+        current_params,
+        candidate_params,
     )
+    next_opt_state = jax.tree.map(
+        lambda current, candidate: jax.lax.select(commit_candidate, candidate, current),
+        current_opt_state,
+        candidate_opt_state,
+    )
+    next_step = jax.lax.select(
+        commit_candidate,
+        current_step + jnp.asarray(1, dtype=jnp.uint32),
+        current_step,
+    )
+    nnx.update(optimizer.model, next_params)
+    nnx.update(optimizer.opt_state, nnx.state(next_opt_state))
+    optimizer.step[...] = next_step
     return status, grad_norm
 
 

@@ -93,6 +93,44 @@ def _adam_state(optimizer):
 
 
 class OptimizerFailStopTest(absltest.TestCase):
+    def test_transaction_invokes_optimizer_transform_once(self):
+        def counted_transform():
+            base = optim_lib.generation_adamw(weight_decay=1.0)
+            invocations = []
+
+            def update(*args, **kwargs):
+                invocations.append(None)
+                return base.update(*args, **kwargs)
+
+            return optax.GradientTransformationExtraArgs(base.init, update), invocations
+
+        for name, model_value, learning_rate, expected_status in (
+            ("healthy", 0.75, 0.03, optim_lib.OptimizerFatalStatus.HEALTHY),
+            (
+                "candidate_overflow",
+                jnp.finfo(jnp.float32).max / 2,
+                4.0,
+                optim_lib.OptimizerFatalStatus.INVALID_CANDIDATE_STATE,
+            ),
+        ):
+            transform, invocations = counted_transform()
+            optimizer = optim_lib.MixedPrecisionOptimizer(
+                _TinyModel(),
+                transform,
+            )
+            optimizer.model.weight[...] = jnp.full((2,), model_value, dtype=jnp.float32)
+            before = _snapshot(optimizer)
+            with self.subTest(name=name):
+                status, _ = _apply(
+                    optimizer,
+                    _gradients((0.0, 0.0)),
+                    learning_rate=learning_rate,
+                )
+                self.assertLen(invocations, 1)
+                self.assertEqual(int(status), expected_status)
+                if expected_status is optim_lib.OptimizerFatalStatus.INVALID_CANDIDATE_STATE:
+                    _assert_tree_bit_equal(self, _snapshot(optimizer), before)
+
     def test_generation_adamw_matches_canonical_one_and_two_steps(self):
         schedules = {
             "constant": (0.03, 0.03),
@@ -389,7 +427,7 @@ class OptimizerFailStopTest(absltest.TestCase):
                 status, optim_lib.OptimizerStatusBoundary.CHECKPOINT
             )
 
-    def test_compiled_transaction_donates_state_and_gradient(self):
+    def test_compiled_transaction_donates_inputs_and_bounds_candidate_staging(self):
         optimizer = _optimizer(size=1024)
         gradients = _gradients(jnp.linspace(-0.4, 0.2, 1024, dtype=jnp.float32))
         compiled = optim_lib.apply_normalized_gradient_sum.lower(
@@ -408,7 +446,7 @@ class OptimizerFailStopTest(absltest.TestCase):
         memory = compiled.memory_analysis()
 
         self.assertEqual(memory.alias_size_in_bytes, optimizer_bytes + gradient_bytes)
-        self.assertLess(memory.temp_size_in_bytes, optimizer_bytes)
+        self.assertLess(memory.temp_size_in_bytes, optimizer_bytes + gradient_bytes)
 
 
 if __name__ == "__main__":
