@@ -126,7 +126,7 @@ class GrainPipelineTest(absltest.TestCase):
         self._write_jsonl(src, [row])
         _write_chat_message_lengths(
             cache,
-            {(0, i): measure(message) for i, message in enumerate(messages)},
+            {(0, i): measure([message])[0] for i, message in enumerate(messages)},
             src,
             _TEST_MEASUREMENT_CONTRACT,
         )
@@ -364,7 +364,7 @@ class GrainPipelineTest(absltest.TestCase):
             self.assertEqual(
                 stats["supervision"],
                 {
-                    "basis": "assistant_message_length_estimate",
+                    "basis": "loss_mask",
                     "total_measured": 2,
                     "kept": 2,
                     "dropped": 0,
