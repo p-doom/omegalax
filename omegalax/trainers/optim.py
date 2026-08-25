@@ -34,15 +34,16 @@ def apply_normalized_gradient_sum(
         gradient_sum,
     )
     grad_norm = optax.tree.norm(normalized_gradients)
+    loss = loss_sum / jnp.maximum(supervised_tokens, 1.0)
     healthy = (
         jnp.isfinite(supervised_tokens)
         & (supervised_tokens > 0)
-        & jnp.isfinite(loss_sum)
-        & (loss_sum >= 0)
+        & jnp.isfinite(loss)
+        & (loss >= 0)
         & jnp.isfinite(grad_norm)
     )
     optimizer.update(normalized_gradients)
-    return grad_norm, healthy
+    return grad_norm, loss, healthy
 
 
 class MixedPrecisionOptimizer(nnx.ModelAndOptimizer):

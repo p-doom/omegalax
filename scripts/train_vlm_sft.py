@@ -7,10 +7,10 @@ import importlib
 import json
 from pathlib import Path
 
-from absl import app, flags
 import grain
 import jax
 import wandb
+from absl import app, flags
 from transformers import AutoImageProcessor, AutoTokenizer
 
 from omegalax.data.collator_qwen3 import VLMSFTCollator
@@ -23,11 +23,11 @@ from omegalax.data.grain_pipeline import (
     required_epochs_for_batches,
 )
 from omegalax.distributed.mesh import process_local_batch_size
+from omegalax.registry import resolve_hf_repo_id
 from omegalax.trainers import vlm as vlm_trainer
 from omegalax.trainers.checkpoint_utils import ResumeMode
-from omegalax.registry import resolve_hf_repo_id
-from omegalax.trainers.text import startup_log
 from omegalax.trainers.perf import resolve_peak_tflops
+from omegalax.trainers.text import startup_log
 
 FLAGS = flags.FLAGS
 
@@ -107,12 +107,10 @@ flags.DEFINE_bool("log_memory", None, "Log per-process JAX/HBM memory at init an
 flags.DEFINE_enum(
     "resume",
     None,
-    [m.value for m in ResumeMode],
-    "Checkpoint resume policy: 'never' (fresh start), 'if_present' "
-    "(resume if a checkpoint exists at --save_dir, else start fresh — right "
-    "mode for SLURM time-limit resubmits), 'required' (resume; error if no "
-    "checkpoint).",
+    [ResumeMode.NEVER.value, ResumeMode.REQUIRED.value],
+    "Checkpoint policy: 'never' starts fresh; 'required' restores --resume_step.",
 )
+flags.DEFINE_integer("resume_step", None, "Exact checkpoint generation required for resume.")
 flags.DEFINE_integer("pad_id", None, "Padding token id.")
 flags.DEFINE_string("peak_tflops", None, "Peak TFLOPS for MFU calculation.")
 flags.DEFINE_string("wandb_entity", None, "Weights & Biases entity (team/user).")
@@ -161,12 +159,14 @@ flags.DEFINE_boolean(
     "--enable_lora (which already freezes vision).",
 )
 flags.DEFINE_string(
-    "extra_transform", None,
+    "extra_transform",
+    None,
     'A single {"class": "module:ClassName", "kwargs": {...}} object applied '
     "as a grain RandomMap augmentation to the train iterator only. The class "
     "must subclass grain.transforms.RandomMap and be importable in worker "
     "processes — set PYTHONPATH in the launch environment if the module lives "
-    "outside the installed venv.")
+    "outside the installed venv.",
+)
 flags.DEFINE_integer(
     "num_loss_tiles",
     None,
@@ -240,6 +240,11 @@ def _validate_flags() -> None:
     if (FLAGS.data_path is None) == (FLAGS.data_mix is None):
         problems.append("exactly one of {data_path, data_mix} (got neither or both)")
 
+    if FLAGS.resume == ResumeMode.REQUIRED.value and FLAGS.resume_step is None:
+        problems.append("resume_step (required when resume=required)")
+    if FLAGS.resume == ResumeMode.NEVER.value and FLAGS.resume_step is not None:
+        problems.append("resume_step (only valid when resume=required)")
+
     # Both freeze the vision tower, so asking for both is a contradiction, not a no-op.
     if FLAGS.enable_lora and FLAGS.freeze_vision_tower:
         problems.append("enable_lora and freeze_vision_tower are mutually exclusive")
@@ -294,8 +299,7 @@ def _parse_extra_transform(
     module_path, _, class_name = entry["class"].partition(":")
     cls = getattr(importlib.import_module(module_path), class_name)
     assert issubclass(cls, grain.transforms.RandomMap), (
-        f"--extra_transform {entry['class']!r} is not a "
-        "grain.transforms.RandomMap subclass"
+        f"--extra_transform {entry['class']!r} is not a grain.transforms.RandomMap subclass"
     )
     return cls(**entry["kwargs"])
 
@@ -509,6 +513,7 @@ def main(_) -> None:
             keep_latest=FLAGS.keep_latest,
             log_every=FLAGS.log_every,
             resume=resume_mode,
+            resume_step=FLAGS.resume_step,
             pad_id=FLAGS.pad_id,
             peak_tflops=peak_tflops,
             tp_size=FLAGS.tp_size,
