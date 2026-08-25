@@ -14,7 +14,6 @@ from etils import epath
 from flax import nnx
 
 from omegalax.distributed.mesh import ensure_mesh, mesh_rules
-from omegalax.models.shard_config import shard_config_for_mesh
 from omegalax.models.params_utils import (
     Transform,
     assign_to_state_dict,
@@ -25,6 +24,8 @@ from omegalax.models.params_utils import (
     map_to_bonsai_key,
     stoi,
 )
+from omegalax.models.shard_config import shard_config_for_mesh
+
 from .config import Qwen3_5Config, make_config_from_hf
 from .model import Qwen3_5ForConditionalGeneration
 
@@ -390,6 +391,8 @@ def create_qwen3_5_from_safetensors(
     for f in files:
         with safetensors.safe_open(f, framework="numpy") as sf:
             for torch_key in sf.keys():
+                if torch_key.startswith("mtp."):
+                    continue
                 tensor = sf.get_tensor(torch_key)
 
                 # Special: Conv3D patch embedding
