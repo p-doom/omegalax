@@ -236,7 +236,7 @@ def _save_sft_checkpoint(
 ) -> None:
     _require_healthy_at_boundary(healthy, step)
     train_state = _train_state(optimizer, rng, schedule_horizon)
-    _validate_optimizer_generation(train_state, step)
+    _validate_checkpoint_generation(train_state, step)
     save_args = checkpoint_utils.make_grain_save_args(
         train_state,
         input_iter,
@@ -247,20 +247,11 @@ def _save_sft_checkpoint(
     checkpoint_manager.wait_until_finished()
 
 
-def _validate_optimizer_generation(optimizer_state, generation: int) -> None:
-    step = optimizer_state["step"][...]
-    counts = [
-        leaf
-        for leaf in jax.tree.leaves(nnx.pure(optimizer_state["opt_state"]))
-        if leaf.shape == () and jnp.issubdtype(leaf.dtype, jnp.integer)
-    ]
-    if not counts:
-        raise ValueError("Optimizer state has no integer update count")
-    host_step, host_counts = jax.device_get((step, counts))
-    values = [int(host_step), *(int(count) for count in host_counts)]
-    if any(value != generation for value in values):
+def _validate_checkpoint_generation(train_state, generation: int) -> None:
+    optimizer_step = int(jax.device_get(train_state["step"]))
+    if optimizer_step != generation:
         raise ValueError(
-            f"Checkpoint generation {generation} does not match optimizer counters {values}"
+            f"Checkpoint generation {generation} does not match optimizer step {optimizer_step}"
         )
 
 
@@ -293,7 +284,7 @@ def _restore_sft_checkpoint(
         )
     if bytes(restored_identity) != bytes(jax.device_get(model_identity)):
         raise ValueError("Checkpoint model snapshot does not match the requested snapshot")
-    _validate_optimizer_generation(train_state, step)
+    _validate_checkpoint_generation(train_state, step)
     nnx.update(optimizer.model, model_item["state"])
     nnx.update(optimizer.opt_state, train_state["opt_state"])
     optimizer.step[...] = train_state["step"]

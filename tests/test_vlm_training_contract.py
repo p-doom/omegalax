@@ -386,6 +386,21 @@ if sharded.shape != (4, 4) or sorted(s.data.shape for s in sharded.addressable_s
             )
         manager.save.assert_not_called()
 
+    def test_generation_mismatch_rejects_before_save(self):
+        manager = mock.Mock()
+        with self.assertRaisesRegex(ValueError, "generation 1 does not match optimizer step 0"):
+            vlm._save_sft_checkpoint(
+                manager,
+                _make_optimizer(),
+                jax.random.key(0),
+                1,
+                _make_iterator(),
+                100,
+                _MODEL_IDENTITY,
+                jnp.asarray(True),
+            )
+        manager.save.assert_not_called()
+
     def test_cleanup_preserves_primary_and_closes_every_owned_iterator(self):
         first = _Closeable(RuntimeError("first cleanup"))
         second = _Closeable(RuntimeError("second cleanup"))
