@@ -243,6 +243,17 @@ class LocalVLMSnapshotTest(absltest.TestCase):
             with self.assertRaisesRegex(ValueError, "invalid schema"):
                 local_snapshot.open_local_vlm_snapshot(snapshot)
 
+        with tempfile.TemporaryDirectory() as root:
+            snapshot = _make_snapshot(Path(root))
+            _rewrite_manifest(
+                snapshot,
+                lambda value: value["files"].update(
+                    {"omegalax-vlm-snapshot.json": {"sha256": "0" * 64, "size_bytes": 0}}
+                ),
+            )
+            with self.assertRaisesRegex(ValueError, "manifest child name"):
+                local_snapshot.open_local_vlm_snapshot(snapshot)
+
     def test_rejects_invalid_and_oversized_identity_json(self):
         with tempfile.TemporaryDirectory() as root:
             snapshot = _make_snapshot(Path(root))

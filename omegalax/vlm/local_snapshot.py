@@ -156,7 +156,7 @@ def _validate_manifest(value: dict) -> dict[str, tuple[int, str]]:
         if (
             type(name) is not str
             or not name
-            or name in {".", ".."}
+            or name in {".", "..", _MANIFEST_NAME}
             or "/" in name
             or "\x00" in name
         ):
