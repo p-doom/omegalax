@@ -209,7 +209,7 @@ def create_qwen3_vl_from_safetensor_files(
 
     for f in files:
         with safetensors.safe_open(f, framework="numpy") as sf:
-            for torch_key in sf:
+            for torch_key in sf.keys():  # noqa: SIM118
                 if is_moe and handle_moe_key(
                     torch_key,
                     sf.get_tensor,
