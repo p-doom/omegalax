@@ -2,9 +2,47 @@
 
 from __future__ import annotations
 
-from flax import nnx
 import jax
 import jax.numpy as jnp
+import optax
+from flax import nnx
+
+
+@jax.jit
+def initialize_gradient_sum(gradients):
+    return jax.tree.map(lambda gradient: gradient.astype(jnp.float32), gradients)
+
+
+@jax.jit(donate_argnums=0)
+def accumulate_gradient_sum(gradient_sum, gradients):
+    return jax.tree.map(
+        lambda total, gradient: total + gradient.astype(jnp.float32),
+        gradient_sum,
+        gradients,
+    )
+
+
+@nnx.jit(donate_argnums=(0, 1))
+def apply_normalized_gradient_sum(
+    optimizer,
+    gradient_sum,
+    supervised_tokens,
+    loss_sum,
+):
+    normalized_gradients = jax.tree.map(
+        lambda gradient: gradient / jnp.maximum(supervised_tokens, 1.0),
+        gradient_sum,
+    )
+    grad_norm = optax.tree.norm(normalized_gradients)
+    healthy = (
+        jnp.isfinite(supervised_tokens)
+        & (supervised_tokens > 0)
+        & jnp.isfinite(loss_sum)
+        & (loss_sum >= 0)
+        & jnp.isfinite(grad_norm)
+    )
+    optimizer.update(normalized_gradients)
+    return grad_norm, healthy
 
 
 class MixedPrecisionOptimizer(nnx.ModelAndOptimizer):
