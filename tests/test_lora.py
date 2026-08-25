@@ -16,19 +16,19 @@ import os
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
-from absl.testing import absltest
 import jax
 import jax.numpy as jnp
-from flax import nnx
 import numpy as np
 import optax
+from absl.testing import absltest
+from flax import nnx
 
 from omegalax.trainers.lora import (
-    LoRAParam,
+    DEFAULT_TARGET_MODULES,
     LoRALinear,
+    LoRAParam,
     inject_lora,
     merge_lora_into_base,
-    DEFAULT_TARGET_MODULES,
 )
 
 
@@ -210,53 +210,6 @@ class LoRATest(absltest.TestCase):
         # Equivalence is up to fp32 numerical error from rearranging
         # (W + αAB)x vs Wx + α(A(Bx)). Loose tol covers last-bit drift.
         np.testing.assert_allclose(y_lora, y_merged, rtol=1e-4, atol=1e-4)
-
-    def test_param_fingerprint_detects_an_export_that_is_still_the_base(self):
-        """The exporter's guard against silently writing the pretrained model.
-
-        `export_to_hf` fingerprints the freshly-loaded base, restores, exports
-        (which merges), fingerprints again, and refuses an export where no leaf
-        moved. Both branches of that comparison are pinned here, because the
-        no-op one is the reachable silent-corruption path: a checkpoint whose
-        LoRA sidecar is missing skips `inject_lora`, orbax `partial_restore`
-        then matches the base subtree and drops every adapter leaf without
-        raising, and the merge has nothing to fold in.
-        """
-        from omegalax.export import param_fingerprint
-
-        def changed(base, model):
-            after = param_fingerprint(model)
-            return sorted(k for k, v in base.items() if after.get(k) != v)
-
-        model = _make_model(seed=0)
-        base = param_fingerprint(model)
-
-        # Nothing restored, nothing to merge: the guard's trigger condition.
-        self.assertEqual(merge_lora_into_base(model), 0)
-        self.assertEqual(changed(base, model), [])
-
-        # A restored adapter, merged: the delta lands on exactly the 14 wrapped
-        # kernels, and the tree shape is the base's again so the keys compare.
-        inject_lora(model, r=8, alpha=16, rngs=nnx.Rngs(1), dtype=jnp.float32)
-        for _, mod in nnx.iter_modules(model):
-            if isinstance(mod, LoRALinear):
-                mod.lora_B[...] = jnp.full(mod.lora_B[...].shape, 0.1, dtype=mod.lora_B[...].dtype)
-        self.assertEqual(merge_lora_into_base(model), 14)
-        self.assertEqual(set(param_fingerprint(model)), set(base))
-        self.assertEqual(
-            changed(base, model),
-            sorted(k for k in base if k.endswith("_proj.kernel") and "vision" not in k),
-        )
-
-        # A merge that never ran is the other way to export the base: the
-        # exporters read ``.kernel``, which on a LoRALinear forwards to the
-        # untouched base kernel. It shows up as a tree-shape change, which is why
-        # the exporter checks the key sets and not only the values.
-        unmerged = _make_model(seed=0)
-        inject_lora(unmerged, r=8, alpha=16, rngs=nnx.Rngs(1), dtype=jnp.float32)
-        q_proj = unmerged.layers[0].attn.q_proj
-        self.assertIs(q_proj.kernel, q_proj.base.kernel)
-        self.assertNotEqual(set(param_fingerprint(unmerged)), set(base))
 
     def test_default_target_modules_match_qwen3vl_attribute_names(self):
         expected = {

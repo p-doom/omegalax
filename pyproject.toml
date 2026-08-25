@@ -30,20 +30,13 @@ dependencies = [
   # rev every measurement in the repo was taken against. Repoint when the fix is
   # upstreamed.
   "tokamax @ git+https://github.com/p-doom/tokamax.git@d81bc23bc80f01728984bcda5161ff2569cd7cc5",
+  "torch==2.10.* ; platform_system == \"Linux\"",
+  "torchvision ; platform_system == \"Linux\"",
   "transformers==5.15.1",
   "triton", 
   "huggingface-hub",
   "wandb",
   "grain>=0.2.16",
-]
-
-[project.optional-dependencies]
-torch-tests = [
-  "torch==2.10.* ; platform_system == \"Linux\"",
-  # transformers resolves Qwen3VLVideoProcessor through a torchvision backend and
-  # raises on the import when it is absent, so the collator parity test cannot
-  # build the reference processor without it.
-  "torchvision ; platform_system == \"Linux\"",
 ]
 
 [tool.uv]

@@ -23,7 +23,7 @@ from omegalax.data.grain_pipeline import (
     required_epochs_for_batches,
 )
 from omegalax.distributed.mesh import process_local_batch_size
-from omegalax.registry import resolve_hf_repo_id
+from omegalax.registry import resolve_hf_model_source
 from omegalax.trainers import vlm as vlm_trainer
 from omegalax.trainers.checkpoint_utils import ResumeMode
 from omegalax.trainers.perf import resolve_peak_tflops
@@ -32,6 +32,11 @@ from omegalax.trainers.text import startup_log
 FLAGS = flags.FLAGS
 
 flags.DEFINE_string("model_id", None, "HF model id.")
+flags.DEFINE_string(
+    "model_revision",
+    None,
+    "Exact HuggingFace commit for a remote --model_id; omit when --model_id is a local path.",
+)
 flags.DEFINE_string("data_path", None, "Path to compiled Grain chunk-index dataset directory.")
 flags.DEFINE_string(
     "data_mix",
@@ -41,9 +46,6 @@ flags.DEFINE_string(
     "Use this OR --data_path, not both. Mixed sources may freely combine "
     "multimodal and text-only datasets — heterogeneous batches are handled "
     "by the VLM collator and forward path.",
-)
-flags.DEFINE_string(
-    "processor", None, "HF repo to read tokenizer and image config from (defaults to --model_id)."
 )
 flags.DEFINE_string(
     "preprocessor_config",
@@ -349,14 +351,14 @@ def _grain_iter(
 
 def main(_) -> None:
     _validate_flags()
+    model_source = resolve_hf_model_source(FLAGS.model_id, FLAGS.model_revision)
     jax.config.update("jax_compilation_cache_dir", FLAGS.jax_cache_dir)
     jax.distributed.initialize()
     startup_log(f"jax_compilation_cache_dir={FLAGS.jax_cache_dir}")
     startup_log("jax.distributed initialized")
 
-    repo_id = FLAGS.processor or resolve_hf_repo_id(FLAGS.model_id)
-    tokenizer = AutoTokenizer.from_pretrained(repo_id)
-    startup_log(f"loaded tokenizer from {repo_id!r}")
+    tokenizer = AutoTokenizer.from_pretrained(model_source, local_files_only=True)
+    startup_log(f"loaded tokenizer from {str(model_source)!r}")
     assert FLAGS.max_length <= tokenizer.model_max_length, (
         f"--max_length={FLAGS.max_length} exceeds tokenizer.model_max_length={tokenizer.model_max_length}"
     )
@@ -365,8 +367,13 @@ def main(_) -> None:
     if FLAGS.preprocessor_config:
         with open(FLAGS.preprocessor_config) as f:
             ip_kwargs = json.load(f)
-    image_processor = AutoImageProcessor.from_pretrained(repo_id, use_fast=False, **ip_kwargs)
-    startup_log(f"loaded image processor from {repo_id!r}")
+    image_processor = AutoImageProcessor.from_pretrained(
+        model_source,
+        use_fast=False,
+        local_files_only=True,
+        **ip_kwargs,
+    )
+    startup_log(f"loaded image processor from {str(model_source)!r}")
 
     if FLAGS.max_vision_patches_per_sample:
         merge_size = int(image_processor.merge_size)
@@ -467,6 +474,7 @@ def main(_) -> None:
         batch_size=FLAGS.batch_size,
         seq_len=FLAGS.max_length,
         num_steps=FLAGS.num_steps,
+        schedule_horizon=FLAGS.num_steps,
         learning_rate=FLAGS.learning_rate,
         weight_decay=FLAGS.weight_decay,
         warmup_steps=FLAGS.warmup_steps,
@@ -504,7 +512,7 @@ def main(_) -> None:
 
     try:
         _, last_metrics = vlm_trainer.run_sft(
-            FLAGS.model_id,
+            str(model_source),
             train_cfg,
             data_iter,
             save_dir=save_dir,

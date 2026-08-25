@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -10,13 +11,17 @@ from flax import nnx
 from jax.sharding import Mesh, PartitionSpec
 
 from omegalax.distributed.mesh import ensure_mesh
-from omegalax.models.shard_config import axis_rules_for_mesh, shard_config_for_mesh
-from omegalax.models.sharding_runtime import (
-    batch_partition_spec as runtime_batch_partition_spec,
-    init_model_sharded,
-    shard_batch as runtime_shard_batch,
-    shard_batch_dict as runtime_shard_batch_dict,
+from omegalax.models.params_utils import load_hf_config_from_source
+from omegalax.models.qwen3_5 import Qwen3_5Config
+from omegalax.models.qwen3_5 import make_config as make_qwen3_5_config
+from omegalax.models.qwen3_5.config import (
+    is_supported_qwen3_5_model_id,
+    list_supported_qwen3_5_model_ids,
 )
+from omegalax.models.qwen3_5.config import (
+    make_config_from_hf as make_qwen3_5_config_from_hf,
+)
+from omegalax.models.qwen3_5.model import Qwen3_5ForConditionalGeneration
 from omegalax.models.qwen3_vl import Qwen3VL, make_vl_config
 from omegalax.models.qwen3_vl.config import (
     Qwen3VLConfig,
@@ -24,15 +29,19 @@ from omegalax.models.qwen3_vl.config import (
     list_supported_qwen3_vl_model_ids,
     make_vl_config_from_hf,
 )
-from omegalax.models.qwen3_5 import Qwen3_5Config
-from omegalax.models.qwen3_5 import make_config as make_qwen3_5_config
-from omegalax.models.qwen3_5.config import (
-    is_supported_qwen3_5_model_id,
-    list_supported_qwen3_5_model_ids,
-    make_config_from_hf as make_qwen3_5_config_from_hf,
+from omegalax.models.shard_config import axis_rules_for_mesh, shard_config_for_mesh
+from omegalax.models.sharding_runtime import (
+    batch_partition_spec as runtime_batch_partition_spec,
 )
-from omegalax.models.qwen3_5.model import Qwen3_5ForConditionalGeneration
-from omegalax.models.params_utils import load_hf_config_from_source
+from omegalax.models.sharding_runtime import (
+    init_model_sharded,
+)
+from omegalax.models.sharding_runtime import (
+    shard_batch as runtime_shard_batch,
+)
+from omegalax.models.sharding_runtime import (
+    shard_batch_dict as runtime_shard_batch_dict,
+)
 
 VLMConfig = Qwen3_5Config | Qwen3VLConfig
 
@@ -175,20 +184,20 @@ def forward(
 
 
 def load_pretrained(
-    model_id: str,
+    model_source: str | Path,
     *,
     tp_size: int | None = None,
     fsdp_size: int | None = None,
     dp_size: int | None = None,
 ) -> tuple[nnx.Module, VLMConfig]:
     """Load a pretrained VLM from HuggingFace safetensors."""
-    from huggingface_hub import snapshot_download
-
     from omegalax.models.qwen3_5 import create_qwen3_5_from_safetensors
     from omegalax.models.qwen3_vl import create_qwen3_vl_from_safetensors
 
-    local_dir = snapshot_download(model_id)
-    cfg = resolve_config(model_id)
+    local_dir = Path(model_source).expanduser().resolve()
+    if not (local_dir / "config.json").is_file():
+        raise ValueError(f"model_source must be a local HuggingFace model directory: {local_dir}")
+    cfg = resolve_config(str(local_dir))
     # Validates any active mesh matches the requested (tp, fsdp, dp); the loaders
     # below build their own mesh from these sizes, so the return value is unused.
     ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size)
@@ -207,7 +216,7 @@ def load_pretrained(
 
 def make_cache(*_args, **_kwargs):
     """Placeholder for cache creation to keep the interface symmetric."""
-    return None
+    return
 
 
 def decode(*_args, **_kwargs):

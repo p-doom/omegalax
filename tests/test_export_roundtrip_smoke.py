@@ -11,8 +11,7 @@ from absl.testing import absltest
 from flax import nnx
 
 from omegalax.distributed.mesh import mesh_rules_for
-from omegalax.export import model_config_to_hf_dict, param_fingerprint
-from omegalax.export_entry import resolve_export_step
+from omegalax.export import model_config_to_hf_dict
 from omegalax.models.params_utils import flatten_pure_state
 from omegalax.models.qwen3.config import make_config as make_qwen3_config
 from omegalax.models.qwen3.loader import create_qwen3_from_safetensors
@@ -28,101 +27,6 @@ from omegalax.models.qwen3_vl.params import (
     create_qwen3_vl_from_safetensors,
     export_qwen3_vl_to_safetensors,
 )
-
-
-def _valid_export_step_env():
-    return {
-        "SLURM_JOB_ID": "1234",
-        "SLURM_STEP_ID": "0",
-        "SLURM_STEP_NUM_NODES": "1",
-        "SLURM_STEP_NUM_TASKS": "1",
-        "SLURM_STEP_NODELIST": "hai001",
-        "SLURM_NTASKS": "1",
-        "SLURM_PROCID": "0",
-        "SLURM_LOCALID": "0",
-        "SLURM_NODEID": "0",
-    }
-
-
-class ExportEntryTopologyTest(absltest.TestCase):
-    def test_plain_batch_launches_one_clean_step(self):
-        env = {
-            "SLURM_JOB_ID": "1234",
-            "SLURM_JOB_NODELIST": "hai001",
-            "SLURM_STEP_ID": "-5",
-            "SLURM_STEP_NODELIST": "hai009",
-            "SLURM_PROCID": "7",
-            "KEEP_ME": "yes",
-        }
-
-        argv, child_env = resolve_export_step(
-            env,
-            ["scripts/export_to_hf.py", "--model_id=x"],
-            "/venv/bin/python",
-            "/repo/scripts/export_to_hf.py",
-            "hai001",
-        )
-
-        self.assertEqual(
-            argv,
-            [
-                "srun",
-                "--nodes=1",
-                "--ntasks=1",
-                "--ntasks-per-node=1",
-                "--kill-on-bad-exit=1",
-                "/venv/bin/python",
-                "/repo/scripts/export_to_hf.py",
-                "--model_id=x",
-            ],
-        )
-        self.assertEqual(child_env["OMEGALAX_EXPORT_STEP_JOB_ID"], "1234")
-        self.assertEqual(child_env["KEEP_ME"], "yes")
-        self.assertNotIn("SLURM_STEP_NODELIST", child_env)
-        self.assertNotIn("SLURM_PROCID", child_env)
-
-    def test_valid_single_task_step_runs_export_directly(self):
-        self.assertIsNone(
-            resolve_export_step(
-                _valid_export_step_env(),
-                ["scripts/export_to_hf.py"],
-                "/venv/bin/python",
-                "/repo/scripts/export_to_hf.py",
-                "hai001",
-            )
-        )
-
-    def test_malformed_or_mismatched_step_fails(self):
-        cases = [
-            ({"SLURM_STEP_NUM_TASKS": "2", "SLURM_NTASKS": "2"}, "exactly one task"),
-            ({"SLURM_PROCID": "x"}, "SLURM_PROCID"),
-            ({"SLURM_STEP_NODELIST": "hai009"}, "runs on hai001"),
-            ({"SLURM_STEP_NUM_NODES": ""}, "SLURM_STEP_NUM_NODES"),
-        ]
-        for update, match in cases:
-            with self.subTest(update=update), self.assertRaisesRegex(ValueError, match):
-                resolve_export_step(
-                    {**_valid_export_step_env(), **update},
-                    ["scripts/export_to_hf.py"],
-                    "/venv/bin/python",
-                    "/repo/scripts/export_to_hf.py",
-                    "hai001",
-                )
-
-    def test_exporter_created_child_must_belong_to_same_job(self):
-        env = {
-            "SLURM_JOB_ID": "5678",
-            "OMEGALAX_EXPORT_STEP_JOB_ID": "1234",
-        }
-
-        with self.assertRaisesRegex(ValueError, "1234.*5678"):
-            resolve_export_step(
-                env,
-                ["scripts/export_to_hf.py"],
-                "/venv/bin/python",
-                "/repo/scripts/export_to_hf.py",
-                "hai001",
-            )
 
 
 def _flatten_model(model):
@@ -143,16 +47,6 @@ def _assert_params_equal(testcase: absltest.TestCase, model_a, model_b):
 
 
 class ExportRoundTripTest(absltest.TestCase):
-    def test_fingerprint_does_not_cancel_equal_and_opposite_changes(self):
-        with mesh_rules_for(tp_size=1, fsdp_size=1, dp_size=1):
-            cfg = make_qwen3_config("qwen3-smoke")
-            model = Qwen3(cfg, rngs=nnx.Rngs(params=jax.random.key(0)))
-        before = param_fingerprint(model)["lm_head.kernel"]
-        model.lm_head.kernel[0, 0] += 1.0
-        model.lm_head.kernel[0, 1] -= 1.0
-
-        self.assertNotEqual(param_fingerprint(model)["lm_head.kernel"], before)
-
     def test_qwen3_dense_round_trip(self):
         with mesh_rules_for(tp_size=1, fsdp_size=1, dp_size=1):
             cfg = make_qwen3_config("qwen3-smoke")

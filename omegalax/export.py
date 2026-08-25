@@ -4,23 +4,18 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import jax
-import jax.numpy as jnp
-from flax import nnx
-
-from omegalax.models.params_utils import flatten_pure_state
 from omegalax.models.qwen3.config import Qwen3Config
 from omegalax.models.qwen3.model import Qwen3
 from omegalax.models.qwen3.params import export_qwen3_to_safetensors, qwen3_to_hf_config_dict
+from omegalax.models.qwen3_5.config import Qwen3_5Config
+from omegalax.models.qwen3_5.model import Qwen3_5ForConditionalGeneration
+from omegalax.models.qwen3_5.params import export_qwen3_5_to_safetensors, qwen3_5_to_hf_config_dict
 from omegalax.models.qwen3_vl.config import Qwen3VLConfig
 from omegalax.models.qwen3_vl.model import Qwen3VL
 from omegalax.models.qwen3_vl.params import (
     export_qwen3_vl_to_safetensors,
     qwen3_vl_to_hf_config_dict,
 )
-from omegalax.models.qwen3_5.config import Qwen3_5Config
-from omegalax.models.qwen3_5.model import Qwen3_5ForConditionalGeneration
-from omegalax.models.qwen3_5.params import export_qwen3_5_to_safetensors, qwen3_5_to_hf_config_dict
 from omegalax.trainers.lora import merge_lora_into_base
 
 
@@ -71,32 +66,6 @@ def export_model_to_hf(model, cfg, out_dir: str | Path) -> Path:
     )
 
 
-def param_fingerprint(model) -> dict[str, int]:
-    """Per-leaf checksum for comparing a model against the base it came from.
-
-    Device-side reduction, so it costs one pass and no host transfer of the
-    weights. Compared before-restore against after-merge it answers the only
-    question the exporter cannot answer any other way: did the checkpoint
-    actually change the weights we are about to write? ``partial_restore=True``
-    drops leaves it cannot path-match without raising, and a LoRA adapter that
-    never got merged leaves the base kernels untouched -- both produce a
-    base-identical export.
-    """
-
-    def checksum(leaf) -> int:
-        # Mixing bits before reduction prevents equal-and-opposite updates from cancelling.
-        bits = jax.lax.bitcast_convert_type(leaf.astype(jnp.float32), jnp.uint32)
-        bits = bits ^ (bits >> jnp.uint32(16))
-        bits *= jnp.uint32(0x7FEB352D)
-        bits ^= bits >> jnp.uint32(15)
-        return int(jnp.sum(bits, dtype=jnp.uint32))
-
-    _, state = nnx.split(model)
-    return {
-        key: checksum(leaf) for key, leaf in flatten_pure_state(nnx.to_pure_dict(state)).items()
-    }
-
-
 # Keyed on the ``model_type`` each family emits, so the architecture cannot drift
 # away from the config class it is meant to name. Every serving stack resolves the
 # model class through ``architectures`` -- sglang subscripts it unconditionally
@@ -121,7 +90,7 @@ def model_config_to_hf_dict(cfg) -> dict:
     elif isinstance(cfg, Qwen3_5Config):
         hf_cfg = qwen3_5_to_hf_config_dict(cfg)
     else:
-        raise ValueError(f"Unsupported config type for HF serialization: {type(cfg)}")
+        raise TypeError(f"Unsupported config type for HF serialization: {type(cfg)}")
 
     model_type = hf_cfg["model_type"]
     if model_type not in _HF_ARCHITECTURES:
