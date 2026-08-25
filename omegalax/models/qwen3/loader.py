@@ -56,10 +56,7 @@ def _assert_config(cfg: Qwen3Config, hf_cfg: dict[str, Any]):
     _require("rope_theta", cfg.rope_theta, rope_theta)
 
     if cfg.is_moe:
-        num_experts = hf_cfg.get("num_experts", hf_cfg.get("num_local_experts"))
-        if num_experts is None:
-            raise ValueError("Missing 'num_experts' (or alias 'num_local_experts') in HF config")
-        _require("num_experts", cfg.num_experts, num_experts)
+        _require("num_experts", cfg.num_experts, hf_cfg["num_experts"])
         _require("num_experts_per_tok", cfg.num_experts_per_tok, hf_cfg["num_experts_per_tok"])
         _require(
             "moe_intermediate_size", cfg.moe_intermediate_size, hf_cfg["moe_intermediate_size"]
