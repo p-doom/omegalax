@@ -7,6 +7,7 @@ import datetime
 import enum
 import gc
 import json
+import math
 import os
 import stat
 from pathlib import Path
@@ -30,7 +31,7 @@ from omegalax.models.qwen3_vl.model import DECODER_LAYER_REMAT
 from omegalax.models.qwen3_vl.vision import VISION_BLOCK_REMAT
 from omegalax.trainers import checkpoint_utils
 from omegalax.trainers.lora import LoRAParam, inject_lora
-from omegalax.trainers.loss import chunked_cross_entropy_loss, chunked_cross_entropy_loss_sum
+from omegalax.trainers.loss import chunked_cross_entropy_loss_sum
 from omegalax.trainers.lr_schedule import build_lr_schedule
 from omegalax.trainers.optim import (
     MixedPrecisionOptimizer,
@@ -751,7 +752,7 @@ def make_sft_eval_step(cfg, pad_id: int = 0, *, num_loss_tiles: int = 4):
     """Build a JIT-compiled VLM SFT eval step (forward only, no gradients)."""
 
     @nnx.jit
-    def sft_eval_step(model: nnx.Module, batch: dict[str, jax.Array]):
+    def compiled_sft_eval_step(model: nnx.Module, batch: dict[str, jax.Array]):
         token_ids_BT = batch["token_ids_BT"]
         attention_mask_BT = batch["attention_mask_BT"]
         loss_mask_BT = batch["loss_mask_BT"]
@@ -772,19 +773,34 @@ def make_sft_eval_step(cfg, pad_id: int = 0, *, num_loss_tiles: int = 4):
             position_ids_ZBT=position_ids_ZBT,
         )
         lm_weight = model.output_weight()
-        loss = (
-            chunked_cross_entropy_loss(
-                hidden_BTD,
-                lm_weight,
-                token_ids_BT,
-                loss_mask_BT,
-                num_tiles=num_loss_tiles,
-                logits_out_sharding=cfg.shd_cfg.logits_btv,
-            )
-            + aux_loss
+        ce_loss_sum, supervised_tokens = chunked_cross_entropy_loss_sum(
+            hidden_BTD,
+            lm_weight,
+            token_ids_BT,
+            loss_mask_BT,
+            num_tiles=num_loss_tiles,
+            logits_out_sharding=cfg.shd_cfg.logits_btv,
         )
-        supervised_tokens = jnp.sum(loss_mask_BT[:, 1:].astype(jnp.float32))
-        return loss, supervised_tokens
+        return ce_loss_sum, supervised_tokens, aux_loss
+
+    def sft_eval_step(model: nnx.Module, batch: dict[str, jax.Array]):
+        ce_loss_sum, supervised_tokens, aux_loss = jax.device_get(
+            compiled_sft_eval_step(model, batch)
+        )
+        supervised_token_count = float(supervised_tokens)
+        if not math.isfinite(supervised_token_count):
+            raise FloatingPointError("VLM evaluation supervised-token count is non-finite.")
+        if supervised_token_count <= 0:
+            raise ValueError("VLM evaluation batch has no supervised next-token targets.")
+        if not supervised_token_count.is_integer():
+            raise ValueError("VLM evaluation supervised-token count must be an integer.")
+        ce_loss_sum = float(ce_loss_sum)
+        if not math.isfinite(ce_loss_sum):
+            raise FloatingPointError("VLM evaluation CE loss sum is non-finite.")
+        aux_loss = float(aux_loss)
+        if not math.isfinite(aux_loss):
+            raise FloatingPointError("VLM evaluation auxiliary loss is non-finite.")
+        return ce_loss_sum, int(supervised_token_count), aux_loss
 
     return sft_eval_step
 
@@ -1265,19 +1281,30 @@ def _run_sft(
 
         if eval_step is not None and val_every and step % val_every == 0:
             require_healthy_optimizer_status(optimizer_status, OptimizerStatusBoundary.VALIDATION)
-            total_val_loss = 0.0
+            total_val_ce_loss_sum = 0.0
             total_val_sup_tokens = 0.0
+            total_val_aux_loss = 0.0
             for _ in range(val_steps):
                 val_batch = next(val_data_iter)
                 pop_source_ids(val_batch)
                 val_batch = vlm_api.shard_batch_dict(val_batch, model_cfg, mesh)
-                val_loss, val_sup_tokens = eval_step(optimizer.model, val_batch)
-                total_val_loss += float(val_loss)
+                val_ce_loss_sum, val_sup_tokens, val_aux_loss = eval_step(
+                    optimizer.model, val_batch
+                )
+                total_val_ce_loss_sum += float(val_ce_loss_sum)
                 total_val_sup_tokens += float(val_sup_tokens)
-            avg_val_loss = total_val_loss / val_steps
+                total_val_aux_loss += float(val_aux_loss)
+            avg_val_ce_loss = total_val_ce_loss_sum / total_val_sup_tokens
+            avg_val_aux_loss = total_val_aux_loss / val_steps
+            avg_val_loss = avg_val_ce_loss + avg_val_aux_loss
             if wandb_run is not None and is_primary_process:
                 wandb_run.log(
-                    {"val/loss": avg_val_loss, "val/sup_tokens": total_val_sup_tokens},
+                    {
+                        "val/loss": avg_val_loss,
+                        "val/ce_loss": avg_val_ce_loss,
+                        "val/aux_loss": avg_val_aux_loss,
+                        "val/sup_tokens": total_val_sup_tokens,
+                    },
                     step=step,
                 )
 
