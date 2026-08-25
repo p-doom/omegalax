@@ -5,6 +5,7 @@ from __future__ import annotations
 import gc
 import importlib
 import json
+import tempfile
 from pathlib import Path
 
 import grain
@@ -13,25 +14,27 @@ import wandb
 from absl import app, flags
 from transformers import AutoImageProcessor, AutoTokenizer
 
+from omegalax.data.artifact_contract import make_measurement_contract
 from omegalax.data.collator_qwen3 import VLMSFTCollator
 from omegalax.data.grain_pipeline import (
     MixSource,
+    load_compiled_metadata,
     make_grain_iterator,
     make_grain_multiprocessing_options,
     make_grain_read_options,
     parse_data_mix,
     required_epochs_for_batches,
 )
-from omegalax.distributed.mesh import ensure_mesh, process_local_batch_size
-from omegalax.registry import resolve_hf_repo_id
+from omegalax.distributed.mesh import ensure_mesh
 from omegalax.trainers import vlm as vlm_trainer
 from omegalax.trainers.checkpoint_utils import ResumeMode
 from omegalax.trainers.perf import resolve_peak_tflops
 from omegalax.trainers.text import startup_log
+from omegalax.vlm.local_snapshot import LocalVLMSnapshot, open_local_vlm_snapshot
 
 FLAGS = flags.FLAGS
 
-flags.DEFINE_string("model_id", None, "HF model id.")
+flags.DEFINE_string("model_snapshot", None, "Absolute sealed local VLM snapshot directory.")
 flags.DEFINE_string("data_path", None, "Path to compiled Grain chunk-index dataset directory.")
 flags.DEFINE_string(
     "data_mix",
@@ -41,14 +44,6 @@ flags.DEFINE_string(
     "Use this OR --data_path, not both. Mixed sources may freely combine "
     "multimodal and text-only datasets — heterogeneous batches are handled "
     "by the VLM collator and forward path.",
-)
-flags.DEFINE_string(
-    "processor", None, "HF repo to read tokenizer and image config from (defaults to --model_id)."
-)
-flags.DEFINE_string(
-    "preprocessor_config",
-    None,
-    "Path to JSON file whose keys override default image processor config.",
 )
 flags.DEFINE_integer("max_length", None, "Maximum sequence length.")
 flags.DEFINE_integer("num_steps", None, "Number of training steps.")
@@ -187,7 +182,7 @@ flags.DEFINE_enum(
 )
 
 _REQUIRED = [
-    "model_id",
+    "model_snapshot",
     "max_length",
     "num_steps",
     "schedule_horizon",
@@ -321,8 +316,6 @@ def _grain_iter(
     shuffle: bool,
     seed: int,
     num_batches: int | None,
-    dp_size: int,
-    fsdp_size: int,
     extra_transform: grain.transforms.RandomMap | None,
 ):
     if len(sources) == 1 and num_batches is not None:
@@ -330,8 +323,8 @@ def _grain_iter(
             sources[0].path,
             batch_size=per_process_batch_size,
             num_batches=num_batches,
-            dp_size=dp_size,
-            fsdp_size=fsdp_size,
+            dp_size=1,
+            fsdp_size=1,
         )
     else:
         num_epochs = None
@@ -350,35 +343,42 @@ def _grain_iter(
             num_workers=FLAGS.grain_workers,
             per_worker_buffer_size=FLAGS.grain_worker_buffer_size,
         ),
-        dp_size=dp_size,
-        fsdp_size=fsdp_size,
+        dp_size=1,
+        fsdp_size=1,
         extra_transform=extra_transform,
     )
 
 
-def main(_) -> None:
-    _validate_flags()
-    jax.config.update("jax_compilation_cache_dir", FLAGS.jax_cache_dir)
-    jax.distributed.initialize()
-    startup_log(f"jax_compilation_cache_dir={FLAGS.jax_cache_dir}")
-    startup_log("jax.distributed initialized")
-    ensure_mesh(tp_size=FLAGS.tp_size, fsdp_size=FLAGS.fsdp_size, dp_size=FLAGS.dp_size)
+def _require_dataset_measurement_contract(paths: list[str], expected: dict) -> None:
+    for path in paths:
+        actual = load_compiled_metadata(path)["measurement_contract"]
+        if actual != expected:
+            raise ValueError(
+                f"Compiled dataset {path!r} does not match the sealed snapshot preprocessing"
+            )
 
-    repo_id = FLAGS.processor or resolve_hf_repo_id(FLAGS.model_id)
-    tokenizer = AutoTokenizer.from_pretrained(repo_id)
-    startup_log(f"loaded tokenizer from {repo_id!r}")
+
+def _run(model_snapshot: LocalVLMSnapshot, identity_dir: Path) -> None:
+    peak_tflops = resolve_peak_tflops(FLAGS.peak_tflops)
+    tokenizer = AutoTokenizer.from_pretrained(identity_dir, local_files_only=True)
+    startup_log(f"loaded tokenizer from sealed snapshot {model_snapshot.sha256}")
     if FLAGS.max_length > tokenizer.model_max_length:
         raise ValueError(
             f"--max_length={FLAGS.max_length} exceeds "
             f"tokenizer.model_max_length={tokenizer.model_max_length}"
         )
 
-    ip_kwargs: dict = {}
-    if FLAGS.preprocessor_config:
-        with open(FLAGS.preprocessor_config) as f:
-            ip_kwargs = json.load(f)
-    image_processor = AutoImageProcessor.from_pretrained(repo_id, use_fast=False, **ip_kwargs)
-    startup_log(f"loaded image processor from {repo_id!r}")
+    image_processor = AutoImageProcessor.from_pretrained(
+        identity_dir,
+        use_fast=False,
+        local_files_only=True,
+    )
+    startup_log("loaded image processor from sealed snapshot")
+    measurement_contract = make_measurement_contract(
+        tokenizer=tokenizer,
+        image_processor=image_processor,
+        preprocessor_config_path=None,
+    )
 
     if FLAGS.max_vision_patches_per_sample:
         merge_size = int(image_processor.merge_size)
@@ -413,14 +413,14 @@ def main(_) -> None:
     )
     startup_log("built VLMSFTCollator")
     train_sources = _resolve_train_sources()
-    per_process_batch = process_local_batch_size(
-        FLAGS.batch_size,
-        dp_size=FLAGS.dp_size,
-        fsdp_size=FLAGS.fsdp_size,
-    )
+    dataset_paths = [source.path for source in train_sources]
+    if FLAGS.val_data_path:
+        dataset_paths.append(FLAGS.val_data_path)
+    _require_dataset_measurement_contract(dataset_paths, measurement_contract)
+    per_process_batch = FLAGS.batch_size
     sources_repr = ", ".join(f"{s.path}@{s.weight:g}" for s in train_sources)
     startup_log(
-        f"model_id={FLAGS.model_id!r} data_sources=[{sources_repr}] "
+        f"model_snapshot_sha256={model_snapshot.sha256} data_sources=[{sources_repr}] "
         f"jax_compilation_cache_dir={FLAGS.jax_cache_dir!r} "
         f"process_count={jax.process_count()} local_device_count={jax.local_device_count()}"
     )
@@ -440,8 +440,6 @@ def main(_) -> None:
         shuffle=True,
         seed=FLAGS.seed,
         num_batches=None,
-        dp_size=FLAGS.dp_size,
-        fsdp_size=FLAGS.fsdp_size,
         extra_transform=extra_transform,
     )
     startup_log("built train grain DataLoader iterator")
@@ -456,11 +454,7 @@ def main(_) -> None:
             per_process_batch,
             shuffle=False,
             seed=FLAGS.seed,
-            num_batches=max(
-                1, (FLAGS.num_steps // max(FLAGS.val_every or FLAGS.num_steps, 1)) * FLAGS.val_steps
-            ),
-            dp_size=FLAGS.dp_size,
-            fsdp_size=FLAGS.fsdp_size,
+            num_batches=FLAGS.val_steps,
             extra_transform=None,
         )
         startup_log(f"built val grain DataLoader iterator from {FLAGS.val_data_path!r}")
@@ -488,27 +482,37 @@ def main(_) -> None:
     )
     resume_mode = ResumeMode(FLAGS.resume)
     save_dir = Path(FLAGS.save_dir)
-    peak_tflops = resolve_peak_tflops(FLAGS.peak_tflops)
 
     wandb_run = None
-    if FLAGS.wandb_project and jax.process_index() == 0:
-        wandb_run = wandb.init(
-            entity=FLAGS.wandb_entity,
-            project=FLAGS.wandb_project,
-            group=FLAGS.wandb_group,
-            name=FLAGS.wandb_name,
-            tags=FLAGS.wandb_tags or None,
-            config=flags.FLAGS.flag_values_dict(),
-        )
+    try:
+        if FLAGS.wandb_project and jax.process_index() == 0:
+            wandb_run = wandb.init(
+                entity=FLAGS.wandb_entity,
+                project=FLAGS.wandb_project,
+                group=FLAGS.wandb_group,
+                name=FLAGS.wandb_name,
+                tags=FLAGS.wandb_tags or None,
+                config=flags.FLAGS.flag_values_dict(),
+            )
+    except BaseException as active_error:
+        for iterator in (val_data_iter, data_iter):
+            close = getattr(iterator, "close", None)
+            if close is not None:
+                try:
+                    close()
+                except BaseException as cleanup_error:  # noqa: BLE001
+                    active_error.add_note(f"Iterator cleanup also failed: {cleanup_error!r}")
+        raise
     if FLAGS.gc_period:
         gc.disable()
         startup_log(
             f"gc_period={FLAGS.gc_period}: Python GC disabled, will collect every {FLAGS.gc_period} steps"
         )
 
+    active_error = None
     try:
         _, last_metrics = vlm_trainer.run_sft(
-            FLAGS.model_id,
+            model_snapshot,
             train_cfg,
             data_iter,
             save_dir=save_dir,
@@ -532,16 +536,51 @@ def main(_) -> None:
             log_memory=FLAGS.log_memory,
             tokamax_cache_dir=FLAGS.tokamax_cache_dir,
         )
+    except BaseException as error:
+        active_error = error
+        raise
     finally:
+        cleanup_errors = []
         if FLAGS.gc_period:
-            gc.enable()
-            print("Training completed, re-enabling Python GC")
+            try:
+                gc.enable()
+            except BaseException as error:  # noqa: BLE001
+                cleanup_errors.append(error)
 
         if wandb_run is not None:
-            wandb_run.finish()
+            try:
+                wandb_run.finish()
+            except BaseException as error:  # noqa: BLE001
+                cleanup_errors.append(error)
+        if active_error is not None:
+            for error in cleanup_errors:
+                active_error.add_note(f"Training script cleanup also failed: {error!r}")
+        elif len(cleanup_errors) == 1:
+            raise cleanup_errors[0]
+        elif cleanup_errors:
+            raise BaseExceptionGroup("Training script cleanup failed", cleanup_errors)
 
     if last_metrics:
         print(f"finished step={int(last_metrics['step'])} loss={last_metrics['loss']:.4f}")
+
+
+def main(_) -> None:
+    _validate_flags()
+    jax.config.update("jax_compilation_cache_dir", FLAGS.jax_cache_dir)
+    jax.distributed.initialize()
+    startup_log(f"jax_compilation_cache_dir={FLAGS.jax_cache_dir}")
+    startup_log("jax.distributed initialized")
+    if jax.process_count() != 1:
+        raise ValueError("VLM training requires one JAX process")
+    ensure_mesh(tp_size=FLAGS.tp_size, fsdp_size=FLAGS.fsdp_size, dp_size=FLAGS.dp_size)
+
+    with (
+        open_local_vlm_snapshot(FLAGS.model_snapshot) as model_snapshot,
+        tempfile.TemporaryDirectory(prefix="omegalax-vlm-identity-") as identity_tmp,
+    ):
+        identity_dir = Path(identity_tmp)
+        model_snapshot.copy_identity_assets(identity_dir)
+        _run(model_snapshot, identity_dir)
 
 
 if __name__ == "__main__":

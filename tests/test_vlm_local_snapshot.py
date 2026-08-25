@@ -112,6 +112,34 @@ with open_local_vlm_snapshot(sys.argv[1]) as snapshot:
                 result = subprocess.run(command, capture_output=True, text=True, check=False)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_training_dataset_identity_consumer_survives_optimized_mode(self):
+        code = """
+from unittest import mock
+from scripts import train_vlm_sft
+expected = {'version': 1, 'tokenizer_sha256': 'a' * 64,
+            'processor_sha256': 'b' * 64, 'preprocessor_sha256': None}
+with mock.patch.object(train_vlm_sft, 'load_compiled_metadata',
+                       return_value={'measurement_contract': expected}):
+    train_vlm_sft._require_dataset_measurement_contract(['/dataset'], expected)
+with mock.patch.object(train_vlm_sft, 'load_compiled_metadata',
+                       return_value={'measurement_contract': {**expected,
+                                     'tokenizer_sha256': 'c' * 64}}):
+    try:
+        train_vlm_sft._require_dataset_measurement_contract(['/dataset'], expected)
+    except ValueError as error:
+        if 'sealed snapshot preprocessing' not in str(error):
+            raise
+    else:
+        raise RuntimeError('mismatched compiled dataset was accepted')
+"""
+        for optimized in (False, True):
+            command = [sys.executable]
+            if optimized:
+                command.append("-O")
+            command.extend(["-c", code])
+            result = subprocess.run(command, capture_output=True, text=True, check=False)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
 
 if __name__ == "__main__":
     absltest.main()

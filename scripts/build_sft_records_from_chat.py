@@ -14,7 +14,8 @@ max_length / overflow_mode never re-tokenizes.
 
 from __future__ import annotations
 
-import json
+import tempfile
+from pathlib import Path
 
 from absl import app, flags
 from transformers import AutoImageProcessor, AutoTokenizer
@@ -22,7 +23,7 @@ from transformers import AutoImageProcessor, AutoTokenizer
 from omegalax.data.artifact_contract import make_measurement_contract
 from omegalax.data.collator_qwen3 import make_message_length_fn
 from omegalax.data.grain_pipeline import build_records_from_chat
-from omegalax.registry import resolve_hf_repo_id
+from omegalax.vlm.local_snapshot import open_local_vlm_snapshot
 
 FLAGS = flags.FLAGS
 
@@ -31,16 +32,10 @@ flags.DEFINE_string(
     "out_dir", None, "Output directory for the inline-records dataset.", required=True
 )
 flags.DEFINE_string(
-    "model_id", None, "Model id used to resolve the default tokenizer.", required=True
-)
-flags.DEFINE_string("tokenizer", None, "HF tokenizer name/path (defaults to --model_id).")
-flags.DEFINE_string(
-    "processor", None, "HF repo to read image config from when the dataset contains images."
-)
-flags.DEFINE_string(
-    "preprocessor_config",
+    "model_snapshot",
     None,
-    "Path to JSON file whose keys override default image processor config.",
+    "Absolute sealed local VLM snapshot directory.",
+    required=True,
 )
 flags.DEFINE_integer("max_length", None, "Maximum sequence length.", required=True)
 flags.DEFINE_integer("records_per_shard", 100_000, "Records per output shard.")
@@ -85,27 +80,19 @@ flags.DEFINE_string(
 )
 
 
-def main(_) -> None:
-    tokenizer_name = FLAGS.tokenizer or resolve_hf_repo_id(FLAGS.model_id)
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
-
-    image_processor = None
-    processor_name = None
-    if FLAGS.processor:
-        processor_name = FLAGS.processor
-        ip_kwargs: dict = {}
-        if FLAGS.preprocessor_config:
-            with open(FLAGS.preprocessor_config) as f:
-                ip_kwargs = json.load(f)
-        image_processor = AutoImageProcessor.from_pretrained(
-            processor_name, use_fast=False, **ip_kwargs
-        )
+def _run(snapshot, identity_dir: Path) -> None:
+    tokenizer = AutoTokenizer.from_pretrained(identity_dir, local_files_only=True)
+    image_processor = AutoImageProcessor.from_pretrained(
+        identity_dir,
+        use_fast=False,
+        local_files_only=True,
+    )
 
     measure_message = make_message_length_fn(tokenizer, image_processor)
     measurement_contract = make_measurement_contract(
         tokenizer=tokenizer,
         image_processor=image_processor,
-        preprocessor_config_path=FLAGS.preprocessor_config,
+        preprocessor_config_path=None,
     )
     out_dir = build_records_from_chat(
         FLAGS.data_path,
@@ -120,14 +107,19 @@ def main(_) -> None:
         measurement_contract=measurement_contract,
         val_fraction=FLAGS.val_fraction,
         split=FLAGS.split,
-        profile_metadata={
-            "model_id": FLAGS.model_id,
-            "tokenizer": tokenizer_name,
-            "processor": processor_name,
-            "preprocessor_config": FLAGS.preprocessor_config,
-        },
+        profile_metadata={"model_snapshot_sha256": snapshot.sha256},
     )
     print(out_dir)
+
+
+def main(_) -> None:
+    with (
+        open_local_vlm_snapshot(FLAGS.model_snapshot) as snapshot,
+        tempfile.TemporaryDirectory(prefix="omegalax-vlm-identity-") as identity_tmp,
+    ):
+        identity_dir = Path(identity_tmp)
+        snapshot.copy_identity_assets(identity_dir)
+        _run(snapshot, identity_dir)
 
 
 if __name__ == "__main__":

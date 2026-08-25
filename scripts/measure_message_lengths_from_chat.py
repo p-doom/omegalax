@@ -14,7 +14,7 @@ measured lengths are byte-identical to what the in-line measurement produces.
 
 from __future__ import annotations
 
-import json
+import tempfile
 from pathlib import Path
 
 from absl import app, flags
@@ -26,7 +26,7 @@ from omegalax.data.grain_pipeline import (
     MESSAGE_LENGTHS_FILENAME,
     measure_message_lengths_from_chat,
 )
-from omegalax.registry import resolve_hf_repo_id
+from omegalax.vlm.local_snapshot import open_local_vlm_snapshot
 
 FLAGS = flags.FLAGS
 
@@ -38,35 +38,23 @@ flags.DEFINE_string(
     required=True,
 )
 flags.DEFINE_string(
-    "model_id", None, "Model id used to resolve the default tokenizer.", required=True
-)
-flags.DEFINE_string("tokenizer", None, "HF tokenizer name/path (defaults to --model_id).")
-flags.DEFINE_string(
-    "processor", None, "HF repo to read image config from when the dataset contains images."
-)
-flags.DEFINE_string(
-    "preprocessor_config",
+    "model_snapshot",
     None,
-    "Path to JSON file whose keys override default image processor config.",
+    "Absolute sealed local VLM snapshot directory.",
+    required=True,
 )
 flags.DEFINE_integer(
     "num_workers", 2, "Number of parallel workers for message length measurement.", lower_bound=2
 )
 
 
-def main(_) -> None:
-    tokenizer_name = FLAGS.tokenizer or resolve_hf_repo_id(FLAGS.model_id)
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
-
-    image_processor = None
-    if FLAGS.processor:
-        ip_kwargs: dict = {}
-        if FLAGS.preprocessor_config:
-            with open(FLAGS.preprocessor_config) as f:
-                ip_kwargs = json.load(f)
-        image_processor = AutoImageProcessor.from_pretrained(
-            FLAGS.processor, use_fast=False, **ip_kwargs
-        )
+def _run(identity_dir: Path) -> None:
+    tokenizer = AutoTokenizer.from_pretrained(identity_dir, local_files_only=True)
+    image_processor = AutoImageProcessor.from_pretrained(
+        identity_dir,
+        use_fast=False,
+        local_files_only=True,
+    )
 
     out_dir = Path(FLAGS.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -74,7 +62,7 @@ def main(_) -> None:
     measurement_contract = make_measurement_contract(
         tokenizer=tokenizer,
         image_processor=image_processor,
-        preprocessor_config_path=FLAGS.preprocessor_config,
+        preprocessor_config_path=None,
     )
     out_path = measure_message_lengths_from_chat(
         FLAGS.data_path,
@@ -84,6 +72,16 @@ def main(_) -> None:
         num_workers=FLAGS.num_workers,
     )
     print(out_path)
+
+
+def main(_) -> None:
+    with (
+        open_local_vlm_snapshot(FLAGS.model_snapshot) as snapshot,
+        tempfile.TemporaryDirectory(prefix="omegalax-vlm-identity-") as identity_tmp,
+    ):
+        identity_dir = Path(identity_tmp)
+        snapshot.copy_identity_assets(identity_dir)
+        _run(identity_dir)
 
 
 if __name__ == "__main__":

@@ -87,7 +87,18 @@ uv run scripts/build_sft_chunk_index.py \
   --max-length 512
 ```
 
-If the dataset contains image content, also pass `--processor` (and optionally `--preprocessor-config`) when building the chunk index.
+Seal an already-local Hugging Face VLM directory before compiling or training:
+```bash
+uv run scripts/seal_vlm_snapshot.py \
+  --source-dir /models/Qwen3-VL-2B-Instruct \
+  --out-dir /models/Qwen3-VL-2B-Instruct.omegalax
+
+uv run scripts/build_sft_records_from_chat.py \
+  --model-snapshot /models/Qwen3-VL-2B-Instruct.omegalax \
+  --data-path /path/to/chat.jsonl \
+  --out-dir /path/to/vlm-train-records \
+  --max-length 512
+```
 
 Run text SFT from the compiled Grain chunk-index dataset:
 ```bash
@@ -103,19 +114,22 @@ uv run scripts/train_text_sft.py \
 Run VLM SFT from the compiled Grain chunk-index dataset:
 ```bash
 uv run scripts/train_vlm_sft.py \
-  --model-id qwen3-vl-smoke \
-  --data-path /path/to/train_chunks \
-  --processor Qwen/Qwen3-VL-2B-Instruct \
+  --model-snapshot /models/Qwen3-VL-2B-Instruct.omegalax \
+  --data-path /path/to/vlm-train-records \
   --max-length 512 \
   --batch-size 4 \
   --tp-size 1 \
   --fsdp-size 1
 ```
-Resume from the latest checkpoint with `--resume`. Training checkpoints also persist the Grain iterator state.
+VLM resume is explicit: pass `--resume=required --resume-step=N`. The requested generation, immutable schedule horizon, model snapshot, optimizer counters, and Grain iterator are restored together; there is no latest-checkpoint guessing.
 
-Export any supported model (Qwen3 dense/MoE, Qwen3.5, Qwen3-VL) to HuggingFace safetensors:
+Export a sealed VLM snapshot, optionally overlaying one exact trained checkpoint:
 ```bash
-uv run scripts/export_to_hf.py --model-id qwen3-smoke --out-dir /tmp/qwen3-smoke-export --tp-size 1 --fsdp-size 1
+uv run scripts/export_to_hf.py \
+  --model-snapshot /models/Qwen3-VL-2B-Instruct.omegalax \
+  --checkpoint-path /checkpoints/run/015001 \
+  --out-dir /exports/run-015001 \
+  --tp-size 1 --fsdp-size 1 --dp-size 1
 ```
 
 ## Quickstart (vision-language)
@@ -125,8 +139,12 @@ import jax
 import jax.numpy as jnp
 from omegalax import vlm
 
+from omegalax.vlm.local_snapshot import open_local_vlm_snapshot
+
 rng = jax.random.key(0)
-model, cfg = vlm.api.init_model("qwen3.5-smoke", rng, tp_size=1, fsdp_size=1)
+with open_local_vlm_snapshot("/models/Qwen3-VL-2B-Instruct.omegalax") as snapshot:
+    cfg = vlm.api.resolve_config(snapshot)
+model, cfg = vlm.api.init_model(cfg, rng, tp_size=1, fsdp_size=1)
 tokens = jnp.ones((1, 16), dtype=jnp.int32)
 pixel_values = jnp.zeros((1, 3, 2, 14, 14), dtype=jnp.float32)  # B, C, T, H, W
 image_grid_thw = jnp.array([[1, 1, 1]], dtype=jnp.int32)
