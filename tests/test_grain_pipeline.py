@@ -2,6 +2,8 @@
 
 import json
 import os
+import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from unittest import mock
@@ -91,6 +93,30 @@ class GrainPipelineTest(absltest.TestCase):
             fsdp_size=1,
         )
         return [next(iterator) for _ in range(count)]
+
+    def test_malformed_message_list_rejects_under_optimized_python(self):
+        code = """
+import sys
+from pathlib import Path
+from omegalax.data.grain_pipeline import _iter_chat_conversations
+try:
+    list(_iter_chat_conversations(Path(sys.argv[1])))
+except TypeError as error:
+    if "Expected 'messages' to be a list" not in str(error):
+        raise
+else:
+    raise RuntimeError('malformed messages were accepted')
+"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "chat.jsonl"
+            source.write_text(json.dumps({"messages": {"role": "user"}}) + "\n")
+            for optimized in (False, True):
+                command = [sys.executable]
+                if optimized:
+                    command.append("-O")
+                command.extend(["-c", code, str(source)])
+                result = subprocess.run(command, capture_output=True, text=True, check=False)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def _build_split(
         self,

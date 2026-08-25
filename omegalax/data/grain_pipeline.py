@@ -332,9 +332,8 @@ def _iter_chat_conversations(path: Path):
                 continue
             raw = json.loads(line)
             messages = raw["messages"]
-            assert isinstance(messages, list), (
-                f"Expected 'messages' to be a list at {path}:{line_num}"
-            )
+            if not isinstance(messages, list):
+                raise TypeError(f"Expected 'messages' to be a list at {path}:{line_num}")
             marker = raw.get(CARRY_KEY, [])
             valid = (
                 isinstance(marker, list)
@@ -666,8 +665,10 @@ def _emit_truncation_stats(
     kept_tokens = total_message_tokens - dropped_tokens
     kept_supervised = total_supervised_tokens - dropped_supervised_tokens
     emitted_supervised = kept_supervised + repeated_supervised_tokens
-    assert emitted_tokens == kept_tokens + carried_tokens
-    assert total_supervised_tokens == kept_supervised + dropped_supervised_tokens
+    if emitted_tokens != kept_tokens + carried_tokens:
+        raise RuntimeError("Token accounting is inconsistent")
+    if total_supervised_tokens != kept_supervised + dropped_supervised_tokens:
+        raise RuntimeError("Supervision accounting is inconsistent")
 
     summary = {
         "overflow_mode": overflow_mode,
@@ -807,10 +808,11 @@ def _process_conversation(
             return None
         chunk_msgs = carry_msgs + list(cur_msgs)
         chunk_len = carry_len + cur_len
-        assert chunk_len <= effective_max, (
-            f"emitted chunk over budget session={session_id} "
-            f"(carried={carry_len} + slice={cur_len} > effective_max={effective_max})"
-        )
+        if chunk_len > effective_max:
+            raise RuntimeError(
+                f"emitted chunk over budget session={session_id} "
+                f"(carried={carry_len} + slice={cur_len} > effective_max={effective_max})"
+            )
         example = dict(session_meta)
         example["messages"] = chunk_msgs
         example["_omegalax_session_id"] = session_id
@@ -888,11 +890,12 @@ def _process_conversation(
                 for shape in grid:
                     image_shapes.append(str(tuple(shape)))
 
-        assert pending_len + unit_len <= effective_max, (
-            f"prefix-truncation pre-scan missed session={session_id} "
-            f"offset={unit_start} (unit_length={unit_len} + carried prefix {pending_len} "
-            f"> effective_max={effective_max})"
-        )
+        if pending_len + unit_len > effective_max:
+            raise RuntimeError(
+                f"prefix-truncation pre-scan missed session={session_id} "
+                f"offset={unit_start} (unit_length={unit_len} + carried prefix {pending_len} "
+                f"> effective_max={effective_max})"
+            )
 
         if not cur_msgs:
             pass
