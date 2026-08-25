@@ -15,6 +15,7 @@ GrainIterator: TypeAlias = grain.DataLoaderIterator | grain.DatasetIterator
 
 class ResumeMode(StrEnum):
     NEVER = "never"
+    IF_PRESENT = "if_present"
     REQUIRED = "required"
 
 
