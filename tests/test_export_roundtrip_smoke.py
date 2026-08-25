@@ -62,14 +62,15 @@ with (
     mock.patch.object(script, "open_local_vlm_snapshot", return_value=snapshot_context),
     mock.patch.object(
         script.vlm_api,
-        "resolve_config",
-        side_effect=lambda *_: events.append("config"),
+        "validate_pretrained",
+        side_effect=lambda *_: events.append("validate") or (mock.Mock(), 750),
     ),
     mock.patch.object(script, "_run", side_effect=lambda *_: events.append("jax")),
 ):
     flag_values.model_snapshot = "/sealed/model"
+    flag_values.checkpoint_path = ""
     script.main(None)
-if events != ["open", "config", "jax", "close"]:
+if events != ["open", "validate", "jax", "close"]:
     raise AssertionError(events)
 """
         env = dict(os.environ)

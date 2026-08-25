@@ -20,6 +20,8 @@ from flax import nnx
 from omegalax.trainers import vlm
 from omegalax.trainers.optim import MixedPrecisionOptimizer
 
+_MODEL_SNAPSHOT_ID = "ab" * 16
+
 
 class _TinyModel(nnx.Module):
     def __init__(self):
@@ -111,6 +113,7 @@ class CheckpointCommitTest(absltest.TestCase):
             self.iterator,
             20,
             20,
+            _MODEL_SNAPSHOT_ID,
             self.status,
             vlm.OptimizerStatusBoundary.CHECKPOINT,
             mode,
@@ -182,6 +185,7 @@ class CheckpointCommitTest(absltest.TestCase):
                 _iterator(),
                 20,
                 20,
+                _MODEL_SNAPSHOT_ID,
                 self.status,
                 vlm.OptimizerStatusBoundary.CHECKPOINT,
                 vlm._CheckpointCommitMode.REUSE,
@@ -195,6 +199,7 @@ class CheckpointCommitTest(absltest.TestCase):
                 self.iterator,
                 20,
                 20,
+                _MODEL_SNAPSHOT_ID,
                 self.status,
                 vlm.OptimizerStatusBoundary.CHECKPOINT,
                 vlm._CheckpointCommitMode.REUSE,
@@ -208,6 +213,7 @@ class CheckpointCommitTest(absltest.TestCase):
                 self.iterator,
                 21,
                 20,
+                _MODEL_SNAPSHOT_ID,
                 self.status,
                 vlm.OptimizerStatusBoundary.CHECKPOINT,
                 vlm._CheckpointCommitMode.REUSE,
@@ -243,6 +249,7 @@ class CheckpointCommitTest(absltest.TestCase):
                         iterator,
                         20,
                         20,
+                        _MODEL_SNAPSHOT_ID,
                         self.status,
                         vlm.OptimizerStatusBoundary.CHECKPOINT,
                         vlm._CheckpointCommitMode.PERIODIC,
@@ -295,6 +302,7 @@ class CheckpointCommitTest(absltest.TestCase):
                 restored_iterator,
                 20,
                 20,
+                _MODEL_SNAPSHOT_ID,
             )
             self.assertEqual(step, 1)
             _assert_tree_equal(self, _snapshot(restored_optimizer), expected_state)
@@ -315,6 +323,7 @@ class CheckpointCommitTest(absltest.TestCase):
                 self.iterator,
                 3,
                 3,
+                _MODEL_SNAPSHOT_ID,
                 self.status,
                 vlm.OptimizerStatusBoundary.FINAL,
                 vlm._CheckpointCommitMode.FORCED,
@@ -327,6 +336,7 @@ class CheckpointCommitTest(absltest.TestCase):
                 _iterator(),
                 3,
                 3,
+                _MODEL_SNAPSHOT_ID,
             )
             self.assertEqual(step, 1)
             self.assertEqual(next(restored_iterator), next(self.iterator))
@@ -349,7 +359,13 @@ class CheckpointCommitTest(absltest.TestCase):
                         train_state=ocp.args.PyTreeSave(vlm._train_state(source_optimizer)),
                         input_iter=grain.checkpoint.CheckpointSave(source_iterator),
                         schema=ocp.args.JsonSave(
-                            vlm._sft_checkpoint_schema(source_optimizer, source_iterator, 20, 20)
+                            vlm._sft_checkpoint_schema(
+                                source_optimizer,
+                                source_iterator,
+                                20,
+                                20,
+                                _MODEL_SNAPSHOT_ID,
+                            )
                         ),
                     ),
                 )
@@ -375,6 +391,7 @@ class CheckpointCommitTest(absltest.TestCase):
                         iterator,
                         20,
                         20,
+                        _MODEL_SNAPSHOT_ID,
                     )
                 restore_iterator.assert_not_called()
                 _assert_tree_equal(self, _snapshot(optimizer), before_optimizer)
@@ -386,12 +403,18 @@ class CheckpointCommitTest(absltest.TestCase):
         iterator = _iterator()
         before_optimizer = _snapshot(optimizer)
         before_iterator = iterator.get_state()
-        for version in (1, 2.0, True, None):
+        for version in (1, 2, 3.0, True, None):
             with self.subTest(version=version):
-                schema = vlm._sft_checkpoint_schema(optimizer, iterator, 20, 20)
+                schema = vlm._sft_checkpoint_schema(
+                    optimizer,
+                    iterator,
+                    20,
+                    20,
+                    _MODEL_SNAPSHOT_ID,
+                )
                 schema["version"] = version
                 manager = _FakeRestoreManager({"optimizer": nnx.state(_optimizer())}, schema)
-                with self.assertRaisesRegex(ValueError, "incompatible with fresh-run schema 2"):
+                with self.assertRaisesRegex(ValueError, "incompatible with fresh-run schema 3"):
                     vlm._restore_sft_checkpoint(
                         manager,
                         optimizer,
@@ -399,10 +422,40 @@ class CheckpointCommitTest(absltest.TestCase):
                         iterator,
                         20,
                         20,
+                        _MODEL_SNAPSHOT_ID,
                     )
                 _assert_tree_equal(self, _snapshot(optimizer), before_optimizer)
                 self.assertEqual(iterator.get_state(), before_iterator)
                 self.assertLen(manager.restores, 1)
+
+    def test_restore_rejects_different_model_snapshot_before_state_restore(self):
+        optimizer = _optimizer()
+        iterator = _iterator()
+        before_optimizer = _snapshot(optimizer)
+        before_iterator = iterator.get_state()
+        schema = vlm._sft_checkpoint_schema(
+            optimizer,
+            iterator,
+            20,
+            20,
+            "cd" * 32,
+        )
+        manager = _FakeRestoreManager({"optimizer": nnx.state(_optimizer())}, schema)
+
+        with self.assertRaisesRegex(ValueError, "schema does not match"):
+            vlm._restore_sft_checkpoint(
+                manager,
+                optimizer,
+                1,
+                iterator,
+                20,
+                20,
+                _MODEL_SNAPSHOT_ID,
+            )
+
+        _assert_tree_equal(self, _snapshot(optimizer), before_optimizer)
+        self.assertEqual(iterator.get_state(), before_iterator)
+        self.assertLen(manager.restores, 1)
 
     def test_restore_rejects_optimizer_schema_without_mutation(self):
         expected = nnx.state(_optimizer())
@@ -444,7 +497,13 @@ class CheckpointCommitTest(absltest.TestCase):
                 before_iterator = iterator.get_state()
                 manager = _FakeRestoreManager(
                     {"optimizer": restored_state},
-                    vlm._sft_checkpoint_schema(optimizer, iterator, 20, 20),
+                    vlm._sft_checkpoint_schema(
+                        optimizer,
+                        iterator,
+                        20,
+                        20,
+                        _MODEL_SNAPSHOT_ID,
+                    ),
                 )
                 with self.assertRaisesRegex(ValueError, f"optimizer .*{name}"):
                     vlm._restore_sft_checkpoint(
@@ -454,6 +513,7 @@ class CheckpointCommitTest(absltest.TestCase):
                         iterator,
                         20,
                         20,
+                        _MODEL_SNAPSHOT_ID,
                     )
                 _assert_tree_equal(self, _snapshot(optimizer), before_optimizer)
                 self.assertEqual(iterator.get_state(), before_iterator)
@@ -464,7 +524,13 @@ class CheckpointCommitTest(absltest.TestCase):
         iterator = _iterator()
         before_optimizer = _snapshot(optimizer)
         before_iterator = iterator.get_state()
-        schema = vlm._sft_checkpoint_schema(optimizer, iterator, 20, 20)
+        schema = vlm._sft_checkpoint_schema(
+            optimizer,
+            iterator,
+            20,
+            20,
+            _MODEL_SNAPSHOT_ID,
+        )
         schema["optimizer"][0]["variable_type"] = "flax.nnx.variablelib.BatchStat"
         manager = _FakeRestoreManager(
             {"optimizer": nnx.state(_optimizer())},
@@ -478,6 +544,7 @@ class CheckpointCommitTest(absltest.TestCase):
                 iterator,
                 20,
                 20,
+                _MODEL_SNAPSHOT_ID,
             )
         _assert_tree_equal(self, _snapshot(optimizer), before_optimizer)
         self.assertEqual(iterator.get_state(), before_iterator)
@@ -496,7 +563,13 @@ class CheckpointCommitTest(absltest.TestCase):
             ),
             _FakeRestoreManager(
                 {"optimizer": nnx.state(_optimizer()), "extra": 1},
-                vlm._sft_checkpoint_schema(optimizer, iterator, 20, 20),
+                vlm._sft_checkpoint_schema(
+                    optimizer,
+                    iterator,
+                    20,
+                    20,
+                    _MODEL_SNAPSHOT_ID,
+                ),
             ),
         )
         for manager in cases:
@@ -511,6 +584,7 @@ class CheckpointCommitTest(absltest.TestCase):
                     iterator,
                     20,
                     20,
+                    _MODEL_SNAPSHOT_ID,
                 )
             _assert_tree_equal(self, _snapshot(optimizer), before_optimizer)
             self.assertEqual(iterator.get_state(), before_iterator)
@@ -542,6 +616,7 @@ class CheckpointCommitTest(absltest.TestCase):
                             iterator,
                             20,
                             20,
+                            _MODEL_SNAPSHOT_ID,
                         )
                     _assert_tree_equal(self, _snapshot(optimizer), before_optimizer)
                     self.assertEqual(iterator.get_state(), before_iterator)
@@ -571,6 +646,7 @@ class CheckpointCommitTest(absltest.TestCase):
                     iterator,
                     20,
                     20,
+                    _MODEL_SNAPSHOT_ID,
                 )
             _assert_tree_equal(self, _snapshot(optimizer), before_optimizer)
             self.assertEqual(iterator.get_state(), before_iterator)
@@ -597,6 +673,7 @@ class CheckpointCommitTest(absltest.TestCase):
                     iterator,
                     20,
                     20,
+                    _MODEL_SNAPSHOT_ID,
                 )
             _assert_tree_equal(self, _snapshot(optimizer), before_optimizer)
             self.assertEqual(iterator.get_state(), before_iterator)
@@ -631,6 +708,7 @@ class CheckpointCommitTest(absltest.TestCase):
                     iterator,
                     20,
                     20,
+                    _MODEL_SNAPSHOT_ID,
                 )
             self.assertEqual(step, 1)
             self.assertTrue(replaced)

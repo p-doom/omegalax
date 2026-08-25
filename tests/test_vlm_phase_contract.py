@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import contextlib
 import inspect
+import json
 import os
 import subprocess
 import sys
@@ -54,6 +55,10 @@ class _CountingIterator:
         }
 
 
+class _LocalSnapshot:
+    sha256 = "a" * 64
+
+
 class _LoopManager(_Resource):
     def __init__(self):
         super().__init__(
@@ -84,7 +89,8 @@ class VLMPhaseContractTest(absltest.TestCase):
                 )
 
         expected = {
-            "version": 2,
+            "version": 3,
+            "model_snapshot_sha256": "a" * 64,
             "optimizer": [],
             "phase": {"schedule_horizon": 20, "invocation_end_step": 20},
             "input_iter": {},
@@ -173,6 +179,7 @@ class VLMPhaseContractTest(absltest.TestCase):
         for boundary, invocation_end, log_every, val_every in cases:
             with self.subTest(boundary=boundary), tempfile.TemporaryDirectory() as tmpdir:
                 manager = _LoopManager()
+                model_snapshot = _LocalSnapshot()
                 train_iterator = _CountingIterator()
                 val_iterator = _CountingIterator() if val_every is not None else None
                 save_every = 2 if boundary == "log" else 1
@@ -192,7 +199,12 @@ class VLMPhaseContractTest(absltest.TestCase):
                     ),
                     mock.patch.object(vlm.vlm_api, "batch_partition_spec", return_value=vlm.P()),
                     mock.patch.object(vlm, "required_batch_multiple", return_value=1),
-                    mock.patch.object(vlm.vlm_api, "init_model", return_value=(model, object())),
+                    mock.patch.object(vlm.vlm_api, "LocalVLMSnapshot", _LocalSnapshot),
+                    mock.patch.object(
+                        vlm.vlm_api,
+                        "load_pretrained",
+                        return_value=(model, object()),
+                    ),
                     mock.patch(
                         "omegalax.models.sharding_runtime.set_attn_backend",
                     ),
@@ -232,7 +244,7 @@ class VLMPhaseContractTest(absltest.TestCase):
                         FloatingPointError, f"{boundary}: invalid_gradient"
                     ) as raised:
                         vlm.run_sft(
-                            object(),
+                            model_snapshot,
                             vlm.TrainConfig(
                                 batch_size=1,
                                 seq_len=4,
@@ -294,7 +306,7 @@ with (
     mock.patch.object(script, "FLAGS") as flag_values,
     mock.patch.object(script, "_validate_flags"),
     mock.patch.object(script, "open_local_vlm_snapshot") as open_snapshot,
-    mock.patch.object(script.vlm_api, "resolve_config"),
+    mock.patch.object(script.vlm_api, "validate_pretrained", return_value=(mock.Mock(), 750)),
     mock.patch.object(script, "_load_snapshot_assets", return_value=(mock.Mock(), mock.Mock())),
     mock.patch.object(script.jax.config, "update"),
     mock.patch.object(script.jax.distributed, "initialize"),
@@ -331,7 +343,7 @@ with (
     mock.patch.object(script, "FLAGS") as flag_values,
     mock.patch.object(script, "_validate_flags"),
     mock.patch.object(script, "open_local_vlm_snapshot") as open_snapshot,
-    mock.patch.object(script.vlm_api, "resolve_config"),
+    mock.patch.object(script.vlm_api, "validate_pretrained", return_value=(mock.Mock(), 750)),
     mock.patch.object(script, "_load_snapshot_assets", return_value=(mock.Mock(), mock.Mock())),
     mock.patch.object(script.jax.config, "update"),
     mock.patch.object(script.jax.distributed, "initialize"),
@@ -390,8 +402,8 @@ with (
             ),
             mock.patch.object(
                 script.vlm_api,
-                "resolve_config",
-                side_effect=lambda *_: events.append("config"),
+                "validate_pretrained",
+                side_effect=lambda *_: events.append("validate") or (mock.Mock(), 750),
             ),
             mock.patch.object(
                 script,
@@ -406,28 +418,93 @@ with (
             flag_values.max_length = 1
             script.main(None)
 
-        self.assertEqual(events, ["flags", "open", "config", "assets", "jax", "close"])
+        self.assertEqual(events, ["flags", "open", "validate", "assets", "jax", "close"])
 
     def test_snapshot_assets_use_one_pinned_local_source(self):
         from scripts import train_vlm_sft as script
 
-        snapshot = mock.Mock()
-        snapshot.consume.return_value = mock.MagicMock()
-        snapshot.consume.return_value.__enter__.return_value = "/proc/pinned"
-        with (
-            mock.patch.object(script.AutoTokenizer, "from_pretrained") as tokenizer_load,
-            mock.patch.object(script.AutoImageProcessor, "from_pretrained") as processor_load,
-        ):
-            tokenizer, processor = script._load_snapshot_assets(snapshot)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "tokenizer_config.json").write_text(
+                json.dumps(
+                    {
+                        "tokenizer_class": "Qwen2Tokenizer",
+                        "chat_template": "{{ messages }}",
+                    }
+                )
+            )
+            (root / "chat_template.json").write_text(
+                json.dumps({"chat_template": "{{ messages }}"})
+            )
+            (root / "preprocessor_config.json").write_text(
+                json.dumps(
+                    {
+                        "image_processor_type": "Qwen2VLImageProcessor",
+                        "patch_size": 16,
+                        "temporal_patch_size": 2,
+                        "merge_size": 2,
+                    }
+                )
+            )
+            (root / "tokenizer.json").write_text("{}")
+            files = {
+                name: str(root / name)
+                for name in (
+                    "chat_template.json",
+                    "preprocessor_config.json",
+                    "tokenizer.json",
+                    "tokenizer_config.json",
+                )
+            }
+            snapshot = mock.Mock(path=Path("/sealed/model"))
+            snapshot.files.return_value = mock.MagicMock()
+            snapshot.files.return_value.__enter__.return_value = files
+            tokenizer_load = mock.MagicMock()
+            tokenizer_load.convert_tokens_to_ids.return_value = [2, 3, 4, 5]
+            tokenizer_load.__len__ = mock.Mock(return_value=8)
+            processor_load = mock.Mock(patch_size=16, temporal_patch_size=2, merge_size=2)
+            model_cfg = mock.Mock(
+                image_token_id=2,
+                video_token_id=3,
+                vision_start_token_id=4,
+                vision_end_token_id=5,
+                vocab_size=16,
+            )
+            model_cfg.vision = mock.Mock(
+                patch_size=16,
+                temporal_patch_size=2,
+                spatial_merge_size=2,
+            )
+            with (
+                mock.patch.object(
+                    script.Qwen2Tokenizer,
+                    "_from_pretrained",
+                    return_value=tokenizer_load,
+                ) as tokenizer_factory,
+                mock.patch.object(
+                    script.Qwen2VLImageProcessor,
+                    "from_dict",
+                    return_value=processor_load,
+                ) as processor_factory,
+            ):
+                tokenizer, processor = script._load_snapshot_assets(snapshot, model_cfg)
 
-        tokenizer_load.assert_called_once_with("/proc/pinned", local_files_only=True)
-        processor_load.assert_called_once_with(
-            "/proc/pinned",
+        tokenizer_factory.assert_called_once_with(
+            {
+                "tokenizer_file": files["tokenizer.json"],
+                "tokenizer_config_file": files["tokenizer_config.json"],
+            },
+            "/sealed/model",
+            {},
             local_files_only=True,
-            use_fast=False,
+            _is_local=True,
+            trust_remote_code=False,
         )
-        self.assertIs(tokenizer, tokenizer_load.return_value)
-        self.assertIs(processor, processor_load.return_value)
+        processor_factory.assert_called_once_with(
+            {"patch_size": 16, "temporal_patch_size": 2, "merge_size": 2}
+        )
+        self.assertIs(tokenizer, tokenizer_load)
+        self.assertIs(processor, processor_load)
 
     def test_fresh_string_source_is_rejected_before_resolution(self):
         with (
@@ -518,6 +595,7 @@ for horizon, end in cases:
                 object(),
                 20,
                 13,
+                "a" * 64,
                 10,
                 jnp.asarray(
                     vlm.OptimizerFatalStatus.INVALID_CANDIDATE_STATE,

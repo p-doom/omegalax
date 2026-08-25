@@ -34,7 +34,7 @@ def stoi(token: str) -> int | str:
 
 def map_to_bonsai_key(mapping: dict[str, tuple[str, Enum]], torch_key: str):
     for pattern, (jax_key, transform) in mapping.items():
-        match = re.match(pattern, torch_key)
+        match = re.fullmatch(pattern, torch_key)
         if match:
             return re.sub(pattern, jax_key, torch_key), transform
     return None, None

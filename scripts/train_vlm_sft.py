@@ -12,7 +12,7 @@ import grain
 import jax
 import wandb
 from absl import app, flags
-from transformers import AutoImageProcessor, AutoTokenizer
+from transformers import Qwen2Tokenizer, Qwen2VLImageProcessor
 
 from omegalax.data.collator_qwen3 import VLMSFTCollator
 from omegalax.data.grain_pipeline import (
@@ -366,13 +366,74 @@ def _grain_iter(
     )
 
 
-def _load_snapshot_assets(model_snapshot: LocalVLMSnapshot):
-    with model_snapshot.consume() as source:
-        tokenizer = AutoTokenizer.from_pretrained(source, local_files_only=True)
-        image_processor = AutoImageProcessor.from_pretrained(
-            source,
+def _load_snapshot_assets(model_snapshot: LocalVLMSnapshot, model_cfg: vlm_api.Qwen3VLConfig):
+    with model_snapshot.files() as files:
+        with open(files["tokenizer_config.json"], encoding="utf-8") as stream:
+            tokenizer_config = json.load(stream)
+        tokenizer_class = tokenizer_config.get("tokenizer_class")
+        if tokenizer_class != "Qwen2Tokenizer":
+            raise ValueError(f"Unsupported sealed tokenizer class: {tokenizer_class!r}")
+        with open(files["chat_template.json"], encoding="utf-8") as stream:
+            chat_template = json.load(stream)
+        if (
+            set(chat_template) != {"chat_template"}
+            or type(chat_template["chat_template"]) is not str
+        ):
+            raise ValueError("Sealed chat_template.json must contain exactly one string template")
+        if tokenizer_config.get("chat_template") != chat_template["chat_template"]:
+            raise ValueError("Sealed tokenizer config and chat template do not match")
+        tokenizer = Qwen2Tokenizer._from_pretrained(
+            {
+                "tokenizer_file": files["tokenizer.json"],
+                "tokenizer_config_file": files["tokenizer_config.json"],
+            },
+            str(model_snapshot.path),
+            {},
             local_files_only=True,
-            use_fast=False,
+            _is_local=True,
+            trust_remote_code=False,
+        )
+
+        with open(files["preprocessor_config.json"], encoding="utf-8") as stream:
+            preprocessor_config = json.load(stream)
+        image_processor_type = preprocessor_config.pop("image_processor_type", None)
+        if image_processor_type not in {
+            "Qwen2VLImageProcessor",
+            "Qwen2VLImageProcessorFast",
+        }:
+            raise ValueError(f"Unsupported sealed image processor class: {image_processor_type!r}")
+        preprocessor_config.pop("processor_class", None)
+        image_processor = Qwen2VLImageProcessor.from_dict(preprocessor_config)
+    expected_token_ids = {
+        "<|image_pad|>": model_cfg.image_token_id,
+        "<|video_pad|>": model_cfg.video_token_id,
+        "<|vision_start|>": model_cfg.vision_start_token_id,
+        "<|vision_end|>": model_cfg.vision_end_token_id,
+    }
+    actual_token_ids = tokenizer.convert_tokens_to_ids(list(expected_token_ids))
+    for token, actual in zip(expected_token_ids, actual_token_ids, strict=True):
+        expected = expected_token_ids[token]
+        if actual != expected:
+            raise ValueError(
+                f"Sealed tokenizer ID for {token} is {actual}, model config requires {expected}"
+            )
+    if len(tokenizer) > model_cfg.vocab_size:
+        raise ValueError(
+            f"Sealed tokenizer has {len(tokenizer)} tokens, model vocab has {model_cfg.vocab_size}"
+        )
+    processor_shape = (
+        image_processor.patch_size,
+        image_processor.temporal_patch_size,
+        image_processor.merge_size,
+    )
+    model_shape = (
+        model_cfg.vision.patch_size,
+        model_cfg.vision.temporal_patch_size,
+        model_cfg.vision.spatial_merge_size,
+    )
+    if processor_shape != model_shape:
+        raise ValueError(
+            f"Sealed image processor geometry {processor_shape} does not match model {model_shape}"
         )
     return tokenizer, image_processor
 
@@ -564,8 +625,8 @@ def _run(model_snapshot: LocalVLMSnapshot, tokenizer, image_processor) -> None:
 def main(_) -> None:
     _validate_flags()
     with open_local_vlm_snapshot(FLAGS.model_snapshot) as model_snapshot:
-        vlm_api.resolve_config(model_snapshot)
-        tokenizer, image_processor = _load_snapshot_assets(model_snapshot)
+        model_cfg, _ = vlm_api.validate_pretrained(model_snapshot)
+        tokenizer, image_processor = _load_snapshot_assets(model_snapshot, model_cfg)
         if FLAGS.max_length > tokenizer.model_max_length:
             raise ValueError(
                 f"--max_length={FLAGS.max_length} exceeds "

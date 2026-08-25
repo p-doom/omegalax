@@ -232,6 +232,7 @@ class _SFTCheckpointCommit:
     input_iter: checkpoint_utils.GrainIterator
     schedule_horizon: int
     invocation_end_step: int
+    model_snapshot_sha256: str
 
 
 def _commit_sft_checkpoint(
@@ -241,6 +242,7 @@ def _commit_sft_checkpoint(
     input_iter: checkpoint_utils.GrainIterator,
     schedule_horizon: int,
     invocation_end_step: int,
+    model_snapshot_sha256: str,
     optimizer_status: jax.Array,
     boundary: OptimizerStatusBoundary,
     mode: _CheckpointCommitMode,
@@ -257,6 +259,7 @@ def _commit_sft_checkpoint(
             or prior_commit.input_iter is not input_iter
             or prior_commit.schedule_horizon != schedule_horizon
             or prior_commit.invocation_end_step != invocation_end_step
+            or prior_commit.model_snapshot_sha256 != model_snapshot_sha256
         ):
             raise ValueError(
                 "Checkpoint reuse requires a commit from the identical step, checkpoint manager, "
@@ -275,6 +278,7 @@ def _commit_sft_checkpoint(
                     input_iter,
                     schedule_horizon,
                     invocation_end_step,
+                    model_snapshot_sha256,
                 )
             ),
         )
@@ -292,6 +296,7 @@ def _commit_sft_checkpoint(
             input_iter,
             schedule_horizon,
             invocation_end_step,
+            model_snapshot_sha256,
         )
     else:
         raise ValueError(f"Unsupported checkpoint commit mode: {mode!r}.")
@@ -311,6 +316,7 @@ def _commit_phase_end(
     input_iter: checkpoint_utils.GrainIterator,
     schedule_horizon: int,
     invocation_end_step: int,
+    model_snapshot_sha256: str,
     save_every: int,
     optimizer_status: jax.Array,
 ) -> _SFTCheckpointCommit | None:
@@ -324,6 +330,7 @@ def _commit_phase_end(
         input_iter,
         schedule_horizon,
         invocation_end_step,
+        model_snapshot_sha256,
         optimizer_status,
         OptimizerStatusBoundary.FINAL,
         _CheckpointCommitMode.FORCED,
@@ -472,7 +479,14 @@ def _sft_checkpoint_schema(
     input_iter: checkpoint_utils.GrainIterator,
     schedule_horizon: int,
     invocation_end_step: int,
+    model_snapshot_sha256: str,
 ) -> dict[str, object]:
+    if (
+        type(model_snapshot_sha256) is not str
+        or len(model_snapshot_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in model_snapshot_sha256)
+    ):
+        raise ValueError("model_snapshot_sha256 must be lowercase SHA-256")
     optimizer_state = nnx.state(optimizer).flat_state()
     optimizer_leaves = []
     for path, leaf in zip(optimizer_state.paths, optimizer_state.leaves, strict=True):
@@ -485,7 +499,8 @@ def _sft_checkpoint_schema(
             }
         )
     return {
-        "version": 2,
+        "version": 3,
+        "model_snapshot_sha256": model_snapshot_sha256,
         "optimizer": optimizer_leaves,
         "phase": {
             "schedule_horizon": schedule_horizon,
@@ -621,6 +636,7 @@ def _restore_sft_checkpoint(
     input_iter: checkpoint_utils.GrainIterator,
     schedule_horizon: int,
     invocation_end_step: int,
+    model_snapshot_sha256: str,
 ) -> tuple[MixedPrecisionOptimizer, int, checkpoint_utils.GrainIterator]:
     abstract_state = _abstract_train_state(optimizer)
     expected_state = nnx.state(optimizer)
@@ -640,10 +656,10 @@ def _restore_sft_checkpoint(
             f"Checkpoint {step} schema restore returned keys {sorted(restored_schema.keys())}."
         )
     schema = restored_schema["schema"]
-    if type(schema) is not dict or type(schema.get("version")) is not int or schema["version"] != 2:
+    if type(schema) is not dict or type(schema.get("version")) is not int or schema["version"] != 3:
         version = schema.get("version") if isinstance(schema, dict) else None
         raise ValueError(
-            f"Checkpoint schema version {version!r} is incompatible with fresh-run schema 2; "
+            f"Checkpoint schema version {version!r} is incompatible with fresh-run schema 3; "
             "historical scheduled-optimizer checkpoints require the separate writer-lineage "
             "recovery path."
         )
@@ -652,6 +668,7 @@ def _restore_sft_checkpoint(
         input_iter,
         schedule_horizon,
         invocation_end_step,
+        model_snapshot_sha256,
     )
     _validate_checkpoint_phase(
         schema,
@@ -944,8 +961,9 @@ def _run_sft(
     _validate_training_phase(train_cfg, invocation_end_step)
     save_path = Path(save_dir).expanduser().resolve() if save_dir is not None else None
     will_resume = _validate_resume_request(resume, resume_step, save_path, invocation_end_step)
-    if not will_resume and isinstance(model_id_or_cfg, str):
-        raise TypeError("Fresh VLM training requires an open LocalVLMSnapshot")
+    if type(model_id_or_cfg) is not vlm_api.LocalVLMSnapshot:
+        raise TypeError("VLM training requires an open LocalVLMSnapshot")
+    model_snapshot_sha256 = model_id_or_cfg.sha256
 
     checkpoint_manager: ocp.CheckpointManager | None = None
     if save_path is not None:
@@ -961,12 +979,8 @@ def _run_sft(
         if will_resume:
             _require_checkpoint_frontier(checkpoint_manager, resume_step, save_path)
 
-    if will_resume:
-        model_cfg = vlm_api.resolve_config(str(save_path))
-        startup_log(f"resolved model config from checkpoint {save_path!r}")
-    else:
-        model_cfg = vlm_api.resolve_config(model_id_or_cfg)
-        startup_log("resolved model config")
+    model_cfg = vlm_api.resolve_config(model_id_or_cfg)
+    startup_log("resolved model config from sealed snapshot")
     require_zero_router_aux_loss(model_cfg)
     startup_log(f"model_cfg={model_cfg}")
     mesh = ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size)
@@ -980,8 +994,6 @@ def _run_sft(
         )
 
     replicated_sharding = NamedSharding(mesh, P())
-    init_rng = jax.device_put(jax.random.key(train_cfg.seed), replicated_sharding)
-    startup_log("placed initialization rng on device mesh")
 
     is_primary_process = jax.process_index() == 0
 
@@ -994,24 +1006,14 @@ def _run_sft(
         stable_fraction=train_cfg.lr_stable_fraction,
     )
 
-    if not will_resume and type(model_id_or_cfg) is vlm_api.LocalVLMSnapshot:
-        model, model_cfg = vlm_api.load_pretrained(
-            model_id_or_cfg,
-            tp_size=tp_size,
-            fsdp_size=fsdp_size,
-            dp_size=dp_size,
-        )
-        model_cfg = vlm_api.align_config_to_mesh(model_cfg, mesh)
-        startup_log("loaded pretrained model")
-    else:
-        model, model_cfg = vlm_api.init_model(
-            model_cfg,
-            init_rng,
-            tp_size=tp_size,
-            fsdp_size=fsdp_size,
-            dp_size=dp_size,
-        )
-        startup_log("initialized model (random init)")
+    model, model_cfg = vlm_api.load_pretrained(
+        model_id_or_cfg,
+        tp_size=tp_size,
+        fsdp_size=fsdp_size,
+        dp_size=dp_size,
+    )
+    model_cfg = vlm_api.align_config_to_mesh(model_cfg, mesh)
+    startup_log("loaded pretrained model")
     if wandb_run is not None and is_primary_process:
         wandb_run.config.update(
             {"model_cfg": export_lib.model_config_to_hf_dict(model_cfg)},
@@ -1103,6 +1105,7 @@ def _run_sft(
             data_iter,
             train_cfg.schedule_horizon,
             invocation_end_step,
+            model_snapshot_sha256,
         )
         startup_log(f"restored checkpoint at step {start_step}")
 
@@ -1291,6 +1294,7 @@ def _run_sft(
                 data_iter,
                 train_cfg.schedule_horizon,
                 invocation_end_step,
+                model_snapshot_sha256,
                 optimizer_status,
                 OptimizerStatusBoundary.CHECKPOINT,
                 _CheckpointCommitMode.PERIODIC,
@@ -1305,6 +1309,7 @@ def _run_sft(
         data_iter,
         train_cfg.schedule_horizon,
         invocation_end_step,
+        model_snapshot_sha256,
         save_every,
         optimizer_status,
     )

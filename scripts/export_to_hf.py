@@ -27,7 +27,6 @@ import sys
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
 import json
-import shutil
 from pathlib import Path
 
 from omegalax.export_entry import resolve_export_step
@@ -57,15 +56,17 @@ if __name__ == "__main__":
     except ValueError as exc:
         raise SystemExit(f"export topology error: {exc}") from exc
 
-from absl import app, flags
 import jax
-from jax.sharding import NamedSharding, PartitionSpec as P
 import orbax.checkpoint as ocp
+from absl import app, flags
 from flax import nnx
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
 
 from omegalax import export as export_lib
 from omegalax.distributed.mesh import ensure_mesh, mesh_rules
 from omegalax.vlm import api as vlm_api
+from omegalax.vlm.checkpoint_identity import require_checkpoint_path_snapshot
 from omegalax.vlm.local_snapshot import LocalVLMSnapshot, open_local_vlm_snapshot
 
 FLAGS = flags.FLAGS
@@ -229,23 +230,22 @@ def _restore_trained_weights(model, cfg, checkpoint_path: Path):
 _DESCRIBES_BASE_WEIGHTS = ("quantization_config",)
 
 
-# Anything that describes or contains the base's weights: our export writes its own
-# single safetensors file, so a copied shard index would send the server looking for
-# `model-00001-of-00004.safetensors` that is not there. config.json is excluded
-# because the overlay below writes it.
-_WEIGHT_SUFFIXES = (".safetensors", ".bin", ".pt", ".pth", ".msgpack", ".h5", ".ckpt")
-
-
-def _copy_base_identity_assets(out_dir: Path, base_dir: Path) -> None:
-    """Copy non-weight HF identity assets from the pinned base snapshot."""
+def _copy_base_identity_assets(out_dir: Path, model_snapshot: LocalVLMSnapshot) -> None:
     copied = []
-    for src in sorted(base_dir.iterdir()):
-        if not src.is_file() or src.name in {"config.json", "omegalax-vlm-snapshot.json"}:
+    for name in model_snapshot.identity_assets:
+        if name == "config.json":
             continue
-        if src.suffix in _WEIGHT_SUFFIXES or src.name.endswith(".index.json"):
-            continue
-        shutil.copyfile(src, out_dir / src.name)
-        copied.append(src.name)
+        output_fd = os.open(
+            out_dir / name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o644,
+        )
+        try:
+            model_snapshot.copy_identity_asset_to(name, output_fd)
+            os.fsync(output_fd)
+        finally:
+            os.close(output_fd)
+        copied.append(name)
     print(f"[export] copied {len(copied)} identity assets from the base: {copied}")
 
 
@@ -255,10 +255,10 @@ def _write_servable_config(
     model_snapshot: LocalVLMSnapshot,
 ) -> None:
     """Overlay owned fields without dropping serving fields absent from the runtime config."""
-    with model_snapshot.consume() as source:
-        base_dir = Path(source)
-        _copy_base_identity_assets(out_dir, base_dir)
-        base = json.loads((base_dir / "config.json").read_text())
+    with model_snapshot.files() as files:
+        _copy_base_identity_assets(out_dir, model_snapshot)
+        with open(files["config.json"], encoding="utf-8") as stream:
+            base = json.load(stream)
     for key in _DESCRIBES_BASE_WEIGHTS:
         base.pop(key, None)
 
@@ -323,7 +323,12 @@ def _run(model_snapshot: LocalVLMSnapshot) -> None:
 
 def main(_) -> None:
     with open_local_vlm_snapshot(FLAGS.model_snapshot) as model_snapshot:
-        vlm_api.resolve_config(model_snapshot)
+        vlm_api.validate_pretrained(model_snapshot)
+        if FLAGS.checkpoint_path:
+            require_checkpoint_path_snapshot(
+                FLAGS.checkpoint_path,
+                model_snapshot.sha256,
+            )
         _run(model_snapshot)
 
 

@@ -8,9 +8,9 @@ import json
 import os
 import re
 import stat
-import tempfile
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from pathlib import Path
+from types import MappingProxyType
 from typing import Self
 
 from safetensors import SafetensorError, safe_open
@@ -19,8 +19,29 @@ _MANIFEST_NAME = "omegalax-vlm-snapshot.json"
 _FORMAT = "omegalax.vlm_snapshot.v1"
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _MAX_MANIFEST_BYTES = 8 << 20
-_MAX_JSON_ASSET_BYTES = 256 << 20
+_MAX_JSON_ASSET_BYTES = 24 << 20
+_MAX_TOTAL_JSON_ASSET_BYTES = 32 << 20
+_MAX_FILES = 128
+_MAX_PATH_COMPONENTS = 64
 _COPY_CHUNK_BYTES = 8 << 20
+SNAPSHOT_IDENTITY_ASSETS = frozenset(
+    {
+        "added_tokens.json",
+        "chat_template.jinja",
+        "chat_template.json",
+        "config.json",
+        "generation_config.json",
+        "merges.txt",
+        "preprocessor_config.json",
+        "processor_config.json",
+        "special_tokens_map.json",
+        "tokenizer.json",
+        "tokenizer.model",
+        "tokenizer_config.json",
+        "video_preprocessor_config.json",
+        "vocab.json",
+    }
+)
 _REQUIRED_ASSETS = frozenset(
     {
         "chat_template.json",
@@ -43,32 +64,54 @@ def _identity(metadata: os.stat_result) -> tuple[int, int, int, int, int]:
     )
 
 
-def _canonical_absolute_directory(path: str | os.PathLike[str]) -> Path:
-    candidate = Path(path)
-    if not candidate.is_absolute():
+def _open_canonical_directory(
+    path: str | os.PathLike[str],
+    *,
+    label: str,
+    require_read_only: bool,
+) -> tuple[Path, int, int, str]:
+    raw = os.fspath(path)
+    if not os.path.isabs(raw):
         raise ValueError("VLM snapshot path must be absolute")
-    lexical = Path(os.path.normpath(os.fspath(candidate)))
+    normalized = os.path.normpath(raw)
+    if raw != normalized or normalized == "/":
+        raise ValueError(f"{label} must be a canonical absolute directory")
+    components = normalized.removeprefix("/").split("/")
+    if len(components) > _MAX_PATH_COMPONENTS:
+        raise ValueError(f"{label} exceeds {_MAX_PATH_COMPONENTS} path components")
+    current_fd = os.open(
+        "/",
+        os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+    )
     try:
-        resolved = Path(os.path.realpath(candidate, strict=True))
-    except OSError as error:
-        raise ValueError(f"VLM snapshot does not exist: {candidate}") from error
-    if candidate != lexical or lexical != resolved:
-        raise ValueError(
-            f"VLM snapshot path must be canonical and contain no symlinks: {candidate}"
-        )
-    return resolved
-
-
-def _open_directory(path: Path) -> int:
-    try:
-        fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW)
-    except OSError as error:
-        raise ValueError(f"VLM snapshot is not an accessible directory: {path}") from error
-    metadata = os.fstat(fd)
-    if metadata.st_mode & 0o222:
-        os.close(fd)
-        raise ValueError(f"VLM snapshot directory must be read-only: {path}")
-    return fd
+        for component in components[:-1]:
+            try:
+                next_fd = os.open(
+                    component,
+                    os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=current_fd,
+                )
+            except OSError as error:
+                raise ValueError(f"{label} contains a missing or symlinked parent") from error
+            os.close(current_fd)
+            current_fd = next_fd
+        name = components[-1]
+        try:
+            directory_fd = os.open(
+                name,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=current_fd,
+            )
+        except OSError as error:
+            raise ValueError(f"{label} is not an accessible no-follow directory") from error
+        metadata = os.fstat(directory_fd)
+        if require_read_only and metadata.st_mode & 0o222:
+            os.close(directory_fd)
+            raise ValueError(f"{label} directory must be read-only")
+        return Path(normalized), directory_fd, current_fd, name
+    except BaseException:
+        os.close(current_fd)
+        raise
 
 
 def _open_regular_at(directory_fd: int, name: str, *, require_read_only: bool) -> int:
@@ -151,6 +194,8 @@ def _validate_manifest(value: dict) -> dict[str, tuple[int, str]]:
     files = value["files"]
     if type(files) is not dict or not files:
         raise ValueError("VLM snapshot manifest files must be a non-empty object")
+    if len(files) > _MAX_FILES:
+        raise ValueError(f"VLM snapshot manifest exceeds {_MAX_FILES} files")
     result: dict[str, tuple[int, str]] = {}
     for name, entry in files.items():
         if (
@@ -173,7 +218,7 @@ def _validate_manifest(value: dict) -> dict[str, tuple[int, str]]:
     return result
 
 
-def _validate_inventory(files: dict[str, tuple[int, str]]) -> None:
+def _validate_inventory(files: Mapping[str, object]) -> None:
     names = set(files)
     missing = _REQUIRED_ASSETS - names
     if missing:
@@ -183,6 +228,9 @@ def _validate_inventory(files: dict[str, tuple[int, str]]) -> None:
         raise ValueError("VLM snapshot contains no safetensors weights")
     if any(name.endswith(".safetensors.index.json") for name in names):
         raise ValueError("VLM snapshot must not contain a safetensors index")
+    unsupported = names - SNAPSHOT_IDENTITY_ASSETS - set(weight_names)
+    if unsupported:
+        raise ValueError(f"VLM snapshot contains unsupported assets: {sorted(unsupported)}")
 
 
 class LocalVLMSnapshot:
@@ -190,13 +238,16 @@ class LocalVLMSnapshot:
 
     __slots__ = (
         "_closed",
-        "_consumer_directory",
         "_directory_fd",
         "_directory_identity",
+        "_directory_name",
+        "_directory_parent_fd",
         "_file_fds",
         "_file_identities",
+        "_files",
         "_manifest_fd",
         "_manifest_identity",
+        "_open_fds",
         "_path",
         "_sha256",
     )
@@ -206,6 +257,8 @@ class LocalVLMSnapshot:
         token: object,
         path: Path,
         directory_fd: int,
+        directory_parent_fd: int,
+        directory_name: str,
         manifest_fd: int,
         manifest_sha256: str,
         file_fds: dict[str, int],
@@ -215,17 +268,23 @@ class LocalVLMSnapshot:
         self._path = path
         self._directory_fd = directory_fd
         self._directory_identity = _identity(os.fstat(directory_fd))
+        self._directory_parent_fd = directory_parent_fd
+        self._directory_name = directory_name
         self._manifest_fd = manifest_fd
         self._manifest_identity = _identity(os.fstat(manifest_fd))
         self._sha256 = manifest_sha256
         self._file_fds = file_fds
         self._file_identities = {name: _identity(os.fstat(fd)) for name, fd in file_fds.items()}
-        self._consumer_directory = tempfile.TemporaryDirectory(prefix="omegalax-vlm-snapshot-")
+        self._files = MappingProxyType(
+            {name: f"/proc/self/fd/{fd}" for name, fd in sorted(file_fds.items())}
+        )
+        self._open_fds = {
+            *file_fds.values(),
+            manifest_fd,
+            directory_fd,
+            directory_parent_fd,
+        }
         self._closed = False
-        alias = Path(self._consumer_directory.name)
-        for name, fd in file_fds.items():
-            os.symlink(f"/proc/self/fd/{fd}", alias / name)
-        os.chmod(alias, 0o500)
 
     @property
     def path(self) -> Path:
@@ -235,12 +294,29 @@ class LocalVLMSnapshot:
     def sha256(self) -> str:
         return self._sha256
 
+    @property
+    def names(self) -> tuple[str, ...]:
+        self._require_open()
+        return tuple(self._files)
+
+    @property
+    def identity_assets(self) -> tuple[str, ...]:
+        self._require_open()
+        return tuple(name for name in self._files if name in SNAPSHOT_IDENTITY_ASSETS)
+
     def _require_open(self) -> None:
         if self._closed:
             raise RuntimeError("VLM snapshot handle is closed")
 
     def assert_unchanged(self) -> None:
         self._require_open()
+        path_metadata = os.stat(
+            self._directory_name,
+            dir_fd=self._directory_parent_fd,
+            follow_symlinks=False,
+        )
+        if _identity(path_metadata) != self._directory_identity:
+            raise RuntimeError("VLM snapshot path changed after validation")
         if _identity(os.fstat(self._directory_fd)) != self._directory_identity:
             raise RuntimeError("VLM snapshot directory changed after validation")
         if set(os.listdir(self._directory_fd)) != set(self._file_fds) | {_MANIFEST_NAME}:
@@ -248,48 +324,89 @@ class LocalVLMSnapshot:
         manifest_metadata = os.fstat(self._manifest_fd)
         if (
             _identity(manifest_metadata) != self._manifest_identity
-            or _sha256(
-                self._manifest_fd,
-                manifest_metadata.st_size,
-            )
-            != self._sha256
+            or _sha256(self._manifest_fd, manifest_metadata.st_size) != self._sha256
         ):
             raise RuntimeError("VLM snapshot manifest changed after validation")
         for name, fd in self._file_fds.items():
             metadata = os.fstat(fd)
-            if _identity(metadata) != self._file_identities[name]:
+            path_metadata = os.stat(name, dir_fd=self._directory_fd, follow_symlinks=False)
+            if (
+                _identity(metadata) != self._file_identities[name]
+                or _identity(path_metadata) != self._file_identities[name]
+            ):
                 raise RuntimeError(f"VLM snapshot child changed after validation: {name!r}")
 
     @contextlib.contextmanager
-    def consume(self) -> Iterator[str]:
+    def files(self) -> Iterator[Mapping[str, str]]:
         self.assert_unchanged()
         try:
-            yield self._consumer_directory.name
+            yield self._files
         finally:
             self.assert_unchanged()
+
+    def copy_identity_asset_to(self, name: str, destination_fd: int) -> None:
+        if name not in SNAPSHOT_IDENTITY_ASSETS or name not in self._file_fds:
+            raise ValueError(f"VLM snapshot has no allowed identity asset {name!r}")
+        destination = os.fstat(destination_fd)
+        if not stat.S_ISREG(destination.st_mode) or destination.st_size != 0:
+            raise ValueError("VLM snapshot identity destination must be a new empty regular file")
+        self.assert_unchanged()
+        source_fd = self._file_fds[name]
+        source = os.fstat(source_fd)
+        offset = 0
+        while offset < source.st_size:
+            chunk = os.pread(source_fd, min(source.st_size - offset, _COPY_CHUNK_BYTES), offset)
+            if not chunk:
+                raise RuntimeError(f"VLM snapshot identity asset ended while copying: {name!r}")
+            written = 0
+            while written < len(chunk):
+                count = os.pwrite(destination_fd, chunk[written:], offset + written)
+                if count == 0:
+                    raise OSError(f"VLM snapshot identity copy made no progress: {name!r}")
+                written += count
+            offset += len(chunk)
+        if os.pread(source_fd, 1, source.st_size):
+            raise RuntimeError(f"VLM snapshot identity asset grew while copying: {name!r}")
+        if _identity(os.fstat(source_fd)) != self._file_identities[name]:
+            raise RuntimeError(f"VLM snapshot identity asset changed while copying: {name!r}")
+        self.assert_unchanged()
 
     def close(self) -> None:
         if self._closed:
             return
-        self._closed = True
-        os.chmod(self._consumer_directory.name, 0o700)
-        self._consumer_directory.cleanup()
-        for fd in self._file_fds.values():
-            os.close(fd)
-        os.close(self._manifest_fd)
-        os.close(self._directory_fd)
+        errors: list[BaseException] = []
+        for fd in tuple(self._open_fds):
+            try:
+                os.close(fd)
+            except BaseException as error:  # noqa: BLE001
+                errors.append(error)
+            else:
+                self._open_fds.remove(fd)
+        self._closed = not self._open_fds
+        if len(errors) == 1:
+            raise errors[0]
+        if errors:
+            raise BaseExceptionGroup("VLM snapshot cleanup failed", errors)
 
     def __enter__(self) -> Self:
         self._require_open()
         return self
 
-    def __exit__(self, *_args) -> None:
-        self.close()
+    def __exit__(self, _error_type, error, _traceback) -> None:
+        try:
+            self.close()
+        except BaseException as cleanup_error:
+            if error is None:
+                raise
+            error.add_note(f"VLM snapshot cleanup also failed: {cleanup_error!r}")
 
 
-def open_local_vlm_snapshot(path: str | os.PathLike[str]) -> LocalVLMSnapshot:
-    resolved = _canonical_absolute_directory(path)
-    directory_fd = _open_directory(resolved)
+def _open_local_vlm_snapshot_at(
+    path: Path,
+    directory_fd: int,
+    directory_parent_fd: int,
+    directory_name: str,
+) -> LocalVLMSnapshot:
     manifest_fd = -1
     file_fds: dict[str, int] = {}
     try:
@@ -308,6 +425,14 @@ def open_local_vlm_snapshot(path: str | os.PathLike[str]) -> LocalVLMSnapshot:
         if names != set(manifest) | {_MANIFEST_NAME}:
             raise ValueError("VLM snapshot directory inventory does not match its manifest")
 
+        json_sizes = [size for name, (size, _) in manifest.items() if name.endswith(".json")]
+        if any(size > _MAX_JSON_ASSET_BYTES for size in json_sizes):
+            raise ValueError(f"VLM snapshot JSON asset exceeds {_MAX_JSON_ASSET_BYTES} bytes")
+        if sum(json_sizes) > _MAX_TOTAL_JSON_ASSET_BYTES:
+            raise ValueError(
+                f"VLM snapshot JSON assets exceed {_MAX_TOTAL_JSON_ASSET_BYTES} aggregate bytes"
+            )
+
         for name, (expected_size, expected_digest) in manifest.items():
             fd = _open_regular_at(directory_fd, name, require_read_only=True)
             metadata = os.fstat(fd)
@@ -316,11 +441,10 @@ def open_local_vlm_snapshot(path: str | os.PathLike[str]) -> LocalVLMSnapshot:
                 raise ValueError(f"VLM snapshot identity mismatch for {name!r}")
             file_fds[name] = fd
 
-        config = None
         for name in sorted(name for name in manifest if name.endswith(".json")):
             fd = file_fds[name]
             metadata = os.fstat(fd)
-            value = _parse_json(
+            _parse_json(
                 _read_bounded(
                     fd,
                     metadata.st_size,
@@ -329,12 +453,6 @@ def open_local_vlm_snapshot(path: str | os.PathLike[str]) -> LocalVLMSnapshot:
                 ),
                 f"VLM snapshot {name}",
             )
-            if name == "config.json":
-                config = value
-        if config is None:
-            raise ValueError("VLM snapshot has no parsed config.json")
-        if config.get("model_type") not in {"qwen3_5", "qwen3_5_moe", "qwen3_vl", "qwen3_vl_moe"}:
-            raise ValueError(f"Unsupported VLM snapshot model_type: {config.get('model_type')!r}")
 
         tensor_names: set[str] = set()
         for name in sorted(name for name in manifest if name.endswith(".safetensors")):
@@ -354,8 +472,10 @@ def open_local_vlm_snapshot(path: str | os.PathLike[str]) -> LocalVLMSnapshot:
 
         return LocalVLMSnapshot(
             _TOKEN,
-            resolved,
+            path,
             directory_fd,
+            directory_parent_fd,
+            directory_name,
             manifest_fd,
             hashlib.sha256(manifest_bytes).hexdigest(),
             file_fds,
@@ -366,49 +486,72 @@ def open_local_vlm_snapshot(path: str | os.PathLike[str]) -> LocalVLMSnapshot:
         if manifest_fd >= 0:
             os.close(manifest_fd)
         os.close(directory_fd)
+        os.close(directory_parent_fd)
         raise
 
 
-def write_local_vlm_snapshot_manifest(path: str | os.PathLike[str]) -> None:
-    resolved = _canonical_absolute_directory(path)
-    directory_fd = os.open(
+def open_local_vlm_snapshot(path: str | os.PathLike[str]) -> LocalVLMSnapshot:
+    resolved, directory_fd, directory_parent_fd, directory_name = _open_canonical_directory(
+        path,
+        label="VLM snapshot",
+        require_read_only=True,
+    )
+    return _open_local_vlm_snapshot_at(
         resolved,
-        os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+        directory_fd,
+        directory_parent_fd,
+        directory_name,
+    )
+
+
+def _write_local_vlm_snapshot_manifest_at(directory_fd: int, label: str) -> None:
+    names = set(os.listdir(directory_fd))
+    if _MANIFEST_NAME in names:
+        raise ValueError(f"VLM snapshot manifest already exists under {label}")
+    files: dict[str, dict[str, int | str]] = {}
+    for name in sorted(names):
+        fd = _open_regular_at(directory_fd, name, require_read_only=False)
+        try:
+            metadata = os.fstat(fd)
+            files[name] = {
+                "sha256": _sha256(fd, metadata.st_size),
+                "size_bytes": metadata.st_size,
+            }
+        finally:
+            os.close(fd)
+    manifest = {"format": _FORMAT, "files": files}
+    _validate_inventory(_validate_manifest(manifest))
+    data = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+    output_fd = os.open(
+        _MANIFEST_NAME,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+        0o440,
+        dir_fd=directory_fd,
     )
     try:
-        names = set(os.listdir(directory_fd))
-        if _MANIFEST_NAME in names:
-            raise ValueError(f"VLM snapshot manifest already exists under {resolved}")
-        files: dict[str, dict[str, int | str]] = {}
-        for name in sorted(names):
-            fd = _open_regular_at(directory_fd, name, require_read_only=False)
-            try:
-                metadata = os.fstat(fd)
-                files[name] = {
-                    "sha256": _sha256(fd, metadata.st_size),
-                    "size_bytes": metadata.st_size,
-                }
-            finally:
-                os.close(fd)
-        manifest = {"format": _FORMAT, "files": files}
-        _validate_inventory(_validate_manifest(manifest))
-        data = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode() + b"\n"
-        output_fd = os.open(
-            _MANIFEST_NAME,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
-            0o440,
-            dir_fd=directory_fd,
-        )
-        try:
-            offset = 0
-            while offset < len(data):
-                offset += os.write(output_fd, data[offset:])
-            os.fsync(output_fd)
-        finally:
-            os.close(output_fd)
-        for name in names:
-            os.chmod(name, 0o440, dir_fd=directory_fd, follow_symlinks=False)
-        os.fsync(directory_fd)
+        offset = 0
+        while offset < len(data):
+            count = os.write(output_fd, data[offset:])
+            if count == 0:
+                raise OSError("VLM snapshot manifest write made no progress")
+            offset += count
+        os.fsync(output_fd)
+    finally:
+        os.close(output_fd)
+    for name in names:
+        os.chmod(name, 0o440, dir_fd=directory_fd, follow_symlinks=False)
+    os.fchmod(directory_fd, 0o550)
+    os.fsync(directory_fd)
+
+
+def write_local_vlm_snapshot_manifest(path: str | os.PathLike[str]) -> None:
+    resolved, directory_fd, directory_parent_fd, _ = _open_canonical_directory(
+        path,
+        label="VLM snapshot",
+        require_read_only=False,
+    )
+    try:
+        _write_local_vlm_snapshot_manifest_at(directory_fd, str(resolved))
     finally:
         os.close(directory_fd)
-    os.chmod(resolved, 0o550)
+        os.close(directory_parent_fd)
