@@ -255,6 +255,7 @@ class VLMSFTTrainingTest(absltest.TestCase):
 
     def test_one_step_sft_text_only(self):
         train_cfg = vlm_trainer.TrainConfig(
+            schedule_horizon=1,
             seed=0,
             batch_size=1,
             seq_len=4,
@@ -291,6 +292,7 @@ class VLMSFTTrainingTest(absltest.TestCase):
     @absltest.skipUnless(jax.default_backend() == "gpu", "vision attention is cuDNN-only")
     def test_one_step_sft_multimodal_qwen3_vl(self):
         train_cfg = vlm_trainer.TrainConfig(
+            schedule_horizon=1,
             seed=0,
             batch_size=1,
             seq_len=8,

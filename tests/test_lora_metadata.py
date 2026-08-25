@@ -18,12 +18,22 @@ class LoraMetadataTest(absltest.TestCase):
         cases = (
             (
                 "full_ft",
-                vlm_trainer.TrainConfig(enable_lora=False, lora_rank=None, lora_alpha=None),
+                vlm_trainer.TrainConfig(
+                    schedule_horizon=20,
+                    enable_lora=False,
+                    lora_rank=None,
+                    lora_alpha=None,
+                ),
                 {"enable_lora": False, "lora_rank": None, "lora_alpha": None},
             ),
             (
                 "lora",
-                vlm_trainer.TrainConfig(enable_lora=True, lora_rank=16, lora_alpha=32.0),
+                vlm_trainer.TrainConfig(
+                    schedule_horizon=20,
+                    enable_lora=True,
+                    lora_rank=16,
+                    lora_alpha=32.0,
+                ),
                 {"enable_lora": True, "lora_rank": 16, "lora_alpha": 32.0},
             ),
         )

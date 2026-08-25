@@ -7,10 +7,10 @@ import importlib
 import json
 from pathlib import Path
 
-from absl import app, flags
 import grain
 import jax
 import wandb
+from absl import app, flags
 from transformers import AutoImageProcessor, AutoTokenizer
 
 from omegalax.data.collator_qwen3 import VLMSFTCollator
@@ -22,12 +22,12 @@ from omegalax.data.grain_pipeline import (
     parse_data_mix,
     required_epochs_for_batches,
 )
-from omegalax.distributed.mesh import process_local_batch_size
+from omegalax.distributed.mesh import ensure_mesh, process_local_batch_size
+from omegalax.registry import resolve_hf_repo_id
 from omegalax.trainers import vlm as vlm_trainer
 from omegalax.trainers.checkpoint_utils import ResumeMode
-from omegalax.registry import resolve_hf_repo_id
-from omegalax.trainers.text import startup_log
 from omegalax.trainers.perf import resolve_peak_tflops
+from omegalax.trainers.text import startup_log
 
 FLAGS = flags.FLAGS
 
@@ -52,6 +52,7 @@ flags.DEFINE_string(
 )
 flags.DEFINE_integer("max_length", None, "Maximum sequence length.")
 flags.DEFINE_integer("num_steps", None, "Number of training steps.")
+flags.DEFINE_integer("schedule_horizon", None, "Immutable LR-schedule horizon.")
 flags.DEFINE_integer("batch_size", None, "Global batch size across all JAX processes.")
 flags.DEFINE_float("learning_rate", None, "Learning rate.")
 flags.DEFINE_float("weight_decay", None, "Weight decay.")
@@ -107,12 +108,10 @@ flags.DEFINE_bool("log_memory", None, "Log per-process JAX/HBM memory at init an
 flags.DEFINE_enum(
     "resume",
     None,
-    [m.value for m in ResumeMode],
-    "Checkpoint resume policy: 'never' (fresh start), 'if_present' "
-    "(resume if a checkpoint exists at --save_dir, else start fresh — right "
-    "mode for SLURM time-limit resubmits), 'required' (resume; error if no "
-    "checkpoint).",
+    [ResumeMode.NEVER.value, ResumeMode.REQUIRED.value],
+    "Checkpoint policy: 'never' starts fresh; 'required' restores --resume_step.",
 )
+flags.DEFINE_integer("resume_step", None, "Exact checkpoint generation required for resume.")
 flags.DEFINE_integer("pad_id", None, "Padding token id.")
 flags.DEFINE_string("peak_tflops", None, "Peak TFLOPS for MFU calculation.")
 flags.DEFINE_string("wandb_entity", None, "Weights & Biases entity (team/user).")
@@ -161,12 +160,14 @@ flags.DEFINE_boolean(
     "--enable_lora (which already freezes vision).",
 )
 flags.DEFINE_string(
-    "extra_transform", None,
+    "extra_transform",
+    None,
     'A single {"class": "module:ClassName", "kwargs": {...}} object applied '
     "as a grain RandomMap augmentation to the train iterator only. The class "
     "must subclass grain.transforms.RandomMap and be importable in worker "
     "processes — set PYTHONPATH in the launch environment if the module lives "
-    "outside the installed venv.")
+    "outside the installed venv.",
+)
 flags.DEFINE_integer(
     "num_loss_tiles",
     None,
@@ -189,6 +190,7 @@ _REQUIRED = [
     "model_id",
     "max_length",
     "num_steps",
+    "schedule_horizon",
     "batch_size",
     "learning_rate",
     "weight_decay",
@@ -239,6 +241,17 @@ def _validate_flags() -> None:
 
     if (FLAGS.data_path is None) == (FLAGS.data_mix is None):
         problems.append("exactly one of {data_path, data_mix} (got neither or both)")
+
+    if FLAGS.resume == ResumeMode.REQUIRED.value and FLAGS.resume_step is None:
+        problems.append("resume_step (required when resume=required)")
+    if FLAGS.resume == ResumeMode.NEVER.value and FLAGS.resume_step is not None:
+        problems.append("resume_step (only valid when resume=required)")
+    if (
+        FLAGS.num_steps is not None
+        and FLAGS.schedule_horizon is not None
+        and FLAGS.num_steps > FLAGS.schedule_horizon
+    ):
+        problems.append("num_steps must not exceed schedule_horizon")
 
     # Both freeze the vision tower, so asking for both is a contradiction, not a no-op.
     if FLAGS.enable_lora and FLAGS.freeze_vision_tower:
@@ -293,10 +306,10 @@ def _parse_extra_transform(
     entry = json.loads(spec)
     module_path, _, class_name = entry["class"].partition(":")
     cls = getattr(importlib.import_module(module_path), class_name)
-    assert issubclass(cls, grain.transforms.RandomMap), (
-        f"--extra_transform {entry['class']!r} is not a "
-        "grain.transforms.RandomMap subclass"
-    )
+    if not issubclass(cls, grain.transforms.RandomMap):
+        raise TypeError(
+            f"--extra_transform {entry['class']!r} is not a grain.transforms.RandomMap subclass"
+        )
     return cls(**entry["kwargs"])
 
 
@@ -307,12 +320,12 @@ def _grain_iter(
     *,
     shuffle: bool,
     seed: int,
-    num_batches: int,
+    num_batches: int | None,
     dp_size: int,
     fsdp_size: int,
     extra_transform: grain.transforms.RandomMap | None,
 ):
-    if len(sources) == 1:
+    if len(sources) == 1 and num_batches is not None:
         num_epochs: int | None = required_epochs_for_batches(
             sources[0].path,
             batch_size=per_process_batch_size,
@@ -349,13 +362,16 @@ def main(_) -> None:
     jax.distributed.initialize()
     startup_log(f"jax_compilation_cache_dir={FLAGS.jax_cache_dir}")
     startup_log("jax.distributed initialized")
+    ensure_mesh(tp_size=FLAGS.tp_size, fsdp_size=FLAGS.fsdp_size, dp_size=FLAGS.dp_size)
 
     repo_id = FLAGS.processor or resolve_hf_repo_id(FLAGS.model_id)
     tokenizer = AutoTokenizer.from_pretrained(repo_id)
     startup_log(f"loaded tokenizer from {repo_id!r}")
-    assert FLAGS.max_length <= tokenizer.model_max_length, (
-        f"--max_length={FLAGS.max_length} exceeds tokenizer.model_max_length={tokenizer.model_max_length}"
-    )
+    if FLAGS.max_length > tokenizer.model_max_length:
+        raise ValueError(
+            f"--max_length={FLAGS.max_length} exceeds "
+            f"tokenizer.model_max_length={tokenizer.model_max_length}"
+        )
 
     ip_kwargs: dict = {}
     if FLAGS.preprocessor_config:
@@ -376,14 +392,6 @@ def main(_) -> None:
                 f"(remainder {max_patches % ms2}). Adjust the flags so their "
                 f"product is a multiple of {ms2}."
             )
-        # The dataset build budgets tokens (max_length) and records nothing about
-        # patches, so it cannot refuse a sample this budget will. Below the ceiling
-        # a sample can satisfy max_length and still exceed us, and the collator
-        # only finds out on the batch that contains it -- thousands of steps in,
-        # taking any afterok chain with it. Not an error: `_pad_vision_arrays` pads
-        # to exactly max_patches, so the ceiling makes every batch pay maximum
-        # vision padding. The tightest safe value is a judgement, so say what the
-        # risk is and let the operator hold it.
         ceiling = ms2 * FLAGS.max_length
         if FLAGS.max_vision_patches_per_sample < ceiling:
             startup_log(
@@ -422,7 +430,6 @@ def main(_) -> None:
             f"per_process_batch_size={per_process_batch}"
         )
 
-    total_micro_batches = FLAGS.num_steps * FLAGS.grad_accum_steps
     extra_transform = _parse_extra_transform(FLAGS.extra_transform)
     if extra_transform is not None:
         startup_log(f"loaded extra train transform: {type(extra_transform).__name__}")
@@ -432,7 +439,7 @@ def main(_) -> None:
         per_process_batch,
         shuffle=True,
         seed=FLAGS.seed,
-        num_batches=total_micro_batches,
+        num_batches=None,
         dp_size=FLAGS.dp_size,
         fsdp_size=FLAGS.fsdp_size,
         extra_transform=extra_transform,
@@ -463,6 +470,7 @@ def main(_) -> None:
         batch_size=FLAGS.batch_size,
         seq_len=FLAGS.max_length,
         num_steps=FLAGS.num_steps,
+        schedule_horizon=FLAGS.schedule_horizon,
         learning_rate=FLAGS.learning_rate,
         weight_decay=FLAGS.weight_decay,
         warmup_steps=FLAGS.warmup_steps,
@@ -509,6 +517,7 @@ def main(_) -> None:
             keep_latest=FLAGS.keep_latest,
             log_every=FLAGS.log_every,
             resume=resume_mode,
+            resume_step=FLAGS.resume_step,
             pad_id=FLAGS.pad_id,
             peak_tflops=peak_tflops,
             tp_size=FLAGS.tp_size,
