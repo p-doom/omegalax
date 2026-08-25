@@ -9,7 +9,7 @@ import ml_dtypes
 import numpy as np
 from transformers import BaseImageProcessor, PreTrainedTokenizer
 
-from omegalax.data.qwen3_encoding import Qwen3MessageEncoder
+from omegalax.data.qwen_chat_encoding import QwenChatMessageEncoder
 
 
 class TextSFTCollator:
@@ -28,7 +28,7 @@ class TextSFTCollator:
         self.max_length = max_length
         if tokenizer.pad_token_id is None:
             raise ValueError("tokenizer must define pad_token_id")
-        self._encoder = Qwen3MessageEncoder(tokenizer, None)
+        self._encoder = QwenChatMessageEncoder(tokenizer, None)
 
     def __call__(self, examples: Sequence[dict[str, Any]]) -> dict[str, np.ndarray]:
         batch_ids: list[np.ndarray] = []
@@ -193,7 +193,7 @@ class VLMSFTCollator:
         self._pixel_values_dtype = pixel_values_dtype
         if tokenizer.pad_token_id is None:
             raise ValueError("tokenizer must define pad_token_id")
-        self._encoder = Qwen3MessageEncoder(tokenizer, image_processor)
+        self._encoder = QwenChatMessageEncoder(tokenizer, image_processor)
 
         self._image_token_id = tokenizer.convert_tokens_to_ids("<|image_pad|>")
         self._video_token_id = tokenizer.convert_tokens_to_ids("<|video_pad|>")
@@ -215,7 +215,6 @@ class VLMSFTCollator:
         batch_ids: list[np.ndarray] = []
         batch_attn: list[np.ndarray] = []
         batch_mask: list[np.ndarray] = []
-        batch_mm_type: list[np.ndarray] = []
         all_pixel_values: list[np.ndarray] = []
         all_grid_thw: list[np.ndarray] = []
 
@@ -238,26 +237,21 @@ class VLMSFTCollator:
             token_ids = np.array(full_ids, dtype=np.int32)
             attn_mask = np.ones(seq_len, dtype=np.int32)
             loss_mask = encoded["loss_mask"]
-            mm_type = encoded["mm_token_type_ids"]
-
             if pad_len > 0:
                 token_ids = np.pad(
                     token_ids, (0, pad_len), constant_values=self.tokenizer.pad_token_id
                 )
                 attn_mask = np.pad(attn_mask, (0, pad_len), constant_values=0)
                 loss_mask = np.pad(loss_mask, (0, pad_len), constant_values=0)
-                mm_type = np.pad(mm_type, (0, pad_len), constant_values=0)
 
             batch_ids.append(token_ids)
             batch_attn.append(attn_mask)
             batch_mask.append(loss_mask)
-            batch_mm_type.append(mm_type)
 
         result: dict[str, np.ndarray] = {
             "token_ids_BT": np.stack(batch_ids).astype(np.int32),
             "attention_mask_BT": np.stack(batch_attn).astype(np.int32),
             "loss_mask_BT": np.stack(batch_mask).astype(np.int32),
-            "mm_token_type_ids_BT": np.stack(batch_mm_type).astype(np.int32),
         }
 
         if all_pixel_values:

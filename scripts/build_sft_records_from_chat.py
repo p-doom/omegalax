@@ -21,7 +21,7 @@ from transformers import AutoImageProcessor, AutoTokenizer
 
 from omegalax.data.artifact_contract import make_measurement_contract
 from omegalax.data.grain_pipeline import build_records_from_chat
-from omegalax.data.qwen3_encoding import make_message_length_fn
+from omegalax.data.qwen_chat_encoding import make_message_length_fn
 
 FLAGS = flags.FLAGS
 

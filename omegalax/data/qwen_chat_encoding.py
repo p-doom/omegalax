@@ -15,17 +15,14 @@ from omegalax.data.arrayrecord_images import extract_images
 class _TurnEncoding:
     input_ids: np.ndarray
     loss_mask: np.ndarray
-    mm_token_type_ids: np.ndarray
     final_input_ids: np.ndarray | None = None
     final_loss_mask: np.ndarray | None = None
-    final_mm_token_type_ids: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
 class _EncodedConversation:
     input_ids: np.ndarray
     loss_mask: np.ndarray
-    mm_token_type_ids: np.ndarray
     pixel_values: np.ndarray | None
     image_grid_thw: np.ndarray
     measurements: list[dict[str, Any]]
@@ -86,6 +83,8 @@ def _validate_messages(messages: list[dict[str, Any]], *, multimodal: bool) -> N
 
         content = message.get("content")
         if isinstance(content, str):
+            if "<|video_pad|>" in content:
+                raise ValueError("video content is not supported")
             continue
         if not multimodal or not isinstance(content, list) or not content:
             expected = "a string" if not multimodal else "a string or non-empty part list"
@@ -102,6 +101,8 @@ def _validate_messages(messages: list[dict[str, Any]], *, multimodal: bool) -> N
                         f"messages[{index}].content[{part_index}] must contain exactly "
                         "type and string text"
                     )
+                if "<|video_pad|>" in part["text"]:
+                    raise ValueError("video content is not supported")
             elif part_type in {"image", "image_url"}:
                 if role != "user":
                     raise ValueError("image parts are supported only in user turns")
@@ -111,7 +112,7 @@ def _validate_messages(messages: list[dict[str, Any]], *, multimodal: bool) -> N
                 )
 
 
-class Qwen3MessageEncoder:
+class QwenChatMessageEncoder:
     """Encode Qwen messages with the supplied tokenizer and image processor."""
 
     def __init__(
@@ -204,31 +205,27 @@ class Qwen3MessageEncoder:
         self,
         ids: np.ndarray,
         grids: np.ndarray,
-    ) -> tuple[np.ndarray, np.ndarray]:
+    ) -> np.ndarray:
         image_positions = np.flatnonzero(ids == self._image_token_id)
         if len(image_positions) != len(grids):
             raise ValueError(
                 "chat template image placeholders do not match the structured image parts"
             )
         if not len(grids):
-            return ids, np.zeros(len(ids), dtype=np.int32)
+            return ids
 
         merge_size = int(self.image_processor.merge_size)
         pieces: list[np.ndarray] = []
-        mm_types: list[np.ndarray] = []
         offset = 0
         for position, grid in zip(image_positions, grids, strict=True):
             pieces.append(ids[offset:position])
-            mm_types.append(np.zeros(position - offset, dtype=np.int32))
             token_count = int(np.prod(grid, dtype=np.int64)) // (merge_size * merge_size)
             if token_count <= 0:
                 raise ValueError("image processor produced an empty image grid")
             pieces.append(np.full(token_count, self._image_token_id, dtype=np.int32))
-            mm_types.append(np.ones(token_count, dtype=np.int32))
             offset = int(position) + 1
         pieces.append(ids[offset:])
-        mm_types.append(np.zeros(len(ids) - offset, dtype=np.int32))
-        return np.concatenate(pieces), np.concatenate(mm_types)
+        return np.concatenate(pieces)
 
     def _encode_turn(
         self,
@@ -237,23 +234,21 @@ class Qwen3MessageEncoder:
         grids: np.ndarray,
         final_text: str | None,
     ) -> _TurnEncoding:
-        ids, mm_types = self._expand_images(
+        ids = self._expand_images(
             np.asarray(_token_ids(self.tokenizer, text), dtype=np.int32), grids
         )
         mask = self._assistant_mask(ids) if role == "assistant" else np.zeros(len(ids), np.int32)
         if final_text is None:
-            return _TurnEncoding(ids, mask, mm_types)
+            return _TurnEncoding(ids, mask)
 
-        final_ids, final_mm_types = self._expand_images(
+        final_ids = self._expand_images(
             np.asarray(_token_ids(self.tokenizer, final_text), dtype=np.int32), grids
         )
         return _TurnEncoding(
             ids,
             mask,
-            mm_types,
             final_ids,
             self._assistant_mask(final_ids),
-            final_mm_types,
         )
 
     def _encode(self, messages: list[dict[str, Any]]) -> _EncodedConversation:
@@ -291,14 +286,14 @@ class Qwen3MessageEncoder:
         ]
         input_ids = np.concatenate(selected_ids)
         full_ids = np.asarray(_token_ids(self.tokenizer, full_text), dtype=np.int32)
-        if self._multimodal and np.any(full_ids == self._video_token_id):
+        if np.any(full_ids == self._video_token_id):
             raise ValueError("video content is not supported")
         expected_unexpanded_images = int(np.sum(full_ids == self._image_token_id))
         if expected_unexpanded_images != len(images):
             raise ValueError(
                 "chat template image placeholders do not match the structured image parts"
             )
-        expanded_full, _ = self._expand_images(full_ids, grids)
+        expanded_full = self._expand_images(full_ids, grids)
         if not np.array_equal(input_ids, expanded_full):
             raise ValueError("turn encodings do not reproduce the full chat-template token stream")
 
@@ -309,14 +304,6 @@ class Qwen3MessageEncoder:
             for index, turn in enumerate(turn_encodings)
         ]
         loss_mask = np.concatenate(selected_masks)
-        mm_token_type_ids = np.concatenate(
-            [
-                turn.final_mm_token_type_ids
-                if index == len(turn_encodings) - 1 and turn.final_mm_token_type_ids is not None
-                else turn.mm_token_type_ids
-                for index, turn in enumerate(turn_encodings)
-            ]
-        )
         measurements: list[dict[str, Any]] = []
         grid_offset = 0
         merge_size = int(getattr(self.image_processor, "merge_size", 1))
@@ -346,7 +333,6 @@ class Qwen3MessageEncoder:
         return _EncodedConversation(
             input_ids,
             loss_mask,
-            mm_token_type_ids,
             pixel_values,
             grids,
             measurements,
@@ -357,7 +343,6 @@ class Qwen3MessageEncoder:
         result = {
             "input_ids": encoded.input_ids,
             "loss_mask": encoded.loss_mask,
-            "mm_token_type_ids": encoded.mm_token_type_ids,
         }
         if encoded.pixel_values is not None:
             result["pixel_values"] = encoded.pixel_values
@@ -368,7 +353,7 @@ class Qwen3MessageEncoder:
         return self._encode(messages).measurements
 
 
-class Qwen3ConversationMeasurement:
+class QwenConversationMeasurement:
     """Picklable conversation measurement callable for spawned workers."""
 
     def __init__(
@@ -378,7 +363,7 @@ class Qwen3ConversationMeasurement:
     ) -> None:
         self.tokenizer = tokenizer
         self.image_processor = image_processor
-        self.encoder = Qwen3MessageEncoder(tokenizer, image_processor)
+        self.encoder = QwenChatMessageEncoder(tokenizer, image_processor)
 
     def reject_unmeasurable(self, messages: list[dict[str, Any]]) -> None:
         _validate_messages(messages, multimodal=self.image_processor is not None)
@@ -391,5 +376,5 @@ class Qwen3ConversationMeasurement:
 def make_message_length_fn(
     tokenizer: PreTrainedTokenizer,
     image_processor: BaseImageProcessor | None = None,
-) -> Qwen3ConversationMeasurement:
-    return Qwen3ConversationMeasurement(tokenizer, image_processor)
+) -> QwenConversationMeasurement:
+    return QwenConversationMeasurement(tokenizer, image_processor)
