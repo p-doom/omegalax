@@ -20,7 +20,7 @@ from flax import nnx
 from omegalax.trainers import vlm
 from omegalax.trainers.optim import MixedPrecisionOptimizer
 
-_MODEL_SNAPSHOT_ID = "ab" * 16
+_MODEL_SNAPSHOT_ID = "ab" * 32
 
 
 class _TinyModel(nnx.Module):

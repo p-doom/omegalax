@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -57,7 +58,10 @@ def _rewrite_file_and_identity(snapshot: Path, name: str, data: bytes) -> None:
     os.chmod(target, 0o440)
     os.chmod(manifest_path, 0o640)
     value = json.loads(manifest_path.read_bytes())
-    value["files"][name] = {"size_bytes": len(data)}
+    value["files"][name] = {
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "size_bytes": len(data),
+    }
     manifest_path.write_text(json.dumps(value, separators=(",", ":")) + "\n")
     os.chmod(manifest_path, 0o440)
     os.chmod(snapshot, 0o550)
@@ -267,7 +271,7 @@ class LocalVLMSnapshotTest(absltest.TestCase):
                     (snapshot / "config.json").write_text('{"model_type":"qwen3_5"}\n')
                     os.chmod(snapshot / "config.json", 0o440)
                 os.chmod(snapshot, 0o550)
-                match = "inventory" if case != "content" else "size mismatch"
+                match = "inventory" if case != "content" else "identity mismatch"
                 with self.assertRaisesRegex(ValueError, match):
                     local_snapshot.open_local_vlm_snapshot(snapshot)
 
@@ -376,7 +380,10 @@ class LocalVLMSnapshotTest(absltest.TestCase):
                 os.chmod(manifest, 0o640)
                 value = json.loads(manifest.read_bytes())
                 data = target.read_bytes()
-                value["files"][target.name] = {"size_bytes": len(data)}
+                value["files"][target.name] = {
+                    "sha256": hashlib.sha256(data).hexdigest(),
+                    "size_bytes": len(data),
+                }
                 manifest.write_text(json.dumps(value, separators=(",", ":")) + "\n")
                 os.chmod(manifest, 0o440)
                 os.chmod(snapshot, 0o550)
@@ -490,7 +497,9 @@ with tempfile.TemporaryDirectory() as root:
             raise RuntimeError('snapshot replacement was not detected')
 """
         env = dict(os.environ)
-        env["PYTHONPATH"] = os.getcwd()
+        env["PYTHONPATH"] = os.pathsep.join(
+            path for path in (os.getcwd(), env.get("PYTHONPATH")) if path
+        )
         for optimized in (False, True):
             command = [sys.executable]
             if optimized:
