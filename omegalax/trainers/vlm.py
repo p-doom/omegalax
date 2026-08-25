@@ -178,8 +178,8 @@ def _make_checkpoint_manager(
     ``keep_period`` permanently retains every checkpoint whose step is a multiple
     of it (e.g. full-epoch boundaries); for it to ever fire it must be a multiple
     of ``save_interval`` since the loop only saves at multiples of ``save_interval``.
-    ``keep_latest`` additionally retains the N most-recent checkpoints. When
-    ``keep_period`` is unset the manager keeps every checkpoint (prior behavior).
+    ``keep_latest`` retains the N most-recent checkpoints independently. With
+    neither policy set, the manager keeps every checkpoint.
     """
     save_dir = Path(save_dir).expanduser().resolve()
     handler_registry = ocp.handlers.DefaultCheckpointHandlerRegistry()
@@ -192,12 +192,12 @@ def _make_checkpoint_manager(
     handler_registry.add("model", ocp.args.PyTreeSave, train_state_handler)
     handler_registry.add("model", ocp.args.PyTreeRestore, train_state_handler)
     checkpoint_utils.register_grain_iterator_handler(handler_registry)
-    preservation_policy = None
+    policies = []
     if keep_period:
-        policies = [ocm.EveryNSteps(keep_period, exact_interval=True)]
-        if keep_latest:
-            policies.append(ocm.LatestN(keep_latest))
-        preservation_policy = ocm.AnyPreservationPolicy(policies)
+        policies.append(ocm.EveryNSteps(keep_period, exact_interval=True))
+    if keep_latest:
+        policies.append(ocm.LatestN(keep_latest))
+    preservation_policy = ocm.AnyPreservationPolicy(policies) if policies else None
     options = ocp.CheckpointManagerOptions(
         save_interval_steps=save_interval,
         step_format_fixed_length=6,

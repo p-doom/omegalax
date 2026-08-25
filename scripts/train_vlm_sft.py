@@ -272,6 +272,8 @@ def _validate_flags() -> None:
         problems.append("warmup_steps must not exceed schedule_horizon")
     if FLAGS.keep_period and FLAGS.save_every and FLAGS.keep_period % FLAGS.save_every:
         problems.append("keep_period must be a multiple of save_every")
+    if FLAGS.keep_period and not FLAGS.save_every:
+        problems.append("keep_period requires save_every > 0")
 
     if (FLAGS.data_path is None) == (FLAGS.data_mix is None):
         problems.append("exactly one of {data_path, data_mix} (got neither or both)")

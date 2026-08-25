@@ -241,7 +241,7 @@ class VLMSFTTrainingTest(absltest.TestCase):
             ) as handler_cls,
             mock.patch.object(vlm_trainer.ocp, "CheckpointManager") as manager_cls,
         ):
-            vlm_trainer._make_checkpoint_manager(Path(tmpdir), save_interval=10)
+            vlm_trainer._make_checkpoint_manager(Path(tmpdir), save_interval=10, keep_latest=2)
 
         handler_kwargs = handler_cls.call_args.kwargs
         self.assertEqual(handler_kwargs["save_device_host_concurrent_gb"], 2)
@@ -249,6 +249,9 @@ class VLMSFTTrainingTest(absltest.TestCase):
 
         manager_kwargs = manager_cls.call_args.kwargs
         self.assertFalse(manager_kwargs["options"].enable_async_checkpointing)
+        policies = manager_kwargs["options"].preservation_policy.policies
+        self.assertLen(policies, 1)
+        self.assertEqual(policies[0].n, 2)
         registry = manager_kwargs["handler_registry"]
         self.assertIs(registry.get("train_state", vlm_trainer.ocp.args.PyTreeSave), handler)
         self.assertIs(registry.get("train_state", vlm_trainer.ocp.args.PyTreeRestore), handler)

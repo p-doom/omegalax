@@ -80,6 +80,17 @@ with flagsaver.flagsaver(**values):
             raise
     else:
         raise RuntimeError('invalid batch_size was accepted')
+values['batch_size'] = 2
+values['save_every'] = 0
+values['keep_period'] = 5
+with flagsaver.flagsaver(**values):
+    try:
+        train_vlm_sft._validate_flags()
+    except ValueError as error:
+        if 'keep_period requires save_every > 0' not in str(error):
+            raise
+    else:
+        raise RuntimeError('unreachable retention policy was accepted')
 """
         payload = json.dumps(_VALID)
         for optimized in (False, True):
