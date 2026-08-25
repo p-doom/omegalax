@@ -20,11 +20,12 @@ from pathlib import Path
 from absl import app, flags
 from transformers import AutoImageProcessor, AutoTokenizer
 
+from omegalax.data.artifact_contract import make_measurement_contract
+from omegalax.data.collator_qwen3 import make_message_length_fn
 from omegalax.data.grain_pipeline import (
     MESSAGE_LENGTHS_FILENAME,
     measure_message_lengths_from_chat,
 )
-from omegalax.data.collator_qwen3 import make_message_length_fn
 from omegalax.registry import resolve_hf_repo_id
 
 FLAGS = flags.FLAGS
@@ -69,10 +70,17 @@ def main(_) -> None:
 
     out_dir = Path(FLAGS.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    measure_message = make_message_length_fn(tokenizer, image_processor)
+    measurement_contract = make_measurement_contract(
+        tokenizer=tokenizer,
+        image_processor=image_processor,
+        preprocessor_config_path=FLAGS.preprocessor_config,
+    )
     out_path = measure_message_lengths_from_chat(
         FLAGS.data_path,
         out_dir / MESSAGE_LENGTHS_FILENAME,
-        measure_message=make_message_length_fn(tokenizer, image_processor),
+        measure_message=measure_message,
+        measurement_contract=measurement_contract,
         num_workers=FLAGS.num_workers,
     )
     print(out_path)

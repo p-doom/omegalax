@@ -7,9 +7,9 @@ from pathlib import Path
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
-from absl.testing import absltest
 import numpy as np
 import orbax.checkpoint as ocp
+from absl.testing import absltest
 
 from omegalax.data.grain_pipeline import (
     BATCH_SOURCE_IDS_KEY,
@@ -46,6 +46,14 @@ def _measure_one(message):
     return 1
 
 
+_TEST_MEASUREMENT_CONTRACT = {
+    "version": 1,
+    "tokenizer_sha256": "a" * 64,
+    "processor_sha256": None,
+    "preprocessor_sha256": None,
+}
+
+
 def _build_chunked_source(
     tmpdir: Path,
     *,
@@ -78,17 +86,18 @@ def _build_chunked_source(
         max_length=2,
         measure_message=_measure_one,
         records_per_shard=8,
+        measurement_contract=_TEST_MEASUREMENT_CONTRACT,
     )
 
 
-_FAST_OPTS = dict(
-    read_options=make_grain_read_options(num_threads=1, prefetch_buffer_size=1),
-    multiprocessing_options=make_grain_multiprocessing_options(
+_FAST_OPTS = {
+    "read_options": make_grain_read_options(num_threads=1, prefetch_buffer_size=1),
+    "multiprocessing_options": make_grain_multiprocessing_options(
         num_workers=0, per_worker_buffer_size=1
     ),
-    dp_size=1,
-    fsdp_size=1,
-)
+    "dp_size": 1,
+    "fsdp_size": 1,
+}
 
 
 class DataMixingTest(absltest.TestCase):
@@ -124,7 +133,7 @@ class DataMixingTest(absltest.TestCase):
         """The mixing iterator surfaces per-example source ids in each batch."""
         with tempfile.TemporaryDirectory() as tmp:
             tmpdir = Path(tmp)
-            a = _build_chunked_source(tmpdir, name="a", contents=[str(i) for i in range(0, 8)])
+            a = _build_chunked_source(tmpdir, name="a", contents=[str(i) for i in range(8)])
             b = _build_chunked_source(tmpdir, name="b", contents=[str(i) for i in range(100, 108)])
 
             it = make_grain_iterator(
@@ -288,6 +297,7 @@ class DataMixingTest(absltest.TestCase):
                 max_length=2,
                 measure_message=_measure_one,
                 records_per_shard=8,
+                measurement_contract=_TEST_MEASUREMENT_CONTRACT,
             )
             chunked_a_long = build_records_from_chat(
                 src_a,
@@ -295,6 +305,7 @@ class DataMixingTest(absltest.TestCase):
                 max_length=3,
                 measure_message=_measure_one,
                 records_per_shard=8,
+                measurement_contract=_TEST_MEASUREMENT_CONTRACT,
             )
             with self.assertRaisesRegex(ValueError, "different max_length"):
                 make_grain_iterator(
