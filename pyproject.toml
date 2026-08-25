@@ -20,11 +20,6 @@ dependencies = [
   "optax",
   "orbax-checkpoint",
   "Pillow",
-  # From the index, pinned exactly to the version prime-rl is on, so training and
-  # rollout share one renderer. It used to come from a path source into a personal
-  # clone of prime-rl, at that clone's pre-#44 layout: it resolved only while the
-  # clone stayed stale, and `uv.lock` recorded the dependency nowhere at all.
-  "renderers==0.1.9.dev1",
   # 0.8.0 stopped honouring strides in save_file (it copies straight off the raw
   # pointer), which silently changed what a non-contiguous view serialized to.
   # The exporter no longer relies on either behaviour, but floor it at the version

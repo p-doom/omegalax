@@ -28,13 +28,8 @@ COMPILED_METADATA_FILENAME = "metadata.json"
 TOKEN_STATS_FILENAME = "token_stats.json"
 TRUNCATION_STATS_FILENAME = "truncation_stats.json"
 SEQUENCE_LENGTHS_FILENAME = "sequence_lengths.jsonl"
-# Per-message token-length cache for the payload-free inline path. Keyed by
-# (conv_idx, msg_offset) -- conv_idx is the 0-based index over non-empty
-# chat.jsonl rows (the no-payload analog of the payload record_idx). Independent
-# of max_length / overflow_mode / split, so it is measured once
-# (measure_message_lengths_from_chat) and reused across every seq-length build.
 MESSAGE_LENGTHS_FILENAME = "message_lengths.jsonl"
-MESSAGE_LENGTHS_VERSION = 2
+MESSAGE_LENGTHS_VERSION = 3
 ARRAY_RECORD_SUFFIX = ".array_record"
 
 SOURCE_ID_KEY = "_omegalax_source_id"
@@ -42,9 +37,6 @@ BATCH_SOURCE_IDS_KEY = "source_ids"
 CARRY_KEY = "_omegalax_carry_messages"
 SPLIT_UNIT_ENDS_KEY = "_omegalax_split_unit_ends"
 
-# Worker-process global for the parallel measure pass. Installed once per worker
-# via the Pool initializer (_measure_init), then reused for every message-length
-# call so the (picklable) measure fn is shipped once, not per task.
 _measure_fn = None
 
 
@@ -231,9 +223,12 @@ def required_epochs_for_batches(
     return max(1, (required_records + records_per_epoch - 1) // records_per_epoch)
 
 
-def _measure_worker(keyed_message):
-    key, message = keyed_message
-    return key, _measure_fn(message)
+def _measure_worker(keyed_conversation):
+    conv_idx, messages = keyed_conversation
+    measurements = _measure_fn(messages)
+    if not isinstance(measurements, list) or len(measurements) != len(messages):
+        raise ValueError("conversation measurement must return one result per message")
+    return [((conv_idx, offset), result) for offset, result in enumerate(measurements)]
 
 
 def _compute_distribution(values: list[int]) -> dict[str, int | float]:
@@ -387,6 +382,41 @@ def _supervised_tokens(result, message: dict[str, Any]) -> int:
     return _extract_measurement(result)[0]
 
 
+def _terminal_length_delta(result, message: dict[str, Any]) -> int:
+    if message.get("role") != "assistant":
+        return 0
+    return int(result["terminal_length_delta"])
+
+
+def _terminal_supervised_delta(result, message: dict[str, Any]) -> int:
+    if message.get("role") != "assistant":
+        return 0
+    return int(result["terminal_supervised_tokens_delta"])
+
+
+def _span_totals(
+    precomputed: dict,
+    conv_idx: int,
+    messages: list[dict[str, Any]],
+    start: int,
+    end: int,
+) -> tuple[int, int]:
+    if start >= end:
+        return 0, 0
+    length = 0
+    supervised = 0
+    for offset in range(start, end):
+        result = precomputed[(conv_idx, offset)]
+        length += _extract_measurement(result)[0]
+        supervised += _supervised_tokens(result, messages[offset])
+    last_result = precomputed[(conv_idx, end - 1)]
+    last_message = messages[end - 1]
+    return (
+        length + _terminal_length_delta(last_result, last_message),
+        supervised + _terminal_supervised_delta(last_result, last_message),
+    )
+
+
 def _measure_init(measure_message) -> None:
     """Pool initializer: install the measure fn in the worker's module global.
 
@@ -415,18 +445,18 @@ def _preflight_measure_fn(measure_message, tasks, chat_path) -> None:
     reject_unmeasurable = getattr(measure_message, "reject_unmeasurable", None)
     if reject_unmeasurable is None:
         return
-    for (conv_idx, msg_offset), message in tasks:
+    for conv_idx, messages in tasks:
         try:
-            reject_unmeasurable(message)
+            reject_unmeasurable(messages)
         except ValueError as exc:
             raise ValueError(
-                f"{Path(chat_path).name} conversation {conv_idx} message "
-                f"{msg_offset}: {exc} Every worker would fail on it."
+                f"{Path(chat_path).name} conversation {conv_idx}: {exc} "
+                "Every worker would fail on it."
             ) from exc
 
 
 def _compute_message_lengths_from_chat(chat_path, measure_message, num_workers) -> dict:
-    """Tokenize every message in a chat.jsonl once, in parallel, under ``spawn``.
+    """Measure every conversation in a chat.jsonl under ``spawn``.
 
     Returns ``{(conv_idx, msg_offset): measurement}``. Uses the ``spawn`` start
     method, not ``fork``: ar:// image refs are read from a native ArrayRecord
@@ -435,23 +465,21 @@ def _compute_message_lengths_from_chat(chat_path, measure_message, num_workers) 
     clean; ``measure_message`` is shipped to each worker via the pool
     initializer since spawn does not inherit globals.
     """
-    tasks: list[tuple[tuple[int, int], dict[str, Any]]] = []
+    tasks: list[tuple[int, list[dict[str, Any]]]] = []
     for conv_idx, _sid, _meta, messages in _iter_chat_conversations(chat_path):
-        for msg_offset, message in enumerate(messages):
-            tasks.append(((conv_idx, msg_offset), message))
+        tasks.append((conv_idx, messages))
     if not tasks:
         return {}
     _preflight_measure_fn(measure_message, tasks, chat_path)
     ctx = mp.get_context("spawn")
     chunksize = max(1, min(32, len(tasks) // num_workers))
     with ctx.Pool(num_workers, initializer=_measure_init, initargs=(measure_message,)) as pool:
-        results = dict(
-            tqdm(
-                pool.imap_unordered(_measure_worker, tasks, chunksize=chunksize),
-                total=len(tasks),
-                desc=f"Measuring messages ({num_workers} workers)",
-            )
+        batches = tqdm(
+            pool.imap_unordered(_measure_worker, tasks, chunksize=chunksize),
+            total=len(tasks),
+            desc=f"Measuring conversations ({num_workers} workers)",
         )
+        results = dict(chain.from_iterable(batches))
     return results
 
 
@@ -539,10 +567,17 @@ def _validate_chat_message_lengths(
     expected = 0
     missing: list[tuple[int, int]] = []
     for conv_idx, _sid, _meta, messages in _iter_chat_conversations(chat_path):
-        for msg_offset in range(len(messages)):
+        for msg_offset, message in enumerate(messages):
             expected += 1
             if (conv_idx, msg_offset) not in results and len(missing) < 5:
                 missing.append((conv_idx, msg_offset))
+                continue
+            result = results[(conv_idx, msg_offset)]
+            if message.get("role") != "assistant" and (
+                result["terminal_length_delta"] != 0
+                or result["terminal_supervised_tokens_delta"] != 0
+            ):
+                raise ValueError("only assistant messages may have terminal measurement deltas")
     if missing or len(results) != expected:
         raise ValueError(
             f"cached message lengths do not match chat dataset {chat_path}: chat has "
@@ -651,6 +686,7 @@ def _emit_truncation_stats(
     dropped_supervised_tokens: int,
     repeated_supervised_tokens: int,
     emitted_tokens: int,
+    emitted_supervised_tokens: int,
     carried_tokens: int,
     carried_messages: int,
     chunks_with_carry: int,
@@ -665,9 +701,10 @@ def _emit_truncation_stats(
     sessions_dropped_entirely = total_sessions - sessions_with_chunks
     kept_tokens = total_message_tokens - dropped_tokens
     kept_supervised = total_supervised_tokens - dropped_supervised_tokens
-    emitted_supervised = kept_supervised + repeated_supervised_tokens
-    assert emitted_tokens == kept_tokens + carried_tokens
-    assert total_supervised_tokens == kept_supervised + dropped_supervised_tokens
+    if total_supervised_tokens != kept_supervised + dropped_supervised_tokens:
+        raise RuntimeError("supervision accounting invariant failed")
+    boundary_tokens = emitted_tokens - kept_tokens - carried_tokens
+    boundary_supervised = emitted_supervised_tokens - kept_supervised - repeated_supervised_tokens
 
     summary = {
         "overflow_mode": overflow_mode,
@@ -692,6 +729,7 @@ def _emit_truncation_stats(
             "total_measured": total_message_tokens,
             "kept": kept_tokens,
             "dropped": dropped_tokens,
+            "chunk_boundary_adjustment": boundary_tokens,
             "dropped_fraction": (
                 round(dropped_tokens / total_message_tokens, 6) if total_message_tokens else 0.0
             ),
@@ -702,7 +740,8 @@ def _emit_truncation_stats(
             "kept": kept_supervised,
             "dropped": dropped_supervised_tokens,
             "repeated": repeated_supervised_tokens,
-            "emitted": emitted_supervised,
+            "chunk_boundary_adjustment": boundary_supervised,
+            "emitted": emitted_supervised_tokens,
             "dropped_fraction": (
                 round(dropped_supervised_tokens / total_supervised_tokens, 6)
                 if total_supervised_tokens
@@ -737,7 +776,7 @@ def _emit_truncation_stats(
         f"dropped={dropped_tokens} ({pct:.3f}%)\n"
         f"  supervision: total={total_supervised_tokens} kept={kept_supervised} "
         f"dropped={dropped_supervised_tokens} repeated={repeated_supervised_tokens} "
-        f"emitted={emitted_supervised}\n"
+        f"boundary_adjustment={boundary_supervised} emitted={emitted_supervised_tokens}\n"
         f"  carry: chunks={chunks_with_carry} messages={carried_messages} "
         f"tokens={carried_tokens} of emitted={emitted_tokens}",
         flush=True,
@@ -770,6 +809,7 @@ def _process_conversation(
     msg_vision_tokens: list[int] = []
     msg_num_images: list[int] = []
     chunk_lengths: list[int] = []
+    chunk_supervised_tokens: list[int] = []
     chunk_vision_tokens: list[int] = []
     chunk_vision_patches: list[int] = []
     chunk_num_images: list[int] = []
@@ -786,17 +826,19 @@ def _process_conversation(
     chunks_with_carry = 0
 
     def _dropped(start: int) -> tuple[int, int, int]:
-        dm = 0
-        dt = 0
-        ds = 0
-        for off in range(start, len(messages)):
-            length, *_ = _extract_measurement(precomputed[(conv_idx, off)])
-            dm += 1
-            dt += length
-            ds += _supervised_tokens(precomputed[(conv_idx, off)], messages[off])
-        return dm, dt, ds
+        dt, ds = _span_totals(precomputed, conv_idx, messages, start, len(messages))
+        return len(messages) - start, dt, ds
 
-    def _make_example(cur_msgs, cur_len, cur_vt, cur_vp, cur_ni):
+    def _make_example(
+        cur_msgs,
+        cur_len,
+        cur_supervised,
+        cur_vt,
+        cur_vp,
+        cur_ni,
+        terminal_delta,
+        terminal_supervised_delta,
+    ):
         """Return an example, or charge an assistant-free slice as dropped."""
         nonlocal dropped_messages, dropped_tokens
         if not cur_msgs:
@@ -806,17 +848,19 @@ def _process_conversation(
             dropped_tokens += cur_len
             return None
         chunk_msgs = carry_msgs + list(cur_msgs)
-        chunk_len = carry_len + cur_len
-        assert chunk_len <= effective_max, (
-            f"emitted chunk over budget session={session_id} "
-            f"(carried={carry_len} + slice={cur_len} > effective_max={effective_max})"
-        )
+        chunk_len = carry_len + cur_len + terminal_delta
+        if chunk_len > effective_max:
+            raise RuntimeError(
+                f"emitted chunk over budget session={session_id} "
+                f"(carried={carry_len} + slice={cur_len} > effective_max={effective_max})"
+            )
         example = dict(session_meta)
         example["messages"] = chunk_msgs
         example["_omegalax_session_id"] = session_id
         example["_omegalax_measured_length"] = chunk_len
         return example, (
             chunk_len,
+            carry_supervised + cur_supervised + terminal_supervised_delta,
             carry_vt + cur_vt,
             carry_vp + cur_vp,
             carry_ni + cur_ni,
@@ -827,8 +871,9 @@ def _process_conversation(
         nonlocal carried_messages, carried_tokens, repeated_supervised, chunks_with_carry
         example, chunk_stat = pair
         examples.append(example)
-        length, vt, vp, ni, nm = chunk_stat
+        length, supervised, vt, vp, ni, nm = chunk_stat
         chunk_lengths.append(length)
+        chunk_supervised_tokens.append(supervised)
         chunk_vision_tokens.append(vt)
         chunk_vision_patches.append(vp)
         chunk_num_images.append(ni)
@@ -841,9 +886,12 @@ def _process_conversation(
 
     cur_msgs: list[dict[str, Any]] = []
     cur_len = 0
+    cur_supervised = 0
     cur_vt = 0
     cur_vp = 0
     cur_ni = 0
+    cur_terminal_delta = 0
+    cur_terminal_supervised_delta = 0
     pending_msgs: list[dict[str, Any]] = []
     pending_len = 0
     pending_vt = 0
@@ -860,7 +908,16 @@ def _process_conversation(
     unit_start = 0
     for unit_end in split_unit_ends:
         if truncate_offset is not None and unit_start >= truncate_offset:
-            pair = _make_example(cur_msgs, cur_len, cur_vt, cur_vp, cur_ni)
+            pair = _make_example(
+                cur_msgs,
+                cur_len,
+                cur_supervised,
+                cur_vt,
+                cur_vp,
+                cur_ni,
+                cur_terminal_delta,
+                cur_terminal_supervised_delta,
+            )
             if pair is not None:
                 _record(pair)
             prefix_truncated = True
@@ -871,13 +928,17 @@ def _process_conversation(
             break
 
         unit_len = 0
+        unit_supervised = 0
         unit_vt = 0
         unit_vp = 0
         unit_ni = 0
+        unit_terminal_delta = 0
+        unit_terminal_supervised_delta = 0
         for msg_offset in range(unit_start, unit_end):
             result = precomputed[(conv_idx, msg_offset)]
             length, vt, vp, ni, grid = _extract_measurement(result)
             unit_len += length
+            unit_supervised += _supervised_tokens(result, messages[msg_offset])
             unit_vt += vt
             unit_vp += vp
             unit_ni += ni
@@ -887,20 +948,39 @@ def _process_conversation(
                 msg_num_images.append(ni)
                 for shape in grid:
                     image_shapes.append(str(tuple(shape)))
+        if unit_end > unit_start:
+            last_result = precomputed[(conv_idx, unit_end - 1)]
+            unit_terminal_delta = _terminal_length_delta(last_result, messages[unit_end - 1])
+            unit_terminal_supervised_delta = _terminal_supervised_delta(
+                last_result, messages[unit_end - 1]
+            )
 
-        assert pending_len + unit_len <= effective_max, (
-            f"prefix-truncation pre-scan missed session={session_id} "
-            f"offset={unit_start} (unit_length={unit_len} + carried prefix {pending_len} "
-            f"> effective_max={effective_max})"
-        )
+        if pending_len + unit_len + unit_terminal_delta > effective_max:
+            raise RuntimeError(
+                f"prefix-truncation pre-scan missed session={session_id} "
+                f"offset={unit_start} (unit_length={unit_len} + carried prefix {pending_len} "
+                f"> effective_max={effective_max})"
+            )
 
         if not cur_msgs:
             pass
-        elif carry_len + cur_len + unit_len > effective_max:
-            pair = _make_example(cur_msgs, cur_len, cur_vt, cur_vp, cur_ni)
+        elif carry_len + cur_len + unit_len + unit_terminal_delta > effective_max:
+            pair = _make_example(
+                cur_msgs,
+                cur_len,
+                cur_supervised,
+                cur_vt,
+                cur_vp,
+                cur_ni,
+                cur_terminal_delta,
+                cur_terminal_supervised_delta,
+            )
             if pair is not None:
                 _record(pair)
             cur_msgs, cur_len, cur_vt, cur_vp, cur_ni = [], 0, 0, 0, 0
+            cur_supervised = 0
+            cur_terminal_delta = 0
+            cur_terminal_supervised_delta = 0
             if overflow_mode == "truncate":
                 overflow_truncated = True
                 dm, dt, ds = _dropped(unit_start)
@@ -919,9 +999,12 @@ def _process_conversation(
 
         cur_msgs.extend(messages[unit_start:unit_end])
         cur_len += unit_len
+        cur_supervised += unit_supervised
         cur_vt += unit_vt
         cur_vp += unit_vp
         cur_ni += unit_ni
+        cur_terminal_delta = unit_terminal_delta
+        cur_terminal_supervised_delta = unit_terminal_supervised_delta
         for msg_offset in range(unit_start, unit_end):
             if msg_offset not in carry:
                 continue
@@ -935,7 +1018,16 @@ def _process_conversation(
             pending_supervised += _supervised_tokens(result, messages[msg_offset])
         unit_start = unit_end
     else:
-        pair = _make_example(cur_msgs, cur_len, cur_vt, cur_vp, cur_ni)
+        pair = _make_example(
+            cur_msgs,
+            cur_len,
+            cur_supervised,
+            cur_vt,
+            cur_vp,
+            cur_ni,
+            cur_terminal_delta,
+            cur_terminal_supervised_delta,
+        )
         if pair is not None:
             _record(pair)
 
@@ -945,6 +1037,7 @@ def _process_conversation(
         "msg_vision_tokens": msg_vision_tokens,
         "msg_num_images": msg_num_images,
         "chunk_lengths": chunk_lengths,
+        "chunk_supervised_tokens": chunk_supervised_tokens,
         "chunk_vision_tokens": chunk_vision_tokens,
         "chunk_vision_patches": chunk_vision_patches,
         "chunk_num_images": chunk_num_images,
@@ -1089,6 +1182,7 @@ def build_records_from_chat(
         unit_start = 0
         for unit_end in split_unit_ends:
             unit_length = 0
+            unit_terminal_delta = 0
             added_reserve = 0
             for msg_offset in range(unit_start, unit_end):
                 result = precomputed[(conv_idx, msg_offset)]
@@ -1102,13 +1196,27 @@ def build_records_from_chat(
                 agg["total_tokens"] += length
                 agg["vision_tokens"] += vt
                 agg["num_images"] += ni
-                agg["max_message_tokens"] = max(agg["max_message_tokens"], length)
-                if length > effective_max:
+                terminal_length = length + _terminal_length_delta(result, messages[msg_offset])
+                agg["max_message_tokens"] = max(agg["max_message_tokens"], terminal_length)
+                if terminal_length > effective_max:
                     agg["num_messages_over_budget"] += 1
-            if reserve + unit_length > effective_max and session_id not in session_truncate_at:
+            if unit_end > unit_start:
+                result = precomputed[(conv_idx, unit_end - 1)]
+                unit_terminal_delta = _terminal_length_delta(result, messages[unit_end - 1])
+            if (
+                reserve + unit_length + unit_terminal_delta > effective_max
+                and session_id not in session_truncate_at
+            ):
                 session_truncate_at[session_id] = unit_start
             reserve += added_reserve
             unit_start = unit_end
+        if messages:
+            final_result = precomputed[(conv_idx, len(messages) - 1)]
+            final_length_delta = _terminal_length_delta(final_result, messages[-1])
+            final_supervised_delta = _terminal_supervised_delta(final_result, messages[-1])
+            total_message_tokens += final_length_delta
+            total_supervised_tokens += final_supervised_delta
+            agg["total_tokens"] += final_length_delta
     all_session_ids = set(sequence_stats)
     if session_truncate_at:
         print(
@@ -1134,6 +1242,7 @@ def build_records_from_chat(
     _msg_vision_tokens: list[int] = []
     _msg_num_images: list[int] = []
     _chunk_lengths: list[int] = []
+    _chunk_supervised_tokens: list[int] = []
     _chunk_vision_tokens: list[int] = []
     _chunk_vision_patches: list[int] = []
     _chunk_num_images: list[int] = []
@@ -1160,12 +1269,11 @@ def build_records_from_chat(
             session_meta.pop(CARRY_KEY, None)
             session_meta.pop(SPLIT_UNIT_ENDS_KEY, None)
             if session_id in drop_sessions:
-                for off in range(len(messages)):
-                    length, *_ = _extract_measurement(precomputed[(conv_idx, off)])
-                    _trunc["dropped_tokens"] += length
-                    _trunc["dropped_supervised"] += _supervised_tokens(
-                        precomputed[(conv_idx, off)], messages[off]
-                    )
+                dropped_tokens, dropped_supervised = _span_totals(
+                    precomputed, conv_idx, messages, 0, len(messages)
+                )
+                _trunc["dropped_tokens"] += dropped_tokens
+                _trunc["dropped_supervised"] += dropped_supervised
                 _trunc["dropped_messages"] += len(messages)
                 _trunc["dropped_sessions"].add(session_id)
                 continue
@@ -1187,6 +1295,7 @@ def build_records_from_chat(
             _msg_vision_tokens.extend(res["msg_vision_tokens"])
             _msg_num_images.extend(res["msg_num_images"])
             _chunk_lengths.extend(res["chunk_lengths"])
+            _chunk_supervised_tokens.extend(res["chunk_supervised_tokens"])
             _chunk_vision_tokens.extend(res["chunk_vision_tokens"])
             _chunk_vision_patches.extend(res["chunk_vision_patches"])
             _chunk_num_images.extend(res["chunk_num_images"])
@@ -1244,6 +1353,7 @@ def build_records_from_chat(
         dropped_supervised_tokens=_trunc["dropped_supervised"],
         repeated_supervised_tokens=_trunc["repeated_supervised"],
         emitted_tokens=sum(_chunk_lengths),
+        emitted_supervised_tokens=sum(_chunk_supervised_tokens),
         carried_tokens=_trunc["carried_tokens"],
         carried_messages=_trunc["carried_messages"],
         chunks_with_carry=_trunc["chunks_with_carry"],

@@ -35,12 +35,25 @@ def _batch_starts(examples):
 # the measure_message callable must be picklable (importable by qualified name) --
 # a local lambda is not. This module-level stand-in counts every message as one
 # token.
-def _measure_one(message):
-    return 1
+def _measurement(message, length=1):
+    return {
+        "length": length,
+        "terminal_length_delta": 0,
+        "supervised_tokens": length if message["role"] == "assistant" else 0,
+        "terminal_supervised_tokens_delta": 0,
+        "vision_tokens": 0,
+        "vision_patches": 0,
+        "num_images": 0,
+        "image_grid_thw": [],
+    }
 
 
-def _measure_declared(message):
-    return message["measurement"]
+def _measure_one(messages):
+    return [_measurement(message) for message in messages]
+
+
+def _measure_declared(messages):
+    return [message["measurement"] for message in messages]
 
 
 _TEST_MEASUREMENT_CONTRACT = {
@@ -57,7 +70,9 @@ def _measured(role, content, length=1, vision_tokens=0):
         "content": content,
         "measurement": {
             "length": length,
+            "terminal_length_delta": 0,
             "supervised_tokens": length if role == "assistant" else 0,
+            "terminal_supervised_tokens_delta": 0,
             "vision_tokens": vision_tokens,
             "vision_patches": vision_tokens * 4,
             "num_images": int(vision_tokens > 0),
@@ -318,11 +333,7 @@ class GrainPipelineTest(absltest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             lengths = [2, 1, 1, 1, 4, 1]
             messages = [
-                {
-                    "role": "assistant" if i % 2 else "user",
-                    "content": str(i),
-                    "measurement": length,
-                }
+                _measured("assistant" if i % 2 else "user", str(i), length=length)
                 for i, length in enumerate(lengths)
             ]
             records_dir, records = self._build_split(
@@ -342,10 +353,10 @@ class GrainPipelineTest(absltest.TestCase):
     def test_split_reports_dropped_unsupervised_slices(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             messages = [
-                {"role": "user", "content": "0", "measurement": 1},
-                {"role": "assistant", "content": "1", "measurement": 1},
-                {"role": "user", "content": "2", "measurement": 2},
-                {"role": "assistant", "content": "3", "measurement": 1},
+                _measured("user", "0"),
+                _measured("assistant", "1"),
+                _measured("user", "2", length=2),
+                _measured("assistant", "3"),
             ]
             records_dir, _ = self._build_split(tmpdir, messages, 2, measure=_measure_declared)
             stats = json.loads((records_dir / "truncation_stats.json").read_text())
@@ -358,6 +369,7 @@ class GrainPipelineTest(absltest.TestCase):
                     "kept": 2,
                     "dropped": 0,
                     "repeated": 0,
+                    "chunk_boundary_adjustment": 0,
                     "emitted": 2,
                     "dropped_fraction": 0.0,
                 },
@@ -449,6 +461,7 @@ class GrainPipelineTest(absltest.TestCase):
                     "kept": 3,
                     "dropped": 0,
                     "repeated": 2,
+                    "chunk_boundary_adjustment": 0,
                     "emitted": 5,
                     "dropped_fraction": 0.0,
                 },

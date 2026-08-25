@@ -22,6 +22,19 @@ def _contract(tokenizer_digest: str = "a" * 64) -> dict:
     }
 
 
+def _measurement(length: int = 1) -> dict:
+    return {
+        "length": length,
+        "terminal_length_delta": 0,
+        "supervised_tokens": 0,
+        "terminal_supervised_tokens_delta": 0,
+        "vision_tokens": 0,
+        "vision_patches": 0,
+        "num_images": 0,
+        "image_grid_thw": [],
+    }
+
+
 class MessageLengthCacheContractTest(absltest.TestCase):
     def _write_chat(self, path: Path, contents: list[str]) -> None:
         with path.open("w") as f:
@@ -43,7 +56,9 @@ class MessageLengthCacheContractTest(absltest.TestCase):
             chat = Path(tmpdir) / "chat.jsonl"
             cache = Path(tmpdir) / "message_lengths.jsonl"
             self._write_chat(chat, ["aa", "bb"])
-            measurements = {(row, offset): 1 for row in range(2) for offset in range(2)}
+            measurements = {
+                (row, offset): _measurement() for row in range(2) for offset in range(2)
+            }
 
             _write_chat_message_lengths(cache, measurements, chat, _contract())
             header, loaded = _load_chat_message_lengths(cache)
@@ -56,7 +71,9 @@ class MessageLengthCacheContractTest(absltest.TestCase):
             chat = Path(tmpdir) / "chat.jsonl"
             cache = Path(tmpdir) / "message_lengths.jsonl"
             self._write_chat(chat, ["aa", "bb"])
-            measurements = {(row, offset): 1 for row in range(2) for offset in range(2)}
+            measurements = {
+                (row, offset): _measurement() for row in range(2) for offset in range(2)
+            }
             _write_chat_message_lengths(cache, measurements, chat, _contract())
             header, loaded = _load_chat_message_lengths(cache)
 
@@ -70,7 +87,9 @@ class MessageLengthCacheContractTest(absltest.TestCase):
             chat = Path(tmpdir) / "chat.jsonl"
             cache = Path(tmpdir) / "message_lengths.jsonl"
             self._write_chat(chat, ["aa", "bb"])
-            measurements = {(row, offset): 1 for row in range(2) for offset in range(2)}
+            measurements = {
+                (row, offset): _measurement() for row in range(2) for offset in range(2)
+            }
             _write_chat_message_lengths(cache, measurements, chat, _contract())
             header, loaded = _load_chat_message_lengths(cache)
 
@@ -84,7 +103,7 @@ class MessageLengthCacheContractTest(absltest.TestCase):
             chat = Path(tmpdir) / "chat.jsonl"
             cache = Path(tmpdir) / "message_lengths.jsonl"
             self._write_chat(chat, ["aa"])
-            measurements = {(0, 0): 1, (0, 1): 1}
+            measurements = {(0, 0): _measurement(), (0, 1): _measurement()}
             _write_chat_message_lengths(cache, measurements, chat, _contract())
             header, loaded = _load_chat_message_lengths(cache)
 

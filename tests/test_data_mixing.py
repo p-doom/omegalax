@@ -42,8 +42,20 @@ def _write_jsonl(path: Path, rows: list[dict]) -> None:
 
 # build_records_from_chat measures messages in a `spawn` multiprocessing pool, so
 # the measure_message callable must be picklable -- a local lambda is not.
-def _measure_one(message):
-    return 1
+def _measure_one(messages):
+    return [
+        {
+            "length": 1,
+            "terminal_length_delta": 0,
+            "supervised_tokens": int(message["role"] == "assistant"),
+            "terminal_supervised_tokens_delta": 0,
+            "vision_tokens": 0,
+            "vision_patches": 0,
+            "num_images": 0,
+            "image_grid_thw": [],
+        }
+        for message in messages
+    ]
 
 
 _TEST_MEASUREMENT_CONTRACT = {
