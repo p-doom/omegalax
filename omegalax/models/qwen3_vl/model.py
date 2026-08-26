@@ -11,6 +11,7 @@ from flax import nnx
 from jax.sharding import PartitionSpec, reshard
 from tokamax import dot_product_attention
 
+from omegalax.attention import segment_ids_to_kstart, segmented_causal_attention
 from .config import Qwen3VLConfig
 from .vision import VisionModel
 
@@ -359,7 +360,13 @@ class TextAttention(nnx.Module):
         object.__setattr__(self, "_attn_backend", "mosaic_gpu")
         object.__setattr__(self, "_attn_kind", "text")
 
-    def __call__(self, hidden_BTD: jax.Array, sin_BTK: jax.Array, cos_BTK: jax.Array) -> jax.Array:
+    def __call__(
+        self,
+        hidden_BTD: jax.Array,
+        sin_BTK: jax.Array,
+        cos_BTK: jax.Array,
+        k_start_B1T: jax.Array | None = None,
+    ) -> jax.Array:
         B, T, _ = hidden_BTD.shape
         q_proj_BTF = self.q_proj(hidden_BTD, out_sharding=self.shd_cfg.act_btf)
         k_proj_BTF = self.k_proj(hidden_BTD, out_sharding=self.shd_cfg.act_btf)
@@ -386,17 +393,32 @@ class TextAttention(nnx.Module):
         q_BTHK = apply_rope(q_BTHK, sin_BTK, cos_BTK)
         k_BTGK = apply_rope(k_BTGK, sin_BTK, cos_BTK)
 
-        # force bfloat16 - tokamax attention only supports fp16/bf16
-        attn_in_dtype = q_BTHK.dtype
-        attn_BTHK = dot_product_attention(
-            q_BTHK.astype(jnp.bfloat16),
-            k_BTGK.astype(jnp.bfloat16),
-            v_BTGK.astype(jnp.bfloat16),
-            is_causal=True,
-            scale=self.scale,
-            implementation=self._attn_backend,
-            q_sharding=self._q_sharding,
-        ).astype(attn_in_dtype)
+        if k_start_B1T is None:
+            # Default (unpacked) path: plain causal attention. Byte-identical to
+            # the pre-packing behaviour.
+            # force bfloat16 - tokamax attention only supports fp16/bf16
+            attn_in_dtype = q_BTHK.dtype
+            attn_BTHK = dot_product_attention(
+                q_BTHK.astype(jnp.bfloat16),
+                k_BTGK.astype(jnp.bfloat16),
+                v_BTGK.astype(jnp.bfloat16),
+                is_causal=True,
+                scale=self.scale,
+                implementation=self._attn_backend,
+                q_sharding=self._q_sharding,
+            ).astype(attn_in_dtype)
+        else:
+            # Packed path: block-diagonal causal attention. A token attends only
+            # within its own segment (never across a pack boundary).
+            attn_BTHK = segmented_causal_attention(
+                q_BTHK,
+                k_BTGK,
+                v_BTGK,
+                scale=self.scale,
+                backend=self._attn_backend,
+                q_sharding=self._q_sharding,
+                k_start_B1T=k_start_B1T,
+            )
         out_BTD = self.o_proj(
             jax.lax.reshape(
                 attn_BTHK, (B, T, self.num_heads * self.head_dim), out_sharding=self.shd_cfg.act_btf
@@ -421,9 +443,15 @@ class TextDecoderLayer(nnx.Module):
 
     @(partial(jax.remat, static_argnums=0) if DECODER_LAYER_REMAT else (lambda f: f))
     def __call__(
-        self, hidden_BTD: jax.Array, sin_BTK: jax.Array, cos_BTK: jax.Array
+        self,
+        hidden_BTD: jax.Array,
+        sin_BTK: jax.Array,
+        cos_BTK: jax.Array,
+        k_start_B1T: jax.Array | None = None,
     ) -> tuple[jax.Array, jax.Array]:
-        hidden_BTD = hidden_BTD + self.attn(self.input_layernorm(hidden_BTD), sin_BTK, cos_BTK)
+        hidden_BTD = hidden_BTD + self.attn(
+            self.input_layernorm(hidden_BTD), sin_BTK, cos_BTK, k_start_B1T
+        )
         if self.is_moe:
             ff_out_BTD, aux_loss = self.mlp(self.post_attention_layernorm(hidden_BTD))
         else:
@@ -485,6 +513,7 @@ class Qwen3VL(nnx.Module):
         pixel_values: jax.Array | None = None,
         image_grid_thw: jax.Array | None = None,
         vision_cu_seqlens: jax.Array | None = None,
+        segment_ids_BT: jax.Array | None = None,
     ) -> tuple[jax.Array, jax.Array]:
         cfg = self.cfg
 
@@ -544,10 +573,17 @@ class Qwen3VL(nnx.Module):
             position_ids_ZBT, cfg.head_dim, cfg.rope_theta, cfg.mrope_section
         )
 
+        # Sequence packing: derive per-query segment-start key indices so attention
+        # is block-diagonal (each token attends only within its own segment). When
+        # segment_ids_BT is None the model runs plain causal attention (default).
+        k_start_B1T = None
+        if segment_ids_BT is not None:
+            k_start_B1T = segment_ids_to_kstart(segment_ids_BT.astype(jnp.int32))[:, None, :]
+
         hidden_BTD = inputs_embeds_BTD
         aux_losses = []
         for layer_idx, layer in enumerate(self.text.layers):
-            hidden_BTD, aux_loss = layer(hidden_BTD, sin_BTK, cos_BTK)
+            hidden_BTD, aux_loss = layer(hidden_BTD, sin_BTK, cos_BTK, k_start_B1T)
             aux_losses.append(aux_loss)
             if deepstack_features is not None and layer_idx < len(deepstack_features):
                 hidden_BTD = _deepstack_process(

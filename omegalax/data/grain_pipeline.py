@@ -1035,6 +1035,8 @@ def make_grain_iterator(
     multiprocessing_options: grain.MultiprocessingOptions | None = None,
     dp_size: int,
     fsdp_size: int,
+    pack_sequences: bool = False,
+    pack_max_length: int | None = None,
 ):
     """Create a checkpointable Grain iterator over one or more inline-records datasets.
 
@@ -1106,12 +1108,30 @@ def make_grain_iterator(
         if len(per_source) == 1
         else grain.MapDataset.mix(per_source, weights=norm_weights)
     )
-    batched = mixed.batch(
-        batch_size=batch_size,
-        drop_remainder=True,
-        batch_fn=_SourceTaggingCollator(batch_fn),
-    )
-    iter_ds = batched.to_iter_dataset(read_options)
+    if pack_sequences:
+        # Sequence packing: group whole records into <= pack_max_length rows, then
+        # batch `batch_size` such packed rows. The PackedVLMSFTCollator concatenates
+        # each pack into one row and emits segment_ids / per-segment position_ids.
+        if pack_max_length is None or pack_max_length <= 0:
+            raise ValueError("pack_sequences=True requires a positive pack_max_length")
+        from omegalax.data.packing import SequencePackIterDataset
+
+        packed = SequencePackIterDataset(
+            mixed.to_iter_dataset(read_options),
+            max_length=pack_max_length,
+        )
+        iter_ds = packed.batch(
+            batch_size=batch_size,
+            drop_remainder=True,
+            batch_fn=_SourceTaggingCollator(batch_fn),
+        )
+    else:
+        batched = mixed.batch(
+            batch_size=batch_size,
+            drop_remainder=True,
+            batch_fn=_SourceTaggingCollator(batch_fn),
+        )
+        iter_ds = batched.to_iter_dataset(read_options)
     if mp_options.num_workers > 0:
         iter_ds = iter_ds.mp_prefetch(mp_options)
     return iter(iter_ds)

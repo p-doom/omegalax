@@ -18,6 +18,11 @@ from omegalax.data.qwen3_encoding import (
     encode_qwen_messages as _encode_qwen_messages,
 )
 
+# Key under which the sequence-packing pipeline stashes the list of examples that
+# make up one packed row (see omegalax.data.packing). The packed collator reads
+# this; nothing else in the batch element is required.
+PACK_EXAMPLES_KEY = "_omegalax_pack_examples"
+
 
 class TextSFTCollator:
     """Collate Qwen ChatML chat examples into padded numpy arrays with loss masks.
@@ -307,6 +312,203 @@ class VLMSFTCollator:
                 merge_size=self.image_processor.merge_size,
                 max_patches=self._max_vision_patches_per_sample * bs,
                 max_images=self._max_vision_images_per_sample * bs,
+            )
+        else:
+            vision_cu_seqlens = _compute_vision_cu_seqlens(image_grid_thw)
+
+        result["pixel_values"] = pixel_values.astype(self._pixel_values_dtype, copy=False)
+        result["image_grid_thw"] = image_grid_thw
+        result["vision_cu_seqlens"] = vision_cu_seqlens
+
+        return result
+
+
+class PackedVLMSFTCollator:
+    """Collate *packed* Qwen multimodal chat examples into ``(B, max_length)`` arrays.
+
+    Each batch element is a *pack*: a ``dict`` carrying
+    :data:`PACK_EXAMPLES_KEY` — a list of independent training examples whose
+    total token length is ``<= max_length`` (guaranteed upstream by the packer,
+    re-checked here). The examples of one pack are concatenated into a single row;
+    ``B`` such rows are stacked.
+
+    Beyond the standard keys this collator emits ``segment_ids_BT`` (int32,
+    ``(B, max_length)``; 1-based per-example id within a row, 0 for trailing
+    padding). Downstream this drives block-diagonal causal attention so segments
+    never attend across each other. Correctness guarantees enforced here:
+
+    * ``position_ids_ZBT`` is computed **per example** (each starting at mRoPE
+      position 0) and concatenated, so every segment's positions reset at its
+      start — including the multimodal 3D positions of any images inside it.
+    * ``loss_mask_BT`` is the concatenation of each example's assistant loss
+      mask, then **zeroed at every segment-start position**. Because the loss
+      shifts targets left by one, that removes exactly the cross-segment
+      next-token targets (last token of segment k predicting the first token of
+      segment k+1); no supervised target ever crosses a boundary.
+    * ``pixel_values`` / ``image_grid_thw`` are accumulated in row-major example
+      order so image features align 1:1 with ``<|image_pad|>`` positions across
+      the whole packed batch (images are handled per-segment automatically:
+      each example's ``<|image_pad|>`` tokens live inside its own segment).
+
+    ``max_vision_patches_per_sample`` / ``max_vision_images_per_sample`` are
+    interpreted per *pack* (per row) here — the same ``* batch_size`` scaling as
+    the unpacked collator, since a pack is exactly one row. An over-budget batch
+    raises rather than silently dropping images.
+    """
+
+    def __init__(
+        self,
+        tokenizer: PreTrainedTokenizer,
+        max_length: int,
+        image_processor: BaseImageProcessor,
+        *,
+        max_vision_patches_per_sample: int | None = None,
+        max_vision_images_per_sample: int | None = None,
+        pixel_values_dtype: Any = ml_dtypes.bfloat16,
+    ) -> None:
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.image_processor = image_processor
+        self._max_vision_patches_per_sample = max_vision_patches_per_sample
+        self._max_vision_images_per_sample = max_vision_images_per_sample
+        self._pixel_values_dtype = pixel_values_dtype
+        assert tokenizer.pad_token_id is not None, (
+            "tokenizer must have pad_token_id set (e.g. Qwen3-VL, Qwen3.5)"
+        )
+
+        self._im_start_id = tokenizer.convert_tokens_to_ids("<|im_start|>")
+        self._im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
+        self._assistant_token_id = tokenizer.encode("assistant", add_special_tokens=False)[0]
+
+        self._image_token_id = tokenizer.convert_tokens_to_ids("<|image_pad|>")
+        self._video_token_id = tokenizer.convert_tokens_to_ids("<|video_pad|>")
+        self._vision_start_token_id = tokenizer.convert_tokens_to_ids("<|vision_start|>")
+
+        self._patch_feat_dim = (
+            image_processor.temporal_patch_size
+            * len(image_processor.image_mean)
+            * image_processor.patch_size
+            * image_processor.patch_size
+        )
+
+    def _encode_one(self, ex: dict[str, Any]) -> dict[str, np.ndarray]:
+        """Encode a single example to (input_ids, loss_mask, position_ids_3L,
+        pixel_values?, image_grid_thw)."""
+        from omegalax.models.qwen3_vl.model import get_rope_index
+
+        encoded = _encode_qwen_messages(
+            ex["messages"],
+            tokenizer=self.tokenizer,
+            image_processor=self.image_processor,
+            include_pixels=True,
+        )
+        full_ids = np.asarray(encoded["input_ids"], dtype=np.int32)
+        seq_len = int(full_ids.shape[0])
+        if seq_len > self.max_length:
+            raise ValueError(
+                f"Encoded example length {seq_len} exceeds max_length="
+                f"{self.max_length}; rebuild the chunk index for this profile."
+            )
+
+        loss_mask = _build_assistant_loss_mask(
+            full_ids, self._im_start_id, self._im_end_id, self._assistant_token_id
+        )
+        grid = encoded.get("image_grid_thw")
+        grid = np.zeros((0, 3), dtype=np.int32) if grid is None else np.asarray(grid)
+
+        # Per-example 3D positions, each starting at mRoPE position 0. Running
+        # get_rope_index on the single example resets the segment's positions.
+        pos_3_1_L, _ = get_rope_index(
+            full_ids[None, :],
+            image_grid_thw=grid if grid.shape[0] > 0 else None,
+            attention_mask=np.ones((1, seq_len), dtype=np.int32),
+            spatial_merge_size=self.image_processor.merge_size,
+            image_token_id=self._image_token_id,
+            video_token_id=self._video_token_id,
+            vision_start_token_id=self._vision_start_token_id,
+        )
+        out = {
+            "input_ids": full_ids,
+            "loss_mask": loss_mask,
+            "position_ids_3L": pos_3_1_L[:, 0, :].astype(np.int32),
+            "image_grid_thw": grid,
+        }
+        if "pixel_values" in encoded:
+            out["pixel_values"] = encoded["pixel_values"]
+        return out
+
+    def __call__(self, packs: Sequence[dict[str, Any]]) -> dict[str, np.ndarray]:
+        B = len(packs)
+        T = self.max_length
+        pad_id = self.tokenizer.pad_token_id
+
+        token_ids_BT = np.full((B, T), pad_id, dtype=np.int32)
+        attention_mask_BT = np.zeros((B, T), dtype=np.int32)
+        loss_mask_BT = np.zeros((B, T), dtype=np.int32)
+        segment_ids_BT = np.zeros((B, T), dtype=np.int32)
+        position_ids_ZBT = np.zeros((3, B, T), dtype=np.int32)
+
+        all_pixel_values: list[np.ndarray] = []
+        all_grid_thw: list[np.ndarray] = []
+
+        for b, pack in enumerate(packs):
+            examples = pack[PACK_EXAMPLES_KEY]
+            if not examples:
+                raise ValueError("Encountered an empty pack (no examples).")
+            offset = 0
+            for seg_idx, ex in enumerate(examples, start=1):
+                enc = self._encode_one(ex)
+                ids = enc["input_ids"]
+                L = int(ids.shape[0])
+                end = offset + L
+                if end > T:
+                    raise ValueError(
+                        f"Pack row {b} overflows max_length={T} at segment "
+                        f"{seg_idx} (cumulative {end}). The packer must not "
+                        "emit packs whose total length exceeds max_length."
+                    )
+                token_ids_BT[b, offset:end] = ids
+                attention_mask_BT[b, offset:end] = 1
+                seg_loss = enc["loss_mask"].copy()
+                # Boundary label-mask: the first token of every segment must not
+                # be a supervised next-token target (it would be predicted from
+                # the previous segment's last token). Zeroing it here is exactly
+                # that removal after the loss's left-shift of targets.
+                seg_loss[0] = 0
+                loss_mask_BT[b, offset:end] = seg_loss
+                segment_ids_BT[b, offset:end] = seg_idx
+                position_ids_ZBT[:, b, offset:end] = enc["position_ids_3L"]
+
+                if "pixel_values" in enc:
+                    all_pixel_values.append(enc["pixel_values"])
+                    all_grid_thw.append(enc["image_grid_thw"])
+                offset = end
+
+        result: dict[str, np.ndarray] = {
+            "token_ids_BT": token_ids_BT,
+            "attention_mask_BT": attention_mask_BT,
+            "loss_mask_BT": loss_mask_BT,
+            "segment_ids_BT": segment_ids_BT,
+            "position_ids_ZBT": position_ids_ZBT,
+        }
+
+        if all_pixel_values:
+            pixel_values = np.concatenate(all_pixel_values, axis=0)
+            image_grid_thw = np.concatenate(all_grid_thw, axis=0)
+        else:
+            pixel_values = np.zeros((0, self._patch_feat_dim), dtype=np.float32)
+            image_grid_thw = np.zeros((0, 3), dtype=np.int32)
+
+        if (
+            self._max_vision_patches_per_sample is not None
+            and self._max_vision_images_per_sample is not None
+        ):
+            pixel_values, image_grid_thw, vision_cu_seqlens = _pad_vision_arrays(
+                pixel_values,
+                image_grid_thw,
+                merge_size=self.image_processor.merge_size,
+                max_patches=self._max_vision_patches_per_sample * B,
+                max_images=self._max_vision_images_per_sample * B,
             )
         else:
             vision_cu_seqlens = _compute_vision_cu_seqlens(image_grid_thw)
