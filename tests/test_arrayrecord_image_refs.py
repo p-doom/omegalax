@@ -14,8 +14,8 @@ from absl.testing import absltest
 from array_record.python.array_record_module import ArrayRecordWriter
 from PIL import Image
 
-from omegalax.data import arrayrecord_images
-from omegalax.data.arrayrecord_images import extract_images
+from omegalax.data import qwen_chat_encoding
+from omegalax.data.qwen_chat_encoding import _extract_images
 
 
 def _jpeg_bytes(color: tuple[int, int, int]) -> bytes:
@@ -26,7 +26,7 @@ def _jpeg_bytes(color: tuple[int, int, int]) -> bytes:
 
 class ArrayRecordImageRefsTest(absltest.TestCase):
     def tearDown(self):
-        arrayrecord_images._close_arrayrecord_image_sources()
+        qwen_chat_encoding._close_arrayrecord_image_sources()
         super().tearDown()
 
     def test_extract_images_reads_the_arrayrecord_uri_fragment_as_the_record_index(self):
@@ -47,12 +47,9 @@ class ArrayRecordImageRefsTest(absltest.TestCase):
                     "content": [{"type": "image", "image": f"ar://{shard_path.as_posix()}#1"}],
                 }
             ]
-            images = extract_images(messages)
+            images = _extract_images(messages)
 
             self.assertLen(images, 1)
-            # Which record came back, not just that some 8x6 RGB image did: two
-            # records of identical geometry, so a reader that ignores the ``#1``
-            # selector and always returns record 0 passes every shape assertion.
             expected = np.asarray(Image.open(io.BytesIO(record_1)).convert("RGB"))
             np.testing.assert_array_equal(np.asarray(images[0]), expected)
             self.assertFalse(
@@ -63,9 +60,9 @@ class ArrayRecordImageRefsTest(absltest.TestCase):
             )
 
     def test_arrayrecord_reader_cache_evicts_and_closes_old_reader(self):
-        old_cache_size = arrayrecord_images._ARRAYRECORD_IMAGE_CACHE_SIZE
-        arrayrecord_images._ARRAYRECORD_IMAGE_CACHE_SIZE = 1
-        arrayrecord_images._close_arrayrecord_image_sources()
+        old_cache_size = qwen_chat_encoding._ARRAYRECORD_IMAGE_CACHE_SIZE
+        qwen_chat_encoding._ARRAYRECORD_IMAGE_CACHE_SIZE = 1
+        qwen_chat_encoding._close_arrayrecord_image_sources()
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
                 shard_a = Path(tmpdir) / "a.array_record"
@@ -77,7 +74,7 @@ class ArrayRecordImageRefsTest(absltest.TestCase):
                     finally:
                         writer.close()
 
-                extract_images(
+                _extract_images(
                     [
                         {
                             "role": "user",
@@ -85,9 +82,9 @@ class ArrayRecordImageRefsTest(absltest.TestCase):
                         }
                     ]
                 )
-                reader_a = arrayrecord_images._ARRAYRECORD_IMAGE_SOURCES[str(shard_a)]
+                reader_a = qwen_chat_encoding._ARRAYRECORD_IMAGE_SOURCES[str(shard_a)]
 
-                extract_images(
+                _extract_images(
                     [
                         {
                             "role": "user",
@@ -97,11 +94,11 @@ class ArrayRecordImageRefsTest(absltest.TestCase):
                 )
 
                 self.assertFalse(reader_a.is_open())
-                self.assertNotIn(str(shard_a), arrayrecord_images._ARRAYRECORD_IMAGE_SOURCES)
-                self.assertIn(str(shard_b), arrayrecord_images._ARRAYRECORD_IMAGE_SOURCES)
+                self.assertNotIn(str(shard_a), qwen_chat_encoding._ARRAYRECORD_IMAGE_SOURCES)
+                self.assertIn(str(shard_b), qwen_chat_encoding._ARRAYRECORD_IMAGE_SOURCES)
         finally:
-            arrayrecord_images._ARRAYRECORD_IMAGE_CACHE_SIZE = old_cache_size
-            arrayrecord_images._close_arrayrecord_image_sources()
+            qwen_chat_encoding._ARRAYRECORD_IMAGE_CACHE_SIZE = old_cache_size
+            qwen_chat_encoding._close_arrayrecord_image_sources()
 
 
 if __name__ == "__main__":
