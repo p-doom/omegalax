@@ -135,7 +135,11 @@ class Qwen3VLSmokeTest(absltest.TestCase):
 
         token_ids_jax_BT = jnp.asarray(token_ids_BT)
         attention_mask_jax_BT = jnp.asarray(attention_mask_BT.astype(np.int32))
-        hidden_BTD, _ = self.jax_model(token_ids_jax_BT, attention_mask_jax_BT)
+        hidden_BTD, _ = self.jax_model(
+            token_ids_jax_BT,
+            attention_mask_jax_BT,
+            vision_patch_valid=jnp.empty((0,), dtype=jnp.bool_),
+        )
         jax_logits_BTV = np.asarray(self.jax_model.lm_head(hidden_BTD), dtype=np.float32)
 
         mask = np.ones_like(token_ids_BT, dtype=bool)
@@ -159,7 +163,11 @@ class Qwen3VLSmokeTest(absltest.TestCase):
 
         token_ids_jax_BT = jnp.asarray(token_ids_BT)
         attention_mask_jax_BT = jnp.asarray(attention_mask_BT.astype(np.int32))
-        hidden_BTD, _ = self.jax_model(token_ids_jax_BT, attention_mask_jax_BT)
+        hidden_BTD, _ = self.jax_model(
+            token_ids_jax_BT,
+            attention_mask_jax_BT,
+            vision_patch_valid=jnp.empty((0,), dtype=jnp.bool_),
+        )
         jax_logits_BTV = np.asarray(self.jax_model.lm_head(hidden_BTD), dtype=np.float32)
 
         mask = attention_mask_BT.astype(bool)

@@ -86,6 +86,7 @@ def _make_multimodal_qwen3_vl_smoke_batch(seq_len: int = 8) -> dict[str, np.ndar
         "attention_mask_BT": attention_mask,
         "loss_mask_BT": loss_mask,
         "pixel_values": pixel_values,
+        "vision_patch_valid": np.ones((pixel_values.shape[0],), dtype=np.bool_),
         "image_grid_thw": image_grid_thw,
         "vision_cu_seqlens": vision_cu_seqlens,
         "position_ids_ZBT": position_ids.astype(np.int32),
@@ -189,10 +190,12 @@ class ShardBatchDictTest(absltest.TestCase):
         batch = {
             "token_ids_BT": np.ones((2, 4), dtype=np.int32),
             "pixel_values": np.ones((2, 3, 8, 8), dtype=np.float32),
+            "vision_patch_valid": np.ones((2,), dtype=np.bool_),
         }
         out = shard_batch_dict(batch, shd_cfg, mesh)
         self.assertEqual(out["token_ids_BT"].shape, (2, 4))
         self.assertEqual(out["pixel_values"].shape, (2, 3, 8, 8))
+        self.assertEqual(out["vision_patch_valid"].shape, (2,))
 
 
 class TextSFTTrainingTest(absltest.TestCase):
@@ -264,6 +267,7 @@ class VLMSFTTrainingTest(absltest.TestCase):
             print_every=0,
         )
         batch = _make_synthetic_sft_batch(1, 4, 32000)
+        batch["vision_patch_valid"] = np.empty((0,), dtype=np.bool_)
         data_iter = _make_grain_batch_iter(batch)
 
         _, metrics = vlm_trainer.run_sft(

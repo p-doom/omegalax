@@ -147,6 +147,7 @@ def forward(
     pad_id: int,
     cfg,
     *,
+    vision_patch_valid: jax.Array,
     attention_mask_BT: jax.Array | None = None,
     pixel_values: jax.Array | None = None,
     image_grid_thw: jax.Array | None = None,
@@ -164,6 +165,7 @@ def forward(
             segment_ids_BT,
             None,
             jnp.array(0, dtype=jnp.int32),
+            vision_patch_valid=vision_patch_valid,
             pixel_values=pixel_values,
             image_grid_thw=image_grid_thw,
             vision_cu_seqlens=vision_cu_seqlens,
@@ -174,6 +176,7 @@ def forward(
         return model(
             token_ids_BT,
             attention_mask_BT,
+            vision_patch_valid=vision_patch_valid,
             position_ids_ZBT=position_ids_ZBT,
             pixel_values=pixel_values,
             image_grid_thw=image_grid_thw,

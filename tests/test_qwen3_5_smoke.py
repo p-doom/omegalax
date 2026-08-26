@@ -131,7 +131,11 @@ class Qwen3_5WeightsTest(absltest.TestCase):
         token_ids_BT = jnp.asarray(tokens_np)
         segment_ids_BT = (token_ids_BT != self.pad_id).astype(jnp.int32)
         hidden_BTD, _ = self.jax_model(
-            token_ids_BT, segment_ids_BT, None, jnp.array(0, dtype=jnp.int32)
+            token_ids_BT,
+            segment_ids_BT,
+            None,
+            jnp.array(0, dtype=jnp.int32),
+            vision_patch_valid=jnp.empty((0,), dtype=jnp.bool_),
         )
         logits_BTV = self.jax_model.lm_head(hidden_BTD)
         return np.asarray(logits_BTV, dtype=np.float32)

@@ -250,7 +250,11 @@ class Qwen3VLRopeDtypeTest(_RopeDtypeTestBase):
             mock.patch.object(model_mod, "compute_mrope_pos_embeddings", gen_spy),
             mock.patch.object(model_mod.TextDecoderLayer, "__call__", layer_spy),
         ):
-            model(tokens, attn_mask)
+            model(
+                tokens,
+                attn_mask,
+                vision_patch_valid=jnp.empty((0,), dtype=jnp.bool_),
+            )
 
         self.assertLen(gen_calls, 1)
         gen_out_sin, gen_out_cos = orig_gen(

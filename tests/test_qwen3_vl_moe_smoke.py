@@ -144,6 +144,7 @@ class Qwen3VLMoeSmokeTest(absltest.TestCase):
         hidden_BTD, _ = self.jax_model(
             jnp.asarray(token_ids_BT, dtype=jnp.int32),
             jnp.asarray(attention_mask_BT, dtype=jnp.int32),
+            vision_patch_valid=jnp.empty((0,), dtype=jnp.bool_),
         )
         jax_logits_BTV = np.asarray(self.jax_model.lm_head(hidden_BTD), dtype=np.float32)
 

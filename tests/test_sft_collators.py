@@ -171,7 +171,24 @@ class VLMEncodingTest(absltest.TestCase):
         image_token_id = self.tokenizer.convert_tokens_to_ids("<|image_pad|>")
         self.assertEqual(int(np.sum(batch["token_ids_BT"] == image_token_id)), image_tokens)
         self.assertEqual(batch["pixel_values"].dtype, ml_dtypes.bfloat16)
+        self.assertTrue(np.all(batch["vision_patch_valid"]))
         self.assertEqual(batch["position_ids_ZBT"].shape, (3, 1, 256))
+
+    def test_vlm_collator_emits_validity_for_text_only_batch(self):
+        batch = VLMSFTCollator(self.tokenizer, 256, self.image_processor)(
+            [
+                {
+                    "messages": [
+                        {"role": "user", "content": [{"type": "text", "text": "hello"}]},
+                        {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": "world"}],
+                        },
+                    ]
+                }
+            ]
+        )
+        self.assertEqual(batch["vision_patch_valid"].shape, (0,))
 
     def test_user_delimiters_do_not_supervise_image_tokens(self):
         image = Image.new("RGB", (112, 112), (80, 40, 20))

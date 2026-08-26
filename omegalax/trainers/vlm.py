@@ -319,9 +319,9 @@ def _restore_sft_checkpoint(
 def make_sft_gradient_step(cfg, pad_id: int = 0, *, wrt=nnx.Param, num_loss_tiles: int = 4):
     """Build a read-only JIT step returning one batch's masked-CE gradient sum.
 
-    The batch dict must contain ``token_ids_BT``, ``attention_mask_BT``, and
-    ``loss_mask_BT``.  It may also contain ``pixel_values`` and
-    ``image_grid_thw`` for multimodal batches.
+    The batch dict must contain ``token_ids_BT``, ``attention_mask_BT``,
+    ``loss_mask_BT``, and ``vision_patch_valid``. It may also contain
+    ``pixel_values`` and ``image_grid_thw`` for multimodal batches.
 
     ``wrt`` selects which model variables receive gradients. Defaults to
     ``nnx.Param`` (full FT). Pass ``LoRAParam`` for adapter-only training
@@ -337,6 +337,7 @@ def make_sft_gradient_step(cfg, pad_id: int = 0, *, wrt=nnx.Param, num_loss_tile
         attention_mask_BT = batch["attention_mask_BT"]
         loss_mask_BT = batch["loss_mask_BT"]
         pixel_values = batch.get("pixel_values")
+        vision_patch_valid = batch["vision_patch_valid"]
         image_grid_thw = batch.get("image_grid_thw")
         vision_cu_seqlens = batch.get("vision_cu_seqlens")
         position_ids_ZBT = batch.get("position_ids_ZBT")
@@ -349,6 +350,7 @@ def make_sft_gradient_step(cfg, pad_id: int = 0, *, wrt=nnx.Param, num_loss_tile
                 cfg,
                 attention_mask_BT=attention_mask_BT,
                 pixel_values=pixel_values,
+                vision_patch_valid=vision_patch_valid,
                 image_grid_thw=image_grid_thw,
                 vision_cu_seqlens=vision_cu_seqlens,
                 position_ids_ZBT=position_ids_ZBT,
@@ -390,6 +392,7 @@ def make_sft_eval_step(cfg, pad_id: int = 0, *, num_loss_tiles: int = 4):
         attention_mask_BT = batch["attention_mask_BT"]
         loss_mask_BT = batch["loss_mask_BT"]
         pixel_values = batch.get("pixel_values")
+        vision_patch_valid = batch["vision_patch_valid"]
         image_grid_thw = batch.get("image_grid_thw")
         vision_cu_seqlens = batch.get("vision_cu_seqlens")
         position_ids_ZBT = batch.get("position_ids_ZBT")
@@ -401,6 +404,7 @@ def make_sft_eval_step(cfg, pad_id: int = 0, *, num_loss_tiles: int = 4):
             cfg,
             attention_mask_BT=attention_mask_BT,
             pixel_values=pixel_values,
+            vision_patch_valid=vision_patch_valid,
             image_grid_thw=image_grid_thw,
             vision_cu_seqlens=vision_cu_seqlens,
             position_ids_ZBT=position_ids_ZBT,
@@ -503,7 +507,8 @@ def _run_sft(
     """SFT a VLM from a Grain iterator; returns final optimizer + last metrics.
 
     ``data_iter`` must be a checkpointable Grain iterator yielding dicts with keys ``token_ids_BT``,
-    ``attention_mask_BT``, and ``loss_mask_BT`` (all numpy ``(B, T)``).
+    ``attention_mask_BT``, ``loss_mask_BT`` (all numpy ``(B, T)``), and
+    ``vision_patch_valid``.
     Optionally ``pixel_values`` and ``image_grid_thw`` for multimodal batches.
 
     If ``val_data_iter`` is provided, runs ``val_steps`` forward-only batches

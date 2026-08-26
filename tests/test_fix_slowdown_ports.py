@@ -186,7 +186,7 @@ def _qwen3_5_vlm_test_cfg() -> Qwen3_5Config:
 
 
 def _make_vlm_inputs(cfg: Qwen3_5Config, real_grids, max_images=None, max_patches=None):
-    """Build (tokens, segment_ids, pixel_values, image_grid_thw, cu_seqlens, position_ids).
+    """Build tokens, segments, pixels, validity, grids, cu-seqlens and positions.
 
     `real_grids` is a list of [t, h, w]. Tokens have one image-token per merged
     pixel for each grid. Optionally pads pixel_values/grid_thw via the same
@@ -229,10 +229,12 @@ def _make_vlm_inputs(cfg: Qwen3_5Config, real_grids, max_images=None, max_patche
         np.arange(tokens.shape[1], dtype=np.int32)[None, None, :],
         (3, *tokens.shape),
     ).copy()
+    vision_patch_valid = np.arange(pv.shape[0]) < real_patches
     return (
         jnp.asarray(tokens),
         jnp.asarray(seg),
         jnp.asarray(pv, dtype=jnp.bfloat16),
+        jnp.asarray(vision_patch_valid),
         jnp.asarray(grid, dtype=jnp.int32),
         jnp.asarray(cu, dtype=jnp.int32),
         jnp.asarray(pos, dtype=jnp.int32),
@@ -263,8 +265,8 @@ class Qwen3_5PaddingNoOpTest(absltest.TestCase):
         max_images = 4
         max_patches = real_patches + (max_images - len(real_grids)) * ms * ms
 
-        toks_a, seg_a, pv_a, grid_a, cu_a, pos_a = _make_vlm_inputs(cfg, real_grids)
-        toks_b, seg_b, pv_b, grid_b, cu_b, pos_b = _make_vlm_inputs(
+        toks_a, seg_a, pv_a, valid_a, grid_a, cu_a, pos_a = _make_vlm_inputs(cfg, real_grids)
+        toks_b, seg_b, pv_b, valid_b, grid_b, cu_b, pos_b = _make_vlm_inputs(
             cfg,
             real_grids,
             max_images=max_images,
@@ -277,6 +279,7 @@ class Qwen3_5PaddingNoOpTest(absltest.TestCase):
             seg_a,
             None,
             jnp.array(0, dtype=jnp.int32),
+            vision_patch_valid=valid_a,
             pixel_values=pv_a,
             image_grid_thw=grid_a,
             vision_cu_seqlens=cu_a,
@@ -287,6 +290,7 @@ class Qwen3_5PaddingNoOpTest(absltest.TestCase):
             seg_b,
             None,
             jnp.array(0, dtype=jnp.int32),
+            vision_patch_valid=valid_b,
             pixel_values=pv_b,
             image_grid_thw=grid_b,
             vision_cu_seqlens=cu_b,
@@ -295,13 +299,9 @@ class Qwen3_5PaddingNoOpTest(absltest.TestCase):
 
         out_a = np.asarray(h_a, dtype=np.float32)
         out_b = np.asarray(h_b, dtype=np.float32)
-        # Position (0, seq_len-1) is the fusion's fill sink — by contract it
-        # holds a pad token whose loss is masked. Padded fusion overwrites it
-        # with zero; unpadded leaves the embedding intact. Exclude that
-        # position from the comparison.
         np.testing.assert_allclose(
-            out_b[:, :-1],
-            out_a[:, :-1],
+            out_b,
+            out_a,
             rtol=3e-2,
             atol=3e-2,
         )

@@ -76,6 +76,7 @@ class Qwen3_5RealTest(absltest.TestCase):
             segment_ids_BT,
             None,
             jnp.array(0, dtype=jnp.int32),
+            vision_patch_valid=jnp.empty((0,), dtype=jnp.bool_),
         )
         logits_BTV = self.jax_model.lm_head(hidden_BTD)
         return np.asarray(logits_BTV, dtype=np.float32)

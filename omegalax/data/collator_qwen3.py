@@ -169,7 +169,8 @@ class VLMSFTCollator:
 
     Every key is always present at a fixed shape, images or not, so ``train_step``
     never recompiles: ``token_ids_BT``, ``attention_mask_BT``, ``loss_mask_BT``,
-    ``pixel_values``, ``image_grid_thw``, ``vision_cu_seqlens``, ``position_ids_ZBT``.
+    ``pixel_values``, ``vision_patch_valid``, ``image_grid_thw``,
+    ``vision_cu_seqlens``, ``position_ids_ZBT``.
 
     ``position_ids_ZBT`` is precomputed here (on CPU, via numpy) so the
     model's ``get_rope_index`` never needs to run inside ``jax.jit``.
@@ -260,6 +261,7 @@ class VLMSFTCollator:
         else:
             pixel_values = np.zeros((0, self._patch_feat_dim), dtype=np.float32)
             image_grid_thw = np.zeros((0, 3), dtype=np.int32)
+        num_real_patches = pixel_values.shape[0]
 
         # Compute position_ids from REAL (unpadded) grid — these only
         # depend on real <|image_pad|> positions in token_ids_BT.
@@ -293,6 +295,7 @@ class VLMSFTCollator:
             vision_cu_seqlens = _compute_vision_cu_seqlens(image_grid_thw)
 
         result["pixel_values"] = pixel_values.astype(self._pixel_values_dtype, copy=False)
+        result["vision_patch_valid"] = np.arange(pixel_values.shape[0]) < num_real_patches
         result["image_grid_thw"] = image_grid_thw
         result["vision_cu_seqlens"] = vision_cu_seqlens
 

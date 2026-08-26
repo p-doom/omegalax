@@ -8,6 +8,8 @@ from flax import nnx
 from jax.sharding import PartitionSpec, reshard
 
 from omegalax.models.shard_config import ShardConfig
+from omegalax.models.vision_routing import _vision_token_destinations
+
 from .attention import Attention
 from .config import Qwen3_5Config, Qwen3_5TextConfig
 from .deltanet import GatedDeltaNet
@@ -355,6 +357,8 @@ class Qwen3_5ForConditionalGeneration(nnx.Module):
         segment_ids_BT: jax.Array,
         cache,
         num_right_pads,
+        *,
+        vision_patch_valid: jax.Array,
         pixel_values: jax.Array | None = None,
         image_grid_thw: jax.Array | None = None,
         vision_cu_seqlens: jax.Array | None = None,
@@ -373,22 +377,15 @@ class Qwen3_5ForConditionalGeneration(nnx.Module):
             image_mask_BT = token_ids_BT == self.cfg.image_token_id
             image_mask_BTD = jnp.broadcast_to(image_mask_BT[:, :, None], inputs_embeds_BTD.shape)
             inputs_embeds_BTD = jnp.where(image_mask_BTD, 0.0, inputs_embeds_BTD)
-            n_embeds = image_embeds_ND.shape[0]  # static after padding
-            seq_len = token_ids_BT.shape[1]
-            batch_indices, seq_indices = jnp.where(
+            batch_indices, seq_indices = _vision_token_destinations(
                 image_mask_BT,
-                size=n_embeds,
-                fill_value=(0, seq_len - 1),
+                vision_patch_valid,
+                self.cfg.vision_config.spatial_merge_size,
             )
-            num_real = jnp.sum(image_mask_BT)
-            valid = jnp.arange(n_embeds) < num_real
-            safe_embeds = jnp.where(
-                valid[:, None],
-                image_embeds_ND,
-                0.0,
-            ).astype(inputs_embeds_BTD.dtype)
+            image_embeds_replicated = reshard(image_embeds_ND, P())
             inputs_embeds_BTD = inputs_embeds_BTD.at[batch_indices, seq_indices].set(
-                safe_embeds,
+                image_embeds_replicated.astype(inputs_embeds_BTD.dtype),
+                mode="drop",
                 out_sharding=self.text.out_emb_shd,
             )
 
