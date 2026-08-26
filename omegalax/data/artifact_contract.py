@@ -45,14 +45,13 @@ def _jsonable(value: Any) -> Any:
 
 def validate_measurement_contract(contract: Any) -> None:
     required = {
-        "version",
         "tokenizer_sha256",
         "processor_sha256",
         "preprocessor_sha256",
     }
-    if not isinstance(contract, dict) or set(contract) != required or contract["version"] != 1:
+    if not isinstance(contract, dict) or set(contract) != required:
         raise TypeError(f"measurement contract fields must be exactly {sorted(required)}")
-    for name in required - {"version"}:
+    for name in required:
         value = contract[name]
         if value is not None and (
             not isinstance(value, str)
@@ -76,7 +75,6 @@ def make_measurement_contract(
         "special_tokens_map": tokenizer.special_tokens_map,
     }
     contract = {
-        "version": 1,
         "tokenizer_sha256": canonical_sha256(_jsonable(tokenizer_behavior)),
         "processor_sha256": (
             None

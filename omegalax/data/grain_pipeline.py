@@ -23,13 +23,11 @@ from omegalax.data.artifact_contract import (
     validate_measurement_contract,
 )
 
-COMPILED_DATASET_VERSION = 2
 COMPILED_METADATA_FILENAME = "metadata.json"
 TOKEN_STATS_FILENAME = "token_stats.json"
 TRUNCATION_STATS_FILENAME = "truncation_stats.json"
 SEQUENCE_LENGTHS_FILENAME = "sequence_lengths.jsonl"
 MESSAGE_LENGTHS_FILENAME = "message_lengths.jsonl"
-MESSAGE_LENGTHS_VERSION = 3
 ARRAY_RECORD_SUFFIX = ".array_record"
 
 SOURCE_ID_KEY = "_omegalax_source_id"
@@ -132,7 +130,6 @@ def _write_arrayrecord_dataset(
     final_metadata = dict(metadata)
     final_metadata.update(
         {
-            "version": COMPILED_DATASET_VERSION,
             "complete": False,
             "num_records": total_records,
             "num_shards": len(shard_paths),
@@ -166,13 +163,29 @@ def load_compiled_metadata(path: str | Path) -> dict[str, Any]:
     metadata = json.loads(metadata_path.read_text())
     if not isinstance(metadata, dict):
         raise TypeError("Compiled Grain dataset metadata must be an object")
-    if metadata.get("version") != COMPILED_DATASET_VERSION or metadata.get("complete") is not True:
-        raise ValueError(
-            f"Compiled Grain dataset is incomplete or has unsupported version at {metadata_path}"
-        )
+    required = {
+        "complete",
+        "inline_records",
+        "max_length",
+        "measurement_contract",
+        "num_records",
+        "num_shards",
+        "overflow_mode",
+        "profile_metadata",
+        "shard_paths",
+        "source_chat",
+        "source_chat_path",
+        "split",
+        "val_fraction",
+    }
+    if set(metadata) != required:
+        raise ValueError(f"Compiled Grain dataset metadata is invalid: {metadata_path}")
+    if metadata["complete"] is not True:
+        raise ValueError(f"Compiled Grain dataset is incomplete: {metadata_path}")
     shard_paths = metadata.get("shard_paths")
     if (
-        not isinstance(shard_paths, list)
+        metadata["inline_records"] is not True
+        or not isinstance(shard_paths, list)
         or not shard_paths
         or not all(
             isinstance(item, str) and Path(item).name == item and item.endswith(ARRAY_RECORD_SUFFIX)
@@ -486,8 +499,6 @@ def _compute_message_lengths_from_chat(chat_path, measure_message, num_workers) 
 def _message_lengths_header(chat_path: str | Path, measurement_contract: dict) -> dict:
     validate_measurement_contract(measurement_contract)
     return {
-        "type": "omegalax_message_lengths",
-        "version": MESSAGE_LENGTHS_VERSION,
         "source_chat": file_identity(chat_path),
         "measurement_contract": measurement_contract,
     }
@@ -528,21 +539,22 @@ def _load_chat_message_lengths(path: str | Path) -> tuple[dict, dict]:
             raise ValueError("message-length cache is empty")
         first_row = json.loads(first_line)
         header = first_row.get("header") if isinstance(first_row, dict) else None
-        if not isinstance(header, dict):
-            raise TypeError("message-length cache is missing its versioned header")
-        if (
-            header.get("type") != "omegalax_message_lengths"
-            or header.get("version") != MESSAGE_LENGTHS_VERSION
-        ):
-            raise ValueError(
-                f"unsupported message-length cache header: expected version {MESSAGE_LENGTHS_VERSION}"
+        required_header = {"source_chat", "measurement_contract"}
+        if not isinstance(header, dict) or set(header) != required_header:
+            raise TypeError(
+                f"message-length cache header fields must be exactly {sorted(required_header)}"
             )
         validate_measurement_contract(header.get("measurement_contract"))
+        required_row = {"conv_idx", "measurement", "msg_offset"}
         for line in f:
             line = line.strip()
             if not line:
                 continue
             row = json.loads(line)
+            if not isinstance(row, dict) or set(row) != required_row:
+                raise TypeError(
+                    f"message-length cache row fields must be exactly {sorted(required_row)}"
+                )
             key = (int(row["conv_idx"]), int(row["msg_offset"]))
             if key in results:
                 raise ValueError(f"message-length cache contains duplicate key {key}")

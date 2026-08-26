@@ -15,7 +15,6 @@ from omegalax.data.grain_pipeline import (
 
 def _contract(tokenizer_digest: str = "a" * 64) -> dict:
     return {
-        "version": 1,
         "tokenizer_sha256": tokenizer_digest,
         "processor_sha256": None,
         "preprocessor_sha256": None,
@@ -115,12 +114,12 @@ class MessageLengthCacheContractTest(absltest.TestCase):
                     _contract(tokenizer_digest="e" * 64),
                 )
 
-    def test_legacy_headerless_cache_rejects(self):
+    def test_missing_header_rejects(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             cache = Path(tmpdir) / "message_lengths.jsonl"
             cache.write_text(json.dumps({"conv_idx": 0, "msg_offset": 0, "measurement": 1}) + "\n")
 
-            with self.assertRaisesRegex(TypeError, "versioned header"):
+            with self.assertRaisesRegex(TypeError, "header fields"):
                 _load_chat_message_lengths(cache)
 
 

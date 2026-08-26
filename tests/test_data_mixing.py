@@ -59,7 +59,6 @@ def _measure_one(messages):
 
 
 _TEST_MEASUREMENT_CONTRACT = {
-    "version": 1,
     "tokenizer_sha256": "a" * 64,
     "processor_sha256": None,
     "preprocessor_sha256": None,

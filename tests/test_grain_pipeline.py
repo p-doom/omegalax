@@ -57,7 +57,6 @@ def _measure_declared(messages):
 
 
 _TEST_MEASUREMENT_CONTRACT = {
-    "version": 1,
     "tokenizer_sha256": "a" * 64,
     "processor_sha256": None,
     "preprocessor_sha256": None,
@@ -230,15 +229,14 @@ class GrainPipelineTest(absltest.TestCase):
             )
 
     def test_make_grain_iterator_requires_inline_records_dataset(self):
-        # Legacy pre-inline-records datasets still sit on disk; iterating one would
-        # feed the trainer chunk descriptors instead of examples.
         with tempfile.TemporaryDirectory() as tmpdir:
-            legacy = Path(tmpdir) / "legacy"
-            legacy.mkdir()
-            (legacy / "metadata.json").write_text(
+            invalid = Path(tmpdir) / "invalid"
+            invalid.mkdir()
+            (invalid / "metadata.json").write_text(
                 json.dumps(
                     {
-                        "version": 1,
+                        "complete": True,
+                        "measurement_contract": _TEST_MEASUREMENT_CONTRACT,
                         "num_records": 1,
                         "num_shards": 1,
                         "shard_paths": ["part-00000.array_record"],
@@ -246,9 +244,9 @@ class GrainPipelineTest(absltest.TestCase):
                 )
             )
 
-            with self.assertRaisesRegex(ValueError, "incomplete or has unsupported version"):
+            with self.assertRaisesRegex(ValueError, "metadata is invalid"):
                 make_grain_iterator(
-                    legacy,
+                    invalid,
                     batch_size=1,
                     batch_fn=lambda batch: batch[0],
                     shuffle=False,
