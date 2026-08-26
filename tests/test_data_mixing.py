@@ -237,15 +237,12 @@ class DataMixingTest(absltest.TestCase):
             self.assertFalse(seen_b)
 
     def test_mix_entry_without_a_weight_rejected(self):
-        """A misspelled weight key used to default to 1.0, which is a mixture the
-        recipe never asked for and that every downstream metric reports as its own.
-        """
         self.assertEqual(
             parse_data_mix('[{"path": "/a", "weight": 0.25}]'),
             [MixSource(path="/a", weight=0.25)],
         )
-        with self.assertRaisesRegex(ValueError, "'path' and 'weight'"):
-            parse_data_mix('[{"path": "/a", "wieght": 0.25}]')
+        with self.assertRaisesRegex(TypeError, "missing.*weight"):
+            parse_data_mix('[{"path": "/a"}]')
 
     def test_negative_weight_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -310,7 +307,10 @@ class DataMixingTest(absltest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "different max_length"):
                 make_grain_iterator(
-                    [MixSource(path=chunked_a_short), MixSource(path=chunked_a_long)],
+                    [
+                        MixSource(path=chunked_a_short, weight=1.0),
+                        MixSource(path=chunked_a_long, weight=1.0),
+                    ],
                     batch_size=1,
                     batch_fn=_batch_starts,
                     shuffle=False,

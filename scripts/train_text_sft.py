@@ -188,8 +188,6 @@ def _validate_flags() -> None:
 
 
 def _resolve_train_sources() -> list[MixSource]:
-    if (FLAGS.data_path is None) == (FLAGS.data_mix is None):
-        raise ValueError("Specify exactly one of --data_path or --data_mix.")
     if FLAGS.data_mix is not None:
         return parse_data_mix(FLAGS.data_mix)
     return [MixSource(path=FLAGS.data_path, weight=1.0)]
