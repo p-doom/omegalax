@@ -32,9 +32,7 @@ from omegalax.trainers.loss import chunked_cross_entropy_loss, chunked_cross_ent
 from omegalax.trainers.lr_schedule import build_lr_schedule
 from omegalax.trainers.optim import (
     MixedPrecisionOptimizer,
-    accumulate_gradient_sum,
-    apply_normalized_gradient_sum,
-    initialize_gradient_sum,
+    update_from_gradient_sum,
 )
 from omegalax.trainers.perf import (
     StepFlops,
@@ -316,8 +314,8 @@ def _restore_sft_checkpoint(
     )
 
 
-def make_sft_gradient_step(cfg, pad_id: int = 0, *, wrt=nnx.Param, num_loss_tiles: int = 4):
-    """Build a read-only JIT step returning one batch's masked-CE gradient sum.
+def make_sft_train_step(cfg, pad_id: int = 0, *, wrt=nnx.Param, num_loss_tiles: int = 4):
+    """Build a JIT-compiled optimizer step over one accumulation window.
 
     The batch dict must contain ``token_ids_BT``, ``attention_mask_BT``, and
     ``loss_mask_BT``.  It may also contain ``pixel_values`` and
@@ -331,54 +329,87 @@ def make_sft_gradient_step(cfg, pad_id: int = 0, *, wrt=nnx.Param, num_loss_tile
 
     diff_state = nnx.DiffState(0, wrt)
 
-    @nnx.jit
-    def sft_gradient_step(model: nnx.Module, batch: dict[str, jax.Array]):
-        token_ids_BT = batch["token_ids_BT"]
-        attention_mask_BT = batch["attention_mask_BT"]
-        loss_mask_BT = batch["loss_mask_BT"]
-        pixel_values = batch.get("pixel_values")
-        image_grid_thw = batch.get("image_grid_thw")
-        vision_cu_seqlens = batch.get("vision_cu_seqlens")
-        position_ids_ZBT = batch.get("position_ids_ZBT")
+    @nnx.jit(donate_argnums=0)
+    def sft_train_step(
+        optimizer: MixedPrecisionOptimizer,
+        batches: tuple[dict[str, jax.Array], ...],
+    ):
+        gradient_sum = None
+        loss_sum = jnp.asarray(0.0, dtype=jnp.float32)
+        supervised_tokens = jnp.asarray(0.0, dtype=jnp.float32)
+        total_tokens = jnp.asarray(0.0, dtype=jnp.float32)
 
-        def loss_fn(model):
-            hidden_BTD, aux_loss = vlm_api.forward(
-                model,
-                token_ids_BT,
-                pad_id,
-                cfg,
-                attention_mask_BT=attention_mask_BT,
-                pixel_values=pixel_values,
-                image_grid_thw=image_grid_thw,
-                vision_cu_seqlens=vision_cu_seqlens,
-                position_ids_ZBT=position_ids_ZBT,
-            )
-            lm_weight = model.output_weight()
-            loss_sum, supervised_tokens = chunked_cross_entropy_loss_sum(
-                hidden_BTD,
-                lm_weight,
-                token_ids_BT,
-                loss_mask_BT,
-                num_tiles=num_loss_tiles,
-                logits_out_sharding=cfg.shd_cfg.logits_btv,
-            )
-            total_tokens = jnp.sum(attention_mask_BT.astype(jnp.float32))
-            return loss_sum, (supervised_tokens, total_tokens, aux_loss)
+        for batch in batches:
+            token_ids_BT = batch["token_ids_BT"]
+            attention_mask_BT = batch["attention_mask_BT"]
+            loss_mask_BT = batch["loss_mask_BT"]
 
-        (loss_sum, (supervised_tokens, total_tokens, aux_loss)), grads = nnx.value_and_grad(
-            loss_fn,
-            argnums=diff_state,
-            has_aux=True,
-        )(model)
-        metrics = {
-            "loss_sum": loss_sum,
-            "aux_loss": aux_loss,
+            def loss_fn(model):
+                hidden_BTD, aux_loss = vlm_api.forward(
+                    model,
+                    token_ids_BT,
+                    pad_id,
+                    cfg,
+                    attention_mask_BT=attention_mask_BT,
+                    pixel_values=batch.get("pixel_values"),
+                    image_grid_thw=batch.get("image_grid_thw"),
+                    vision_cu_seqlens=batch.get("vision_cu_seqlens"),
+                    position_ids_ZBT=batch.get("position_ids_ZBT"),
+                )
+                lm_weight = model.output_weight()
+                batch_loss_sum, batch_supervised_tokens = chunked_cross_entropy_loss_sum(
+                    hidden_BTD,
+                    lm_weight,
+                    token_ids_BT,
+                    loss_mask_BT,
+                    num_tiles=num_loss_tiles,
+                    logits_out_sharding=cfg.shd_cfg.logits_btv,
+                )
+                batch_total_tokens = jnp.sum(attention_mask_BT.astype(jnp.float32))
+                return batch_loss_sum, (
+                    batch_supervised_tokens,
+                    batch_total_tokens,
+                    aux_loss,
+                )
+
+            (
+                batch_loss_sum,
+                (batch_supervised_tokens, batch_total_tokens, _),
+            ), gradients = nnx.value_and_grad(
+                loss_fn,
+                argnums=diff_state,
+                has_aux=True,
+            )(optimizer.model)
+            gradient_sum = (
+                jax.tree.map(lambda gradient: gradient.astype(jnp.float32), gradients)
+                if gradient_sum is None
+                else jax.tree.map(
+                    lambda total, gradient: total + gradient.astype(jnp.float32),
+                    gradient_sum,
+                    gradients,
+                )
+            )
+            loss_sum = loss_sum + batch_loss_sum
+            supervised_tokens = supervised_tokens + batch_supervised_tokens
+            total_tokens = total_tokens + batch_total_tokens
+
+        if gradient_sum is None:
+            raise ValueError("At least one microbatch is required")
+        grad_norm, loss, healthy = update_from_gradient_sum(
+            optimizer,
+            gradient_sum,
+            supervised_tokens,
+            loss_sum,
+        )
+        return loss, {
+            "loss": loss,
+            "grad_norm": grad_norm,
+            "optimizer_healthy": healthy,
             "supervised_tokens": supervised_tokens,
             "total_tokens": total_tokens,
         }
-        return grads, metrics
 
-    return sft_gradient_step
+    return sft_train_step
 
 
 def make_sft_eval_step(cfg, pad_id: int = 0, *, num_loss_tiles: int = 4):
@@ -639,7 +670,7 @@ def _run_sft(
         )
         log_device_memory("after optimizer build", save_dir=save_path)
 
-    sft_gradient_step = make_sft_gradient_step(
+    sft_train_step = make_sft_train_step(
         model_cfg,
         pad_id=pad_id,
         wrt=wrt_filter,
@@ -651,11 +682,11 @@ def _run_sft(
         else None
     )
     startup_log(
-        "built gradient step (jit)" + (" and eval step (jit)" if eval_step is not None else "")
+        "built train step (jit)" + (" and eval step (jit)" if eval_step is not None else "")
     )
 
     accum_steps = train_cfg.grad_accum_steps
-    timer = StepTimer(warmup=2 * accum_steps)
+    timer = StepTimer(warmup=2)
     global_tokens_per_step = train_cfg.seq_len * train_cfg.batch_size * accum_steps
 
     if checkpoint_manager is not None and not will_resume:
@@ -724,15 +755,24 @@ def _run_sft(
         signal.signal(signum, _request_stop)
 
     autotune_result = None
-    pending_batch = None
+    pending_batches = None
     if tokamax_cache_dir is not None:
         autotune_result = tokamax_cache_lib.try_load(tokamax_cache_dir)
         if autotune_result is None:
-            startup_log("priming tokamax autotuning with first training batch")
-            pending_batch = next(data_iter)
-            pending_batch_sharded = vlm_api.shard_batch_dict(pending_batch, model_cfg, mesh)
+            startup_log("priming tokamax autotuning with first training step")
+            pending_batches = tuple(next(data_iter) for _ in range(accum_steps))
+            autotune_batches = []
+            for pending_batch in pending_batches:
+                autotune_batch = dict(pending_batch)
+                pop_source_ids(autotune_batch)
+                autotune_batches.append(
+                    vlm_api.shard_batch_dict(autotune_batch, model_cfg, mesh)
+                )
             autotune_result = tokamax_cache_lib.autotune_and_save(
-                tokamax_cache_dir, sft_gradient_step, optimizer.model, pending_batch_sharded
+                tokamax_cache_dir,
+                sft_train_step,
+                optimizer,
+                tuple(autotune_batches),
             )
 
     _autotune_ctx = autotune_result if autotune_result is not None else contextlib.nullcontext()
@@ -750,19 +790,14 @@ def _run_sft(
     for step_idx in range(start_step, train_cfg.num_steps):
         step = step_idx + 1
 
-        gradient_sum = None
-        accum_loss_sum = 0.0
-        accum_sup_tokens = 0.0
-        accum_total_tokens = 0.0
         accum_model_flops = 0.0
         accum_hardware_flops = 0.0
-        accum_time = datetime.timedelta(0)
         source_counts: dict[int, int] = {}
+        step_batches = []
 
-        for _micro in range(accum_steps):
-            if pending_batch is not None:
-                batch = pending_batch
-                pending_batch = None
+        for micro_idx in range(accum_steps):
+            if pending_batches is not None:
+                batch = pending_batches[micro_idx]
             else:
                 batch = next(data_iter)
             sids = pop_source_ids(batch)
@@ -782,56 +817,44 @@ def _run_sft(
                 vision_remat=VISION_BLOCK_REMAT,
             )
             batch = vlm_api.shard_batch_dict(batch, model_cfg, mesh)
-            gradients, metrics = sft_gradient_step(optimizer.model, batch)
-            gradient_sum = (
-                initialize_gradient_sum(gradients)
-                if gradient_sum is None
-                else accumulate_gradient_sum(gradient_sum, gradients)
-            )
-            micro_delta = timer.step()
-
-            accum_loss_sum = accum_loss_sum + metrics["loss_sum"]
-            accum_sup_tokens = accum_sup_tokens + metrics["supervised_tokens"]
-            accum_total_tokens = accum_total_tokens + metrics["total_tokens"]
+            step_batches.append(batch)
             accum_model_flops += micro_flops.model
             accum_hardware_flops += micro_flops.hardware
-            accum_time += micro_delta
+        pending_batches = None
 
-        if gradient_sum is None:
-            raise RuntimeError("Gradient accumulation produced no microbatches")
-        grad_norm, loss, optimizer_healthy = apply_normalized_gradient_sum(
+        _, metrics = sft_train_step(
             optimizer,
-            gradient_sum,
-            accum_sup_tokens,
-            accum_loss_sum,
+            tuple(step_batches),
         )
-        accum_time += timer.step()
+        accum_time = timer.step()
 
         if not _mem_logged_after_first_step:
-            jax.block_until_ready(grad_norm)
+            jax.block_until_ready(metrics["grad_norm"])
             log_device_memory("after first step (compile done)", save_dir=save_path)
             log_live_arrays("after first step (compile done)", save_dir=save_path)
             log_compiled_memory_analysis(
-                "sft_gradient_step", sft_gradient_step, save_path, optimizer.model, batch
+                "sft_train_step", sft_train_step, save_path, optimizer, tuple(step_batches)
             )
             _mem_logged_after_first_step = True
         elif not _mem_logged_steady_state and step_idx >= 4:
-            jax.block_until_ready(grad_norm)
+            jax.block_until_ready(metrics["grad_norm"])
             log_device_memory("after step 5 (steady state)", save_dir=save_path)
             _mem_logged_steady_state = True
 
         logged = _log_prev_metrics()
         if logged or optimizer_healthy_since_boundary is None:
-            optimizer_healthy_since_boundary = optimizer_healthy
+            optimizer_healthy_since_boundary = metrics["optimizer_healthy"]
         else:
-            optimizer_healthy_since_boundary = optimizer_healthy_since_boundary & optimizer_healthy
+            optimizer_healthy_since_boundary = (
+                optimizer_healthy_since_boundary & metrics["optimizer_healthy"]
+            )
 
         with jax.default_device("cpu"):
             window_metrics = {
-                "loss": loss,
-                "grad_norm": grad_norm,
-                "supervised_tokens": accum_sup_tokens,
-                "total_tokens": accum_total_tokens,
+                "loss": metrics["loss"],
+                "grad_norm": metrics["grad_norm"],
+                "supervised_tokens": metrics["supervised_tokens"],
+                "total_tokens": metrics["total_tokens"],
                 "optimizer_healthy": optimizer_healthy_since_boundary,
                 "lr": (
                     float(lr_schedule_fn(step_idx))

@@ -29,6 +29,15 @@ def apply_normalized_gradient_sum(
     supervised_tokens,
     loss_sum,
 ):
+    return update_from_gradient_sum(optimizer, gradient_sum, supervised_tokens, loss_sum)
+
+
+def update_from_gradient_sum(
+    optimizer,
+    gradient_sum,
+    supervised_tokens,
+    loss_sum,
+):
     normalized_gradients = jax.tree.map(
         lambda gradient: gradient / jnp.maximum(supervised_tokens, 1.0),
         gradient_sum,

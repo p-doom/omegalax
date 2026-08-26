@@ -4,6 +4,8 @@ import inspect
 import os
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
@@ -26,6 +28,16 @@ from omegalax.trainers.optim import (
 class _ScalarModel(nnx.Module):
     def __init__(self):
         self.weight = nnx.Param(jnp.asarray([1.0], dtype=jnp.bfloat16))
+
+
+class _TinyLM(nnx.Module):
+    def __init__(self):
+        self.weight = nnx.Param(
+            jnp.asarray([[0.2, -0.1, 0.4], [0.3, 0.5, -0.2]], dtype=jnp.float32)
+        )
+
+    def output_weight(self):
+        return self.weight[...]
 
 
 class _Closable:
@@ -102,6 +114,33 @@ class VLMTrainingContractTest(absltest.TestCase):
         self.assertAlmostEqual(float(grad_norm), 1.0)
         self.assertAlmostEqual(float(loss), 0.5)
         self.assertAlmostEqual(float(model.weight[0]), 0.9, places=2)
+
+    def test_accumulation_window_is_one_optimizer_step(self):
+        def forward(_model, token_ids_BT, _pad_id, _cfg, **_kwargs):
+            hidden = jax.nn.one_hot(token_ids_BT % 2, 2)
+            return hidden, jnp.asarray(0.0, dtype=jnp.float32)
+
+        optimizer = MixedPrecisionOptimizer(_TinyLM(), optax.sgd(0.1))
+        cfg = SimpleNamespace(shd_cfg=SimpleNamespace(logits_btv=None))
+        batches = tuple(
+            {
+                "token_ids_BT": jnp.asarray([tokens], dtype=jnp.int32),
+                "attention_mask_BT": jnp.ones((1, 4), dtype=jnp.int32),
+                "loss_mask_BT": jnp.asarray([mask], dtype=jnp.int32),
+            }
+            for tokens, mask in (
+                ([0, 1, 2, 1], [0, 1, 0, 1]),
+                ([1, 2, 0, 2], [0, 1, 1, 1]),
+            )
+        )
+
+        with mock.patch.object(vlm.vlm_api, "forward", new=forward):
+            train_step = vlm.make_sft_train_step(cfg, num_loss_tiles=1)
+            loss, metrics = train_step(optimizer, batches)
+
+        self.assertTrue(bool(jnp.isfinite(loss)))
+        self.assertEqual(float(metrics["supervised_tokens"]), 5.0)
+        self.assertEqual(int(optimizer.step[...]), 1)
 
     def test_checkpoint_generation_matches_optimizer_counters(self):
         model = _ScalarModel()
