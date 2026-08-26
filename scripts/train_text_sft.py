@@ -19,6 +19,7 @@ from omegalax.data.grain_pipeline import (
     make_grain_read_options,
     required_epochs_for_batches,
 )
+from omegalax.distributed import configure_gpu_xla_flags, init_distributed
 from omegalax.distributed.mesh import process_local_batch_size
 from omegalax.registry import resolve_hf_repo_id
 from omegalax.trainers import text as text_trainer
@@ -61,6 +62,7 @@ flags.DEFINE_integer("grad_accum_steps", 1, "Gradient accumulation steps (1 = no
 flags.DEFINE_integer("gc_period", 0, "If >0, disable Python GC and collect every N training steps.")
 flags.DEFINE_integer("seed", 0, "RNG seed.")
 flags.DEFINE_integer("tp_size", None, "Tensor parallelism size.")
+flags.DEFINE_integer("cp_size", 1, "Context (sequence) parallelism size (default 1 == disabled).")
 flags.DEFINE_integer("fsdp_size", 1, "FSDP parallelism size.")
 flags.DEFINE_integer("dp_size", 1, "Data parallelism size.")
 flags.DEFINE_string("save_dir", None, "Checkpoint save directory.")
@@ -176,10 +178,10 @@ def _grain_iter(
 
 
 def main(_) -> None:
+    configure_gpu_xla_flags()  # must precede any jax backend creation
     jax.config.update("jax_compilation_cache_dir", FLAGS.jax_cache_dir)
-    jax.distributed.initialize()
+    init_distributed()
     startup_log(f"jax_compilation_cache_dir={FLAGS.jax_cache_dir}")
-    startup_log("jax.distributed initialized")
 
     tokenizer_name = FLAGS.tokenizer or resolve_hf_repo_id(FLAGS.model_id)
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
@@ -291,6 +293,7 @@ def main(_) -> None:
             pad_id=FLAGS.pad_id,
             peak_tflops=peak_tflops,
             tp_size=FLAGS.tp_size,
+            cp_size=FLAGS.cp_size,
             fsdp_size=FLAGS.fsdp_size,
             dp_size=FLAGS.dp_size,
             wandb_run=wandb_run,

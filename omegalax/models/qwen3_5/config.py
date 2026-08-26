@@ -9,6 +9,7 @@ import jax.numpy as jnp
 from etils import epath
 
 from omegalax.models.params_utils import load_hf_config_from_source
+from omegalax.models.remat_policy import DEFAULT_REMAT_POLICY
 from omegalax.models.shard_config import ShardConfig
 
 
@@ -24,6 +25,8 @@ class Qwen3_5VisionConfig:
     in_channels: int = 3
     out_hidden_size: int = 4096
     num_position_embeddings: int = 2304
+    # Activation checkpointing policy for vision blocks (see remat_policy.py).
+    remat_policy: str = DEFAULT_REMAT_POLICY
     dtype: Any = jnp.bfloat16
 
 
@@ -61,12 +64,53 @@ class Qwen3_5TextConfig:
     num_experts: int = 0
     num_experts_per_tok: int = 0
     router_aux_loss_coef: float = 0.001
+    # Activation checkpointing policy for decoder layers (see remat_policy.py).
+    remat_policy: str = DEFAULT_REMAT_POLICY
     shd_cfg: ShardConfig = dataclasses.field(default_factory=ShardConfig.default)
     dtype: Any = jnp.bfloat16
 
     @property
     def is_moe(self) -> bool:
         return self.num_experts > 0
+
+    @property
+    def is_homogeneous(self) -> bool:
+        """True when every decoder layer has the same parameter pytree structure.
+
+        Qwen3.5 interleaves ``linear_attention`` (Gated DeltaNet) and
+        ``full_attention`` layers, which have DIFFERENT parameter structures and
+        therefore cannot be stacked into a single ``nnx.scan``. Homogeneous only
+        when every layer shares the same ``layer_type``.
+        """
+        return len(set(self.layer_types)) <= 1
+
+    @property
+    def scan_block_period(self) -> int | None:
+        """Smallest period ``p`` such that ``layer_types`` is a repeating block of
+        length ``p`` tiled ``num_hidden_layers // p`` times, else ``None``.
+
+        Qwen3.5's hybrid stack (e.g. ``[linear, linear, linear, full]`` repeated)
+        is scanned as a repeating BLOCK over ``num_blocks = num_layers // p``
+        (MaxText Gemma3 "scannable block" pattern): each of the ``p`` positions is
+        homogeneous across blocks and its params are stacked along the block axis;
+        the scan body applies the ``p`` positions in order. Returns ``None`` when
+        the pattern is irregular or ``num_layers`` is not divisible by any period,
+        forcing the unrolled fallback.
+        """
+        n = len(self.layer_types)
+        if n == 0:
+            return None
+        if n != self.num_hidden_layers:
+            return None
+        # A homogeneous stack has period 1 (handled by the plain single-stack scan
+        # via is_homogeneous); still report 1 for completeness.
+        for p in range(1, n + 1):
+            if n % p != 0:
+                continue
+            block = self.layer_types[:p]
+            if all(self.layer_types[i] == block[i % p] for i in range(n)):
+                return p
+        return None
 
 
 @dataclasses.dataclass(frozen=True, slots=True)

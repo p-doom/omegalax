@@ -31,6 +31,7 @@ from flax import nnx
 
 from omegalax import export as export_lib
 from omegalax import registry
+from omegalax.distributed import configure_gpu_xla_flags
 from omegalax.distributed.mesh import ensure_mesh, mesh_rules
 from omegalax.vlm import api as vlm_api
 
@@ -222,7 +223,9 @@ def _restore_trained_weights(model, cfg, checkpoint_path: Path):
 
 
 def main(_) -> None:
-    jax.distributed.initialize()
+    # Single-process checkpoint->HF conversion: no init_distributed (it shards the
+    # model over all local GPUs in one process, not one-process-per-GPU).
+    configure_gpu_xla_flags()  # must precede any jax backend creation
     model, cfg = load_model()
     if FLAGS.checkpoint_path:
         ckpt = Path(FLAGS.checkpoint_path).expanduser()
