@@ -112,6 +112,20 @@ flags.DEFINE_enum(
     "mode for SLURM time-limit resubmits), 'required' (resume; error if no "
     "checkpoint).",
 )
+flags.DEFINE_string(
+    "init_from",
+    None,
+    "One checkpoint step directory to take the weights (and LoRA adapter) from, e.g. "
+    "/runs/prev/orbax/000900. Must lie outside --save_dir. Requires --reset_optimizer.",
+)
+flags.DEFINE_bool(
+    "reset_optimizer",
+    False,
+    "Keep --init_from's weights but start a new optimization: opt_state and step zeroed "
+    "so the LR schedule re-runs warmup, RNG re-derived from --seed, and a fresh Grain "
+    "iterator over the current dataset. Use this — not --resume — when continuing "
+    "weights on a DIFFERENT dataset. Requires --resume=never and an empty --save_dir.",
+)
 flags.DEFINE_integer("pad_id", None, "Padding token id.")
 flags.DEFINE_string("peak_tflops", None, "Peak TFLOPS for MFU calculation.")
 flags.DEFINE_string("wandb_entity", None, "Weights & Biases entity (team/user).")
@@ -242,6 +256,16 @@ def _validate_flags() -> None:
         for name in ("lora_rank", "lora_alpha"):
             if FLAGS[name].value is None:
                 problems.append(f"{name} (required when enable_lora=true)")
+
+    if FLAGS.resume is not None:
+        problems.extend(
+            vlm_trainer.optimizer_reset_problems(
+                resume=FLAGS.resume,
+                init_from=FLAGS.init_from,
+                reset_optimizer=FLAGS.reset_optimizer,
+                save_dir=FLAGS.save_dir,
+            )
+        )
 
     # Validation cadence required only when a validation set is configured.
     if FLAGS.val_data_path:
@@ -483,6 +507,8 @@ def main(_) -> None:
             gc_period=FLAGS.gc_period,
             log_memory=FLAGS.log_memory,
             tokamax_cache_dir=FLAGS.tokamax_cache_dir,
+            init_from=FLAGS.init_from,
+            reset_optimizer=FLAGS.reset_optimizer,
         )
     finally:
         if FLAGS.gc_period:
