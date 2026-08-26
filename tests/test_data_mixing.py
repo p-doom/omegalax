@@ -66,7 +66,7 @@ def _build_chunked_source(
 ) -> Path:
     """Build an inline-records dataset from a user+assistant-per-session chat.jsonl.
 
-    Each session pairs the tracking value (carried as the user turn so tests can
+    Each session pairs the tracking value (stored as the user turn so tests can
     read it back at ``messages[0]``) with a trivial assistant turn, so the chunk
     survives ``build_records_from_chat``'s assistant-turn filter. ``max_length=2``
     keeps both messages in a single chunk, preserving one record per session.
