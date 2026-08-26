@@ -74,9 +74,7 @@ def main(_) -> None:
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
 
     image_processor = None
-    processor_name = None
     if FLAGS.processor:
-        processor_name = FLAGS.processor
         ip_kwargs: dict = {}
         if FLAGS.preprocessor_config:
             with open(FLAGS.preprocessor_config) as f:
@@ -97,12 +95,6 @@ def main(_) -> None:
         overflow_mode=FLAGS.overflow_mode,
         val_fraction=FLAGS.val_fraction,
         split=FLAGS.split,
-        profile_metadata={
-            "model_id": FLAGS.model_id,
-            "tokenizer": tokenizer_name,
-            "processor": processor_name,
-            "preprocessor_config": FLAGS.preprocessor_config,
-        },
     )
     print(out_dir)
 

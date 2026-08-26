@@ -63,7 +63,6 @@ def _write_arrayrecord_dataset(
     *,
     records_per_shard: int,
     overwrite: bool,
-    metadata: dict[str, Any],
 ) -> Path:
     if records_per_shard <= 0:
         raise ValueError("records_per_shard must be > 0")
@@ -102,14 +101,11 @@ def _write_arrayrecord_dataset(
     finally:
         writer.close()
 
-    final_metadata = dict(metadata)
-    final_metadata.update(
-        {
-            "num_records": total_records,
-            "shard_paths": shard_paths,
-        }
-    )
-    (out_dir / COMPILED_METADATA_FILENAME).write_text(json.dumps(final_metadata, indent=2) + "\n")
+    metadata = {
+        "num_records": total_records,
+        "shard_paths": shard_paths,
+    }
+    (out_dir / COMPILED_METADATA_FILENAME).write_text(json.dumps(metadata, indent=2) + "\n")
     return out_dir
 
 
@@ -141,6 +137,9 @@ def load_compiled_metadata(path: str | Path) -> dict[str, Any]:
         isinstance(item, str) for item in shard_paths
     ):
         raise ValueError(f"Compiled Grain dataset has no shard paths: {metadata_path}")
+    num_records = metadata.get("num_records")
+    if type(num_records) is not int or num_records <= 0:
+        raise ValueError(f"Compiled Grain dataset has invalid num_records: {num_records!r}")
     return metadata
 
 
@@ -158,9 +157,7 @@ def required_epochs_for_batches(
         raise ValueError("batch_size must be > 0")
 
     metadata = load_compiled_metadata(path)
-    num_records = metadata.get("num_records")
-    if type(num_records) is not int or num_records <= 0:
-        raise ValueError(f"Compiled Grain dataset has invalid num_records: {num_records!r}")
+    num_records = metadata["num_records"]
     dp = dp_size * fsdp_size
     records_per_epoch = num_records // dp
     if records_per_epoch <= 0:
@@ -749,7 +746,6 @@ def build_records_from_chat(
     measure_message,
     records_per_shard: int = 100_000,
     overwrite: bool = False,
-    profile_metadata: dict[str, Any] | None = None,
     num_workers: int = 2,
     overflow_mode: str = "drop",
     val_fraction: float = 0.0,
@@ -928,13 +924,6 @@ def build_records_from_chat(
         out_dir,
         records_per_shard=records_per_shard,
         overwrite=overwrite,
-        metadata={
-            "max_length": max_length,
-            "overflow_mode": overflow_mode,
-            "split": split,
-            "val_fraction": val_fraction,
-            "profile_metadata": profile_metadata or {},
-        },
     )
 
     _emit_sequence_lengths(out_dir, sequence_stats=sequence_stats, effective_max=effective_max)
@@ -1060,27 +1049,6 @@ def _coerce_sources(
     return out
 
 
-def _validate_mix_compatibility(
-    sources: list[MixSource],
-    metadatas: list[dict[str, Any]],
-) -> None:
-    """Refuse mixes that would silently corrupt training (different tokenization, length, etc.)."""
-    if len(sources) <= 1:
-        return
-    max_lengths = {int(m["max_length"]) for m in metadatas if "max_length" in m}
-    if len(max_lengths) > 1:
-        raise ValueError(
-            f"Cannot mix datasets compiled with different max_length: {max_lengths}. "
-            f"Rebuild chunk indices with a shared --max_length."
-        )
-    tokenizer_ids = {(m.get("profile_metadata") or {}).get("tokenizer_id") for m in metadatas}
-    tokenizer_ids.discard(None)
-    if len(tokenizer_ids) > 1:
-        raise ValueError(
-            f"Cannot mix datasets compiled with different tokenizers: {tokenizer_ids}."
-        )
-
-
 def make_grain_iterator(
     sources: str | Path | MixSource | Sequence[str | Path | MixSource],
     *,
@@ -1133,11 +1101,6 @@ def make_grain_iterator(
     # configs commonly zero out a source to disable it without changing structure.
     # Source ids stay aligned with the user-provided list so metric tags remain stable.
     active_indices = [i for i, s in enumerate(mix_sources) if s.weight > 0.0]
-    metadatas = [load_compiled_metadata(mix_sources[i].path) for i in active_indices]
-    _validate_mix_compatibility(
-        [mix_sources[i] for i in active_indices],
-        metadatas,
-    )
     norm_weights = [mix_sources[i].weight / total_w for i in active_indices]
 
     mp_options = multiprocessing_options or make_grain_multiprocessing_options()

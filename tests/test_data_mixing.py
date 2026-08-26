@@ -274,51 +274,6 @@ class DataMixingTest(absltest.TestCase):
                     **_FAST_OPTS,
                 )
 
-    def test_mixing_different_max_length_rejected(self):
-        """Mixing record datasets built with different max_length is refused."""
-        with tempfile.TemporaryDirectory() as tmp:
-            tmpdir = Path(tmp)
-            # Build the same chat twice, with different max_lengths.
-            src_a = tmpdir / "a.jsonl"
-            _write_jsonl(
-                src_a,
-                [
-                    {
-                        "messages": [
-                            {"role": "user", "content": "x"},
-                            {"role": "assistant", "content": "ok"},
-                        ]
-                    }
-                ],
-            )
-            chunked_a_short = build_records_from_chat(
-                src_a,
-                tmpdir / "a_records_short",
-                max_length=2,
-                measure_message=_measure_one,
-                records_per_shard=8,
-            )
-            chunked_a_long = build_records_from_chat(
-                src_a,
-                tmpdir / "a_records_long",
-                max_length=3,
-                measure_message=_measure_one,
-                records_per_shard=8,
-            )
-            with self.assertRaisesRegex(ValueError, "different max_length"):
-                make_grain_iterator(
-                    [
-                        MixSource(path=chunked_a_short, weight=1.0),
-                        MixSource(path=chunked_a_long, weight=1.0),
-                    ],
-                    batch_size=1,
-                    batch_fn=_batch_starts,
-                    shuffle=False,
-                    seed=0,
-                    num_epochs=1,
-                    **_FAST_OPTS,
-                )
-
     def test_checkpoint_restore_preserves_mix(self):
         """Save/restore mid-stream resumes the same mixed sequence (and source ids)."""
         with tempfile.TemporaryDirectory() as tmp:
