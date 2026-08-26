@@ -11,6 +11,7 @@ from flax import nnx
 from jax.sharding import PartitionSpec, reshard
 from tokamax import dot_product_attention
 
+from omegalax.models.vision_splice import image_embed_destinations, merged_embed_valid
 from .config import Qwen3VLConfig
 from .vision import VisionModel
 
@@ -485,12 +486,13 @@ class Qwen3VL(nnx.Module):
         pixel_values: jax.Array | None = None,
         image_grid_thw: jax.Array | None = None,
         vision_cu_seqlens: jax.Array | None = None,
+        vision_patch_valid: jax.Array | None = None,
     ) -> tuple[jax.Array, jax.Array]:
         cfg = self.cfg
 
         image_features_ND = None
         deepstack_features = None
-        visual_pos_mask_BT = None
+        visual_destinations = None
         if pixel_values is not None and image_grid_thw is not None:
             if vision_cu_seqlens is None:
                 raise ValueError(
@@ -506,15 +508,13 @@ class Qwen3VL(nnx.Module):
 
         if image_features_ND is not None:
             image_mask_BT = token_ids_BT == cfg.image_token_id
-            visual_pos_mask_BT = image_mask_BT
             n_features = image_features_ND.shape[0]  # static after padding
-            seq_len = token_ids_BT.shape[1]
-            image_mask_replicated = reshard(image_mask_BT, P())
-            batch_idx, seq_idx = jnp.where(
-                image_mask_replicated,
-                size=n_features,
-                fill_value=(0, seq_len),
+            batch_idx, seq_idx = image_embed_destinations(
+                image_mask_BT,
+                n_features,
+                merged_embed_valid(vision_patch_valid, n_features),
             )
+            visual_destinations = (batch_idx, seq_idx)
             image_features_replicated = reshard(image_features_ND, P())
             inputs_embeds_BTD = inputs_embeds_BTD.at[batch_idx, seq_idx].set(
                 image_features_replicated.astype(inputs_embeds_BTD.dtype),
@@ -552,7 +552,7 @@ class Qwen3VL(nnx.Module):
             if deepstack_features is not None and layer_idx < len(deepstack_features):
                 hidden_BTD = _deepstack_process(
                     hidden_BTD,
-                    visual_pos_mask_BT,
+                    visual_destinations,
                     deepstack_features[layer_idx],
                     out_sharding=self.text.out_emb_shd,
                 )
@@ -566,20 +566,17 @@ class Qwen3VL(nnx.Module):
 
 def _deepstack_process(
     hidden_BTD: jax.Array,
-    visual_pos_mask_BT: jax.Array,
+    visual_destinations: tuple[jax.Array, jax.Array],
     visual_embeds_ND: jax.Array,
     out_sharding: P | None = None,
 ) -> jax.Array:
-    """Add visual embeddings to hidden states at visual token positions."""
-    n_embeds = visual_embeds_ND.shape[0]
-    seq_len = hidden_BTD.shape[1]
-    mask_replicated = reshard(visual_pos_mask_BT, P())
+    """Add visual embeddings to hidden states at visual token positions.
+
+    Shares the scatter destinations computed for the input-embedding splice, so
+    the deepstack residual lands on exactly the same tokens.
+    """
+    batch_idx, seq_idx = visual_destinations
     embeds_replicated = reshard(visual_embeds_ND, P())
-    batch_idx, seq_idx = jnp.where(
-        mask_replicated,
-        size=n_embeds,
-        fill_value=(0, seq_len),
-    )
     return hidden_BTD.at[batch_idx, seq_idx].add(
         embeds_replicated.astype(hidden_BTD.dtype),
         mode="drop",

@@ -15,6 +15,7 @@ from transformers import AutoImageProcessor
 from omegalax.data.collator_qwen3 import (
     TextSFTCollator,
     VLMSFTCollator,
+    padded_vision_shape,
 )
 from omegalax.data.qwen3_encoding import (
     build_chatml_blocks as _build_chatml_blocks,
@@ -779,6 +780,113 @@ class VLMSFTCollatorTest(absltest.TestCase):
         grid = batch["image_grid_thw"][0]
         expected_pads = int(grid[0]) * (int(grid[1]) // 2) * (int(grid[2]) // 2)
         self.assertEqual(n_pad_sample_1, expected_pads)
+
+
+class VLMSFTCollatorVisionPaddingTest(absltest.TestCase):
+    """Padded-budget behavior: static shapes, and the real/padding row mask.
+
+    Every process collates only its own samples and appends its vision padding
+    after them, so ``vision_patch_valid`` is what lets the model tell a real
+    merged embedding from a padding one once the process-local blocks are
+    concatenated into the global array.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.tokenizer = _make_tokenizer()
+        self.image_processor = AutoImageProcessor.from_pretrained(
+            "Qwen/Qwen3-VL-2B-Instruct",
+            use_fast=False,
+        )
+        self.max_length = 4096
+        self.max_patches_per_sample = 4096
+        self.max_images_per_sample = 2
+        self.collator = VLMSFTCollator(
+            self.tokenizer,
+            max_length=self.max_length,
+            image_processor=self.image_processor,
+            max_vision_patches_per_sample=self.max_patches_per_sample,
+            max_vision_images_per_sample=self.max_images_per_sample,
+        )
+
+    def _example(self, n_images):
+        from PIL import Image
+
+        content = [
+            {"type": "image", "image": Image.new("RGB", (64 + 8 * i, 64), color=(i * 30, 40, 50))}
+            for i in range(n_images)
+        ]
+        content.append({"type": "text", "text": "Describe."})
+        return {
+            "messages": [
+                {"role": "user", "content": content},
+                {"role": "assistant", "content": "Some answer."},
+            ]
+        }
+
+    def test_full_image_budget_collates_instead_of_raising(self):
+        batch = self.collator([self._example(self.max_images_per_sample)])
+        self.assertIn("vision_patch_valid", batch)
+        self.assertEqual(batch["image_grid_thw"].shape[0] > self.max_images_per_sample, True)
+
+    def test_padded_shapes_are_independent_of_image_count(self):
+        shapes = set()
+        for n_images in range(0, self.max_images_per_sample + 1):
+            batch = self.collator([self._example(n_images)])
+            shapes.add(
+                (
+                    batch["pixel_values"].shape,
+                    batch["image_grid_thw"].shape,
+                    batch["vision_cu_seqlens"].shape,
+                    batch["vision_patch_valid"].shape,
+                )
+            )
+        self.assertEqual(len(shapes), 1, f"vision shapes must stay static for JIT: {shapes}")
+
+    def test_padded_shapes_match_the_declared_budget(self):
+        batch = self.collator([self._example(1)])
+        patch_rows, grid_rows = padded_vision_shape(
+            int(self.image_processor.merge_size),
+            self.max_patches_per_sample,
+            self.max_images_per_sample,
+        )
+        self.assertEqual(batch["pixel_values"].shape[0], patch_rows)
+        self.assertEqual(batch["image_grid_thw"].shape[0], grid_rows)
+        self.assertEqual(batch["vision_patch_valid"].shape[0], patch_rows)
+
+    def test_patch_valid_is_a_prefix_marking_exactly_the_real_rows(self):
+        for n_images in (0, 1, self.max_images_per_sample):
+            batch = self.collator([self._example(n_images)])
+            valid = batch["vision_patch_valid"]
+            n_real = int(np.sum(valid))
+            np.testing.assert_array_equal(valid[:n_real], 1)
+            np.testing.assert_array_equal(valid[n_real:], 0)
+            real_grid_patches = 0
+            remaining = n_real
+            for t, h, w in batch["image_grid_thw"].tolist():
+                if remaining <= 0:
+                    break
+                real_grid_patches += t * h * w
+                remaining -= t * h * w
+            self.assertEqual(real_grid_patches, n_real)
+
+    def test_patch_valid_counts_match_the_image_pad_tokens(self):
+        merge_size = int(self.image_processor.merge_size)
+        image_pad_id = self.tokenizer.convert_tokens_to_ids("<|image_pad|>")
+        batch = self.collator([self._example(2)])
+        n_real_patches = int(np.sum(batch["vision_patch_valid"]))
+        n_image_tokens = int(np.sum(batch["token_ids_BT"] == image_pad_id))
+        self.assertEqual(n_real_patches // (merge_size * merge_size), n_image_tokens)
+
+    def test_unpadded_collator_marks_every_row_valid(self):
+        plain = VLMSFTCollator(
+            self.tokenizer,
+            max_length=self.max_length,
+            image_processor=self.image_processor,
+        )
+        batch = plain([self._example(1)])
+        self.assertEqual(batch["vision_patch_valid"].shape[0], batch["pixel_values"].shape[0])
+        np.testing.assert_array_equal(batch["vision_patch_valid"], 1)
 
 
 if __name__ == "__main__":

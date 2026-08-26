@@ -78,6 +78,26 @@ class TextSFTCollator:
         }
 
 
+def padded_vision_shape(merge_size: int, max_patches: int, max_images: int) -> tuple[int, int]:
+    """Return the ``(patch_rows, grid_rows)`` every padded batch is filled to.
+
+    Padding is expressed as extra ``(1, ms, ms*k)`` grid rows, so a batch can
+    only be padded when at least one grid row is free *and* the leftover patch
+    budget covers ``ms2`` patches for each free row. A batch holding exactly
+    ``max_images`` real images has no free row, which used to be a hard failure
+    even though the input was perfectly within budget.
+
+    Reserving one grid row plus ``ms2`` patch rows for each grid row makes the
+    invariant hold unconditionally for any in-budget batch: ``num_dummies`` is
+    at most ``grid_rows`` and ``extra_patches`` is at least ``grid_rows * ms2``.
+    The reservation is a fixed function of the budget, so the padded shapes stay
+    static and JIT never recompiles.
+    """
+    ms2 = merge_size * merge_size
+    grid_rows = max_images + 1
+    return max_patches + grid_rows * ms2, grid_rows
+
+
 def _pad_vision_arrays(
     pixel_values: np.ndarray,
     image_grid_thw: np.ndarray,
@@ -85,46 +105,29 @@ def _pad_vision_arrays(
     max_patches: int,
     max_images: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Pad vision arrays to exact ``(max_patches, max_images)`` target.
+    """Pad vision arrays to the static shape from :func:`padded_vision_shape`.
 
     Fills the ``num_dummies`` padding image slots with ``(1, ms, ms*k_i)`` rows
     whose patch counts ``ms2*k_i`` are spread as evenly as possible so the total
-    lands on ``max_patches`` exactly. Preserves
-    ``pixel_values.shape[0] == sum(t*h*w for image_grid_thw)``.
-
-    Each grid row contributes at least ``ms2`` patches, so padding requires
-    ``extra_patches == num_dummies == 0`` (nothing to do) or
-    ``num_dummies >= 1 and extra_patches >= num_dummies * ms2``. Other budget
-    combinations are infeasible — increase the per-sample limits.
+    lands on the padded patch row count exactly. Preserves
+    ``pixel_values.shape[0] == sum(t*h*w for image_grid_thw)``, and always
+    appends the padding after the real rows so a prefix mask describes validity.
     """
     real_images = image_grid_thw.shape[0]
     real_patches = pixel_values.shape[0]
     feat_dim = pixel_values.shape[1]
     ms2 = merge_size * merge_size
 
-    num_dummies = max_images - real_images
-    extra_patches = max_patches - real_patches
-
-    if num_dummies < 0 or extra_patches < 0:
+    if real_images > max_images or real_patches > max_patches:
         raise ValueError(
             f"Batch exceeds padding budget: real_images={real_images} > "
             f"max_images={max_images} or real_patches={real_patches} > "
             f"max_patches={max_patches}. Increase the per-sample limits."
         )
 
-    if num_dummies == 0 and extra_patches == 0:
-        return pixel_values, image_grid_thw, _compute_vision_cu_seqlens(image_grid_thw)
-
-    if num_dummies == 0 or extra_patches < num_dummies * ms2:
-        raise ValueError(
-            f"Vision budgets are infeasible for this batch: real_images="
-            f"{real_images}, real_patches={real_patches}, max_images="
-            f"{max_images}, max_patches={max_patches}, ms2={ms2}. Padding "
-            f"needs num_dummies>=1 and extra_patches>=num_dummies*ms2 (each "
-            f"dummy row costs at least ms2 patches). Increase "
-            f"max_vision_images_per_sample or max_vision_patches_per_sample "
-            f"so this invariant holds for every batch."
-        )
+    patch_rows, grid_rows = padded_vision_shape(merge_size, max_patches, max_images)
+    num_dummies = grid_rows - real_images
+    extra_patches = patch_rows - real_patches
 
     if extra_patches % ms2 != 0:
         raise ValueError(
@@ -177,11 +180,17 @@ class VLMSFTCollator:
     HF image processor (slow path, NumPy backend).
 
     Outputs ``{"token_ids_BT", "attention_mask_BT", "loss_mask_BT"}`` plus
-    ``"pixel_values"``, ``"image_grid_thw"``, and ``"position_ids_ZBT"``
-    when images are present.
+    ``"pixel_values"``, ``"image_grid_thw"``, ``"vision_cu_seqlens"``,
+    ``"vision_patch_valid"`` and ``"position_ids_ZBT"`` when images are present.
 
     ``position_ids_ZBT`` is precomputed here (on CPU, via numpy) so the
     model's ``get_rope_index`` never needs to run inside ``jax.jit``.
+
+    ``vision_patch_valid`` flags which ``pixel_values`` rows carry a real patch.
+    A collator only ever sees its own process's samples and appends the vision
+    padding after them, so once the process-local blocks are concatenated into
+    the global array the real rows are no longer a prefix — the model needs this
+    mask to route each merged embedding to the image token it belongs to.
     """
 
     def __init__(
@@ -293,6 +302,8 @@ class VLMSFTCollator:
         )
         result["position_ids_ZBT"] = position_ids.astype(np.int32)
 
+        real_patch_rows = pixel_values.shape[0]
+
         # Pad vision arrays to static shapes so JAX JIT never recompiles.
         # Per-sample limits are multiplied by batch size so the user
         # doesn't need to recompute when changing batch_size.
@@ -311,8 +322,12 @@ class VLMSFTCollator:
         else:
             vision_cu_seqlens = _compute_vision_cu_seqlens(image_grid_thw)
 
+        vision_patch_valid = np.zeros(pixel_values.shape[0], dtype=np.int32)
+        vision_patch_valid[:real_patch_rows] = 1
+
         result["pixel_values"] = pixel_values.astype(self._pixel_values_dtype, copy=False)
         result["image_grid_thw"] = image_grid_thw
         result["vision_cu_seqlens"] = vision_cu_seqlens
+        result["vision_patch_valid"] = vision_patch_valid
 
         return result

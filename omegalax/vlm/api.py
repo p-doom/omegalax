@@ -143,6 +143,7 @@ def forward(
     image_grid_thw: jax.Array | None = None,
     vision_cu_seqlens: jax.Array | None = None,
     position_ids_ZBT: jax.Array | None = None,
+    vision_patch_valid: jax.Array | None = None,
 ):
     """Forward pass returning hidden states before lm_head, plus aux loss."""
     if attention_mask_BT is None:
@@ -159,6 +160,7 @@ def forward(
             image_grid_thw=image_grid_thw,
             vision_cu_seqlens=vision_cu_seqlens,
             position_ids_ZBT=position_ids_ZBT,
+            vision_patch_valid=vision_patch_valid,
         )
 
     if isinstance(model, Qwen3VL):
@@ -169,6 +171,7 @@ def forward(
             pixel_values=pixel_values,
             image_grid_thw=image_grid_thw,
             vision_cu_seqlens=vision_cu_seqlens,
+            vision_patch_valid=vision_patch_valid,
         )
 
     raise ValueError(f"Unsupported VLM model type: {type(model)}")

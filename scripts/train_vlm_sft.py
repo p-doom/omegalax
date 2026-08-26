@@ -173,6 +173,12 @@ flags.DEFINE_integer(
     "Number of tiles for chunked cross-entropy along the "
     "sequence axis. Must evenly divide (max_length - 1).",
 )
+flags.DEFINE_boolean(
+    "log_per_sample_loss",
+    False,
+    "Log train/loss_bidx_<i> for every global batch index. Diagnostic for "
+    "batch-index-dependent bugs such as a mis-ordered vision embedding splice.",
+)
 
 _ATTN_BACKENDS = [
     "mosaic_tpu",
@@ -447,6 +453,7 @@ def main(_) -> None:
         lora_extra_target_modules=tuple(FLAGS.lora_extra_target_modules or ()),
         freeze_vision_tower=FLAGS.freeze_vision_tower,
         num_loss_tiles=FLAGS.num_loss_tiles,
+        log_per_sample_loss=FLAGS.log_per_sample_loss,
     )
     resume_mode = ResumeMode(FLAGS.resume)
     save_dir = Path(FLAGS.save_dir)

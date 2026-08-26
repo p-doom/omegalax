@@ -8,6 +8,7 @@ from flax import nnx
 from jax.sharding import PartitionSpec, reshard
 
 from omegalax.models.shard_config import ShardConfig
+from omegalax.models.vision_splice import image_embed_destinations, merged_embed_valid
 from .attention import Attention
 from .config import Qwen3_5Config, Qwen3_5TextConfig
 from .deltanet import GatedDeltaNet
@@ -376,6 +377,7 @@ class Qwen3_5ForConditionalGeneration(nnx.Module):
         image_grid_thw: jax.Array | None = None,
         vision_cu_seqlens: jax.Array | None = None,
         position_ids_ZBT: jax.Array | None = None,
+        vision_patch_valid: jax.Array | None = None,
     ):
         del cache, num_right_pads
         embedding_VD = jnp.astype(self.text.embedder.embedding[...], self.text.embedder.dtype)
@@ -388,12 +390,10 @@ class Qwen3_5ForConditionalGeneration(nnx.Module):
             image_embeds_ND = self.vision(pixel_values, image_grid_thw, vision_cu_seqlens)
             image_mask_BT = token_ids_BT == self.cfg.image_token_id
             n_embeds = image_embeds_ND.shape[0]  # static after padding
-            seq_len = token_ids_BT.shape[1]
-            image_mask_replicated = reshard(image_mask_BT, P())
-            batch_indices, seq_indices = jnp.where(
-                image_mask_replicated,
-                size=n_embeds,
-                fill_value=(0, seq_len),
+            batch_indices, seq_indices = image_embed_destinations(
+                image_mask_BT,
+                n_embeds,
+                merged_embed_valid(vision_patch_valid, n_embeds),
             )
             image_embeds_replicated = reshard(image_embeds_ND, P())
             inputs_embeds_BTD = inputs_embeds_BTD.at[batch_indices, seq_indices].set(

@@ -644,6 +644,11 @@ def maybe_log_step_metrics(
 
     if is_primary_process:
         lr = host_metrics.get("lr", 0.0)
+        per_index_keys = sorted(
+            (k for k in host_metrics if k.startswith("loss_bidx_")),
+            key=lambda k: int(k.rsplit("_", 1)[1]),
+        )
+        per_index = "".join(f"train/{k}={host_metrics[k]:.4f} " for k in per_index_keys)
         print(
             f"time={datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} "
             f"step={step_to_log} "
@@ -659,7 +664,8 @@ def maybe_log_step_metrics(
             f"train/hardware_tflops_per_device={host_metrics.get('hardware_tflops_per_device', 0.0):.2f} "
             f"train/mfu={host_metrics.get('mfu', 0.0) * 100:.1f}% "
             f"train/hfu={host_metrics.get('hfu', 0.0) * 100:.1f}% "
-            f"train/tok/s/dev={host_metrics.get('tokens_per_sec_per_device', 0.0):.0f} ",
+            f"train/tok/s/dev={host_metrics.get('tokens_per_sec_per_device', 0.0):.0f} "
+            f"{per_index}",
             flush=True,
         )
 

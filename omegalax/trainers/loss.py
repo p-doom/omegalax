@@ -19,8 +19,13 @@ def _cross_entropy_with_logits(
     logits_NV: jax.Array,
     targets_N: jax.Array,
     mask_N: jax.Array,
-) -> tuple[jax.Array, jax.Array]:
-    """Numerically stable cross-entropy for a chunk. Returns (masked_loss_sum, mask_sum)."""
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Numerically stable cross-entropy for a chunk.
+
+    Returns ``(masked_loss_sum, mask_sum, per_row_loss_sum, per_row_mask_sum)``;
+    the per-row pair reduces only the sequence axis, leaving the leading batch
+    axis intact for the per-sample-loss diagnostic.
+    """
     logits_NV = logits_NV.astype(jnp.float32)
     # Use one-hot + dot to extract target logits. This avoids take_along_axis
     # which fails on TP-sharded vocab, and avoids reshard which breaks VJP
@@ -32,7 +37,13 @@ def _cross_entropy_with_logits(
     logsumexp_N = max_logits_N + jnp.log(jnp.sum(jnp.exp(stable_logits_NV), axis=-1))
     nll_N = logsumexp_N - target_logits_N
     mask_f = mask_N.astype(jnp.float32)
-    return jnp.sum(nll_N * mask_f), jnp.sum(mask_f)
+    weighted_N = nll_N * mask_f
+    return (
+        jnp.sum(weighted_N),
+        jnp.sum(mask_f),
+        jnp.sum(weighted_N, axis=-1),
+        jnp.sum(mask_f, axis=-1),
+    )
 
 
 def chunked_cross_entropy_loss(
@@ -42,7 +53,8 @@ def chunked_cross_entropy_loss(
     mask_BT: jax.Array,
     num_tiles: int = 8,
     logits_out_sharding: P | None = None,
-) -> jax.Array:
+    return_per_sample: bool = False,
+) -> jax.Array | tuple[jax.Array, jax.Array]:
     """Memory-efficient cross-entropy that never materializes the full logit tensor.
 
     Tiles over the batch-sequence axis. Each tile computes ``hidden_chunk @ lm_head_kernel``
@@ -56,9 +68,16 @@ def chunked_cross_entropy_loss(
         mask_BT: Loss mask, shape ``(B, T)``, int32/float32.
         num_tiles: Number of tiles to split B*T into. Higher = less memory.
             Must evenly divide ``B * T``.
+        return_per_sample: Also return a ``(B,)`` vector of per-batch-index mean
+            losses. Diagnostic only — it costs two extra ``(B,)`` reductions and
+            leaves the scalar loss computation untouched. The per-row sums leave
+            the tiling loop as stacked scan outputs rather than as carries: they
+            stay FSDP-sharded on B while the scalar accumulators are replicated,
+            and a scan carry has to round-trip its exact sharding.
 
     Returns:
-        Scalar masked mean cross-entropy loss.
+        Scalar masked mean cross-entropy loss, or ``(scalar, per_sample_B)``
+        when ``return_per_sample`` is set.
     """
     B, T, D = hidden_BTD.shape
 
@@ -73,8 +92,13 @@ def chunked_cross_entropy_loss(
         logits_BTV = jnp.einsum(
             "BTD,DV->BTV", hidden_BTD, lm_head_kernel_DV, out_sharding=logits_out_sharding
         )
-        loss_sum, mask_sum = _cross_entropy_with_logits(logits_BTV, targets_BT, mask_BT)
-        return loss_sum / jnp.maximum(mask_sum, 1.0)
+        loss_sum, mask_sum, row_loss_B, row_mask_B = _cross_entropy_with_logits(
+            logits_BTV, targets_BT, mask_BT
+        )
+        loss = loss_sum / jnp.maximum(mask_sum, 1.0)
+        if return_per_sample:
+            return loss, row_loss_B / jnp.maximum(row_mask_B, 1.0)
+        return loss
 
     # Tile within each sequence (B stays intact, T gets chunked)
     chunk_size = -(-T1 // num_tiles)
@@ -99,13 +123,14 @@ def chunked_cross_entropy_loss(
     def _scan_body(acc, chunk_data):
         loss_acc, mask_acc = acc
         h_BSD, tgt_BS, msk_BS = chunk_data
-        chunk_loss, chunk_mask = _remat_chunk(h_BSD, tgt_BS, msk_BS)
-        return (loss_acc + chunk_loss, mask_acc + chunk_mask), None
+        chunk_loss, chunk_mask, chunk_row_loss, chunk_row_mask = _remat_chunk(h_BSD, tgt_BS, msk_BS)
+        per_row = (chunk_row_loss, chunk_row_mask) if return_per_sample else None
+        return (loss_acc + chunk_loss, mask_acc + chunk_mask), per_row
 
     # Scan over chunks (axis 1), keeping B (axis 0, possibly FSDP-sharded) intact.
     # jax.remat on the body ensures logits are recomputed during backward instead
     # of stored for all tiles (which would require O(num_tiles * B * chunk * V)).
-    (total_loss, total_mask), _ = jax.lax.scan(
+    (total_loss, total_mask), per_row_CB = jax.lax.scan(
         _scan_body,
         (jnp.array(0.0, dtype=jnp.float32), jnp.array(0.0, dtype=jnp.float32)),
         (
@@ -115,4 +140,9 @@ def chunked_cross_entropy_loss(
         ),
         unroll=1,
     )
-    return total_loss / jnp.maximum(total_mask, 1.0)
+    loss = total_loss / jnp.maximum(total_mask, 1.0)
+    if return_per_sample:
+        row_loss_B = jnp.sum(per_row_CB[0], axis=0)
+        row_mask_B = jnp.sum(per_row_CB[1], axis=0)
+        return loss, row_loss_B / jnp.maximum(row_mask_B, 1.0)
+    return loss

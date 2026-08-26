@@ -13,7 +13,8 @@ from pathlib import Path
 from flax import nnx
 import jax
 import jax.numpy as jnp
-from jax.sharding import NamedSharding, PartitionSpec
+import numpy as np
+from jax.sharding import NamedSharding, PartitionSpec, reshard
 import optax
 import orbax.checkpoint as ocp
 from orbax.checkpoint import checkpoint_managers as ocm
@@ -83,6 +84,7 @@ class TrainConfig:
     lora_extra_target_modules: tuple[str, ...] = ()
     freeze_vision_tower: bool = False
     num_loss_tiles: int = 4
+    log_per_sample_loss: bool = False
 
 
 def init_model(
@@ -239,17 +241,30 @@ def _restore_sft_checkpoint(
     )
 
 
-def make_sft_train_step(cfg, pad_id: int = 0, *, wrt=nnx.Param, num_loss_tiles: int = 4):
+def make_sft_train_step(
+    cfg,
+    pad_id: int = 0,
+    *,
+    wrt=nnx.Param,
+    num_loss_tiles: int = 4,
+    log_per_sample_loss: bool = False,
+):
     """Build a JIT-compiled VLM SFT train step that consumes a batch dict.
 
     The batch dict must contain ``token_ids_BT``, ``attention_mask_BT``, and
-    ``loss_mask_BT``.  It may also contain ``pixel_values`` and
-    ``image_grid_thw`` for multimodal batches.
+    ``loss_mask_BT``.  It may also contain ``pixel_values``, ``image_grid_thw``,
+    ``vision_cu_seqlens`` and ``vision_patch_valid`` for multimodal batches.
 
     ``wrt`` selects which model variables receive gradients. Defaults to
     ``nnx.Param`` (full FT). Pass ``LoRAParam`` for adapter-only training
     — every other ``nnx.Param`` then sees zero gradient and contributes
     no optimizer state.
+
+    ``log_per_sample_loss`` adds a ``per_sample_loss`` ``(B,)`` metric. A batch
+    index whose loss sits far below the others is the signature of a vision
+    splice that only routes sample 0's embeddings correctly. It is returned
+    replicated: the loss vector is sharded on the batch axis, and under
+    ``process_count>1`` every process must be able to read the whole thing.
     """
 
     diff_state = nnx.DiffState(0, wrt)
@@ -262,6 +277,7 @@ def make_sft_train_step(cfg, pad_id: int = 0, *, wrt=nnx.Param, num_loss_tiles: 
         pixel_values = batch.get("pixel_values")
         image_grid_thw = batch.get("image_grid_thw")
         vision_cu_seqlens = batch.get("vision_cu_seqlens")
+        vision_patch_valid = batch.get("vision_patch_valid")
         position_ids_ZBT = batch.get("position_ids_ZBT")
 
         def loss_fn(model):
@@ -275,24 +291,28 @@ def make_sft_train_step(cfg, pad_id: int = 0, *, wrt=nnx.Param, num_loss_tiles: 
                 image_grid_thw=image_grid_thw,
                 vision_cu_seqlens=vision_cu_seqlens,
                 position_ids_ZBT=position_ids_ZBT,
+                vision_patch_valid=vision_patch_valid,
             )
             lm_weight = model.output_weight()
-            loss = (
-                chunked_cross_entropy_loss(
-                    hidden_BTD,
-                    lm_weight,
-                    token_ids_BT,
-                    loss_mask_BT,
-                    num_tiles=num_loss_tiles,
-                    logits_out_sharding=cfg.shd_cfg.logits_btv,
-                )
-                + aux_loss
+            ce = chunked_cross_entropy_loss(
+                hidden_BTD,
+                lm_weight,
+                token_ids_BT,
+                loss_mask_BT,
+                num_tiles=num_loss_tiles,
+                logits_out_sharding=cfg.shd_cfg.logits_btv,
+                return_per_sample=log_per_sample_loss,
             )
+            if log_per_sample_loss:
+                ce, per_sample_B = ce
+            else:
+                per_sample_B = None
+            loss = ce + aux_loss
             supervised_tokens = jnp.sum(loss_mask_BT[:, 1:].astype(jnp.float32))
             total_tokens = jnp.sum(attention_mask_BT.astype(jnp.float32))
-            return loss, (supervised_tokens, total_tokens)
+            return loss, (supervised_tokens, total_tokens, per_sample_B)
 
-        (loss, (supervised_tokens, total_tokens)), grads = nnx.value_and_grad(
+        (loss, (supervised_tokens, total_tokens, per_sample_B)), grads = nnx.value_and_grad(
             loss_fn,
             argnums=diff_state,
             has_aux=True,
@@ -304,6 +324,8 @@ def make_sft_train_step(cfg, pad_id: int = 0, *, wrt=nnx.Param, num_loss_tiles: 
             "supervised_tokens": supervised_tokens,
             "total_tokens": total_tokens,
         }
+        if per_sample_B is not None:
+            metrics["per_sample_loss"] = reshard(per_sample_B, P())
         return loss, metrics
 
     return sft_train_step
@@ -320,6 +342,7 @@ def make_sft_eval_step(cfg, pad_id: int = 0, *, num_loss_tiles: int = 4):
         pixel_values = batch.get("pixel_values")
         image_grid_thw = batch.get("image_grid_thw")
         vision_cu_seqlens = batch.get("vision_cu_seqlens")
+        vision_patch_valid = batch.get("vision_patch_valid")
         position_ids_ZBT = batch.get("position_ids_ZBT")
 
         hidden_BTD, aux_loss = vlm_api.forward(
@@ -332,6 +355,7 @@ def make_sft_eval_step(cfg, pad_id: int = 0, *, num_loss_tiles: int = 4):
             image_grid_thw=image_grid_thw,
             vision_cu_seqlens=vision_cu_seqlens,
             position_ids_ZBT=position_ids_ZBT,
+            vision_patch_valid=vision_patch_valid,
         )
         lm_weight = model.output_weight()
         loss = (
@@ -546,6 +570,7 @@ def run_sft(
         pad_id=pad_id,
         wrt=wrt_filter,
         num_loss_tiles=train_cfg.num_loss_tiles,
+        log_per_sample_loss=train_cfg.log_per_sample_loss,
     )
     eval_step = (
         make_sft_eval_step(model_cfg, pad_id=pad_id, num_loss_tiles=train_cfg.num_loss_tiles)
@@ -648,6 +673,7 @@ def run_sft(
         accum_grad_norm = 0.0
         accum_model_flops = 0.0
         accum_hardware_flops = 0.0
+        accum_per_sample_loss = None
         accum_time = datetime.timedelta(0)
         source_counts: dict[int, int] = {}
 
@@ -681,6 +707,12 @@ def run_sft(
             accum_sup_tokens = accum_sup_tokens + metrics["supervised_tokens"]
             accum_total_tokens = accum_total_tokens + metrics["total_tokens"]
             accum_grad_norm = accum_grad_norm + metrics["grad_norm"]
+            if "per_sample_loss" in metrics:
+                accum_per_sample_loss = (
+                    metrics["per_sample_loss"]
+                    if accum_per_sample_loss is None
+                    else accum_per_sample_loss + metrics["per_sample_loss"]
+                )
             accum_model_flops += micro_flops.model
             accum_hardware_flops += micro_flops.hardware
             accum_time += micro_delta
@@ -709,6 +741,9 @@ def run_sft(
                 total = float(sum(source_counts.values()))
                 for sid, cnt in source_counts.items():
                     window_metrics[f"data_source_{sid}_frac"] = cnt / total
+            if accum_per_sample_loss is not None:
+                for bidx, value in enumerate(np.asarray(jax.device_get(accum_per_sample_loss))):
+                    window_metrics[f"loss_bidx_{bidx}"] = float(value) / accum_steps
             _log_prev_metrics()
 
             prev_metrics = (
