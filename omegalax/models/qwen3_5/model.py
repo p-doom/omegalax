@@ -8,6 +8,7 @@ from flax import nnx
 from jax.sharding import PartitionSpec, reshard
 
 from omegalax.models.shard_config import ShardConfig
+from omegalax.models.vision_splice import vision_scatter_index
 from .attention import Attention
 from .config import Qwen3_5Config, Qwen3_5TextConfig
 from .deltanet import GatedDeltaNet
@@ -384,21 +385,10 @@ class Qwen3_5ForConditionalGeneration(nnx.Module):
             image_mask_BTD = jnp.broadcast_to(image_mask_BT[:, :, None], inputs_embeds_BTD.shape)
             inputs_embeds_BTD = jnp.where(image_mask_BTD, 0.0, inputs_embeds_BTD)
             n_embeds = image_embeds_ND.shape[0]  # static after padding
-            seq_len = token_ids_BT.shape[1]
-            batch_indices, seq_indices = jnp.where(
-                image_mask_BT,
-                size=n_embeds,
-                fill_value=(0, seq_len - 1),
-            )
-            num_real = jnp.sum(image_mask_BT)
-            valid = jnp.arange(n_embeds) < num_real
-            safe_embeds = jnp.where(
-                valid[:, None],
-                image_embeds_ND,
-                0.0,
-            ).astype(inputs_embeds_BTD.dtype)
+            batch_indices, seq_indices = vision_scatter_index(image_mask_BT, n_embeds)
             inputs_embeds_BTD = inputs_embeds_BTD.at[batch_indices, seq_indices].set(
-                safe_embeds,
+                image_embeds_ND.astype(inputs_embeds_BTD.dtype),
+                mode="drop",
                 out_sharding=self.text.out_emb_shd,
             )
 

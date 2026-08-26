@@ -824,16 +824,36 @@ class VLMSFTCollatorTest(_LegacyMaskMixin, absltest.TestCase):
         self.assertIn("position_ids_ZBT", batch)
 
         # Sample 0 has no <|image_pad|> tokens, sample 1 has exactly the count
-        # implied by image_grid_thw — the alignment that lets the row-major
-        # image-token scatter in the model forward put the right embedding
-        # into the right position in a heterogeneous batch.
+        # implied by its real grid row — the alignment that lets the model's
+        # scatter put the right embedding into the right position.
         image_pad_id = self.tokenizer.convert_tokens_to_ids("<|image_pad|>")
         n_pad_sample_0 = int(np.sum(batch["token_ids_BT"][0] == image_pad_id))
         n_pad_sample_1 = int(np.sum(batch["token_ids_BT"][1] == image_pad_id))
         self.assertEqual(n_pad_sample_0, 0)
-        self.assertEqual(batch["image_grid_thw"].shape, (1, 3))
-        grid = batch["image_grid_thw"][0]
-        expected_pads = int(grid[0]) * (int(grid[1]) // 2) * (int(grid[2]) // 2)
+
+        # The text-only sample still owns an equally sized block of pixel_values:
+        # the model maps embedding block b to batch row b, so the blocks have to
+        # be uniform even when a row contributes no real image. Its block is all
+        # dummy patches, which the scatter drops.
+        n_samples = 2
+        self.assertEqual(batch["pixel_values"].shape[0] % n_samples, 0)
+        self.assertEqual(batch["image_grid_thw"].shape[0] % n_samples, 0)
+        patches_per_sample = batch["pixel_values"].shape[0] // n_samples
+        images_per_sample = batch["image_grid_thw"].shape[0] // n_samples
+        for sample in range(n_samples):
+            block = batch["image_grid_thw"][
+                sample * images_per_sample : (sample + 1) * images_per_sample
+            ]
+            self.assertEqual(
+                int(np.sum(np.prod(block.astype(np.int64), axis=1))),
+                patches_per_sample,
+                f"sample {sample}'s grid rows must account for exactly its patch block",
+            )
+
+        # Sample 1's real image is the first row of its own block, and its token
+        # count matches the <|image_pad|> run in that row.
+        real_grid = batch["image_grid_thw"][images_per_sample]
+        expected_pads = int(real_grid[0]) * (int(real_grid[1]) // 2) * (int(real_grid[2]) // 2)
         self.assertEqual(n_pad_sample_1, expected_pads)
 
 

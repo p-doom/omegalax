@@ -11,6 +11,7 @@ from flax import nnx
 from jax.sharding import PartitionSpec, reshard
 from tokamax import dot_product_attention
 
+from omegalax.models.vision_splice import vision_scatter_index
 from .config import Qwen3VLConfig
 from .vision import VisionModel
 
@@ -490,7 +491,7 @@ class Qwen3VL(nnx.Module):
 
         image_features_ND = None
         deepstack_features = None
-        visual_pos_mask_BT = None
+        vision_scatter_idx = None
         if pixel_values is not None and image_grid_thw is not None:
             if vision_cu_seqlens is None:
                 raise ValueError(
@@ -506,15 +507,10 @@ class Qwen3VL(nnx.Module):
 
         if image_features_ND is not None:
             image_mask_BT = token_ids_BT == cfg.image_token_id
-            visual_pos_mask_BT = image_mask_BT
             n_features = image_features_ND.shape[0]  # static after padding
-            seq_len = token_ids_BT.shape[1]
             image_mask_replicated = reshard(image_mask_BT, P())
-            batch_idx, seq_idx = jnp.where(
-                image_mask_replicated,
-                size=n_features,
-                fill_value=(0, seq_len),
-            )
+            vision_scatter_idx = vision_scatter_index(image_mask_replicated, n_features)
+            batch_idx, seq_idx = vision_scatter_idx
             image_features_replicated = reshard(image_features_ND, P())
             inputs_embeds_BTD = inputs_embeds_BTD.at[batch_idx, seq_idx].set(
                 image_features_replicated.astype(inputs_embeds_BTD.dtype),
@@ -549,10 +545,14 @@ class Qwen3VL(nnx.Module):
         for layer_idx, layer in enumerate(self.text.layers):
             hidden_BTD, aux_loss = layer(hidden_BTD, sin_BTK, cos_BTK)
             aux_losses.append(aux_loss)
-            if deepstack_features is not None and layer_idx < len(deepstack_features):
+            if (
+                deepstack_features is not None
+                and vision_scatter_idx is not None
+                and layer_idx < len(deepstack_features)
+            ):
                 hidden_BTD = _deepstack_process(
                     hidden_BTD,
-                    visual_pos_mask_BT,
+                    vision_scatter_idx,
                     deepstack_features[layer_idx],
                     out_sharding=self.text.out_emb_shd,
                 )
@@ -566,20 +566,18 @@ class Qwen3VL(nnx.Module):
 
 def _deepstack_process(
     hidden_BTD: jax.Array,
-    visual_pos_mask_BT: jax.Array,
+    scatter_idx: tuple[jax.Array, jax.Array],
     visual_embeds_ND: jax.Array,
     out_sharding: P | None = None,
 ) -> jax.Array:
-    """Add visual embeddings to hidden states at visual token positions."""
-    n_embeds = visual_embeds_ND.shape[0]
-    seq_len = hidden_BTD.shape[1]
-    mask_replicated = reshard(visual_pos_mask_BT, P())
+    """Add visual embeddings to hidden states at visual token positions.
+
+    Takes the scatter index built for the input splice rather than rebuilding it:
+    the deepstack features share ``pixel_values``' per-sample block layout, so the
+    same row-to-token mapping applies.
+    """
+    batch_idx, seq_idx = scatter_idx
     embeds_replicated = reshard(visual_embeds_ND, P())
-    batch_idx, seq_idx = jnp.where(
-        mask_replicated,
-        size=n_embeds,
-        fill_value=(0, seq_len),
-    )
     return hidden_BTD.at[batch_idx, seq_idx].add(
         embeds_replicated.astype(hidden_BTD.dtype),
         mode="drop",

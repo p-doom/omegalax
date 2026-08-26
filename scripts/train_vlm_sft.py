@@ -354,14 +354,15 @@ def main(_) -> None:
     if FLAGS.max_vision_patches_per_sample:
         merge_size = int(image_processor.merge_size)
         ms2 = merge_size * merge_size
-        max_patches = FLAGS.max_vision_patches_per_sample * FLAGS.batch_size
-        if max_patches % ms2 != 0:
+        # The budget is enforced per sample, not per batch: every batch row owns
+        # an equally sized block of pixel_values, which is what lets the model
+        # pair each image token with its own embedding.
+        if FLAGS.max_vision_patches_per_sample % ms2 != 0:
             raise ValueError(
-                f"max_vision_patches_per_sample * batch_size = "
-                f"{FLAGS.max_vision_patches_per_sample} * {FLAGS.batch_size} "
-                f"= {max_patches} must be divisible by merge_size**2={ms2} "
-                f"(remainder {max_patches % ms2}). Adjust the flags so their "
-                f"product is a multiple of {ms2}."
+                f"max_vision_patches_per_sample={FLAGS.max_vision_patches_per_sample} "
+                f"must be divisible by merge_size**2={ms2} (remainder "
+                f"{FLAGS.max_vision_patches_per_sample % ms2}); each sample is "
+                f"padded to exactly that many patches."
             )
 
     collator = VLMSFTCollator(

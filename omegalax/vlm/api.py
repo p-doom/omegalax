@@ -6,6 +6,7 @@ import dataclasses
 
 import jax
 import jax.numpy as jnp
+from etils import epath
 from flax import nnx
 from jax.sharding import Mesh, PartitionSpec
 
@@ -181,13 +182,23 @@ def load_pretrained(
     fsdp_size: int | None = None,
     dp_size: int | None = None,
 ) -> tuple[nnx.Module, VLMConfig]:
-    """Load a pretrained VLM from HuggingFace safetensors."""
+    """Load a pretrained VLM from HuggingFace safetensors.
+
+    `model_id` is either a HuggingFace repo id, resolved through the hub cache, or a
+    path to a local HF-format directory (config.json + *.safetensors) — e.g. a
+    `scripts/export_to_hf.py` export of an earlier run, which is how a run warm-starts
+    from trained weights instead of the upstream base checkpoint. `snapshot_download`
+    validates its argument as a repo id before touching the filesystem and so rejects
+    any path outright, hence the explicit directory branch. `resolve_config` below
+    already accepts either form.
+    """
     from huggingface_hub import snapshot_download
 
     from omegalax.models.qwen3_5 import create_qwen3_5_from_safetensors
     from omegalax.models.qwen3_vl import create_qwen3_vl_from_safetensors
 
-    local_dir = snapshot_download(model_id)
+    local_path = epath.Path(model_id).expanduser()
+    local_dir = str(local_path) if local_path.is_dir() else snapshot_download(model_id)
     cfg = resolve_config(model_id)
     # Validates any active mesh matches the requested (tp, fsdp, dp); the loaders
     # below build their own mesh from these sizes, so the return value is unused.

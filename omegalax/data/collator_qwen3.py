@@ -85,7 +85,7 @@ def _pad_vision_arrays(
     max_patches: int,
     max_images: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Pad vision arrays to exact ``(max_patches, max_images)`` target.
+    """Pad one sample's vision arrays to the exact ``(max_patches, max_images)`` target.
 
     Fills the ``num_dummies`` padding image slots with ``(1, ms, ms*k_i)`` rows
     whose patch counts ``ms2*k_i`` are spread as evenly as possible so the total
@@ -107,7 +107,7 @@ def _pad_vision_arrays(
 
     if num_dummies < 0 or extra_patches < 0:
         raise ValueError(
-            f"Batch exceeds padding budget: real_images={real_images} > "
+            f"Sample exceeds padding budget: real_images={real_images} > "
             f"max_images={max_images} or real_patches={real_patches} > "
             f"max_patches={max_patches}. Increase the per-sample limits."
         )
@@ -117,11 +117,13 @@ def _pad_vision_arrays(
 
     if num_dummies == 0 or extra_patches < num_dummies * ms2:
         raise ValueError(
-            f"Vision budgets are infeasible for this batch: real_images="
+            f"Vision budgets are infeasible for this sample: real_images="
             f"{real_images}, real_patches={real_patches}, max_images="
             f"{max_images}, max_patches={max_patches}, ms2={ms2}. Padding "
             f"needs num_dummies>=1 and extra_patches>=num_dummies*ms2 (each "
-            f"dummy row costs at least ms2 patches). Increase "
+            f"dummy row costs at least ms2 patches; a sample already holding "
+            f"max_images real images therefore has nowhere to put its padding). "
+            f"Increase "
             f"max_vision_images_per_sample or max_vision_patches_per_sample "
             f"so this invariant holds for every batch."
         )
@@ -218,6 +220,36 @@ class VLMSFTCollator:
             * image_processor.patch_size
         )
 
+    def _per_sample_vision_budget(
+        self,
+        all_pixel_values: list[np.ndarray],
+        all_grid_thw: list[np.ndarray],
+        merge_size: int,
+    ) -> tuple[int, int]:
+        """Return the ``(max_patches, max_images)`` every sample is padded up to.
+
+        The configured limits are already per sample, so they pass straight
+        through. Without them (no static shapes requested, so JIT recompiles per
+        batch anyway) the budget is derived from the batch: if the samples are
+        already uniform there is nothing to pad, otherwise every sample needs at
+        least one dummy image slot to carry its padding patches, hence the
+        ``+1`` image and the ``max_images * ms2`` patch headroom that keeps
+        ``_pad_vision_arrays``' feasibility invariant true for every sample.
+        """
+        if (
+            self._max_vision_patches_per_sample is not None
+            and self._max_vision_images_per_sample is not None
+        ):
+            return self._max_vision_patches_per_sample, self._max_vision_images_per_sample
+
+        patches = [int(pv.shape[0]) for pv in all_pixel_values]
+        images = [int(grid.shape[0]) for grid in all_grid_thw]
+        if len(set(patches)) == 1 and len(set(images)) == 1:
+            return patches[0], images[0]
+
+        max_images = max(images) + 1
+        return max(patches) + max_images * merge_size * merge_size, max_images
+
     def __call__(self, examples: Sequence[dict[str, Any]]) -> dict[str, np.ndarray]:
         from omegalax.models.qwen3_vl.model import get_rope_index
 
@@ -242,9 +274,14 @@ class VLMSFTCollator:
                     "rebuild the chunk index for this profile."
                 )
 
+            # One entry per sample, empty for text-only ones: the model maps
+            # embedding block ``b`` to batch row ``b``, so every row owns a block.
             if "pixel_values" in encoded:
                 all_pixel_values.append(encoded["pixel_values"])
                 all_grid_thw.append(encoded["image_grid_thw"])
+            else:
+                all_pixel_values.append(np.zeros((0, self._patch_feat_dim), dtype=np.float32))
+                all_grid_thw.append(np.zeros((0, 3), dtype=np.int32))
 
             seq_len = len(full_ids)
             pad_len = self.max_length - seq_len
@@ -293,23 +330,33 @@ class VLMSFTCollator:
         )
         result["position_ids_ZBT"] = position_ids.astype(np.int32)
 
-        # Pad vision arrays to static shapes so JAX JIT never recompiles.
-        # Per-sample limits are multiplied by batch size so the user
-        # doesn't need to recompute when changing batch_size.
-        if (
-            self._max_vision_patches_per_sample is not None
-            and self._max_vision_images_per_sample is not None
-        ):
-            bs = len(examples)
-            pixel_values, image_grid_thw, vision_cu_seqlens = _pad_vision_arrays(
-                pixel_values,
-                image_grid_thw,
-                merge_size=self.image_processor.merge_size,
-                max_patches=self._max_vision_patches_per_sample * bs,
-                max_images=self._max_vision_images_per_sample * bs,
+        # Pad vision arrays to static shapes so JAX JIT never recompiles -- and pad
+        # them PER SAMPLE, so every batch row owns an equally sized block of
+        # ``pixel_values``. The model relies on that stride to pair each image
+        # token with its own embedding. Padding the batch as a whole instead
+        # leaves the dummy rows at the end of the block, which is invisible in a
+        # single-process run but corrupts every sample after the first once
+        # ``make_array_from_process_local_data`` concatenates the per-process
+        # blocks and the padding ends up *between* samples.
+        if pixel_values.shape[0] or image_grid_thw.shape[0]:
+            merge_size = int(self.image_processor.merge_size)
+            max_patches, max_images = self._per_sample_vision_budget(
+                all_pixel_values, all_grid_thw, merge_size
             )
-        else:
-            vision_cu_seqlens = _compute_vision_cu_seqlens(image_grid_thw)
+            padded_pv, padded_grid = [], []
+            for sample_pv, sample_grid in zip(all_pixel_values, all_grid_thw):
+                pv, grid, _ = _pad_vision_arrays(
+                    sample_pv,
+                    sample_grid,
+                    merge_size=merge_size,
+                    max_patches=max_patches,
+                    max_images=max_images,
+                )
+                padded_pv.append(pv)
+                padded_grid.append(grid)
+            pixel_values = np.concatenate(padded_pv, axis=0)
+            image_grid_thw = np.concatenate(padded_grid, axis=0)
+        vision_cu_seqlens = _compute_vision_cu_seqlens(image_grid_thw)
 
         result["pixel_values"] = pixel_values.astype(self._pixel_values_dtype, copy=False)
         result["image_grid_thw"] = image_grid_thw
