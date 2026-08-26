@@ -18,17 +18,10 @@ import numpy as np
 from array_record.python.array_record_module import ArrayRecordWriter
 from tqdm import tqdm
 
-from omegalax.data.artifact_contract import (
-    file_identity,
-    validate_measurement_contract,
-)
-
 COMPILED_METADATA_FILENAME = "metadata.json"
 TOKEN_STATS_FILENAME = "token_stats.json"
 TRUNCATION_STATS_FILENAME = "truncation_stats.json"
 SEQUENCE_LENGTHS_FILENAME = "sequence_lengths.jsonl"
-MESSAGE_LENGTHS_FILENAME = "message_lengths.jsonl"
-ARRAY_RECORD_SUFFIX = ".array_record"
 
 SOURCE_ID_KEY = "_omegalax_source_id"
 BATCH_SOURCE_IDS_KEY = "source_ids"
@@ -130,9 +123,7 @@ def _write_arrayrecord_dataset(
     final_metadata = dict(metadata)
     final_metadata.update(
         {
-            "complete": False,
             "num_records": total_records,
-            "num_shards": len(shard_paths),
             "shard_paths": shard_paths,
         }
     )
@@ -163,51 +154,12 @@ def load_compiled_metadata(path: str | Path) -> dict[str, Any]:
     metadata = json.loads(metadata_path.read_text())
     if not isinstance(metadata, dict):
         raise TypeError("Compiled Grain dataset metadata must be an object")
-    required = {
-        "complete",
-        "inline_records",
-        "max_length",
-        "measurement_contract",
-        "num_records",
-        "num_shards",
-        "overflow_mode",
-        "profile_metadata",
-        "shard_paths",
-        "source_chat",
-        "source_chat_path",
-        "split",
-        "val_fraction",
-    }
-    if set(metadata) != required:
-        raise ValueError(f"Compiled Grain dataset metadata is invalid: {metadata_path}")
-    if metadata["complete"] is not True:
-        raise ValueError(f"Compiled Grain dataset is incomplete: {metadata_path}")
     shard_paths = metadata.get("shard_paths")
-    if (
-        metadata["inline_records"] is not True
-        or not isinstance(shard_paths, list)
-        or not shard_paths
-        or not all(
-            isinstance(item, str) and Path(item).name == item and item.endswith(ARRAY_RECORD_SUFFIX)
-            for item in shard_paths
-        )
-        or shard_paths != sorted(set(shard_paths))
-        or metadata.get("num_shards") != len(shard_paths)
-        or not isinstance(metadata.get("num_records"), int)
-        or metadata["num_records"] <= 0
+    if not isinstance(shard_paths, list) or not shard_paths or not all(
+        isinstance(item, str) for item in shard_paths
     ):
-        raise ValueError(f"Compiled Grain dataset metadata is invalid: {metadata_path}")
-    validate_measurement_contract(metadata.get("measurement_contract"))
+        raise ValueError(f"Compiled Grain dataset has no shard paths: {metadata_path}")
     return metadata
-
-
-def _mark_compiled_dataset_complete(out_dir: Path) -> None:
-    metadata_path = out_dir / COMPILED_METADATA_FILENAME
-    metadata = json.loads(metadata_path.read_text())
-    if metadata.get("complete") is not False:
-        raise ValueError(f"Compiled dataset completion state is invalid: {metadata_path}")
-    metadata["complete"] = True
-    metadata_path.write_text(json.dumps(metadata, indent=2) + "\n")
 
 
 def required_epochs_for_batches(
@@ -224,7 +176,9 @@ def required_epochs_for_batches(
         raise ValueError("batch_size must be > 0")
 
     metadata = load_compiled_metadata(path)
-    num_records = int(metadata["num_records"])
+    num_records = metadata.get("num_records")
+    if type(num_records) is not int or num_records <= 0:
+        raise ValueError(f"Compiled Grain dataset has invalid num_records: {num_records!r}")
     dp = dp_size * fsdp_size
     records_per_epoch = num_records // dp
     if records_per_epoch <= 0:
@@ -494,163 +448,6 @@ def _compute_message_lengths_from_chat(chat_path, measure_message, num_workers) 
         )
         results = dict(chain.from_iterable(batches))
     return results
-
-
-def _message_lengths_header(chat_path: str | Path, measurement_contract: dict) -> dict:
-    validate_measurement_contract(measurement_contract)
-    return {
-        "source_chat": file_identity(chat_path),
-        "measurement_contract": measurement_contract,
-    }
-
-
-def _write_chat_message_lengths(
-    path: str | Path,
-    results: dict,
-    chat_path: str | Path,
-    measurement_contract: dict,
-) -> None:
-    """Persist a source- and processor-bound message-length cache."""
-    path = Path(path).expanduser()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    header = _message_lengths_header(chat_path, measurement_contract)
-    with path.open("x") as file:
-        file.write(json.dumps({"header": header}, sort_keys=True) + "\n")
-        for (conv_idx, msg_offset), measurement in sorted(results.items()):
-            file.write(
-                json.dumps(
-                    {
-                        "conv_idx": conv_idx,
-                        "msg_offset": msg_offset,
-                        "measurement": measurement,
-                    },
-                    sort_keys=True,
-                )
-                + "\n"
-            )
-
-
-def _load_chat_message_lengths(path: str | Path) -> tuple[dict, dict]:
-    """Inverse of :func:`_write_chat_message_lengths`."""
-    results: dict[tuple[int, int], Any] = {}
-    with Path(path).expanduser().open() as f:
-        first_line = f.readline()
-        if not first_line:
-            raise ValueError("message-length cache is empty")
-        first_row = json.loads(first_line)
-        header = first_row.get("header") if isinstance(first_row, dict) else None
-        required_header = {"source_chat", "measurement_contract"}
-        if not isinstance(header, dict) or set(header) != required_header:
-            raise TypeError(
-                f"message-length cache header fields must be exactly {sorted(required_header)}"
-            )
-        validate_measurement_contract(header.get("measurement_contract"))
-        required_row = {"conv_idx", "measurement", "msg_offset"}
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            row = json.loads(line)
-            if not isinstance(row, dict) or set(row) != required_row:
-                raise TypeError(
-                    f"message-length cache row fields must be exactly {sorted(required_row)}"
-                )
-            key = (int(row["conv_idx"]), int(row["msg_offset"]))
-            if key in results:
-                raise ValueError(f"message-length cache contains duplicate key {key}")
-            results[key] = row["measurement"]
-    return header, results
-
-
-def _validate_chat_message_lengths(
-    chat_path,
-    header: dict,
-    results: dict,
-    measurement_contract: dict,
-) -> None:
-    """Fail loudly if a cached length map does not match chat_path exactly."""
-    validate_measurement_contract(measurement_contract)
-    if header["source_chat"] != file_identity(chat_path):
-        raise ValueError(
-            f"cached message lengths do not match source chat identity for {chat_path}"
-        )
-    if header["measurement_contract"] != measurement_contract:
-        raise ValueError("cached message lengths do not match the measurement contract")
-    expected = 0
-    missing: list[tuple[int, int]] = []
-    for conv_idx, _sid, _meta, messages in _iter_chat_conversations(chat_path):
-        for msg_offset, message in enumerate(messages):
-            expected += 1
-            if (conv_idx, msg_offset) not in results and len(missing) < 5:
-                missing.append((conv_idx, msg_offset))
-                continue
-            result = results[(conv_idx, msg_offset)]
-            if message.get("role") != "assistant" and (
-                result["terminal_length_delta"] != 0
-                or result["terminal_supervised_tokens_delta"] != 0
-            ):
-                raise ValueError("only assistant messages may have terminal measurement deltas")
-    if missing or len(results) != expected:
-        raise ValueError(
-            f"cached message lengths do not match chat dataset {chat_path}: chat has "
-            f"{expected} messages, cache has {len(results)} entries"
-            + (f"; first missing keys: {missing}" if missing else "")
-            + ". The cache is stale for this chat.jsonl -- delete it and re-measure."
-        )
-
-
-def _resolve_chat_message_lengths(
-    chat_path,
-    measure_message,
-    num_workers,
-    message_lengths_path,
-    measurement_contract,
-):
-    """Load-or-compute the per-message length map for the inline path.
-
-    Mirrors the payload path's cache semantics: cache present -> load + validate;
-    requested but absent -> compute then write; None -> compute in-memory.
-    """
-    if message_lengths_path is not None:
-        if not measurement_contract:
-            raise ValueError("message_lengths_path requires an explicit measurement_contract")
-        cache_path = Path(message_lengths_path).expanduser()
-        if cache_path.exists():
-            print(f"[records] loading cached message lengths from {cache_path}", flush=True)
-            header, results = _load_chat_message_lengths(cache_path)
-            _validate_chat_message_lengths(chat_path, header, results, measurement_contract)
-            return results
-
-    results = _compute_message_lengths_from_chat(chat_path, measure_message, num_workers)
-
-    if message_lengths_path is not None:
-        _write_chat_message_lengths(message_lengths_path, results, chat_path, measurement_contract)
-        print(f"[records] wrote message-length cache to {message_lengths_path}", flush=True)
-    return results
-
-
-def measure_message_lengths_from_chat(
-    chat_path: str | Path,
-    out_path: str | Path,
-    *,
-    measure_message,
-    measurement_contract: dict,
-    num_workers: int = 2,
-) -> Path:
-    """Tokenize every message in a chat.jsonl once and write the length cache.
-
-    Standalone entry point for the payload-free "measure" stage: produces the
-    ``message_lengths.jsonl`` that :func:`build_records_from_chat` consumes via
-    its ``message_lengths_path``, so re-binning at a different ``max_length`` /
-    ``overflow_mode`` never re-tokenizes. Reads chat.jsonl directly -- no
-    intermediate grain payload.
-    """
-    chat_path = Path(chat_path).expanduser().resolve()
-    out_path = Path(out_path).expanduser()
-    results = _compute_message_lengths_from_chat(chat_path, measure_message, num_workers)
-    _write_chat_message_lengths(out_path, results, chat_path, measurement_contract)
-    print(f"[measure] wrote {len(results)} message lengths to {out_path}", flush=True)
-    return out_path
 
 
 def _emit_sequence_lengths(out_dir: Path, *, sequence_stats: dict, effective_max: int) -> None:
@@ -1069,11 +866,7 @@ def _process_conversation(
 
 def recording_split(recording_id: Any, val_fraction: float) -> str:
     """Deterministic recording-level train/val split (whole recording -> one side,
-    so a recording never leaks across the split). No RNG/seed.
-
-    Mirrors the stage-04 builder's ``_split_of`` byte-for-byte so a split applied
-    here (records stage) matches one baked upstream. Lets the split move out of the
-    measure stage: the per-message length cache is split-agnostic and reused."""
+    so a recording never leaks across the split). No RNG/seed."""
     if val_fraction <= 0.0 or not recording_id:
         return "train"
     bucket = int(hashlib.sha1(str(recording_id).encode()).hexdigest(), 16) % 1000
@@ -1091,8 +884,6 @@ def build_records_from_chat(
     profile_metadata: dict[str, Any] | None = None,
     num_workers: int = 2,
     overflow_mode: str = "drop",
-    message_lengths_path: str | Path | None = None,
-    measurement_contract: dict[str, Any] | None = None,
     val_fraction: float = 0.0,
     split: str | None = None,
     split_key: str = "recording_id",
@@ -1108,21 +899,14 @@ def build_records_from_chat(
 
     The system prompt is NOT injected here: it is part of the conversation (the
     upstream chat.jsonl builder emits it as the first turn), so it is measured
-    and budgeted as a normal message. ``overflow_mode`` ("drop" (default) |
-    "split" | "truncate") and ``message_lengths_path`` (measure-once cache, keyed to chat.jsonl
-    positions, reused across every max_length / overflow_mode) are the only
-    binning knobs. Under "split", messages named by ``CARRY_KEY`` are prepended
-    to continuation chunks within the same token budget. Exclusive offsets in
-    ``SPLIT_UNIT_ENDS_KEY`` make contiguous message groups indivisible.
+    and budgeted as a normal message. ``overflow_mode`` is "drop" (default),
+    "split", or "truncate". Under "split", messages named by ``CARRY_KEY`` are
+    prepended to continuation chunks within the same token budget. Exclusive
+    offsets in ``SPLIT_UNIT_ENDS_KEY`` make contiguous message groups indivisible.
 
     Train/val split (optional): when ``split`` is set, only conversations whose
     ``recording_split(row[split_key], val_fraction)`` equals ``split`` are emitted.
-    The message-length cache is keyed by position over the FULL chat.jsonl and is
-    resolved/validated against it in full, so ``conv_idx`` stays aligned no matter
-    which split is being built -- the split changes only which conversations reach
-    the output, never the cache. That is what lets a single (split-agnostic) cache
-    serve every split and every val_fraction without re-tokenizing. ``split=None``
-    (default) emits all conversations (single-split / pre-split input).
+    ``split=None`` emits all conversations.
     """
     if max_length <= 0:
         raise ValueError("max_length must be > 0")
@@ -1130,8 +914,6 @@ def build_records_from_chat(
         raise ValueError(
             f"overflow_mode must be 'split', 'truncate', or 'drop', got {overflow_mode!r}"
         )
-    validate_measurement_contract(measurement_contract)
-
     chat_path = Path(chat_path).expanduser().resolve()
     out_dir = Path(out_dir).expanduser().resolve()
     effective_max = max_length
@@ -1143,23 +925,15 @@ def build_records_from_chat(
         return unit_ends if overflow_mode == "split" else tuple(range(1, message_count + 1))
 
     def _in_split(session_meta: dict[str, Any]) -> bool:
-        # conv_idx (and thus the cache key) is always over the full chat; this only
-        # decides whether a conversation's records are emitted for this split.
         return split is None or recording_split(session_meta.get(split_key), val_fraction) == split
 
-    precomputed = _resolve_chat_message_lengths(
-        chat_path,
-        measure_message,
-        num_workers,
-        message_lengths_path,
-        measurement_contract,
-    )
+    precomputed = _compute_message_lengths_from_chat(chat_path, measure_message, num_workers)
     supervision_fields = {
         isinstance(result, dict) and "supervised_tokens" in result
         for result in precomputed.values()
     }
     if len(supervision_fields) > 1:
-        raise ValueError("message-length cache mixes supervision measurement schemas")
+        raise ValueError("conversation measurement mixes supervision schemas")
     supervision_basis = (
         "loss_mask" if supervision_fields == {True} else "assistant_message_length_estimate"
     )
@@ -1335,15 +1109,11 @@ def build_records_from_chat(
         records_per_shard=records_per_shard,
         overwrite=overwrite,
         metadata={
-            "inline_records": True,
-            "source_chat_path": str(chat_path),
             "max_length": max_length,
             "overflow_mode": overflow_mode,
             "split": split,
             "val_fraction": val_fraction,
             "profile_metadata": profile_metadata or {},
-            "source_chat": file_identity(chat_path),
-            "measurement_contract": measurement_contract,
         },
     )
 
@@ -1385,7 +1155,6 @@ def build_records_from_chat(
             image_shape_counts=_image_shape_counts,
         )
 
-    _mark_compiled_dataset_complete(out_dir)
     return out_path
 
 
@@ -1549,11 +1318,6 @@ def make_grain_iterator(
     # Source ids stay aligned with the user-provided list so metric tags remain stable.
     active_indices = [i for i, s in enumerate(mix_sources) if s.weight > 0.0]
     metadatas = [load_compiled_metadata(mix_sources[i].path) for i in active_indices]
-    for i, m in zip(active_indices, metadatas):
-        if not m.get("inline_records"):
-            raise ValueError(
-                f"Expected an inline-records dataset (build_records_from_chat): {mix_sources[i].path}"
-            )
     _validate_mix_compatibility(
         [mix_sources[i] for i in active_indices],
         metadatas,

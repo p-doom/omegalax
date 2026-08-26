@@ -15,7 +15,6 @@ import orbax.checkpoint as ocp
 from absl.testing import absltest
 
 from omegalax.data.grain_pipeline import (
-    _write_chat_message_lengths,
     build_records_from_chat,
     make_grain_iterator,
     make_grain_multiprocessing_options,
@@ -54,13 +53,6 @@ def _measure_one(messages):
 
 def _measure_declared(messages):
     return [message["measurement"] for message in messages]
-
-
-_TEST_MEASUREMENT_CONTRACT = {
-    "tokenizer_sha256": "a" * 64,
-    "processor_sha256": None,
-    "preprocessor_sha256": None,
-}
 
 
 def _measured(role, content, length=1, vision_tokens=0):
@@ -116,19 +108,12 @@ class GrainPipelineTest(absltest.TestCase):
         measure=_measure_one,
     ):
         src = Path(tmpdir) / "train.jsonl"
-        cache = Path(tmpdir) / "message_lengths.jsonl"
         row = {"messages": messages}
         if marker is not None:
             row["_omegalax_carry_messages"] = marker
         if split_unit_ends is not None:
             row["_omegalax_split_unit_ends"] = split_unit_ends
         self._write_jsonl(src, [row])
-        _write_chat_message_lengths(
-            cache,
-            {(0, i): measure([message])[0] for i, message in enumerate(messages)},
-            src,
-            _TEST_MEASUREMENT_CONTRACT,
-        )
         records_dir = build_records_from_chat(
             src,
             Path(tmpdir) / "records",
@@ -136,8 +121,6 @@ class GrainPipelineTest(absltest.TestCase):
             measure_message=measure,
             records_per_shard=8,
             overflow_mode="split",
-            message_lengths_path=cache,
-            measurement_contract=_TEST_MEASUREMENT_CONTRACT,
         )
         return records_dir, self._read_records(records_dir)
 
@@ -164,7 +147,6 @@ class GrainPipelineTest(absltest.TestCase):
                 max_length=3,
                 measure_message=_measure_one,
                 records_per_shard=8,
-                measurement_contract=_TEST_MEASUREMENT_CONTRACT,
             )
 
             iterator = make_grain_iterator(
@@ -214,7 +196,6 @@ class GrainPipelineTest(absltest.TestCase):
                 measure_message=_measure_one,
                 records_per_shard=8,
                 overflow_mode="truncate",
-                measurement_contract=_TEST_MEASUREMENT_CONTRACT,
             )
 
             stats = json.loads((records_dir / "truncation_stats.json").read_text())
@@ -227,37 +208,6 @@ class GrainPipelineTest(absltest.TestCase):
                 stats["tokens"]["kept"] + stats["tokens"]["dropped"],
                 stats["tokens"]["total_measured"],
             )
-
-    def test_make_grain_iterator_requires_inline_records_dataset(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            invalid = Path(tmpdir) / "invalid"
-            invalid.mkdir()
-            (invalid / "metadata.json").write_text(
-                json.dumps(
-                    {
-                        "complete": True,
-                        "measurement_contract": _TEST_MEASUREMENT_CONTRACT,
-                        "num_records": 1,
-                        "num_shards": 1,
-                        "shard_paths": ["part-00000.array_record"],
-                    }
-                )
-            )
-
-            with self.assertRaisesRegex(ValueError, "metadata is invalid"):
-                make_grain_iterator(
-                    invalid,
-                    batch_size=1,
-                    batch_fn=lambda batch: batch[0],
-                    shuffle=False,
-                    seed=0,
-                    read_options=make_grain_read_options(num_threads=1, prefetch_buffer_size=1),
-                    multiprocessing_options=make_grain_multiprocessing_options(
-                        num_workers=0, per_worker_buffer_size=1
-                    ),
-                    dp_size=1,
-                    fsdp_size=1,
-                )
 
     def test_build_records_from_chat_splits_oversized_conversation(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -285,7 +235,6 @@ class GrainPipelineTest(absltest.TestCase):
                 measure_message=_measure_one,
                 records_per_shard=8,
                 overflow_mode="split",
-                measurement_contract=_TEST_MEASUREMENT_CONTRACT,
             )
 
             iterator = make_grain_iterator(
@@ -529,7 +478,6 @@ class GrainPipelineTest(absltest.TestCase):
                 measure_message=_measure_one,
                 records_per_shard=8,
                 overflow_mode="split",
-                measurement_contract=_TEST_MEASUREMENT_CONTRACT,
             )
 
             iterator = make_grain_iterator(
@@ -621,7 +569,6 @@ class GrainPipelineTest(absltest.TestCase):
                 measure_message=_measure_one,
                 records_per_shard=8,
                 overflow_mode="split",
-                measurement_contract=_TEST_MEASUREMENT_CONTRACT,
             )
 
             with mock.patch("jax.process_index", return_value=0):
@@ -686,7 +633,6 @@ class GrainPipelineTest(absltest.TestCase):
                 max_length=2,
                 measure_message=_measure_one,
                 records_per_shard=8,
-                measurement_contract=_TEST_MEASUREMENT_CONTRACT,
             )
 
             def collect_process_order(process_index: int, seed: int) -> list[str]:

@@ -58,13 +58,6 @@ def _measure_one(messages):
     ]
 
 
-_TEST_MEASUREMENT_CONTRACT = {
-    "tokenizer_sha256": "a" * 64,
-    "processor_sha256": None,
-    "preprocessor_sha256": None,
-}
-
-
 def _build_chunked_source(
     tmpdir: Path,
     *,
@@ -97,7 +90,6 @@ def _build_chunked_source(
         max_length=2,
         measure_message=_measure_one,
         records_per_shard=8,
-        measurement_contract=_TEST_MEASUREMENT_CONTRACT,
     )
 
 
@@ -308,7 +300,6 @@ class DataMixingTest(absltest.TestCase):
                 max_length=2,
                 measure_message=_measure_one,
                 records_per_shard=8,
-                measurement_contract=_TEST_MEASUREMENT_CONTRACT,
             )
             chunked_a_long = build_records_from_chat(
                 src_a,
@@ -316,7 +307,6 @@ class DataMixingTest(absltest.TestCase):
                 max_length=3,
                 measure_message=_measure_one,
                 records_per_shard=8,
-                measurement_contract=_TEST_MEASUREMENT_CONTRACT,
             )
             with self.assertRaisesRegex(ValueError, "different max_length"):
                 make_grain_iterator(
