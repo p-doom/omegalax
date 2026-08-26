@@ -41,7 +41,7 @@ rc=0
 
 if [ "$ARM" = "gpu_tests" ] || [ "$ARM" = "both" ]; then
     echo "=== stage 1: interleaved-layout equivalence (1 GPU) ==="
-    srun --ntasks=1 --gres=gpu:1 --overlap "$PY" -m unittest -v \
+    srun --ntasks=1 --gres=gpu:1 --overlap "$PY" -m unittest \
         tests.test_vision_splice_multiprocess_layout \
         tests.test_fix_slowdown_ports
     rc=$?
