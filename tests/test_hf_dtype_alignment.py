@@ -28,6 +28,7 @@ def _qwen3_vl_hf_cfg() -> dict:
             "rope_theta": 1_000_000,
             "rope_scaling": {
                 "mrope_section": [8, 4, 4],
+                "mrope_interleaved": True,
             },
         },
         "vision_config": {
@@ -112,6 +113,12 @@ class HFDtypeAlignmentTest(unittest.TestCase):
         self.assertEqual(cfg.dtype, jnp.bfloat16)
         self.assertEqual(cfg.vision.dtype, jnp.float32)
 
+    def test_qwen3_vl_rejects_non_interleaved_mrope(self):
+        hf_cfg = _qwen3_vl_hf_cfg()
+        hf_cfg["text_config"]["rope_scaling"]["mrope_interleaved"] = False
+        with self.assertRaisesRegex(ValueError, "mrope_interleaved=True"):
+            make_vl_config_from_hf(hf_cfg)
+
     def test_qwen3_5_defaults_vision_dtype_to_text_dtype(self):
         cfg = make_config_from_hf(_qwen3_5_hf_cfg())
         self.assertEqual(cfg.text_config.dtype, jnp.bfloat16)
@@ -123,6 +130,12 @@ class HFDtypeAlignmentTest(unittest.TestCase):
         cfg = make_config_from_hf(hf_cfg)
         self.assertEqual(cfg.text_config.dtype, jnp.bfloat16)
         self.assertEqual(cfg.vision_config.dtype, jnp.float32)
+
+    def test_qwen3_5_rejects_non_interleaved_mrope(self):
+        hf_cfg = _qwen3_5_hf_cfg()
+        hf_cfg["text_config"]["rope_parameters"]["mrope_interleaved"] = False
+        with self.assertRaisesRegex(ValueError, "mrope_interleaved=True"):
+            make_config_from_hf(hf_cfg)
 
 
 if __name__ == "__main__":

@@ -98,7 +98,7 @@ class Qwen3VLSmokeTest(absltest.TestCase):
         text_cfg["rope_theta"] = rope_parameters["rope_theta"]
         text_cfg["rope_scaling"] = {
             "rope_type": rope_parameters.get("rope_type", "default"),
-            "mrope_interleaved": rope_parameters.get("mrope_interleaved", True),
+            "mrope_interleaved": True,
             "mrope_section": rope_parameters["mrope_section"],
         }
 

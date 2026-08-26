@@ -272,6 +272,11 @@ def make_vl_config_from_hf(hf_cfg: dict[str, Any]) -> Qwen3VLConfig:
     rope_type = rope_scaling.get("rope_type", "default")
     if rope_type != "default":
         raise ValueError(f"Unsupported rope_scaling.rope_type '{rope_type}' for Qwen3-VL.")
+    if (
+        _required(rope_scaling, "mrope_interleaved", "hf_cfg['text_config'].rope_scaling")
+        is not True
+    ):
+        raise ValueError("Qwen3-VL requires rope_scaling.mrope_interleaved=True.")
 
     mrope_section = _required(rope_scaling, "mrope_section", "hf_cfg['text_config'].rope_scaling")
     text_dtype = _hf_dtype_to_jnp(_required(txt, "dtype", "hf_cfg['text_config']"))

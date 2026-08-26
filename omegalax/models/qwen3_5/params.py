@@ -79,7 +79,7 @@ def qwen3_5_to_hf_config_dict(cfg: Qwen3_5Config) -> dict[str, Any]:
             "rope_theta": txt.rope_theta,
             "partial_rotary_factor": txt.partial_rotary_factor,
             "mrope_section": list(txt.mrope_section),
-            "mrope_interleaved": txt.mrope_interleaved,
+            "mrope_interleaved": True,
             "rope_type": "default",
         },
         "attention_bias": txt.attention_bias,

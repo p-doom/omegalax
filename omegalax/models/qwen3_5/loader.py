@@ -66,9 +66,6 @@ def _assert_config(cfg: Qwen3_5Config, hf_cfg: dict):
     _require(
         "mrope_section", tuple(cfg.text_config.mrope_section), tuple(rope_params["mrope_section"])
     )
-    _require(
-        "mrope_interleaved", cfg.text_config.mrope_interleaved, rope_params["mrope_interleaved"]
-    )
 
     _require("vision.hidden_size", cfg.vision_config.hidden_size, vis["hidden_size"])
     _require("vision.depth", cfg.vision_config.depth, vis["depth"])
