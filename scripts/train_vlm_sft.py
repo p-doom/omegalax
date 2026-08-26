@@ -13,6 +13,7 @@ import wandb
 from absl import app, flags
 from transformers import AutoImageProcessor, AutoTokenizer
 
+from omegalax.compat.cudnn_ampere_packed import enable_ampere_packed_attention
 from omegalax.data.collator_qwen3 import VLMSFTCollator
 from omegalax.data.grain_pipeline import (
     MixSource,
@@ -354,6 +355,7 @@ def main(_) -> None:
     model_source = resolve_hf_model_source(FLAGS.model_id, FLAGS.model_revision)
     jax.config.update("jax_compilation_cache_dir", FLAGS.jax_cache_dir)
     jax.distributed.initialize()
+    enable_ampere_packed_attention()
     startup_log(f"jax_compilation_cache_dir={FLAGS.jax_cache_dir}")
     startup_log("jax.distributed initialized")
 
