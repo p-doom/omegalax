@@ -61,7 +61,7 @@ def require_zero_router_aux_loss(cfg) -> None:
     else:
         raise TypeError(f"Unsupported VLM config type: {type(cfg)}")
     if has_nonzero_aux:
-        raise ValueError("Gradient accumulation requires zero router auxiliary loss")
+        raise ValueError("VLM training does not support non-zero router auxiliary loss")
 
 
 def _require_healthy_at_boundary(healthy: jax.Array, step: int) -> None:
