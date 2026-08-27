@@ -250,6 +250,18 @@ class TextEncodingTest(absltest.TestCase):
         with self.assertRaisesRegex(ValueError, "exceeds max_length"):
             TextSFTCollator(tokenizer, max_length=4, model_type=model_type)([example])
 
+    def test_text_collator_rejects_zero_supervision(self):
+        model, model_type = TEXT_MODELS[0]
+        tokenizer = AutoTokenizer.from_pretrained(model, local_files_only=True)
+        example = {
+            "messages": [
+                {"role": "user", "content": "question"},
+                {"role": "assistant", "content": "context", "loss": False},
+            ]
+        }
+        with self.assertRaisesRegex(ValueError, "must contain supervised tokens"):
+            TextSFTCollator(tokenizer, max_length=64, model_type=model_type)([example])
+
     def test_video_placeholder_is_rejected(self):
         model, model_type = TEXT_MODELS[0]
         tokenizer = AutoTokenizer.from_pretrained(model, local_files_only=True)
@@ -317,6 +329,14 @@ class VLMEncodingTest(absltest.TestCase):
         self.assertEqual(batch["pixel_values"].dtype, ml_dtypes.bfloat16)
         self.assertTrue(np.all(batch["vision_patch_valid"]))
         self.assertEqual(batch["position_ids_ZBT"].shape, (3, 1, 256))
+
+    def test_vlm_collator_rejects_zero_supervision(self):
+        messages = self._messages(Image.new("RGB", (112, 112), (80, 40, 20)))
+        messages[-1]["loss"] = False
+        with self.assertRaisesRegex(ValueError, "must contain supervised tokens"):
+            VLMSFTCollator(self.tokenizer, 256, self.image_processor, VLM_MODEL_TYPE)(
+                [{"messages": messages}]
+            )
 
     def test_vlm_collator_emits_validity_for_text_only_batch(self):
         batch = VLMSFTCollator(self.tokenizer, 256, self.image_processor, VLM_MODEL_TYPE)(

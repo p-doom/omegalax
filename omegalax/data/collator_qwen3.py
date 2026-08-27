@@ -12,6 +12,13 @@ from transformers import BaseImageProcessor, PreTrainedTokenizer
 from omegalax.data.qwen3_encoding import Qwen3MessageEncoder
 
 
+def _require_supervision(encoded: dict[str, np.ndarray]) -> np.ndarray:
+    loss_mask = encoded["loss_mask"]
+    if not np.any(loss_mask):
+        raise ValueError("each training example must contain supervised tokens")
+    return loss_mask
+
+
 class TextSFTCollator:
     """Collate Qwen ChatML chat examples into padded numpy arrays with loss masks.
 
@@ -40,6 +47,7 @@ class TextSFTCollator:
             messages = ex["messages"]
             encoded = self._encoder.encode(messages)
             full_ids = encoded["input_ids"]
+            loss_mask = _require_supervision(encoded)
             if len(full_ids) > self.max_length:
                 raise ValueError(
                     f"Encoded example length {len(full_ids)} exceeds max_length={self.max_length}; "
@@ -50,8 +58,6 @@ class TextSFTCollator:
             pad_len = self.max_length - seq_len
             token_ids = np.array(full_ids, dtype=np.int32)
             attn_mask = np.ones(seq_len, dtype=np.int32)
-            loss_mask = encoded["loss_mask"]
-
             if pad_len > 0:
                 token_ids = np.pad(
                     token_ids, (0, pad_len), constant_values=self.tokenizer.pad_token_id
@@ -225,6 +231,7 @@ class VLMSFTCollator:
             messages = ex["messages"]
             encoded = self._encoder.encode(messages)
             full_ids = encoded["input_ids"]
+            loss_mask = _require_supervision(encoded)
             if len(full_ids) > self.max_length:
                 raise ValueError(
                     f"Encoded example length {len(full_ids)} exceeds max_length={self.max_length}; "
@@ -239,7 +246,6 @@ class VLMSFTCollator:
             pad_len = self.max_length - seq_len
             token_ids = np.array(full_ids, dtype=np.int32)
             attn_mask = np.ones(seq_len, dtype=np.int32)
-            loss_mask = encoded["loss_mask"]
             if pad_len > 0:
                 token_ids = np.pad(
                     token_ids, (0, pad_len), constant_values=self.tokenizer.pad_token_id
