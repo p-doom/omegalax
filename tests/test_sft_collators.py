@@ -34,7 +34,11 @@ class TextEncodingTest(absltest.TestCase):
         messages = [
             {"role": "system", "content": "system"},
             {"role": "user", "content": "first"},
-            {"role": "assistant", "content": "answer one"},
+            {
+                "role": "assistant",
+                "reasoning_content": "historical reasoning",
+                "content": "answer one",
+            },
             {"role": "user", "content": "second"},
             {"role": "assistant", "content": "answer two"},
         ]
