@@ -15,6 +15,8 @@ import orbax.checkpoint as ocp
 from absl.testing import absltest
 
 from omegalax.data.grain_pipeline import (
+    COMPILED_DATASET_VERSION,
+    _write_arrayrecord_dataset,
     build_records_from_chat,
     make_grain_iterator,
     make_grain_multiprocessing_options,
@@ -116,6 +118,26 @@ class GrainPipelineTest(absltest.TestCase):
             overflow_mode="split",
         )
         return records_dir, self._read_records(records_dir)
+
+    def test_compiled_metadata_records_version_and_shard_count(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            records_dir = Path(tmpdir) / "records"
+            _write_arrayrecord_dataset(
+                ({"record": i} for i in range(3)),
+                records_dir,
+                records_per_shard=2,
+                overwrite=False,
+            )
+
+            self.assertEqual(
+                json.loads((records_dir / "metadata.json").read_text()),
+                {
+                    "version": COMPILED_DATASET_VERSION,
+                    "num_records": 3,
+                    "num_shards": 2,
+                    "shard_paths": ["part-00000.array_record", "part-00001.array_record"],
+                },
+            )
 
     def test_system_turn_is_budgeted_and_included_in_the_record(self):
         with tempfile.TemporaryDirectory() as tmpdir:

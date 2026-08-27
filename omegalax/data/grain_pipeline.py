@@ -18,6 +18,7 @@ import numpy as np
 from array_record.python.array_record_module import ArrayRecordWriter
 from tqdm import tqdm
 
+COMPILED_DATASET_VERSION = 1
 COMPILED_METADATA_FILENAME = "metadata.json"
 TOKEN_STATS_FILENAME = "token_stats.json"
 TRUNCATION_STATS_FILENAME = "truncation_stats.json"
@@ -103,7 +104,9 @@ def _write_arrayrecord_dataset(
         writer.close()
 
     metadata = {
+        "version": COMPILED_DATASET_VERSION,
         "num_records": total_records,
+        "num_shards": len(shard_paths),
         "shard_paths": shard_paths,
     }
     (out_dir / COMPILED_METADATA_FILENAME).write_text(json.dumps(metadata, indent=2) + "\n")
