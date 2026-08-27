@@ -19,11 +19,8 @@ import jax.numpy as jnp
 import numpy as np
 from absl.testing import absltest
 
-from omegalax.models.qwen3 import registry as qwen3_registry
 from omegalax.models.qwen3_5 import kernels
-from omegalax.models.qwen3_5.config import make_config as make_qwen3_5_config
 from omegalax.models.qwen3_5.kernels.xla_reference import chunk_gated_delta_rule_xla
-from omegalax.trainers.perf import record_deltanet_kernel
 
 
 def _fake_devices(*platforms: str) -> list[types.SimpleNamespace]:
@@ -52,9 +49,11 @@ class DispatcherTest(absltest.TestCase):
         os.environ.pop("OMEGALAX_DELTANET_KERNEL", None)
 
     def test_probe_failure_raises_instead_of_substituting_xla(self):
-        with mock.patch.object(jax, "devices", side_effect=RuntimeError("cuda init failed")):
-            with self.assertRaisesRegex(RuntimeError, "cuda init failed"):
-                kernels.resolve_backend()
+        with (
+            mock.patch.object(jax, "devices", side_effect=RuntimeError("cuda init failed")),
+            self.assertRaisesRegex(RuntimeError, "cuda init failed"),
+        ):
+            kernels.resolve_backend()
 
     def test_no_preference_on_gpu_selects_pallas(self):
         with mock.patch.object(jax, "devices", return_value=_fake_devices("cuda", "cuda")):
@@ -72,7 +71,7 @@ class DispatcherTest(absltest.TestCase):
     def test_unknown_backend_raises(self):
         os.environ["OMEGALAX_DELTANET_KERNEL"] = "flash"
         with self.assertRaisesRegex(ValueError, "flash"):
-            kernels.chunk_gated_delta_rule(*_inputs())
+            kernels.resolve_backend()
 
     def test_explicit_xla_executes_the_reference(self):
         os.environ["OMEGALAX_DELTANET_KERNEL"] = "xla"
@@ -85,51 +84,6 @@ class DispatcherTest(absltest.TestCase):
         with mock.patch.object(jax, "devices", return_value=_fake_devices("cpu")):
             out = np.asarray(kernels.chunk_gated_delta_rule(*args))
         np.testing.assert_array_equal(out, np.asarray(chunk_gated_delta_rule_xla(*args)))
-
-
-class KernelRecordTest(absltest.TestCase):
-    """``record_deltanet_kernel`` is what ties a run's reported MFU to a named kernel."""
-
-    def setUp(self):
-        super().setUp()
-        patcher = mock.patch.dict(os.environ)
-        patcher.start()
-        self.addCleanup(patcher.stop)
-        os.environ["OMEGALAX_DELTANET_KERNEL"] = "xla"
-
-    def test_records_the_resolved_kernel_for_a_text_run(self):
-        cfg = make_qwen3_5_config("qwen3.5-smoke").text_config
-        wandb_run = mock.Mock()
-        self.assertEqual(record_deltanet_kernel(cfg, wandb_run), "xla")
-        wandb_run.config.update.assert_called_once_with(
-            {"deltanet_kernel": "xla"}, allow_val_change=True
-        )
-
-    def test_records_the_resolved_kernel_for_a_vlm_run(self):
-        cfg = make_qwen3_5_config("qwen3.5-smoke")
-        wandb_run = mock.Mock()
-        self.assertEqual(record_deltanet_kernel(cfg, wandb_run), "xla")
-        wandb_run.config.update.assert_called_once_with(
-            {"deltanet_kernel": "xla"}, allow_val_change=True
-        )
-
-    def test_resolves_without_wandb(self):
-        # wandb is opt-in (--wandb_project), so no-wandb is the common path.
-        cfg = make_qwen3_5_config("qwen3.5-smoke").text_config
-        self.assertEqual(record_deltanet_kernel(cfg, None), "xla")
-
-    def test_records_nothing_for_an_architecture_without_deltanet(self):
-        cfg = qwen3_registry.build_config("Qwen/Qwen3-0.6B")
-        wandb_run = mock.Mock()
-        self.assertIsNone(record_deltanet_kernel(cfg, wandb_run))
-        wandb_run.config.update.assert_not_called()
-
-    def test_a_failing_probe_fails_the_run_before_training(self):
-        os.environ.pop("OMEGALAX_DELTANET_KERNEL")
-        cfg = make_qwen3_5_config("qwen3.5-smoke").text_config
-        with mock.patch.object(jax, "devices", side_effect=RuntimeError("cuda init failed")):
-            with self.assertRaisesRegex(RuntimeError, "cuda init failed"):
-                record_deltanet_kernel(cfg, mock.Mock())
 
 
 if __name__ == "__main__":

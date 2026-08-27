@@ -333,30 +333,7 @@ def load_hf_config(path: str | epath.Path) -> dict[str, Any]:
     if not cfg_path.exists():
         raise ValueError(f"Expected HuggingFace config.json under {path}")
     with cfg_path.open() as f:
-        return _normalize_hf_config(json.load(f))
-
-
-def _normalize_hf_config(hf_cfg: dict[str, Any]) -> dict[str, Any]:
-    model_type = hf_cfg.get("model_type")
-    if model_type not in {"qwen3_moe", "qwen3_vl_moe"}:
-        return hf_cfg
-
-    target = hf_cfg["text_config"] if model_type == "qwen3_vl_moe" else hf_cfg
-    names = {"num_experts", "num_local_experts"}.intersection(target)
-    if len(names) != 1:
-        raise ValueError(
-            f"Expected exactly one expert-count field in {model_type} config, found {sorted(names)}"
-        )
-
-    from transformers import AutoConfig
-
-    kwargs = dict(hf_cfg)
-    kwargs.pop("model_type")
-    typed_cfg = AutoConfig.for_model(model_type, **kwargs)
-    typed_target = typed_cfg.text_config if model_type == "qwen3_vl_moe" else typed_cfg
-    target["num_experts"] = typed_target.num_experts
-    target.pop("num_local_experts", None)
-    return hf_cfg
+        return json.load(f)
 
 
 def load_hf_config_from_source(source: str | epath.Path) -> dict[str, Any]:

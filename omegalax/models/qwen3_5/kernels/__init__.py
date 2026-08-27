@@ -31,7 +31,12 @@ __all__ = ["chunk_gated_delta_rule_xla"]
 def resolve_backend():
     explicit = os.environ.get("OMEGALAX_DELTANET_KERNEL")
     if explicit is not None:
-        return explicit.lower()
+        backend = explicit.lower()
+        if backend not in {"xla", "pallas"}:
+            raise ValueError(
+                f"Unknown OMEGALAX_DELTANET_KERNEL={backend!r}. Use 'xla' or 'pallas'."
+            )
+        return backend
     # Implicit default: pallas if a GPU is reachable, else xla. We check
     # ``jax.devices()`` lazily so import order doesn't force a backend choice.
     # A failing probe must propagate: swallowing it substituted the XLA
@@ -53,8 +58,6 @@ def chunk_gated_delta_rule(
     backend = resolve_backend()
     if backend == "xla":
         return chunk_gated_delta_rule_xla(q_BTHA, k_BTHA, v_BTHU, g_BTH, beta_BTH, chunk_size)
-    if backend == "pallas":
-        from .pallas_triton import chunk_gated_delta_rule_pallas
+    from .pallas_triton import chunk_gated_delta_rule_pallas
 
-        return chunk_gated_delta_rule_pallas(q_BTHA, k_BTHA, v_BTHU, g_BTH, beta_BTH, chunk_size)
-    raise ValueError(f"Unknown OMEGALAX_DELTANET_KERNEL={backend!r}. Use 'xla' or 'pallas'.")
+    return chunk_gated_delta_rule_pallas(q_BTHA, k_BTHA, v_BTHU, g_BTH, beta_BTH, chunk_size)
