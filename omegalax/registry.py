@@ -23,15 +23,35 @@ _TEXT_MODEL_TYPES = {"qwen3", "qwen3_moe"}
 _VLM_MODEL_TYPES = {"qwen3_5", "qwen3_5_moe", "qwen3_vl", "qwen3_vl_moe"}
 
 
-def _load_resolved_hf_config(model_id: str) -> dict:
+def _resolve_supported_hf_repo_id(model_id: str) -> str:
     if is_supported_qwen3_model_id(model_id):
-        source = resolve_qwen3_repo_id(model_id)
+        repo_id = resolve_qwen3_repo_id(model_id)
     elif is_supported_qwen3_5_model_id(model_id):
-        source = resolve_qwen3_5_repo_id(model_id)
+        repo_id = resolve_qwen3_5_repo_id(model_id)
     elif is_supported_qwen3_vl_model_id(model_id):
-        source = resolve_qwen3_vl_repo_id(model_id)
+        repo_id = resolve_qwen3_vl_repo_id(model_id)
     else:
         raise ValueError(f"Unsupported model id '{model_id}'")
+    if "/" not in repo_id:
+        raise ValueError(f"Model id is not a remote HuggingFace repo: '{model_id}'")
+    return repo_id
+
+
+def _resolve_hf_model_directory(source: Path) -> Path:
+    source = source.expanduser().resolve()
+    if not source.is_dir():
+        raise ValueError(f"model source must be a HuggingFace model directory: {source}")
+    if not (source / "config.json").is_file():
+        raise ValueError(f"model source has no config.json: {source}")
+    return source
+
+
+def _load_resolved_hf_config(model_id: str) -> dict:
+    local_source = Path(model_id).expanduser()
+    if local_source.exists():
+        source = _resolve_hf_model_directory(local_source)
+    else:
+        source = _resolve_supported_hf_repo_id(model_id)
     return load_hf_config_from_source(source)
 
 
@@ -65,10 +85,11 @@ def resolve_hf_repo_id(model_id: str) -> str:
 
 
 def resolve_hf_model_source(model_id: str) -> Path:
-    source = Path(snapshot_download(resolve_hf_repo_id(model_id))).resolve()
-    if not (source / "config.json").is_file():
-        raise ValueError(f"model source has no config.json: {source}")
-    return source
+    local_source = Path(model_id).expanduser()
+    if local_source.exists():
+        return _resolve_hf_model_directory(local_source)
+    source = Path(snapshot_download(_resolve_supported_hf_repo_id(model_id)))
+    return _resolve_hf_model_directory(source)
 
 
 def resolve(model_id: str) -> Arch:
