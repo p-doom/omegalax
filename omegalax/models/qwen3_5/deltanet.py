@@ -78,10 +78,20 @@ class GatedDeltaNet(nnx.Module):
             D, self.value_dim, use_bias=False, rngs=rngs, dtype=cfg.dtype, kernel_init=in_proj_init
         )
         self.in_proj_b = nnx.Linear(
-            D, self.num_v_heads, use_bias=False, rngs=rngs, dtype=cfg.dtype, kernel_init=in_proj_init
+            D,
+            self.num_v_heads,
+            use_bias=False,
+            rngs=rngs,
+            dtype=cfg.dtype,
+            kernel_init=in_proj_init,
         )
         self.in_proj_a = nnx.Linear(
-            D, self.num_v_heads, use_bias=False, rngs=rngs, dtype=cfg.dtype, kernel_init=in_proj_init
+            D,
+            self.num_v_heads,
+            use_bias=False,
+            rngs=rngs,
+            dtype=cfg.dtype,
+            kernel_init=in_proj_init,
         )
 
         self.conv_weight = nnx.Param(
@@ -110,9 +120,7 @@ class GatedDeltaNet(nnx.Module):
         self.hidden_shd = cfg.shd_cfg.act_btd
         self.scan_state_shd = P(batch_axis, head_axis, None, None)
         self.flat_norm_shd = P(flat_axis, None)
-        self.norm = RMSNormGated(
-            self.head_v_dim, cfg.rms_norm_eps, rngs=rngs, sharding=(None,)
-        )
+        self.norm = RMSNormGated(self.head_v_dim, cfg.rms_norm_eps, rngs=rngs, sharding=(None,))
         self.out_proj = nnx.Linear(
             self.value_dim,
             D,
@@ -123,7 +131,9 @@ class GatedDeltaNet(nnx.Module):
         )
 
     @jax.named_scope("gated_delta_net")
-    def __call__(self, hidden_BTD: jax.Array, attention_mask_BT: jax.Array | None = None) -> jax.Array:
+    def __call__(
+        self, hidden_BTD: jax.Array, attention_mask_BT: jax.Array | None = None
+    ) -> jax.Array:
         if attention_mask_BT is not None and attention_mask_BT.shape[1] > 1:
             hidden_BTD = hidden_BTD * attention_mask_BT[:, :, None]
 
@@ -133,7 +143,9 @@ class GatedDeltaNet(nnx.Module):
         batch_axis = heads_shd[0]
         head_axis = heads_shd[2]
         beta_g_shd = P(batch_axis, None, head_axis)
-        mixed_qkv_BCT = self.in_proj_qkv(hidden_BTD, out_sharding=self.shd_cfg.act_btf).transpose(0, 2, 1)
+        mixed_qkv_BCT = self.in_proj_qkv(hidden_BTD, out_sharding=self.shd_cfg.act_btf).transpose(
+            0, 2, 1
+        )
         z_BTHU = jax.lax.reshape(
             self.in_proj_z(hidden_BTD, out_sharding=self.shd_cfg.act_btf),
             (B, T, self.num_v_heads, self.head_v_dim),
@@ -142,7 +154,11 @@ class GatedDeltaNet(nnx.Module):
         b_BTH = self.in_proj_b(hidden_BTD, out_sharding=beta_g_shd)
         a_BTH = self.in_proj_a(hidden_BTD, out_sharding=beta_g_shd)
 
-        mixed_qkv_BCT = nnx.silu(_causal_depthwise_conv1d(mixed_qkv_BCT, self.conv_weight[...].astype(mixed_qkv_BCT.dtype)))
+        mixed_qkv_BCT = nnx.silu(
+            _causal_depthwise_conv1d(
+                mixed_qkv_BCT, self.conv_weight[...].astype(mixed_qkv_BCT.dtype)
+            )
+        )
         mixed_qkv_BTC = mixed_qkv_BCT.transpose(0, 2, 1)
         q_BTP, k_BTP, v_BTO = jnp.split(mixed_qkv_BTC, [self.key_dim, self.key_dim * 2], axis=-1)
         q_BTHA = jax.lax.reshape(
@@ -182,7 +198,6 @@ class GatedDeltaNet(nnx.Module):
             if gqa_factor > 1:
                 q_BTHA = jnp.broadcast_to(
                     q_BTHA[:, :, :, None, :],
-                    
                     (B, T, local_k_heads, gqa_factor, head_k_dim),
                 ).reshape(B, T, local_v_heads, head_k_dim)
                 k_BTHA = jnp.broadcast_to(
@@ -197,7 +212,7 @@ class GatedDeltaNet(nnx.Module):
             z_flat = z_BTHU.reshape(BL * H, U)
             dtype = core_flat.dtype
             x_f32 = core_flat.astype(jnp.float32)
-            variance = jnp.mean(x_f32 ** 2, axis=-1, keepdims=True)
+            variance = jnp.mean(x_f32**2, axis=-1, keepdims=True)
             normed = (x_f32 * jax.lax.rsqrt(variance + norm_eps)).astype(dtype)
             normed = nw.astype(dtype) * normed
             gated = normed * jax.nn.silu(z_flat.astype(jnp.float32))

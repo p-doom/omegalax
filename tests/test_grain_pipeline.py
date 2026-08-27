@@ -286,9 +286,7 @@ class GrainPipelineTest(absltest.TestCase):
                 _measured("user", "2", length=5),
                 _measured("assistant", "3"),
             ]
-            records_dir, records = self._build_split(
-                tmpdir, messages, 2, measure=_measure_declared
-            )
+            records_dir, records = self._build_split(tmpdir, messages, 2, measure=_measure_declared)
             self.assertEqual(
                 [[message["content"] for message in record["messages"]] for record in records],
                 [["0", "1"]],
