@@ -149,12 +149,23 @@ flags.DEFINE_float(
     "LoRA alpha scaling (required if --enable_lora). Effective LR multiplier is alpha/rank.",
 )
 flags.DEFINE_boolean(
+    "lora_qwen3_5_deltanet",
+    None,
+    "Also train LoRA adapters on every Qwen3.5 DeltaNet projection. Requires --enable_lora.",
+)
+flags.DEFINE_boolean(
     "freeze_vision_tower",
     None,
     "Full FT on text decoder + embedder + lm_head + "
     "layernorms while freezing the vision tower at the "
     "gradient/opt-state layer. Mutually exclusive with "
     "--enable_lora (which already freezes vision).",
+)
+flags.DEFINE_boolean(
+    "train_vision_merger",
+    None,
+    "Train vision.merger while the rest of the vision tower remains frozen. "
+    "Requires --freeze_vision_tower.",
 )
 flags.DEFINE_string(
     "extra_transform",
@@ -218,7 +229,9 @@ _REQUIRED = [
     "num_loss_tiles",
     "text_attn_backend",
     "enable_lora",
+    "lora_qwen3_5_deltanet",
     "freeze_vision_tower",
+    "train_vision_merger",
 ]
 
 
@@ -246,6 +259,10 @@ def _validate_flags() -> None:
     # Both freeze the vision tower, so asking for both is a contradiction, not a no-op.
     if FLAGS.enable_lora and FLAGS.freeze_vision_tower:
         problems.append("enable_lora and freeze_vision_tower are mutually exclusive")
+    if FLAGS.lora_qwen3_5_deltanet and not FLAGS.enable_lora:
+        problems.append("lora_qwen3_5_deltanet requires enable_lora")
+    if FLAGS.train_vision_merger and not FLAGS.freeze_vision_tower:
+        problems.append("train_vision_merger requires freeze_vision_tower")
 
     if FLAGS.enable_lora:
         for name in ("lora_rank", "lora_alpha"):
@@ -465,7 +482,9 @@ def main(_) -> None:
         enable_lora=FLAGS.enable_lora,
         lora_rank=FLAGS.lora_rank,
         lora_alpha=FLAGS.lora_alpha,
+        lora_qwen3_5_deltanet=FLAGS.lora_qwen3_5_deltanet,
         freeze_vision_tower=FLAGS.freeze_vision_tower,
+        train_vision_merger=FLAGS.train_vision_merger,
         num_loss_tiles=FLAGS.num_loss_tiles,
     )
     resume_mode = ResumeMode(FLAGS.resume)

@@ -71,15 +71,16 @@ def _restore_trained_weights(model, checkpoint_path: Path):
     default_sharding = NamedSharding(mesh, P())
 
     with mesh_rules(mesh):
-        if bool(lora_meta["enable_lora"]):
-            from omegalax.trainers.lora import inject_lora
+        if lora_meta["enable_lora"]:
+            from omegalax.trainers.lora import inject_model_lora
 
             rank = int(lora_meta["lora_rank"])
-            n_wrapped = inject_lora(
+            n_wrapped = inject_model_lora(
                 model,
                 r=rank,
                 alpha=float(lora_meta["lora_alpha"]),
                 rngs=nnx.Rngs(FLAGS.seed),
+                qwen3_5_deltanet=lora_meta["lora_qwen3_5_deltanet"],
             )
             print(f"[export] re-injected LoRA into base for restore: r={rank} wrapped={n_wrapped}")
 

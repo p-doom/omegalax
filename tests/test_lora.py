@@ -23,11 +23,16 @@ import optax
 from absl.testing import absltest
 from flax import nnx
 
+from omegalax.distributed.mesh import mesh_rules_for
+from omegalax.models.qwen3_5 import Qwen3_5ForConditionalGeneration
+from omegalax.models.qwen3_5.config import make_config as make_qwen3_5_config
 from omegalax.trainers.lora import (
     DEFAULT_TARGET_MODULES,
+    QWEN3_5_DELTANET_TARGET_MODULES,
     LoRALinear,
     LoRAParam,
     inject_lora,
+    inject_model_lora,
     merge_lora_into_base,
 )
 
@@ -222,6 +227,68 @@ class LoRATest(absltest.TestCase):
             "down_proj",
         }
         self.assertEqual(set(DEFAULT_TARGET_MODULES), expected)
+
+    def test_default_injection_allows_unmatched_moe_projection_names(self):
+        model = _MiniAttention(16, rngs=nnx.Rngs(0))
+        count = inject_lora(model, r=4, alpha=8, rngs=nnx.Rngs(1), dtype=jnp.float32)
+        self.assertEqual(count, 4)
+
+    def test_injection_consumes_rng_in_declared_target_order(self):
+        model = _MiniAttention(16, rngs=nnx.Rngs(0))
+        expected_rngs = nnx.Rngs(1)
+        expected_a = nnx.initializers.uniform(scale=0.25)(
+            expected_rngs.params(), (16, 4), jnp.float32
+        )
+
+        inject_lora(
+            model,
+            r=4,
+            alpha=8,
+            rngs=nnx.Rngs(1),
+            target_modules=("q_proj", "k_proj"),
+            dtype=jnp.float32,
+        )
+
+        np.testing.assert_array_equal(model.q_proj.lora_A[...], expected_a)
+
+    def test_qwen3_5_deltanet_targets_wrap_every_projection(self):
+        with mesh_rules_for(tp_size=1, fsdp_size=1, dp_size=1):
+            cfg = make_qwen3_5_config("qwen3.5-smoke-dense")
+            model = Qwen3_5ForConditionalGeneration(cfg, rngs=nnx.Rngs(0))
+            count = inject_model_lora(
+                model,
+                r=4,
+                alpha=8,
+                rngs=nnx.Rngs(1),
+                qwen3_5_deltanet=True,
+            )
+
+        self.assertGreater(count, len(QWEN3_5_DELTANET_TARGET_MODULES))
+        deltanet_layers = [
+            layer.linear_attn for layer in model.text.layers if hasattr(layer, "linear_attn")
+        ]
+        self.assertTrue(deltanet_layers)
+        for layer in deltanet_layers:
+            for name in QWEN3_5_DELTANET_TARGET_MODULES:
+                self.assertIsInstance(getattr(layer, name), LoRALinear)
+        self.assertTupleEqual(
+            QWEN3_5_DELTANET_TARGET_MODULES,
+            ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "out_proj"),
+        )
+
+    def test_deltanet_mode_fails_before_mutating_a_non_deltanet_model(self):
+        model = _make_model(seed=0)
+        with self.assertRaisesRegex(ValueError, "DeltaNet LoRA targets not found"):
+            inject_model_lora(
+                model,
+                r=4,
+                alpha=8,
+                rngs=nnx.Rngs(1),
+                qwen3_5_deltanet=True,
+            )
+        self.assertFalse(
+            any(isinstance(module, LoRALinear) for _, module in nnx.iter_modules(model))
+        )
 
     def test_mixed_precision_optimizer_with_wrt_lora(self):
         """End-to-end smoke of the trainer's pattern: build the

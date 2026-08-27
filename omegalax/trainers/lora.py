@@ -33,13 +33,13 @@ unchanged.
 
 from __future__ import annotations
 
-from typing import Sequence
+from collections.abc import Sequence
 
-from flax import nnx
 import jax
 import jax.numpy as jnp
-from jax.sharding import PartitionSpec as P, reshard
-
+from flax import nnx
+from jax.sharding import PartitionSpec as P
+from jax.sharding import reshard
 
 # Standard LoRA target-module names for transformer-block projections.
 # Match by attribute name on the *parent* module (e.g.
@@ -55,6 +55,14 @@ DEFAULT_TARGET_MODULES: tuple[str, ...] = (
     "gate_proj",
     "up_proj",
     "down_proj",
+)
+
+QWEN3_5_DELTANET_TARGET_MODULES: tuple[str, ...] = (
+    "in_proj_qkv",
+    "in_proj_z",
+    "in_proj_b",
+    "in_proj_a",
+    "out_proj",
 )
 
 # Subtree attribute names to skip during injection. Any module whose
@@ -191,7 +199,7 @@ def inject_lora(
     Idempotent on already-wrapped modules: a ``LoRALinear`` is not an
     ``nnx.Linear``, so re-running this function won't double-wrap.
     """
-    target_set = set(target_modules)
+    target_names = tuple(dict.fromkeys(target_modules))
     skip_set = set(skip_paths)
     # Materialize iter_modules first because we mutate during iteration.
     modules = list(nnx.iter_modules(model))
@@ -199,7 +207,7 @@ def inject_lora(
     for path, module in modules:
         if any(p in skip_set for p in path):
             continue
-        for name in target_set:
+        for name in target_names:
             child = getattr(module, name, None)
             if not isinstance(child, nnx.Linear):
                 continue
@@ -213,6 +221,41 @@ def inject_lora(
             setattr(module, name, wrapped)
             count += 1
     return count
+
+
+def inject_model_lora(
+    model: nnx.Module,
+    *,
+    r: int,
+    alpha: float,
+    rngs: nnx.Rngs,
+    qwen3_5_deltanet: bool,
+    dtype: jnp.dtype | None = None,
+) -> int:
+    if qwen3_5_deltanet:
+        from omegalax.models.qwen3_5.deltanet import GatedDeltaNet
+
+        modules = list(nnx.iter_modules(model))
+        deltanet_modules = [module for _, module in modules if isinstance(module, GatedDeltaNet)]
+        if not deltanet_modules:
+            raise ValueError("Qwen3.5 DeltaNet LoRA targets not found")
+        for module in deltanet_modules:
+            missing = [
+                name
+                for name in QWEN3_5_DELTANET_TARGET_MODULES
+                if not isinstance(getattr(module, name, None), (nnx.Linear, LoRALinear))
+            ]
+            if missing:
+                raise ValueError(f"Qwen3.5 DeltaNet LoRA targets not found: {missing}")
+    return inject_lora(
+        model,
+        r=r,
+        alpha=alpha,
+        rngs=rngs,
+        target_modules=DEFAULT_TARGET_MODULES
+        + (QWEN3_5_DELTANET_TARGET_MODULES if qwen3_5_deltanet else ()),
+        dtype=dtype,
+    )
 
 
 def merge_lora_into_base(model: nnx.Module) -> int:

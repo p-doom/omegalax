@@ -28,7 +28,7 @@ from omegalax.models.qwen3_vl.model import DECODER_LAYER_REMAT
 from omegalax.models.qwen3_vl.vision import VISION_BLOCK_REMAT
 from omegalax.trainers import checkpoint_utils
 from omegalax.trainers import tokamax_cache as tokamax_cache_lib
-from omegalax.trainers.lora import LoRAParam, inject_lora
+from omegalax.trainers.lora import LoRAParam, inject_model_lora
 from omegalax.trainers.loss import chunked_cross_entropy_loss_sum
 from omegalax.trainers.lr_schedule import build_lr_schedule
 from omegalax.trainers.optim import (
@@ -97,6 +97,12 @@ def _validate_train_config(train_cfg: TrainConfig) -> None:
         raise ValueError(
             f"num_steps={train_cfg.num_steps} exceeds schedule_horizon={train_cfg.schedule_horizon}"
         )
+    if train_cfg.enable_lora and train_cfg.freeze_vision_tower:
+        raise ValueError("enable_lora and freeze_vision_tower are mutually exclusive")
+    if train_cfg.lora_qwen3_5_deltanet and not train_cfg.enable_lora:
+        raise ValueError("lora_qwen3_5_deltanet requires enable_lora")
+    if train_cfg.train_vision_merger and not train_cfg.freeze_vision_tower:
+        raise ValueError("train_vision_merger requires freeze_vision_tower")
 
 
 def _trainable_non_vision(path, x):
@@ -112,6 +118,21 @@ def _trainable_non_vision(path, x):
         if key == "vision":
             return False
     return True
+
+
+def _path_keys(path) -> tuple[str, ...]:
+    return tuple(
+        getattr(part, "key", None) or getattr(part, "name", None) or str(part) for part in path
+    )
+
+
+def _trainable_non_vision_except_merger(path, x):
+    if not isinstance(x, nnx.Param):
+        return False
+    keys = _path_keys(path)
+    if "vision" not in keys:
+        return True
+    return keys[:2] == ("vision", "merger")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -133,7 +154,9 @@ class TrainConfig:
     enable_lora: bool = False
     lora_rank: int = 32
     lora_alpha: float = 32.0
+    lora_qwen3_5_deltanet: bool = False
     freeze_vision_tower: bool = False
+    train_vision_merger: bool = False
     num_loss_tiles: int = 4
 
 
@@ -246,6 +269,7 @@ def _write_lora_metadata(save_dir: Path, train_cfg: TrainConfig) -> None:
         "enable_lora": bool(train_cfg.enable_lora),
         "lora_rank": int(train_cfg.lora_rank) if train_cfg.enable_lora else None,
         "lora_alpha": float(train_cfg.lora_alpha) if train_cfg.enable_lora else None,
+        "lora_qwen3_5_deltanet": bool(train_cfg.lora_qwen3_5_deltanet),
     }
     (Path(save_dir) / "lora_metadata.json").write_text(json.dumps(meta, indent=2))
 
@@ -472,6 +496,7 @@ def _run_sft(
 
     Required resumes name one exact checkpoint generation with ``resume_step``.
     """
+    _validate_train_config(train_cfg)
     save_path = Path(save_dir).expanduser().resolve() if save_dir is not None else None
     will_resume = _validate_resume_request(resume, resume_step, save_path, train_cfg.num_steps)
 
@@ -499,6 +524,11 @@ def _run_sft(
     else:
         model_cfg = vlm_api.resolve_config(model_id_or_cfg)
         startup_log("resolved model config")
+    if train_cfg.lora_qwen3_5_deltanet:
+        if not isinstance(model_cfg, Qwen3_5Config):
+            raise ValueError("lora_qwen3_5_deltanet requires a Qwen3.5 model")
+        if "linear_attention" not in model_cfg.text_config.layer_types:
+            raise ValueError("lora_qwen3_5_deltanet requires a Qwen3.5 DeltaNet layer")
     require_zero_router_aux_loss(model_cfg)
     startup_log(f"model_cfg={model_cfg}")
     mesh = ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size)
@@ -561,24 +591,24 @@ def _run_sft(
         if wandb_run is not None and is_primary_process:
             wandb_run.config.update({"deltanet_kernel": deltanet_kernel}, allow_val_change=True)
         startup_log(f"deltanet kernel: {deltanet_kernel}")
-    if train_cfg.enable_lora and train_cfg.freeze_vision_tower:
-        raise ValueError(
-            "--enable_lora already freezes the vision tower; "
-            "--freeze_vision_tower is redundant. Pass at most one."
-        )
     if train_cfg.enable_lora:
         with mesh_rules(mesh):
-            n_wrapped = inject_lora(
+            n_wrapped = inject_model_lora(
                 model,
                 r=train_cfg.lora_rank,
                 alpha=train_cfg.lora_alpha,
                 rngs=nnx.Rngs(train_cfg.seed),
+                qwen3_5_deltanet=train_cfg.lora_qwen3_5_deltanet,
             )
         startup_log(
             f"LoRA enabled: r={train_cfg.lora_rank} alpha={train_cfg.lora_alpha} "
+            f"qwen3_5_deltanet={train_cfg.lora_qwen3_5_deltanet} "
             f"wrapped {n_wrapped} text-decoder Linear projections; vision frozen"
         )
         wrt_filter = LoRAParam
+    elif train_cfg.train_vision_merger:
+        wrt_filter = _trainable_non_vision_except_merger
+        startup_log("vision tower frozen except vision.merger; full FT on remaining parameters")
     elif train_cfg.freeze_vision_tower:
         wrt_filter = _trainable_non_vision
         startup_log(

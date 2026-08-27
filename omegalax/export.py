@@ -29,12 +29,22 @@ def read_lora_metadata(save_dir: Path) -> dict:
             f"no lora_metadata.json next to the checkpoint at {save_dir}. Every "
             "checkpoint written by omegalax.trainers.vlm has one; without it an "
             "adapter checkpoint exports as the base model with no error. Write the "
-            "file from the training run's recipe (enable_lora, lora_rank, lora_alpha)."
+            "file from the training run's recipe."
         )
     metadata = json.loads(path.read_text())
-    missing = {"enable_lora", "lora_rank", "lora_alpha"} - metadata.keys()
+    missing = {
+        "enable_lora",
+        "lora_rank",
+        "lora_alpha",
+        "lora_qwen3_5_deltanet",
+    } - metadata.keys()
     if missing:
-        raise ValueError(f"{path} is missing {sorted(missing)}; refusing to guess a LoRA rank")
+        raise ValueError(f"{path} is missing {sorted(missing)}; refusing to guess model structure")
+    for name in ("enable_lora", "lora_qwen3_5_deltanet"):
+        if type(metadata[name]) is not bool:
+            raise ValueError(f"{path} field {name!r} must be a boolean")
+    if metadata["lora_qwen3_5_deltanet"] and not metadata["enable_lora"]:
+        raise ValueError(f"{path} enables DeltaNet LoRA while LoRA is disabled")
     return metadata
 
 
