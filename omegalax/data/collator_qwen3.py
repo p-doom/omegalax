@@ -9,7 +9,7 @@ import ml_dtypes
 import numpy as np
 from transformers import BaseImageProcessor, PreTrainedTokenizer
 
-from omegalax.data.qwen_chat_encoding import QwenChatMessageEncoder
+from omegalax.data.qwen3_encoding import Qwen3MessageEncoder
 
 
 class TextSFTCollator:
@@ -23,12 +23,13 @@ class TextSFTCollator:
         self,
         tokenizer: PreTrainedTokenizer,
         max_length: int,
+        model_type: str,
     ) -> None:
         self.tokenizer = tokenizer
         self.max_length = max_length
         if tokenizer.pad_token_id is None:
             raise ValueError("tokenizer must define pad_token_id")
-        self._encoder = QwenChatMessageEncoder(tokenizer, None)
+        self._encoder = Qwen3MessageEncoder(tokenizer, None, model_type)
 
     def __call__(self, examples: Sequence[dict[str, Any]]) -> dict[str, np.ndarray]:
         batch_ids: list[np.ndarray] = []
@@ -181,6 +182,7 @@ class VLMSFTCollator:
         tokenizer: PreTrainedTokenizer,
         max_length: int,
         image_processor: BaseImageProcessor,
+        model_type: str,
         *,
         max_vision_patches_per_sample: int | None = None,
         max_vision_images_per_sample: int | None = None,
@@ -194,7 +196,7 @@ class VLMSFTCollator:
         self._pixel_values_dtype = pixel_values_dtype
         if tokenizer.pad_token_id is None:
             raise ValueError("tokenizer must define pad_token_id")
-        self._encoder = QwenChatMessageEncoder(tokenizer, image_processor)
+        self._encoder = Qwen3MessageEncoder(tokenizer, image_processor, model_type)
 
         self._image_token_id = tokenizer.convert_tokens_to_ids("<|image_pad|>")
         self._video_token_id = tokenizer.convert_tokens_to_ids("<|video_pad|>")

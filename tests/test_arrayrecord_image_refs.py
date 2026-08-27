@@ -14,8 +14,8 @@ from absl.testing import absltest
 from array_record.python.array_record_module import ArrayRecordWriter
 from PIL import Image
 
-from omegalax.data import qwen_chat_encoding
-from omegalax.data.qwen_chat_encoding import _extract_images
+from omegalax.data import qwen3_encoding
+from omegalax.data.qwen3_encoding import _extract_images
 
 
 def _jpeg_bytes(color: tuple[int, int, int]) -> bytes:
@@ -26,7 +26,7 @@ def _jpeg_bytes(color: tuple[int, int, int]) -> bytes:
 
 class ArrayRecordImageRefsTest(absltest.TestCase):
     def tearDown(self):
-        qwen_chat_encoding._close_arrayrecord_image_sources()
+        qwen3_encoding._close_arrayrecord_image_sources()
         super().tearDown()
 
     def test_extract_images_reads_the_arrayrecord_uri_fragment_as_the_record_index(self):
@@ -60,9 +60,9 @@ class ArrayRecordImageRefsTest(absltest.TestCase):
             )
 
     def test_arrayrecord_reader_cache_evicts_and_closes_old_reader(self):
-        old_cache_size = qwen_chat_encoding._ARRAYRECORD_IMAGE_CACHE_SIZE
-        qwen_chat_encoding._ARRAYRECORD_IMAGE_CACHE_SIZE = 1
-        qwen_chat_encoding._close_arrayrecord_image_sources()
+        old_cache_size = qwen3_encoding._ARRAYRECORD_IMAGE_CACHE_SIZE
+        qwen3_encoding._ARRAYRECORD_IMAGE_CACHE_SIZE = 1
+        qwen3_encoding._close_arrayrecord_image_sources()
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
                 shard_a = Path(tmpdir) / "a.array_record"
@@ -82,7 +82,7 @@ class ArrayRecordImageRefsTest(absltest.TestCase):
                         }
                     ]
                 )
-                reader_a = qwen_chat_encoding._ARRAYRECORD_IMAGE_SOURCES[str(shard_a)]
+                reader_a = qwen3_encoding._ARRAYRECORD_IMAGE_SOURCES[str(shard_a)]
 
                 _extract_images(
                     [
@@ -94,11 +94,11 @@ class ArrayRecordImageRefsTest(absltest.TestCase):
                 )
 
                 self.assertFalse(reader_a.is_open())
-                self.assertNotIn(str(shard_a), qwen_chat_encoding._ARRAYRECORD_IMAGE_SOURCES)
-                self.assertIn(str(shard_b), qwen_chat_encoding._ARRAYRECORD_IMAGE_SOURCES)
+                self.assertNotIn(str(shard_a), qwen3_encoding._ARRAYRECORD_IMAGE_SOURCES)
+                self.assertIn(str(shard_b), qwen3_encoding._ARRAYRECORD_IMAGE_SOURCES)
         finally:
-            qwen_chat_encoding._ARRAYRECORD_IMAGE_CACHE_SIZE = old_cache_size
-            qwen_chat_encoding._close_arrayrecord_image_sources()
+            qwen3_encoding._ARRAYRECORD_IMAGE_CACHE_SIZE = old_cache_size
+            qwen3_encoding._close_arrayrecord_image_sources()
 
 
 if __name__ == "__main__":

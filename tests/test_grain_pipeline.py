@@ -49,12 +49,12 @@ def _measurement(message, length=1):
     }
 
 
-def _measure_one(messages):
-    return [_measurement(message) for message in messages]
+def _measure_one(message):
+    return _measurement(message)
 
 
-def _measure_declared(messages):
-    return [message["measurement"] for message in messages]
+def _measure_declared(message):
+    return message["measurement"]
 
 
 def _measured(role, content, length=1, vision_tokens=0):

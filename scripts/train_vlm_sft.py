@@ -11,7 +11,7 @@ import grain
 import jax
 import wandb
 from absl import app, flags
-from transformers import AutoImageProcessor, AutoTokenizer
+from transformers import AutoConfig, AutoImageProcessor, AutoTokenizer
 
 from omegalax.compat.cudnn_ampere_packed import enable_ampere_packed_attention
 from omegalax.data.collator_qwen3 import VLMSFTCollator
@@ -358,6 +358,7 @@ def main(_) -> None:
     startup_log("jax.distributed initialized")
 
     tokenizer = AutoTokenizer.from_pretrained(model_source, local_files_only=True)
+    model_type = AutoConfig.from_pretrained(model_source, local_files_only=True).model_type
     startup_log(f"loaded tokenizer from {str(model_source)!r}")
     assert FLAGS.max_length <= tokenizer.model_max_length, (
         f"--max_length={FLAGS.max_length} exceeds tokenizer.model_max_length={tokenizer.model_max_length}"
@@ -411,6 +412,7 @@ def main(_) -> None:
         tokenizer,
         max_length=FLAGS.max_length,
         image_processor=image_processor,
+        model_type=model_type,
         max_vision_patches_per_sample=FLAGS.max_vision_patches_per_sample or None,
         max_vision_images_per_sample=FLAGS.max_vision_images_per_sample or None,
     )

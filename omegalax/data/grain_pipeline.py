@@ -174,12 +174,9 @@ def required_epochs_for_batches(
     return max(1, (required_records + records_per_epoch - 1) // records_per_epoch)
 
 
-def _measure_worker(keyed_conversation):
-    conv_idx, messages = keyed_conversation
-    measurements = _measure_fn(messages)
-    if not isinstance(measurements, list) or len(measurements) != len(messages):
-        raise ValueError("conversation measurement must return one result per message")
-    return [((conv_idx, offset), result) for offset, result in enumerate(measurements)]
+def _measure_worker(keyed_message):
+    key, message = keyed_message
+    return key, _measure_fn(message)
 
 
 def _compute_distribution(values: list[int]) -> dict[str, int | float]:
@@ -377,7 +374,7 @@ def _preflight_measure_fn(measure_message, tasks, chat_path) -> None:
 
 
 def _compute_message_lengths_from_chat(chat_path, measure_message, num_workers) -> dict:
-    """Measure every conversation in a chat.jsonl under ``spawn``.
+    """Measure every message in a chat.jsonl under ``spawn``.
 
     Returns ``{(conv_idx, msg_offset): measurement}``. Uses the ``spawn`` start
     method, not ``fork``: ar:// image refs are read from a native ArrayRecord
@@ -386,21 +383,24 @@ def _compute_message_lengths_from_chat(chat_path, measure_message, num_workers) 
     clean; ``measure_message`` is shipped to each worker via the pool
     initializer since spawn does not inherit globals.
     """
-    tasks: list[tuple[int, list[dict[str, Any]]]] = []
+    conversations: list[tuple[int, list[dict[str, Any]]]] = []
+    tasks: list[tuple[tuple[int, int], dict[str, Any]]] = []
     for conv_idx, _sid, _meta, messages in _iter_chat_conversations(chat_path):
-        tasks.append((conv_idx, messages))
+        conversations.append((conv_idx, messages))
+        tasks.extend(((conv_idx, offset), message) for offset, message in enumerate(messages))
     if not tasks:
         return {}
-    _preflight_measure_fn(measure_message, tasks, chat_path)
+    _preflight_measure_fn(measure_message, conversations, chat_path)
     ctx = mp.get_context("spawn")
     chunksize = max(1, min(32, len(tasks) // num_workers))
     with ctx.Pool(num_workers, initializer=_measure_init, initargs=(measure_message,)) as pool:
-        batches = tqdm(
-            pool.imap_unordered(_measure_worker, tasks, chunksize=chunksize),
-            total=len(tasks),
-            desc=f"Measuring conversations ({num_workers} workers)",
+        results = dict(
+            tqdm(
+                pool.imap_unordered(_measure_worker, tasks, chunksize=chunksize),
+                total=len(tasks),
+                desc=f"Measuring messages ({num_workers} workers)",
+            )
         )
-        results = dict(chain.from_iterable(batches))
     return results
 
 

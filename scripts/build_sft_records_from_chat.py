@@ -13,10 +13,10 @@ from __future__ import annotations
 import json
 
 from absl import app, flags
-from transformers import AutoImageProcessor, AutoTokenizer
+from transformers import AutoConfig, AutoImageProcessor, AutoTokenizer
 
 from omegalax.data.grain_pipeline import build_records_from_chat
-from omegalax.data.qwen_chat_encoding import make_message_length_fn
+from omegalax.data.qwen3_encoding import make_message_length_fn
 from omegalax.registry import resolve_hf_repo_id
 
 FLAGS = flags.FLAGS
@@ -72,6 +72,7 @@ flags.DEFINE_string(
 def main(_) -> None:
     tokenizer_name = FLAGS.tokenizer or resolve_hf_repo_id(FLAGS.model_id)
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+    model_type = AutoConfig.from_pretrained(resolve_hf_repo_id(FLAGS.model_id)).model_type
 
     image_processor = None
     if FLAGS.processor:
@@ -80,15 +81,15 @@ def main(_) -> None:
             with open(FLAGS.preprocessor_config) as f:
                 ip_kwargs = json.load(f)
         image_processor = AutoImageProcessor.from_pretrained(
-            processor_name, use_fast=False, **ip_kwargs
+            FLAGS.processor, use_fast=False, **ip_kwargs
         )
 
-    measure_conversation = make_message_length_fn(tokenizer, image_processor)
+    measure_message = make_message_length_fn(tokenizer, image_processor, model_type)
     out_dir = build_records_from_chat(
         FLAGS.data_path,
         FLAGS.out_dir,
         max_length=FLAGS.max_length,
-        measure_message=measure_conversation,
+        measure_message=measure_message,
         records_per_shard=FLAGS.records_per_shard,
         overwrite=FLAGS.overwrite,
         num_workers=FLAGS.num_workers,

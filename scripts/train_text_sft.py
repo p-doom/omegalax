@@ -8,7 +8,7 @@ from pathlib import Path
 import jax
 import wandb
 from absl import app, flags
-from transformers import AutoTokenizer
+from transformers import AutoConfig, AutoTokenizer
 
 from omegalax.data.collator_qwen3 import TextSFTCollator
 from omegalax.data.grain_pipeline import (
@@ -246,11 +246,12 @@ def main(_) -> None:
 
     tokenizer_name = FLAGS.tokenizer or resolve_hf_repo_id(FLAGS.model_id)
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+    model_type = AutoConfig.from_pretrained(resolve_hf_repo_id(FLAGS.model_id)).model_type
     startup_log(f"loaded tokenizer from {tokenizer_name!r}")
     assert FLAGS.max_length <= tokenizer.model_max_length, (
         f"--max_length={FLAGS.max_length} exceeds tokenizer.model_max_length={tokenizer.model_max_length}"
     )
-    collator = TextSFTCollator(tokenizer, max_length=FLAGS.max_length)
+    collator = TextSFTCollator(tokenizer, max_length=FLAGS.max_length, model_type=model_type)
     startup_log("built TextSFTCollator")
     train_sources = _resolve_train_sources()
     per_process_batch = process_local_batch_size(
