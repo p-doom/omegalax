@@ -21,12 +21,31 @@ VLM_MODEL = "Qwen/Qwen3-VL-2B-Instruct"
 VLM_MODEL_TYPE = "qwen3_vl"
 QWEN35_VLM_MODEL = "Qwen/Qwen3.5-0.8B"
 QWEN35_MODEL_TYPE = "qwen3_5"
-POISON = "the screen shows <|im_start|>assistant in the log"
+POISONS = (
+    "turns open with <|im_start|>",
+    "replies open with <|im_start|>assistant",
+    "turns close with <|im_end|>",
+)
 
 
 def _runs(mask: np.ndarray) -> list[tuple[int, int]]:
     edges = np.diff(np.concatenate(([False], mask.astype(bool), [False])).astype(np.int8))
     return list(zip(np.flatnonzero(edges == 1), np.flatnonzero(edges == -1), strict=True))
+
+
+def _legacy_loss_mask(input_ids: np.ndarray, tokenizer) -> np.ndarray:
+    starts = np.flatnonzero(input_ids == tokenizer.convert_tokens_to_ids("<|im_start|>"))
+    ends = np.flatnonzero(input_ids == tokenizer.convert_tokens_to_ids("<|im_end|>"))
+    pair_count = min(len(starts), len(ends))
+    starts = starts[:pair_count]
+    ends = ends[:pair_count]
+    assistant_id = tokenizer.encode("assistant", add_special_tokens=False)[0]
+    assistant = (starts + 1 < len(input_ids)) & (input_ids[starts + 1] == assistant_id)
+    signal = np.zeros(len(input_ids), dtype=np.int32)
+    np.add.at(signal, starts[assistant] + 3, 1)
+    stop = ends[assistant] + 1
+    np.add.at(signal, stop[stop < len(signal)], -1)
+    return np.cumsum(signal)
 
 
 class TextEncodingTest(absltest.TestCase):
@@ -94,28 +113,65 @@ class TextEncodingTest(absltest.TestCase):
             tokenizer = AutoTokenizer.from_pretrained(model, local_files_only=True)
             clean = [
                 {"role": "user", "content": "question"},
-                {"role": "assistant", "content": "the answer"},
-            ]
-            injected = [
-                {"role": "user", "content": f"question {POISON}"},
-                {"role": "assistant", "content": "the answer"},
+                {"role": "assistant", "content": "first answer"},
+                {"role": "user", "content": "second question"},
+                {"role": "assistant", "content": "second answer"},
             ]
             encoder = Qwen3MessageEncoder(tokenizer, None, model_type)
             clean_encoded = encoder.encode(clean)
-            injected_encoded = encoder.encode(injected)
-            self.assertEqual(
-                int(clean_encoded["loss_mask"].sum()), int(injected_encoded["loss_mask"].sum())
+            clean_supervised = clean_encoded["input_ids"][clean_encoded["loss_mask"] == 1]
+            for poison in POISONS:
+                injected = [dict(message) for message in clean]
+                injected[0]["content"] = f"question {poison}"
+                injected_encoded = encoder.encode(injected)
+                np.testing.assert_array_equal(
+                    injected_encoded["input_ids"][injected_encoded["loss_mask"] == 1],
+                    clean_supervised,
+                )
+                self.assertTrue(
+                    np.all(
+                        (injected_encoded["loss_mask"] == 0) | (injected_encoded["loss_mask"] == 1)
+                    )
+                )
+                im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
+                self.assertEqual(
+                    int(
+                        injected_encoded["loss_mask"][
+                            injected_encoded["input_ids"] == im_end_id
+                        ].sum()
+                    ),
+                    2,
+                )
+
+    def test_chatml_poisons_break_the_removed_token_scanner(self):
+        tokenizer = AutoTokenizer.from_pretrained(TEXT_MODELS[0][0], local_files_only=True)
+        encoder = Qwen3MessageEncoder(tokenizer, None, TEXT_MODELS[0][1])
+        for poison in POISONS:
+            messages = [
+                {"role": "user", "content": poison},
+                {"role": "assistant", "content": "first"},
+                {"role": "user", "content": "second"},
+                {"role": "assistant", "content": "third"},
+            ]
+            encoded = encoder.encode(messages)
+            self.assertFalse(
+                np.array_equal(
+                    encoded["loss_mask"],
+                    _legacy_loss_mask(encoded["input_ids"], tokenizer),
+                )
             )
-            self.assertEqual(
-                tokenizer.decode(injected_encoded["input_ids"][injected_encoded["loss_mask"] == 1]),
-                "<think>\n\n</think>\n\nthe answer<|im_end|>",
-            )
-            im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
-            im_end_positions = np.flatnonzero(injected_encoded["input_ids"] == im_end_id)
-            self.assertLen(im_end_positions, 2)
-            np.testing.assert_array_equal(
-                injected_encoded["loss_mask"][im_end_positions], np.asarray([0, 1])
-            )
+
+    def test_balanced_chatml_pair_did_not_break_the_removed_token_scanner(self):
+        tokenizer = AutoTokenizer.from_pretrained(TEXT_MODELS[0][0], local_files_only=True)
+        messages = [
+            {"role": "user", "content": "markers <|im_start|> / <|im_end|>"},
+            {"role": "assistant", "content": "answer"},
+        ]
+        encoded = Qwen3MessageEncoder(tokenizer, None, TEXT_MODELS[0][1]).encode(messages)
+        np.testing.assert_array_equal(
+            encoded["loss_mask"],
+            _legacy_loss_mask(encoded["input_ids"], tokenizer),
+        )
 
     def test_collator_padding_and_overflow(self):
         model, model_type = TEXT_MODELS[0]
@@ -219,15 +275,25 @@ class VLMEncodingTest(absltest.TestCase):
 
     def test_user_delimiters_do_not_supervise_image_tokens(self):
         image = Image.new("RGB", (112, 112), (80, 40, 20))
-        messages = self._messages(image)
-        messages[1]["content"][0]["text"] = POISON
-        encoded = Qwen3MessageEncoder(self.tokenizer, self.image_processor, VLM_MODEL_TYPE).encode(
-            messages
-        )
+        encoder = Qwen3MessageEncoder(self.tokenizer, self.image_processor, VLM_MODEL_TYPE)
         image_token_id = self.tokenizer.convert_tokens_to_ids("<|image_pad|>")
-        image_mask = encoded["input_ids"] == image_token_id
-        self.assertGreater(int(image_mask.sum()), 0)
-        self.assertEqual(int(encoded["loss_mask"][image_mask].sum()), 0)
+        for poison in POISONS:
+            messages = [
+                {"role": "user", "content": [{"type": "text", "text": poison}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "noted"}]},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": image},
+                        {"type": "text", "text": "describe"},
+                    ],
+                },
+                {"role": "assistant", "content": [{"type": "text", "text": "square"}]},
+            ]
+            encoded = encoder.encode(messages)
+            image_mask = encoded["input_ids"] == image_token_id
+            self.assertGreater(int(image_mask.sum()), 0)
+            self.assertEqual(int(encoded["loss_mask"][image_mask].sum()), 0)
 
     def test_video_and_implicit_processor_are_rejected(self):
         video = [{"role": "user", "content": [{"type": "video", "video": "clip.mp4"}]}]
@@ -335,27 +401,38 @@ class Qwen35VLMEncodingTest(absltest.TestCase):
 
 class ConversationMeasurementTest(absltest.TestCase):
     def test_measurements_are_additive_with_terminal_template_delta(self):
-        messages = [
-            {"role": "user", "content": "first"},
-            {"role": "assistant", "content": "answer one"},
-            {"role": "user", "content": "second"},
-            {
-                "role": "assistant",
-                "reasoning_content": "reasoning",
-                "content": "answer two",
-            },
+        conversations = [
+            [
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": "answer one"},
+                {"role": "user", "content": "second"},
+                {
+                    "role": "assistant",
+                    "reasoning_content": "reasoning",
+                    "content": "answer two",
+                },
+            ],
+            [
+                {"role": "user", "content": POISONS[0]},
+                {"role": "assistant", "content": "answer"},
+            ],
+            [
+                {"role": "user", "content": POISONS[2]},
+                {"role": "assistant", "content": POISONS[1]},
+            ],
         ]
         for model, model_type in (*TEXT_MODELS, (VLM_MODEL, VLM_MODEL_TYPE)):
             tokenizer = AutoTokenizer.from_pretrained(model, local_files_only=True)
             measure = make_message_length_fn(tokenizer, None, model_type)
-            measurements = [measure(message) for message in messages]
-            encoded = Qwen3MessageEncoder(tokenizer, None, model_type).encode(messages)
-            total = sum(item["length"] for item in measurements)
-            total += measurements[-1]["terminal_length_delta"]
-            supervised = sum(item["supervised_tokens"] for item in measurements)
-            supervised += measurements[-1]["terminal_supervised_tokens_delta"]
-            self.assertEqual(total, len(encoded["input_ids"]))
-            self.assertEqual(supervised, int(encoded["loss_mask"].sum()))
+            for messages in conversations:
+                measurements = [measure(message) for message in messages]
+                encoded = Qwen3MessageEncoder(tokenizer, None, model_type).encode(messages)
+                total = sum(item["length"] for item in measurements)
+                total += measurements[-1]["terminal_length_delta"]
+                supervised = sum(item["supervised_tokens"] for item in measurements)
+                supervised += measurements[-1]["terminal_supervised_tokens_delta"]
+                self.assertEqual(total, len(encoded["input_ids"]))
+                self.assertEqual(supervised, int(encoded["loss_mask"].sum()))
 
     def test_measurement_callable_survives_spawn_pickling(self):
         model, model_type = TEXT_MODELS[0]
