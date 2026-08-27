@@ -8,28 +8,29 @@ import gc
 import os
 from pathlib import Path
 
-from flax import nnx
 import jax
 import jax.numpy as jnp
-from jax.sharding import NamedSharding, PartitionSpec
 import optax
 import orbax.checkpoint as ocp
+from flax import nnx
+from jax.sharding import NamedSharding, PartitionSpec
 
+from omegalax import export as export_lib
 from omegalax.data.grain_pipeline import pop_source_ids
 from omegalax.distributed.mesh import ensure_mesh, mesh_rules, required_batch_multiple
-from omegalax import export as export_lib
 from omegalax.models.params_utils import save_hf_config
+from omegalax.models.qwen3_5 import Qwen3_5TextConfig
+from omegalax.models.qwen3_5.kernels import resolve_backend as resolve_deltanet_backend
 from omegalax.text import api as text_api
 from omegalax.trainers import checkpoint_utils
 from omegalax.trainers.loss import chunked_cross_entropy_loss
 from omegalax.trainers.lr_schedule import build_lr_schedule
 from omegalax.trainers.optim import MixedPrecisionOptimizer
 from omegalax.trainers.perf import (
-    maybe_log_step_metrics,
-    per_device_step_flops,
-    record_deltanet_kernel,
     StepFlops,
     StepTimer,
+    maybe_log_step_metrics,
+    per_device_step_flops,
 )
 
 P = PartitionSpec
@@ -331,8 +332,10 @@ def run_sft(
 
     set_attn_backend(model, text_backend=text_attn_backend)
     startup_log(f"set attn backend: text={text_attn_backend}")
-    deltanet_kernel = record_deltanet_kernel(model_cfg, wandb_run)
-    if deltanet_kernel is not None:
+    if isinstance(model_cfg, Qwen3_5TextConfig):
+        deltanet_kernel = resolve_deltanet_backend()
+        if wandb_run is not None and is_primary_process:
+            wandb_run.config.update({"deltanet_kernel": deltanet_kernel}, allow_val_change=True)
         startup_log(f"deltanet kernel: {deltanet_kernel}")
     with mesh_rules(mesh):
         optimizer = build_optimizer(model, train_cfg)

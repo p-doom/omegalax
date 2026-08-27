@@ -22,6 +22,7 @@ from omegalax.data.grain_pipeline import pop_source_ids
 from omegalax.distributed.mesh import ensure_mesh, mesh_rules, required_batch_multiple
 from omegalax.models.params_utils import save_hf_config
 from omegalax.models.qwen3_5 import Qwen3_5Config
+from omegalax.models.qwen3_5.kernels import resolve_backend as resolve_deltanet_backend
 from omegalax.models.qwen3_vl import Qwen3VLConfig
 from omegalax.models.qwen3_vl.model import DECODER_LAYER_REMAT
 from omegalax.models.qwen3_vl.vision import VISION_BLOCK_REMAT
@@ -46,7 +47,6 @@ from omegalax.trainers.perf import (
     log_top_leaves_with_paths,
     maybe_log_step_metrics,
     per_device_step_flops,
-    record_deltanet_kernel,
 )
 from omegalax.trainers.text import startup_log
 from omegalax.vlm import api as vlm_api
@@ -599,8 +599,10 @@ def _run_sft(
 
     set_attn_backend(model, text_backend=text_attn_backend)
     startup_log(f"set attn backend: text={text_attn_backend}")
-    deltanet_kernel = record_deltanet_kernel(model_cfg, wandb_run)
-    if deltanet_kernel is not None:
+    if isinstance(model_cfg, Qwen3_5Config):
+        deltanet_kernel = resolve_deltanet_backend()
+        if wandb_run is not None and is_primary_process:
+            wandb_run.config.update({"deltanet_kernel": deltanet_kernel}, allow_val_change=True)
         startup_log(f"deltanet kernel: {deltanet_kernel}")
     if train_cfg.enable_lora and train_cfg.freeze_vision_tower:
         raise ValueError(

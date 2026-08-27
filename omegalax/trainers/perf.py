@@ -20,7 +20,6 @@ import numpy as np
 
 from omegalax.models.qwen3.config import Qwen3Config
 from omegalax.models.qwen3_5.config import Qwen3_5Config, Qwen3_5TextConfig
-from omegalax.models.qwen3_5.kernels import resolve_backend as resolve_deltanet_backend
 from omegalax.models.qwen3_vl.config import Qwen3VLConfig
 
 # Config types that the FLOP counters accept (text or full VLM configs).
@@ -57,20 +56,6 @@ def resolve_peak_tflops(spec: str | float | None) -> float | None:
         raise ValueError(
             f"Unknown peak_tflops {spec!r}. Use a key from {list(PEAK_TFLOPS)} or a number."
         ) from e
-
-
-def record_deltanet_kernel(cfg: RunPerfConfig, wandb_run: Any) -> str | None:
-    """Record which DeltaNet kernel this run's MFU/HFU is measuring; None if it has none.
-
-    Resolved here rather than at first trace so an unavailable kernel fails before
-    training and the recorded value is provably the one that ran.
-    """
-    if not isinstance(cfg, (Qwen3_5Config, Qwen3_5TextConfig)):
-        return None
-    backend = resolve_deltanet_backend()
-    if wandb_run is not None and jax.process_index() == 0:
-        wandb_run.config.update({"deltanet_kernel": backend}, allow_val_change=True)
-    return backend
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
