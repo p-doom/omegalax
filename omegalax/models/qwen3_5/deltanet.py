@@ -161,7 +161,6 @@ class GatedDeltaNet(nnx.Module):
             out_sharding=heads_shd,
         )
 
-        from jax.experimental.shard_map import shard_map
         mesh = jax.sharding.get_abstract_mesh()
         beta_BTH = jax.nn.sigmoid(b_BTH)
         A_H = -jnp.exp(self.A_log[...].astype(jnp.float32))
@@ -204,11 +203,12 @@ class GatedDeltaNet(nnx.Module):
             gated = normed * jax.nn.silu(z_flat.astype(jnp.float32))
             return gated.astype(dtype).reshape(out.shape[0], out.shape[1], H * U)
 
-        normed_BTD = shard_map(
-            _full_deltanet, mesh,
+        normed_BTD = jax.shard_map(
+            _full_deltanet,
+            mesh=mesh,
             in_specs=(heads_shd, heads_shd, heads_shd, heads_shd, beta_g_shd, beta_g_shd, P(None)),
             out_specs=self.shd_cfg.act_btf,
-            check_rep=False,
+            check_vma=False,
         )(q_BTHA, k_BTHA, v_BTHU, z_BTHU, g_BTH, beta_BTH, norm_w)
 
         out_BTD = self.out_proj(normed_BTD, out_sharding=self.shd_cfg.act_btd)
