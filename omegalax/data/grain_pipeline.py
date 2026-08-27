@@ -22,6 +22,7 @@ COMPILED_METADATA_FILENAME = "metadata.json"
 TOKEN_STATS_FILENAME = "token_stats.json"
 TRUNCATION_STATS_FILENAME = "truncation_stats.json"
 SEQUENCE_LENGTHS_FILENAME = "sequence_lengths.jsonl"
+ARRAY_RECORD_SUFFIX = ".array_record"
 
 SOURCE_ID_KEY = "_omegalax_source_id"
 BATCH_SOURCE_IDS_KEY = "source_ids"
@@ -115,32 +116,33 @@ def _build_session_id(path: Path, line_num: int) -> str:
 
 def resolve_arrayrecord_paths(path: str | Path) -> list[Path]:
     path = Path(path).expanduser().resolve()
-    metadata = load_compiled_metadata(path)
+    if path.is_file():
+        if path.suffix != ARRAY_RECORD_SUFFIX:
+            raise ValueError(
+                f"Expected a compiled Grain shard ({ARRAY_RECORD_SUFFIX}) or dataset directory, got file: {path}"
+            )
+        return [path]
+    metadata_path = path / COMPILED_METADATA_FILENAME
+    assert metadata_path.is_file(), (
+        f"Compiled Grain dataset metadata does not exist: {metadata_path}"
+    )
+    metadata = json.loads(metadata_path.read_text())
     shard_paths = [path / rel for rel in metadata["shard_paths"]]
 
-    invalid = [candidate for candidate in shard_paths if not candidate.is_file()]
-    if invalid:
-        raise ValueError(f"Compiled dataset has missing or non-file shard(s): {invalid}")
+    if not shard_paths:
+        raise ValueError(f"No ArrayRecord shards found under: {path}")
+    missing = [p for p in shard_paths if not p.exists()]
+    if missing:
+        raise ValueError(f"Missing ArrayRecord shard(s): {missing}")
     return shard_paths
 
 
 def load_compiled_metadata(path: str | Path) -> dict[str, Any]:
     path = Path(path).expanduser().resolve()
     metadata_path = path / COMPILED_METADATA_FILENAME
-    if not metadata_path.is_file():
+    if not metadata_path.exists():
         raise ValueError(f"Compiled Grain dataset metadata does not exist: {metadata_path}")
-    metadata = json.loads(metadata_path.read_text())
-    if not isinstance(metadata, dict):
-        raise TypeError("Compiled Grain dataset metadata must be an object")
-    shard_paths = metadata.get("shard_paths")
-    if not isinstance(shard_paths, list) or not shard_paths or not all(
-        isinstance(item, str) for item in shard_paths
-    ):
-        raise ValueError(f"Compiled Grain dataset has no shard paths: {metadata_path}")
-    num_records = metadata.get("num_records")
-    if type(num_records) is not int or num_records <= 0:
-        raise ValueError(f"Compiled Grain dataset has invalid num_records: {num_records!r}")
-    return metadata
+    return json.loads(metadata_path.read_text())
 
 
 def required_epochs_for_batches(
@@ -157,7 +159,7 @@ def required_epochs_for_batches(
         raise ValueError("batch_size must be > 0")
 
     metadata = load_compiled_metadata(path)
-    num_records = metadata["num_records"]
+    num_records = int(metadata["num_records"])
     dp = dp_size * fsdp_size
     records_per_epoch = num_records // dp
     if records_per_epoch <= 0:

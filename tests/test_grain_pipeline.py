@@ -518,7 +518,7 @@ class GrainPipelineTest(absltest.TestCase):
             src = Path(tmpdir) / "train.jsonl"
             self._write_jsonl(src, [{"messages": [{"role": "user", "content": "a"}]}])
 
-            with self.assertRaisesRegex(ValueError, "metadata does not exist"):
+            with self.assertRaisesRegex(ValueError, "compiled Grain shard"):
                 resolve_arrayrecord_paths(src)
 
 
