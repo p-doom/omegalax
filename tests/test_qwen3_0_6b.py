@@ -11,19 +11,17 @@ import jax.numpy as jnp
 import numpy as np
 import safetensors
 import torch
-
 from absl.testing import absltest
 from flax import nnx
 from huggingface_hub import snapshot_download
 from transformers import AutoConfig, AutoTokenizer, Qwen3ForCausalLM
 
-from tests.logits_assert import assert_logits_close
-from tests.real_weights import requires_real_weights
 from omegalax.distributed.mesh import mesh_rules_for
-from omegalax.text import api
 from omegalax.models.params_utils import map_to_bonsai_key
 from omegalax.models.qwen3 import loader as qwen3_loader
-
+from omegalax.text import api
+from tests.logits_assert import assert_logits_close
+from tests.real_weights import requires_real_weights
 
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
@@ -92,7 +90,13 @@ class Qwen3MappingTest(absltest.TestCase):
             )
             for t in texts
         ]
-        toks = self.tokenizer(chat_texts, return_tensors="pt", padding=True, padding_side="right")
+        toks = self.tokenizer(
+            chat_texts,
+            return_tensors="pt",
+            padding=True,
+            padding_side="right",
+            pad_to_multiple_of=8,
+        )
         return {k: v.to(self.device) for k, v in toks.items()}
 
     def _jax_prefill_logits(self, input_ids: torch.Tensor) -> np.ndarray:
@@ -110,7 +114,7 @@ class Qwen3MappingTest(absltest.TestCase):
         unmapped: list[str] = []
         for f in Path(self.model_path).glob("*.safetensors"):
             with safetensors.safe_open(f, framework="numpy") as sf:
-                for torch_key in sf.keys():
+                for torch_key in sf:
                     jax_key, _ = map_to_bonsai_key(mapping, torch_key)
                     if jax_key is None:
                         unmapped.append(torch_key)
