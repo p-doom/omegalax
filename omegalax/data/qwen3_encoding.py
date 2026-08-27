@@ -127,12 +127,19 @@ def _validate_message(message: dict[str, Any], *, multimodal: bool, family: str)
     if (
         not isinstance(message, dict)
         or not {"role", "content"} <= set(message)
-        or set(message) - {"role", "content", "reasoning_content"}
+        or set(message) - {"role", "content", "reasoning_content", "loss"}
     ):
-        raise ValueError("messages must contain role, content, and optional reasoning_content")
+        raise ValueError(
+            "messages must contain role, content, and optional reasoning_content and loss"
+        )
     role = message["role"]
     if role not in {"system", "user", "assistant"}:
         raise ValueError(f"unsupported message role: {role!r}")
+    if "loss" in message:
+        if role != "assistant":
+            raise ValueError("loss is supported only on assistant turns")
+        if not isinstance(message["loss"], bool):
+            raise ValueError("loss must be a boolean")
     reasoning = message.get("reasoning_content")
     if reasoning is not None and (role != "assistant" or not isinstance(reasoning, str)):
         raise ValueError("reasoning_content must be a string on an assistant turn")
@@ -198,6 +205,10 @@ def _assistant_loss_mask(block_ids: np.ndarray) -> np.ndarray:
     return mask
 
 
+def _message_is_supervised(message: dict[str, Any]) -> bool:
+    return message["role"] == "assistant" and message.get("loss", True)
+
+
 def _reasoning_prefix(message: dict[str, Any], family: str) -> str:
     reasoning = message.get("reasoning_content") or ""
     reasoning = reasoning.strip("\n") if family == "qwen3" else reasoning.strip()
@@ -260,7 +271,11 @@ class Qwen3MessageEncoder:
             content = _reasoning_prefix(message, self.family) + content
         text = f"<|im_start|>{role}\n{content}<|im_end|>\n"
         ids = np.asarray(self.tokenizer.encode(text, add_special_tokens=False), dtype=np.int32)
-        mask = _assistant_loss_mask(ids) if role == "assistant" else np.zeros(len(ids), np.int32)
+        mask = (
+            _assistant_loss_mask(ids)
+            if _message_is_supervised(message)
+            else np.zeros(len(ids), np.int32)
+        )
         return ids, mask
 
     def encode(self, messages: list[dict[str, Any]]) -> dict[str, np.ndarray]:
@@ -312,7 +327,9 @@ class Qwen3MessageEncoder:
             "length": len(ids),
             "terminal_length_delta": terminal_delta,
             "supervised_tokens": int(mask.sum()),
-            "terminal_supervised_tokens_delta": terminal_delta,
+            "terminal_supervised_tokens_delta": (
+                terminal_delta if _message_is_supervised(message) else 0
+            ),
             "vision_tokens": vision_tokens,
             "vision_patches": vision_patches,
             "num_images": len(grids),

@@ -91,6 +91,67 @@ class TextEncodingTest(absltest.TestCase):
                 ],
             )
 
+    def test_loss_false_makes_an_assistant_turn_context_only(self):
+        clean = [
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": "answer one"},
+            {"role": "user", "content": "second"},
+            {"role": "assistant", "content": "answer two"},
+        ]
+        marked = [dict(message) for message in clean]
+        marked[1]["loss"] = False
+        for model, model_type in TEXT_MODELS:
+            tokenizer = AutoTokenizer.from_pretrained(model, local_files_only=True)
+            encoder = Qwen3MessageEncoder(tokenizer, None, model_type)
+            clean_encoded = encoder.encode(clean)
+            marked_encoded = encoder.encode(marked)
+            np.testing.assert_array_equal(marked_encoded["input_ids"], clean_encoded["input_ids"])
+            measurement = encoder.measure(marked[1])
+            self.assertEqual(measurement["supervised_tokens"], 0)
+            self.assertEqual(measurement["terminal_supervised_tokens_delta"], 0)
+            spans = [
+                tokenizer.decode(marked_encoded["input_ids"][start:end])
+                for start, end in _runs(marked_encoded["loss_mask"])
+            ]
+            self.assertEqual(spans, ["<think>\n\n</think>\n\nanswer two<|im_end|>"])
+
+    def test_loss_defaults_true(self):
+        clean = [
+            {"role": "user", "content": "question"},
+            {"role": "assistant", "content": "answer"},
+        ]
+        marked = [
+            {"role": "user", "content": "question"},
+            {"role": "assistant", "content": "answer", "loss": True},
+        ]
+        model, model_type = TEXT_MODELS[0]
+        tokenizer = AutoTokenizer.from_pretrained(model, local_files_only=True)
+        encoder = Qwen3MessageEncoder(tokenizer, None, model_type)
+        clean_encoded = encoder.encode(clean)
+        marked_encoded = encoder.encode(marked)
+        np.testing.assert_array_equal(marked_encoded["input_ids"], clean_encoded["input_ids"])
+        np.testing.assert_array_equal(marked_encoded["loss_mask"], clean_encoded["loss_mask"])
+
+    def test_loss_must_be_boolean(self):
+        model, model_type = TEXT_MODELS[0]
+        tokenizer = AutoTokenizer.from_pretrained(model, local_files_only=True)
+        messages = [
+            {"role": "user", "content": "question"},
+            {"role": "assistant", "content": "answer", "loss": 0},
+        ]
+        with self.assertRaisesRegex(ValueError, "loss must be a boolean"):
+            Qwen3MessageEncoder(tokenizer, None, model_type).encode(messages)
+
+    def test_loss_is_rejected_on_non_assistant_turns(self):
+        model, model_type = TEXT_MODELS[0]
+        tokenizer = AutoTokenizer.from_pretrained(model, local_files_only=True)
+        messages = [
+            {"role": "user", "content": "question", "loss": False},
+            {"role": "assistant", "content": "answer"},
+        ]
+        with self.assertRaisesRegex(ValueError, "only on assistant turns"):
+            Qwen3MessageEncoder(tokenizer, None, model_type).encode(messages)
+
     def test_explicit_reasoning_matches_chat_templates(self):
         messages = [
             {"role": "user", "content": "question"},

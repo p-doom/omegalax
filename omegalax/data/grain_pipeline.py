@@ -578,15 +578,16 @@ def _process_conversation(
         terminal_delta,
         terminal_supervised_delta,
     ):
-        """Return an example, or charge an assistant-free slice as dropped."""
+        """Return an example, or charge an unsupervised slice as dropped."""
         nonlocal dropped_messages, dropped_tokens
         if not cur_msgs:
             return None
-        if not any(m.get("role") == "assistant" for m in cur_msgs):
-            dropped_messages += len(cur_msgs)
-            dropped_tokens += cur_len
-            return None
         chunk_len = cur_len + terminal_delta
+        chunk_supervised = cur_supervised + terminal_supervised_delta
+        if chunk_supervised == 0:
+            dropped_messages += len(cur_msgs)
+            dropped_tokens += chunk_len
+            return None
         if chunk_len > effective_max:
             raise RuntimeError(
                 f"emitted chunk over budget session={session_id} "
@@ -598,7 +599,7 @@ def _process_conversation(
         example["_omegalax_measured_length"] = chunk_len
         return example, (
             chunk_len,
-            cur_supervised + terminal_supervised_delta,
+            chunk_supervised,
             cur_vt,
             cur_vp,
             cur_ni,

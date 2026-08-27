@@ -16,6 +16,7 @@ from absl.testing import absltest
 
 from omegalax.data.grain_pipeline import (
     COMPILED_DATASET_VERSION,
+    _process_conversation,
     _write_arrayrecord_dataset,
     build_records_from_chat,
     make_grain_iterator,
@@ -40,7 +41,9 @@ def _measurement(message, length=1):
     return {
         "length": length,
         "terminal_length_delta": 0,
-        "supervised_tokens": length if message["role"] == "assistant" else 0,
+        "supervised_tokens": (
+            length if message["role"] == "assistant" and message.get("loss", True) else 0
+        ),
         "terminal_supervised_tokens_delta": 0,
         "vision_tokens": 0,
         "vision_patches": 0,
@@ -542,6 +545,48 @@ class GrainPipelineTest(absltest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "compiled Grain shard"):
                 resolve_arrayrecord_paths(src)
+
+    def test_zero_loss_assistant_chunk_is_dropped(self):
+        messages = [
+            {"role": "user", "content": "question"},
+            {"role": "assistant", "content": "context", "loss": False},
+        ]
+        precomputed = {(0, index): _measurement(message) for index, message in enumerate(messages)}
+        precomputed[(0, 1)]["terminal_length_delta"] = 2
+        result = _process_conversation(
+            0,
+            "session-0",
+            {},
+            messages,
+            precomputed,
+            effective_max=100,
+            overflow_mode="split",
+            truncate_offset=None,
+        )
+        self.assertEmpty(result["examples"])
+        self.assertEqual(result["dropped_messages"], 2)
+        self.assertEqual(result["dropped_tokens"], 4)
+
+    def test_mixed_loss_chunk_is_preserved(self):
+        messages = [
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": "context", "loss": False},
+            {"role": "user", "content": "second"},
+            {"role": "assistant", "content": "target"},
+        ]
+        result = _process_conversation(
+            0,
+            "session-0",
+            {},
+            messages,
+            {(0, index): _measurement(message) for index, message in enumerate(messages)},
+            effective_max=100,
+            overflow_mode="split",
+            truncate_offset=None,
+        )
+        self.assertLen(result["examples"], 1)
+        self.assertEqual(result["examples"][0]["messages"], messages)
+        self.assertEqual(result["chunk_supervised_tokens"], [1])
 
 
 if __name__ == "__main__":
