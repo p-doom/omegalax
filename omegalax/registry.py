@@ -64,28 +64,8 @@ def resolve_hf_repo_id(model_id: str) -> str:
     return model_id
 
 
-def resolve_hf_model_source(model_id: str, revision: str | None) -> Path:
-    local_path = Path(model_id).expanduser()
-    if local_path.exists():
-        if revision is not None:
-            raise ValueError("model_revision is invalid when model_id is a local path")
-        if not local_path.is_dir():
-            raise ValueError(f"model_id must be a HuggingFace model directory: {local_path}")
-        source = local_path.resolve()
-    else:
-        if (
-            revision is None
-            or len(revision) != 40
-            or any(character not in "0123456789abcdef" for character in revision)
-        ):
-            raise ValueError("remote model_id requires an exact 40-character model_revision")
-        source = Path(
-            snapshot_download(
-                resolve_hf_repo_id(model_id),
-                revision=revision,
-                local_files_only=True,
-            )
-        ).resolve()
+def resolve_hf_model_source(model_id: str) -> Path:
+    source = Path(snapshot_download(resolve_hf_repo_id(model_id))).resolve()
     if not (source / "config.json").is_file():
         raise ValueError(f"model source has no config.json: {source}")
     return source

@@ -7,7 +7,6 @@ import os
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
 import json
-import shutil
 from pathlib import Path
 
 import jax
@@ -16,7 +15,7 @@ from absl import app, flags
 from flax import nnx
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
-from transformers import AutoTokenizer
+from transformers import AutoProcessor
 
 from omegalax import export as export_lib
 from omegalax import registry
@@ -26,11 +25,6 @@ from omegalax.vlm import api as vlm_api
 FLAGS = flags.FLAGS
 
 flags.DEFINE_string("model_id", None, "Model id to export.", required=True)
-flags.DEFINE_string(
-    "model_revision",
-    None,
-    "Exact HuggingFace commit for a remote --model_id; omit when --model_id is a local path.",
-)
 flags.DEFINE_string("out_dir", None, "Destination directory for safetensors+config.", required=True)
 flags.DEFINE_integer("seed", 0, "RNG seed used when initializing the model.")
 flags.DEFINE_integer("tp_size", None, "Tensor parallelism size.")
@@ -120,9 +114,9 @@ def _restore_trained_weights(model, checkpoint_path: Path):
             "train_state", ocp.args.PyTreeRestore, ocp.handlers.PyTreeCheckpointHandler
         )
         options = ocp.CheckpointManagerOptions(step_format_fixed_length=6)
-        cm = ocp.CheckpointManager(save_dir, options=options, handler_registry=handler_registry)
-
-        try:
+        with ocp.CheckpointManager(
+            save_dir, options=options, handler_registry=handler_registry
+        ) as cm:
             restored = cm.restore(
                 step,
                 args=ocp.args.Composite(
@@ -133,8 +127,6 @@ def _restore_trained_weights(model, checkpoint_path: Path):
                     ),
                 ),
             )
-        finally:
-            cm.close()
         restored_model_state = restored["train_state"]["optimizer"]["model"]
         if jax.tree.structure(restored_model_state) != jax.tree.structure(model_state):
             raise ValueError("checkpoint model tree does not match the export model")
@@ -149,23 +141,10 @@ def _restore_trained_weights(model, checkpoint_path: Path):
     return model
 
 
-_DESCRIBES_BASE_WEIGHTS = ("quantization_config",)
-
-
-def _save_identity_assets(out_dir: Path, model_source: Path) -> None:
-    tokenizer = AutoTokenizer.from_pretrained(model_source, local_files_only=True)
-    tokenizer.save_pretrained(out_dir)
-    processor_config = model_source / "preprocessor_config.json"
-    if not processor_config.is_file():
-        raise ValueError(f"model source has no preprocessor_config.json: {model_source}")
-    shutil.copyfile(processor_config, out_dir / processor_config.name)
-
-
 def _write_servable_config(out_dir: Path, cfg, model_source: Path) -> None:
-    _save_identity_assets(out_dir, model_source)
+    AutoProcessor.from_pretrained(model_source, local_files_only=True).save_pretrained(out_dir)
     base = json.loads((model_source / "config.json").read_text())
-    for key in _DESCRIBES_BASE_WEIGHTS:
-        base.pop(key, None)
+    base.pop("quantization_config", None)
 
     owned = export_lib.model_config_to_hf_dict(cfg)
     merged = {**base, **owned}
@@ -179,7 +158,7 @@ def _write_servable_config(out_dir: Path, cfg, model_source: Path) -> None:
 
 
 def main(_) -> None:
-    model_source = registry.resolve_hf_model_source(FLAGS.model_id, FLAGS.model_revision)
+    model_source = registry.resolve_hf_model_source(FLAGS.model_id)
     jax.distributed.initialize()
     model, cfg = load_model(model_source)
     model = _restore_trained_weights(model, Path(FLAGS.checkpoint_path).expanduser())
