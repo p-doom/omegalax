@@ -9,6 +9,7 @@ from unittest import mock
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 from absl.testing import absltest
 
@@ -283,6 +284,61 @@ class VLMSFTTrainingTest(absltest.TestCase):
         self.assertIn("supervised_tokens", metrics)
         self.assertGreater(metrics["supervised_tokens"], 0)
         self.assertEqual(int(metrics["step"]), 1)
+
+    def test_accumulated_step_and_token_weighted_validation(self):
+        train_cfg = vlm_trainer.TrainConfig(
+            seed=0,
+            batch_size=1,
+            seq_len=4,
+            num_steps=1,
+            learning_rate=1e-3,
+            weight_decay=0.0,
+            grad_accum_steps=2,
+            print_every=0,
+        )
+        train_batch = _make_synthetic_sft_batch(1, 4, 32000)
+        train_batch["vision_patch_valid"] = np.empty((0,), dtype=np.bool_)
+        val_batches = []
+        for marker in (1, 2):
+            batch = _make_synthetic_sft_batch(1, 4, 32000)
+            batch["token_ids_BT"][0, 0] = marker
+            batch["vision_patch_valid"] = np.empty((0,), dtype=np.bool_)
+            val_batches.append(batch)
+
+        def eval_step(_model, batch):
+            first = batch["token_ids_BT"][0, 0] == 1
+            return (
+                jnp.where(first, 2.0, 18.0),
+                jnp.where(first, 1.0, 3.0),
+                jnp.where(first, 0.25, 0.75),
+            )
+
+        wandb_run = mock.Mock()
+        with mock.patch.object(vlm_trainer, "make_sft_eval_step", return_value=eval_step):
+            optimizer, metrics = vlm_trainer.run_sft(
+                make_vl_config("qwen3-vl-smoke"),
+                train_cfg,
+                iter([dict(train_batch), dict(train_batch)]),
+                log_every=0,
+                tp_size=1,
+                fsdp_size=1,
+                dp_size=1,
+                wandb_run=wandb_run,
+                val_data_iter=iter(val_batches),
+                val_every=1,
+                val_steps=2,
+                text_attn_backend="xla",
+            )
+
+        self.assertEqual(int(optimizer.step[...]), 1)
+        self.assertEqual(int(metrics["supervised_tokens"]), 4)
+        val_metrics = next(
+            call.args[0] for call in wandb_run.log.call_args_list if "val/loss" in call.args[0]
+        )
+        self.assertEqual(val_metrics["val/sup_tokens"], 4.0)
+        self.assertEqual(val_metrics["val/ce_loss"], 5.0)
+        self.assertEqual(val_metrics["val/aux_loss"], 0.5)
+        self.assertEqual(val_metrics["val/loss"], 5.5)
 
     @absltest.skipUnless(jax.default_backend() == "gpu", "vision attention is cuDNN-only")
     def test_one_step_sft_multimodal_qwen3_vl(self):
