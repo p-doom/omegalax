@@ -265,8 +265,8 @@ class Qwen3_5PaddingNoOpTest(absltest.TestCase):
         max_images = 4
         max_patches = real_patches + (max_images - len(real_grids)) * ms * ms
 
-        toks_a, seg_a, pv_a, valid_a, grid_a, cu_a, pos_a = _make_vlm_inputs(cfg, real_grids)
-        toks_b, seg_b, pv_b, valid_b, grid_b, cu_b, pos_b = _make_vlm_inputs(
+        toks_a, seg_a, pv_a, valid_a, grid_a, _, pos_a = _make_vlm_inputs(cfg, real_grids)
+        toks_b, seg_b, pv_b, valid_b, grid_b, _, pos_b = _make_vlm_inputs(
             cfg,
             real_grids,
             max_images=max_images,
@@ -282,7 +282,6 @@ class Qwen3_5PaddingNoOpTest(absltest.TestCase):
             vision_patch_valid=valid_a,
             pixel_values=pv_a,
             image_grid_thw=grid_a,
-            vision_cu_seqlens=cu_a,
             position_ids_ZBT=pos_a,
         )
         h_b, _ = model(
@@ -293,7 +292,6 @@ class Qwen3_5PaddingNoOpTest(absltest.TestCase):
             vision_patch_valid=valid_b,
             pixel_values=pv_b,
             image_grid_thw=grid_b,
-            vision_cu_seqlens=cu_b,
             position_ids_ZBT=pos_b,
         )
 
@@ -340,7 +338,7 @@ class Qwen3_5JitStabilityTest(absltest.TestCase):
             rng = np.random.RandomState(len(real_grids))
             pv = rng.randn(real_patches, patch_dim).astype(np.float32)
             grid = np.array(real_grids, dtype=np.int32)
-            pv, grid, cu = _pad_vision_arrays(
+            pv, grid, _ = _pad_vision_arrays(
                 pv,
                 grid,
                 merge_size=ms,
@@ -350,15 +348,14 @@ class Qwen3_5JitStabilityTest(absltest.TestCase):
             return (
                 jnp.asarray(pv, dtype=jnp.bfloat16),
                 jnp.asarray(grid, dtype=jnp.int32),
-                jnp.asarray(cu, dtype=jnp.int32),
             )
 
         # Side-effect counter: increments only on Python re-tracing.
         trace_count = [0]
 
-        def vision_inner(model, pv, grid, cu):
+        def vision_inner(model, pv, grid):
             trace_count[0] += 1
-            return model.vision(pv, grid, cu)
+            return model.vision(pv, grid)
 
         vision_fwd = nnx.jit(vision_inner)
 
@@ -370,7 +367,6 @@ class Qwen3_5JitStabilityTest(absltest.TestCase):
         # All three must produce identical PADDED shapes.
         self.assertEqual(a[0].shape, b[0].shape)
         self.assertEqual(a[1].shape, b[1].shape)
-        self.assertEqual(a[2].shape, b[2].shape)
         self.assertEqual(a[0].shape, c[0].shape)
 
         _ = vision_fwd(model, *a)

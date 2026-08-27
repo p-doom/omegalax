@@ -130,7 +130,7 @@ def _validate_message(message: dict[str, Any], *, multimodal: bool, family: str)
         or set(message) - {"role", "content", "reasoning_content", "loss"}
     ):
         raise ValueError(
-            "messages must contain role, content, and optional reasoning_content and loss"
+            "messages must contain role and content; only reasoning_content and loss are optional"
         )
     role = message["role"]
     if role not in {"system", "user", "assistant"}:

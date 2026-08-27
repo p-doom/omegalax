@@ -391,9 +391,7 @@ class VisionModel(nnx.Module):
         self,
         pixel_values: jax.Array,
         grid_thw: jax.Array,
-        cu_seqlens: jax.Array | None = None,
     ) -> jax.Array:
-        del cu_seqlens
         grid_thw = reshard(grid_thw, P())
         hidden_ND = self.patch_embed(pixel_values)
         total_tokens: int = hidden_ND.shape[0]

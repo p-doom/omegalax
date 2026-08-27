@@ -368,7 +368,6 @@ class Qwen3_5ForConditionalGeneration(nnx.Module):
         vision_patch_valid: jax.Array,
         pixel_values: jax.Array | None = None,
         image_grid_thw: jax.Array | None = None,
-        vision_cu_seqlens: jax.Array | None = None,
         position_ids_ZBT: jax.Array | None = None,
     ):
         del cache, num_right_pads
@@ -380,7 +379,7 @@ class Qwen3_5ForConditionalGeneration(nnx.Module):
         )
 
         if pixel_values is not None and image_grid_thw is not None:
-            image_embeds_ND = self.vision(pixel_values, image_grid_thw, vision_cu_seqlens)
+            image_embeds_ND = self.vision(pixel_values, image_grid_thw)
             image_mask_BT = token_ids_BT == self.cfg.image_token_id
             image_mask_BTD = jnp.broadcast_to(image_mask_BT[:, :, None], inputs_embeds_BTD.shape)
             inputs_embeds_BTD = jnp.where(image_mask_BTD, 0.0, inputs_embeds_BTD)

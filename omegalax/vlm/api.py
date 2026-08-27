@@ -161,6 +161,8 @@ def forward(
         attention_mask_BT = (token_ids_BT != pad_id).astype(jnp.int32)
 
     if isinstance(model, Qwen3_5ForConditionalGeneration):
+        if vision_cu_seqlens is not None:
+            raise ValueError("vision_cu_seqlens is not accepted for Qwen3.5")
         segment_ids_BT = attention_mask_BT.astype(jnp.int32)
         return model(
             token_ids_BT,
@@ -170,7 +172,6 @@ def forward(
             vision_patch_valid=vision_patch_valid,
             pixel_values=pixel_values,
             image_grid_thw=image_grid_thw,
-            vision_cu_seqlens=vision_cu_seqlens,
             position_ids_ZBT=position_ids_ZBT,
         )
 

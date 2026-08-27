@@ -33,13 +33,12 @@ unchanged.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from typing import Sequence
 
+from flax import nnx
 import jax
 import jax.numpy as jnp
-from flax import nnx
-from jax.sharding import PartitionSpec as P
-from jax.sharding import reshard
+from jax.sharding import PartitionSpec as P, reshard
 
 # Standard LoRA target-module names for transformer-block projections.
 # Match by attribute name on the *parent* module (e.g.

@@ -120,16 +120,12 @@ def _trainable_non_vision(path, x):
     return True
 
 
-def _path_keys(path) -> tuple[str, ...]:
-    return tuple(
-        getattr(part, "key", None) or getattr(part, "name", None) or str(part) for part in path
-    )
-
-
 def _trainable_non_vision_except_merger(path, x):
     if not isinstance(x, nnx.Param):
         return False
-    keys = _path_keys(path)
+    keys = tuple(
+        getattr(part, "key", None) or getattr(part, "name", None) or str(part) for part in path
+    )
     if "vision" not in keys:
         return True
     return keys[:2] == ("vision", "merger")
