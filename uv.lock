@@ -1939,11 +1939,15 @@ dependencies = [
     { name = "pillow" },
     { name = "safetensors" },
     { name = "tokamax" },
-    { name = "torch", marker = "sys_platform == 'linux'" },
-    { name = "torchvision", marker = "sys_platform == 'linux'" },
     { name = "transformers" },
     { name = "triton" },
     { name = "wandb" },
+]
+
+[package.optional-dependencies]
+torch-tests = [
+    { name = "torch", marker = "sys_platform == 'linux'" },
+    { name = "torchvision", marker = "sys_platform == 'linux'" },
 ]
 
 [package.dev-dependencies]
@@ -1971,12 +1975,13 @@ requires-dist = [
     { name = "pillow" },
     { name = "safetensors", specifier = ">=0.8.0" },
     { name = "tokamax", git = "https://github.com/p-doom/tokamax.git?rev=d81bc23bc80f01728984bcda5161ff2569cd7cc5" },
-    { name = "torch", marker = "sys_platform == 'linux'", specifier = "==2.10.*" },
-    { name = "torchvision", marker = "sys_platform == 'linux'" },
+    { name = "torch", marker = "sys_platform == 'linux' and extra == 'torch-tests'", specifier = "==2.10.*" },
+    { name = "torchvision", marker = "sys_platform == 'linux' and extra == 'torch-tests'" },
     { name = "transformers", specifier = "==5.15.1" },
     { name = "triton" },
     { name = "wandb" },
 ]
+provides-extras = ["torch-tests"]
 
 [package.metadata.requires-dev]
 dev = [

@@ -22,13 +22,17 @@ dependencies = [
   "Pillow",
   "safetensors>=0.8.0",
   "tokamax @ git+https://github.com/p-doom/tokamax.git@d81bc23bc80f01728984bcda5161ff2569cd7cc5",
-  "torch==2.10.* ; platform_system == \"Linux\"",
-  "torchvision ; platform_system == \"Linux\"",
   "transformers==5.15.1",
   "triton", 
   "huggingface-hub",
   "wandb",
   "grain>=0.2.16",
+]
+
+[project.optional-dependencies]
+torch-tests = [
+  "torch==2.10.* ; platform_system == \"Linux\"",
+  "torchvision ; platform_system == \"Linux\"",
 ]
 
 [tool.uv]
