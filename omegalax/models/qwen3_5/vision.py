@@ -23,7 +23,7 @@ from .norms import LayerNorm
 from .rope import apply_vision_rope
 
 
-def _cudnn_packed_vision_attention(
+def _cudnn_packed_vision_attention_local(
     q_NHK: jax.Array,
     k_NHK: jax.Array,
     v_NHK: jax.Array,
@@ -54,6 +54,25 @@ def _cudnn_packed_vision_attention(
         qkv_layout="BTNH",
     )
     return out[0]
+
+
+def _cudnn_packed_vision_attention(
+    q_NHK: jax.Array,
+    k_NHK: jax.Array,
+    v_NHK: jax.Array,
+    cu_seqlens: jax.Array,
+    scale: float,
+) -> jax.Array:
+    sharding = jax.typeof(q_NHK).sharding
+    qkv_spec = sharding.spec
+    cu_spec = jax.typeof(cu_seqlens).sharding.spec
+    return jax.shard_map(
+        lambda q, k, v, cu: _cudnn_packed_vision_attention_local(q, k, v, cu, scale),
+        mesh=sharding.mesh,
+        in_specs=(qkv_spec, qkv_spec, qkv_spec, cu_spec),
+        out_specs=qkv_spec,
+        check_vma=False,
+    )(q_NHK, k_NHK, v_NHK, cu_seqlens)
 
 
 def _token_spatial_coords(
@@ -206,6 +225,12 @@ class VisionAttention(nnx.Module):
         v_NHK = reshard(qkv[:, 2], self.heads_shd)
 
         q_NHK, k_NHK = apply_vision_rope(q_NHK, k_NHK, cos_NK, sin_NK)
+
+        # Equal token shards can split images, invalidating packed offsets.
+        attn_in_shd = P(None, self.heads_shd[1], self.heads_shd[2])
+        q_NHK = reshard(q_NHK, attn_in_shd)
+        k_NHK = reshard(k_NHK, attn_in_shd)
+        v_NHK = reshard(v_NHK, attn_in_shd)
 
         attn_NHK = _cudnn_packed_vision_attention(
             q_NHK,
@@ -368,32 +393,26 @@ class VisionModel(nnx.Module):
         grid_thw: jax.Array,
         cu_seqlens: jax.Array | None = None,
     ) -> jax.Array:
+        del cu_seqlens
+        grid_thw = reshard(grid_thw, P())
         hidden_ND = self.patch_embed(pixel_values)
         total_tokens: int = hidden_ND.shape[0]
 
         pos_embeds_ND = self._fast_pos_embed_interpolate(grid_thw, total_tokens)
+        pos_embeds_ND = reshard(pos_embeds_ND, self.hidden_shd)
         hidden_ND = hidden_ND + pos_embeds_ND
 
         rotary_emb_NK = self._rot_pos_emb(grid_thw, total_tokens)
+        rotary_emb_NK = reshard(rotary_emb_NK, P(self.hidden_shd[0], None))
         emb_NK = jnp.concatenate([rotary_emb_NK, rotary_emb_NK], axis=-1)
         cos_NK, sin_NK = jnp.cos(emb_NK), jnp.sin(emb_NK)
         cos_NK = cos_NK.astype(self.cfg.dtype)
         sin_NK = sin_NK.astype(self.cfg.dtype)
 
-        if cu_seqlens is None:
-            # Eager fallback (e.g. unit tests passing raw grids). Under JIT
-            # the caller must precompute and pass cu_seqlens — `jnp.repeat`
-            # below has data-dependent output shape.
-            cu_seqlens = jnp.concatenate(
-                [
-                    jnp.array([0], dtype=jnp.int32),
-                    jnp.cumsum(
-                        jnp.repeat(
-                            grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0], out_sharding=P()
-                        )
-                    ).astype(jnp.int32),
-                ]
-            )
+        segment_lengths = jnp.prod(grid_thw, axis=-1, dtype=jnp.int32)
+        cu_seqlens = jnp.concatenate(
+            [jnp.zeros(1, dtype=jnp.int32), jnp.cumsum(segment_lengths, dtype=jnp.int32)]
+        )
 
         for blk in self.blocks:
             hidden_ND = blk(hidden_ND, cu_seqlens, cos_NK, sin_NK)

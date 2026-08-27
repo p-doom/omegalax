@@ -406,6 +406,15 @@ class VLMEncodingTest(absltest.TestCase):
 
 
 class Qwen35VLMEncodingTest(absltest.TestCase):
+    def test_video_is_rejected(self):
+        tokenizer = AutoTokenizer.from_pretrained(QWEN35_VLM_MODEL, local_files_only=True)
+        image_processor = AutoImageProcessor.from_pretrained(
+            QWEN35_VLM_MODEL, use_fast=False, local_files_only=True
+        )
+        messages = [{"role": "user", "content": [{"type": "video", "video": "clip.mp4"}]}]
+        with self.assertRaisesRegex(ValueError, "video content"):
+            Qwen3MessageEncoder(tokenizer, image_processor, QWEN35_MODEL_TYPE).encode(messages)
+
     def test_template_processor_mask_and_positions_match(self):
         tokenizer = AutoTokenizer.from_pretrained(QWEN35_VLM_MODEL, local_files_only=True)
         image_processor = AutoImageProcessor.from_pretrained(

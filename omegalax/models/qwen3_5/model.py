@@ -285,6 +285,10 @@ class TextModel(nnx.Module):
         elif position_ids_ZBT.ndim == 2:
             position_ids_ZBT = jnp.stack([position_ids_ZBT] * 3, axis=0)
 
+        batch_axis = cfg.shd_cfg.act_btd[0]
+        segment_ids_BT = reshard(segment_ids_BT, P(batch_axis, None))
+        position_ids_ZBT = reshard(position_ids_ZBT, P(None, batch_axis, None))
+
         cos_BTK, sin_BTK = generate_text_rope(
             position_ids_ZBT,
             cfg.head_dim,
@@ -350,6 +354,9 @@ class Qwen3_5ForConditionalGeneration(nnx.Module):
             dtype=cfg.text_config.dtype,
             kernel_init=wp(lm_head_init, ("embed", "vocab")),
         )
+
+    def output_weight(self) -> jax.Array:
+        return self.lm_head.kernel[...]
 
     def __call__(
         self,

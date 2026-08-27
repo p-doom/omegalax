@@ -104,6 +104,8 @@ def shard_batch(token_ids_BT: jax.Array, cfg: VLMConfig, mesh: Mesh) -> jax.Arra
 def shard_batch_dict(batch: dict, cfg: VLMConfig, mesh: Mesh) -> dict[str, jax.Array]:
     """Shard every array in a batch dict (batch dim sharded, rest replicated)."""
     if isinstance(cfg, Qwen3_5Config):
+        # Process-local cumulative offsets cannot be concatenated across hosts.
+        batch = {key: value for key, value in batch.items() if key != "vision_cu_seqlens"}
         return runtime_shard_batch_dict(batch, cfg.text_config.shd_cfg, mesh)
     if isinstance(cfg, Qwen3VLConfig):
         return runtime_shard_batch_dict(batch, cfg.shd_cfg, mesh)
