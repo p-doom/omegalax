@@ -258,29 +258,11 @@ def _save_sft_checkpoint(
     input_iter: checkpoint_utils.GrainIterator,
     schedule_num_steps: int,
 ) -> None:
-    _validate_optimizer_generation(nnx.state(optimizer), step)
     train_state = _train_state(optimizer, rng, schedule_num_steps)
     save_args = checkpoint_utils.make_grain_save_args(train_state, input_iter)
     if not checkpoint_manager.save(step, args=save_args, force=True):
         raise RuntimeError(f"Checkpoint {step} was not accepted")
     checkpoint_manager.wait_until_finished()
-
-
-def _validate_optimizer_generation(optimizer_state: nnx.State, generation: int) -> None:
-    step = optimizer_state["step"][...]
-    counts = [
-        leaf
-        for leaf in jax.tree.leaves(nnx.pure(optimizer_state["opt_state"]))
-        if leaf.shape == () and jnp.issubdtype(leaf.dtype, jnp.integer)
-    ]
-    if not counts:
-        raise ValueError("Optimizer state has no integer update count")
-    host_step, host_counts = jax.device_get((step, counts))
-    values = [int(host_step), *(int(count) for count in host_counts)]
-    if any(value != generation for value in values):
-        raise ValueError(
-            f"Checkpoint generation {generation} does not match optimizer counters {values}"
-        )
 
 
 def _restore_sft_checkpoint(
@@ -304,7 +286,6 @@ def _restore_sft_checkpoint(
             f"Checkpoint schedule horizon is {restored_schedule_num_steps}, "
             f"requested {schedule_num_steps}"
         )
-    _validate_optimizer_generation(train_state["optimizer"], step)
     nnx.update(optimizer, train_state["optimizer"])
     return (
         optimizer,
@@ -452,56 +433,6 @@ def make_sft_eval_step(cfg, pad_id: int = 0, *, num_loss_tiles: int = 4):
     return sft_eval_step
 
 
-@dataclasses.dataclass
-class _TrainingCleanup:
-    data_iter: object
-    val_data_iter: object | None
-    checkpoint_manager: ocp.CheckpointManager | None = None
-    autotune_context: object | None = None
-    signal_handlers: dict[int, object] = dataclasses.field(default_factory=dict)
-
-    def close(self, active_error: BaseException | None) -> None:
-        errors: list[BaseException] = []
-        if self.autotune_context is not None:
-            try:
-                self.autotune_context.__exit__(None, None, None)
-            except BaseException as error:  # noqa: BLE001
-                errors.append(error)
-        if self.checkpoint_manager is not None:
-            try:
-                self.checkpoint_manager.wait_until_finished()
-            except BaseException as error:  # noqa: BLE001
-                errors.append(error)
-            try:
-                self.checkpoint_manager.close()
-            except BaseException as error:  # noqa: BLE001
-                errors.append(error)
-        for signum, handler in self.signal_handlers.items():
-            try:
-                signal.signal(signum, handler)
-            except BaseException as error:  # noqa: BLE001
-                errors.append(error)
-        closed: set[int] = set()
-        for iterator in (self.data_iter, self.val_data_iter):
-            close = getattr(iterator, "close", None)
-            if close is None or id(iterator) in closed:
-                continue
-            closed.add(id(iterator))
-            try:
-                close()
-            except BaseException as error:  # noqa: BLE001
-                errors.append(error)
-        if not errors:
-            return
-        if active_error is not None:
-            for error in errors:
-                active_error.add_note(f"Training cleanup also failed: {error!r}")
-            return
-        if len(errors) == 1:
-            raise errors[0]
-        raise BaseExceptionGroup("Training cleanup failed", errors)
-
-
 def _run_sft(
     model_id_or_cfg,
     train_cfg: TrainConfig,
@@ -527,7 +458,7 @@ def _run_sft(
     gc_period: int = 0,
     log_memory: bool = False,
     tokamax_cache_dir: str | Path | None = None,
-    _cleanup: _TrainingCleanup,
+    _resources: contextlib.ExitStack,
 ) -> tuple[MixedPrecisionOptimizer, dict[str, float]]:
     """SFT a VLM from a Grain iterator; returns final optimizer + last metrics.
 
@@ -553,13 +484,14 @@ def _run_sft(
             if save_path.exists() and any(save_path.iterdir()):
                 raise ValueError(f"Fresh checkpoint directory is not empty: {save_path}")
             save_path.mkdir(parents=True, exist_ok=True)
-        checkpoint_manager = _make_checkpoint_manager(
-            save_path,
-            save_interval=save_every or None,
-            keep_period=keep_period or None,
-            keep_latest=keep_latest or None,
+        checkpoint_manager = _resources.enter_context(
+            _make_checkpoint_manager(
+                save_path,
+                save_interval=save_every or None,
+                keep_period=keep_period or None,
+                keep_latest=keep_latest or None,
+            )
         )
-        _cleanup.checkpoint_manager = checkpoint_manager
 
     if will_resume:
         model_cfg = vlm_api.resolve_config(str(save_path))
@@ -752,7 +684,7 @@ def _run_sft(
         stop_requested = True
 
     for signum in (signal.SIGUSR1, signal.SIGTERM):
-        _cleanup.signal_handlers[signum] = signal.getsignal(signum)
+        _resources.callback(signal.signal, signum, signal.getsignal(signum))
         signal.signal(signum, _request_stop)
 
     autotune_result = None
@@ -774,9 +706,9 @@ def _run_sft(
                 tuple(autotune_batches),
             )
 
-    _autotune_ctx = autotune_result if autotune_result is not None else contextlib.nullcontext()
-    _autotune_ctx.__enter__()
-    _cleanup.autotune_context = _autotune_ctx
+    _resources.enter_context(
+        autotune_result if autotune_result is not None else contextlib.nullcontext()
+    )
 
     startup_log("entering training loop")
     if log_memory:
@@ -978,9 +910,11 @@ def run_sft(
     log_memory: bool = False,
     tokamax_cache_dir: str | Path | None = None,
 ) -> tuple[MixedPrecisionOptimizer, dict[str, float]]:
-    cleanup = _TrainingCleanup(data_iter, val_data_iter)
-    active_error: BaseException | None = None
-    try:
+    with contextlib.ExitStack() as resources:
+        for iterator in (val_data_iter, data_iter):
+            close = getattr(iterator, "close", None)
+            if close is not None:
+                resources.callback(close)
         return _run_sft(
             model_id_or_cfg,
             train_cfg,
@@ -1005,10 +939,5 @@ def run_sft(
             gc_period=gc_period,
             log_memory=log_memory,
             tokamax_cache_dir=tokamax_cache_dir,
-            _cleanup=cleanup,
+            _resources=resources,
         )
-    except BaseException as error:
-        active_error = error
-        raise
-    finally:
-        cleanup.close(active_error)

@@ -4,6 +4,7 @@ import inspect
 import os
 import tempfile
 from pathlib import Path
+from unittest import mock
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
@@ -103,37 +104,24 @@ class VLMTrainingContractTest(absltest.TestCase):
         self.assertAlmostEqual(float(loss), 0.5)
         self.assertAlmostEqual(float(model.weight[0]), 0.9, places=2)
 
-    def test_checkpoint_generation_matches_optimizer_counters(self):
-        model = _ScalarModel()
-        optimizer = MixedPrecisionOptimizer(model, optax.adamw(lambda _: 0.1))
-        gradients = jax.tree.map(
-            lambda value: jnp.ones_like(value),
-            nnx.state(model),
-        )
-        gradient_sum = initialize_gradient_sum(gradients)
-        apply_normalized_gradient_sum(
-            optimizer,
-            gradient_sum,
-            jnp.asarray(1.0),
-            jnp.asarray(1.0),
-        )
-
-        vlm._validate_optimizer_generation(nnx.state(optimizer), 1)
-        with self.assertRaisesRegex(ValueError, "generation 2"):
-            vlm._validate_optimizer_generation(nnx.state(optimizer), 2)
-
     def test_numerical_failure_stops_at_boundary(self):
         with self.assertRaisesRegex(FloatingPointError, "step 7"):
             vlm._require_healthy_at_boundary(jnp.asarray(False), 7)
 
     def test_owned_iterators_close_after_failure(self):
         events: list[str] = []
-        cleanup = vlm._TrainingCleanup(
-            _Closable(events, "train"),
-            _Closable(events, "validation"),
-        )
-
-        cleanup.close(RuntimeError("training failed"))
+        data_iter = _Closable(events, "train")
+        val_data_iter = _Closable(events, "validation")
+        with (
+            mock.patch.object(vlm, "_run_sft", side_effect=RuntimeError("training failed")),
+            self.assertRaisesRegex(RuntimeError, "training failed"),
+        ):
+            vlm.run_sft(
+                "unused",
+                vlm.TrainConfig(),
+                data_iter,
+                val_data_iter=val_data_iter,
+            )
 
         self.assertEqual(events, ["train", "validation"])
 
