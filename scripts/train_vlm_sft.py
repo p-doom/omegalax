@@ -167,6 +167,14 @@ flags.DEFINE_boolean(
     "gradient/opt-state layer. Mutually exclusive with "
     "--enable_lora (which already freezes vision).",
 )
+flags.DEFINE_boolean(
+    "train_vision_merger",
+    False,
+    "Carve the vision→LLM patch merger (vision.merger: norm + fc1 + fc2) "
+    "out of the frozen vision subtree so it receives gradients and optimizer "
+    "state. Requires --freeze_vision_tower; the rest of the vision tower "
+    "stays frozen.",
+)
 flags.DEFINE_integer(
     "num_loss_tiles",
     None,
@@ -250,6 +258,9 @@ def _validate_flags() -> None:
     # enable_lora / freeze_vision_tower are mutually exclusive (both freeze the vision tower).
     if FLAGS.enable_lora and FLAGS.freeze_vision_tower:
         problems.append("enable_lora and freeze_vision_tower are mutually exclusive")
+
+    if FLAGS.train_vision_merger and not FLAGS.freeze_vision_tower:
+        problems.append("train_vision_merger requires freeze_vision_tower")
 
     # LoRA hyperparameters required only when LoRA is on.
     if FLAGS.enable_lora:
@@ -452,6 +463,7 @@ def main(_) -> None:
         lora_alpha=FLAGS.lora_alpha,
         lora_extra_target_modules=tuple(FLAGS.lora_extra_target_modules or ()),
         freeze_vision_tower=FLAGS.freeze_vision_tower,
+        train_vision_merger=FLAGS.train_vision_merger,
         num_loss_tiles=FLAGS.num_loss_tiles,
         log_per_sample_loss=FLAGS.log_per_sample_loss,
     )

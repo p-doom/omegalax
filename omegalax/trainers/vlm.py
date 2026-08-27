@@ -48,6 +48,13 @@ from omegalax.vlm import api as vlm_api
 P = PartitionSpec
 
 
+VISION_MERGER_ATTR = "merger"
+
+
+def _path_keys(path) -> list[str]:
+    return [getattr(part, "key", None) or getattr(part, "name", None) or str(part) for part in path]
+
+
 def _trainable_non_vision(path, x):
     """NNX filter predicate: select every ``nnx.Param`` whose state-tree path
     does not pass through ``Qwen3VL.vision`` (or any nested ``vision``
@@ -56,9 +63,21 @@ def _trainable_non_vision(path, x):
     """
     if not isinstance(x, nnx.Param):
         return False
-    for part in path:
-        key = getattr(part, "key", None) or getattr(part, "name", None) or str(part)
-        if key == "vision":
+    return "vision" not in _path_keys(path)
+
+
+def _trainable_non_vision_except_merger(path, x):
+    """Like ``_trainable_non_vision`` but keeps the vision→LLM patch merger
+    (``vision.merger``: norm + fc1 + fc2) trainable while the rest of the
+    vision tower stays frozen. The merger is the projection that carries
+    spatial readout from the ViT into the decoder's embedding space; the
+    deeper ``vision.*`` blocks and the patch embedder remain excluded.
+    """
+    if not isinstance(x, nnx.Param):
+        return False
+    keys = _path_keys(path)
+    for i, key in enumerate(keys):
+        if key == "vision" and keys[i + 1 : i + 2] != [VISION_MERGER_ATTR]:
             return False
     return True
 
@@ -83,6 +102,7 @@ class TrainConfig:
     lora_alpha: float = 32.0
     lora_extra_target_modules: tuple[str, ...] = ()
     freeze_vision_tower: bool = False
+    train_vision_merger: bool = False
     num_loss_tiles: int = 4
     log_per_sample_loss: bool = False
 
@@ -523,6 +543,13 @@ def run_sft(
             "--enable_lora already freezes the vision tower; "
             "--freeze_vision_tower is redundant. Pass at most one."
         )
+    if train_cfg.train_vision_merger and not train_cfg.freeze_vision_tower:
+        raise ValueError(
+            "--train_vision_merger only has an effect together with "
+            "--freeze_vision_tower (it carves the merger out of the frozen "
+            "vision subtree). Without it the merger is either already "
+            "trainable (full FT) or unreachable (--enable_lora)."
+        )
     if train_cfg.enable_lora:
         with mesh_rules(mesh):
             n_wrapped = inject_lora(
@@ -541,6 +568,12 @@ def run_sft(
             f"wrapped {n_wrapped} text-decoder Linear projections; vision frozen"
         )
         wrt_filter = LoRAParam
+    elif train_cfg.freeze_vision_tower and train_cfg.train_vision_merger:
+        wrt_filter = _trainable_non_vision_except_merger
+        startup_log(
+            "vision tower frozen except vision.merger; full FT on text decoder + "
+            "embedder + lm_head + layernorms + vision→LLM merger"
+        )
     elif train_cfg.freeze_vision_tower:
         wrt_filter = _trainable_non_vision
         startup_log(
