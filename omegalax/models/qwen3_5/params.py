@@ -9,9 +9,9 @@ from typing import Any
 import jax
 import numpy as np
 from flax import nnx
-from safetensors import numpy as stnp
 
 from omegalax.models.params_utils import (
+    atomic_save_hf_weights,
     build_inverse_mapping,
     flatten_pure_state,
     inverse_transform,
@@ -136,7 +136,6 @@ def export_qwen3_5_to_safetensors(
     """Export a Qwen3.5 nnx model to HuggingFace-style safetensors."""
     out_path = Path(out_dir).expanduser()
     out_path.mkdir(parents=True, exist_ok=True)
-    tensor_path = out_path / "model.safetensors"
 
     _, abs_state = nnx.split(model)
     pure_state = nnx.to_pure_dict(abs_state)
@@ -273,7 +272,5 @@ def export_qwen3_5_to_safetensors(
             "Unmapped JAX parameters during export:\n" + "\n".join(sorted(unmatched))
         )
 
-    stnp.save_file(hf_tensors, tensor_path)
     save_hf_config(qwen3_5_to_hf_config_dict(cfg), out_path)
-
-    return tensor_path
+    return atomic_save_hf_weights(out_path, {"model.safetensors": hf_tensors})

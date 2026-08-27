@@ -9,10 +9,10 @@ from typing import Any
 import jax
 import numpy as np
 from flax import nnx
-from safetensors import numpy as stnp
 from etils import epath
 
 from omegalax.models.params_utils import (
+    atomic_save_hf_weights,
     build_inverse_mapping,
     flatten_pure_state,
     inverse_transform,
@@ -89,7 +89,6 @@ def export_qwen3_to_safetensors(
     """Export a Qwen3 nnx model (dense or MoE) to HuggingFace-style safetensors."""
     out_dir = epath.Path(out_dir).expanduser()
     out_dir.mkdir(parents=True, exist_ok=True)
-    tensor_path = out_dir / "model.safetensors"
 
     _, abs_state = nnx.split(model)
     pure_state = nnx.to_pure_dict(abs_state)
@@ -167,7 +166,5 @@ def export_qwen3_to_safetensors(
         missing = "\n".join(sorted(unmatched))
         raise RuntimeError(f"Unmapped JAX parameters during export:\n{missing}")
 
-    stnp.save_file(hf_tensors, str(tensor_path))
     save_hf_config(qwen3_to_hf_config_dict(cfg), out_dir)
-
-    return tensor_path
+    return atomic_save_hf_weights(out_dir, {"model.safetensors": hf_tensors})

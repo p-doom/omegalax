@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
+import os
 import re
+import tempfile
 from enum import Enum
+from pathlib import Path
 from typing import Any, Callable
 
 import jax
@@ -13,6 +17,7 @@ import numpy as np
 from etils import epath
 from huggingface_hub import hf_hub_download
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
+from safetensors import numpy as stnp
 
 TransformRule = tuple[tuple[int, ...] | None, tuple[int, ...] | None, bool] | None
 
@@ -406,7 +411,90 @@ def flatten_pure_state(tree: dict[str, Any]) -> dict[str, Any]:
     return flat
 
 
+def _fsync_dir(directory: Path) -> None:
+    fd = os.open(str(directory), os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+@contextlib.contextmanager
+def staged_replace(final_path: str | Path):
+    """Yield a temp path in the same directory, then atomically rename it into place.
+
+    The temp file shares the destination's filesystem, so the ``os.replace`` is
+    atomic: a concurrent reader sees either the previous file or the complete
+    new one, never a partial write. If the body raises, the temp file is removed
+    and no file with the final name is created or clobbered.
+    """
+    final_path = Path(final_path)
+    final_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(final_path.parent), prefix=f".{final_path.name}.", suffix=".incomplete"
+    )
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    try:
+        yield tmp_path
+        with tmp_path.open("rb+") as f:
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, final_path)
+        _fsync_dir(final_path.parent)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
+def atomic_save_safetensors(
+    tensors: dict[str, np.ndarray], path: str | Path, metadata: dict[str, str] | None = None
+) -> Path:
+    """Write one safetensors file atomically."""
+    final_path = Path(path)
+    with staged_replace(final_path) as tmp_path:
+        stnp.save_file(tensors, str(tmp_path), metadata=metadata)
+    return final_path
+
+
+def atomic_write_json(obj: Any, path: str | Path) -> Path:
+    """Write one JSON file atomically."""
+    final_path = Path(path)
+    with staged_replace(final_path) as tmp_path:
+        with tmp_path.open("w") as f:
+            json.dump(obj, f, indent=2)
+    return final_path
+
+
+def atomic_save_hf_weights(
+    out_dir: str | epath.Path | Path,
+    shards: dict[str, dict[str, np.ndarray]],
+    metadata: dict[str, str] | None = None,
+) -> Path:
+    """Write safetensors shards atomically and return the path consumers key on.
+
+    Every shard lands via a same-directory rename, so an export interrupted at
+    any point leaves no final-named file behind for a concurrent reader to pick
+    up. With more than one shard the ``model.safetensors.index.json`` is written
+    last, after every shard is durable, because that index is what HF loaders
+    gate on.
+    """
+    out_path = Path(str(out_dir)).expanduser()
+    out_path.mkdir(parents=True, exist_ok=True)
+
+    for name in sorted(shards):
+        atomic_save_safetensors(shards[name], out_path / name, metadata=metadata)
+
+    if len(shards) == 1:
+        return out_path / next(iter(shards))
+
+    weight_map = {key: name for name, tensors in shards.items() for key in tensors}
+    total_size = sum(int(arr.nbytes) for tensors in shards.values() for arr in tensors.values())
+    return atomic_write_json(
+        {"metadata": {"total_size": total_size}, "weight_map": weight_map},
+        out_path / "model.safetensors.index.json",
+    )
+
+
 def save_hf_config(cfg: dict[str, Any], path: str | epath.Path):
-    cfg_path = epath.Path(path) / "config.json"
-    with cfg_path.open("w") as f:
-        json.dump(cfg, f, indent=2)
+    atomic_write_json(cfg, Path(str(path)) / "config.json")
