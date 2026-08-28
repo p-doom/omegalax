@@ -813,11 +813,7 @@ def _run_sft(
                 "supervised_tokens": metrics["supervised_tokens"],
                 "total_tokens": metrics["total_tokens"],
                 "optimizer_healthy": optimizer_healthy_since_boundary,
-                "lr": (
-                    float(lr_schedule_fn(step_idx))
-                    if callable(lr_schedule_fn)
-                    else float(lr_schedule_fn)
-                ),
+                "lr": lr_schedule_fn(step_idx) if callable(lr_schedule_fn) else lr_schedule_fn,
             }
             if len(source_counts) > 1:
                 total = float(sum(source_counts.values()))
