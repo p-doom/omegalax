@@ -25,6 +25,7 @@ import jax.numpy as jnp
 import numpy as np
 from absl.testing import absltest
 from flax import nnx
+from jax.sharding import NamedSharding, PartitionSpec
 
 from omegalax.data.collator_qwen3 import _pad_vision_arrays, _compute_vision_cu_seqlens
 from omegalax.distributed.mesh import mesh_rules_for
@@ -85,14 +86,16 @@ class CuDnnPackedVisionAttentionTest(absltest.TestCase):
         v = rng.randn(N, H, K).astype(np.float32) * 0.1
         cu = np.concatenate([[0], np.cumsum(seg_sizes)]).astype(np.int32)
 
-        q_jax = jnp.asarray(q, dtype=jnp.bfloat16)
-        k_jax = jnp.asarray(k, dtype=jnp.bfloat16)
-        v_jax = jnp.asarray(v, dtype=jnp.bfloat16)
-        cu_jax = jnp.asarray(cu)
+        with mesh_rules_for(tp_size=1, fsdp_size=1, dp_size=1) as mesh:
+            replicated = NamedSharding(mesh, PartitionSpec())
+            q_jax = jax.device_put(jnp.asarray(q, dtype=jnp.bfloat16), replicated)
+            k_jax = jax.device_put(jnp.asarray(k, dtype=jnp.bfloat16), replicated)
+            v_jax = jax.device_put(jnp.asarray(v, dtype=jnp.bfloat16), replicated)
+            cu_jax = jax.device_put(jnp.asarray(cu), replicated)
 
-        scale = 1.0 / (K**0.5)
-        out_cudnn = _cudnn_packed_vision_attention(q_jax, k_jax, v_jax, cu_jax, scale)
-        out_ref = _block_diag_reference(q_jax, k_jax, v_jax, cu, scale)
+            scale = 1.0 / (K**0.5)
+            out_cudnn = _cudnn_packed_vision_attention(q_jax, k_jax, v_jax, cu_jax, scale)
+            out_ref = _block_diag_reference(q_jax, k_jax, v_jax, cu, scale)
 
         np.testing.assert_allclose(
             np.asarray(out_cudnn, dtype=np.float32),
