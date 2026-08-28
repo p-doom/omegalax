@@ -144,8 +144,8 @@ class VisionPatchEmbed(nnx.Module):
         """
         N = pixels.shape[0]
         patches = pixels.reshape(
-            N, self.temporal_patch_size, self.patch_size, self.patch_size, self.in_channels
-        )
+            N, self.in_channels, self.temporal_patch_size, self.patch_size, self.patch_size
+        ).transpose(0, 2, 3, 4, 1)
         embedded = self.proj(patches)
         return jax.lax.reshape(embedded, (N, self.embed_dim), out_sharding=self.hidden_shd)
 
