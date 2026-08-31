@@ -220,10 +220,17 @@ def _save_sft_checkpoint(
     rng: jax.Array,
     step: int,
     input_iter: checkpoint_utils.GrainIterator,
-) -> None:
+    *,
+    force: bool = False,
+) -> bool:
+    if force and checkpoint_manager.latest_step() == step:
+        startup_log(f"checkpoint save at step={step}: already saved this step; skipping")
+        return True
     train_state = _train_state(optimizer, rng)
     save_args = checkpoint_utils.make_grain_save_args(train_state, input_iter)
-    checkpoint_manager.save(step, args=save_args)
+    saved = checkpoint_manager.save(step, args=save_args, force=force)
+    startup_log(f"checkpoint save at step={step}: force={force} saved={saved}")
+    return saved
 
 
 def _restore_sft_checkpoint(
@@ -813,7 +820,9 @@ def run_sft(
         if requeue_requested:
             startup_log(f"[signal] saving checkpoint at step={step} and requeueing")
             if checkpoint_manager is not None:
-                _save_sft_checkpoint(checkpoint_manager, optimizer, rng, step, data_iter)
+                _save_sft_checkpoint(
+                    checkpoint_manager, optimizer, rng, step, data_iter, force=True
+                )
                 checkpoint_manager.wait_until_finished()
                 checkpoint_manager.close()
             slurm_job_id = os.environ.get("SLURM_JOB_ID")
@@ -828,7 +837,12 @@ def run_sft(
     if checkpoint_manager is not None:
         if last_metrics and (not save_every or last_metrics["step"] % save_every != 0):
             _save_sft_checkpoint(
-                checkpoint_manager, optimizer, rng, int(last_metrics["step"]), data_iter
+                checkpoint_manager,
+                optimizer,
+                rng,
+                int(last_metrics["step"]),
+                data_iter,
+                force=True,
             )
         checkpoint_manager.wait_until_finished()
         checkpoint_manager.close()
