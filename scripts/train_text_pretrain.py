@@ -5,6 +5,7 @@ from __future__ import annotations
 import gc
 from pathlib import Path
 
+import omegalax
 from absl import app, flags
 import jax
 import jax.numpy as jnp
@@ -27,6 +28,19 @@ from omegalax.trainers import pretrain as pretrain_trainer
 from omegalax.trainers.checkpoint_utils import ResumeMode
 from omegalax.trainers.perf import resolve_peak_tflops
 from omegalax.trainers.text import startup_log
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_NONPRODUCTION_MARKER = _REPO_ROOT / ".OMEGALAX_NONPRODUCTION"
+if _REPO_ROOT.name == "omegalax_optimization" or _NONPRODUCTION_MARKER.is_file():
+    raise RuntimeError(
+        f"Refusing to run production pretraining from non-production checkout: {_REPO_ROOT}"
+    )
+_IMPORTED_REPO_ROOT = Path(omegalax.__file__).resolve().parents[1]
+if _IMPORTED_REPO_ROOT != _REPO_ROOT:
+    raise RuntimeError(
+        "Entrypoint/package repo mismatch: "
+        f"script={_REPO_ROOT}, imported_omegalax={_IMPORTED_REPO_ROOT}"
+    )
 
 FLAGS = flags.FLAGS
 
