@@ -16,7 +16,7 @@ dependencies = [
   "jax[cuda12]",
   "jax-triton",
   "nvidia-cudnn-cu12==9.18.1.3",
-  "nvidia-nccl-cu12>=2.28",
+  "nvidia-nccl-cu12==2.28.3",
   "jaxtyping",
   "optax",
   "orbax-checkpoint",
@@ -37,7 +37,7 @@ torch-tests = [
 ]
 
 [tool.uv]
-override-dependencies = ["nvidia-cudnn-cu12==9.18.1.3", "nvidia-nccl-cu12>=2.28"]
+override-dependencies = ["nvidia-cudnn-cu12==9.18.1.3", "nvidia-nccl-cu12==2.28.3"]
 
 [tool.hatch.metadata]
 allow-direct-references = true
