@@ -30,7 +30,8 @@ class MLP(nnx.Module):
         intermediate_size: int,
         shd_cfg: ShardConfig,
         *,
-        dtype=None,
+        dtype,
+        param_dtype,
         rngs: nnx.Rngs,
     ):
         self.shd_cfg = shd_cfg
@@ -40,6 +41,7 @@ class MLP(nnx.Module):
             use_bias=False,
             rngs=rngs,
             dtype=dtype,
+            param_dtype=param_dtype,
             kernel_init=wp(init_fn, ("embed", "mlp")),
         )
         row_parallel = partial(
@@ -47,6 +49,7 @@ class MLP(nnx.Module):
             use_bias=False,
             rngs=rngs,
             dtype=dtype,
+            param_dtype=param_dtype,
             kernel_init=wp(init_fn, ("mlp", "embed")),
         )
         self.gate_proj = col_parallel(hidden_size, intermediate_size)
@@ -73,15 +76,15 @@ class MoEFeedForward(nnx.Module):
 
         init = nnx.initializers.lecun_normal()
         self.gate_proj = nnx.Param(
-            init(rngs.params(), (E, D, F_moe)),
+            init(rngs.params(), (E, D, F_moe), dtype=cfg.param_dtype),
             sharding=(None, "embed", "mlp"),
         )
         self.up_proj = nnx.Param(
-            init(rngs.params(), (E, D, F_moe)),
+            init(rngs.params(), (E, D, F_moe), dtype=cfg.param_dtype),
             sharding=(None, "embed", "mlp"),
         )
         self.down_proj = nnx.Param(
-            init(rngs.params(), (E, F_moe, D)),
+            init(rngs.params(), (E, F_moe, D), dtype=cfg.param_dtype),
             sharding=(None, "mlp", "embed"),
         )
         self.router = nnx.Linear(
@@ -90,6 +93,7 @@ class MoEFeedForward(nnx.Module):
             use_bias=False,
             rngs=rngs,
             dtype=cfg.dtype,
+            param_dtype=cfg.param_dtype,
             kernel_init=wp(init, ("embed", None)),
         )
 
@@ -98,6 +102,7 @@ class MoEFeedForward(nnx.Module):
             cfg.shared_expert_intermediate_size,
             shd_cfg=cfg.shd_cfg,
             dtype=cfg.dtype,
+            param_dtype=cfg.param_dtype,
             rngs=rngs,
         )
         self.shared_expert_gate = nnx.Linear(
@@ -106,6 +111,7 @@ class MoEFeedForward(nnx.Module):
             use_bias=False,
             rngs=rngs,
             dtype=cfg.dtype,
+            param_dtype=cfg.param_dtype,
             kernel_init=wp(init, ("embed", None)),
         )
 
@@ -201,10 +207,15 @@ class DecoderLayer(nnx.Module):
                 cfg.intermediate_size,
                 cfg.shd_cfg,
                 dtype=cfg.dtype,
+                param_dtype=cfg.param_dtype,
                 rngs=rngs,
             )
-        self.input_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, rngs=rngs)
-        self.post_attention_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, rngs=rngs)
+        self.input_layernorm = RMSNorm(
+            cfg.hidden_size, cfg.rms_norm_eps, rngs=rngs, param_dtype=cfg.param_dtype
+        )
+        self.post_attention_layernorm = RMSNorm(
+            cfg.hidden_size, cfg.rms_norm_eps, rngs=rngs, param_dtype=cfg.param_dtype
+        )
 
     @partial(jax.remat, static_argnums=0)
     def __call__(
@@ -247,13 +258,16 @@ class TextModel(nnx.Module):
             cfg.hidden_size,
             rngs=rngs,
             dtype=cfg.dtype,
+            param_dtype=cfg.param_dtype,
             embedding_init=wp(embed_init, ("vocab", "embed")),
         )
         self.out_emb_shd = cfg.shd_cfg.act_btd
         self.layers = nnx.List(
             [DecoderLayer(cfg, i, rngs=rngs) for i in range(cfg.num_hidden_layers)]
         )
-        self.final_norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, rngs=rngs)
+        self.final_norm = RMSNorm(
+            cfg.hidden_size, cfg.rms_norm_eps, rngs=rngs, param_dtype=cfg.param_dtype
+        )
 
     @jax.named_scope("text_model")
     def __call__(
@@ -329,6 +343,7 @@ class Qwen3_5ForCausalLM(nnx.Module):
             use_bias=False,
             rngs=rngs,
             dtype=cfg.dtype,
+            param_dtype=cfg.param_dtype,
             kernel_init=wp(lm_head_init, ("embed", "vocab")),
         )
 
@@ -352,6 +367,7 @@ class Qwen3_5ForConditionalGeneration(nnx.Module):
             use_bias=False,
             rngs=rngs,
             dtype=cfg.text_config.dtype,
+            param_dtype=cfg.text_config.param_dtype,
             kernel_init=wp(lm_head_init, ("embed", "vocab")),
         )
 

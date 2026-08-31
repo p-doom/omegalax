@@ -14,6 +14,7 @@ import jax.numpy as jnp
 import numpy as np
 import torch
 from absl.testing import absltest
+from flax import nnx
 from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import (
     Qwen3_5MoeConfig as HFConfig,
     Qwen3_5MoeTextConfig as HFTextConfig,
@@ -26,6 +27,7 @@ from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
 )
 
 from omegalax.models.qwen3_5.params import create_qwen3_5_from_safetensors
+from omegalax.models.params_utils import flatten_pure_state
 from omegalax.models.sharding_runtime import set_attn_backend
 
 from tests.logits_assert import assert_logits_close
@@ -110,7 +112,7 @@ class Qwen3_5WeightsTest(absltest.TestCase):
         cls.tmpdir = tempfile.mkdtemp()
         torch.manual_seed(0)
 
-        hf_model = HFModel(HF_CFG).eval()
+        hf_model = HFModel(HF_CFG).to(torch.bfloat16).eval()
         hf_model.save_pretrained(cls.tmpdir, safe_serialization=True)
 
         cls.jax_model, cls.jax_cfg = create_qwen3_5_from_safetensors(
@@ -142,6 +144,15 @@ class Qwen3_5WeightsTest(absltest.TestCase):
 
     def test_weight_loading_succeeds(self):
         self.assertIsNotNone(self.jax_model)
+
+    def test_bf16_hf_weights_load_into_fp32_parameter_state(self):
+        state = nnx.to_pure_dict(nnx.state(self.jax_model, nnx.Param))
+        flat_state = flatten_pure_state(state)
+        self.assertNotEmpty(flat_state)
+        self.assertEqual(
+            {value.dtype for value in flat_state.values()},
+            {jnp.dtype(jnp.float32)},
+        )
 
     def test_prefill_logits_match_hf(self):
         """Single-sequence text-only forward pass should match HuggingFace."""

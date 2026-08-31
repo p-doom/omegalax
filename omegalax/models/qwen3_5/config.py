@@ -25,6 +25,7 @@ class Qwen3_5VisionConfig:
     out_hidden_size: int = 4096
     num_position_embeddings: int = 2304
     dtype: Any = jnp.bfloat16
+    param_dtype: Any = jnp.float32
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -61,6 +62,7 @@ class Qwen3_5TextConfig:
     router_aux_loss_coef: float = 0.001
     shd_cfg: ShardConfig = dataclasses.field(default_factory=ShardConfig.default)
     dtype: Any = jnp.bfloat16
+    param_dtype: Any = jnp.float32
 
     @property
     def is_moe(self) -> bool:
@@ -298,6 +300,7 @@ def make_config_from_hf(hf_cfg: dict[str, Any]) -> Qwen3_5Config:
         "linear_num_value_heads": _required(txt, "linear_num_value_heads", "hf_cfg['text_config']"),
         "linear_value_head_dim": _required(txt, "linear_value_head_dim", "hf_cfg['text_config']"),
         "dtype": text_dtype,
+        "param_dtype": jnp.float32,
     }
 
     if has_moe:
@@ -328,6 +331,7 @@ def make_config_from_hf(hf_cfg: dict[str, Any]) -> Qwen3_5Config:
                 vis, "num_position_embeddings", "hf_cfg['vision_config']"
             ),
             dtype=vision_dtype,
+            param_dtype=jnp.float32,
         ),
         text_config=Qwen3_5TextConfig(**text_kw),
         image_token_id=_required(hf_cfg, "image_token_id", "hf_cfg"),

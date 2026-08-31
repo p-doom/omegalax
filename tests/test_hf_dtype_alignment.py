@@ -123,6 +123,8 @@ class HFDtypeAlignmentTest(unittest.TestCase):
         cfg = make_config_from_hf(_qwen3_5_hf_cfg())
         self.assertEqual(cfg.text_config.dtype, jnp.bfloat16)
         self.assertEqual(cfg.vision_config.dtype, cfg.text_config.dtype)
+        self.assertEqual(cfg.text_config.param_dtype, jnp.float32)
+        self.assertEqual(cfg.vision_config.param_dtype, jnp.float32)
 
     def test_qwen3_5_honors_explicit_vision_dtype(self):
         hf_cfg = copy.deepcopy(_qwen3_5_hf_cfg())
@@ -130,6 +132,8 @@ class HFDtypeAlignmentTest(unittest.TestCase):
         cfg = make_config_from_hf(hf_cfg)
         self.assertEqual(cfg.text_config.dtype, jnp.bfloat16)
         self.assertEqual(cfg.vision_config.dtype, jnp.float32)
+        self.assertEqual(cfg.text_config.param_dtype, jnp.float32)
+        self.assertEqual(cfg.vision_config.param_dtype, jnp.float32)
 
     def test_qwen3_5_rejects_non_interleaved_mrope(self):
         hf_cfg = _qwen3_5_hf_cfg()

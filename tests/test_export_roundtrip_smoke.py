@@ -6,6 +6,7 @@ import tempfile
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 from absl.testing import absltest
 from flax import nnx
@@ -44,6 +45,12 @@ def _assert_params_equal(testcase: absltest.TestCase, model_a, model_b):
         b = np.asarray(jax.device_get(flat_b[key]))
         testcase.assertEqual(a.shape, b.shape, f"Shape mismatch at {key}")
         np.testing.assert_allclose(a, b, rtol=0, atol=0, err_msg=key)
+
+
+def _assert_params_dtype(testcase: absltest.TestCase, model, dtype):
+    flat = _flatten_model(model)
+    testcase.assertNotEmpty(flat)
+    testcase.assertEqual({value.dtype for value in flat.values()}, {jnp.dtype(dtype)})
 
 
 class ExportRoundTripTest(absltest.TestCase):
@@ -118,6 +125,8 @@ class ExportRoundTripTest(absltest.TestCase):
                     dp_size=1,
                 )
         _assert_params_equal(self, model, loaded)
+        _assert_params_dtype(self, model, jnp.float32)
+        _assert_params_dtype(self, loaded, jnp.float32)
 
     def test_qwen3_5_dense_round_trip(self):
         with mesh_rules_for(tp_size=1, fsdp_size=1, dp_size=1):
@@ -134,6 +143,8 @@ class ExportRoundTripTest(absltest.TestCase):
                     dp_size=1,
                 )
         _assert_params_equal(self, model, loaded)
+        _assert_params_dtype(self, model, jnp.float32)
+        _assert_params_dtype(self, loaded, jnp.float32)
 
 
 # The top-level keys a serving stack dereferences, per model_type, taken from the

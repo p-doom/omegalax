@@ -37,6 +37,7 @@ class Attention(nnx.Module):
             use_bias=cfg.attention_bias,
             rngs=rngs,
             dtype=cfg.dtype,
+            param_dtype=cfg.param_dtype,
             kernel_init=qkv_init,
         )
         self.k_proj = nnx.Linear(
@@ -45,6 +46,7 @@ class Attention(nnx.Module):
             use_bias=cfg.attention_bias,
             rngs=rngs,
             dtype=cfg.dtype,
+            param_dtype=cfg.param_dtype,
             kernel_init=qkv_init,
         )
         self.v_proj = nnx.Linear(
@@ -53,6 +55,7 @@ class Attention(nnx.Module):
             use_bias=cfg.attention_bias,
             rngs=rngs,
             dtype=cfg.dtype,
+            param_dtype=cfg.param_dtype,
             kernel_init=qkv_init,
         )
         self.o_proj = nnx.Linear(
@@ -61,11 +64,16 @@ class Attention(nnx.Module):
             use_bias=cfg.attention_bias,
             rngs=rngs,
             dtype=cfg.dtype,
+            param_dtype=cfg.param_dtype,
             kernel_init=o_init,
         )
 
-        self.q_norm = RMSNorm(hd, cfg.rms_norm_eps, rngs=rngs, sharding=(None,))
-        self.k_norm = RMSNorm(hd, cfg.rms_norm_eps, rngs=rngs, sharding=(None,))
+        self.q_norm = RMSNorm(
+            hd, cfg.rms_norm_eps, rngs=rngs, param_dtype=cfg.param_dtype, sharding=(None,)
+        )
+        self.k_norm = RMSNorm(
+            hd, cfg.rms_norm_eps, rngs=rngs, param_dtype=cfg.param_dtype, sharding=(None,)
+        )
 
         self.num_heads = nh
         self.num_kv_heads = nkv

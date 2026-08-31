@@ -72,10 +72,22 @@ class GatedDeltaNet(nnx.Module):
 
         in_proj_init = wp(init, ("embed", "mlp"))
         self.in_proj_qkv = nnx.Linear(
-            D, conv_dim, use_bias=False, rngs=rngs, dtype=cfg.dtype, kernel_init=in_proj_init
+            D,
+            conv_dim,
+            use_bias=False,
+            rngs=rngs,
+            dtype=cfg.dtype,
+            param_dtype=cfg.param_dtype,
+            kernel_init=in_proj_init,
         )
         self.in_proj_z = nnx.Linear(
-            D, self.value_dim, use_bias=False, rngs=rngs, dtype=cfg.dtype, kernel_init=in_proj_init
+            D,
+            self.value_dim,
+            use_bias=False,
+            rngs=rngs,
+            dtype=cfg.dtype,
+            param_dtype=cfg.param_dtype,
+            kernel_init=in_proj_init,
         )
         self.in_proj_b = nnx.Linear(
             D,
@@ -83,6 +95,7 @@ class GatedDeltaNet(nnx.Module):
             use_bias=False,
             rngs=rngs,
             dtype=cfg.dtype,
+            param_dtype=cfg.param_dtype,
             kernel_init=in_proj_init,
         )
         self.in_proj_a = nnx.Linear(
@@ -91,17 +104,25 @@ class GatedDeltaNet(nnx.Module):
             use_bias=False,
             rngs=rngs,
             dtype=cfg.dtype,
+            param_dtype=cfg.param_dtype,
             kernel_init=in_proj_init,
         )
 
         self.conv_weight = nnx.Param(
-            init(rngs.params(), (conv_dim, self.conv_kernel_size)),
+            init(rngs.params(), (conv_dim, self.conv_kernel_size), dtype=cfg.param_dtype),
             sharding=(None, None),
         )
 
-        self.dt_bias = nnx.Param(jnp.ones(self.num_v_heads), sharding=(None,))
+        self.dt_bias = nnx.Param(
+            jnp.ones(self.num_v_heads, dtype=cfg.param_dtype), sharding=(None,)
+        )
         self.A_log = nnx.Param(
-            jnp.log(jax.random.uniform(rngs.params(), (self.num_v_heads,)) * 16),
+            jnp.log(
+                jax.random.uniform(
+                    rngs.params(), (self.num_v_heads,), dtype=cfg.param_dtype
+                )
+                * 16
+            ),
             sharding=(None,),
         )
 
@@ -120,13 +141,20 @@ class GatedDeltaNet(nnx.Module):
         self.hidden_shd = cfg.shd_cfg.act_btd
         self.scan_state_shd = P(batch_axis, head_axis, None, None)
         self.flat_norm_shd = P(flat_axis, None)
-        self.norm = RMSNormGated(self.head_v_dim, cfg.rms_norm_eps, rngs=rngs, sharding=(None,))
+        self.norm = RMSNormGated(
+            self.head_v_dim,
+            cfg.rms_norm_eps,
+            rngs=rngs,
+            param_dtype=cfg.param_dtype,
+            sharding=(None,),
+        )
         self.out_proj = nnx.Linear(
             self.value_dim,
             D,
             use_bias=False,
             rngs=rngs,
             dtype=cfg.dtype,
+            param_dtype=cfg.param_dtype,
             kernel_init=wp(init, ("mlp", "embed")),
         )
 
