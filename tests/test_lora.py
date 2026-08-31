@@ -216,6 +216,41 @@ class LoRATest(absltest.TestCase):
         # (W + αAB)x vs Wx + α(A(Bx)). Loose tol covers last-bit drift.
         np.testing.assert_allclose(y_lora, y_merged, rtol=1e-4, atol=1e-4)
 
+    def test_adapter_params_fp32_by_default_with_bf16_base(self):
+        class _Bf16Block(nnx.Module):
+            def __init__(self, d, *, rngs):
+                self.q_proj = nnx.Linear(d, d, use_bias=False, param_dtype=jnp.bfloat16, rngs=rngs)
+                self.up_proj = nnx.Linear(d, d, use_bias=False, param_dtype=jnp.bfloat16, rngs=rngs)
+
+        model = _Bf16Block(16, rngs=nnx.Rngs(0))
+        n = inject_lora(model, r=4, alpha=8, rngs=nnx.Rngs(1))
+        self.assertEqual(n, 2)
+        for _, mod in nnx.iter_modules(model):
+            if isinstance(mod, LoRALinear):
+                self.assertEqual(mod.lora_A[...].dtype, jnp.float32)
+                self.assertEqual(mod.lora_B[...].dtype, jnp.float32)
+                self.assertEqual(mod.base.kernel[...].dtype, jnp.bfloat16)
+
+    def test_lora_A_init_symmetric(self):
+        base = nnx.Linear(256, 64, use_bias=False, rngs=nnx.Rngs(0))
+        wrapped = LoRALinear(base, r=32, alpha=32.0, rngs=nnx.Rngs(1))
+        a = np.asarray(wrapped.lora_A[...])
+        limit = 1.0 / (256**0.5)
+        self.assertLess(abs(float(a.mean())), 0.1 * limit)
+        self.assertGreater((a > 0).mean(), 0.4)
+        self.assertGreater((a < 0).mean(), 0.4)
+        self.assertLessEqual(float(a.max()), limit)
+        self.assertGreaterEqual(float(a.min()), -limit)
+        np.testing.assert_array_equal(np.asarray(wrapped.lora_B[...]), 0.0)
+
+    def test_forward_compute_stays_in_activation_dtype(self):
+        base = nnx.Linear(16, 16, use_bias=False, param_dtype=jnp.bfloat16, rngs=nnx.Rngs(0))
+        wrapped = LoRALinear(base, r=4, alpha=8.0, rngs=nnx.Rngs(1))
+        self.assertEqual(wrapped.lora_A[...].dtype, jnp.float32)
+        x = jax.random.normal(jax.random.key(2), (2, 16), dtype=jnp.bfloat16)
+        y = wrapped(x)
+        self.assertEqual(y.dtype, jnp.bfloat16)
+
     def test_default_target_modules_match_qwen3vl_attribute_names(self):
         expected = {
             "q_proj",

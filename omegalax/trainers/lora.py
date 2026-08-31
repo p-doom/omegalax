@@ -9,9 +9,12 @@ Design follows the "LoRA Without Regret" recommendations:
 * default ``rank=32``, ``alpha=32`` (matches Tinker's SL default and the
   PEFT/HuggingFace convention; ``alpha/r = 1`` makes the optimal LR
   approximately rank-independent).
-* init A from uniform with scale ``1/sqrt(d_in)``, B from zeros (so the
+* init A ~ Uniform(-1/sqrt(d_in), +1/sqrt(d_in)), B from zeros (so the
   adapter is the identity at step 0 and we get bit-exact forward parity
   with the unwrapped model).
+* adapter params are stored in fp32 (master weights) regardless of the
+  base dtype; the forward casts them to the activation dtype so the
+  compute path stays bf16.
 * recommended LR ≈ 10× the FullFT LR.
 
 Vision tower is intentionally excluded by the ``skip_paths`` default:
@@ -95,7 +98,7 @@ class LoRALinear(nnx.Module):
         r: int,
         alpha: float,
         rngs: nnx.Rngs,
-        dtype: jnp.dtype | None = None,
+        dtype: jnp.dtype = jnp.float32,
     ):
         if r <= 0:
             raise ValueError(f"LoRA rank must be positive, got r={r}")
@@ -106,16 +109,21 @@ class LoRALinear(nnx.Module):
 
         d_in = base.in_features
         d_out = base.out_features
-        adapter_dtype = dtype if dtype is not None else base.dtype
+        adapter_dtype = dtype
 
-        # PEFT/Tinker convention: A ~ Uniform(-1/sqrt(d_in), 1/sqrt(d_in))
-        # under nnx.initializers.uniform's symmetric scale. B = 0.
+        # PEFT/Tinker convention: A ~ Uniform(-1/sqrt(d_in), +1/sqrt(d_in)), B = 0.
         # No sharding metadata: A and B are tiny (~r·d each) and replicated
         # across the mesh; the surrounding matmul output sharding is
         # constrained explicitly via ``out_sharding`` in ``__call__``.
-        a_init_fn = nnx.initializers.uniform(scale=1.0 / (d_in**0.5))
+        a_limit = 1.0 / (d_in**0.5)
         self.lora_A = LoRAParam(
-            a_init_fn(rngs.params(), (d_in, r), adapter_dtype),
+            jax.random.uniform(
+                rngs.params(),
+                (d_in, r),
+                adapter_dtype,
+                minval=-a_limit,
+                maxval=a_limit,
+            ),
         )
         self.lora_B = LoRAParam(
             jnp.zeros((r, d_out), dtype=adapter_dtype),
@@ -144,8 +152,8 @@ class LoRALinear(nnx.Module):
 
     def __call__(self, inputs: jax.Array, *, out_sharding=None) -> jax.Array:
         base_out = self.base(inputs, out_sharding=out_sharding)
-        a = self.lora_A[...]
-        b = self.lora_B[...]
+        a = self.lora_A[...].astype(inputs.dtype)
+        b = self.lora_B[...].astype(inputs.dtype)
         if out_sharding is not None:
             # reshard lora_B (not the delta) so the delta is born tp-sharded; no-op at tp=1.
             b = reshard(b, P(None, out_sharding[-1]))
@@ -178,7 +186,7 @@ def inject_lora(
     rngs: nnx.Rngs,
     target_modules: Sequence[str] = DEFAULT_TARGET_MODULES,
     skip_paths: Sequence[str] = DEFAULT_SKIP_PATHS,
-    dtype: jnp.dtype | None = None,
+    dtype: jnp.dtype = jnp.float32,
 ) -> int:
     """Replace each ``nnx.Linear`` named in ``target_modules`` with a
     ``LoRALinear`` wrapping it. In place. Returns the count of layers

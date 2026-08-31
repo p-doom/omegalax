@@ -561,6 +561,7 @@ def run_sft(
                     *DEFAULT_TARGET_MODULES,
                     *train_cfg.lora_extra_target_modules,
                 ),
+                dtype=jnp.float32,
             )
         startup_log(
             f"LoRA enabled: r={train_cfg.lora_rank} alpha={train_cfg.lora_alpha} "
