@@ -13,6 +13,8 @@ Run on CPU; no model loading. Validate:
 from __future__ import annotations
 
 import os
+import tempfile
+from pathlib import Path
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
@@ -20,12 +22,14 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+import orbax.checkpoint as ocp
 from absl.testing import absltest
 from flax import nnx
 
 from omegalax.distributed.mesh import mesh_rules_for
 from omegalax.models.qwen3_5 import Qwen3_5ForConditionalGeneration
 from omegalax.models.qwen3_5.config import make_config as make_qwen3_5_config
+from omegalax.trainers import vlm
 from omegalax.trainers.lora import (
     DEFAULT_TARGET_MODULES,
     QWEN3_5_DELTANET_TARGET_MODULES,
@@ -35,6 +39,7 @@ from omegalax.trainers.lora import (
     inject_model_lora,
     merge_lora_into_base,
 )
+from omegalax.trainers.optim import MixedPrecisionOptimizer
 
 
 class _MiniAttention(nnx.Module):
@@ -90,6 +95,21 @@ class _MiniModel(nnx.Module):
         return self.lm_head(x)
 
 
+class _MiniBf16Model(nnx.Module):
+    def __init__(self, *, rngs: nnx.Rngs):
+        self.q_proj = nnx.Linear(
+            4,
+            4,
+            use_bias=False,
+            dtype=jnp.bfloat16,
+            param_dtype=jnp.float32,
+            rngs=rngs,
+        )
+
+    def __call__(self, x):
+        return self.q_proj(x)
+
+
 def _make_model(seed: int = 0, d: int = 16, mlp: int = 32, n_layers: int = 2):
     return _MiniModel(d=d, mlp=mlp, n_layers=n_layers, rngs=nnx.Rngs(seed))
 
@@ -102,28 +122,72 @@ class LoRATest(absltest.TestCase):
         x = jax.random.normal(jax.random.key(42), (4, 7, 16), dtype=jnp.float32)
         y_before = model(x)
 
-        n = inject_lora(model, r=8, alpha=16, rngs=nnx.Rngs(1), dtype=jnp.float32)
+        n = inject_lora(model, r=8, alpha=16, rngs=nnx.Rngs(1))
         self.assertGreater(n, 0)
         y_after = model(x)
         np.testing.assert_array_equal(np.asarray(y_before), np.asarray(y_after))
+
+    def test_adapter_master_is_fp32_and_forward_matmuls_are_bf16(self):
+        model = _MiniBf16Model(rngs=nnx.Rngs(0))
+        inject_model_lora(model, r=2, alpha=2, rngs=nnx.Rngs(1))
+
+        self.assertEqual(model.q_proj.lora_A[...].dtype, jnp.float32)
+        self.assertEqual(model.q_proj.lora_B[...].dtype, jnp.float32)
+
+        x = jnp.ones((1, 4), dtype=jnp.bfloat16)
+        jaxpr = jax.make_jaxpr(model)(x).jaxpr
+        dot_dtypes = [
+            tuple(value.aval.dtype for value in equation.invars)
+            for equation in jaxpr.eqns
+            if equation.primitive.name == "dot_general"
+        ]
+        self.assertLen(dot_dtypes, 3)
+        self.assertTrue(all(dtypes == (jnp.bfloat16, jnp.bfloat16) for dtypes in dot_dtypes))
+        self.assertEqual(model(x).dtype, jnp.bfloat16)
+
+    def test_sub_bf16_ulp_adamw_updates_accumulate_in_master(self):
+        model = _MiniBf16Model(rngs=nnx.Rngs(0))
+        inject_model_lora(model, r=2, alpha=2, rngs=nnx.Rngs(1))
+        model.q_proj.lora_A[...] = jnp.ones_like(model.q_proj.lora_A[...])
+        model.q_proj.lora_B[...] = jnp.ones_like(model.q_proj.lora_B[...])
+        optimizer = MixedPrecisionOptimizer(
+            model,
+            optax.adamw(1e-4, weight_decay=0.0),
+            wrt=LoRAParam,
+        )
+
+        def loss_fn(m):
+            return jnp.sum(m.q_proj.lora_A[...]) + jnp.sum(m.q_proj.lora_B[...])
+
+        gradients = nnx.grad(loss_fn, argnums=nnx.DiffState(0, LoRAParam))(model)
+        before = np.asarray(model.q_proj.lora_B[...]).copy()
+        for _ in range(16):
+            optimizer.update(gradients)
+        after = np.asarray(model.q_proj.lora_B[...])
+
+        bf16_control = jnp.asarray(1.0, jnp.bfloat16)
+        for _ in range(16):
+            bf16_control = (bf16_control.astype(jnp.float32) - 1e-4).astype(jnp.bfloat16)
+        self.assertEqual(float(bf16_control), 1.0)
+        self.assertEqual(np.count_nonzero(after != before), after.size)
 
     def test_inject_count_matches_expected(self):
         """Per layer: 4 attention projections + 3 MLP projections = 7. Times
         n_layers. Vision (skipped) and lm_head (not in target list) → 0."""
         n_layers = 3
         model = _make_model(seed=0, n_layers=n_layers)
-        n = inject_lora(model, r=4, alpha=8, rngs=nnx.Rngs(1), dtype=jnp.float32)
+        n = inject_lora(model, r=4, alpha=8, rngs=nnx.Rngs(1))
         self.assertEqual(n, 7 * n_layers)
 
     def test_vision_subtree_is_skipped(self):
         model = _make_model(seed=0)
-        inject_lora(model, r=4, alpha=8, rngs=nnx.Rngs(1), dtype=jnp.float32)
+        inject_lora(model, r=4, alpha=8, rngs=nnx.Rngs(1))
         self.assertIsInstance(model.vision.q_proj, nnx.Linear)
         self.assertNotIsInstance(model.vision.q_proj, LoRALinear)
 
     def test_lm_head_not_wrapped(self):
         model = _make_model(seed=0)
-        inject_lora(model, r=4, alpha=8, rngs=nnx.Rngs(1), dtype=jnp.float32)
+        inject_lora(model, r=4, alpha=8, rngs=nnx.Rngs(1))
         self.assertIsInstance(model.lm_head, nnx.Linear)
         self.assertNotIsInstance(model.lm_head, LoRALinear)
 
@@ -131,7 +195,7 @@ class LoRATest(absltest.TestCase):
         """grads filtered by wrt=LoRAParam must contain only LoRAParam
         leaves; no base nnx.Param weights should receive gradient."""
         model = _make_model(seed=0)
-        inject_lora(model, r=4, alpha=8, rngs=nnx.Rngs(1), dtype=jnp.float32)
+        inject_lora(model, r=4, alpha=8, rngs=nnx.Rngs(1))
         x = jax.random.normal(jax.random.key(42), (2, 4, 16), dtype=jnp.float32)
 
         def loss_fn(m):
@@ -149,7 +213,7 @@ class LoRATest(absltest.TestCase):
         """One optimizer step with wrt=LoRAParam must leave every base
         nnx.Linear kernel bit-identical."""
         model = _make_model(seed=0)
-        inject_lora(model, r=4, alpha=8, rngs=nnx.Rngs(1), dtype=jnp.float32)
+        inject_lora(model, r=4, alpha=8, rngs=nnx.Rngs(1))
 
         base_snapshots: dict[str, np.ndarray] = {}
         for path, mod in nnx.iter_modules(model):
@@ -191,7 +255,7 @@ class LoRATest(absltest.TestCase):
         """``merge_lora_into_base`` must produce a model whose forward output
         matches the LoRA-wrapped forward to within fp32 tolerance."""
         model = _make_model(seed=0)
-        inject_lora(model, r=8, alpha=16, rngs=nnx.Rngs(1), dtype=jnp.float32)
+        inject_lora(model, r=8, alpha=16, rngs=nnx.Rngs(1))
 
         for path, mod in nnx.iter_modules(model):
             if isinstance(mod, LoRALinear):
@@ -216,6 +280,52 @@ class LoRATest(absltest.TestCase):
         # (W + αAB)x vs Wx + α(A(Bx)). Loose tol covers last-bit drift.
         np.testing.assert_allclose(y_lora, y_merged, rtol=1e-4, atol=1e-4)
 
+    def test_checkpoint_restore_preserves_fp32_master_and_export_merge(self):
+        model = _MiniBf16Model(rngs=nnx.Rngs(0))
+        inject_model_lora(model, r=2, alpha=2, rngs=nnx.Rngs(1))
+        model.q_proj.lora_B[...] = jnp.full_like(model.q_proj.lora_B[...], 0.25)
+        optimizer = MixedPrecisionOptimizer(model, optax.adamw(1e-3), wrt=LoRAParam)
+
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            vlm._make_checkpoint_manager(Path(tmpdir), save_interval=1) as manager,
+        ):
+            state = vlm._train_state(optimizer, jax.random.key(2), 10)
+            manager.save(
+                1,
+                args=ocp.args.Composite(
+                    train_state=ocp.args.PyTreeSave(state),
+                ),
+                force=True,
+            )
+
+            restored_model = _MiniBf16Model(rngs=nnx.Rngs(0))
+            inject_model_lora(restored_model, r=2, alpha=2, rngs=nnx.Rngs(1))
+            restored_optimizer = MixedPrecisionOptimizer(
+                restored_model,
+                optax.adamw(1e-3),
+                wrt=LoRAParam,
+            )
+            abstract = vlm._abstract_train_state(
+                restored_optimizer,
+                jax.random.key(2),
+                10,
+            )
+            restored = manager.restore(
+                1,
+                args=ocp.args.Composite(
+                    train_state=ocp.args.PyTreeRestore(abstract),
+                ),
+            )
+            nnx.update(restored_optimizer, restored["train_state"]["optimizer"])
+
+        self.assertEqual(restored_model.q_proj.lora_B[...].dtype, jnp.float32)
+        np.testing.assert_array_equal(restored_model.q_proj.lora_B[...], 0.25)
+        x = jnp.ones((1, 4), dtype=jnp.bfloat16)
+        before_merge = restored_model(x)
+        self.assertEqual(merge_lora_into_base(restored_model), 1)
+        np.testing.assert_allclose(restored_model(x), before_merge, rtol=1e-2, atol=1e-2)
+
     def test_default_target_modules_match_qwen3vl_attribute_names(self):
         expected = {
             "q_proj",
@@ -230,7 +340,7 @@ class LoRATest(absltest.TestCase):
 
     def test_default_injection_allows_unmatched_moe_projection_names(self):
         model = _MiniAttention(16, rngs=nnx.Rngs(0))
-        count = inject_lora(model, r=4, alpha=8, rngs=nnx.Rngs(1), dtype=jnp.float32)
+        count = inject_lora(model, r=4, alpha=8, rngs=nnx.Rngs(1))
         self.assertEqual(count, 4)
 
     def test_injection_consumes_rng_in_declared_target_order(self):
@@ -246,7 +356,6 @@ class LoRATest(absltest.TestCase):
             alpha=8,
             rngs=nnx.Rngs(1),
             target_modules=("q_proj", "k_proj"),
-            dtype=jnp.float32,
         )
 
         np.testing.assert_array_equal(model.q_proj.lora_A[...], expected_a)
@@ -284,10 +393,8 @@ class LoRATest(absltest.TestCase):
         """End-to-end smoke of the trainer's pattern: build the
         MixedPrecisionOptimizer with wrt=LoRAParam, take one step, verify
         loss is finite and base kernels are bit-exact unchanged."""
-        from omegalax.trainers.optim import MixedPrecisionOptimizer
-
         model = _make_model(seed=0)
-        n = inject_lora(model, r=4, alpha=8, rngs=nnx.Rngs(1), dtype=jnp.float32)
+        n = inject_lora(model, r=4, alpha=8, rngs=nnx.Rngs(1))
         self.assertGreater(n, 0)
 
         # Snapshot base kernels before stepping.
