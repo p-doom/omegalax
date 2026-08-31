@@ -80,7 +80,6 @@ def _restore_trained_weights(model, checkpoint_path: Path):
                 r=rank,
                 alpha=float(lora_meta["lora_alpha"]),
                 rngs=nnx.Rngs(FLAGS.seed),
-                qwen3_5_deltanet=lora_meta["lora_qwen3_5_deltanet"],
             )
             print(f"[export] re-injected LoRA into base for restore: r={rank} wrapped={n_wrapped}")
 

@@ -81,13 +81,10 @@ class VLMTrainableFilterTest(absltest.TestCase):
 
     def test_feature_combinations_fail_at_the_config_boundary(self):
         _validate_train_config(TrainConfig(freeze_vision_tower=True, train_vision_merger=True))
-        _validate_train_config(TrainConfig(enable_lora=True, lora_qwen3_5_deltanet=True))
         with self.assertRaisesRegex(ValueError, "mutually exclusive"):
             _validate_train_config(TrainConfig(enable_lora=True, freeze_vision_tower=True))
         with self.assertRaisesRegex(ValueError, "requires freeze_vision_tower"):
             _validate_train_config(TrainConfig(train_vision_merger=True))
-        with self.assertRaisesRegex(ValueError, "requires enable_lora"):
-            _validate_train_config(TrainConfig(lora_qwen3_5_deltanet=True))
 
 
 if __name__ == "__main__":

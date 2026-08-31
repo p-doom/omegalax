@@ -260,7 +260,6 @@ class LoRATest(absltest.TestCase):
                 r=4,
                 alpha=8,
                 rngs=nnx.Rngs(1),
-                qwen3_5_deltanet=True,
             )
 
         self.assertGreater(count, len(QWEN3_5_DELTANET_TARGET_MODULES))
@@ -276,19 +275,10 @@ class LoRATest(absltest.TestCase):
             ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "out_proj"),
         )
 
-    def test_deltanet_mode_fails_before_mutating_a_non_deltanet_model(self):
-        model = _make_model(seed=0)
-        with self.assertRaisesRegex(ValueError, "DeltaNet LoRA targets not found"):
-            inject_model_lora(
-                model,
-                r=4,
-                alpha=8,
-                rngs=nnx.Rngs(1),
-                qwen3_5_deltanet=True,
-            )
-        self.assertFalse(
-            any(isinstance(module, LoRALinear) for _, module in nnx.iter_modules(model))
-        )
+    def test_deltanet_target_names_do_not_change_a_non_deltanet_model(self):
+        model = _MiniAttention(16, rngs=nnx.Rngs(0))
+        count = inject_model_lora(model, r=4, alpha=8, rngs=nnx.Rngs(1))
+        self.assertEqual(count, 4)
 
     def test_mixed_precision_optimizer_with_wrt_lora(self):
         """End-to-end smoke of the trainer's pattern: build the

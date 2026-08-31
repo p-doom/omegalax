@@ -99,8 +99,6 @@ def _validate_train_config(train_cfg: TrainConfig) -> None:
         )
     if train_cfg.enable_lora and train_cfg.freeze_vision_tower:
         raise ValueError("enable_lora and freeze_vision_tower are mutually exclusive")
-    if train_cfg.lora_qwen3_5_deltanet and not train_cfg.enable_lora:
-        raise ValueError("lora_qwen3_5_deltanet requires enable_lora")
     if train_cfg.train_vision_merger and not train_cfg.freeze_vision_tower:
         raise ValueError("train_vision_merger requires freeze_vision_tower")
 
@@ -150,7 +148,6 @@ class TrainConfig:
     enable_lora: bool = False
     lora_rank: int = 32
     lora_alpha: float = 32.0
-    lora_qwen3_5_deltanet: bool = False
     freeze_vision_tower: bool = False
     train_vision_merger: bool = False
     num_loss_tiles: int = 4
@@ -265,7 +262,6 @@ def _write_lora_metadata(save_dir: Path, train_cfg: TrainConfig) -> None:
         "enable_lora": bool(train_cfg.enable_lora),
         "lora_rank": int(train_cfg.lora_rank) if train_cfg.enable_lora else None,
         "lora_alpha": float(train_cfg.lora_alpha) if train_cfg.enable_lora else None,
-        "lora_qwen3_5_deltanet": bool(train_cfg.lora_qwen3_5_deltanet),
     }
     (Path(save_dir) / "lora_metadata.json").write_text(json.dumps(meta, indent=2))
 
@@ -520,11 +516,6 @@ def _run_sft(
     else:
         model_cfg = vlm_api.resolve_config(model_id_or_cfg)
         startup_log("resolved model config")
-    if train_cfg.lora_qwen3_5_deltanet:
-        if not isinstance(model_cfg, Qwen3_5Config):
-            raise ValueError("lora_qwen3_5_deltanet requires a Qwen3.5 model")
-        if "linear_attention" not in model_cfg.text_config.layer_types:
-            raise ValueError("lora_qwen3_5_deltanet requires a Qwen3.5 DeltaNet layer")
     require_zero_router_aux_loss(model_cfg)
     startup_log(f"model_cfg={model_cfg}")
     mesh = ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size)
@@ -594,11 +585,9 @@ def _run_sft(
                 r=train_cfg.lora_rank,
                 alpha=train_cfg.lora_alpha,
                 rngs=nnx.Rngs(train_cfg.seed),
-                qwen3_5_deltanet=train_cfg.lora_qwen3_5_deltanet,
             )
         startup_log(
             f"LoRA enabled: r={train_cfg.lora_rank} alpha={train_cfg.lora_alpha} "
-            f"qwen3_5_deltanet={train_cfg.lora_qwen3_5_deltanet} "
             f"wrapped {n_wrapped} text-decoder Linear projections; vision frozen"
         )
         wrt_filter = LoRAParam

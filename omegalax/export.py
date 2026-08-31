@@ -36,15 +36,11 @@ def read_lora_metadata(save_dir: Path) -> dict:
         "enable_lora",
         "lora_rank",
         "lora_alpha",
-        "lora_qwen3_5_deltanet",
     } - metadata.keys()
     if missing:
         raise ValueError(f"{path} is missing {sorted(missing)}; refusing to guess model structure")
-    for name in ("enable_lora", "lora_qwen3_5_deltanet"):
-        if type(metadata[name]) is not bool:
-            raise ValueError(f"{path} field {name!r} must be a boolean")
-    if metadata["lora_qwen3_5_deltanet"] and not metadata["enable_lora"]:
-        raise ValueError(f"{path} enables DeltaNet LoRA while LoRA is disabled")
+    if type(metadata["enable_lora"]) is not bool:
+        raise ValueError(f"{path} field 'enable_lora' must be a boolean")
     return metadata
 
 

@@ -228,31 +228,14 @@ def inject_model_lora(
     r: int,
     alpha: float,
     rngs: nnx.Rngs,
-    qwen3_5_deltanet: bool,
     dtype: jnp.dtype | None = None,
 ) -> int:
-    if qwen3_5_deltanet:
-        from omegalax.models.qwen3_5.deltanet import GatedDeltaNet
-
-        modules = list(nnx.iter_modules(model))
-        deltanet_modules = [module for _, module in modules if isinstance(module, GatedDeltaNet)]
-        if not deltanet_modules:
-            raise ValueError("Qwen3.5 DeltaNet LoRA targets not found")
-        for module in deltanet_modules:
-            missing = [
-                name
-                for name in QWEN3_5_DELTANET_TARGET_MODULES
-                if not isinstance(getattr(module, name, None), (nnx.Linear, LoRALinear))
-            ]
-            if missing:
-                raise ValueError(f"Qwen3.5 DeltaNet LoRA targets not found: {missing}")
     return inject_lora(
         model,
         r=r,
         alpha=alpha,
         rngs=rngs,
-        target_modules=DEFAULT_TARGET_MODULES
-        + (QWEN3_5_DELTANET_TARGET_MODULES if qwen3_5_deltanet else ()),
+        target_modules=DEFAULT_TARGET_MODULES + QWEN3_5_DELTANET_TARGET_MODULES,
         dtype=dtype,
     )
 
