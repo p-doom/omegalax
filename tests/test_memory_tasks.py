@@ -6,6 +6,7 @@ import io
 import json
 from pathlib import Path
 import tempfile
+from unittest import mock
 
 from absl.testing import absltest, parameterized
 import jax
@@ -13,6 +14,7 @@ import jax.numpy as jnp
 import numpy as np
 import orbax.checkpoint as ocp
 
+from omegalax.data import memory_tasks
 from omegalax.data.memory_tasks import (
     MemoryTask,
     MemoryTaskConfig,
@@ -28,12 +30,25 @@ from omegalax.evals.memory_tasks import (
     evaluate_memory_batch,
     swap_counterfactual_pairs,
 )
+from omegalax.evals.memory_pollution import (
+    MemoryTrainingStream,
+    build_pollution_free_manifest,
+    load_training_stream,
+    pair_digest,
+    table_digest,
+    validate_pollution_free_manifest,
+)
 from omegalax.models.qwen3_5.config import Qwen3_5TextConfig
 from omegalax.models.shard_config import ShardConfig
 from omegalax.text import api as text_api
 from omegalax.trainers import pretrain as pretrain_trainer
 from omegalax.trainers import checkpoint_utils
-from scripts import eval_memory_tasks, train_memory_tasks
+from scripts import (
+    audit_memory_task_overlap,
+    build_memory_task_eval_manifest,
+    eval_memory_tasks,
+    train_memory_tasks,
+)
 from scripts.train_memory_tasks import TrainingCondition, training_layout
 from scripts.eval_memory_tasks import (
     _canonical_json_sha256,
@@ -174,6 +189,179 @@ class MemoryTaskTest(parameterized.TestCase):
     def test_canonical_num_pairs_gate_rejects_a_mismatched_count(self, task, num_pairs):
         with self.assertRaisesRegex(ValueError, "num_pairs"):
             _require_canonical_num_pairs(task.value, num_pairs)
+
+    def test_pollution_signatures_ignore_filler_and_table_order(self):
+        config = MemoryTaskConfig(
+            task=MemoryTask.EXACT,
+            seed=0,
+            segment_length=16,
+            num_segments=4,
+            num_exact_bindings=3,
+        )
+        pair, _ = memory_tasks._paired_tokens(7, config)
+        filler_changed = pair.copy()
+        filler_changed[filler_changed >= 256] = 999
+        reordered = filler_changed.copy()
+        reordered[:, 0, 1:4], reordered[:, 0, 4:7] = (
+            reordered[:, 0, 4:7].copy(),
+            reordered[:, 0, 1:4].copy(),
+        )
+
+        for world in (0, 1):
+            self.assertEqual(
+                table_digest(pair[world], config), table_digest(reordered[world], config)
+            )
+        self.assertEqual(pair_digest(pair, config), pair_digest(filler_changed, config))
+
+    def test_pollution_manifest_rejects_seen_tables_and_pairs(self):
+        train_config = MemoryTaskConfig(
+            task=MemoryTask.EXACT,
+            seed=0,
+            segment_length=16,
+            num_segments=2,
+            num_exact_bindings=3,
+        )
+        eval_config = dataclasses.replace(
+            train_config,
+            seed=1,
+            num_segments=4,
+            split=MemoryTaskSplit.EVAL,
+        )
+        stream = MemoryTrainingStream(
+            checkpoint_root=Path("/training/run"),
+            checkpoint_step=300,
+            contract_sha256="a" * 64,
+            config=train_config,
+            train_pairs=300,
+        )
+
+        manifest = build_pollution_free_manifest(
+            eval_config,
+            num_pairs=8,
+            training_streams=(stream,),
+        )
+        validate_pollution_free_manifest(manifest)
+
+        train_tables = set()
+        train_pairs = set()
+        for pair_index in range(stream.train_pairs):
+            pair, _ = memory_tasks._paired_tokens(pair_index, train_config)
+            train_pairs.add(pair_digest(pair, train_config))
+            train_tables.update(table_digest(pair[world], train_config) for world in (0, 1))
+        for pair_index in manifest["pair_indices"]:
+            pair, _ = memory_tasks._paired_tokens(pair_index, eval_config)
+            self.assertNotIn(pair_digest(pair, eval_config), train_pairs)
+            for world in (0, 1):
+                self.assertNotIn(table_digest(pair[world], eval_config), train_tables)
+        self.assertEqual(manifest["pollution_guard"]["collision_action"], "reject")
+
+    def test_single_binding_exact_fails_when_no_disjoint_eval_set_exists(self):
+        train_config = MemoryTaskConfig(
+            task=MemoryTask.EXACT,
+            seed=0,
+            segment_length=16,
+            num_segments=2,
+        )
+        eval_config = dataclasses.replace(
+            train_config,
+            seed=1,
+            split=MemoryTaskSplit.EVAL,
+        )
+        stream = MemoryTrainingStream(
+            checkpoint_root=Path("/training/run"),
+            checkpoint_step=300,
+            contract_sha256="a" * 64,
+            config=train_config,
+            train_pairs=10_000,
+        )
+
+        with self.assertRaisesRegex(ValueError, "Could not select 32 disjoint eval pairs"):
+            build_pollution_free_manifest(
+                eval_config,
+                num_pairs=32,
+                training_streams=(stream,),
+            )
+
+    def test_pollution_manifest_rejects_malformed_pair_indices(self):
+        config = MemoryTaskConfig(
+            task=MemoryTask.EXACT,
+            seed=0,
+            segment_length=16,
+            num_segments=2,
+            num_exact_bindings=3,
+            split=MemoryTaskSplit.EVAL,
+        )
+        stream = MemoryTrainingStream(
+            checkpoint_root=Path("/training/run"),
+            checkpoint_step=1,
+            contract_sha256="a" * 64,
+            config=dataclasses.replace(config, split=MemoryTaskSplit.TRAIN),
+            train_pairs=1,
+        )
+        manifest = build_pollution_free_manifest(
+            config,
+            num_pairs=2,
+            training_streams=(stream,),
+        )
+        manifest["pair_indices"] = [0, 1.5]
+        manifest["sha256"] = _canonical_json_sha256(
+            {name: value for name, value in manifest.items() if name != "sha256"}
+        )
+
+        with self.assertRaisesRegex(ValueError, "non-negative JSON integers"):
+            validate_pollution_free_manifest(manifest)
+
+    def test_known_legacy_v1_training_content_hash_remains_reconstructable(self):
+        config = MemoryTaskConfig(
+            task=MemoryTask.EXACT,
+            seed=0,
+            segment_length=16,
+            num_segments=2,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            contract = {
+                "task": {
+                    name: value
+                    for name, value in dataclasses.asdict(config).items()
+                    if name != "generator_version"
+                },
+                "source": {"model_id": "qwen3.5-smoke-dense"},
+                "pairs_per_batch": 2,
+                "optimizer": {"num_steps": 2, "grad_accum_steps": 1},
+                "runtime": {"topology": {"tp_size": 1, "fsdp_size": 1, "dp_size": 1}},
+                "revision": {
+                    "content_sha256": (
+                        "51089c1ecf697b43266ae81844a30b2fbb67b3de0f2eb04d7a5bb92ea0a6d018"
+                    )
+                },
+            }
+            (root / "memory_task_contract.json").write_text(json.dumps(contract))
+
+            stream = load_training_stream(root, 2)
+
+        self.assertEqual(stream.config.generator_version, 1)
+        self.assertEqual(stream.train_pairs, 4)
+
+    @parameterized.parameters(MemoryTask.EXACT, MemoryTask.DOMINANT_RULE)
+    def test_generator_v2_keeps_task_semantics_fixed_across_horizons(self, task):
+        c2 = MemoryTaskConfig(
+            task=task,
+            seed=5,
+            segment_length=16,
+            num_segments=2,
+            generator_version=2,
+        )
+        c32 = dataclasses.replace(c2, num_segments=32)
+
+        for pair_index in range(8):
+            pair_c2, _ = memory_tasks._paired_tokens(pair_index, c2)
+            pair_c32, _ = memory_tasks._paired_tokens(pair_index, c32)
+            self.assertEqual(pair_digest(pair_c2, c2), pair_digest(pair_c32, c32))
+            for world in (0, 1):
+                self.assertEqual(
+                    table_digest(pair_c2[world], c2), table_digest(pair_c32[world], c32)
+                )
 
     def test_training_conditions_have_matched_token_budgets(self):
         layouts = {
@@ -814,21 +1002,74 @@ class MemoryTaskTest(parameterized.TestCase):
             contract = json.loads((tail_dir / "memory_task_contract.json").read_text())
             self.assertEqual(contract["source"]["checkpoint_root"], str(source_dir.resolve()))
             self.assertEqual(contract["source"]["checkpoint_step"], 1)
+            self.assertEqual(len(contract["source"]["memory_task_contract_sha256"]), 64)
             self.assertTrue((tail_dir / "000002").is_dir())
+            manifest_path = tmpdir / "eval_manifest.json"
+            with contextlib.redirect_stdout(io.StringIO()):
+                build_memory_task_eval_manifest.main(
+                    [
+                        f"--checkpoint={tail_dir}",
+                        f"--output={manifest_path}",
+                        "--task=exact",
+                        "--num_pairs=2",
+                    ]
+                )
+            pollution_guard = json.loads(manifest_path.read_text())["pollution_guard"]
+            self.assertEqual(len(pollution_guard["training_streams"]), 2)
+            audit_stdout = io.StringIO()
+            with contextlib.redirect_stdout(audit_stdout):
+                audit_memory_task_overlap.main(
+                    [
+                        f"--training_contract={tail_dir / 'memory_task_contract.json'}",
+                        "--checkpoint_step=2",
+                        f"--eval_manifest={manifest_path}",
+                    ]
+                )
+            audit = json.loads(audit_stdout.getvalue())
+            self.assertEqual(len(audit["training_streams"]), 2)
+            self.assertEqual(audit["semantic_pair_overlap"], 0)
+            self.assertEqual(audit["semantic_table_overlap"], 0)
             mirror_dir = tmpdir / "wiki_mirror"
             eval_argv = [
                 f"--checkpoint={tail_dir}",
                 "--task=exact",
+                f"--eval_manifest={manifest_path}",
                 "--num_pairs=2",
                 "--pairs_per_batch=1",
                 "--text_attn_backend=xla",
                 f"--jax_cache_dir={tmpdir / 'eval_jax_cache'}",
                 f"--wiki_mirror_dir={mirror_dir}",
             ]
-            with contextlib.redirect_stdout(io.StringIO()):
+            incomplete_manifest = json.loads(manifest_path.read_text())
+            incomplete_manifest["pollution_guard"]["training_streams"] = [
+                reference
+                for reference in incomplete_manifest["pollution_guard"]["training_streams"]
+                if reference["checkpoint_root"] == str(tail_dir.resolve())
+            ]
+            incomplete_manifest["sha256"] = _canonical_json_sha256(
+                {name: value for name, value in incomplete_manifest.items() if name != "sha256"}
+            )
+            incomplete_manifest_path = tmpdir / "incomplete_eval_manifest.json"
+            incomplete_manifest_path.write_text(json.dumps(incomplete_manifest))
+            with (
+                mock.patch.dict(eval_memory_tasks._CANONICAL_NUM_PAIRS, {MemoryTask.EXACT: 2}),
+                self.assertRaisesRegex(ValueError, "complete checkpoint ancestry"),
+            ):
+                eval_memory_tasks.main(
+                    [
+                        argument
+                        if not argument.startswith("--eval_manifest=")
+                        else f"--eval_manifest={incomplete_manifest_path}"
+                        for argument in eval_argv
+                    ]
+                )
+            with (
+                mock.patch.dict(eval_memory_tasks._CANONICAL_NUM_PAIRS, {MemoryTask.EXACT: 2}),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
                 eval_memory_tasks.main(eval_argv)
 
-            eval_dir = tail_dir / "evals" / "memory_exact_v1" / "step_2"
+            eval_dir = tail_dir / "evals" / "memory_exact_pollution_guard_v1" / "step_2"
             eval_config = json.loads((eval_dir / "eval_config.json").read_text())
             self.assertIn("training_contract_sha256", eval_config)
             self.assertEqual(eval_config["text_attn_backend"], "xla")
@@ -876,11 +1117,25 @@ class MemoryTaskTest(parameterized.TestCase):
             with contextlib.redirect_stdout(io.StringIO()):
                 train_memory_tasks.main(train_argv)
 
+            manifest_path = tmpdir / "eval_manifest.json"
+            with contextlib.redirect_stdout(io.StringIO()):
+                build_memory_task_eval_manifest.main(
+                    [
+                        f"--checkpoint={save_dir}",
+                        f"--output={manifest_path}",
+                        "--task=exact",
+                        "--segment_length=16",
+                        "--num_segments=4",
+                        "--num_pairs=2",
+                    ]
+                )
+
             base_eval_argv = [
                 f"--checkpoint={save_dir}",
                 "--task=exact",
                 "--segment_length=16",
                 "--num_segments=4",
+                f"--eval_manifest={manifest_path}",
                 "--num_pairs=2",
                 "--pairs_per_batch=1",
                 "--text_attn_backend=xla",
@@ -897,12 +1152,20 @@ class MemoryTaskTest(parameterized.TestCase):
                     [*base_eval_argv, "--vocab_size=768", "--allow_zero_shot_horizon_override"]
                 )
 
-            with contextlib.redirect_stdout(io.StringIO()):
+            with (
+                mock.patch.dict(eval_memory_tasks._CANONICAL_NUM_PAIRS, {MemoryTask.EXACT: 2}),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
                 eval_memory_tasks.main([*base_eval_argv, "--allow_zero_shot_horizon_override"])
 
-            eval_dir = save_dir / "evals" / "memory_exact_zero_shot_horizon_c4_l16_v1" / "step_1"
+            eval_dir = (
+                save_dir
+                / "evals"
+                / "memory_exact_zero_shot_horizon_c4_l16_pollution_guard_v1"
+                / "step_1"
+            )
             self.assertTrue(eval_dir.is_dir())
-            self.assertFalse((save_dir / "evals" / "memory_exact_v1").exists())
+            self.assertFalse((save_dir / "evals" / "memory_exact_pollution_guard_v1").exists())
             config = json.loads((eval_dir / "eval_config.json").read_text())
             contract = json.loads((save_dir / "memory_task_contract.json").read_text())
             self.assertEqual(config["source_training_task"], contract["task"])
@@ -925,7 +1188,10 @@ class MemoryTaskTest(parameterized.TestCase):
 
             # Same source/requested contract resolves to the same isolated
             # horizon path and is immutable once its artifacts are complete.
-            with self.assertRaisesRegex(ValueError, "already complete"):
+            with (
+                mock.patch.dict(eval_memory_tasks._CANONICAL_NUM_PAIRS, {MemoryTask.EXACT: 2}),
+                self.assertRaisesRegex(ValueError, "already complete"),
+            ):
                 eval_memory_tasks.main([*base_eval_argv, "--allow_zero_shot_horizon_override"])
 
     @parameterized.parameters(
@@ -1310,6 +1576,7 @@ class MemoryTaskTest(parameterized.TestCase):
                 [
                     "--checkpoint=/unused",
                     "--task=exact",
+                    "--eval_manifest=/unused",
                     "--num_pairs=2",
                     "--pairs_per_batch=2",
                     "--wiki_mirror_dir=/unused",

@@ -51,6 +51,7 @@ class MemoryTaskConfig:
     num_exact_bindings: int = 1
     relevance_cue: MemoryTaskCue | str = MemoryTaskCue.MARKED
     split: MemoryTaskSplit | str = MemoryTaskSplit.TRAIN
+    generator_version: int = 1
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "task", MemoryTask(self.task))
@@ -64,6 +65,8 @@ class MemoryTaskConfig:
             raise ValueError("segment_length must be >= 8")
         if self.vocab_size <= 256:
             raise ValueError("vocab_size must be > 256")
+        if self.generator_version not in (1, 2):
+            raise ValueError("generator_version must be 1 or 2")
         if self.num_rule_examples < 3 or not self.num_rule_examples % 2:
             raise ValueError("num_rule_examples must be odd and >= 3")
         if self.num_exact_bindings < 1:
@@ -154,7 +157,9 @@ _RULE_BANK_NUM_EARLY_SEGMENTS = 4
 _RULE_BANK_LABEL_COUNTS = (4, 1, 1, 1)
 
 
-def _rng(config: MemoryTaskConfig, pair_index: int) -> np.random.Generator:
+def _rng(
+    config: MemoryTaskConfig, pair_index: int, *, stream: int | None = None
+) -> np.random.Generator:
     if config.task is MemoryTask.EXACT:
         task_id = 0
     elif config.task is MemoryTask.DOMINANT_RULE:
@@ -166,9 +171,21 @@ def _rng(config: MemoryTaskConfig, pair_index: int) -> np.random.Generator:
     else:
         raise ValueError(f"Unhandled MemoryTask: {config.task!r}")
     split_id = 0 if config.split is MemoryTaskSplit.TRAIN else 1
-    return np.random.default_rng(
-        np.random.SeedSequence((config.seed, pair_index, task_id, split_id))
-    )
+    entropy = (config.seed, pair_index, task_id, split_id)
+    if config.generator_version == 2:
+        if stream not in (0, 1):
+            raise ValueError("generator_version=2 requires stream=0 or stream=1")
+        entropy = (*entropy, stream)
+    return np.random.default_rng(np.random.SeedSequence(entropy))
+
+
+def _filler_and_task_rng(
+    config: MemoryTaskConfig, pair_index: int
+) -> tuple[np.random.Generator, np.random.Generator]:
+    if config.generator_version == 1:
+        rng = _rng(config, pair_index)
+        return rng, rng
+    return _rng(config, pair_index, stream=0), _rng(config, pair_index, stream=1)
 
 
 def _multi_slot_exact_tokens(
@@ -219,8 +236,8 @@ def _associative_bank_tokens(pair_index: int, config: MemoryTaskConfig) -> tuple
         bank_index = pair_index // _BANK_NUM_SLOTS
         fixed_slot = pair_index % _BANK_NUM_SLOTS
 
-    rng = _rng(config, bank_index)
-    shared = rng.integers(
+    filler_rng, rng = _filler_and_task_rng(config, bank_index)
+    shared = filler_rng.integers(
         _BANK_FILLER_START,
         _BANK_FILLER_END,
         size=(config.num_segments, config.segment_length),
@@ -270,8 +287,8 @@ def _rule_bank_tokens(pair_index: int, config: MemoryTaskConfig) -> tuple[np.nda
         bank_index = pair_index // _RULE_BANK_NUM_NAMESPACES
         fixed_namespace = pair_index % _RULE_BANK_NUM_NAMESPACES
 
-    rng = _rng(config, bank_index)
-    shared = rng.integers(
+    filler_rng, rng = _filler_and_task_rng(config, bank_index)
+    shared = filler_rng.integers(
         _BANK_FILLER_START,
         _BANK_FILLER_END,
         size=(config.num_segments, config.segment_length),
@@ -350,8 +367,8 @@ def _paired_tokens(pair_index: int, config: MemoryTaskConfig) -> tuple[np.ndarra
     if config.task is MemoryTask.RULE_BANK:
         return _rule_bank_tokens(pair_index, config)
 
-    rng = _rng(config, pair_index)
-    shared = rng.integers(
+    filler_rng, rng = _filler_and_task_rng(config, pair_index)
+    shared = filler_rng.integers(
         _FILLER_START,
         config.vocab_size,
         size=(config.num_segments, config.segment_length),

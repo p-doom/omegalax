@@ -24,6 +24,10 @@ from omegalax.data.memory_tasks import (
 )
 from omegalax.data.pretrain_data_set import BATCH_PRETRAIN_METADATA_KEY
 from omegalax.evals.memory_tasks import MemoryEvalMode, make_memory_evaluator
+from omegalax.evals.memory_pollution import (
+    load_training_streams,
+    validate_pollution_free_manifest,
+)
 from omegalax.models.qwen3_5.kernels import _resolve_backend
 from omegalax.models.sharding_runtime import set_attn_backend
 from omegalax.text import api as text_api
@@ -79,6 +83,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--vocab_size", type=int, default=1024)
     parser.add_argument("--num_rule_examples", type=int, default=5)
     parser.add_argument("--num_exact_bindings", type=int, default=1)
+    parser.add_argument("--generator_version", type=int, choices=(1, 2), default=1)
     parser.add_argument(
         "--relevance_cue",
         choices=[cue.value for cue in MemoryTaskCue],
@@ -92,6 +97,7 @@ def _parser() -> argparse.ArgumentParser:
             "checkpoint's training task contract."
         ),
     )
+    parser.add_argument("--eval_manifest", type=Path, required=True)
     parser.add_argument("--num_pairs", type=int, required=True)
     parser.add_argument("--pairs_per_batch", type=int, default=8)
     parser.add_argument("--tp_size", type=int, default=1)
@@ -107,24 +113,6 @@ def _write_json(path: Path, value: Any) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
     temporary.replace(path)
-
-
-def _manifest(config: MemoryTaskConfig, num_pairs: int) -> dict[str, Any]:
-    manifest = {
-        "schema_version": 1,
-        "task": str(config.task),
-        "split": str(config.split),
-        "seed": config.seed,
-        "segment_length": config.segment_length,
-        "num_segments": config.num_segments,
-        "vocab_size": config.vocab_size,
-        "num_rule_examples": config.num_rule_examples,
-        "num_exact_bindings": config.num_exact_bindings,
-        "relevance_cue": str(config.relevance_cue),
-        "pair_indices": list(range(num_pairs)),
-    }
-    payload = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
-    return manifest | {"sha256": hashlib.sha256(payload).hexdigest()}
 
 
 def _canonical_json_sha256(value: Any) -> str:
@@ -172,7 +160,8 @@ def _read_training_contract(checkpoint_root: Path) -> tuple[dict[str, Any], dict
         raise ValueError(f"Refusing to evaluate without memory_task_contract.json: {contract_path}")
     try:
         contract = json.loads(contract_path.read_text())
-        trained_task = contract["task"]
+        trained_task = dict(contract["task"])
+        trained_task.setdefault("generator_version", 1)
     except (json.JSONDecodeError, KeyError, TypeError) as exc:
         raise ValueError(f"Unreadable memory-task contract: {contract_path}") from exc
     if not isinstance(contract, dict) or not isinstance(trained_task, dict):
@@ -232,9 +221,67 @@ def _eval_name(task_config: MemoryTaskConfig, *, allow_zero_shot_horizon_overrid
     if allow_zero_shot_horizon_override:
         return (
             f"memory_{task_config.task.value}_zero_shot_horizon_"
-            f"c{task_config.num_segments}_l{task_config.segment_length}_v1"
+            f"c{task_config.num_segments}_l{task_config.segment_length}_pollution_guard_v1"
         )
-    return f"memory_{task_config.task.value}_v1"
+    return f"memory_{task_config.task.value}_pollution_guard_v1"
+
+
+def _load_manifest(
+    path: Path,
+    task_config: MemoryTaskConfig,
+    *,
+    num_pairs: int,
+    checkpoint_root: Path,
+    checkpoint_step: int,
+    training_contract_sha256: str,
+) -> dict[str, Any]:
+    path = path.expanduser().resolve()
+    try:
+        manifest = json.loads(path.read_text())
+        manifest_config = MemoryTaskConfig(
+            **{field.name: manifest[field.name] for field in dataclasses.fields(MemoryTaskConfig)}
+        )
+        pair_indices = manifest["pair_indices"]
+        training_streams = manifest["pollution_guard"]["training_streams"]
+    except (FileNotFoundError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"Unreadable memory-task eval manifest: {path}") from exc
+    validate_pollution_free_manifest(manifest)
+    if manifest_config != task_config:
+        raise ValueError(
+            f"Eval manifest task config does not match request: "
+            f"manifest={manifest_config!r}, requested={task_config!r}"
+        )
+    if len(pair_indices) != num_pairs or len(set(pair_indices)) != num_pairs:
+        raise ValueError(
+            f"Eval manifest must contain exactly {num_pairs} unique pair indices, "
+            f"got {len(pair_indices)} entries and {len(set(pair_indices))} unique values"
+        )
+    required_streams = load_training_streams(checkpoint_root, checkpoint_step)
+    expected_references = [
+        {
+            "checkpoint_root": str(stream.checkpoint_root),
+            "checkpoint_step": stream.checkpoint_step,
+            "contract_sha256": stream.contract_sha256,
+            "train_pairs": stream.train_pairs,
+        }
+        for stream in required_streams
+    ]
+    if expected_references[0]["contract_sha256"] != training_contract_sha256:
+        raise ValueError("Evaluated checkpoint contract changed while loading its eval manifest")
+    missing_references = [
+        expected
+        for expected in expected_references
+        if not any(
+            all(reference.get(name) == value for name, value in expected.items())
+            for reference in training_streams
+        )
+    ]
+    if missing_references:
+        raise ValueError(
+            "Eval manifest pollution guard does not include the complete checkpoint ancestry: "
+            f"{missing_references}"
+        )
+    return manifest
 
 
 def _revision() -> dict[str, Any]:
@@ -259,6 +306,8 @@ def _revision() -> dict[str, Any]:
         Path(__file__),
         repo / "omegalax/data/memory_tasks.py",
         repo / "omegalax/evals/memory_tasks.py",
+        repo / "omegalax/evals/memory_pollution.py",
+        repo / "scripts/build_memory_task_eval_manifest.py",
     )
     digest = hashlib.sha256()
     for path in relevant_paths:
@@ -433,6 +482,7 @@ def main(argv: list[str] | None = None) -> None:
         num_exact_bindings=args.num_exact_bindings,
         relevance_cue=args.relevance_cue,
         split=MemoryTaskSplit.EVAL,
+        generator_version=args.generator_version,
     )
     resolved = resolve_checkpoint(args.checkpoint)
     training_contract_sha256 = _validate_training_contract(
@@ -447,11 +497,19 @@ def main(argv: list[str] | None = None) -> None:
         allow_zero_shot_horizon_override=args.allow_zero_shot_horizon_override,
     )
     run_dir = resolved.root / "evals" / eval_name / f"step_{resolved.step}"
-    manifest = _manifest(task_config, args.num_pairs)
+    manifest = _load_manifest(
+        args.eval_manifest,
+        task_config,
+        num_pairs=args.num_pairs,
+        checkpoint_root=resolved.root,
+        checkpoint_step=resolved.step,
+        training_contract_sha256=training_contract_sha256,
+    )
     config = {
-        "schema_version": 3,
+        "schema_version": 4,
         "checkpoint_root": str(resolved.root),
         "checkpoint_step": resolved.step,
+        "manifest_path": str(args.eval_manifest.expanduser().resolve()),
         "manifest_sha256": manifest["sha256"],
         "training_contract_sha256": training_contract_sha256,
         "source_training_task": source_training_task,
@@ -499,9 +557,10 @@ def main(argv: list[str] | None = None) -> None:
     evaluate_batch = make_memory_evaluator(model_config)
 
     rows: list[dict[str, Any]] = []
+    pair_indices = [int(index) for index in manifest["pair_indices"]]
     for start in range(0, args.num_pairs, args.pairs_per_batch):
         batch = build_memory_task_batch(
-            tuple(range(start, start + args.pairs_per_batch)),
+            tuple(pair_indices[start : start + args.pairs_per_batch]),
             task_config,
             flatten=False,
         )

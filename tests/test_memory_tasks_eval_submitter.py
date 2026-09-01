@@ -25,7 +25,9 @@ class MemoryTaskEvalSubmitterTest(absltest.TestCase):
             "--vocab_size=1024",
             "--num_rule_examples=5",
             "--num_exact_bindings=3",
+            "--generator_version=2",
             "--relevance_cue=marked",
+            f"--eval_manifest={checkpoint.parent / 'eval_manifest.json'}",
             f"--num_pairs={num_pairs}",
             "--pairs_per_batch=256",
             f"--jax_cache_dir={checkpoint.parent / 'jax_cache'}",
@@ -95,8 +97,27 @@ class MemoryTaskEvalSubmitterTest(absltest.TestCase):
         with test_temp_dir() as tmp:
             tmpdir = Path(tmp)
             eval_args = self._eval_args(tmpdir / "checkpoint")
-            eval_args[9] = "--num_pairs=2"
+            eval_args[11] = "--num_pairs=2"
             with self.assertRaisesRegex(ValueError, "num_pairs=2048"):
+                submit_memory_tasks_eval_slurm.render_sbatch(
+                    repo_root=tmpdir / "repo",
+                    python_bin=tmpdir / "python",
+                    job_name="memory-eval-test",
+                    log_dir=tmpdir / "logs",
+                    time_limit="02:00:00",
+                    eval_args=eval_args,
+                    expected_commit="test-commit",
+                )
+
+    def test_renderer_requires_a_pollution_guard_manifest(self):
+        with test_temp_dir() as tmp:
+            tmpdir = Path(tmp)
+            eval_args = [
+                argument
+                for argument in self._eval_args(tmpdir / "checkpoint")
+                if not argument.startswith("--eval_manifest=")
+            ]
+            with self.assertRaisesRegex(ValueError, "eval_manifest"):
                 submit_memory_tasks_eval_slurm.render_sbatch(
                     repo_root=tmpdir / "repo",
                     python_bin=tmpdir / "python",

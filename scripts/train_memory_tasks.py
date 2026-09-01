@@ -105,6 +105,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--vocab_size", type=int, default=1024)
     parser.add_argument("--num_rule_examples", type=int, default=5)
     parser.add_argument("--num_exact_bindings", type=int, default=1)
+    parser.add_argument("--generator_version", type=int, choices=(1, 2), default=1)
     parser.add_argument(
         "--relevance_cue",
         choices=[cue.value for cue in MemoryTaskCue],
@@ -239,6 +240,8 @@ def _ensure_contract(save_dir: Path, contract: dict[str, object]) -> None:
     path = save_dir / "memory_task_contract.json"
     if path.exists():
         existing = json.loads(path.read_text())
+        if contract["task"].get("generator_version") == 1:
+            existing["task"].setdefault("generator_version", 1)
         if existing != contract:
             raise ValueError(f"Memory-task contract mismatch at {path}")
         return
@@ -266,6 +269,7 @@ def main(argv: list[str] | None = None) -> None:
         num_exact_bindings=args.num_exact_bindings,
         relevance_cue=args.relevance_cue,
         split=MemoryTaskSplit.TRAIN,
+        generator_version=args.generator_version,
     )
     layout = training_layout(
         args.condition,
@@ -292,6 +296,20 @@ def main(argv: list[str] | None = None) -> None:
         dp_size=args.dp_size,
         fsdp_size=args.fsdp_size,
     )
+    source = {"model_id": args.model_id}
+    if source_checkpoint is not None:
+        source_contract_path = source_checkpoint.root / "memory_task_contract.json"
+        source_contract_sha256 = None
+        if source_contract_path.is_file():
+            source_contract = json.loads(source_contract_path.read_text())
+            source_contract_sha256 = hashlib.sha256(
+                json.dumps(source_contract, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest()
+        source = {
+            "checkpoint_root": str(source_checkpoint.root),
+            "checkpoint_step": source_checkpoint.step,
+            "memory_task_contract_sha256": source_contract_sha256,
+        }
     contract = {
         "schema_version": 2,
         "task": dataclasses.asdict(task_config),
@@ -301,14 +319,7 @@ def main(argv: list[str] | None = None) -> None:
             **dataclasses.asdict(layout),
             "pretrain_mode": layout.pretrain_mode.value,
         },
-        "source": (
-            {"model_id": args.model_id}
-            if source_checkpoint is None
-            else {
-                "checkpoint_root": str(source_checkpoint.root),
-                "checkpoint_step": source_checkpoint.step,
-            }
-        ),
+        "source": source,
         "optimizer": {
             "num_steps": args.num_steps,
             "learning_rate": args.learning_rate,
