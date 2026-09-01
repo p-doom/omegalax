@@ -100,6 +100,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--model_id", default="qwen3.5-smoke-dense")
     parser.add_argument("--init_model_checkpoint", type=Path)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--data_seed", type=int)
     parser.add_argument("--segment_length", type=int, default=16)
     parser.add_argument("--num_segments", type=int, default=2)
     parser.add_argument("--vocab_size", type=int, default=1024)
@@ -242,6 +243,7 @@ def _ensure_contract(save_dir: Path, contract: dict[str, object]) -> None:
         existing = json.loads(path.read_text())
         if contract["task"].get("generator_version") == 1:
             existing["task"].setdefault("generator_version", 1)
+        existing.setdefault("model_seed", existing["task"]["seed"])
         if existing != contract:
             raise ValueError(f"Memory-task contract mismatch at {path}")
         return
@@ -259,9 +261,10 @@ def main(argv: list[str] | None = None) -> None:
         raise ValueError("--success_criterion must be non-empty")
     wandb_identity = _wandb_identity(args)
     jax.config.update("jax_compilation_cache_dir", str(args.jax_cache_dir))
+    data_seed = args.seed if args.data_seed is None else args.data_seed
     task_config = MemoryTaskConfig(
         task=args.task,
-        seed=args.seed,
+        seed=data_seed,
         segment_length=args.segment_length,
         num_segments=args.num_segments,
         vocab_size=args.vocab_size,
@@ -312,6 +315,7 @@ def main(argv: list[str] | None = None) -> None:
         }
     contract = {
         "schema_version": 2,
+        "model_seed": args.seed,
         "task": dataclasses.asdict(task_config),
         "condition": str(args.condition),
         "pairs_per_batch": args.pairs_per_batch,

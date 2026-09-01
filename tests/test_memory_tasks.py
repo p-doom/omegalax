@@ -890,6 +890,19 @@ class MemoryTaskTest(parameterized.TestCase):
         self.assertTrue(np.isfinite(metrics["loss"]))
         self.assertEqual(metrics["supervised_tokens"], 2.0)
 
+    def test_contract_accepts_legacy_implicit_model_seed(self):
+        with test_temp_dir() as tmp:
+            save_dir = Path(tmp)
+            legacy_contract = {"schema_version": 2, "task": {"seed": 7}}
+            (save_dir / "memory_task_contract.json").write_text(json.dumps(legacy_contract))
+
+            train_memory_tasks._ensure_contract(save_dir, {**legacy_contract, "model_seed": 7})
+
+            self.assertEqual(
+                json.loads((save_dir / "memory_task_contract.json").read_text()),
+                legacy_contract,
+            )
+
     def test_cli_trains_one_step_with_explicit_adam_hparams_and_device_memory(self):
         # Exercises the real argparse -> Grain iterator -> Qwen3.5 ->
         # run_pretrain -> optimizer -> checkpoint path through
@@ -904,6 +917,8 @@ class MemoryTaskTest(parameterized.TestCase):
                 "--condition=full_context",
                 f"--save_dir={save_dir}",
                 "--model_id=qwen3.5-smoke-dense",
+                "--seed=7",
+                "--data_seed=11",
                 "--num_steps=1",
                 "--pairs_per_batch=1",
                 "--grad_accum_steps=2",
@@ -924,6 +939,8 @@ class MemoryTaskTest(parameterized.TestCase):
             metrics = json.loads(stdout.getvalue().strip().splitlines()[-1])
             contract = json.loads((save_dir / "memory_task_contract.json").read_text())
 
+            self.assertEqual(contract["model_seed"], 7)
+            self.assertEqual(contract["task"]["seed"], 11)
             self.assertEqual(contract["optimizer"]["adam_beta1"], 0.8)
             self.assertEqual(contract["optimizer"]["adam_beta2"], 0.9)
             self.assertEqual(contract["optimizer"]["adam_eps"], 1e-6)
@@ -971,6 +988,7 @@ class MemoryTaskTest(parameterized.TestCase):
                 "--condition=full_context",
                 f"--save_dir={source_dir}",
                 "--model_id=qwen3.5-smoke-dense",
+                "--seed=13",
                 "--num_steps=1",
                 "--pairs_per_batch=1",
                 "--log_every=0",
@@ -981,6 +999,9 @@ class MemoryTaskTest(parameterized.TestCase):
             ]
             with contextlib.redirect_stdout(io.StringIO()):
                 train_memory_tasks.main(source_argv)
+            source_contract = json.loads((source_dir / "memory_task_contract.json").read_text())
+            self.assertEqual(source_contract["model_seed"], 13)
+            self.assertEqual(source_contract["task"]["seed"], 13)
 
             tail_dir = tmpdir / "tail"
             tail_argv = [
@@ -1000,6 +1021,8 @@ class MemoryTaskTest(parameterized.TestCase):
                 train_memory_tasks.main(tail_argv)
 
             contract = json.loads((tail_dir / "memory_task_contract.json").read_text())
+            self.assertEqual(contract["model_seed"], 0)
+            self.assertEqual(contract["task"]["seed"], 0)
             self.assertEqual(contract["source"]["checkpoint_root"], str(source_dir.resolve()))
             self.assertEqual(contract["source"]["checkpoint_step"], 1)
             self.assertEqual(len(contract["source"]["memory_task_contract_sha256"]), 64)
