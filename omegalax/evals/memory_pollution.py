@@ -23,6 +23,9 @@ _LEGACY_V1_CONTENT_SHA256 = {
     MemoryTask.ASSOCIATIVE_BANK: "9263e91aa2e3088c37946266d0af87433376b795adbdba8c3a7640306cd942c3",
     MemoryTask.RULE_BANK: "9263e91aa2e3088c37946266d0af87433376b795adbdba8c3a7640306cd942c3",
 }
+_COMPATIBLE_V2_CONTENT_SHA256 = frozenset(
+    {"32f307dc07996ab71d09f6a8aa660238447a817e9be31d27464a97d386478478"}
+)
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -142,7 +145,14 @@ def load_training_stream(checkpoint_root: Path, checkpoint_step: int) -> MemoryT
         config.generator_version == 1
         and training_content_sha256 == _LEGACY_V1_CONTENT_SHA256.get(config.task)
     )
-    if training_content_sha256 != current_content_sha256 and not compatible_legacy_hash:
+    compatible_v2_hash = (
+        config.generator_version == 2 and training_content_sha256 in _COMPATIBLE_V2_CONTENT_SHA256
+    )
+    if (
+        training_content_sha256 != current_content_sha256
+        and not compatible_legacy_hash
+        and not compatible_v2_hash
+    ):
         raise ValueError(
             f"Cannot reconstruct {checkpoint_root}: training content hash changed "
             f"from {training_content_sha256} to {current_content_sha256}"

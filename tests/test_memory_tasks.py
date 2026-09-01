@@ -343,6 +343,58 @@ class MemoryTaskTest(parameterized.TestCase):
         self.assertEqual(stream.config.generator_version, 1)
         self.assertEqual(stream.train_pairs, 4)
 
+    def test_known_previous_v2_training_content_hash_remains_reconstructable(self):
+        config = MemoryTaskConfig(
+            task=MemoryTask.EXACT,
+            seed=0,
+            segment_length=16,
+            num_segments=2,
+            generator_version=2,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            contract = {
+                "task": dataclasses.asdict(config),
+                "source": {"model_id": "qwen3.5-smoke-dense"},
+                "pairs_per_batch": 2,
+                "optimizer": {"num_steps": 2, "grad_accum_steps": 1},
+                "runtime": {"topology": {"tp_size": 1, "fsdp_size": 1, "dp_size": 1}},
+                "revision": {
+                    "content_sha256": (
+                        "32f307dc07996ab71d09f6a8aa660238447a817e9be31d27464a97d386478478"
+                    )
+                },
+            }
+            (root / "memory_task_contract.json").write_text(json.dumps(contract))
+
+            stream = load_training_stream(root, 2)
+
+        self.assertEqual(stream.config.generator_version, 2)
+        self.assertEqual(stream.train_pairs, 4)
+
+    def test_unknown_v2_training_content_hash_is_rejected(self):
+        config = MemoryTaskConfig(
+            task=MemoryTask.EXACT,
+            seed=0,
+            segment_length=16,
+            num_segments=2,
+            generator_version=2,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            contract = {
+                "task": dataclasses.asdict(config),
+                "source": {"model_id": "qwen3.5-smoke-dense"},
+                "pairs_per_batch": 2,
+                "optimizer": {"num_steps": 2, "grad_accum_steps": 1},
+                "runtime": {"topology": {"tp_size": 1, "fsdp_size": 1, "dp_size": 1}},
+                "revision": {"content_sha256": "f" * 64},
+            }
+            (root / "memory_task_contract.json").write_text(json.dumps(contract))
+
+            with self.assertRaisesRegex(ValueError, "training content hash changed"):
+                load_training_stream(root, 2)
+
     @parameterized.parameters(MemoryTask.EXACT, MemoryTask.DOMINANT_RULE)
     def test_generator_v2_keeps_task_semantics_fixed_across_horizons(self, task):
         c2 = MemoryTaskConfig(
