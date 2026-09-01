@@ -47,6 +47,7 @@ class MemoryTaskConfig:
     segment_length: int
     num_segments: int
     vocab_size: int = 1024
+    bank_value_alphabet: int = 256
     num_rule_examples: int = 5
     num_exact_bindings: int = 1
     relevance_cue: MemoryTaskCue | str = MemoryTaskCue.MARKED
@@ -111,6 +112,15 @@ class MemoryTaskConfig:
                 raise ValueError(
                     "num_exact_bindings/relevance_cue are only defined for MemoryTask.EXACT"
                 )
+            if (
+                type(self.bank_value_alphabet) is not int
+                or not 48 <= self.bank_value_alphabet <= _BANK_VALUES.size
+            ):
+                raise ValueError("bank_value_alphabet must be between 48 and 256")
+        elif self.bank_value_alphabet != _BANK_VALUES.size:
+            raise ValueError(
+                "bank_value_alphabet is only configurable for MemoryTask.ASSOCIATIVE_BANK"
+            )
         if self.task is MemoryTask.RULE_BANK:
             if self.segment_length != 64:
                 raise ValueError("segment_length must be == 64 for MemoryTask.RULE_BANK")
@@ -249,7 +259,11 @@ def _associative_bank_tokens(pair_index: int, config: MemoryTaskConfig) -> tuple
     # Base and per-slot alternate values are drawn from a single
     # without-replacement pool (as in _multi_slot_exact_tokens) so that no
     # base value can ever collide with an alternate value.
-    all_values = rng.choice(_BANK_VALUES, size=2 * _BANK_NUM_SLOTS, replace=False)
+    all_values = rng.choice(
+        _BANK_VALUES[: config.bank_value_alphabet],
+        size=2 * _BANK_NUM_SLOTS,
+        replace=False,
+    )
     base_values = all_values[:_BANK_NUM_SLOTS]
     alt_values = all_values[_BANK_NUM_SLOTS:]
     target_slot = int(rng.integers(0, _BANK_NUM_SLOTS)) if fixed_slot is None else fixed_slot

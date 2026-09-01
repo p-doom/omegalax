@@ -81,6 +81,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--segment_length", type=int, default=16)
     parser.add_argument("--num_segments", type=int, default=2)
     parser.add_argument("--vocab_size", type=int, default=1024)
+    parser.add_argument("--bank_value_alphabet", type=int, default=256)
     parser.add_argument("--num_rule_examples", type=int, default=5)
     parser.add_argument("--num_exact_bindings", type=int, default=1)
     parser.add_argument("--generator_version", type=int, choices=(1, 2), default=1)
@@ -162,6 +163,7 @@ def _read_training_contract(checkpoint_root: Path) -> tuple[dict[str, Any], dict
         contract = json.loads(contract_path.read_text())
         trained_task = dict(contract["task"])
         trained_task.setdefault("generator_version", 1)
+        trained_task.setdefault("bank_value_alphabet", 256)
     except (json.JSONDecodeError, KeyError, TypeError) as exc:
         raise ValueError(f"Unreadable memory-task contract: {contract_path}") from exc
     if not isinstance(contract, dict) or not isinstance(trained_task, dict):
@@ -239,7 +241,10 @@ def _load_manifest(
     try:
         manifest = json.loads(path.read_text())
         manifest_config = MemoryTaskConfig(
-            **{field.name: manifest[field.name] for field in dataclasses.fields(MemoryTaskConfig)}
+            **{
+                field.name: manifest.get(field.name, field.default)
+                for field in dataclasses.fields(MemoryTaskConfig)
+            }
         )
         pair_indices = manifest["pair_indices"]
         training_streams = manifest["pollution_guard"]["training_streams"]
@@ -478,6 +483,7 @@ def main(argv: list[str] | None = None) -> None:
         segment_length=args.segment_length,
         num_segments=args.num_segments,
         vocab_size=args.vocab_size,
+        bank_value_alphabet=args.bank_value_alphabet,
         num_rule_examples=args.num_rule_examples,
         num_exact_bindings=args.num_exact_bindings,
         relevance_cue=args.relevance_cue,

@@ -111,7 +111,12 @@ def main(argv: list[str] | None = None) -> None:
         if train_config.task in (MemoryTask.ASSOCIATIVE_BANK, MemoryTask.RULE_BANK)
         else memory_tasks._FILLER_START
     )
-    symbol_ranges = _SYMBOL_POOLS[train_config.task]
+    symbol_ranges = dict(_SYMBOL_POOLS[train_config.task])
+    if train_config.task is MemoryTask.ASSOCIATIVE_BANK:
+        symbol_ranges["values"] = (
+            int(memory_tasks._BANK_VALUES[0]),
+            int(memory_tasks._BANK_VALUES[0]) + train_config.bank_value_alphabet,
+        )
     train_symbols = {name: set() for name in symbol_ranges}
     eval_symbols = {name: set() for name in symbol_ranges}
 

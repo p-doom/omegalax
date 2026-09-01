@@ -73,6 +73,7 @@ def _validate_eval_args(args: list[str]) -> list[str]:
         "segment_length",
         "num_segments",
         "vocab_size",
+        "bank_value_alphabet",
         "num_rule_examples",
         "num_exact_bindings",
         "generator_version",

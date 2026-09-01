@@ -32,6 +32,7 @@ class MemoryTaskEvalSubmitterTest(absltest.TestCase):
             "--pairs_per_batch=256",
             f"--jax_cache_dir={checkpoint.parent / 'jax_cache'}",
             f"--wiki_mirror_dir={checkpoint.parent / 'wiki_mirror'}",
+            "--bank_value_alphabet=256",
         ]
 
     def test_rendered_script_enforces_eval_runtime_and_resources(self):
@@ -128,6 +129,25 @@ class MemoryTaskEvalSubmitterTest(absltest.TestCase):
                     expected_commit="test-commit",
                 )
 
+    def test_renderer_requires_the_bank_value_alphabet(self):
+        with test_temp_dir() as tmp:
+            tmpdir = Path(tmp)
+            eval_args = [
+                argument
+                for argument in self._eval_args(tmpdir / "checkpoint")
+                if not argument.startswith("--bank_value_alphabet=")
+            ]
+            with self.assertRaisesRegex(ValueError, "bank_value_alphabet"):
+                submit_memory_tasks_eval_slurm.render_sbatch(
+                    repo_root=tmpdir / "repo",
+                    python_bin=tmpdir / "python",
+                    job_name="memory-eval-test",
+                    log_dir=tmpdir / "logs",
+                    time_limit="02:00:00",
+                    eval_args=eval_args,
+                    expected_commit="test-commit",
+                )
+
     def test_renderer_requires_the_canonical_pair_manifest_for_rule_bank(self):
         with test_temp_dir() as tmp:
             tmpdir = Path(tmp)
@@ -163,19 +183,22 @@ class MemoryTaskEvalSubmitterTest(absltest.TestCase):
     def test_renderer_accepts_the_associative_bank_pair_count(self):
         with test_temp_dir() as tmp:
             tmpdir = Path(tmp)
+            eval_args = self._eval_args(
+                tmpdir / "checkpoint", task="associative_bank", num_pairs=3072
+            )
+            eval_args[-1] = "--bank_value_alphabet=48"
             script = submit_memory_tasks_eval_slurm.render_sbatch(
                 repo_root=tmpdir / "repo",
                 python_bin=tmpdir / "python",
                 job_name="memory-eval-test",
                 log_dir=tmpdir / "logs",
                 time_limit="02:00:00",
-                eval_args=self._eval_args(
-                    tmpdir / "checkpoint", task="associative_bank", num_pairs=3072
-                ),
+                eval_args=eval_args,
                 expected_commit="test-commit",
             )
 
         self.assertIn("--num_pairs=3072", script)
+        self.assertIn("--bank_value_alphabet=48", script)
 
     def test_renderer_forwards_the_explicit_zero_shot_horizon_override(self):
         with test_temp_dir() as tmp:

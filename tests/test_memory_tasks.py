@@ -2,6 +2,7 @@
 
 import contextlib
 import dataclasses
+import hashlib
 import io
 import json
 from pathlib import Path
@@ -24,7 +25,7 @@ from omegalax.data.memory_tasks import (
     make_memory_task_iterator,
 )
 from omegalax.data.pretrain_data_set import BATCH_PRETRAIN_METADATA_KEY
-from omegalax.evals import memory_tasks as memory_evals
+from omegalax.evals import memory_pollution, memory_tasks as memory_evals
 from omegalax.evals.memory_tasks import (
     MemoryEvalMode,
     evaluate_memory_batch,
@@ -324,7 +325,7 @@ class MemoryTaskTest(parameterized.TestCase):
                 "task": {
                     name: value
                     for name, value in dataclasses.asdict(config).items()
-                    if name != "generator_version"
+                    if name not in ("bank_value_alphabet", "generator_version")
                 },
                 "source": {"model_id": "qwen3.5-smoke-dense"},
                 "pairs_per_batch": 2,
@@ -343,7 +344,11 @@ class MemoryTaskTest(parameterized.TestCase):
         self.assertEqual(stream.config.generator_version, 1)
         self.assertEqual(stream.train_pairs, 4)
 
-    def test_known_previous_v2_training_content_hash_remains_reconstructable(self):
+    @parameterized.parameters(
+        "32f307dc07996ab71d09f6a8aa660238447a817e9be31d27464a97d386478478",
+        "fe8d88245437d92c8c096624f2aa112ef46b506fe41e1fc6aa17f0c611c4c03e",
+    )
+    def test_known_previous_v2_training_content_hash_remains_reconstructable(self, content_sha256):
         config = MemoryTaskConfig(
             task=MemoryTask.EXACT,
             seed=0,
@@ -354,16 +359,16 @@ class MemoryTaskTest(parameterized.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             contract = {
-                "task": dataclasses.asdict(config),
+                "task": {
+                    name: value
+                    for name, value in dataclasses.asdict(config).items()
+                    if name != "bank_value_alphabet"
+                },
                 "source": {"model_id": "qwen3.5-smoke-dense"},
                 "pairs_per_batch": 2,
                 "optimizer": {"num_steps": 2, "grad_accum_steps": 1},
                 "runtime": {"topology": {"tp_size": 1, "fsdp_size": 1, "dp_size": 1}},
-                "revision": {
-                    "content_sha256": (
-                        "32f307dc07996ab71d09f6a8aa660238447a817e9be31d27464a97d386478478"
-                    )
-                },
+                "revision": {"content_sha256": content_sha256},
             }
             (root / "memory_task_contract.json").write_text(json.dumps(contract))
 
@@ -698,6 +703,122 @@ class MemoryTaskTest(parameterized.TestCase):
         train_tokens = build_memory_task_batch((0, 1), train_config, flatten=False)["token_ids_BCT"]
         self.assertFalse(np.array_equal(train_tokens[0, :3], train_tokens[2, :3]))
 
+    def test_associative_bank_default_stream_and_table_digests_are_unchanged(self):
+        config = MemoryTaskConfig(
+            task=MemoryTask.ASSOCIATIVE_BANK,
+            seed=0,
+            segment_length=64,
+            num_segments=4,
+            generator_version=2,
+        )
+        pair, _ = memory_tasks._paired_tokens(0, config)
+
+        self.assertEqual(
+            hashlib.sha256(pair.tobytes()).hexdigest(),
+            "c03966cd4d3750dc250334bd93242f0ab235a1609268bdd204d3f226bd469f53",
+        )
+        self.assertEqual(
+            pair_digest(pair, config).hex(),
+            "ab59c68a20a60de779dad78ce5bfe9375415e502430c58c3aed0d71d0242c7e4",
+        )
+        self.assertEqual(
+            table_digest(pair[0], config).hex(),
+            "830076c20ee40ac1ec5d124b5858fda5bbd7086a8b54f92e92d0519e8b204fb6",
+        )
+        self.assertEqual(
+            table_digest(pair[1], config).hex(),
+            "4e2f02e8b190e818c7650d0aa684e485287c3dbaafdc4f4e30fe5143ccd48566",
+        )
+
+    @parameterized.parameters(47, 257, 48.0)
+    def test_associative_bank_rejects_invalid_value_alphabet(self, bank_value_alphabet):
+        with self.assertRaisesRegex(ValueError, "bank_value_alphabet"):
+            MemoryTaskConfig(
+                task=MemoryTask.ASSOCIATIVE_BANK,
+                seed=0,
+                segment_length=64,
+                num_segments=4,
+                bank_value_alphabet=bank_value_alphabet,
+            )
+
+    @parameterized.parameters(MemoryTask.EXACT, MemoryTask.DOMINANT_RULE, MemoryTask.RULE_BANK)
+    def test_bank_value_alphabet_is_scoped_to_associative_bank(self, task):
+        kwargs = {"segment_length": 16, "num_segments": 2}
+        if task is MemoryTask.RULE_BANK:
+            kwargs = {"segment_length": 64, "num_segments": 5}
+        with self.assertRaisesRegex(ValueError, "only configurable"):
+            MemoryTaskConfig(
+                task=task,
+                seed=0,
+                bank_value_alphabet=48,
+                **kwargs,
+            )
+
+    def test_associative_bank_minimum_alphabet_keeps_all_pair_answers_distinct(self):
+        config = MemoryTaskConfig(
+            task=MemoryTask.ASSOCIATIVE_BANK,
+            seed=0,
+            segment_length=64,
+            num_segments=4,
+            bank_value_alphabet=48,
+            split=MemoryTaskSplit.EVAL,
+            generator_version=2,
+        )
+        batch = build_memory_task_batch(tuple(range(24)), config, flatten=False)
+        answers = np.asarray(batch[BATCH_PRETRAIN_METADATA_KEY]["answer_token_B"])
+
+        self.assertLen(set(answers.tolist()), 48)
+        self.assertEqual(set(answers.tolist()), set(range(96, 144)))
+
+    def test_associative_bank_overlap_audit_uses_configured_value_alphabet(self):
+        train_config = MemoryTaskConfig(
+            task=MemoryTask.ASSOCIATIVE_BANK,
+            seed=0,
+            segment_length=64,
+            num_segments=4,
+            bank_value_alphabet=48,
+            generator_version=2,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            contract = {
+                "task": dataclasses.asdict(train_config),
+                "source": {"model_id": "qwen3.5-smoke-dense"},
+                "pairs_per_batch": 1,
+                "optimizer": {"num_steps": 1, "grad_accum_steps": 1},
+                "runtime": {"topology": {"tp_size": 1, "fsdp_size": 1, "dp_size": 1}},
+                "revision": {"content_sha256": memory_pollution._current_training_content_sha256()},
+            }
+            contract_path = root / "memory_task_contract.json"
+            contract_path.write_text(json.dumps(contract))
+            stream = MemoryTrainingStream(
+                checkpoint_root=root,
+                checkpoint_step=1,
+                contract_sha256=memory_pollution.canonical_json_sha256(contract),
+                config=train_config,
+                train_pairs=1,
+            )
+            manifest = build_pollution_free_manifest(
+                dataclasses.replace(train_config, seed=1, split=MemoryTaskSplit.EVAL),
+                num_pairs=24,
+                training_streams=(stream,),
+            )
+            manifest_path = root / "manifest.json"
+            manifest_path.write_text(json.dumps(manifest))
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                audit_memory_task_overlap.main(
+                    [
+                        f"--training_contract={contract_path}",
+                        "--checkpoint_step=1",
+                        f"--eval_manifest={manifest_path}",
+                    ]
+                )
+
+        audit = json.loads(stdout.getvalue())
+        self.assertEqual(audit["symbol_pools"]["values"]["allowed"], 48)
+
     def test_rule_bank_eval_group_covers_every_namespace_with_shared_world0_evidence(self):
         # rule_bank is only defined for a fixed C=5/L=64 geometry: the
         # generator hardcodes segment 4 as the query segment and 56 demos
@@ -942,13 +1063,20 @@ class MemoryTaskTest(parameterized.TestCase):
         self.assertTrue(np.isfinite(metrics["loss"]))
         self.assertEqual(metrics["supervised_tokens"], 2.0)
 
-    def test_contract_accepts_legacy_implicit_model_seed(self):
+    def test_contract_accepts_legacy_implicit_model_seed_and_bank_alphabet(self):
         with test_temp_dir() as tmp:
             save_dir = Path(tmp)
             legacy_contract = {"schema_version": 2, "task": {"seed": 7}}
             (save_dir / "memory_task_contract.json").write_text(json.dumps(legacy_contract))
 
-            train_memory_tasks._ensure_contract(save_dir, {**legacy_contract, "model_seed": 7})
+            train_memory_tasks._ensure_contract(
+                save_dir,
+                {
+                    **legacy_contract,
+                    "model_seed": 7,
+                    "task": {"seed": 7, "bank_value_alphabet": 256},
+                },
+            )
 
             self.assertEqual(
                 json.loads((save_dir / "memory_task_contract.json").read_text()),
@@ -1582,6 +1710,36 @@ class MemoryTaskTest(parameterized.TestCase):
             )
             with self.assertRaises(ValueError):
                 _validate_training_contract(root, base_config)
+
+    def test_eval_contract_treats_legacy_bank_alphabet_as_256_only(self):
+        train_config = MemoryTaskConfig(
+            task=MemoryTask.ASSOCIATIVE_BANK,
+            seed=0,
+            segment_length=64,
+            num_segments=4,
+            split=MemoryTaskSplit.TRAIN,
+            generator_version=2,
+        )
+        legacy_task = dataclasses.asdict(train_config)
+        del legacy_task["bank_value_alphabet"]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            contract = {"task": legacy_task}
+            (root / "memory_task_contract.json").write_text(json.dumps(contract))
+
+            _validate_training_contract(
+                root,
+                dataclasses.replace(train_config, split=MemoryTaskSplit.EVAL),
+            )
+            with self.assertRaisesRegex(ValueError, "mismatched memory-task config"):
+                _validate_training_contract(
+                    root,
+                    dataclasses.replace(
+                        train_config,
+                        split=MemoryTaskSplit.EVAL,
+                        bank_value_alphabet=48,
+                    ),
+                )
 
     def test_eval_contract_validation_rejects_missing_contract(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -30,6 +30,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--segment_length", type=int, default=16)
     parser.add_argument("--num_segments", type=int, default=2)
     parser.add_argument("--vocab_size", type=int, default=1024)
+    parser.add_argument("--bank_value_alphabet", type=int, default=256)
     parser.add_argument("--num_rule_examples", type=int, default=5)
     parser.add_argument("--num_exact_bindings", type=int, default=1)
     parser.add_argument("--generator_version", type=int, choices=(1, 2), default=1)
@@ -73,6 +74,7 @@ def main(argv: list[str] | None = None) -> None:
         segment_length=args.segment_length,
         num_segments=args.num_segments,
         vocab_size=args.vocab_size,
+        bank_value_alphabet=args.bank_value_alphabet,
         num_rule_examples=args.num_rule_examples,
         num_exact_bindings=args.num_exact_bindings,
         relevance_cue=args.relevance_cue,
