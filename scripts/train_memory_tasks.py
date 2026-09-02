@@ -99,6 +99,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--save_dir", type=Path, required=True)
     parser.add_argument("--model_id", default="qwen3.5-smoke-dense")
     parser.add_argument("--init_model_checkpoint", type=Path)
+    parser.add_argument("--init_hf_model_path", type=Path)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--data_seed", type=int)
     parser.add_argument("--segment_length", type=int, default=16)
@@ -132,6 +133,16 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--keep_latest", type=int, default=3)
     parser.add_argument("--log_every", type=int, default=10)
     parser.add_argument("--resume", choices=[mode.value for mode in ResumeMode], default="never")
+    parser.add_argument(
+        "--stop_after_local_step",
+        type=int,
+        help="Stop after this local optimizer step; tail checkpoint names remain global steps.",
+    )
+    parser.add_argument(
+        "--resume_expected_step",
+        type=int,
+        help="Require the latest checkpoint to have exactly this global step.",
+    )
     parser.add_argument("--text_attn_backend", default="mosaic_gpu")
     parser.add_argument("--jax_cache_dir", type=Path, required=True)
     parser.add_argument("--run_plan_sha256", required=True, type=_sha256_arg)
@@ -258,10 +269,14 @@ def _ensure_contract(save_dir: Path, contract: dict[str, object]) -> None:
 
 def main(argv: list[str] | None = None) -> None:
     args = _parser().parse_args(argv)
-    if not flags.FLAGS.is_parsed():
-        flags.FLAGS(["train_memory_tasks.py"])
     if not args.success_criterion.strip():
         raise ValueError("--success_criterion must be non-empty")
+    if args.init_model_checkpoint is not None and args.init_hf_model_path is not None:
+        raise ValueError("Provide at most one of --init_model_checkpoint or --init_hf_model_path")
+    if args.resume_expected_step is not None and args.resume == ResumeMode.NEVER.value:
+        raise ValueError("--resume_expected_step requires --resume=required or --resume=if_present")
+    if not flags.FLAGS.is_parsed():
+        flags.FLAGS(["train_memory_tasks.py"])
     wandb_identity = _wandb_identity(args)
     jax.config.update("jax_compilation_cache_dir", str(args.jax_cache_dir))
     data_seed = args.seed if args.data_seed is None else args.data_seed
@@ -286,10 +301,23 @@ def main(argv: list[str] | None = None) -> None:
     )
     model_source = args.model_id
     source_checkpoint = None
+    init_hf_model_path = None
+    hf_initialization = None
     if args.init_model_checkpoint is not None:
         source_checkpoint = resolve_checkpoint(args.init_model_checkpoint)
         model_source = str(source_checkpoint.config_path)
+    elif args.init_hf_model_path is not None:
+        init_hf_model_path = args.init_hf_model_path.expanduser().resolve()
+        hf_initialization = tail_pretrain.hf_initialization_metadata(
+            init_hf_model_path, global_step_offset=0
+        )
+        model_source = str(init_hf_model_path)
     model_config = text_api.resolve_config(model_source)
+    if hf_initialization is not None and (
+        hf_initialization["vocab_size"] != model_config.vocab_size
+        or hf_initialization["tie_word_embeddings"] != model_config.tie_word_embeddings
+    ):
+        raise ValueError("HuggingFace provenance does not match the resolved model config")
     if task_config.vocab_size > model_config.vocab_size:
         raise ValueError(
             f"Task vocab_size={task_config.vocab_size} exceeds model vocab_size={model_config.vocab_size}"
@@ -304,7 +332,9 @@ def main(argv: list[str] | None = None) -> None:
         fsdp_size=args.fsdp_size,
     )
     source = {"model_id": args.model_id}
-    if source_checkpoint is not None:
+    if hf_initialization is not None:
+        source = hf_initialization
+    elif source_checkpoint is not None:
         source_contract_path = source_checkpoint.root / "memory_task_contract.json"
         source_contract_sha256 = None
         if source_contract_path.is_file():
@@ -397,7 +427,7 @@ def main(argv: list[str] | None = None) -> None:
                 f"W&B returned run id {actual_wandb_id!r}, expected requested id {args.wandb_id!r}"
             )
     try:
-        if source_checkpoint is None:
+        if source_checkpoint is None and init_hf_model_path is None:
             train_config = pretrain_trainer.TrainConfig(
                 seed=args.seed,
                 batch_size=layout.batch_size,
@@ -434,14 +464,17 @@ def main(argv: list[str] | None = None) -> None:
                 pass_gdn_state=layout.pass_gdn_state,
                 pass_rope_positions=False,
                 pass_conv_state=False,
+                resume_expected_step=args.resume_expected_step,
+                stop_after_local_step=args.stop_after_local_step,
             )
         else:
+            global_step_offset = source_checkpoint.step if source_checkpoint is not None else 0
             train_config = tail_pretrain.TailTrainConfig(
                 seed=args.seed,
                 batch_size=layout.batch_size,
                 seq_len=layout.seq_len,
                 num_steps=args.num_steps,
-                global_step_offset=source_checkpoint.step,
+                global_step_offset=global_step_offset,
                 learning_rate=args.learning_rate,
                 weight_decay=args.weight_decay,
                 warmup_steps=args.warmup_steps,
@@ -454,7 +487,7 @@ def main(argv: list[str] | None = None) -> None:
                 grad_accum_steps=args.grad_accum_steps,
             )
             _, metrics = tail_pretrain.run_tail_pretrain(
-                source_checkpoint.step_path,
+                source_checkpoint.step_path if source_checkpoint is not None else None,
                 train_config,
                 iterator,
                 pretrain_mode=layout.pretrain_mode,
@@ -472,6 +505,10 @@ def main(argv: list[str] | None = None) -> None:
                 pass_gdn_state=layout.pass_gdn_state,
                 pass_rope_positions=False,
                 pass_conv_state=False,
+                stop_after_local_step=args.stop_after_local_step,
+                init_hf_model_path=init_hf_model_path,
+                resume_expected_step=args.resume_expected_step,
+                hf_provenance=hf_initialization,
             )
     finally:
         if wandb_run is not None:

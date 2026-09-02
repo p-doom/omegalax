@@ -24,6 +24,18 @@ from omegalax.text.checkpoint import resolve_checkpoint
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=Path, action="append", required=True)
+    parser.add_argument(
+        "--exclude_manifest",
+        type=Path,
+        action="append",
+        default=[],
+        help="Previously used schema-2 gate manifest to exclude; repeat for multiple gates.",
+    )
+    parser.add_argument(
+        "--final_holdout",
+        action="store_true",
+        help="Mark a final holdout and require at least one excluded gate manifest.",
+    )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--task", choices=[task.value for task in MemoryTask], required=True)
     parser.add_argument("--seed", type=int, default=1)
@@ -90,6 +102,8 @@ def main(argv: list[str] | None = None) -> None:
         eval_config,
         num_pairs=args.num_pairs,
         training_streams=tuple(streams_by_identity.values()),
+        exclude_manifests=args.exclude_manifest,
+        final_holdout=args.final_holdout,
     )
     _write_immutable(args.output, manifest)
     print(json.dumps(manifest, sort_keys=True))

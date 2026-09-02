@@ -27,6 +27,9 @@ _COMPATIBLE_V2_CONTENT_SHA256 = frozenset(
     {
         "32f307dc07996ab71d09f6a8aa660238447a817e9be31d27464a97d386478478",
         "fe8d88245437d92c8c096624f2aa112ef46b506fe41e1fc6aa17f0c611c4c03e",
+        # Unique 230179f v2 content hash (currently only the clean A48 run): later
+        # HF-init/provenance changes leave deterministic pair consumption unchanged.
+        "971f564351b87e962092de318fcb260fa1c1552b6b1870ebc1c90834a6693610",
     }
 )
 
@@ -116,7 +119,12 @@ def training_pairs_at_checkpoint(contract: dict[str, Any], checkpoint_step: int)
     if checkpoint_step <= 0:
         raise ValueError("checkpoint_step must be > 0")
     source = contract["source"]
-    source_step = int(source.get("checkpoint_step", 0))
+    if source.get("restore") == "huggingface_safetensors":
+        if source.get("global_step_offset") != 0 or "checkpoint_step" in source:
+            raise ValueError("HuggingFace memory initialization must start at global step 0")
+        source_step = 0
+    else:
+        source_step = int(source.get("checkpoint_step", 0))
     updates = checkpoint_step - source_step
     planned_updates = int(contract["optimizer"]["num_steps"])
     if updates <= 0 or updates > planned_updates:
@@ -235,14 +243,78 @@ def _eval_group_size(task: MemoryTask) -> int:
     return 1
 
 
+def _manifest_config(manifest: dict[str, Any], path: Path | None = None) -> MemoryTaskConfig:
+    try:
+        fields = {
+            field.name: manifest.get(field.name, field.default)
+            for field in dataclasses.fields(MemoryTaskConfig)
+        }
+        config = MemoryTaskConfig(**fields)
+    except (TypeError, ValueError) as exc:
+        location = f" {path}" if path is not None else ""
+        raise ValueError(f"Invalid memory-task eval manifest config{location}") from exc
+    if config.split is not MemoryTaskSplit.EVAL:
+        location = f" {path}" if path is not None else ""
+        raise ValueError(f"Memory-task eval manifest{location} must use split=eval")
+    return config
+
+
+def _validate_exclusion_config(
+    exclusion_config: MemoryTaskConfig,
+    eval_config: MemoryTaskConfig,
+    path: Path,
+) -> None:
+    excluded = dataclasses.asdict(exclusion_config)
+    requested = dataclasses.asdict(eval_config)
+    mismatches = {
+        name: (excluded[name], value)
+        for name, value in requested.items()
+        if name not in _ALLOWED_TRAIN_EVAL_DIFFERENCES and excluded[name] != value
+    }
+    if mismatches:
+        raise ValueError(f"Exclusion manifest {path} has incompatible task fields: {mismatches}")
+
+
+def _manifest_digests(
+    manifest: dict[str, Any], config: MemoryTaskConfig
+) -> tuple[set[bytes], set[bytes]]:
+    pair_digests: set[bytes] = set()
+    table_digests: set[bytes] = set()
+    for pair_index in manifest["pair_indices"]:
+        pair, _ = memory_tasks._paired_tokens(pair_index, config)
+        pair_digests.add(pair_digest(pair, config))
+        table_digests.update(table_digest(pair[world], config) for world in (0, 1))
+    return pair_digests, table_digests
+
+
+def _load_exclusion_manifest(path: Path) -> tuple[dict[str, str], dict[str, Any]]:
+    path = path.expanduser().resolve()
+    try:
+        content = path.read_bytes()
+        manifest = json.loads(content)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Unreadable exclusion manifest: {path}") from exc
+    if not isinstance(manifest, dict):
+        raise ValueError(f"Exclusion manifest must contain a JSON object: {path}")
+    pollution_guard = manifest.get("pollution_guard")
+    if isinstance(pollution_guard, dict) and pollution_guard.get("exclusion_manifests"):
+        raise ValueError(f"Exclusion source must be a gate manifest: {path}")
+    validate_pollution_free_manifest(manifest)
+    return {"path": str(path), "sha256": hashlib.sha256(content).hexdigest()}, manifest
+
+
 def build_pollution_free_manifest(
     eval_config: MemoryTaskConfig,
     *,
     num_pairs: int,
     training_streams: Sequence[MemoryTrainingStream],
+    exclude_manifests: Sequence[Path] = (),
+    final_holdout: bool = False,
 ) -> dict[str, Any]:
     if eval_config.split is not MemoryTaskSplit.EVAL:
         raise ValueError("Eval config must use split=eval")
+    if final_holdout and not exclude_manifests:
+        raise ValueError("A final holdout requires at least one exclusion manifest")
     if not training_streams:
         raise ValueError("At least one training stream is required")
     if num_pairs <= 0:
@@ -272,6 +344,21 @@ def build_pollution_free_manifest(
             pair, _ = memory_tasks._paired_tokens(pair_index, stream.config)
             train_pair_digests.add(pair_digest(pair, stream.config))
             train_table_digests.update(table_digest(pair[world], stream.config) for world in (0, 1))
+
+    exclusion_references = []
+    exclusion_paths = sorted(path.expanduser().resolve() for path in exclude_manifests)
+    if len(set(exclusion_paths)) != len(exclusion_paths):
+        raise ValueError("Exclusion manifests must not contain duplicate paths")
+    for path in exclusion_paths:
+        reference, exclusion_manifest = _load_exclusion_manifest(path)
+        exclusion_config = _manifest_config(exclusion_manifest, path)
+        _validate_exclusion_config(exclusion_config, eval_config, path)
+        excluded_pair_digests, excluded_table_digests = _manifest_digests(
+            exclusion_manifest, exclusion_config
+        )
+        train_pair_digests.update(excluded_pair_digests)
+        train_table_digests.update(excluded_table_digests)
+        exclusion_references.append(reference)
 
     group_size = _eval_group_size(eval_config.task)
     if num_pairs % group_size:
@@ -308,30 +395,36 @@ def build_pollution_free_manifest(
             f"{considered_groups * group_size} candidates"
         )
 
+    pollution_guard = {
+        "policy": _POLICY,
+        "digest": "sha256",
+        "ignored_content": "filler_tokens",
+        "table_order": "ignored",
+        "collision_action": "reject",
+        "eval_group_size": group_size,
+        "candidate_groups_considered": considered_groups,
+        "pair_collision_groups": pair_collision_groups,
+        "table_collision_groups": table_collision_groups,
+        "training_streams": [
+            {
+                "checkpoint_root": str(stream.checkpoint_root),
+                "checkpoint_step": stream.checkpoint_step,
+                "contract_sha256": stream.contract_sha256,
+                "train_pairs": stream.train_pairs,
+            }
+            for stream in normalized_streams
+        ],
+    }
+    if exclusion_references:
+        pollution_guard["exclusion_manifests"] = exclusion_references
+    if final_holdout:
+        pollution_guard["final_holdout"] = True
+
     manifest = {
         "schema_version": 2,
         **dataclasses.asdict(eval_config),
         "pair_indices": selected,
-        "pollution_guard": {
-            "policy": _POLICY,
-            "digest": "sha256",
-            "ignored_content": "filler_tokens",
-            "table_order": "ignored",
-            "collision_action": "reject",
-            "eval_group_size": group_size,
-            "candidate_groups_considered": considered_groups,
-            "pair_collision_groups": pair_collision_groups,
-            "table_collision_groups": table_collision_groups,
-            "training_streams": [
-                {
-                    "checkpoint_root": str(stream.checkpoint_root),
-                    "checkpoint_step": stream.checkpoint_step,
-                    "contract_sha256": stream.contract_sha256,
-                    "train_pairs": stream.train_pairs,
-                }
-                for stream in normalized_streams
-            ],
-        },
+        "pollution_guard": pollution_guard,
     }
     return manifest | {"sha256": canonical_json_sha256(manifest)}
 
@@ -363,3 +456,46 @@ def validate_pollution_free_manifest(manifest: dict[str, Any]) -> None:
         group = pair_indices[start : start + group_size]
         if group != list(range(group[0], group[0] + group_size)) or group[0] % group_size:
             raise ValueError(f"Invalid {task.value} eval group: {group}")
+
+    eval_config = _manifest_config(manifest)
+    exclusion_references = manifest["pollution_guard"].get("exclusion_manifests", [])
+    if not isinstance(exclusion_references, list):
+        raise ValueError("Eval manifest exclusion_manifests must be a JSON list")
+    final_holdout = manifest["pollution_guard"].get("final_holdout", False)
+    if not isinstance(final_holdout, bool):
+        raise ValueError("Eval manifest final_holdout must be boolean")
+    if final_holdout and not exclusion_references:
+        raise ValueError("A final holdout requires at least one exclusion manifest")
+    seen_paths = set()
+    excluded_pair_digests: set[bytes] = set()
+    excluded_table_digests: set[bytes] = set()
+    for reference in exclusion_references:
+        if not isinstance(reference, dict) or set(reference) != {"path", "sha256"}:
+            raise ValueError("Invalid exclusion manifest reference")
+        path_value = reference["path"]
+        expected_file_sha256 = reference["sha256"]
+        if not isinstance(path_value, str) or not isinstance(expected_file_sha256, str):
+            raise ValueError("Invalid exclusion manifest reference")
+        path = Path(path_value)
+        if not path.is_absolute() or str(path.resolve()) != path_value:
+            raise ValueError(f"Exclusion manifest path must be absolute and resolved: {path_value}")
+        if path in seen_paths:
+            raise ValueError("Exclusion manifests must not contain duplicate paths")
+        seen_paths.add(path)
+        actual_reference, exclusion_manifest = _load_exclusion_manifest(path)
+        if actual_reference["sha256"] != expected_file_sha256:
+            raise ValueError(
+                f"Exclusion manifest file hash mismatch at {path}: "
+                f"expected {expected_file_sha256}, got {actual_reference['sha256']}"
+            )
+        exclusion_config = _manifest_config(exclusion_manifest, path)
+        _validate_exclusion_config(exclusion_config, eval_config, path)
+        pair_digests, table_digests = _manifest_digests(exclusion_manifest, exclusion_config)
+        excluded_pair_digests.update(pair_digests)
+        excluded_table_digests.update(table_digests)
+
+    manifest_pair_digests, manifest_table_digests = _manifest_digests(manifest, eval_config)
+    if manifest_pair_digests & excluded_pair_digests:
+        raise ValueError("Eval manifest overlaps an exclusion manifest pair digest")
+    if manifest_table_digests & excluded_table_digests:
+        raise ValueError("Eval manifest overlaps an exclusion manifest table digest")

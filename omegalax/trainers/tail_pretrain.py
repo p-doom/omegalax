@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import datetime
+import hashlib
 import json
 import time
 from pathlib import Path
@@ -251,10 +252,96 @@ def _ensure_json(path: Path, requested: dict[str, object], *, will_resume: bool)
     path.write_text(json.dumps(requested, indent=2, sort_keys=True) + "\n")
 
 
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def hf_initialization_metadata(
+    init_hf_model_path: str | Path, *, global_step_offset: int
+) -> dict[str, object]:
+    source = Path(init_hf_model_path).expanduser().resolve()
+    config_path = source / "config.json"
+    index_path = source / "model.safetensors.index.json"
+    if not config_path.is_file():
+        raise ValueError(f"Expected HuggingFace config.json under {source}")
+    if not index_path.is_file():
+        raise ValueError(f"Expected HuggingFace safetensors index at {index_path}")
+
+    hf_config = json.loads(config_path.read_text())
+    text_config = hf_config.get("text_config")
+    if not isinstance(text_config, dict):
+        raise ValueError(f"Expected text_config in {config_path}")
+    vocab_size = text_config.get("vocab_size")
+    tie_word_embeddings = hf_config.get("tie_word_embeddings")
+    eos_token_id = text_config.get("eos_token_id")
+    if not isinstance(vocab_size, int) or isinstance(vocab_size, bool) or vocab_size <= 0:
+        raise ValueError(f"Expected positive integer text_config.vocab_size in {config_path}")
+    if not isinstance(tie_word_embeddings, bool):
+        raise ValueError(f"Expected boolean tie_word_embeddings in {config_path}")
+    if text_config.get("tie_word_embeddings") != tie_word_embeddings:
+        raise ValueError(f"Inconsistent tie_word_embeddings in {config_path}")
+    if (
+        not isinstance(eos_token_id, int)
+        or isinstance(eos_token_id, bool)
+        or not 0 <= eos_token_id < vocab_size
+    ):
+        raise ValueError(
+            f"Expected in-vocabulary integer text_config.eos_token_id in {config_path}"
+        )
+
+    index = json.loads(index_path.read_text())
+    weight_map = index.get("weight_map")
+    if not isinstance(weight_map, dict) or not weight_map:
+        raise ValueError(f"Expected non-empty weight_map in {index_path}")
+    if not all(isinstance(name, str) and name for name in weight_map.values()):
+        raise ValueError(f"Expected shard filenames in {index_path}")
+    shard_names = sorted(set(weight_map.values()))
+    shard_paths = []
+    for name in shard_names:
+        shard_path = (source / name).resolve()
+        if shard_path.parent != source or not shard_path.is_file():
+            raise ValueError(f"Missing or invalid indexed safetensors shard: {name}")
+        shard_paths.append(shard_path)
+    discovered_shards = {path.resolve() for path in source.glob("*.safetensors")}
+    if discovered_shards != set(shard_paths):
+        raise ValueError(
+            f"Safetensors files under {source} do not match the shards referenced by {index_path}"
+        )
+
+    return {
+        "source_hf_model_path": str(source),
+        "restore": "huggingface_safetensors",
+        "global_step_offset": int(global_step_offset),
+        "vocab_size": vocab_size,
+        "tie_word_embeddings": tie_word_embeddings,
+        "eos_token_id": eos_token_id,
+        "config_sha256": _file_sha256(config_path),
+        "safetensors_index_sha256": _file_sha256(index_path),
+        "safetensors_shards": [
+            {"filename": path.name, "sha256": _file_sha256(path)} for path in shard_paths
+        ],
+    }
+
+
 def _initialization_metadata(
-    checkpoint: ResolvedCheckpoint | None, init_hf_model_path: str | Path | None
+    checkpoint: ResolvedCheckpoint | None,
+    init_hf_model_path: str | Path | None,
+    *,
+    global_step_offset: int,
+    hf_provenance: dict[str, object] | None,
 ) -> dict[str, object]:
     if init_hf_model_path is not None:
+        if hf_provenance is not None:
+            actual_provenance = hf_initialization_metadata(
+                init_hf_model_path, global_step_offset=global_step_offset
+            )
+            if hf_provenance != actual_provenance:
+                raise ValueError("HuggingFace provenance does not match tail initialization")
+            return actual_provenance
         return {
             "source_hf_model_path": str(Path(init_hf_model_path).expanduser().resolve()),
             "restore": "huggingface_safetensors",
@@ -319,6 +406,7 @@ def run_tail_pretrain(
     init_hf_model_path: str | Path | None = None,
     restore_input_iter: bool = True,
     resume_expected_step: int | None = None,
+    hf_provenance: dict[str, object] | None = None,
 ) -> tuple[MixedPrecisionOptimizer, dict[str, float]]:
     pretrain_mode = PretrainMode(pretrain_mode)
     save_path = Path(save_dir).expanduser().resolve()
@@ -376,6 +464,8 @@ def run_tail_pretrain(
     replicated = NamedSharding(mesh, P())
     root_rng = jax.device_put(jax.random.key(config.seed), replicated)
     init_rng, rng = jax.random.split(root_rng)
+    # Orbax scalar restore requires P(); split can leave the scalar key at P(None,).
+    rng = jax.device_put(rng, replicated)
     if not will_resume and init_hf_model_path is not None:
         from omegalax.models.qwen3_5.params import create_qwen3_5_from_safetensors
 
@@ -416,7 +506,12 @@ def run_tail_pretrain(
 
     _ensure_json(
         save_path / "initialization.json",
-        _initialization_metadata(source_checkpoint, init_hf_model_path),
+        _initialization_metadata(
+            source_checkpoint,
+            init_hf_model_path,
+            global_step_offset=config.global_step_offset,
+            hf_provenance=hf_provenance,
+        ),
         will_resume=will_resume,
     )
     if enable_lora:

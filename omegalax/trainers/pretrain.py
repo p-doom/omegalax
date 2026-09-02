@@ -846,6 +846,7 @@ def run_pretrain(
     init_hf_model_path: str | Path | None = None,
     restore_input_iter: bool = True,
     resume_expected_step: int | None = None,
+    stop_after_local_step: int | None = None,
     tokamax_cache_dir: str | Path | None = None,
 ) -> tuple[MixedPrecisionOptimizer, dict[str, float]]:
     pretrain_mode = PretrainMode(pretrain_mode)
@@ -965,6 +966,15 @@ def run_pretrain(
         )
         rng = jax.device_put(rng, replicated_rng_sharding)
 
+    local_stop_step = (
+        train_cfg.num_steps if stop_after_local_step is None else int(stop_after_local_step)
+    )
+    if not start_step < local_stop_step <= train_cfg.num_steps:
+        raise ValueError(
+            f"Local stop step must be in ({start_step}, {train_cfg.num_steps}], "
+            f"got {local_stop_step}"
+        )
+
     accum_steps = train_cfg.grad_accum_steps
     timer = StepTimer(warmup=2 * accum_steps)
     global_tokens_per_step = train_cfg.seq_len * train_cfg.batch_size * accum_steps
@@ -1017,7 +1027,7 @@ def run_pretrain(
     _autotune_ctx.__enter__()
 
     startup_log(f"entering pretrain loop mode={pretrain_mode}")
-    for step_idx in range(start_step, train_cfg.num_steps):
+    for step_idx in range(start_step, local_stop_step):
         step = step_idx + 1
         accum = {}
         accum_grad_norm = 0.0
@@ -1121,7 +1131,7 @@ def run_pretrain(
                     )
                 checkpoint_manager.wait_until_finished()
                 checkpoint_manager.close()
-            if step < train_cfg.num_steps:
+            if step < local_stop_step:
                 _request_slurm_requeue_if_primary(is_primary_process)
                 _autotune_ctx.__exit__(None, None, None)
                 return optimizer, last_metrics
