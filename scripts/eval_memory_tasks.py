@@ -7,7 +7,9 @@ from collections import defaultdict
 import dataclasses
 import hashlib
 import json
+import os
 from pathlib import Path
+import socket
 import subprocess
 from typing import Any
 
@@ -40,6 +42,16 @@ from omegalax.text.checkpoint import resolve_checkpoint, restore_model_params
 # most recent slot/segment/age). query_namespace has no such ordering and just
 # isolates per-namespace rule-bank performance.
 _STRATA_FIELDS = ("target_slot", "target_segment", "target_age", "query_namespace")
+
+
+def _require_slurm_job() -> None:
+    slurm_node = os.environ.get("SLURMD_NODENAME", "").split(".", 1)[0]
+    current_node = socket.gethostname().split(".", 1)[0]
+    if not os.environ.get("SLURM_JOB_ID") or not slurm_node or slurm_node != current_node:
+        raise RuntimeError(
+            "Refusing to run a memory-task evaluation outside a Slurm compute node; "
+            "submit it with sbatch"
+        )
 
 
 def summarize_rows(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -472,6 +484,7 @@ def _plot(summary: dict[str, dict[str, float]], plots_dir: Path) -> None:
 
 def main(argv: list[str] | None = None) -> None:
     args = _parser().parse_args(argv)
+    _require_slurm_job()
     if not flags.FLAGS.is_parsed():
         flags.FLAGS(["eval_memory_tasks.py"])
     if args.num_pairs <= 0 or args.num_pairs % args.pairs_per_batch:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import subprocess
 from unittest import mock
@@ -54,6 +55,9 @@ class MemoryTaskEvalSubmitterTest(absltest.TestCase):
         self.assertIn("#SBATCH --cpus-per-task=24", script)
         self.assertIn("#SBATCH --mem=120G", script)
         self.assertIn("#SBATCH --gres=gpu:H100-SXM5:1", script)
+        self.assertIn('-z "${SLURM_JOB_ID:-}"', script)
+        self.assertIn('-z "${SLURMD_NODENAME:-}"', script)
+        self.assertIn('"$(hostname -s)" != "${SLURMD_NODENAME%%.*}"', script)
         self.assertIn("PYTHONPATH", script)
         self.assertIn("omegalax.__file__", script)
         self.assertIn('"git", "status", "--porcelain"', script)
@@ -259,6 +263,35 @@ class MemoryTaskEvalSubmitterTest(absltest.TestCase):
             submit.assert_not_called()
             self.assertTrue(script_path.is_file())
             subprocess.run(["bash", "-n", str(script_path)], check=True)
+
+    def test_rendered_script_refuses_non_slurm_execution(self):
+        with test_temp_dir() as tmp:
+            tmpdir = Path(tmp)
+            script_path = tmpdir / "eval.sbatch"
+            script_path.write_text(
+                submit_memory_tasks_eval_slurm.render_sbatch(
+                    repo_root=tmpdir / "missing-repo",
+                    python_bin=tmpdir / "missing-python",
+                    job_name="memory-eval-test",
+                    log_dir=tmpdir / "logs",
+                    time_limit="02:00:00",
+                    eval_args=self._eval_args(tmpdir / "checkpoint"),
+                    expected_commit="test-commit",
+                )
+            )
+            environment = dict(os.environ)
+            environment["SLURM_JOB_ID"] = "stale-allocation"
+            environment.pop("SLURMD_NODENAME", None)
+            completed = subprocess.run(
+                ["bash", str(script_path)],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=environment,
+            )
+
+        self.assertEqual(completed.returncode, 2)
+        self.assertIn("outside a Slurm compute node", completed.stderr)
 
 
 if __name__ == "__main__":
