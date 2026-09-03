@@ -8,12 +8,32 @@ import json
 import os
 from pathlib import Path
 import socket
+import sys
 
-import numpy as np
 
-from omegalax.data import memory_tasks
-from omegalax.data.memory_tasks import MemoryTask, MemoryTaskConfig, MemoryTaskSplit
-from omegalax.evals.memory_pollution import (
+def _require_slurm_job() -> None:
+    slurm_node = os.environ.get("SLURMD_NODENAME", "").split(".", 1)[0]
+    current_node = socket.gethostname().split(".", 1)[0]
+    if not os.environ.get("SLURM_JOB_ID") or not slurm_node or slurm_node != current_node:
+        raise RuntimeError(
+            "Refusing to scan memory-task overlap outside a Slurm compute node; "
+            "submit it with sbatch"
+        )
+
+
+if __name__ == "__main__" and not {"-h", "--help"}.intersection(sys.argv[1:]):
+    _require_slurm_job()
+
+
+import numpy as np  # noqa: E402
+
+from omegalax.data import memory_tasks  # noqa: E402
+from omegalax.data.memory_tasks import (  # noqa: E402
+    MemoryTask,
+    MemoryTaskConfig,
+    MemoryTaskSplit,
+)
+from omegalax.evals.memory_pollution import (  # noqa: E402
     load_training_streams,
     pair_digest,
     table_digest,
@@ -32,16 +52,6 @@ _SYMBOL_POOLS = {
         "labels": (488, 492),
     },
 }
-
-
-def _require_slurm_job() -> None:
-    slurm_node = os.environ.get("SLURMD_NODENAME", "").split(".", 1)[0]
-    current_node = socket.gethostname().split(".", 1)[0]
-    if not os.environ.get("SLURM_JOB_ID") or not slurm_node or slurm_node != current_node:
-        raise RuntimeError(
-            "Refusing to scan memory-task overlap outside a Slurm compute node; "
-            "submit it with sbatch"
-        )
 
 
 def _parser() -> argparse.ArgumentParser:

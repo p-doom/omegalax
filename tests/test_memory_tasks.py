@@ -8,6 +8,8 @@ import json
 import os
 from pathlib import Path
 import socket
+import subprocess
+import sys
 import tempfile
 from unittest import mock
 
@@ -139,6 +141,49 @@ class MemoryTaskTest(parameterized.TestCase):
         ):
             with self.assertRaisesRegex(RuntimeError, "outside a Slurm compute node"):
                 entrypoint(argv)
+
+    @parameterized.parameters(
+        "build_memory_task_eval_manifest.py",
+        "audit_memory_task_overlap.py",
+        "eval_memory_tasks.py",
+    )
+    def test_direct_cli_rejects_before_third_party_imports(self, script_name):
+        environment = dict(os.environ)
+        environment.pop("SLURM_JOB_ID", None)
+        environment.pop("SLURMD_NODENAME", None)
+        repo_root = Path(__file__).resolve().parents[1]
+        completed = subprocess.run(
+            [sys.executable, "-S", str(repo_root / "scripts" / script_name)],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("outside a Slurm compute node", completed.stderr)
+        self.assertNotIn("No module named", completed.stderr)
+
+    @parameterized.parameters(
+        "build_memory_task_eval_manifest.py",
+        "audit_memory_task_overlap.py",
+        "eval_memory_tasks.py",
+    )
+    def test_direct_cli_allows_local_help(self, script_name):
+        environment = dict(os.environ)
+        environment.pop("SLURM_JOB_ID", None)
+        environment.pop("SLURMD_NODENAME", None)
+        repo_root = Path(__file__).resolve().parents[1]
+        completed = subprocess.run(
+            [sys.executable, str(repo_root / "scripts" / script_name), "--help"],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("usage:", completed.stdout)
 
     def test_eval_summary_keeps_answer_and_donor_metrics_separate(self):
         rows = [

@@ -11,37 +11,8 @@ import os
 from pathlib import Path
 import socket
 import subprocess
+import sys
 from typing import Any
-
-from absl import flags
-import jax
-import numpy as np
-
-from omegalax.data.memory_tasks import (
-    MemoryTask,
-    MemoryTaskConfig,
-    MemoryTaskCue,
-    MemoryTaskSplit,
-    build_memory_task_batch,
-)
-from omegalax.data.pretrain_data_set import BATCH_PRETRAIN_METADATA_KEY
-from omegalax.evals.memory_tasks import MemoryEvalMode, make_memory_evaluator
-from omegalax.evals.memory_pollution import (
-    load_training_streams,
-    validate_pollution_free_manifest,
-)
-from omegalax.models.qwen3_5.kernels import _resolve_backend
-from omegalax.models.sharding_runtime import set_attn_backend
-from omegalax.text import api as text_api
-from omegalax.text.checkpoint import resolve_checkpoint, restore_model_params
-
-
-# target_slot/target_segment/target_age double as recency rank (segment 0 writes
-# slots in temporal order), separating "the state can't hold K items" (flat across
-# strata) from "the model defaults to a recency policy" (accuracy skewed toward the
-# most recent slot/segment/age). query_namespace has no such ordering and just
-# isolates per-namespace rule-bank performance.
-_STRATA_FIELDS = ("target_slot", "target_segment", "target_age", "query_namespace")
 
 
 def _require_slurm_job() -> None:
@@ -52,6 +23,44 @@ def _require_slurm_job() -> None:
             "Refusing to run a memory-task evaluation outside a Slurm compute node; "
             "submit it with sbatch"
         )
+
+
+if __name__ == "__main__" and not {"-h", "--help"}.intersection(sys.argv[1:]):
+    _require_slurm_job()
+
+
+from absl import flags  # noqa: E402
+import jax  # noqa: E402
+import numpy as np  # noqa: E402
+
+from omegalax.data.memory_tasks import (  # noqa: E402
+    MemoryTask,
+    MemoryTaskConfig,
+    MemoryTaskCue,
+    MemoryTaskSplit,
+    build_memory_task_batch,
+)
+from omegalax.data.pretrain_data_set import BATCH_PRETRAIN_METADATA_KEY  # noqa: E402
+from omegalax.evals.memory_tasks import MemoryEvalMode, make_memory_evaluator  # noqa: E402
+from omegalax.evals.memory_pollution import (  # noqa: E402
+    load_training_streams,
+    validate_pollution_free_manifest,
+)
+from omegalax.models.qwen3_5.kernels import _resolve_backend  # noqa: E402
+from omegalax.models.sharding_runtime import set_attn_backend  # noqa: E402
+from omegalax.text import api as text_api  # noqa: E402
+from omegalax.text.checkpoint import (  # noqa: E402
+    resolve_checkpoint,
+    restore_model_params,
+)
+
+
+# target_slot/target_segment/target_age double as recency rank (segment 0 writes
+# slots in temporal order), separating "the state can't hold K items" (flat across
+# strata) from "the model defaults to a recency policy" (accuracy skewed toward the
+# most recent slot/segment/age). query_namespace has no such ordering and just
+# isolates per-namespace rule-bank performance.
+_STRATA_FIELDS = ("target_slot", "target_segment", "target_age", "query_namespace")
 
 
 def summarize_rows(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:

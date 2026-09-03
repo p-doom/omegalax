@@ -7,19 +7,8 @@ import json
 import os
 from pathlib import Path
 import socket
+import sys
 import tempfile
-
-from omegalax.data.memory_tasks import (
-    MemoryTask,
-    MemoryTaskConfig,
-    MemoryTaskCue,
-    MemoryTaskSplit,
-)
-from omegalax.evals.memory_pollution import (
-    build_pollution_free_manifest,
-    load_training_streams,
-)
-from omegalax.text.checkpoint import resolve_checkpoint
 
 
 def _require_slurm_job() -> None:
@@ -30,6 +19,23 @@ def _require_slurm_job() -> None:
             "Refusing to build a memory eval manifest outside a Slurm compute node; "
             "submit it with sbatch"
         )
+
+
+if __name__ == "__main__" and not {"-h", "--help"}.intersection(sys.argv[1:]):
+    _require_slurm_job()
+
+
+from omegalax.data.memory_tasks import (  # noqa: E402
+    MemoryTask,
+    MemoryTaskConfig,
+    MemoryTaskCue,
+    MemoryTaskSplit,
+)
+from omegalax.evals.memory_pollution import (  # noqa: E402
+    build_pollution_free_manifest,
+    load_training_streams,
+)
+from omegalax.text.checkpoint import resolve_checkpoint  # noqa: E402
 
 
 def _parser() -> argparse.ArgumentParser:
