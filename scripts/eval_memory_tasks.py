@@ -98,6 +98,7 @@ def _parser() -> argparse.ArgumentParser:
             "checkpoint's training task contract."
         ),
     )
+    parser.add_argument("--eval_role", choices=("gate", "final"))
     parser.add_argument("--eval_manifest", type=Path, required=True)
     parser.add_argument("--num_pairs", type=int, required=True)
     parser.add_argument("--pairs_per_batch", type=int, default=8)
@@ -219,13 +220,21 @@ def _validate_training_contract(
     return _canonical_json_sha256(contract)
 
 
-def _eval_name(task_config: MemoryTaskConfig, *, allow_zero_shot_horizon_override: bool) -> str:
+def _eval_name(
+    task_config: MemoryTaskConfig,
+    *,
+    allow_zero_shot_horizon_override: bool,
+    eval_role: str | None,
+) -> str:
     if allow_zero_shot_horizon_override:
-        return (
+        name = (
             f"memory_{task_config.task.value}_zero_shot_horizon_"
-            f"c{task_config.num_segments}_l{task_config.segment_length}_pollution_guard_v1"
+            f"c{task_config.num_segments}_l{task_config.segment_length}"
         )
-    return f"memory_{task_config.task.value}_pollution_guard_v1"
+    else:
+        name = f"memory_{task_config.task.value}"
+    role = f"_{eval_role}" if eval_role is not None else ""
+    return f"{name}{role}_pollution_guard_v1"
 
 
 def _load_manifest(
@@ -236,6 +245,7 @@ def _load_manifest(
     checkpoint_root: Path,
     checkpoint_step: int,
     training_contract_sha256: str,
+    eval_role: str | None,
 ) -> dict[str, Any]:
     path = path.expanduser().resolve()
     try:
@@ -251,6 +261,11 @@ def _load_manifest(
     except (FileNotFoundError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
         raise ValueError(f"Unreadable memory-task eval manifest: {path}") from exc
     validate_pollution_free_manifest(manifest)
+    final_holdout = manifest["pollution_guard"].get("final_holdout")
+    if eval_role == "final" and final_holdout is not True:
+        raise ValueError("eval_role=final requires a final-holdout eval manifest")
+    if eval_role == "gate" and final_holdout is True:
+        raise ValueError("eval_role=gate rejects a final-holdout eval manifest")
     if manifest_config != task_config:
         raise ValueError(
             f"Eval manifest task config does not match request: "
@@ -501,6 +516,7 @@ def main(argv: list[str] | None = None) -> None:
     eval_name = _eval_name(
         task_config,
         allow_zero_shot_horizon_override=args.allow_zero_shot_horizon_override,
+        eval_role=args.eval_role,
     )
     run_dir = resolved.root / "evals" / eval_name / f"step_{resolved.step}"
     manifest = _load_manifest(
@@ -510,6 +526,7 @@ def main(argv: list[str] | None = None) -> None:
         checkpoint_root=resolved.root,
         checkpoint_step=resolved.step,
         training_contract_sha256=training_contract_sha256,
+        eval_role=args.eval_role,
     )
     config = {
         "schema_version": 4,
@@ -536,6 +553,8 @@ def main(argv: list[str] | None = None) -> None:
         "conditions": [mode.value for mode in MemoryEvalMode],
         "revision": _revision(),
     }
+    if args.eval_role is not None:
+        config["eval_role"] = args.eval_role
     run_dir.mkdir(parents=True, exist_ok=True)
     _ensure_not_complete(run_dir, manifest, config)
     for path, value in (

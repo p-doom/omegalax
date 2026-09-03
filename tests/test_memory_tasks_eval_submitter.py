@@ -225,6 +225,21 @@ class MemoryTaskEvalSubmitterTest(absltest.TestCase):
         self.assertIn("--num_pairs=2048", script)
         self.assertIn("--text_attn_backend=mosaic_gpu", script)
 
+    def test_renderer_forwards_an_explicit_eval_role(self):
+        with test_temp_dir() as tmp:
+            tmpdir = Path(tmp)
+            script = submit_memory_tasks_eval_slurm.render_sbatch(
+                repo_root=tmpdir / "repo",
+                python_bin=tmpdir / "python",
+                job_name="memory-eval-final-test",
+                log_dir=tmpdir / "logs",
+                time_limit="02:00:00",
+                eval_args=[*self._eval_args(tmpdir / "checkpoint"), "--eval_role=final"],
+                expected_commit="test-commit",
+            )
+
+        self.assertIn("--eval_role=final", script)
+
     def test_default_cli_only_renders_and_the_script_passes_bash_n(self):
         with test_temp_dir() as tmp:
             tmpdir = Path(tmp)

@@ -1275,6 +1275,7 @@ class MemoryTaskTest(parameterized.TestCase):
             eval_dir = tail_dir / "evals" / "memory_exact_pollution_guard_v1" / "step_2"
             eval_config = json.loads((eval_dir / "eval_config.json").read_text())
             self.assertIn("training_contract_sha256", eval_config)
+            self.assertNotIn("eval_role", eval_config)
             self.assertEqual(eval_config["text_attn_backend"], "xla")
             self.assertEqual(
                 eval_config["runtime"],
@@ -1292,6 +1293,87 @@ class MemoryTaskTest(parameterized.TestCase):
             self.assertTrue((mirror_dir / "answer_nll.svg").is_file())
             self.assertTrue((mirror_dir / "README.md").is_file())
             self.assertFalse((mirror_dir / "raw.jsonl").exists())
+
+            final_manifest_path = tmpdir / "final_eval_manifest.json"
+            with contextlib.redirect_stdout(io.StringIO()):
+                build_memory_task_eval_manifest.main(
+                    [
+                        f"--checkpoint={tail_dir}",
+                        f"--exclude_manifest={manifest_path}",
+                        "--final_holdout",
+                        f"--output={final_manifest_path}",
+                        "--task=exact",
+                        "--seed=2",
+                        "--num_pairs=2",
+                    ]
+                )
+            final_eval_argv = [
+                f"--checkpoint={tail_dir}",
+                "--task=exact",
+                "--seed=2",
+                f"--eval_manifest={final_manifest_path}",
+                "--eval_role=final",
+                "--num_pairs=2",
+                "--pairs_per_batch=1",
+                "--text_attn_backend=xla",
+                f"--jax_cache_dir={tmpdir / 'final_eval_jax_cache'}",
+                f"--wiki_mirror_dir={tmpdir / 'final_wiki_mirror'}",
+            ]
+            final_eval_dir = tail_dir / "evals" / "memory_exact_final_pollution_guard_v1" / "step_2"
+            with (
+                mock.patch.dict(eval_memory_tasks._CANONICAL_NUM_PAIRS, {MemoryTask.EXACT: 2}),
+                self.assertRaisesRegex(ValueError, "requires a final-holdout"),
+            ):
+                eval_memory_tasks.main(
+                    [
+                        argument
+                        if not argument.startswith("--eval_manifest=")
+                        else f"--eval_manifest={manifest_path}"
+                        for argument in final_eval_argv
+                    ]
+                )
+            self.assertFalse(final_eval_dir.exists())
+
+            gate_eval_dir = tail_dir / "evals" / "memory_exact_gate_pollution_guard_v1" / "step_2"
+            with (
+                mock.patch.dict(eval_memory_tasks._CANONICAL_NUM_PAIRS, {MemoryTask.EXACT: 2}),
+                self.assertRaisesRegex(ValueError, "rejects a final-holdout"),
+            ):
+                eval_memory_tasks.main(
+                    [
+                        *(
+                            argument
+                            for argument in final_eval_argv
+                            if argument != "--eval_role=final"
+                        ),
+                        "--eval_role=gate",
+                    ]
+                )
+            self.assertFalse(gate_eval_dir.exists())
+
+            gate_eval_argv = [
+                argument
+                if not argument.startswith("--wiki_mirror_dir=")
+                else f"--wiki_mirror_dir={tmpdir / 'gate_wiki_mirror'}"
+                for argument in eval_argv
+            ]
+            with (
+                mock.patch.dict(eval_memory_tasks._CANONICAL_NUM_PAIRS, {MemoryTask.EXACT: 2}),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                eval_memory_tasks.main([*gate_eval_argv, "--eval_role=gate"])
+            gate_eval_config = json.loads((gate_eval_dir / "eval_config.json").read_text())
+            self.assertEqual(gate_eval_config["eval_role"], "gate")
+
+            with (
+                mock.patch.dict(eval_memory_tasks._CANONICAL_NUM_PAIRS, {MemoryTask.EXACT: 2}),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                eval_memory_tasks.main(final_eval_argv)
+
+            final_eval_config = json.loads((final_eval_dir / "eval_config.json").read_text())
+            self.assertEqual(final_eval_config["eval_role"], "final")
+            self.assertTrue((final_eval_dir / "artifact_manifest.json").is_file())
 
     def test_zero_shot_horizon_override_runs_real_cli_and_preserves_immutable_outputs(self):
         # This is deliberately end-to-end: train_memory_tasks creates the
