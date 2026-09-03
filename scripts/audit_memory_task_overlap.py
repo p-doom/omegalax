@@ -5,7 +5,9 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+import os
 from pathlib import Path
+import socket
 
 import numpy as np
 
@@ -32,6 +34,16 @@ _SYMBOL_POOLS = {
 }
 
 
+def _require_slurm_job() -> None:
+    slurm_node = os.environ.get("SLURMD_NODENAME", "").split(".", 1)[0]
+    current_node = socket.gethostname().split(".", 1)[0]
+    if not os.environ.get("SLURM_JOB_ID") or not slurm_node or slurm_node != current_node:
+        raise RuntimeError(
+            "Refusing to scan memory-task overlap outside a Slurm compute node; "
+            "submit it with sbatch"
+        )
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--training_contract", type=Path, required=True)
@@ -56,6 +68,7 @@ def _config_from_manifest(manifest: dict[str, object]) -> MemoryTaskConfig:
 
 def main(argv: list[str] | None = None) -> None:
     args = _parser().parse_args(argv)
+    _require_slurm_job()
     if args.checkpoint_step <= 0:
         raise ValueError("--checkpoint_step must be > 0")
 

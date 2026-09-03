@@ -5,7 +5,9 @@ import dataclasses
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
+import socket
 import tempfile
 from unittest import mock
 
@@ -88,6 +90,56 @@ def _tiny_gdn_config() -> Qwen3_5TextConfig:
 
 
 class MemoryTaskTest(parameterized.TestCase):
+    def setUp(self):
+        super().setUp()
+        slurm_environment = mock.patch.dict(
+            os.environ,
+            {"SLURM_JOB_ID": "test-job", "SLURMD_NODENAME": socket.gethostname()},
+        )
+        slurm_environment.start()
+        self.addCleanup(slurm_environment.stop)
+
+    @parameterized.named_parameters(
+        (
+            "manifest_builder",
+            build_memory_task_eval_manifest.main,
+            [
+                "--checkpoint=/missing/checkpoint",
+                "--output=/missing/manifest.json",
+                "--task=exact",
+                "--num_pairs=2",
+            ],
+        ),
+        (
+            "overlap_auditor",
+            audit_memory_task_overlap.main,
+            [
+                "--training_contract=/missing/contract.json",
+                "--checkpoint_step=1",
+                "--eval_manifest=/missing/manifest.json",
+            ],
+        ),
+        (
+            "memory_evaluator",
+            eval_memory_tasks.main,
+            [
+                "--checkpoint=/missing/checkpoint",
+                "--task=exact",
+                "--eval_manifest=/missing/manifest.json",
+                "--num_pairs=2",
+                "--jax_cache_dir=/missing/cache",
+                "--wiki_mirror_dir=/missing/wiki",
+            ],
+        ),
+    )
+    def test_heavy_entrypoints_require_slurm(self, entrypoint, argv):
+        with mock.patch.dict(
+            os.environ,
+            {"SLURM_JOB_ID": "stale-allocation", "SLURMD_NODENAME": "not-this-node"},
+        ):
+            with self.assertRaisesRegex(RuntimeError, "outside a Slurm compute node"):
+                entrypoint(argv)
+
     def test_eval_summary_keeps_answer_and_donor_metrics_separate(self):
         rows = [
             {

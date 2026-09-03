@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import socket
 import tempfile
 
 from omegalax.data.memory_tasks import (
@@ -19,6 +20,16 @@ from omegalax.evals.memory_pollution import (
     load_training_streams,
 )
 from omegalax.text.checkpoint import resolve_checkpoint
+
+
+def _require_slurm_job() -> None:
+    slurm_node = os.environ.get("SLURMD_NODENAME", "").split(".", 1)[0]
+    current_node = socket.gethostname().split(".", 1)[0]
+    if not os.environ.get("SLURM_JOB_ID") or not slurm_node or slurm_node != current_node:
+        raise RuntimeError(
+            "Refusing to build a memory eval manifest outside a Slurm compute node; "
+            "submit it with sbatch"
+        )
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -80,6 +91,7 @@ def _write_immutable(path: Path, manifest: dict[str, object]) -> None:
 
 def main(argv: list[str] | None = None) -> None:
     args = _parser().parse_args(argv)
+    _require_slurm_job()
     eval_config = MemoryTaskConfig(
         task=args.task,
         seed=args.seed,

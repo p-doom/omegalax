@@ -152,6 +152,11 @@ def render_sbatch(
 #SBATCH --error={shlex.quote(str(log_dir / "%x-%j.err"))}
 
 set -euo pipefail
+if [[ -z "${{SLURM_JOB_ID:-}}" || -z "${{SLURMD_NODENAME:-}}" \
+      || "$(hostname -s)" != "${{SLURMD_NODENAME%%.*}}" ]]; then
+  echo "Refusing to run this memory eval outside a Slurm compute node; submit it with sbatch" >&2
+  exit 2
+fi
 REPO_ROOT={shlex.quote(str(repo_root))}
 PYTHON_BIN={shlex.quote(str(python_bin))}
 EXPECTED_COMMIT={shlex.quote(expected_commit)}
