@@ -31,7 +31,11 @@ def required_batch_multiple(batch_spec: PartitionSpec, mesh: Mesh) -> int:
     axis = batch_spec[0]
     if axis is None:
         return 1
-    return int(mesh.shape[axis])
+    axes = (axis,) if isinstance(axis, str) else axis
+    multiple = 1
+    for name in axes:
+        multiple *= int(mesh.shape[name])
+    return multiple
 
 
 def process_local_batch_size(global_batch_size: int, dp_size: int, fsdp_size: int) -> int:

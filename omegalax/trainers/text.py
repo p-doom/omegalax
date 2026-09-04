@@ -306,7 +306,6 @@ def run_sft(
         startup_log("resolved model config")
     startup_log(f"model_cfg={model_cfg}")
     mesh = ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size)
-    model_cfg = text_api.align_config_to_mesh(model_cfg, mesh)
     startup_log("mesh ready (tp/fsdp/dp)")
     batch_multiple = required_batch_multiple(text_api.batch_partition_spec(model_cfg), mesh)
     if train_cfg.batch_size % batch_multiple != 0:

@@ -2,18 +2,20 @@
 
 import datetime
 import time
+from types import SimpleNamespace
 from unittest import mock
 
 from absl.testing import absltest
+from jax.sharding import PartitionSpec
 
-from omegalax.distributed.mesh import process_local_batch_size
+from omegalax.distributed.mesh import process_local_batch_size, required_batch_multiple
 from omegalax.models.qwen3.config import make_config as make_qwen3_config
 from omegalax.models.qwen3_5.config import make_config as make_qwen3_5_config
 from omegalax.models.qwen3_vl.config import make_vl_config as make_qwen3_vl_config
 from omegalax.trainers import perf
 from omegalax.trainers.perf import (
-    ForwardFlops,
     PEAK_TFLOPS,
+    ForwardFlops,
     StepFlops,
     StepTimer,
     forward_flops_per_token,
@@ -286,6 +288,12 @@ class ProcessLocalBatchSizeTest(absltest.TestCase):
     def test_rejects_non_divisible_global_batch_size(self):
         with self.assertRaisesRegex(ValueError, "divisible by data_parallel_size=3"):
             process_local_batch_size(8, dp_size=3, fsdp_size=1)
+
+    def test_required_batch_multiple_combines_sharding_axes(self):
+        mesh = SimpleNamespace(shape={"dp": 2, "fsdp": 4})
+        self.assertEqual(required_batch_multiple(PartitionSpec(None, None), mesh), 1)
+        self.assertEqual(required_batch_multiple(PartitionSpec("dp", None), mesh), 2)
+        self.assertEqual(required_batch_multiple(PartitionSpec(("dp", "fsdp"), None), mesh), 8)
 
 
 class StepTimerTest(absltest.TestCase):
