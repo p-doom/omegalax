@@ -84,8 +84,10 @@ def _vision_batch():
 def _shard_global_batch(batch, mesh):
     sharded = {}
     for key, value in batch.items():
-        spec = P(None, "fsdp", None) if key == "position_ids_ZBT" else P(
-            "fsdp", *((None,) * (value.ndim - 1))
+        spec = (
+            P(None, "fsdp", None)
+            if key == "position_ids_ZBT"
+            else P("fsdp", *((None,) * (value.ndim - 1)))
         )
         sharded[key] = _put(mesh, value, spec)
     return sharded
@@ -152,11 +154,27 @@ def _install_checked_attention():
     vision_lib._cudnn_packed_vision_attention_local = checked_local
 
 
+def _assert_attention_does_not_all_gather(mesh):
+    qkv = _put(mesh, np.arange(32, dtype=np.float32).reshape(16, 2, 1), P("fsdp", None, None))
+    grid = _put(
+        mesh,
+        np.tile(np.asarray([[1, 1, 1], [1, 1, 3]], dtype=np.int32), (4, 1)),
+        P("fsdp", None),
+    )
+    lowered = jax.jit(
+        lambda q, k, v, g: vision_lib._cudnn_packed_vision_attention(q, k, v, g, 1.0)
+    ).lower(qkv, qkv, qkv, grid)
+    hlo = lowered.as_text().lower()
+    assert "all_gather" not in hlo
+    assert "all-gather" not in hlo
+
+
 def main():
     assert jax.device_count() == 4
     mesh = make_mesh(tp_size=1, fsdp_size=4, dp_size=1)
     model, cfg = vlm_api.init_model(_config(), jax.random.key(0), tp_size=1, fsdp_size=4, dp_size=1)
     _install_checked_attention()
+    _assert_attention_does_not_all_gather(mesh)
     _assert_embedding_and_output_weight(model, mesh)
     _assert_batch_ingress_rejects_process_misalignment(cfg, mesh)
     _assert_trainer_consumer(model, cfg, mesh)
