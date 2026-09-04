@@ -30,6 +30,9 @@ _COMPATIBLE_V2_CONTENT_SHA256 = frozenset(
         # Unique 230179f v2 content hash (currently only the clean A48 run): later
         # HF-init/provenance changes leave deterministic pair consumption unchanged.
         "971f564351b87e962092de318fcb260fa1c1552b6b1870ebc1c90834a6693610",
+        # 402e59f only forces scheduled checkpoint saves through Orbax's save policy;
+        # generator semantics and deterministic pair consumption are unchanged.
+        "c382c3dfbd0e9f4113e12320cab0761d3ed4377a961c096e7f0e7ac85b5bdd9f",
     }
 )
 
