@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 import multiprocessing as mp
-import numpy as np
 import shutil
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
@@ -13,32 +12,23 @@ from itertools import chain
 from pathlib import Path
 from typing import Any
 
-from tqdm import tqdm
-
-from array_record.python.array_record_module import ArrayRecordWriter
 import grain
 import jax
+import numpy as np
+from array_record.python.array_record_module import ArrayRecordWriter
+from tqdm import tqdm
 
 COMPILED_DATASET_VERSION = 1
 COMPILED_METADATA_FILENAME = "metadata.json"
 TOKEN_STATS_FILENAME = "token_stats.json"
 TRUNCATION_STATS_FILENAME = "truncation_stats.json"
 SEQUENCE_LENGTHS_FILENAME = "sequence_lengths.jsonl"
-# Per-message token-length cache for the payload-free inline path. Keyed by
-# (conv_idx, msg_offset) -- conv_idx is the 0-based index over non-empty
-# chat.jsonl rows (the no-payload analog of the payload record_idx). Independent
-# of max_length / overflow_mode / system_message, so it is measured once
-# (measure_message_lengths_from_chat) and reused across every seq-length build.
-MESSAGE_LENGTHS_FILENAME = "message_lengths.jsonl"
 ARRAY_RECORD_SUFFIX = ".array_record"
 
 SOURCE_ID_KEY = "_omegalax_source_id"
 BATCH_SOURCE_IDS_KEY = "source_ids"
 
-# Worker-process global for the parallel measure pass. Installed once per worker
-# via the Pool initializer (_measure_init), then reused for every message-length
-# call so the (picklable) measure fn is shipped once, not per task.
-_measure_fn = None
+_prepare_conversation_fn = None
 
 
 @dataclass(frozen=True)
@@ -52,7 +42,11 @@ class MixSource:
     """
 
     path: str | Path
-    weight: float = 1.0
+    weight: float
+
+
+def parse_data_mix(spec: str) -> list[MixSource]:
+    return [MixSource(**entry) for entry in json.loads(spec)]
 
 
 def _prepare_output_dir(out_dir: Path, *, overwrite: bool) -> None:
@@ -71,7 +65,6 @@ def _write_arrayrecord_dataset(
     *,
     records_per_shard: int,
     overwrite: bool,
-    metadata: dict[str, Any],
 ) -> Path:
     if records_per_shard <= 0:
         raise ValueError("records_per_shard must be > 0")
@@ -110,16 +103,13 @@ def _write_arrayrecord_dataset(
     finally:
         writer.close()
 
-    final_metadata = dict(metadata)
-    final_metadata.update(
-        {
-            "version": COMPILED_DATASET_VERSION,
-            "num_records": total_records,
-            "num_shards": len(shard_paths),
-            "shard_paths": shard_paths,
-        }
-    )
-    (out_dir / COMPILED_METADATA_FILENAME).write_text(json.dumps(final_metadata, indent=2) + "\n")
+    metadata = {
+        "version": COMPILED_DATASET_VERSION,
+        "num_records": total_records,
+        "num_shards": len(shard_paths),
+        "shard_paths": shard_paths,
+    }
+    (out_dir / COMPILED_METADATA_FILENAME).write_text(json.dumps(metadata, indent=2) + "\n")
     return out_dir
 
 
@@ -184,9 +174,21 @@ def required_epochs_for_batches(
     return max(1, (required_records + records_per_epoch - 1) // records_per_epoch)
 
 
-def _measure_worker(keyed_message):
-    key, message = keyed_message
-    return key, _measure_fn(message)
+def _process_worker(task):
+    conv_idx, session_id, session_meta, messages, effective_max, overflow_mode = task
+    prepared = _prepare_conversation_fn(messages)
+    return (
+        conv_idx,
+        session_id,
+        _process_conversation(
+            session_id,
+            session_meta,
+            messages,
+            prepared,
+            effective_max=effective_max,
+            overflow_mode=overflow_mode,
+        ),
+    )
 
 
 def _compute_distribution(values: list[int]) -> dict[str, int | float]:
@@ -270,13 +272,7 @@ def _emit_token_stats(
 
 
 def _iter_chat_conversations(path: Path):
-    """Yield ``(conv_idx, session_id, session_meta, messages)`` per non-empty row.
-
-    ``conv_idx`` is a 0-based index over non-empty JSONL rows -- the no-payload
-    analog of the payload ``record_idx`` and the key the length cache is built
-    on. ``session_id`` mirrors the payload path's synthesis so provenance is
-    identical (filename stem + 1-based file line).
-    """
+    """Yield ``(conv_idx, session_id, session_meta, messages)`` per non-empty row."""
     with path.open() as f:
         conv_idx = 0
         for line_num, line in enumerate(f, start=1):
@@ -294,148 +290,9 @@ def _iter_chat_conversations(path: Path):
             conv_idx += 1
 
 
-def _extract_measurement(result) -> tuple[int, int, int, int, list]:
-    """Normalize a measure_message() result to (length, vision_tokens,
-    vision_patches, num_images, image_grid_thw)."""
-    if isinstance(result, dict):
-        return (
-            int(result["length"]),
-            int(result["vision_tokens"]),
-            int(result["vision_patches"]),
-            int(result["num_images"]),
-            result.get("image_grid_thw", []),
-        )
-    return (int(result), 0, 0, 0, [])
-
-
-def _measure_init(measure_message) -> None:
-    """Pool initializer: install the measure fn in the worker's module global.
-
-    Required because the from-chat workers run under ``spawn`` (see
-    ``_compute_message_lengths_from_chat``), which does not inherit the parent's
-    globals; ``measure_message`` is pickled in via ``initargs`` instead.
-    """
-    global _measure_fn
-    _measure_fn = measure_message
-
-
-def _compute_message_lengths_from_chat(chat_path, measure_message, num_workers) -> dict:
-    """Tokenize every message in a chat.jsonl once, in parallel, under ``spawn``.
-
-    Returns ``{(conv_idx, msg_offset): measurement}``. Uses the ``spawn`` start
-    method, not ``fork``: ar:// image refs are read from a native ArrayRecord
-    store, and a forked worker inherits a thread-tainted reader that segfaults on
-    its first image read (deadlocking the pool). ``spawn`` starts each worker
-    clean; ``measure_message`` is shipped to each worker via the pool
-    initializer since spawn does not inherit globals.
-    """
-    tasks: list[tuple[tuple[int, int], dict[str, Any]]] = []
-    for conv_idx, _sid, _meta, messages in _iter_chat_conversations(chat_path):
-        for msg_offset, message in enumerate(messages):
-            tasks.append(((conv_idx, msg_offset), message))
-    if not tasks:
-        return {}
-    ctx = mp.get_context("spawn")
-    chunksize = max(1, min(32, len(tasks) // num_workers))
-    with ctx.Pool(num_workers, initializer=_measure_init, initargs=(measure_message,)) as pool:
-        results = dict(
-            tqdm(
-                pool.imap_unordered(_measure_worker, tasks, chunksize=chunksize),
-                total=len(tasks),
-                desc=f"Measuring messages ({num_workers} workers)",
-            )
-        )
-    return results
-
-
-def _write_chat_message_lengths(path: str | Path, results: dict) -> None:
-    """Persist the ``(conv_idx, msg_offset) -> measurement`` map as JSONL."""
-    path = Path(path).expanduser()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w") as f:
-        for (conv_idx, msg_offset), measurement in sorted(results.items()):
-            f.write(
-                json.dumps(
-                    {"conv_idx": conv_idx, "msg_offset": msg_offset, "measurement": measurement}
-                )
-                + "\n"
-            )
-
-
-def _load_chat_message_lengths(path: str | Path) -> dict:
-    """Inverse of :func:`_write_chat_message_lengths`."""
-    results: dict[tuple[int, int], Any] = {}
-    with Path(path).expanduser().open() as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            row = json.loads(line)
-            results[(int(row["conv_idx"]), int(row["msg_offset"]))] = row["measurement"]
-    return results
-
-
-def _validate_chat_message_lengths(chat_path, results: dict) -> None:
-    """Fail loudly if a cached length map does not match chat_path exactly."""
-    expected = 0
-    missing: list[tuple[int, int]] = []
-    for conv_idx, _sid, _meta, messages in _iter_chat_conversations(chat_path):
-        for msg_offset in range(len(messages)):
-            expected += 1
-            if (conv_idx, msg_offset) not in results and len(missing) < 5:
-                missing.append((conv_idx, msg_offset))
-    if missing or len(results) != expected:
-        raise ValueError(
-            f"cached message lengths do not match chat dataset {chat_path}: chat has "
-            f"{expected} messages, cache has {len(results)} entries"
-            + (f"; first missing keys: {missing}" if missing else "")
-            + ". The cache is stale for this chat.jsonl -- delete it and re-measure."
-        )
-
-
-def _resolve_chat_message_lengths(chat_path, measure_message, num_workers, message_lengths_path):
-    """Load-or-compute the per-message length map for the inline path.
-
-    Mirrors the payload path's cache semantics: cache present -> load + validate;
-    requested but absent -> compute then write; None -> compute in-memory.
-    """
-    if message_lengths_path is not None:
-        cache_path = Path(message_lengths_path).expanduser()
-        if cache_path.exists():
-            print(f"[records] loading cached message lengths from {cache_path}", flush=True)
-            results = _load_chat_message_lengths(cache_path)
-            _validate_chat_message_lengths(chat_path, results)
-            return results
-
-    results = _compute_message_lengths_from_chat(chat_path, measure_message, num_workers)
-
-    if message_lengths_path is not None:
-        _write_chat_message_lengths(message_lengths_path, results)
-        print(f"[records] wrote message-length cache to {message_lengths_path}", flush=True)
-    return results
-
-
-def measure_message_lengths_from_chat(
-    chat_path: str | Path,
-    out_path: str | Path,
-    *,
-    measure_message,
-    num_workers: int = 2,
-) -> Path:
-    """Tokenize every message in a chat.jsonl once and write the length cache.
-
-    Standalone entry point for the payload-free "measure" stage: produces the
-    ``message_lengths.jsonl`` that :func:`build_records_from_chat` consumes via
-    its ``message_lengths_path``, so re-binning at a different ``max_length`` /
-    ``overflow_mode`` never re-tokenizes. Reads chat.jsonl directly -- no
-    intermediate grain payload.
-    """
-    chat_path = Path(chat_path).expanduser().resolve()
-    out_path = Path(out_path).expanduser()
-    results = _compute_message_lengths_from_chat(chat_path, measure_message, num_workers)
-    _write_chat_message_lengths(out_path, results)
-    print(f"[measure] wrote {len(results)} message lengths to {out_path}", flush=True)
-    return out_path
+def _prepare_init(prepare_conversation) -> None:
+    global _prepare_conversation_fn
+    _prepare_conversation_fn = prepare_conversation
 
 
 def _emit_sequence_lengths(out_dir: Path, *, sequence_stats: dict, effective_max: int) -> None:
@@ -470,16 +327,20 @@ def _emit_truncation_stats(
     *,
     overflow_mode: str,
     max_length: int,
-    system_message_length: int,
     effective_max: int,
     total_sessions: int,
     total_message_tokens: int,
+    total_supervised_tokens: int,
     session_chunk_counts: dict[str, int],
     prefix_sessions: set[str],
     overflow_sessions: set[str],
     dropped_sessions: set[str],
     dropped_messages: int,
     dropped_tokens: int,
+    dropped_supervised_tokens: int,
+    emitted_tokens: int,
+    emitted_supervised_tokens: int,
+    supervision_basis: str,
 ) -> None:
     """Summarise per-session truncation/splitting, print it, and persist it to
     ``truncation_stats.json``."""
@@ -489,11 +350,15 @@ def _emit_truncation_stats(
     sessions_split = sum(1 for c in session_chunk_counts.values() if c > 1)
     sessions_dropped_entirely = total_sessions - sessions_with_chunks
     kept_tokens = total_message_tokens - dropped_tokens
+    kept_supervised = total_supervised_tokens - dropped_supervised_tokens
+    if total_supervised_tokens != kept_supervised + dropped_supervised_tokens:
+        raise RuntimeError("supervision accounting invariant failed")
+    boundary_tokens = emitted_tokens - kept_tokens
+    boundary_supervised = emitted_supervised_tokens - kept_supervised
 
     summary = {
         "overflow_mode": overflow_mode,
         "max_length": max_length,
-        "system_message_length": system_message_length,
         "effective_max": effective_max,
         "sessions": {
             "total": total_sessions,
@@ -514,8 +379,22 @@ def _emit_truncation_stats(
             "total_measured": total_message_tokens,
             "kept": kept_tokens,
             "dropped": dropped_tokens,
+            "chunk_boundary_adjustment": boundary_tokens,
             "dropped_fraction": (
                 round(dropped_tokens / total_message_tokens, 6) if total_message_tokens else 0.0
+            ),
+        },
+        "supervision": {
+            "basis": supervision_basis,
+            "total_measured": total_supervised_tokens,
+            "kept": kept_supervised,
+            "dropped": dropped_supervised_tokens,
+            "chunk_boundary_adjustment": boundary_supervised,
+            "emitted": emitted_supervised_tokens,
+            "dropped_fraction": (
+                round(dropped_supervised_tokens / total_supervised_tokens, 6)
+                if total_supervised_tokens
+                else 0.0
             ),
         },
     }
@@ -524,8 +403,8 @@ def _emit_truncation_stats(
     pct = summary["tokens"]["dropped_fraction"] * 100
     print(
         "[records] truncation summary "
-        f"(overflow_mode={overflow_mode}, effective_max={effective_max} "
-        f"= max_length={max_length} - system_tokens={system_message_length}):\n"
+        f"(overflow_mode={overflow_mode}, max_length={max_length}, "
+        f"effective_max={effective_max}):\n"
         f"  sessions: total={total_sessions} emitted={sessions_with_chunks} "
         f"split={sessions_split} truncated={len(truncated_sessions)} "
         f"(overflow={len(overflow_sessions)}, single_msg={len(prefix_sessions)}) "
@@ -534,160 +413,154 @@ def _emit_truncation_stats(
         f"  chunks_emitted={num_chunks}\n"
         f"  messages_dropped={dropped_messages}\n"
         f"  tokens: total={total_message_tokens} kept={kept_tokens} "
-        f"dropped={dropped_tokens} ({pct:.3f}%)",
+        f"dropped={dropped_tokens} ({pct:.3f}%)\n"
+        f"  supervision: total={total_supervised_tokens} kept={kept_supervised} "
+        f"dropped={dropped_supervised_tokens} "
+        f"boundary_adjustment={boundary_supervised} emitted={emitted_supervised_tokens}",
         flush=True,
     )
 
 
 def _process_conversation(
-    conv_idx: int,
     session_id: str,
     session_meta: dict[str, Any],
     messages: list[dict[str, Any]],
-    precomputed: dict,
+    prepared,
     *,
     effective_max: int,
     overflow_mode: str,
-    truncate_offset: int | None,
 ) -> dict[str, Any]:
-    """Bin one conversation's messages into <=effective_max token chunks and
-    build the self-contained inline example records for it.
-
-    Pure function of the precomputed lengths; the caller handles drop-mode
-    (whole-conversation) drops before calling this.
-    """
+    """Build exact, independently renderable conversation chunks."""
     examples: list[dict[str, Any]] = []
-    msg_lengths: list[int] = []
-    msg_vision_tokens: list[int] = []
-    msg_num_images: list[int] = []
     chunk_lengths: list[int] = []
+    chunk_supervised_tokens: list[int] = []
     chunk_vision_tokens: list[int] = []
     chunk_vision_patches: list[int] = []
     chunk_num_images: list[int] = []
     chunk_num_messages: list[int] = []
-    image_shapes: list[str] = []
-    prefix_truncated = False
+    full = prepared(0, len(messages))
+    message_measurements = prepared.message_measurements
+    if sum(item["length"] for item in message_measurements) != full["length"]:
+        raise RuntimeError("conversation message lengths do not sum to the rendered sequence")
+
+    truncate_offset = next(
+        (
+            index
+            for index, measurement in enumerate(message_measurements)
+            if measurement["length"] > effective_max
+        ),
+        None,
+    )
+    limit = truncate_offset if truncate_offset is not None else len(messages)
+    prefix_truncated = truncate_offset is not None
     overflow_truncated = False
+    dropped_whole = False
     dropped_messages = 0
     dropped_tokens = 0
+    dropped_supervised = 0
 
-    def _dropped(start: int) -> tuple[int, int]:
-        dm = 0
-        dt = 0
-        for off in range(start, len(messages)):
-            length, *_ = _extract_measurement(precomputed[(conv_idx, off)])
-            dm += 1
-            dt += length
-        return dm, dt
+    def _drop(start: int, end: int) -> None:
+        nonlocal dropped_messages, dropped_tokens, dropped_supervised
+        for measurement in message_measurements[start:end]:
+            dropped_messages += 1
+            dropped_tokens += measurement["length"]
+            dropped_supervised += measurement["supervised_tokens"]
 
-    def _make_example(cur_msgs, cur_len, cur_vt, cur_vp, cur_ni):
-        """Return (example, chunk_stat) or None (chunk with no assistant turn).
-
-        The record IS the training example: the message slice for this chunk,
-        with ar:// image refs preserved. The trainer reads it directly.
-        """
-        if not cur_msgs:
-            return None
-        # Skip chunks whose loss mask would be all zeros (no assistant tokens).
-        if not any(m.get("role") == "assistant" for m in cur_msgs):
-            return None
+    def _record(start: int, end: int, measurement: dict[str, Any]) -> None:
         example = dict(session_meta)
-        example["messages"] = list(cur_msgs)
+        example["messages"] = messages[start:end]
         example["_omegalax_session_id"] = session_id
-        example["_omegalax_measured_length"] = cur_len  # content-only; system added at load
-        return example, (cur_len, cur_vt, cur_vp, cur_ni, len(cur_msgs))
-
-    def _record(pair) -> None:
-        example, chunk_stat = pair
+        example["_omegalax_measured_length"] = measurement["length"]
         examples.append(example)
-        length, vt, vp, ni, nm = chunk_stat
-        chunk_lengths.append(length)
-        chunk_vision_tokens.append(vt)
-        chunk_vision_patches.append(vp)
-        chunk_num_images.append(ni)
-        chunk_num_messages.append(nm)
+        chunk_lengths.append(measurement["length"])
+        chunk_supervised_tokens.append(measurement["supervised_tokens"])
+        chunk_vision_tokens.append(measurement["vision_tokens"])
+        chunk_vision_patches.append(measurement["vision_patches"])
+        chunk_num_images.append(measurement["num_images"])
+        chunk_num_messages.append(end - start)
 
-    cur_msgs: list[dict[str, Any]] = []
-    cur_len = 0
-    cur_vt = 0
-    cur_vp = 0
-    cur_ni = 0
+    def _longest_fitting(start: int, end_limit: int):
+        best = None
+        for end in range(start + 1, end_limit + 1):
+            try:
+                measurement = prepared(start, end)
+            except ValueError:
+                continue
+            if (
+                measurement["length"] <= effective_max
+                and measurement["supervised_tokens"] > 0
+            ):
+                best = end, measurement
+        return best
 
-    for msg_offset in range(len(messages)):
-        if truncate_offset is not None and msg_offset >= truncate_offset:
-            pair = _make_example(cur_msgs, cur_len, cur_vt, cur_vp, cur_ni)
-            if pair is not None:
-                _record(pair)
-            prefix_truncated = True
-            dm, dt = _dropped(msg_offset)
-            dropped_messages += dm
-            dropped_tokens += dt
-            break
-
-        result = precomputed[(conv_idx, msg_offset)]
-        length, vt, vp, ni, grid = _extract_measurement(result)
-        if isinstance(result, dict):
-            msg_lengths.append(length)
-            msg_vision_tokens.append(vt)
-            msg_num_images.append(ni)
-            for shape in grid:
-                image_shapes.append(str(tuple(shape)))
-
-        assert length <= effective_max, (
-            f"prefix-truncation pre-scan missed session={session_id} "
-            f"offset={msg_offset} (msg_length={length} > effective_max={effective_max})"
-        )
-
-        if not cur_msgs:
-            pass
-        elif cur_len + length > effective_max:
-            pair = _make_example(cur_msgs, cur_len, cur_vt, cur_vp, cur_ni)
-            if pair is not None:
-                _record(pair)
-            cur_msgs, cur_len, cur_vt, cur_vp, cur_ni = [], 0, 0, 0, 0
-            if overflow_mode == "truncate":
-                overflow_truncated = True
-                dm, dt = _dropped(msg_offset)
-                dropped_messages += dm
-                dropped_tokens += dt
-                break
-            # split: fall through and start a fresh chunk with this message
-
-        cur_msgs.append(messages[msg_offset])
-        cur_len += length
-        cur_vt += vt
-        cur_vp += vp
-        cur_ni += ni
+    if overflow_mode == "drop":
+        if full["length"] <= effective_max and full["supervised_tokens"] > 0:
+            _record(0, len(messages), full)
+        else:
+            _drop(0, len(messages))
+            dropped_whole = True
+    elif overflow_mode == "truncate":
+        best = _longest_fitting(0, limit)
+        if best is None:
+            _drop(0, len(messages))
+            dropped_whole = True
+        else:
+            end, measurement = best
+            _record(0, end, measurement)
+            _drop(end, len(messages))
+            overflow_truncated = end < limit
     else:
-        pair = _make_example(cur_msgs, cur_len, cur_vt, cur_vp, cur_ni)
-        if pair is not None:
-            _record(pair)
+        start = 0
+        while start < limit:
+            best = _longest_fitting(start, limit)
+            if best is None:
+                _drop(start, start + 1)
+                start += 1
+                continue
+            end, measurement = best
+            _record(start, end, measurement)
+            start = end
+        _drop(limit, len(messages))
 
     return {
         "examples": examples,
-        "msg_lengths": msg_lengths,
-        "msg_vision_tokens": msg_vision_tokens,
-        "msg_num_images": msg_num_images,
+        "sequence_stats": {
+            "num_messages": len(messages),
+            "total_tokens": full["length"],
+            "vision_tokens": full["vision_tokens"],
+            "num_images": full["num_images"],
+            "max_message_tokens": max(
+                (item["length"] for item in message_measurements), default=0
+            ),
+            "num_messages_over_budget": sum(
+                item["length"] > effective_max for item in message_measurements
+            ),
+            "total_supervised_tokens": full["supervised_tokens"],
+        },
+        "msg_lengths": [item["length"] for item in message_measurements],
+        "msg_vision_tokens": [item["vision_tokens"] for item in message_measurements],
+        "msg_num_images": [item["num_images"] for item in message_measurements],
         "chunk_lengths": chunk_lengths,
+        "chunk_supervised_tokens": chunk_supervised_tokens,
         "chunk_vision_tokens": chunk_vision_tokens,
         "chunk_vision_patches": chunk_vision_patches,
         "chunk_num_images": chunk_num_images,
         "chunk_num_messages": chunk_num_messages,
-        "image_shapes": image_shapes,
+        "image_shapes": [
+            str(tuple(grid)) for item in message_measurements for grid in item["image_grid_thw"]
+        ],
         "prefix_truncated": prefix_truncated,
         "overflow_truncated": overflow_truncated,
+        "dropped_whole": dropped_whole,
         "dropped_messages": dropped_messages,
         "dropped_tokens": dropped_tokens,
+        "dropped_supervised": dropped_supervised,
     }
 
 
 def recording_split(recording_id: Any, val_fraction: float) -> str:
     """Deterministic recording-level train/val split (whole recording -> one side,
-    so a recording never leaks across the split). No RNG/seed.
-
-    Mirrors the stage-04 builder's ``_split_of`` byte-for-byte so a split applied
-    here (records stage) matches one baked upstream. Lets the split move out of the
-    measure stage: the per-message length cache is split-agnostic and reused."""
+    so a recording never leaks across the split). No RNG/seed."""
     if val_fraction <= 0.0 or not recording_id:
         return "train"
     bucket = int(hashlib.sha1(str(recording_id).encode()).hexdigest(), 16) % 1000
@@ -699,13 +572,11 @@ def build_records_from_chat(
     out_dir: str | Path,
     *,
     max_length: int,
-    measure_message,
+    prepare_conversation,
     records_per_shard: int = 100_000,
     overwrite: bool = False,
-    profile_metadata: dict[str, Any] | None = None,
     num_workers: int = 2,
     overflow_mode: str = "drop",
-    message_lengths_path: str | Path | None = None,
     val_fraction: float = 0.0,
     split: str | None = None,
     split_key: str = "recording_id",
@@ -721,95 +592,41 @@ def build_records_from_chat(
 
     The system prompt is NOT injected here: it is part of the conversation (the
     upstream chat.jsonl builder emits it as the first turn), so it is measured
-    and budgeted as a normal message. ``overflow_mode`` ("drop" (default) |
-    "split" | "truncate") and ``message_lengths_path`` (measure-once cache, keyed to chat.jsonl
-    positions, reused across every max_length / overflow_mode) are the only
-    binning knobs.
+    and budgeted as a normal message. ``overflow_mode`` is "drop" (default),
+    "split", or "truncate".
 
     Train/val split (optional): when ``split`` is set, only conversations whose
     ``recording_split(row[split_key], val_fraction)`` equals ``split`` are emitted.
-    The message-length cache is keyed by position over the FULL chat.jsonl and is
-    resolved/validated against it in full, so ``conv_idx`` stays aligned no matter
-    which split is being built -- the split changes only which conversations reach
-    the output, never the cache. That is what lets a single (split-agnostic) cache
-    serve every split and every val_fraction without re-tokenizing. ``split=None``
-    (default) emits all conversations (single-split / pre-split input).
+    ``split=None`` emits all conversations.
     """
     if max_length <= 0:
         raise ValueError("max_length must be > 0")
+    if num_workers <= 0:
+        raise ValueError("num_workers must be > 0")
     if overflow_mode not in ("split", "truncate", "drop"):
         raise ValueError(
             f"overflow_mode must be 'split', 'truncate', or 'drop', got {overflow_mode!r}"
         )
-
     chat_path = Path(chat_path).expanduser().resolve()
     out_dir = Path(out_dir).expanduser().resolve()
     effective_max = max_length
 
     def _in_split(session_meta: dict[str, Any]) -> bool:
-        # conv_idx (and thus the cache key) is always over the full chat; this only
-        # decides whether a conversation's records are emitted for this split.
         return split is None or recording_split(session_meta.get(split_key), val_fraction) == split
 
-    precomputed = _resolve_chat_message_lengths(
-        chat_path, measure_message, num_workers, message_lengths_path
-    )
-
-    # Prescan: per-conversation token totals (-> sequence_lengths.jsonl) and the
-    # earliest over-budget message per session (prefix-truncation point).
-    session_truncate_at: dict[str, int] = {}
+    tasks = [
+        (conv_idx, session_id, session_meta, messages, effective_max, overflow_mode)
+        for conv_idx, session_id, session_meta, messages in _iter_chat_conversations(chat_path)
+        if _in_split(session_meta)
+    ]
     sequence_stats: dict[str, dict[str, int]] = {}
-    total_message_tokens = 0
-    for conv_idx, session_id, session_meta, messages in _iter_chat_conversations(chat_path):
-        if not _in_split(session_meta):
-            continue
-        agg = {
-            "num_messages": 0,
-            "total_tokens": 0,
-            "vision_tokens": 0,
-            "num_images": 0,
-            "max_message_tokens": 0,
-            "num_messages_over_budget": 0,
-        }
-        sequence_stats[session_id] = agg
-        for msg_offset in range(len(messages)):
-            length, vt, _vp, ni, _grid = _extract_measurement(precomputed[(conv_idx, msg_offset)])
-            total_message_tokens += length
-            agg["num_messages"] += 1
-            agg["total_tokens"] += length
-            agg["vision_tokens"] += vt
-            agg["num_images"] += ni
-            if length > agg["max_message_tokens"]:
-                agg["max_message_tokens"] = length
-            if length > effective_max:
-                agg["num_messages_over_budget"] += 1
-                if session_id not in session_truncate_at:
-                    session_truncate_at[session_id] = msg_offset
-    all_session_ids = set(sequence_stats)
-    if session_truncate_at:
-        print(
-            f"[records] prefix-truncating {len(session_truncate_at)} session(s) at the first "
-            f"message exceeding max_length={max_length}: {sorted(session_truncate_at)[:5]}"
-            + (" ..." if len(session_truncate_at) > 5 else ""),
-            flush=True,
-        )
-
-    drop_sessions: set[str] = set()
-    if overflow_mode == "drop":
-        drop_sessions = {
-            sid for sid, agg in sequence_stats.items() if agg["total_tokens"] > effective_max
-        }
-        if drop_sessions:
-            print(
-                f"[records] drop mode: dropping {len(drop_sessions)} session(s) whose total "
-                f"length exceeds effective_max={effective_max}",
-                flush=True,
-            )
+    totals = {"tokens": 0, "supervised": 0}
 
     _msg_lengths: list[int] = []
     _msg_vision_tokens: list[int] = []
     _msg_num_images: list[int] = []
     _chunk_lengths: list[int] = []
+    _chunk_supervised_tokens: list[int] = []
     _chunk_vision_tokens: list[int] = []
     _chunk_vision_patches: list[int] = []
     _chunk_num_images: list[int] = []
@@ -821,36 +638,20 @@ def build_records_from_chat(
         "dropped_sessions": set(),
         "dropped_messages": 0,
         "dropped_tokens": 0,
+        "dropped_supervised": 0,
     }
     _session_chunk_counts: dict[str, int] = {}
 
-    def _iter_records():
-        for conv_idx, session_id, session_meta, messages in _iter_chat_conversations(chat_path):
-            if not _in_split(session_meta):
-                continue
-            if session_id in drop_sessions:
-                for off in range(len(messages)):
-                    length, *_ = _extract_measurement(precomputed[(conv_idx, off)])
-                    _trunc["dropped_tokens"] += length
-                _trunc["dropped_messages"] += len(messages)
-                _trunc["dropped_sessions"].add(session_id)
-                continue
-
-            res = _process_conversation(
-                conv_idx,
-                session_id,
-                session_meta,
-                messages,
-                precomputed,
-                effective_max=effective_max,
-                overflow_mode=overflow_mode,
-                truncate_offset=session_truncate_at.get(session_id),
-            )
-
+    def _iter_records(results):
+        for _conv_idx, session_id, res in results:
+            sequence_stats[session_id] = res["sequence_stats"]
+            totals["tokens"] += res["sequence_stats"]["total_tokens"]
+            totals["supervised"] += res["sequence_stats"]["total_supervised_tokens"]
             _msg_lengths.extend(res["msg_lengths"])
             _msg_vision_tokens.extend(res["msg_vision_tokens"])
             _msg_num_images.extend(res["msg_num_images"])
             _chunk_lengths.extend(res["chunk_lengths"])
+            _chunk_supervised_tokens.extend(res["chunk_supervised_tokens"])
             _chunk_vision_tokens.extend(res["chunk_vision_tokens"])
             _chunk_vision_patches.extend(res["chunk_vision_patches"])
             _chunk_num_images.extend(res["chunk_num_images"])
@@ -861,43 +662,53 @@ def build_records_from_chat(
                 _trunc["prefix_sessions"].add(session_id)
             if res["overflow_truncated"]:
                 _trunc["overflow_sessions"].add(session_id)
+            if res["dropped_whole"]:
+                _trunc["dropped_sessions"].add(session_id)
             _trunc["dropped_messages"] += res["dropped_messages"]
             _trunc["dropped_tokens"] += res["dropped_tokens"]
+            _trunc["dropped_supervised"] += res["dropped_supervised"]
             if res["examples"]:
                 _session_chunk_counts[session_id] = len(res["examples"])
             yield from res["examples"]
 
-    out_path = _write_arrayrecord_dataset(
-        _iter_records(),
-        out_dir,
-        records_per_shard=records_per_shard,
-        overwrite=overwrite,
-        metadata={
-            "inline_records": True,
-            "source_chat_path": str(chat_path),
-            "max_length": max_length,
-            "overflow_mode": overflow_mode,
-            "split": split,
-            "val_fraction": val_fraction,
-            "profile_metadata": profile_metadata or {},
-        },
-    )
+    ctx = mp.get_context("spawn")
+    chunksize = max(1, min(32, len(tasks) // num_workers))
+    with ctx.Pool(
+        num_workers,
+        initializer=_prepare_init,
+        initargs=(prepare_conversation,),
+    ) as pool:
+        results = tqdm(
+            pool.imap(_process_worker, tasks, chunksize=chunksize),
+            total=len(tasks),
+            desc=f"Preparing conversations ({num_workers} workers)",
+        )
+        out_path = _write_arrayrecord_dataset(
+            _iter_records(results),
+            out_dir,
+            records_per_shard=records_per_shard,
+            overwrite=overwrite,
+        )
 
     _emit_sequence_lengths(out_dir, sequence_stats=sequence_stats, effective_max=effective_max)
     _emit_truncation_stats(
         out_dir,
         overflow_mode=overflow_mode,
         max_length=max_length,
-        system_message_length=0,
         effective_max=effective_max,
-        total_sessions=len(all_session_ids),
-        total_message_tokens=total_message_tokens,
+        total_sessions=len(sequence_stats),
+        total_message_tokens=totals["tokens"],
+        total_supervised_tokens=totals["supervised"],
         session_chunk_counts=_session_chunk_counts,
         prefix_sessions=_trunc["prefix_sessions"],
         overflow_sessions=_trunc["overflow_sessions"],
         dropped_sessions=_trunc["dropped_sessions"],
         dropped_messages=_trunc["dropped_messages"],
         dropped_tokens=_trunc["dropped_tokens"],
+        dropped_supervised_tokens=_trunc["dropped_supervised"],
+        emitted_tokens=sum(_chunk_lengths),
+        emitted_supervised_tokens=sum(_chunk_supervised_tokens),
+        supervision_basis="loss_mask",
     )
     if _msg_lengths:
         _emit_token_stats(
@@ -1002,27 +813,6 @@ def _coerce_sources(
     return out
 
 
-def _validate_mix_compatibility(
-    sources: list[MixSource],
-    metadatas: list[dict[str, Any]],
-) -> None:
-    """Refuse mixes that would silently corrupt training (different tokenization, length, etc.)."""
-    if len(sources) <= 1:
-        return
-    max_lengths = {int(m["max_length"]) for m in metadatas if "max_length" in m}
-    if len(max_lengths) > 1:
-        raise ValueError(
-            f"Cannot mix datasets compiled with different max_length: {max_lengths}. "
-            f"Rebuild chunk indices with a shared --max_length."
-        )
-    tokenizer_ids = {(m.get("profile_metadata") or {}).get("tokenizer_id") for m in metadatas}
-    tokenizer_ids.discard(None)
-    if len(tokenizer_ids) > 1:
-        raise ValueError(
-            f"Cannot mix datasets compiled with different tokenizers: {tokenizer_ids}."
-        )
-
-
 def make_grain_iterator(
     sources: str | Path | MixSource | Sequence[str | Path | MixSource],
     *,
@@ -1035,6 +825,7 @@ def make_grain_iterator(
     multiprocessing_options: grain.MultiprocessingOptions | None = None,
     dp_size: int,
     fsdp_size: int,
+    extra_transform: grain.transforms.RandomMap | None = None,
 ):
     """Create a checkpointable Grain iterator over one or more inline-records datasets.
 
@@ -1050,6 +841,16 @@ def make_grain_iterator(
 
     Data-parallel sharding spans both axes: ``dp = dp_size * fsdp_size``. The
     process's slot is ``jax.process_index() % dp``.
+
+    ``extra_transform`` is an optional dataset-specific augmentation
+    (e.g. action-magnitude scaling): a ``grain.transforms.RandomMap`` applied
+    per-source via ``ds.random_map`` after content resolution and source
+    tagging, before mixing and batching, so it sees fully-materialized chat
+    content and may inspect the source-id tag to filter. It gets a
+    deterministic per-source seed derived from ``seed``, so
+    resume-from-checkpoint reproduces the same augmentation. Caller must
+    restrict this to the train iterator — augmenting a val iterator silently
+    corrupts metrics.
     """
     if batch_size <= 0:
         raise ValueError("batch_size must be > 0")
@@ -1064,16 +865,6 @@ def make_grain_iterator(
     # configs commonly zero out a source to disable it without changing structure.
     # Source ids stay aligned with the user-provided list so metric tags remain stable.
     active_indices = [i for i, s in enumerate(mix_sources) if s.weight > 0.0]
-    metadatas = [load_compiled_metadata(mix_sources[i].path) for i in active_indices]
-    for i, m in zip(active_indices, metadatas):
-        if not m.get("inline_records"):
-            raise ValueError(
-                f"Expected an inline-records dataset (build_records_from_chat): {mix_sources[i].path}"
-            )
-    _validate_mix_compatibility(
-        [mix_sources[i] for i in active_indices],
-        metadatas,
-    )
     norm_weights = [mix_sources[i].weight / total_w for i in active_indices]
 
     mp_options = multiprocessing_options or make_grain_multiprocessing_options()
@@ -1099,6 +890,10 @@ def make_grain_iterator(
         # zero out individual sources).
         ds = ds.map(_JsonLoadsMap())
         ds = ds.map(_TagSourceMap(source_id=original_idx))
+        # Optional user-supplied augmentation (a RandomMap), with a deterministic
+        # per-source seed so resume-from-checkpoint reproduces it.
+        if extra_transform is not None:
+            ds = ds.random_map(extra_transform, seed=seed + 10_000 * (original_idx + 1))
         per_source.append(ds)
 
     mixed = (

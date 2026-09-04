@@ -40,7 +40,6 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P, reshard
 
-
 # Standard LoRA target-module names for transformer-block projections.
 # Match by attribute name on the *parent* module (e.g.
 # ``TextAttention.q_proj``). MoE feed-forward layers store gate/up/down
@@ -55,6 +54,14 @@ DEFAULT_TARGET_MODULES: tuple[str, ...] = (
     "gate_proj",
     "up_proj",
     "down_proj",
+)
+
+QWEN3_5_DELTANET_TARGET_MODULES: tuple[str, ...] = (
+    "in_proj_qkv",
+    "in_proj_z",
+    "in_proj_b",
+    "in_proj_a",
+    "out_proj",
 )
 
 # Subtree attribute names to skip during injection. Any module whose
@@ -80,12 +87,9 @@ class LoRALinear(nnx.Module):
     are frozen at the gradient layer while still being checkpointed as
     part of the model state.
 
-    ``lora_A`` / ``lora_B`` are stored replicated (they are tiny: ~r·d
-    each); sharding is applied in the forward instead. ``__call__``
-    reshards ``lora_B`` so the delta is *born* with the base projection's
-    output sharding — mirroring how the base weight is tp-sharded — which
-    keeps the delta activation tp-sharded under TP with no extra
-    collective. At tp=1 it is a no-op.
+    ``lora_A`` / ``lora_B`` are replicated fp32 masters. ``__call__``
+    casts them to the input dtype and reshards ``lora_B`` so the delta is
+    born with the base projection's output sharding.
     """
 
     def __init__(
@@ -95,7 +99,6 @@ class LoRALinear(nnx.Module):
         r: int,
         alpha: float,
         rngs: nnx.Rngs,
-        dtype: jnp.dtype | None = None,
     ):
         if r <= 0:
             raise ValueError(f"LoRA rank must be positive, got r={r}")
@@ -106,8 +109,6 @@ class LoRALinear(nnx.Module):
 
         d_in = base.in_features
         d_out = base.out_features
-        adapter_dtype = dtype if dtype is not None else base.dtype
-
         # PEFT/Tinker convention: A ~ Uniform(-1/sqrt(d_in), 1/sqrt(d_in))
         # under nnx.initializers.uniform's symmetric scale. B = 0.
         # No sharding metadata: A and B are tiny (~r·d each) and replicated
@@ -115,13 +116,13 @@ class LoRALinear(nnx.Module):
         # constrained explicitly via ``out_sharding`` in ``__call__``.
         a_init_fn = nnx.initializers.uniform(scale=1.0 / (d_in**0.5))
         self.lora_A = LoRAParam(
-            a_init_fn(rngs.params(), (d_in, r), adapter_dtype),
+            a_init_fn(rngs.params(), (d_in, r), jnp.float32),
         )
         self.lora_B = LoRAParam(
-            jnp.zeros((r, d_out), dtype=adapter_dtype),
+            jnp.zeros((r, d_out), dtype=jnp.float32),
         )
 
-    # ---- forward-compat surface so callers that read base.kernel etc. still work ----
+    # Forward-compat surface so callers that read base.kernel etc. still work.
     @property
     def kernel(self):
         return self.base.kernel
@@ -144,8 +145,8 @@ class LoRALinear(nnx.Module):
 
     def __call__(self, inputs: jax.Array, *, out_sharding=None) -> jax.Array:
         base_out = self.base(inputs, out_sharding=out_sharding)
-        a = self.lora_A[...]
-        b = self.lora_B[...]
+        a = self.lora_A[...].astype(inputs.dtype)
+        b = self.lora_B[...].astype(inputs.dtype)
         if out_sharding is not None:
             # reshard lora_B (not the delta) so the delta is born tp-sharded; no-op at tp=1.
             b = reshard(b, P(None, out_sharding[-1]))
@@ -178,7 +179,6 @@ def inject_lora(
     rngs: nnx.Rngs,
     target_modules: Sequence[str] = DEFAULT_TARGET_MODULES,
     skip_paths: Sequence[str] = DEFAULT_SKIP_PATHS,
-    dtype: jnp.dtype | None = None,
 ) -> int:
     """Replace each ``nnx.Linear`` named in ``target_modules`` with a
     ``LoRALinear`` wrapping it. In place. Returns the count of layers
@@ -191,7 +191,7 @@ def inject_lora(
     Idempotent on already-wrapped modules: a ``LoRALinear`` is not an
     ``nnx.Linear``, so re-running this function won't double-wrap.
     """
-    target_set = set(target_modules)
+    target_names = tuple(dict.fromkeys(target_modules))
     skip_set = set(skip_paths)
     # Materialize iter_modules first because we mutate during iteration.
     modules = list(nnx.iter_modules(model))
@@ -199,7 +199,7 @@ def inject_lora(
     for path, module in modules:
         if any(p in skip_set for p in path):
             continue
-        for name in target_set:
+        for name in target_names:
             child = getattr(module, name, None)
             if not isinstance(child, nnx.Linear):
                 continue
@@ -208,11 +208,26 @@ def inject_lora(
                 r=r,
                 alpha=alpha,
                 rngs=rngs,
-                dtype=dtype,
             )
             setattr(module, name, wrapped)
             count += 1
     return count
+
+
+def inject_model_lora(
+    model: nnx.Module,
+    *,
+    r: int,
+    alpha: float,
+    rngs: nnx.Rngs,
+) -> int:
+    return inject_lora(
+        model,
+        r=r,
+        alpha=alpha,
+        rngs=rngs,
+        target_modules=DEFAULT_TARGET_MODULES + QWEN3_5_DELTANET_TARGET_MODULES,
+    )
 
 
 def merge_lora_into_base(model: nnx.Module) -> int:

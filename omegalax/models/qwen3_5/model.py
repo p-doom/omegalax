@@ -8,6 +8,8 @@ from flax import nnx
 from jax.sharding import PartitionSpec, reshard
 
 from omegalax.models.shard_config import ShardConfig
+from omegalax.models.vision_routing import _vision_token_destinations
+
 from .attention import Attention
 from .config import Qwen3_5Config, Qwen3_5TextConfig
 from .deltanet import GatedDeltaNet
@@ -19,7 +21,6 @@ P = PartitionSpec
 wp = nnx.with_partitioning
 
 
-# Feed-forward blocks
 class MLP(nnx.Module):
     """Standard gated MLP."""
 
@@ -29,7 +30,8 @@ class MLP(nnx.Module):
         intermediate_size: int,
         shd_cfg: ShardConfig,
         *,
-        dtype=None,
+        dtype,
+        param_dtype,
         rngs: nnx.Rngs,
     ):
         self.shd_cfg = shd_cfg
@@ -39,6 +41,7 @@ class MLP(nnx.Module):
             use_bias=False,
             rngs=rngs,
             dtype=dtype,
+            param_dtype=param_dtype,
             kernel_init=wp(init_fn, ("embed", "mlp")),
         )
         row_parallel = partial(
@@ -46,6 +49,7 @@ class MLP(nnx.Module):
             use_bias=False,
             rngs=rngs,
             dtype=dtype,
+            param_dtype=param_dtype,
             kernel_init=wp(init_fn, ("mlp", "embed")),
         )
         self.gate_proj = col_parallel(hidden_size, intermediate_size)
@@ -72,15 +76,15 @@ class MoEFeedForward(nnx.Module):
 
         init = nnx.initializers.lecun_normal()
         self.gate_proj = nnx.Param(
-            init(rngs.params(), (E, D, F_moe)),
+            init(rngs.params(), (E, D, F_moe), dtype=cfg.param_dtype),
             sharding=(None, "embed", "mlp"),
         )
         self.up_proj = nnx.Param(
-            init(rngs.params(), (E, D, F_moe)),
+            init(rngs.params(), (E, D, F_moe), dtype=cfg.param_dtype),
             sharding=(None, "embed", "mlp"),
         )
         self.down_proj = nnx.Param(
-            init(rngs.params(), (E, F_moe, D)),
+            init(rngs.params(), (E, F_moe, D), dtype=cfg.param_dtype),
             sharding=(None, "mlp", "embed"),
         )
         self.router = nnx.Linear(
@@ -89,6 +93,7 @@ class MoEFeedForward(nnx.Module):
             use_bias=False,
             rngs=rngs,
             dtype=cfg.dtype,
+            param_dtype=cfg.param_dtype,
             kernel_init=wp(init, ("embed", None)),
         )
 
@@ -97,6 +102,7 @@ class MoEFeedForward(nnx.Module):
             cfg.shared_expert_intermediate_size,
             shd_cfg=cfg.shd_cfg,
             dtype=cfg.dtype,
+            param_dtype=cfg.param_dtype,
             rngs=rngs,
         )
         self.shared_expert_gate = nnx.Linear(
@@ -105,6 +111,7 @@ class MoEFeedForward(nnx.Module):
             use_bias=False,
             rngs=rngs,
             dtype=cfg.dtype,
+            param_dtype=cfg.param_dtype,
             kernel_init=wp(init, ("embed", None)),
         )
 
@@ -180,7 +187,6 @@ class MoEFeedForward(nnx.Module):
         return output_BTD, aux_loss
 
 
-# Decoder Layer
 class DecoderLayer(nnx.Module):
     """Hybrid decoder layer: full_attention or linear_attention + dense MLP or MoE."""
 
@@ -201,10 +207,15 @@ class DecoderLayer(nnx.Module):
                 cfg.intermediate_size,
                 cfg.shd_cfg,
                 dtype=cfg.dtype,
+                param_dtype=cfg.param_dtype,
                 rngs=rngs,
             )
-        self.input_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, rngs=rngs)
-        self.post_attention_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, rngs=rngs)
+        self.input_layernorm = RMSNorm(
+            cfg.hidden_size, cfg.rms_norm_eps, rngs=rngs, param_dtype=cfg.param_dtype
+        )
+        self.post_attention_layernorm = RMSNorm(
+            cfg.hidden_size, cfg.rms_norm_eps, rngs=rngs, param_dtype=cfg.param_dtype
+        )
 
     @partial(jax.remat, static_argnums=0)
     def __call__(
@@ -212,15 +223,13 @@ class DecoderLayer(nnx.Module):
         hidden_BTD: jax.Array,
         cos_BTK: jax.Array,
         sin_BTK: jax.Array,
-        segment_ids_BT: jax.Array,
-        position_ids_BT: jax.Array,
         attention_mask_BT: jax.Array | None = None,
     ) -> tuple[jax.Array, jax.Array]:
         residual_BTD = hidden_BTD
         normed_BTD = self.input_layernorm(hidden_BTD)
 
         if self.layer_type == "full_attention":
-            attn_out_BTD = self.attn(normed_BTD, cos_BTK, sin_BTK, segment_ids_BT, position_ids_BT)
+            attn_out_BTD = self.attn(normed_BTD, cos_BTK, sin_BTK)
         else:
             attn_out_BTD = self.linear_attn(normed_BTD, attention_mask_BT)
 
@@ -238,7 +247,6 @@ class DecoderLayer(nnx.Module):
         return hidden_BTD, aux_loss
 
 
-# Text Model
 class TextModel(nnx.Module):
     """Qwen3.5 text decoder."""
 
@@ -250,13 +258,16 @@ class TextModel(nnx.Module):
             cfg.hidden_size,
             rngs=rngs,
             dtype=cfg.dtype,
+            param_dtype=cfg.param_dtype,
             embedding_init=wp(embed_init, ("vocab", "embed")),
         )
         self.out_emb_shd = cfg.shd_cfg.act_btd
         self.layers = nnx.List(
             [DecoderLayer(cfg, i, rngs=rngs) for i in range(cfg.num_hidden_layers)]
         )
-        self.final_norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, rngs=rngs)
+        self.final_norm = RMSNorm(
+            cfg.hidden_size, cfg.rms_norm_eps, rngs=rngs, param_dtype=cfg.param_dtype
+        )
 
     @jax.named_scope("text_model")
     def __call__(
@@ -288,6 +299,10 @@ class TextModel(nnx.Module):
         elif position_ids_ZBT.ndim == 2:
             position_ids_ZBT = jnp.stack([position_ids_ZBT] * 3, axis=0)
 
+        batch_axis = cfg.shd_cfg.act_btd[0]
+        segment_ids_BT = reshard(segment_ids_BT, P(batch_axis, None))
+        position_ids_ZBT = reshard(position_ids_ZBT, P(None, batch_axis, None))
+
         cos_BTK, sin_BTK = generate_text_rope(
             position_ids_ZBT,
             cfg.head_dim,
@@ -299,7 +314,6 @@ class TextModel(nnx.Module):
         sin_BTK = sin_BTK.astype(cfg.dtype)
 
         attention_mask_BT = (segment_ids_BT != 0).astype(jnp.float32)
-        text_position_ids_BT = position_ids_ZBT[0]
 
         aux_losses = []
         for layer in self.layers:
@@ -307,8 +321,6 @@ class TextModel(nnx.Module):
                 hidden_BTD,
                 cos_BTK,
                 sin_BTK,
-                segment_ids_BT,
-                text_position_ids_BT,
                 attention_mask_BT,
             )
             aux_losses.append(aux)
@@ -318,7 +330,6 @@ class TextModel(nnx.Module):
         return hidden_BTD, total_aux
 
 
-# Causal LM
 class Qwen3_5ForCausalLM(nnx.Module):
     """Text-only causal language model."""
 
@@ -332,6 +343,7 @@ class Qwen3_5ForCausalLM(nnx.Module):
             use_bias=False,
             rngs=rngs,
             dtype=cfg.dtype,
+            param_dtype=cfg.param_dtype,
             kernel_init=wp(lm_head_init, ("embed", "vocab")),
         )
 
@@ -340,7 +352,6 @@ class Qwen3_5ForCausalLM(nnx.Module):
         return self.text(token_ids_BT=token_ids_BT, segment_ids_BT=segment_ids_BT)
 
 
-# VLM
 class Qwen3_5ForConditionalGeneration(nnx.Module):
     """Vision-Language Model."""
 
@@ -356,8 +367,12 @@ class Qwen3_5ForConditionalGeneration(nnx.Module):
             use_bias=False,
             rngs=rngs,
             dtype=cfg.text_config.dtype,
+            param_dtype=cfg.text_config.param_dtype,
             kernel_init=wp(lm_head_init, ("embed", "vocab")),
         )
+
+    def output_weight(self) -> jax.Array:
+        return self.lm_head.kernel[...]
 
     def __call__(
         self,
@@ -365,9 +380,10 @@ class Qwen3_5ForConditionalGeneration(nnx.Module):
         segment_ids_BT: jax.Array,
         cache,
         num_right_pads,
+        *,
+        vision_patch_valid: jax.Array,
         pixel_values: jax.Array | None = None,
         image_grid_thw: jax.Array | None = None,
-        vision_cu_seqlens: jax.Array | None = None,
         position_ids_ZBT: jax.Array | None = None,
     ):
         del cache, num_right_pads
@@ -379,26 +395,19 @@ class Qwen3_5ForConditionalGeneration(nnx.Module):
         )
 
         if pixel_values is not None and image_grid_thw is not None:
-            image_embeds_ND = self.vision(pixel_values, image_grid_thw, vision_cu_seqlens)
+            image_embeds_ND = self.vision(pixel_values, image_grid_thw)
             image_mask_BT = token_ids_BT == self.cfg.image_token_id
             image_mask_BTD = jnp.broadcast_to(image_mask_BT[:, :, None], inputs_embeds_BTD.shape)
             inputs_embeds_BTD = jnp.where(image_mask_BTD, 0.0, inputs_embeds_BTD)
-            n_embeds = image_embeds_ND.shape[0]  # static after padding
-            seq_len = token_ids_BT.shape[1]
-            batch_indices, seq_indices = jnp.where(
+            batch_indices, seq_indices = _vision_token_destinations(
                 image_mask_BT,
-                size=n_embeds,
-                fill_value=(0, seq_len - 1),
+                vision_patch_valid,
+                self.cfg.vision_config.spatial_merge_size,
             )
-            num_real = jnp.sum(image_mask_BT)
-            valid = jnp.arange(n_embeds) < num_real
-            safe_embeds = jnp.where(
-                valid[:, None],
-                image_embeds_ND,
-                0.0,
-            ).astype(inputs_embeds_BTD.dtype)
+            image_embeds_replicated = reshard(image_embeds_ND, P())
             inputs_embeds_BTD = inputs_embeds_BTD.at[batch_indices, seq_indices].set(
-                safe_embeds,
+                image_embeds_replicated.astype(inputs_embeds_BTD.dtype),
+                mode="drop",
                 out_sharding=self.text.out_emb_shd,
             )
 

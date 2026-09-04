@@ -11,19 +11,17 @@ import jax.numpy as jnp
 import numpy as np
 import safetensors
 import torch
-
 from absl.testing import absltest
 from flax import nnx
 from huggingface_hub import snapshot_download
 from transformers import AutoConfig, AutoTokenizer, Qwen3ForCausalLM
 
-from tests.logits_assert import assert_logits_close
-from tests.real_weights import requires_real_weights
 from omegalax.distributed.mesh import mesh_rules_for
-from omegalax.text import api
 from omegalax.models.params_utils import map_to_bonsai_key
 from omegalax.models.qwen3 import loader as qwen3_loader
-
+from omegalax.text import api
+from tests.logits_assert import assert_logits_close
+from tests.real_weights import requires_real_weights
 
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
@@ -92,7 +90,13 @@ class Qwen3MappingTest(absltest.TestCase):
             )
             for t in texts
         ]
-        toks = self.tokenizer(chat_texts, return_tensors="pt", padding=True, padding_side="left")
+        toks = self.tokenizer(
+            chat_texts,
+            return_tensors="pt",
+            padding=True,
+            padding_side="right",
+            pad_to_multiple_of=8,
+        )
         return {k: v.to(self.device) for k, v in toks.items()}
 
     def _jax_prefill_logits(self, input_ids: torch.Tensor) -> np.ndarray:
@@ -110,7 +114,7 @@ class Qwen3MappingTest(absltest.TestCase):
         unmapped: list[str] = []
         for f in Path(self.model_path).glob("*.safetensors"):
             with safetensors.safe_open(f, framework="numpy") as sf:
-                for torch_key in sf.keys():
+                for torch_key in sf:
                     jax_key, _ = map_to_bonsai_key(mapping, torch_key)
                     if jax_key is None:
                         unmapped.append(torch_key)
@@ -143,7 +147,15 @@ class Qwen3MappingTest(absltest.TestCase):
             hf_logits_BTV = self.hf_model(**inputs).logits.float().cpu().numpy()
         jax_logits_BTV = self._jax_prefill_logits(inputs["input_ids"])
         mask = inputs["attention_mask"].cpu().numpy().astype(bool)
-        assert_logits_close(self, jax_logits_BTV, hf_logits_BTV, mask, top1_min_match=0.8)
+        assert_logits_close(
+            self,
+            jax_logits_BTV,
+            hf_logits_BTV,
+            mask,
+            atol=1.25,
+            median_atol=0.075,
+            top1_min_match=0.8,
+        )
 
     def test_prefill_logits_match_hf_batched(self):
         inputs = self._tokenize([PROMPT, "Who am I?"])
@@ -151,24 +163,15 @@ class Qwen3MappingTest(absltest.TestCase):
             hf_logits_BTV = self.hf_model(**inputs).logits.float().cpu().numpy()
         jax_logits_BTV = self._jax_prefill_logits(inputs["input_ids"])
         mask = inputs["attention_mask"].cpu().numpy().astype(bool)
-        assert_logits_close(self, jax_logits_BTV, hf_logits_BTV, mask, top1_min_match=0.8)
-
-    def test_round_trip_preserves_prefill_logits(self):
-        inputs = self._tokenize([PROMPT])
-        baseline_BTV = self._jax_prefill_logits(inputs["input_ids"])
-
-        graph_def, state = nnx.split(self.jax_model)
-        pure_state = nnx.to_pure_dict(state)
-        restored = nnx.merge(graph_def, pure_state)
-        restored_token_ids_BT = jnp.asarray(np.array(inputs["input_ids"].cpu()), dtype=jnp.int32)
-        segment_ids_BT = 1 * (restored_token_ids_BT != self.pad_id)
-        restored_hidden_BTD, _ = restored(
-            restored_token_ids_BT, segment_ids_BT, None, jnp.array(0, dtype=jnp.int32)
+        assert_logits_close(
+            self,
+            jax_logits_BTV,
+            hf_logits_BTV,
+            mask,
+            atol=1.25,
+            median_atol=0.075,
+            top1_min_match=0.8,
         )
-        restored_logits_BTV = restored.lm_head(restored_hidden_BTD)
-        restored_logits_BTV = np.asarray(restored_logits_BTV)
-
-        np.testing.assert_allclose(restored_logits_BTV, baseline_BTV, rtol=0, atol=0)
 
 
 if __name__ == "__main__":

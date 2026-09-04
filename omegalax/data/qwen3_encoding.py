@@ -1,4 +1,4 @@
-"""Shared Qwen3/Qwen3.5 message serialization and encoding helpers."""
+"""Direct Qwen message encoding for SFT."""
 
 from __future__ import annotations
 
@@ -14,9 +14,13 @@ import numpy as np
 from PIL import Image
 from transformers import BaseImageProcessor, PreTrainedTokenizer
 
-_ARRAYRECORD_IMAGE_URI_SCHEME = "ar"
+from omegalax.data.qwen_renderers import renderer_for_model_type
+
 _ARRAYRECORD_IMAGE_CACHE_SIZE = int(os.environ.get("OMEGALAX_ARRAYRECORD_IMAGE_CACHE_SIZE", "128"))
 _ARRAYRECORD_IMAGE_SOURCES: OrderedDict[str, Any] = OrderedDict()
+
+_CHATML_HEADER_TOKENS = 3
+_CHATML_TRAILING_TOKENS = 1
 
 
 def _close_arrayrecord_reader(reader: Any) -> None:
@@ -37,7 +41,7 @@ def _get_arrayrecord_image_reader(path: str) -> Any:
         _ARRAYRECORD_IMAGE_SOURCES.move_to_end(path)
         return reader
 
-    from array_record.python.array_record_module import ArrayRecordReader  # noqa: PLC0415
+    from array_record.python.array_record_module import ArrayRecordReader
 
     reader = ArrayRecordReader(path)
     if _ARRAYRECORD_IMAGE_CACHE_SIZE <= 0:
@@ -50,102 +54,9 @@ def _get_arrayrecord_image_reader(path: str) -> Any:
     return reader
 
 
-# A ChatML turn is ``<|im_start|>{role}\n{content}<|im_end|>\n``. Because
-# ``<|im_start|>``/``<|im_end|>`` are registered special tokens (hard BPE split
-# points), the assistant header ``<|im_start|>assistant\n`` always tokenizes to
-# exactly three tokens and the ``<|im_end|>\n`` footer to two, independent of the
-# surrounding text. These offsets let us mask assistant content structurally.
-_ASSISTANT_ROLE = "assistant"
-_CHATML_HEADER_TOKENS = 3  # <|im_start|> , role , \n
-_CHATML_TRAILING_TOKENS = 1  # the \n after <|im_end|> (the <|im_end|> itself is supervised)
-
-
-def build_chatml_blocks(
-    messages: list[dict[str, Any]],
-    image_grids: list[tuple[int, int, int]],
-    merge_size: int,
-) -> list[tuple[str, str]]:
-    """Return one ``(role, block_text)`` per message.
-
-    Each block is a complete ChatML turn ``<|im_start|>{role}\n{content}<|im_end|>\n``.
-    Concatenating the block texts reproduces :func:`build_chatml_text` exactly, and
-    because ``<|im_start|>``/``<|im_end|>`` are registered special tokens (hard BPE
-    split points) each block also tokenizes independently: the concatenation of the
-    per-block token ids equals ``tokenizer.encode(build_chatml_text(...))``. Callers
-    use this to build the assistant loss mask from message *structure* rather than by
-    scanning the final token stream for ChatML specials -- the latter is corrupted
-    when user/context text contains literal ``<|im_start|>`` / ``<|im_end|>`` markers.
-    """
-
-    blocks: list[tuple[str, str]] = []
-    img_idx = 0
-
-    for msg in messages:
-        role = msg["role"]
-        content = msg["content"]
-
-        parts: list[str] = [f"<|im_start|>{role}\n"]
-
-        if isinstance(content, str):
-            parts.append(content)
-        else:
-            for block in content:
-                if block["type"] == "text":
-                    parts.append(block["text"])
-                elif block["type"] == "image":
-                    grid_t, grid_h, grid_w = image_grids[img_idx]
-                    img_idx += 1
-                    n_tokens = grid_t * (grid_h // merge_size) * (grid_w // merge_size)
-                    parts.append("<|vision_start|>" + "<|image_pad|>" * n_tokens + "<|vision_end|>")
-
-        parts.append("<|im_end|>\n")
-        blocks.append((role, "".join(parts)))
-
-    return blocks
-
-
-def build_chatml_text(
-    messages: list[dict[str, Any]],
-    image_grids: list[tuple[int, int, int]],
-    merge_size: int,
-) -> str:
-    """Build a ChatML string from messages, inserting image pad tokens."""
-
-    return "".join(
-        block_text for _, block_text in build_chatml_blocks(messages, image_grids, merge_size)
-    )
-
-
-def _assistant_block_loss_mask(block_ids: np.ndarray, is_assistant: bool) -> np.ndarray:
-    """Loss mask for a single ChatML block: 1 on supervised tokens, 0 elsewhere.
-
-    A block is ``<|im_start|>{role}\n{content}<|im_end|>\n``. Non-assistant turns are
-    never supervised. For assistant turns everything between the 3-token header
-    (``<|im_start|>``, ``assistant``, ``\n``) and the trailing ``\n`` is supervised --
-    i.e. the content plus the terminating ``<|im_end|>`` so the model learns to stop.
-
-    Because the mask is scoped to one block built from message structure, literal
-    ``<|im_start|>`` / ``<|im_end|>`` markers appearing inside ``content`` cannot flip
-    neighbouring (user/system) turns -- or image pad tokens -- to supervised.
-    """
-
-    mask = np.zeros(len(block_ids), dtype=np.int32)
-    if not is_assistant:
-        return mask
-    start = _CHATML_HEADER_TOKENS
-    end = len(block_ids) - _CHATML_TRAILING_TOKENS  # exclude trailing \n, keep <|im_end|>
-    if end > start:
-        mask[start:end] = 1
-    return mask
-
-
-def _is_arrayrecord_image_uri(value: object) -> bool:
-    return isinstance(value, str) and value.startswith(f"{_ARRAYRECORD_IMAGE_URI_SCHEME}://")
-
-
 def _parse_arrayrecord_image_uri(uri: str) -> tuple[Path, int]:
     parsed = urlparse(uri)
-    if parsed.scheme != _ARRAYRECORD_IMAGE_URI_SCHEME:
+    if parsed.scheme != "ar":
         raise ValueError(f"not an ArrayRecord image URI: {uri!r}")
     if parsed.netloc:
         raise ValueError(
@@ -155,8 +66,8 @@ def _parse_arrayrecord_image_uri(uri: str) -> tuple[Path, int]:
         raise ValueError(f"malformed ArrayRecord image URI: {uri!r}")
     try:
         record_index = int(parsed.fragment)
-    except ValueError as e:
-        raise ValueError(f"ArrayRecord URI fragment must be an integer: {uri!r}") from e
+    except ValueError as error:
+        raise ValueError(f"ArrayRecord URI fragment must be an integer: {uri!r}") from error
     if record_index < 0:
         raise ValueError(f"ArrayRecord URI record index must be non-negative: {uri!r}")
     return Path(unquote(parsed.path)), record_index
@@ -164,167 +75,300 @@ def _parse_arrayrecord_image_uri(uri: str) -> tuple[Path, int]:
 
 def _open_arrayrecord_image(uri: str) -> Image.Image:
     shard_path, record_index = _parse_arrayrecord_image_uri(uri)
-    key = str(shard_path)
-    reader = _get_arrayrecord_image_reader(key)
+    reader = _get_arrayrecord_image_reader(str(shard_path))
     try:
         jpeg_bytes = reader.read([record_index])[0]
-        with Image.open(io.BytesIO(jpeg_bytes)) as img:
-            return img.convert("RGB")
+        with Image.open(io.BytesIO(jpeg_bytes)) as image:
+            return image.convert("RGB")
     finally:
         if _ARRAYRECORD_IMAGE_CACHE_SIZE <= 0:
             _close_arrayrecord_reader(reader)
 
 
-atexit.register(_close_arrayrecord_image_sources)
-
-
 def _open_image_ref(ref: Any) -> Image.Image:
     if isinstance(ref, Image.Image):
         return ref
-    if _is_arrayrecord_image_uri(ref):
+    if isinstance(ref, str) and ref.startswith("ar://"):
         return _open_arrayrecord_image(ref)
+    if not isinstance(ref, (str, os.PathLike)):
+        raise TypeError("image reference must be a PIL image, local path, or ar:// URI")
+    if isinstance(ref, str) and "://" in ref:
+        raise ValueError("remote image references are not supported")
     return Image.open(ref)
 
 
-def extract_images(messages: list[dict[str, Any]]) -> list[Image.Image]:
-    """Pull PIL images out of Qwen structured-content blocks."""
-
+def _extract_images(messages: list[dict[str, Any]]) -> list[Image.Image]:
     images: list[Image.Image] = []
-    for msg in messages:
-        content = msg["content"]
+    for message in messages:
+        content = message["content"]
         if isinstance(content, str):
             continue
-        for block in content:
-            if block["type"] != "image":
-                continue
-            if "image" in block:
-                images.append(_open_image_ref(block["image"]))
-            elif "url" in block:
-                images.append(_open_image_ref(block["url"]))
+        for part in content:
+            if part["type"] == "image":
+                images.append(_open_image_ref(part["image"]))
     return images
 
 
-def _message_has_images(message: dict[str, Any]) -> bool:
-    content = message.get("content", "")
+atexit.register(_close_arrayrecord_image_sources)
+
+
+def _validate_message(message: dict[str, Any], *, multimodal: bool) -> None:
+    if (
+        not isinstance(message, dict)
+        or not {"role", "content"} <= set(message)
+        or set(message) - {"role", "content", "reasoning_content", "loss"}
+    ):
+        raise ValueError(
+            "messages must contain role and content; only reasoning_content and loss are optional"
+        )
+    role = message["role"]
+    if role not in {"system", "user", "assistant"}:
+        raise ValueError(f"unsupported message role: {role!r}")
+    if "loss" in message:
+        if role != "assistant":
+            raise ValueError("loss is supported only on assistant turns")
+        if not isinstance(message["loss"], bool):
+            raise ValueError("loss must be a boolean")
+    reasoning = message.get("reasoning_content")
+    if reasoning is not None and (role != "assistant" or not isinstance(reasoning, str)):
+        raise ValueError("reasoning_content must be a string on an assistant turn")
+
+    content = message["content"]
     if isinstance(content, str):
-        return False
-    return any(block.get("type") == "image" for block in content)
+        if "<|video_pad|>" in content:
+            raise ValueError("video content is not supported")
+        return
+    if not isinstance(content, list) or not content:
+        raise ValueError("message content must be a string or a non-empty multimodal part list")
+    if not multimodal and any(
+        isinstance(part, dict) and part.get("type") == "image" for part in content
+    ):
+        raise ValueError("image content requires an image processor")
+    if not multimodal:
+        raise ValueError("structured content requires an image processor")
+    for part in content:
+        if isinstance(part, dict) and (part.get("type") == "video" or "video" in part):
+            raise ValueError("video content is not supported")
+        if not isinstance(part, dict) or part.get("type") not in {"text", "image"}:
+            raise ValueError("multimodal parts must be text or image")
+        if part["type"] == "text":
+            if set(part) != {"type", "text"} or not isinstance(part["text"], str):
+                raise ValueError("text parts must contain exactly type and string text")
+            if "<|video_pad|>" in part["text"]:
+                raise ValueError("video content is not supported")
+        elif set(part) != {"type", "image"}:
+            raise ValueError("image parts must contain exactly type and image")
+        elif role != "user":
+            raise ValueError("images are supported only in user turns")
 
 
-class _MessageLengthFn:
-    """Picklable ``message -> measurement`` callable (see ``make_message_length_fn``).
+def _assistant_loss_mask(block_ids: np.ndarray) -> np.ndarray:
+    mask = np.zeros(len(block_ids), dtype=np.int32)
+    mask[_CHATML_HEADER_TOKENS:-_CHATML_TRAILING_TOKENS] = 1
+    return mask
 
-    Defined at module scope rather than as a closure so it can be pickled and
-    sent to ``spawn`` multiprocessing workers. The measure pass
-    (``grain_pipeline._compute_message_lengths_from_chat``) uses ``spawn`` --
-    workers must not inherit the parent's thread-tainted native ArrayRecord image
-    readers, which segfault -- and ``spawn`` re-pickles the measure fn into each
-    worker; a nested closure cannot cross that boundary, an instance of this
-    class can.
-    """
 
+def _message_is_supervised(message: dict[str, Any]) -> bool:
+    return message["role"] == "assistant" and message.get("loss", True)
+
+
+class Qwen3MessageEncoder:
     def __init__(
         self,
         tokenizer: PreTrainedTokenizer,
-        image_processor: BaseImageProcessor | None = None,
+        image_processor: BaseImageProcessor | None,
+        model_type: str,
     ) -> None:
         self.tokenizer = tokenizer
         self.image_processor = image_processor
-        self.merge_size = int(getattr(image_processor, "merge_size", 1)) if image_processor else 1
+        self._renderer, supports_images = renderer_for_model_type(model_type)
+        if image_processor is not None and not supports_images:
+            raise ValueError("Qwen3 text encoding does not accept an image processor")
+        self.merge_size = int(getattr(image_processor, "merge_size", 1))
 
-    def __call__(self, message: dict[str, Any]) -> int | dict[str, Any]:
-        if self.image_processor is None and _message_has_images(message):
-            raise ValueError(
-                "Encountered image content in message but no image_processor was provided. "
-                "Pass image_processor= to make_message_length_fn."
-            )
-        encoded = encode_qwen_messages(
-            [message],
-            tokenizer=self.tokenizer,
-            image_processor=self.image_processor,
-            include_pixels=False,
+    def _process_images(self, images: list[Image.Image]) -> tuple[np.ndarray | None, np.ndarray]:
+        if not images:
+            return None, np.empty((0, 3), dtype=np.int32)
+        processed = self.image_processor(images=images, return_tensors="np")
+        return (
+            np.asarray(processed["pixel_values"]),
+            np.asarray(processed["image_grid_thw"], dtype=np.int32).reshape(-1, 3),
         )
-        length = int(len(encoded["input_ids"]))
 
-        grid_thw = encoded.get("image_grid_thw", np.empty((0, 3), dtype=np.int64))
-        num_images = int(grid_thw.shape[0])
-        vision_tokens = 0
-        vision_patches = 0
-        for row in grid_thw:
-            t, h, w = int(row[0]), int(row[1]), int(row[2])
-            vision_tokens += t * (h // self.merge_size) * (w // self.merge_size)
-            vision_patches += t * h * w
+    def _content(self, message: dict[str, Any], grids: np.ndarray) -> str:
+        content = message["content"]
+        if isinstance(content, str):
+            text = content
+        else:
+            parts: list[str] = []
+            image_index = 0
+            for part in content:
+                if part["type"] == "text":
+                    parts.append(part["text"])
+                else:
+                    grid = grids[image_index]
+                    image_index += 1
+                    image_tokens = int(np.prod(grid, dtype=np.int64)) // self.merge_size**2
+                    parts.append(
+                        "<|vision_start|>" + "<|image_pad|>" * image_tokens + "<|vision_end|>"
+                    )
+            text = "".join(parts)
+        return text
 
+    def _encode_block(self, message: dict[str, Any], text: str) -> tuple[np.ndarray, np.ndarray]:
+        ids = np.asarray(self.tokenizer.encode(text, add_special_tokens=False), dtype=np.int32)
+        mask = (
+            _assistant_loss_mask(ids)
+            if _message_is_supervised(message)
+            else np.zeros(len(ids), np.int32)
+        )
+        return ids, mask
+
+    def _validate(self, messages: list[dict[str, Any]]) -> None:
+        if not isinstance(messages, list) or not messages:
+            raise ValueError("messages must be a non-empty list")
+        multimodal = self.image_processor is not None
+        for message in messages:
+            _validate_message(message, multimodal=multimodal)
+
+    def _prepare_turns(
+        self, messages: list[dict[str, Any]]
+    ) -> tuple[np.ndarray | None, list[np.ndarray], list[str]]:
+        images_by_turn = [_extract_images([message]) for message in messages]
+        images = [image for turn_images in images_by_turn for image in turn_images]
+        pixel_values, grids = self._process_images(images)
+        grids_by_turn: list[np.ndarray] = []
+        contents: list[str] = []
+        grid_offset = 0
+        for message, turn_images in zip(messages, images_by_turn, strict=True):
+            turn_grids = grids[grid_offset : grid_offset + len(turn_images)]
+            grid_offset += len(turn_images)
+            grids_by_turn.append(turn_grids)
+            contents.append(self._content(message, turn_grids))
+        return pixel_values, grids_by_turn, contents
+
+    def _encode_prepared(
+        self,
+        messages: list[dict[str, Any]],
+        grids_by_turn: list[np.ndarray],
+        contents: list[str],
+    ) -> tuple[list[np.ndarray], list[np.ndarray]]:
+        blocks = self._renderer(messages, contents)
+        id_parts: list[np.ndarray] = []
+        mask_parts: list[np.ndarray] = []
+        for message, block in zip(messages, blocks, strict=True):
+            if block is None:
+                ids = np.empty(0, dtype=np.int32)
+                mask = np.empty(0, dtype=np.int32)
+            else:
+                ids, mask = self._encode_block(message, block)
+            id_parts.append(ids)
+            mask_parts.append(mask)
+        return id_parts, mask_parts
+
+    def _measure_prepared(
+        self,
+        messages: list[dict[str, Any]],
+        grids_by_turn: list[np.ndarray],
+        contents: list[str],
+    ) -> dict[str, Any]:
+        id_parts, mask_parts = self._encode_prepared(messages, grids_by_turn, contents)
+        message_measurements: list[dict[str, Any]] = []
+        for ids, mask, grids in zip(id_parts, mask_parts, grids_by_turn, strict=True):
+            vision_patches = sum(int(np.prod(grid, dtype=np.int64)) for grid in grids)
+            message_measurements.append(
+                {
+                    "length": len(ids),
+                    "supervised_tokens": int(mask.sum()),
+                    "vision_tokens": vision_patches // self.merge_size**2,
+                    "vision_patches": vision_patches,
+                    "num_images": len(grids),
+                    "image_grid_thw": grids.tolist(),
+                }
+            )
         return {
-            "length": length,
-            "vision_tokens": vision_tokens,
-            "vision_patches": vision_patches,
-            "num_images": num_images,
-            "image_grid_thw": grid_thw.tolist(),
+            "length": sum(item["length"] for item in message_measurements),
+            "supervised_tokens": sum(
+                item["supervised_tokens"] for item in message_measurements
+            ),
+            "vision_tokens": sum(item["vision_tokens"] for item in message_measurements),
+            "vision_patches": sum(item["vision_patches"] for item in message_measurements),
+            "num_images": sum(item["num_images"] for item in message_measurements),
+            "image_grid_thw": [
+                grid for item in message_measurements for grid in item["image_grid_thw"]
+            ],
+            "message_measurements": message_measurements,
         }
 
+    def encode(self, messages: list[dict[str, Any]]) -> dict[str, np.ndarray]:
+        self._validate(messages)
+        pixel_values, grids_by_turn, contents = self._prepare_turns(messages)
+        id_parts, mask_parts = self._encode_prepared(messages, grids_by_turn, contents)
 
-def make_message_length_fn(
+        result = {
+            "input_ids": np.concatenate(id_parts),
+            "loss_mask": np.concatenate(mask_parts),
+        }
+        if pixel_values is not None:
+            result["pixel_values"] = pixel_values
+            result["image_grid_thw"] = np.concatenate(grids_by_turn)
+        return result
+
+    def measure(self, messages: list[dict[str, Any]]) -> dict[str, Any]:
+        self._validate(messages)
+        _, grids_by_turn, contents = self._prepare_turns(messages)
+        return self._measure_prepared(messages, grids_by_turn, contents)
+
+    def prepare(self, messages: list[dict[str, Any]]) -> _PreparedConversation:
+        self._validate(messages)
+        _, grids_by_turn, contents = self._prepare_turns(messages)
+        return _PreparedConversation(self, messages, grids_by_turn, contents)
+
+
+class _PreparedConversation:
+    def __init__(
+        self,
+        encoder: Qwen3MessageEncoder,
+        messages: list[dict[str, Any]],
+        grids_by_turn: list[np.ndarray],
+        contents: list[str],
+    ) -> None:
+        self._encoder = encoder
+        self._messages = messages
+        self._grids_by_turn = grids_by_turn
+        self._contents = contents
+        self._cache: dict[tuple[int, int], dict[str, Any]] = {}
+        self.message_measurements = self(0, len(messages))["message_measurements"]
+
+    def __call__(self, start: int, end: int) -> dict[str, Any]:
+        if not 0 <= start < end <= len(self._messages):
+            raise ValueError(f"invalid conversation span [{start}, {end})")
+        key = (start, end)
+        if key not in self._cache:
+            self._cache[key] = self._encoder._measure_prepared(
+                self._messages[start:end],
+                self._grids_by_turn[start:end],
+                self._contents[start:end],
+            )
+        return self._cache[key]
+
+
+class _ConversationMeasureFn:
+    def __init__(
+        self,
+        tokenizer: PreTrainedTokenizer,
+        image_processor: BaseImageProcessor | None,
+        model_type: str,
+    ) -> None:
+        self.encoder = Qwen3MessageEncoder(tokenizer, image_processor, model_type)
+
+    def __call__(self, messages: list[dict[str, Any]]) -> _PreparedConversation:
+        return self.encoder.prepare(messages)
+
+
+def make_conversation_measure_fn(
     tokenizer: PreTrainedTokenizer,
-    image_processor: BaseImageProcessor | None = None,
-):
-    """Return a ``message -> token_count`` callable for use with the record builders.
-
-    Suitable for ChatML-formatted models (Qwen3 / Qwen3.5).  Token lengths are
-    exactly additive at message boundaries: ``<|im_start|>``/``<|im_end|>`` act
-    as hard BPE split points and ``add_special_tokens=False`` suppresses any
-    per-sequence overhead, so ``sum(lengths)`` equals the full-sequence length
-    exactly.  Returns a picklable :class:`_MessageLengthFn` instance so it can be
-    shipped to ``spawn`` workers. For a different chat template, implement an
-    analogous factory and swap it in.
-    """
-    return _MessageLengthFn(tokenizer, image_processor)
-
-
-def encode_qwen_messages(
-    messages: list[dict[str, Any]],
-    *,
-    tokenizer: PreTrainedTokenizer,
-    image_processor: BaseImageProcessor | None = None,
-    include_pixels: bool = False,
-) -> dict[str, np.ndarray]:
-    """Encode a Qwen chat example exactly as the collators expect.
-
-    Returns ``input_ids`` and a matching assistant ``loss_mask`` (both 1-D int32),
-    plus ``image_grid_thw`` / ``pixel_values`` when an image processor is given. The
-    loss mask is built from message structure per ChatML turn, so it is unaffected by
-    literal ``<|im_start|>`` / ``<|im_end|>`` markers embedded in user/context text.
-    """
-
-    image_grids: list[tuple[int, int, int]] = []
-    result: dict[str, np.ndarray] = {}
-    if image_processor is not None:
-        imgs = extract_images(messages)
-        if imgs:
-            processed = image_processor.preprocess(imgs, return_tensors="np")
-            result["image_grid_thw"] = processed["image_grid_thw"]
-            if include_pixels:
-                result["pixel_values"] = processed["pixel_values"]
-            image_grids = [tuple(row) for row in result["image_grid_thw"].tolist()]
-
-    merge_size = int(getattr(image_processor, "merge_size", 1))
-    blocks = build_chatml_blocks(messages, image_grids, merge_size)
-
-    # Encode each ChatML turn independently and build its loss mask from message
-    # structure. The additive property of the ChatML specials (see
-    # ``build_chatml_blocks``) guarantees the concatenated ids are identical to a
-    # single ``tokenizer.encode`` of the whole conversation, while masking per block
-    # is immune to literal ``<|im_start|>`` / ``<|im_end|>`` markers in user text.
-    id_parts: list[np.ndarray] = []
-    mask_parts: list[np.ndarray] = []
-    for role, block_text in blocks:
-        block_ids = np.asarray(
-            tokenizer.encode(block_text, add_special_tokens=False),
-            dtype=np.int32,
-        )
-        id_parts.append(block_ids)
-        mask_parts.append(_assistant_block_loss_mask(block_ids, role == _ASSISTANT_ROLE))
-
-    result["input_ids"] = np.concatenate(id_parts) if id_parts else np.zeros(0, dtype=np.int32)
-    result["loss_mask"] = np.concatenate(mask_parts) if mask_parts else np.zeros(0, dtype=np.int32)
-    return result
+    image_processor: BaseImageProcessor | None,
+    model_type: str,
+) -> _ConversationMeasureFn:
+    return _ConversationMeasureFn(tokenizer, image_processor, model_type)

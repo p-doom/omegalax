@@ -1,4 +1,4 @@
-"""GPU verification of fix-slowdown ports to qwen3 and qwen3_5.
+"""GPU verification of the qwen3 / qwen3_5 packed-attention paths.
 
 Covers four layered checks:
 
@@ -25,6 +25,7 @@ import jax.numpy as jnp
 import numpy as np
 from absl.testing import absltest
 from flax import nnx
+from jax.sharding import NamedSharding, PartitionSpec
 
 from omegalax.data.collator_qwen3 import _pad_vision_arrays, _compute_vision_cu_seqlens
 from omegalax.distributed.mesh import mesh_rules_for
@@ -64,16 +65,14 @@ def _block_diag_reference(
     return out_HNK
 
 
-# --------------------------------------------------------------------------- #
 # A. cuDNN packed attention correctness
-# --------------------------------------------------------------------------- #
 
 
 class CuDnnPackedVisionAttentionTest(absltest.TestCase):
     """Validates the cuDNN packed kernel + cu_seqlens path used by both VLMs.
 
-    Uses unequal segment sizes — the precise case the `Mask(k_start, k_end)`
-    path used to handle on the old branch.
+    Uses unequal segment sizes, which is the case a uniform-segment mask cannot
+    express.
     """
 
     def test_unequal_segments_match_reference(self):
@@ -86,15 +85,18 @@ class CuDnnPackedVisionAttentionTest(absltest.TestCase):
         k = rng.randn(N, H, K).astype(np.float32) * 0.1
         v = rng.randn(N, H, K).astype(np.float32) * 0.1
         cu = np.concatenate([[0], np.cumsum(seg_sizes)]).astype(np.int32)
+        grid = np.asarray([[1, 1, size] for size in seg_sizes], dtype=np.int32)
 
-        q_jax = jnp.asarray(q, dtype=jnp.bfloat16)
-        k_jax = jnp.asarray(k, dtype=jnp.bfloat16)
-        v_jax = jnp.asarray(v, dtype=jnp.bfloat16)
-        cu_jax = jnp.asarray(cu)
+        with mesh_rules_for(tp_size=1, fsdp_size=1, dp_size=1) as mesh:
+            replicated = NamedSharding(mesh, PartitionSpec())
+            q_jax = jax.device_put(jnp.asarray(q, dtype=jnp.bfloat16), replicated)
+            k_jax = jax.device_put(jnp.asarray(k, dtype=jnp.bfloat16), replicated)
+            v_jax = jax.device_put(jnp.asarray(v, dtype=jnp.bfloat16), replicated)
+            grid_jax = jax.device_put(jnp.asarray(grid), replicated)
 
-        scale = 1.0 / (K**0.5)
-        out_cudnn = _cudnn_packed_vision_attention(q_jax, k_jax, v_jax, cu_jax, scale)
-        out_ref = _block_diag_reference(q_jax, k_jax, v_jax, cu, scale)
+            scale = 1.0 / (K**0.5)
+            out_cudnn = _cudnn_packed_vision_attention(q_jax, k_jax, v_jax, grid_jax, scale)
+            out_ref = _block_diag_reference(q_jax, k_jax, v_jax, cu, scale)
 
         np.testing.assert_allclose(
             np.asarray(out_cudnn, dtype=np.float32),
@@ -104,9 +106,7 @@ class CuDnnPackedVisionAttentionTest(absltest.TestCase):
         )
 
 
-# --------------------------------------------------------------------------- #
 # B. qwen3 text-attn backend selector
-# --------------------------------------------------------------------------- #
 
 
 def _qwen3_test_cfg() -> Qwen3Config:
@@ -147,9 +147,7 @@ class Qwen3TextAttnBackendSwapTest(absltest.TestCase):
         np.testing.assert_allclose(out_cudnn, out_default, rtol=3e-2, atol=3e-2)
 
 
-# --------------------------------------------------------------------------- #
 # Shared qwen3_5 VLM test fixtures
-# --------------------------------------------------------------------------- #
 
 
 def _qwen3_5_vlm_test_cfg() -> Qwen3_5Config:
@@ -192,7 +190,7 @@ def _qwen3_5_vlm_test_cfg() -> Qwen3_5Config:
 
 
 def _make_vlm_inputs(cfg: Qwen3_5Config, real_grids, max_images=None, max_patches=None):
-    """Build (tokens, segment_ids, pixel_values, image_grid_thw, cu_seqlens, position_ids).
+    """Build tokens, segments, pixels, validity, grids, cu-seqlens and positions.
 
     `real_grids` is a list of [t, h, w]. Tokens have one image-token per merged
     pixel for each grid. Optionally pads pixel_values/grid_thw via the same
@@ -235,19 +233,19 @@ def _make_vlm_inputs(cfg: Qwen3_5Config, real_grids, max_images=None, max_patche
         np.arange(tokens.shape[1], dtype=np.int32)[None, None, :],
         (3, *tokens.shape),
     ).copy()
+    vision_patch_valid = np.arange(pv.shape[0]) < real_patches
     return (
         jnp.asarray(tokens),
         jnp.asarray(seg),
         jnp.asarray(pv, dtype=jnp.bfloat16),
+        jnp.asarray(vision_patch_valid),
         jnp.asarray(grid, dtype=jnp.int32),
         jnp.asarray(cu, dtype=jnp.int32),
         jnp.asarray(pos, dtype=jnp.int32),
     )
 
 
-# --------------------------------------------------------------------------- #
 # C. qwen3_5 padding-no-op
-# --------------------------------------------------------------------------- #
 
 
 class Qwen3_5PaddingNoOpTest(absltest.TestCase):
@@ -271,8 +269,8 @@ class Qwen3_5PaddingNoOpTest(absltest.TestCase):
         max_images = 4
         max_patches = real_patches + (max_images - len(real_grids)) * ms * ms
 
-        toks_a, seg_a, pv_a, grid_a, cu_a, pos_a = _make_vlm_inputs(cfg, real_grids)
-        toks_b, seg_b, pv_b, grid_b, cu_b, pos_b = _make_vlm_inputs(
+        toks_a, seg_a, pv_a, valid_a, grid_a, _, pos_a = _make_vlm_inputs(cfg, real_grids)
+        toks_b, seg_b, pv_b, valid_b, grid_b, _, pos_b = _make_vlm_inputs(
             cfg,
             real_grids,
             max_images=max_images,
@@ -285,9 +283,9 @@ class Qwen3_5PaddingNoOpTest(absltest.TestCase):
             seg_a,
             None,
             jnp.array(0, dtype=jnp.int32),
+            vision_patch_valid=valid_a,
             pixel_values=pv_a,
             image_grid_thw=grid_a,
-            vision_cu_seqlens=cu_a,
             position_ids_ZBT=pos_a,
         )
         h_b, _ = model(
@@ -295,29 +293,23 @@ class Qwen3_5PaddingNoOpTest(absltest.TestCase):
             seg_b,
             None,
             jnp.array(0, dtype=jnp.int32),
+            vision_patch_valid=valid_b,
             pixel_values=pv_b,
             image_grid_thw=grid_b,
-            vision_cu_seqlens=cu_b,
             position_ids_ZBT=pos_b,
         )
 
         out_a = np.asarray(h_a, dtype=np.float32)
         out_b = np.asarray(h_b, dtype=np.float32)
-        # Position (0, seq_len-1) is the fusion's fill sink — by contract it
-        # holds a pad token whose loss is masked. Padded fusion overwrites it
-        # with zero; unpadded leaves the embedding intact. Exclude that
-        # position from the comparison.
         np.testing.assert_allclose(
-            out_b[:, :-1],
-            out_a[:, :-1],
+            out_b,
+            out_a,
             rtol=3e-2,
             atol=3e-2,
         )
 
 
-# --------------------------------------------------------------------------- #
 # D. JIT-stability: padded budget should not recompile when real counts vary
-# --------------------------------------------------------------------------- #
 
 
 class Qwen3_5JitStabilityTest(absltest.TestCase):
@@ -350,7 +342,7 @@ class Qwen3_5JitStabilityTest(absltest.TestCase):
             rng = np.random.RandomState(len(real_grids))
             pv = rng.randn(real_patches, patch_dim).astype(np.float32)
             grid = np.array(real_grids, dtype=np.int32)
-            pv, grid, cu = _pad_vision_arrays(
+            pv, grid, _ = _pad_vision_arrays(
                 pv,
                 grid,
                 merge_size=ms,
@@ -360,15 +352,14 @@ class Qwen3_5JitStabilityTest(absltest.TestCase):
             return (
                 jnp.asarray(pv, dtype=jnp.bfloat16),
                 jnp.asarray(grid, dtype=jnp.int32),
-                jnp.asarray(cu, dtype=jnp.int32),
             )
 
         # Side-effect counter: increments only on Python re-tracing.
         trace_count = [0]
 
-        def vision_inner(model, pv, grid, cu):
+        def vision_inner(model, pv, grid):
             trace_count[0] += 1
-            return model.vision(pv, grid, cu)
+            return model.vision(pv, grid)
 
         vision_fwd = nnx.jit(vision_inner)
 
@@ -380,7 +371,6 @@ class Qwen3_5JitStabilityTest(absltest.TestCase):
         # All three must produce identical PADDED shapes.
         self.assertEqual(a[0].shape, b[0].shape)
         self.assertEqual(a[1].shape, b[1].shape)
-        self.assertEqual(a[2].shape, b[2].shape)
         self.assertEqual(a[0].shape, c[0].shape)
 
         _ = vision_fwd(model, *a)

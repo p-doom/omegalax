@@ -13,6 +13,7 @@ from absl.testing import absltest
 from transformers import AutoConfig, Qwen3VLMoeForConditionalGeneration
 
 from omegalax.models.qwen3_vl import create_qwen3_vl_from_safetensors
+from omegalax.models.sharding_runtime import set_attn_backend
 
 from tests.logits_assert import assert_logits_close
 
@@ -36,6 +37,7 @@ class Qwen3VLMoeSmokeTest(absltest.TestCase):
     def setUpClass(cls):
         super().setUpClass()
         cls.tmpdir = tempfile.mkdtemp()
+        torch.manual_seed(0)
 
         vision_cfg = {
             "hidden_size": 64,
@@ -100,7 +102,7 @@ class Qwen3VLMoeSmokeTest(absltest.TestCase):
         text_cfg["rope_theta"] = rope_parameters["rope_theta"]
         text_cfg["rope_scaling"] = {
             "rope_type": rope_parameters.get("rope_type", "default"),
-            "mrope_interleaved": rope_parameters.get("mrope_interleaved", True),
+            "mrope_interleaved": True,
             "mrope_section": rope_parameters["mrope_section"],
         }
 
@@ -113,6 +115,9 @@ class Qwen3VLMoeSmokeTest(absltest.TestCase):
             fsdp_size=1,
             dp_size=1,
         )
+        # This module runs on CPU, where the default mosaic_gpu backend raises
+        # before any assertion below executes.
+        set_attn_backend(cls.jax_model, text_backend="xla")
 
         torch_dtype = _JNP_TO_TORCH[cls.jax_cfg.dtype]
         cls.hf_model = hf_model.to(torch_dtype)
@@ -139,6 +144,7 @@ class Qwen3VLMoeSmokeTest(absltest.TestCase):
         hidden_BTD, _ = self.jax_model(
             jnp.asarray(token_ids_BT, dtype=jnp.int32),
             jnp.asarray(attention_mask_BT, dtype=jnp.int32),
+            vision_patch_valid=jnp.empty((0,), dtype=jnp.bool_),
         )
         jax_logits_BTV = np.asarray(self.jax_model.lm_head(hidden_BTD), dtype=np.float32)
 

@@ -16,13 +16,14 @@ dependencies = [
   "jax[cuda12]",
   "jax-triton",
   "nvidia-cudnn-cu12==9.18.1.3",
+  "nvidia-nccl-cu12==2.28.3",
   "jaxtyping",
   "optax",
   "orbax-checkpoint",
   "Pillow",
-  "safetensors",
-  "tokamax @ git+https://github.com/p-doom/tokamax.git@nested-mask", # change after fix has been upstreamed
-  "transformers",
+  "safetensors>=0.8.0",
+  "tokamax @ git+https://github.com/p-doom/tokamax.git@d81bc23bc80f01728984bcda5161ff2569cd7cc5",
+  "transformers==5.15.1",
   "triton", 
   "huggingface-hub",
   "wandb",
@@ -32,10 +33,11 @@ dependencies = [
 [project.optional-dependencies]
 torch-tests = [
   "torch==2.10.* ; platform_system == \"Linux\"",
+  "torchvision ; platform_system == \"Linux\"",
 ]
 
 [tool.uv]
-override-dependencies = ["nvidia-cudnn-cu12==9.18.1.3"]
+override-dependencies = ["nvidia-cudnn-cu12==9.18.1.3", "nvidia-nccl-cu12==2.28.3"]
 
 [tool.hatch.metadata]
 allow-direct-references = true
@@ -45,6 +47,7 @@ packages = ["omegalax"]
 
 [dependency-groups]
 dev = [
+    "jinja2>=3.1.6",
     "setuptools<81",
     "tensorboard>=2.20.0",
     "xprof>=2.22.0",

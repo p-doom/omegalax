@@ -3,30 +3,32 @@
 from __future__ import annotations
 
 import gc
+import importlib
 import json
 from pathlib import Path
 
-from absl import app, flags
+import grain
 import jax
 import wandb
-from transformers import AutoImageProcessor, AutoTokenizer
+from absl import app, flags
+from transformers import AutoConfig, AutoImageProcessor, AutoTokenizer
 
-import omegalax.compat.cudnn_ampere_packed  # noqa: F401
-
+from omegalax.compat.cudnn_ampere_packed import enable_ampere_packed_attention
 from omegalax.data.collator_qwen3 import VLMSFTCollator
 from omegalax.data.grain_pipeline import (
     MixSource,
     make_grain_iterator,
     make_grain_multiprocessing_options,
     make_grain_read_options,
+    parse_data_mix,
     required_epochs_for_batches,
 )
 from omegalax.distributed.mesh import process_local_batch_size
+from omegalax.registry import resolve_hf_model_source
 from omegalax.trainers import vlm as vlm_trainer
 from omegalax.trainers.checkpoint_utils import ResumeMode
-from omegalax.registry import resolve_hf_repo_id
-from omegalax.trainers.text import startup_log
 from omegalax.trainers.perf import resolve_peak_tflops
+from omegalax.trainers.text import startup_log
 
 FLAGS = flags.FLAGS
 
@@ -40,9 +42,6 @@ flags.DEFINE_string(
     "Use this OR --data_path, not both. Mixed sources may freely combine "
     "multimodal and text-only datasets — heterogeneous batches are handled "
     "by the VLM collator and forward path.",
-)
-flags.DEFINE_string(
-    "processor", None, "HF repo to read tokenizer and image config from (defaults to --model_id)."
 )
 flags.DEFINE_string(
     "preprocessor_config",
@@ -106,12 +105,10 @@ flags.DEFINE_bool("log_memory", None, "Log per-process JAX/HBM memory at init an
 flags.DEFINE_enum(
     "resume",
     None,
-    [m.value for m in ResumeMode],
-    "Checkpoint resume policy: 'never' (fresh start), 'if_present' "
-    "(resume if a checkpoint exists at --save_dir, else start fresh — right "
-    "mode for SLURM time-limit resubmits), 'required' (resume; error if no "
-    "checkpoint).",
+    [ResumeMode.NEVER.value, ResumeMode.REQUIRED.value],
+    "Checkpoint policy: 'never' starts fresh; 'required' restores --resume_step.",
 )
+flags.DEFINE_integer("resume_step", None, "Exact checkpoint generation required for resume.")
 flags.DEFINE_integer("pad_id", None, "Padding token id.")
 flags.DEFINE_string("peak_tflops", None, "Peak TFLOPS for MFU calculation.")
 flags.DEFINE_string("wandb_entity", None, "Weights & Biases entity (team/user).")
@@ -158,6 +155,21 @@ flags.DEFINE_boolean(
     "layernorms while freezing the vision tower at the "
     "gradient/opt-state layer. Mutually exclusive with "
     "--enable_lora (which already freezes vision).",
+)
+flags.DEFINE_boolean(
+    "train_vision_merger",
+    None,
+    "Train vision.merger while the rest of the vision tower remains frozen. "
+    "Requires --freeze_vision_tower.",
+)
+flags.DEFINE_string(
+    "extra_transform",
+    None,
+    'A single {"class": "module:ClassName", "kwargs": {...}} object applied '
+    "as a grain RandomMap augmentation to the train iterator only. The class "
+    "must subclass grain.transforms.RandomMap and be importable in worker "
+    "processes — set PYTHONPATH in the launch environment if the module lives "
+    "outside the installed venv.",
 )
 flags.DEFINE_integer(
     "num_loss_tiles",
@@ -213,6 +225,7 @@ _REQUIRED = [
     "text_attn_backend",
     "enable_lora",
     "freeze_vision_tower",
+    "train_vision_merger",
 ]
 
 
@@ -229,33 +242,35 @@ def _validate_flags() -> None:
         if FLAGS[name].value is None:
             problems.append(name)
 
-    # Exactly one data source.
     if (FLAGS.data_path is None) == (FLAGS.data_mix is None):
         problems.append("exactly one of {data_path, data_mix} (got neither or both)")
 
-    # enable_lora / freeze_vision_tower are mutually exclusive (both freeze the vision tower).
+    if FLAGS.resume == ResumeMode.REQUIRED.value and FLAGS.resume_step is None:
+        problems.append("resume_step (required when resume=required)")
+    if FLAGS.resume == ResumeMode.NEVER.value and FLAGS.resume_step is not None:
+        problems.append("resume_step (only valid when resume=required)")
+
+    # Both freeze the vision tower, so asking for both is a contradiction, not a no-op.
     if FLAGS.enable_lora and FLAGS.freeze_vision_tower:
         problems.append("enable_lora and freeze_vision_tower are mutually exclusive")
+    if FLAGS.train_vision_merger and not FLAGS.freeze_vision_tower:
+        problems.append("train_vision_merger requires freeze_vision_tower")
 
-    # LoRA hyperparameters required only when LoRA is on.
     if FLAGS.enable_lora:
         for name in ("lora_rank", "lora_alpha"):
             if FLAGS[name].value is None:
                 problems.append(f"{name} (required when enable_lora=true)")
 
-    # Validation cadence required only when a validation set is configured.
     if FLAGS.val_data_path:
         for name in ("val_every", "val_steps"):
             if FLAGS[name].value is None:
                 problems.append(f"{name} (required when val_data_path is set)")
 
-    # LR-schedule shape parameters required only for the schedules that use them.
     if FLAGS.lr_schedule in ("cosine", "wsd") and FLAGS.lr_end_factor is None:
         problems.append(f"lr_end_factor (required when lr_schedule={FLAGS.lr_schedule})")
     if FLAGS.lr_schedule == "wsd" and FLAGS.lr_stable_fraction is None:
         problems.append("lr_stable_fraction (required when lr_schedule=wsd)")
 
-    # Weights & Biases is opt-in via wandb_project; if on, identifying fields are required.
     if FLAGS.wandb_project:
         for name in ("wandb_entity", "wandb_group", "wandb_name"):
             if FLAGS[name].value is None:
@@ -268,25 +283,30 @@ def _validate_flags() -> None:
         )
 
 
-def _parse_data_mix(spec: str) -> list[MixSource]:
-    """Parse the --data_mix JSON spec into a list of MixSource."""
-    raw = json.loads(spec)
-    if not isinstance(raw, list) or not raw:
-        raise ValueError("--data_mix must be a non-empty JSON list of {path, weight} objects")
-    out: list[MixSource] = []
-    for entry in raw:
-        if not isinstance(entry, dict) or "path" not in entry:
-            raise ValueError(f"--data_mix entry must be an object with a 'path' field: {entry!r}")
-        out.append(MixSource(path=str(entry["path"]), weight=float(entry.get("weight", 1.0))))
-    return out
-
-
 def _resolve_train_sources() -> list[MixSource]:
-    if (FLAGS.data_path is None) == (FLAGS.data_mix is None):
-        raise ValueError("Specify exactly one of --data_path or --data_mix.")
     if FLAGS.data_mix is not None:
-        return _parse_data_mix(FLAGS.data_mix)
+        return parse_data_mix(FLAGS.data_mix)
     return [MixSource(path=FLAGS.data_path, weight=1.0)]
+
+
+def _parse_extra_transform(
+    spec: str | None,
+) -> grain.transforms.RandomMap | None:
+    """Instantiate the train-only augmentation transform from --extra_transform.
+
+    ``spec`` is a single JSON ``{"class": "module:ClassName", "kwargs": {...}}``
+    object whose class must be a ``grain.transforms.RandomMap`` subclass (our
+    augmentations are stochastic). A malformed spec fails loudly here.
+    """
+    if spec is None:
+        return None
+    entry = json.loads(spec)
+    module_path, _, class_name = entry["class"].partition(":")
+    cls = getattr(importlib.import_module(module_path), class_name)
+    assert issubclass(cls, grain.transforms.RandomMap), (
+        f"--extra_transform {entry['class']!r} is not a grain.transforms.RandomMap subclass"
+    )
+    return cls(**entry["kwargs"])
 
 
 def _grain_iter(
@@ -299,6 +319,7 @@ def _grain_iter(
     num_batches: int,
     dp_size: int,
     fsdp_size: int,
+    extra_transform: grain.transforms.RandomMap | None,
 ):
     if len(sources) == 1:
         num_epochs: int | None = required_epochs_for_batches(
@@ -327,19 +348,22 @@ def _grain_iter(
         ),
         dp_size=dp_size,
         fsdp_size=fsdp_size,
+        extra_transform=extra_transform,
     )
 
 
 def main(_) -> None:
     _validate_flags()
+    model_source = resolve_hf_model_source(FLAGS.model_id)
     jax.config.update("jax_compilation_cache_dir", FLAGS.jax_cache_dir)
     jax.distributed.initialize()
+    enable_ampere_packed_attention()
     startup_log(f"jax_compilation_cache_dir={FLAGS.jax_cache_dir}")
     startup_log("jax.distributed initialized")
 
-    repo_id = FLAGS.processor or resolve_hf_repo_id(FLAGS.model_id)
-    tokenizer = AutoTokenizer.from_pretrained(repo_id)
-    startup_log(f"loaded tokenizer from {repo_id!r}")
+    tokenizer = AutoTokenizer.from_pretrained(model_source, local_files_only=True)
+    model_type = AutoConfig.from_pretrained(model_source, local_files_only=True).model_type
+    startup_log(f"loaded tokenizer from {str(model_source)!r}")
     assert FLAGS.max_length <= tokenizer.model_max_length, (
         f"--max_length={FLAGS.max_length} exceeds tokenizer.model_max_length={tokenizer.model_max_length}"
     )
@@ -348,8 +372,13 @@ def main(_) -> None:
     if FLAGS.preprocessor_config:
         with open(FLAGS.preprocessor_config) as f:
             ip_kwargs = json.load(f)
-    image_processor = AutoImageProcessor.from_pretrained(repo_id, use_fast=False, **ip_kwargs)
-    startup_log(f"loaded image processor from {repo_id!r}")
+    image_processor = AutoImageProcessor.from_pretrained(
+        model_source,
+        use_fast=False,
+        local_files_only=True,
+        **ip_kwargs,
+    )
+    startup_log(f"loaded image processor from {str(model_source)!r}")
 
     if FLAGS.max_vision_patches_per_sample:
         merge_size = int(image_processor.merge_size)
@@ -368,6 +397,7 @@ def main(_) -> None:
         tokenizer,
         max_length=FLAGS.max_length,
         image_processor=image_processor,
+        model_type=model_type,
         max_vision_patches_per_sample=FLAGS.max_vision_patches_per_sample or None,
         max_vision_images_per_sample=FLAGS.max_vision_images_per_sample or None,
     )
@@ -391,6 +421,9 @@ def main(_) -> None:
         )
 
     total_micro_batches = FLAGS.num_steps * FLAGS.grad_accum_steps
+    extra_transform = _parse_extra_transform(FLAGS.extra_transform)
+    if extra_transform is not None:
+        startup_log(f"loaded extra train transform: {type(extra_transform).__name__}")
     data_iter = _grain_iter(
         train_sources,
         collator,
@@ -400,11 +433,14 @@ def main(_) -> None:
         num_batches=total_micro_batches,
         dp_size=FLAGS.dp_size,
         fsdp_size=FLAGS.fsdp_size,
+        extra_transform=extra_transform,
     )
     startup_log("built train grain DataLoader iterator")
 
     val_data_iter = None
     if FLAGS.val_data_path:
+        # extra_transform=None — augmentation must NEVER run on validation data
+        # (it would corrupt val metrics by scoring against re-scaled labels).
         val_data_iter = _grain_iter(
             [MixSource(path=FLAGS.val_data_path, weight=1.0)],
             collator,
@@ -416,6 +452,7 @@ def main(_) -> None:
             ),
             dp_size=FLAGS.dp_size,
             fsdp_size=FLAGS.fsdp_size,
+            extra_transform=None,
         )
         startup_log(f"built val grain DataLoader iterator from {FLAGS.val_data_path!r}")
 
@@ -424,6 +461,7 @@ def main(_) -> None:
         batch_size=FLAGS.batch_size,
         seq_len=FLAGS.max_length,
         num_steps=FLAGS.num_steps,
+        schedule_horizon=FLAGS.num_steps,
         learning_rate=FLAGS.learning_rate,
         weight_decay=FLAGS.weight_decay,
         warmup_steps=FLAGS.warmup_steps,
@@ -437,6 +475,7 @@ def main(_) -> None:
         lora_rank=FLAGS.lora_rank,
         lora_alpha=FLAGS.lora_alpha,
         freeze_vision_tower=FLAGS.freeze_vision_tower,
+        train_vision_merger=FLAGS.train_vision_merger,
         num_loss_tiles=FLAGS.num_loss_tiles,
     )
     resume_mode = ResumeMode(FLAGS.resume)
@@ -461,7 +500,7 @@ def main(_) -> None:
 
     try:
         _, last_metrics = vlm_trainer.run_sft(
-            FLAGS.model_id,
+            str(model_source),
             train_cfg,
             data_iter,
             save_dir=save_dir,
@@ -470,6 +509,7 @@ def main(_) -> None:
             keep_latest=FLAGS.keep_latest,
             log_every=FLAGS.log_every,
             resume=resume_mode,
+            resume_step=FLAGS.resume_step,
             pad_id=FLAGS.pad_id,
             peak_tflops=peak_tflops,
             tp_size=FLAGS.tp_size,

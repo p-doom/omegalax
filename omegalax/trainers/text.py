@@ -8,27 +8,29 @@ import gc
 import os
 from pathlib import Path
 
-from flax import nnx
 import jax
 import jax.numpy as jnp
-from jax.sharding import NamedSharding, PartitionSpec
 import optax
 import orbax.checkpoint as ocp
+from flax import nnx
+from jax.sharding import NamedSharding, PartitionSpec
 
+from omegalax import export as export_lib
 from omegalax.data.grain_pipeline import pop_source_ids
 from omegalax.distributed.mesh import ensure_mesh, mesh_rules, required_batch_multiple
-from omegalax import export as export_lib
 from omegalax.models.params_utils import save_hf_config
+from omegalax.models.qwen3_5 import Qwen3_5TextConfig
+from omegalax.models.qwen3_5.kernels import resolve_backend as resolve_deltanet_backend
 from omegalax.text import api as text_api
 from omegalax.trainers import checkpoint_utils
 from omegalax.trainers.loss import chunked_cross_entropy_loss
 from omegalax.trainers.lr_schedule import build_lr_schedule
 from omegalax.trainers.optim import MixedPrecisionOptimizer
 from omegalax.trainers.perf import (
-    maybe_log_step_metrics,
-    per_device_step_flops,
     StepFlops,
     StepTimer,
+    maybe_log_step_metrics,
+    per_device_step_flops,
 )
 
 P = PartitionSpec
@@ -175,6 +177,7 @@ def make_sft_train_step(cfg, pad_id: int = 0):
     @nnx.jit(donate_argnums=0)
     def sft_train_step(optimizer: MixedPrecisionOptimizer, batch: dict[str, jax.Array]):
         token_ids_BT = batch["token_ids_BT"]
+        attention_mask_BT = batch["attention_mask_BT"]
         loss_mask_BT = batch["loss_mask_BT"]
 
         def loss_fn(model):
@@ -192,16 +195,18 @@ def make_sft_train_step(cfg, pad_id: int = 0):
                 + aux_loss
             )
             supervised_tokens = jnp.sum(loss_mask_BT[:, 1:].astype(jnp.float32))
-            return loss, supervised_tokens
+            total_tokens = jnp.sum(attention_mask_BT.astype(jnp.float32))
+            return loss, (supervised_tokens, total_tokens)
 
-        (loss, supervised_tokens), grads = nnx.value_and_grad(loss_fn, has_aux=True)(
-            optimizer.model
-        )
+        (loss, (supervised_tokens, total_tokens)), grads = nnx.value_and_grad(
+            loss_fn, has_aux=True
+        )(optimizer.model)
         optimizer.update(grads)
         metrics = {
             "loss": loss,
             "grad_norm": optax.tree.norm(grads),
             "supervised_tokens": supervised_tokens,
+            "total_tokens": total_tokens,
         }
         return loss, metrics
 
@@ -301,7 +306,6 @@ def run_sft(
         startup_log("resolved model config")
     startup_log(f"model_cfg={model_cfg}")
     mesh = ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size)
-    model_cfg = text_api.align_config_to_mesh(model_cfg, mesh)
     startup_log("mesh ready (tp/fsdp/dp)")
     batch_multiple = required_batch_multiple(text_api.batch_partition_spec(model_cfg), mesh)
     if train_cfg.batch_size % batch_multiple != 0:
@@ -327,10 +331,14 @@ def run_sft(
 
     set_attn_backend(model, text_backend=text_attn_backend)
     startup_log(f"set attn backend: text={text_attn_backend}")
+    if isinstance(model_cfg, Qwen3_5TextConfig):
+        deltanet_kernel = resolve_deltanet_backend()
+        if wandb_run is not None and is_primary_process:
+            wandb_run.config.update({"deltanet_kernel": deltanet_kernel}, allow_val_change=True)
+        startup_log(f"deltanet kernel: {deltanet_kernel}")
     with mesh_rules(mesh):
         optimizer = build_optimizer(model, train_cfg)
 
-    # Init cpu learning rate scheduler function for logging
     lr_schedule_fn = build_lr_schedule(
         peak_lr=train_cfg.learning_rate,
         num_steps=train_cfg.num_steps,
@@ -396,6 +404,7 @@ def run_sft(
 
         accum_loss = 0.0
         accum_sup_tokens = 0.0
+        accum_total_tokens = 0.0
         accum_grad_norm = 0.0
         accum_model_flops = 0.0
         accum_hardware_flops = 0.0
@@ -423,6 +432,7 @@ def run_sft(
 
             accum_loss = accum_loss + metrics["loss"]
             accum_sup_tokens = accum_sup_tokens + metrics["supervised_tokens"]
+            accum_total_tokens = accum_total_tokens + metrics["total_tokens"]
             accum_grad_norm = accum_grad_norm + metrics["grad_norm"]
             accum_model_flops += micro_flops.model
             accum_hardware_flops += micro_flops.hardware
@@ -438,6 +448,7 @@ def run_sft(
             "loss": accum_loss / accum_steps,
             "grad_norm": accum_grad_norm / accum_steps,
             "supervised_tokens": accum_sup_tokens,
+            "total_tokens": accum_total_tokens,
             "lr": current_lr,
         }
         # Surface realized mix ratios when training on >1 source.

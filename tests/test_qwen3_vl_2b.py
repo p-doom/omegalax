@@ -137,7 +137,11 @@ class Qwen3VLMappingTest(absltest.TestCase):
 
         token_ids_BT = jnp.asarray(np.array(inputs["input_ids"].cpu(), dtype=np.int32))
         attention_mask_BT = jnp.asarray(np.array(inputs["attention_mask"].cpu(), dtype=np.int32))
-        hidden_BTD, _ = self.jax_model(token_ids_BT, attention_mask_BT)
+        hidden_BTD, _ = self.jax_model(
+            token_ids_BT,
+            attention_mask_BT,
+            vision_patch_valid=jnp.empty((0,), dtype=jnp.bool_),
+        )
         jax_logits_BTV = np.asarray(self.jax_model.lm_head(hidden_BTD), dtype=np.float32)
 
         mask = inputs["attention_mask"].cpu().numpy().astype(bool)
@@ -155,7 +159,7 @@ class Qwen3VLMappingTest(absltest.TestCase):
             for p in prompts
         ]
         inputs = self.processor.tokenizer(
-            texts, return_tensors="pt", padding=True, padding_side="left"
+            texts, return_tensors="pt", padding=True, padding_side="right"
         )
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
@@ -172,7 +176,11 @@ class Qwen3VLMappingTest(absltest.TestCase):
 
         token_ids_BT = jnp.asarray(np.array(inputs["input_ids"].cpu(), dtype=np.int32))
         attention_mask_BT = jnp.asarray(np.array(inputs["attention_mask"].cpu(), dtype=np.int32))
-        hidden_BTD, _ = self.jax_model(token_ids_BT, attention_mask_BT)
+        hidden_BTD, _ = self.jax_model(
+            token_ids_BT,
+            attention_mask_BT,
+            vision_patch_valid=jnp.empty((0,), dtype=jnp.bool_),
+        )
         jax_logits_BTV = np.asarray(self.jax_model.lm_head(hidden_BTD), dtype=np.float32)
 
         mask = inputs["attention_mask"].cpu().numpy().astype(bool)
@@ -230,6 +238,7 @@ class Qwen3VLMappingTest(absltest.TestCase):
         hidden_BTD, _ = self.jax_model(
             token_ids_BT,
             attention_mask_BT,
+            vision_patch_valid=jnp.ones((pixel_values_jax.shape[0],), dtype=jnp.bool_),
             pixel_values=pixel_values_jax,
             image_grid_thw=image_grid_thw_jax,
             vision_cu_seqlens=vision_cu_seqlens_jax,

@@ -1,8 +1,7 @@
 """Pure-JAX reference for chunk_gated_delta_rule.
 
-Mirror of the original implementation that was inlined in ``deltanet.py``,
-moved here so the Pallas kernel can use it as a correctness oracle without a
-circular import. The math is unchanged.
+Kept out of ``deltanet.py`` so the Pallas kernel can use it as a correctness
+oracle without a circular import.
 """
 
 from __future__ import annotations

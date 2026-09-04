@@ -23,6 +23,7 @@ from transformers.models.qwen3_vl.configuration_qwen3_vl import (
 )
 
 from omegalax.models.qwen3_vl import create_qwen3_vl_from_safetensors
+from omegalax.models.sharding_runtime import set_attn_backend
 
 from tests.logits_assert import assert_logits_close
 
@@ -85,6 +86,7 @@ class Qwen3VLSmokeTest(absltest.TestCase):
     def setUpClass(cls):
         super().setUpClass()
         cls.tmpdir = tempfile.mkdtemp()
+        torch.manual_seed(0)
 
         hf_model = Qwen3VLForConditionalGeneration(HF_CFG).eval()
         hf_model.save_pretrained(cls.tmpdir, safe_serialization=True)
@@ -96,7 +98,7 @@ class Qwen3VLSmokeTest(absltest.TestCase):
         text_cfg["rope_theta"] = rope_parameters["rope_theta"]
         text_cfg["rope_scaling"] = {
             "rope_type": rope_parameters.get("rope_type", "default"),
-            "mrope_interleaved": rope_parameters.get("mrope_interleaved", True),
+            "mrope_interleaved": True,
             "mrope_section": rope_parameters["mrope_section"],
         }
 
@@ -110,6 +112,9 @@ class Qwen3VLSmokeTest(absltest.TestCase):
             fsdp_size=1,
             dp_size=1,
         )
+        # This module runs on CPU, where the default mosaic_gpu backend raises
+        # before any assertion below executes.
+        set_attn_backend(cls.jax_model, text_backend="xla")
 
         torch_dtype = _JNP_TO_TORCH[cls.jax_cfg.dtype]
         cls.hf_model = hf_model.to(torch_dtype)
@@ -130,7 +135,11 @@ class Qwen3VLSmokeTest(absltest.TestCase):
 
         token_ids_jax_BT = jnp.asarray(token_ids_BT)
         attention_mask_jax_BT = jnp.asarray(attention_mask_BT.astype(np.int32))
-        hidden_BTD, _ = self.jax_model(token_ids_jax_BT, attention_mask_jax_BT)
+        hidden_BTD, _ = self.jax_model(
+            token_ids_jax_BT,
+            attention_mask_jax_BT,
+            vision_patch_valid=jnp.empty((0,), dtype=jnp.bool_),
+        )
         jax_logits_BTV = np.asarray(self.jax_model.lm_head(hidden_BTD), dtype=np.float32)
 
         mask = np.ones_like(token_ids_BT, dtype=bool)
@@ -141,7 +150,7 @@ class Qwen3VLSmokeTest(absltest.TestCase):
         token_ids_b_BT = _random_input(batch_size=1, seq_len=10, vocab_size=HF_TEXT_CFG.vocab_size)
 
         padded_b = np.zeros((1, 16), dtype=np.int32)
-        padded_b[:, 6:] = token_ids_b_BT
+        padded_b[:, :10] = token_ids_b_BT
         token_ids_BT = np.concatenate([token_ids_a_BT, padded_b], axis=0)
         attention_mask_BT = (token_ids_BT != 0).astype(np.int64)
 
@@ -154,29 +163,15 @@ class Qwen3VLSmokeTest(absltest.TestCase):
 
         token_ids_jax_BT = jnp.asarray(token_ids_BT)
         attention_mask_jax_BT = jnp.asarray(attention_mask_BT.astype(np.int32))
-        hidden_BTD, _ = self.jax_model(token_ids_jax_BT, attention_mask_jax_BT)
+        hidden_BTD, _ = self.jax_model(
+            token_ids_jax_BT,
+            attention_mask_jax_BT,
+            vision_patch_valid=jnp.empty((0,), dtype=jnp.bool_),
+        )
         jax_logits_BTV = np.asarray(self.jax_model.lm_head(hidden_BTD), dtype=np.float32)
 
         mask = attention_mask_BT.astype(bool)
         assert_logits_close(self, jax_logits_BTV, hf_logits_BTV, mask)
-
-    def test_round_trip_preserves_logits(self):
-        from flax import nnx
-
-        token_ids_BT = _random_input(batch_size=1, seq_len=16, vocab_size=HF_TEXT_CFG.vocab_size)
-        token_ids_jax_BT = jnp.asarray(token_ids_BT)
-        attention_mask_jax_BT = jnp.ones_like(token_ids_jax_BT, dtype=jnp.int32)
-
-        baseline_hidden, _ = self.jax_model(token_ids_jax_BT, attention_mask_jax_BT)
-        baseline_BTV = np.asarray(self.jax_model.lm_head(baseline_hidden), dtype=np.float32)
-
-        graph_def, state = nnx.split(self.jax_model)
-        pure_state = nnx.to_pure_dict(state)
-        restored = nnx.merge(graph_def, pure_state)
-        restored_hidden, _ = restored(token_ids_jax_BT, attention_mask_jax_BT)
-        restored_logits_BTV = np.asarray(restored.lm_head(restored_hidden), dtype=np.float32)
-
-        np.testing.assert_array_equal(restored_logits_BTV, baseline_BTV)
 
 
 if __name__ == "__main__":

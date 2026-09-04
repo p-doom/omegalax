@@ -1,20 +1,20 @@
 """Smoke tests for SFT training loops and shard_batch_dict."""
 
-import contextlib
 import json
 import os
-from pathlib import Path
 import tempfile
+from pathlib import Path
+from unittest import mock
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
+import jax
+import jax.numpy as jnp
+import numpy as np
 from absl.testing import absltest
 
-import numpy as np
-
 from omegalax.data.grain_pipeline import (
-    build_chunk_index,
-    compile_jsonl_to_arrayrecord,
+    build_records_from_chat,
     make_grain_iterator,
     make_grain_multiprocessing_options,
     make_grain_read_options,
@@ -22,8 +22,8 @@ from omegalax.data.grain_pipeline import (
 from omegalax.distributed.mesh import ensure_mesh
 from omegalax.models.qwen3_vl.config import make_vl_config
 from omegalax.models.qwen3_vl.model import get_rope_index
-from omegalax.models.sharding_runtime import shard_batch_dict
 from omegalax.models.shard_config import ShardConfig
+from omegalax.models.sharding_runtime import shard_batch_dict
 from omegalax.trainers import text as text_trainer
 from omegalax.trainers import vlm as vlm_trainer
 
@@ -87,6 +87,7 @@ def _make_multimodal_qwen3_vl_smoke_batch(seq_len: int = 8) -> dict[str, np.ndar
         "attention_mask_BT": attention_mask,
         "loss_mask_BT": loss_mask,
         "pixel_values": pixel_values,
+        "vision_patch_valid": np.ones((pixel_values.shape[0],), dtype=np.bool_),
         "image_grid_thw": image_grid_thw,
         "vision_cu_seqlens": vision_cu_seqlens,
         "position_ids_ZBT": position_ids.astype(np.int32),
@@ -115,24 +116,56 @@ def _restore_arrays(value):
     return value
 
 
+class _PreparedMeasurements:
+    def __init__(self, messages):
+        self.message_measurements = [
+            {
+                "length": 1,
+                "supervised_tokens": int(message["role"] == "assistant"),
+                "vision_tokens": 0,
+                "vision_patches": 0,
+                "num_images": 0,
+                "image_grid_thw": [],
+            }
+            for message in messages
+        ]
+
+    def __call__(self, start, end):
+        items = self.message_measurements[start:end]
+        return {
+            "length": len(items),
+            "supervised_tokens": sum(item["supervised_tokens"] for item in items),
+            "vision_tokens": 0,
+            "vision_patches": 0,
+            "num_images": 0,
+            "image_grid_thw": [],
+        }
+
+
+def _prepare_conversation(messages):
+    return _PreparedMeasurements(messages)
+
+
 def _make_grain_batch_iter(batch: dict[str, np.ndarray]):
     with tempfile.TemporaryDirectory() as tmpdir:
         src = Path(tmpdir) / "train.jsonl"
         src.write_text(
             json.dumps(
                 {
-                    "messages": [{"role": "user", "content": "stub"}],
+                    "messages": [
+                        {"role": "user", "content": "stub"},
+                        {"role": "assistant", "content": "ok"},
+                    ],
                     "batch": _to_jsonable(batch),
                 }
             )
             + "\n"
         )
-        payload = compile_jsonl_to_arrayrecord(src, Path(tmpdir) / "payload", records_per_shard=1)
-        compiled = build_chunk_index(
-            payload,
-            Path(tmpdir) / "chunked",
-            max_length=1,
-            measure_message=lambda message: 1,
+        compiled = build_records_from_chat(
+            src,
+            Path(tmpdir) / "records",
+            max_length=2,
+            prepare_conversation=_prepare_conversation,
             records_per_shard=1,
         )
         iterator = make_grain_iterator(
@@ -145,50 +178,10 @@ def _make_grain_batch_iter(batch: dict[str, np.ndarray]):
             multiprocessing_options=make_grain_multiprocessing_options(
                 num_workers=0, per_worker_buffer_size=1
             ),
+            dp_size=1,
+            fsdp_size=1,
         )
         yield from iterator
-
-
-@contextlib.contextmanager
-def _grain_iter_ctx(batch: dict[str, np.ndarray]):
-    """Yield a checkpointable Grain iterator (not a generator wrapper).
-
-    The trainer's checkpoint save path needs the underlying ``grain.DatasetIterator``
-    (not a ``yield from`` wrapper) so its position can be serialized via the
-    registered Grain checkpoint handler. The ArrayRecord files must outlive the
-    iterator, so the tempdir is owned by this context manager.
-    """
-    with tempfile.TemporaryDirectory() as tmpdir:
-        src = Path(tmpdir) / "train.jsonl"
-        src.write_text(
-            json.dumps(
-                {
-                    "messages": [{"role": "user", "content": "stub"}],
-                    "batch": _to_jsonable(batch),
-                }
-            )
-            + "\n"
-        )
-        payload = compile_jsonl_to_arrayrecord(src, Path(tmpdir) / "payload", records_per_shard=1)
-        compiled = build_chunk_index(
-            payload,
-            Path(tmpdir) / "chunked",
-            max_length=1,
-            measure_message=lambda message: 1,
-            records_per_shard=1,
-        )
-        iterator = make_grain_iterator(
-            compiled,
-            batch_size=1,
-            batch_fn=lambda records: _restore_arrays(records[0]["batch"]),
-            shuffle=False,
-            seed=0,
-            read_options=make_grain_read_options(num_threads=1, prefetch_buffer_size=1),
-            multiprocessing_options=make_grain_multiprocessing_options(
-                num_workers=0, per_worker_buffer_size=1
-            ),
-        )
-        yield iterator
 
 
 class ShardBatchDictTest(absltest.TestCase):
@@ -210,10 +203,12 @@ class ShardBatchDictTest(absltest.TestCase):
         batch = {
             "token_ids_BT": np.ones((2, 4), dtype=np.int32),
             "pixel_values": np.ones((2, 3, 8, 8), dtype=np.float32),
+            "vision_patch_valid": np.ones((2,), dtype=np.bool_),
         }
         out = shard_batch_dict(batch, shd_cfg, mesh)
         self.assertEqual(out["token_ids_BT"].shape, (2, 4))
         self.assertEqual(out["pixel_values"].shape, (2, 3, 8, 8))
+        self.assertEqual(out["vision_patch_valid"].shape, (2,))
 
 
 class TextSFTTrainingTest(absltest.TestCase):
@@ -238,14 +233,42 @@ class TextSFTTrainingTest(absltest.TestCase):
             tp_size=1,
             fsdp_size=1,
             dp_size=1,
+            # This module runs on CPU, where the default mosaic_gpu backend
+            # raises before any assertion below executes.
+            text_attn_backend="xla",
         )
         self.assertIn("loss", metrics)
         self.assertIn("supervised_tokens", metrics)
         self.assertGreater(metrics["supervised_tokens"], 0)
         self.assertEqual(int(metrics["step"]), 1)
+        self.assertEqual(int(metrics["total_tokens"]), 8)
+        self.assertEqual(int(metrics["supervised_tokens"]), 4)
 
 
 class VLMSFTTrainingTest(absltest.TestCase):
+    def test_checkpoint_saves_bound_host_staging(self):
+        handler = object()
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            mock.patch.object(
+                vlm_trainer.ocp.handlers,
+                "PyTreeCheckpointHandler",
+                return_value=handler,
+            ) as handler_cls,
+            mock.patch.object(vlm_trainer.ocp, "CheckpointManager") as manager_cls,
+        ):
+            vlm_trainer._make_checkpoint_manager(Path(tmpdir), save_interval=10)
+
+        handler_kwargs = handler_cls.call_args.kwargs
+        self.assertEqual(handler_kwargs["save_device_host_concurrent_gb"], 2)
+        self.assertFalse(handler_kwargs["is_prioritized_key_fn"](()))
+
+        manager_kwargs = manager_cls.call_args.kwargs
+        self.assertFalse(manager_kwargs["options"].enable_async_checkpointing)
+        registry = manager_kwargs["handler_registry"]
+        self.assertIs(registry.get("train_state", vlm_trainer.ocp.args.PyTreeSave), handler)
+        self.assertIs(registry.get("train_state", vlm_trainer.ocp.args.PyTreeRestore), handler)
+
     def test_one_step_sft_text_only(self):
         train_cfg = vlm_trainer.TrainConfig(
             seed=0,
@@ -257,22 +280,82 @@ class VLMSFTTrainingTest(absltest.TestCase):
             print_every=0,
         )
         batch = _make_synthetic_sft_batch(1, 4, 32000)
+        batch["vision_patch_valid"] = np.empty((0,), dtype=np.bool_)
         data_iter = _make_grain_batch_iter(batch)
 
         _, metrics = vlm_trainer.run_sft(
-            "qwen3-vl-smoke",
+            make_vl_config("qwen3-vl-smoke"),
             train_cfg,
             data_iter,
             log_every=0,
             tp_size=1,
             fsdp_size=1,
             dp_size=1,
+            # This module runs on CPU, where the default mosaic_gpu backend
+            # raises before any assertion below executes.
+            text_attn_backend="xla",
         )
         self.assertIn("loss", metrics)
         self.assertIn("supervised_tokens", metrics)
         self.assertGreater(metrics["supervised_tokens"], 0)
         self.assertEqual(int(metrics["step"]), 1)
 
+    def test_accumulated_step_and_token_weighted_validation(self):
+        train_cfg = vlm_trainer.TrainConfig(
+            seed=0,
+            batch_size=1,
+            seq_len=4,
+            num_steps=1,
+            learning_rate=1e-3,
+            weight_decay=0.0,
+            grad_accum_steps=2,
+            print_every=0,
+        )
+        train_batch = _make_synthetic_sft_batch(1, 4, 32000)
+        train_batch["vision_patch_valid"] = np.empty((0,), dtype=np.bool_)
+        val_batches = []
+        for marker in (1, 2):
+            batch = _make_synthetic_sft_batch(1, 4, 32000)
+            batch["token_ids_BT"][0, 0] = marker
+            batch["vision_patch_valid"] = np.empty((0,), dtype=np.bool_)
+            val_batches.append(batch)
+
+        def eval_step(_model, batch):
+            first = batch["token_ids_BT"][0, 0] == 1
+            return (
+                jnp.where(first, 2.0, 18.0),
+                jnp.where(first, 1.0, 3.0),
+                jnp.where(first, 0.25, 0.75),
+            )
+
+        wandb_run = mock.Mock()
+        with mock.patch.object(vlm_trainer, "make_sft_eval_step", return_value=eval_step):
+            optimizer, metrics = vlm_trainer.run_sft(
+                make_vl_config("qwen3-vl-smoke"),
+                train_cfg,
+                iter([dict(train_batch), dict(train_batch)]),
+                log_every=0,
+                tp_size=1,
+                fsdp_size=1,
+                dp_size=1,
+                wandb_run=wandb_run,
+                val_data_iter=iter(val_batches),
+                val_every=1,
+                val_steps=2,
+                text_attn_backend="xla",
+            )
+
+        self.assertEqual(int(optimizer.step[...]), 1)
+        self.assertEqual(int(metrics["supervised_tokens"]), 4)
+        val_metrics = next(
+            call.args[0] for call in wandb_run.log.call_args_list if "val/loss" in call.args[0]
+        )
+        self.assertEqual(val_metrics["val/sup_tokens"], 4.0)
+        self.assertEqual(val_metrics["val/ce_loss"], 5.0)
+        self.assertEqual(val_metrics["val/aux_loss"], 0.5)
+        self.assertEqual(val_metrics["val/loss"], 5.5)
+
+    @absltest.skipUnless(jax.default_backend() == "gpu", "vision attention is cuDNN-only")
     def test_one_step_sft_multimodal_qwen3_vl(self):
         train_cfg = vlm_trainer.TrainConfig(
             seed=0,
@@ -287,13 +370,16 @@ class VLMSFTTrainingTest(absltest.TestCase):
         data_iter = _make_grain_batch_iter(batch)
 
         _, metrics = vlm_trainer.run_sft(
-            "qwen3-vl-smoke",
+            make_vl_config("qwen3-vl-smoke"),
             train_cfg,
             data_iter,
             log_every=0,
             tp_size=1,
             fsdp_size=1,
             dp_size=1,
+            # This module runs on CPU, where the default mosaic_gpu backend
+            # raises before any assertion below executes.
+            text_attn_backend="xla",
         )
         self.assertIn("loss", metrics)
         self.assertIn("supervised_tokens", metrics)

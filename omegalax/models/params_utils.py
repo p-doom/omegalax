@@ -13,6 +13,7 @@ import numpy as np
 from etils import epath
 from huggingface_hub import hf_hub_download
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
+from safetensors import numpy as stnp
 
 TransformRule = tuple[tuple[int, ...] | None, tuple[int, ...] | None, bool] | None
 
@@ -44,8 +45,8 @@ def _place_like(value: jax.Array, target: Any, sharding: NamedSharding | None = 
     # takes precedence. We must NOT fall back to `target.sharding` when the target
     # is an abstract `eval_shape` leaf: that sharding carries an AbstractMesh, which
     # `jax.device_put` cannot place ("is_fully_addressable not implemented"). Callers
-    # loading into an abstract state pass `sharding=`; legacy callers (concrete target
-    # arrays) pass nothing and keep the old behavior.
+    # loading into an abstract state pass `sharding=`; a caller holding a concrete
+    # target array passes nothing and falls back to that array's own sharding.
     if sharding is not None:
         return jax.device_put(value, sharding)
     target_sharding = getattr(target, "sharding", None)
@@ -342,13 +343,11 @@ def load_hf_config_from_source(source: str | epath.Path) -> dict[str, Any]:
         if source_path.is_dir():
             return load_hf_config(source_path)
         if source_path.name == "config.json":
-            with source_path.open() as f:
-                return json.load(f)
+            return load_hf_config(source_path.parent)
         raise ValueError(f"Expected a directory or config.json path, got {source_path}")
 
     cfg_file = hf_hub_download(repo_id=str(source), filename="config.json")
-    with epath.Path(cfg_file).open() as f:
-        return json.load(f)
+    return load_hf_config(epath.Path(cfg_file).parent)
 
 
 def inverse_transform(value, transform_rule: TransformRule):
@@ -404,6 +403,13 @@ def flatten_pure_state(tree: dict[str, Any]) -> dict[str, Any]:
 
     _recurse(tree, [])
     return flat
+
+
+def save_hf_tensors(hf_tensors: dict[str, np.ndarray], tensor_path: str | epath.Path):
+    """Write HF tensors after making transformed NumPy views contiguous."""
+    for key in list(hf_tensors):
+        hf_tensors[key] = np.ascontiguousarray(hf_tensors[key])
+    stnp.save_file(hf_tensors, str(tensor_path))
 
 
 def save_hf_config(cfg: dict[str, Any], path: str | epath.Path):

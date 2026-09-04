@@ -1,23 +1,29 @@
 """Tests for training FLOP counting and throughput metrics."""
 
 import datetime
+import time
+from types import SimpleNamespace
 from unittest import mock
 
 from absl.testing import absltest
+from jax.sharding import PartitionSpec
 
-from omegalax.distributed.mesh import process_local_batch_size
+from omegalax.distributed.mesh import process_local_batch_size, required_batch_multiple
 from omegalax.models.qwen3.config import make_config as make_qwen3_config
 from omegalax.models.qwen3_5.config import make_config as make_qwen3_5_config
 from omegalax.models.qwen3_vl.config import make_vl_config as make_qwen3_vl_config
+from omegalax.trainers import perf
 from omegalax.trainers.perf import (
-    ForwardFlops,
     PEAK_TFLOPS,
+    ForwardFlops,
     StepFlops,
     StepTimer,
     forward_flops_per_token,
+    maybe_log_step_metrics,
     per_device_step_flops,
     qwen3_vl_vision_flops,
     qwen3_vl_vision_training_flops,
+    resolve_peak_tflops,
     step_metrics,
     training_flops_per_token,
 )
@@ -223,6 +229,57 @@ class StepMetricsTest(absltest.TestCase):
         self.assertGreater(out["model_tflops_per_device"], 0)
 
 
+class MaybeLogStepMetricsTest(absltest.TestCase):
+    """The utilisation numbers a run is judged on come out of here.
+
+    They were all read with a ``0.0`` default, so renaming one in ``step_metrics``
+    logged and returned zero for it instead of raising -- on exactly the figures
+    with a history of being misread.
+    """
+
+    #: What both trainers put in `window_metrics` (vlm.py, text.py).
+    _CALLER_METRICS = {
+        "loss": 1.5,
+        "grad_norm": 0.5,
+        "supervised_tokens": 64.0,
+        "total_tokens": 128.0,
+        "lr": 1e-4,
+    }
+
+    def _log(self, metrics=None):
+        return maybe_log_step_metrics(
+            1,
+            dict(self._CALLER_METRICS if metrics is None else metrics),
+            datetime.timedelta(seconds=1),
+            is_primary_process=True,
+            log_every=1,
+            step_flops=StepFlops(model=1e12, hardware=2e12),
+            global_tokens_per_step=64,
+            peak_tflops=312.0,
+            batch_size=8,
+        )
+
+    def test_logs_the_utilization_metrics_step_metrics_produced(self):
+        out = self._log()
+        self.assertAlmostEqual(out["mfu"], 1.0 / 312.0)
+        self.assertAlmostEqual(out["hfu"], 2.0 / 312.0)
+        self.assertEqual(out["total_samples"], 8)
+
+    def test_a_renamed_step_metric_raises(self):
+        renamed = dict(step_metrics(StepFlops(1e12, 2e12), datetime.timedelta(seconds=1), 64, 312.0))
+        renamed["model_flops_utilization"] = renamed.pop("mfu")
+        with mock.patch.object(perf, "step_metrics", return_value=renamed):
+            with self.assertRaisesRegex(KeyError, "mfu"):
+                self._log()
+
+    def test_a_caller_metric_the_print_reads_is_required(self):
+        for key in ("lr", "supervised_tokens", "total_tokens"):
+            metrics = dict(self._CALLER_METRICS)
+            metrics.pop(key)
+            with self.assertRaisesRegex(KeyError, key):
+                self._log(metrics)
+
+
 class ProcessLocalBatchSizeTest(absltest.TestCase):
     def test_returns_process_local_batch_size(self):
         self.assertEqual(process_local_batch_size(8, dp_size=4, fsdp_size=1), 2)
@@ -232,6 +289,12 @@ class ProcessLocalBatchSizeTest(absltest.TestCase):
         with self.assertRaisesRegex(ValueError, "divisible by data_parallel_size=3"):
             process_local_batch_size(8, dp_size=3, fsdp_size=1)
 
+    def test_required_batch_multiple_combines_sharding_axes(self):
+        mesh = SimpleNamespace(shape={"dp": 2, "fsdp": 4})
+        self.assertEqual(required_batch_multiple(PartitionSpec(None, None), mesh), 1)
+        self.assertEqual(required_batch_multiple(PartitionSpec("dp", None), mesh), 2)
+        self.assertEqual(required_batch_multiple(PartitionSpec(("dp", "fsdp"), None), mesh), 8)
+
 
 class StepTimerTest(absltest.TestCase):
     def test_warmup_returns_zero_delta(self):
@@ -239,16 +302,66 @@ class StepTimerTest(absltest.TestCase):
         self.assertEqual(t.step().total_seconds(), 0)
         self.assertEqual(t.step().total_seconds(), 0)
 
-    def test_after_warmup_returns_positive_delta(self):
-        t = StepTimer(warmup=0)
-        d = t.step()
-        self.assertGreaterEqual(d.total_seconds(), 0)
+    def test_after_warmup_returns_the_interval_since_the_previous_step(self):
+        """`>= 0` holds for every timedelta, so this could not fail.
+
+        The interval is what every throughput number divides by, and the bug that
+        shape cannot see is a `step()` that measures from the wrong origin: one
+        that never advances `_last` returns the time since construction, which is
+        positive, grows every step, and deflates step time forever after. The
+        second step is taken with no pause, so only a timer that advanced its
+        origin can report less than the first pause.
+        """
+        pause = 0.05
+        timer = StepTimer(warmup=0)
+        time.sleep(pause)
+        first = timer.step().total_seconds()
+        second = timer.step().total_seconds()
+
+        self.assertGreaterEqual(first, pause)
+        self.assertLess(second, pause)
+
+    def test_a_wall_clock_step_backwards_does_not_zero_the_metrics(self):
+        """The timer reads a monotonic clock, so wall time cannot reach it.
+
+        It used to read `datetime.now()` (CLOCK_REALTIME), which an NTP step moves
+        backwards. The delta then goes negative, `step_metrics` takes its
+        ``sec <= 0`` branch, and mfu / hfu / tflops / tokens-per-second are all
+        reported as 0.0 -- a false zero under every throughput number a run quotes,
+        for a reason nothing in the log would name.
+        """
+        timer = StepTimer(warmup=0)
+        time.sleep(0.01)
+        with mock.patch.object(datetime, "datetime", wraps=datetime.datetime) as wall_clock:
+            wall_clock.now.return_value = datetime.datetime(2000, 1, 1)
+            delta = timer.step()
+
+        self.assertGreater(delta.total_seconds(), 0)
+        metrics = step_metrics(StepFlops(model=1e12, hardware=2e12), delta, 64, 312.0)
+        for name in ("mfu", "hfu", "model_tflops_per_device", "tokens_per_sec_per_device"):
+            self.assertGreater(metrics[name], 0, msg=name)
 
 
 class PeakTflopsTest(absltest.TestCase):
-    def test_peak_tflops_entries_positive(self):
-        for name, v in PEAK_TFLOPS.items():
-            self.assertGreater(v, 0, msg=name)
+    """``resolve_peak_tflops`` is what reads the table; the table itself is a literal."""
+
+    def test_every_preset_name_resolves_to_its_table_value(self):
+        for name, expected in PEAK_TFLOPS.items():
+            self.assertEqual(resolve_peak_tflops(name), expected, msg=name)
+
+    def test_h100_sxm_is_the_name_the_launchers_pass(self):
+        self.assertEqual(resolve_peak_tflops("h100_sxm"), 989.0)
+
+    def test_numeric_spec_passes_through(self):
+        self.assertEqual(resolve_peak_tflops("312"), 312.0)
+        self.assertEqual(resolve_peak_tflops(989.0), 989.0)
+
+    def test_none_disables_utilization(self):
+        self.assertIsNone(resolve_peak_tflops(None))
+
+    def test_unknown_name_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "Unknown peak_tflops 'h100'"):
+            resolve_peak_tflops("h100")
 
 
 if __name__ == "__main__":

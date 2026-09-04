@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 from enum import Enum
+from pathlib import Path
+
+from huggingface_hub import snapshot_download
 
 from omegalax.models.params_utils import load_hf_config_from_source
 from omegalax.models.qwen3.config import is_supported_model_id as is_supported_qwen3_model_id
@@ -20,15 +23,35 @@ _TEXT_MODEL_TYPES = {"qwen3", "qwen3_moe"}
 _VLM_MODEL_TYPES = {"qwen3_5", "qwen3_5_moe", "qwen3_vl", "qwen3_vl_moe"}
 
 
-def _load_resolved_hf_config(model_id: str) -> dict:
+def _resolve_supported_hf_repo_id(model_id: str) -> str:
     if is_supported_qwen3_model_id(model_id):
-        source = resolve_qwen3_repo_id(model_id)
+        repo_id = resolve_qwen3_repo_id(model_id)
     elif is_supported_qwen3_5_model_id(model_id):
-        source = resolve_qwen3_5_repo_id(model_id)
+        repo_id = resolve_qwen3_5_repo_id(model_id)
     elif is_supported_qwen3_vl_model_id(model_id):
-        source = resolve_qwen3_vl_repo_id(model_id)
+        repo_id = resolve_qwen3_vl_repo_id(model_id)
     else:
         raise ValueError(f"Unsupported model id '{model_id}'")
+    if "/" not in repo_id:
+        raise ValueError(f"Model id is not a remote HuggingFace repo: '{model_id}'")
+    return repo_id
+
+
+def _resolve_hf_model_directory(source: Path) -> Path:
+    source = source.expanduser().resolve()
+    if not source.is_dir():
+        raise ValueError(f"model source must be a HuggingFace model directory: {source}")
+    if not (source / "config.json").is_file():
+        raise ValueError(f"model source has no config.json: {source}")
+    return source
+
+
+def _load_resolved_hf_config(model_id: str) -> dict:
+    local_source = Path(model_id).expanduser()
+    if local_source.exists():
+        source = _resolve_hf_model_directory(local_source)
+    else:
+        source = _resolve_supported_hf_repo_id(model_id)
     return load_hf_config_from_source(source)
 
 
@@ -36,7 +59,7 @@ def infer_arch(model_id: str) -> Arch:
     """Determine the architecture from a smoke alias or HF-format config source."""
     if model_id.startswith("qwen3-smoke"):
         return Arch.TEXT
-    if model_id.startswith("qwen3.5-smoke") or model_id.startswith("qwen3-vl-smoke"):
+    if model_id.startswith(("qwen3.5-smoke", "qwen3-vl-smoke")):
         return Arch.VLM
 
     hf_cfg = _load_resolved_hf_config(model_id)
@@ -59,6 +82,14 @@ def resolve_hf_repo_id(model_id: str) -> str:
     if is_supported_qwen3_vl_model_id(model_id):
         return resolve_qwen3_vl_repo_id(model_id)
     return model_id
+
+
+def resolve_hf_model_source(model_id: str) -> Path:
+    local_source = Path(model_id).expanduser()
+    if local_source.exists():
+        return _resolve_hf_model_directory(local_source)
+    source = Path(snapshot_download(_resolve_supported_hf_repo_id(model_id)))
+    return _resolve_hf_model_directory(source)
 
 
 def resolve(model_id: str) -> Arch:

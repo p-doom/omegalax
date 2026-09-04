@@ -39,11 +39,6 @@ def _l2norm(x: jax.Array, axis: int = -1, eps: float = 1e-6) -> jax.Array:
     return x * inv_norm
 
 
-# --------------------------------------------------------------------------- #
-# Pallas state-pass kernel
-# --------------------------------------------------------------------------- #
-
-
 def _state_pass_kernel(
     kcd_ref,  # (J, C, A)  fp32  — A_inv @ (kb * exp(g_cum))
     k_dec_ref,  # (J, C, A)  fp32  — k * exp(g_last - g_cum)
@@ -198,11 +193,6 @@ def _state_pass_bwd(residuals, cotangents):
 
 
 _state_pass_pallas.defvjp(_state_pass_fwd_for_vjp, _state_pass_bwd)
-
-
-# --------------------------------------------------------------------------- #
-# Public entry point
-# --------------------------------------------------------------------------- #
 
 
 def chunk_gated_delta_rule_pallas(

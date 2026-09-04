@@ -25,6 +25,7 @@ class Qwen3_5VisionConfig:
     out_hidden_size: int = 4096
     num_position_embeddings: int = 2304
     dtype: Any = jnp.bfloat16
+    param_dtype: Any = jnp.float32
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -40,8 +41,6 @@ class Qwen3_5TextConfig:
     rope_theta: float = 10_000_000
     partial_rotary_factor: float = 0.25
     mrope_section: tuple[int, ...] = (11, 11, 10)
-    # Stored for config fidelity; ignored in the forward pass (see HF source).
-    mrope_interleaved: bool = True
     attention_bias: bool = False
     tie_word_embeddings: bool = False
 
@@ -63,6 +62,7 @@ class Qwen3_5TextConfig:
     router_aux_loss_coef: float = 0.001
     shd_cfg: ShardConfig = dataclasses.field(default_factory=ShardConfig.default)
     dtype: Any = jnp.bfloat16
+    param_dtype: Any = jnp.float32
 
     @property
     def is_moe(self) -> bool:
@@ -268,6 +268,8 @@ def make_config_from_hf(hf_cfg: dict[str, Any]) -> Qwen3_5Config:
     rope_type = rope_params.get("rope_type", "default")
     if rope_type != "default":
         raise ValueError(f"Unsupported rope_parameters.rope_type '{rope_type}' for Qwen3.5.")
+    if _required(rope_params, "mrope_interleaved", "rope_parameters") is not True:
+        raise ValueError("Qwen3.5 requires rope_parameters.mrope_interleaved=True.")
 
     text_dtype = _hf_dtype_to_jnp(_required(txt, "dtype", "hf_cfg['text_config']"))
     vision_dtype = _hf_dtype_to_jnp(vis["dtype"]) if vis.get("dtype") is not None else text_dtype
@@ -290,7 +292,6 @@ def make_config_from_hf(hf_cfg: dict[str, Any]) -> Qwen3_5Config:
         "rope_theta": _required(rope_params, "rope_theta", "rope_parameters"),
         "partial_rotary_factor": _required(rope_params, "partial_rotary_factor", "rope_parameters"),
         "mrope_section": tuple(_required(rope_params, "mrope_section", "rope_parameters")),
-        "mrope_interleaved": _required(rope_params, "mrope_interleaved", "rope_parameters"),
         "attention_bias": _required(txt, "attention_bias", "hf_cfg['text_config']"),
         "tie_word_embeddings": _required(hf_cfg, "tie_word_embeddings", "hf_cfg"),
         "linear_conv_kernel_dim": _required(txt, "linear_conv_kernel_dim", "hf_cfg['text_config']"),
@@ -299,6 +300,7 @@ def make_config_from_hf(hf_cfg: dict[str, Any]) -> Qwen3_5Config:
         "linear_num_value_heads": _required(txt, "linear_num_value_heads", "hf_cfg['text_config']"),
         "linear_value_head_dim": _required(txt, "linear_value_head_dim", "hf_cfg['text_config']"),
         "dtype": text_dtype,
+        "param_dtype": jnp.float32,
     }
 
     if has_moe:
@@ -329,6 +331,7 @@ def make_config_from_hf(hf_cfg: dict[str, Any]) -> Qwen3_5Config:
                 vis, "num_position_embeddings", "hf_cfg['vision_config']"
             ),
             dtype=vision_dtype,
+            param_dtype=jnp.float32,
         ),
         text_config=Qwen3_5TextConfig(**text_kw),
         image_token_id=_required(hf_cfg, "image_token_id", "hf_cfg"),

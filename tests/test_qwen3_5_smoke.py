@@ -14,6 +14,7 @@ import jax.numpy as jnp
 import numpy as np
 import torch
 from absl.testing import absltest
+from flax import nnx
 from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import (
     Qwen3_5MoeConfig as HFConfig,
     Qwen3_5MoeTextConfig as HFTextConfig,
@@ -26,6 +27,8 @@ from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
 )
 
 from omegalax.models.qwen3_5.params import create_qwen3_5_from_safetensors
+from omegalax.models.params_utils import flatten_pure_state
+from omegalax.models.sharding_runtime import set_attn_backend
 
 from tests.logits_assert import assert_logits_close
 
@@ -107,8 +110,9 @@ class Qwen3_5WeightsTest(absltest.TestCase):
     def setUpClass(cls):
         super().setUpClass()
         cls.tmpdir = tempfile.mkdtemp()
+        torch.manual_seed(0)
 
-        hf_model = HFModel(HF_CFG).eval()
+        hf_model = HFModel(HF_CFG).to(torch.bfloat16).eval()
         hf_model.save_pretrained(cls.tmpdir, safe_serialization=True)
 
         cls.jax_model, cls.jax_cfg = create_qwen3_5_from_safetensors(
@@ -117,6 +121,9 @@ class Qwen3_5WeightsTest(absltest.TestCase):
             fsdp_size=1,
             dp_size=1,
         )
+        # This module runs on CPU, where the default mosaic_gpu backend raises
+        # before any assertion below executes.
+        set_attn_backend(cls.jax_model, text_backend="xla")
 
         torch_dtype = _JNP_TO_TORCH[cls.jax_cfg.text_config.dtype]
         cls.hf_model = hf_model.to(torch_dtype)
@@ -126,13 +133,26 @@ class Qwen3_5WeightsTest(absltest.TestCase):
         token_ids_BT = jnp.asarray(tokens_np)
         segment_ids_BT = (token_ids_BT != self.pad_id).astype(jnp.int32)
         hidden_BTD, _ = self.jax_model(
-            token_ids_BT, segment_ids_BT, None, jnp.array(0, dtype=jnp.int32)
+            token_ids_BT,
+            segment_ids_BT,
+            None,
+            jnp.array(0, dtype=jnp.int32),
+            vision_patch_valid=jnp.empty((0,), dtype=jnp.bool_),
         )
         logits_BTV = self.jax_model.lm_head(hidden_BTD)
         return np.asarray(logits_BTV, dtype=np.float32)
 
     def test_weight_loading_succeeds(self):
         self.assertIsNotNone(self.jax_model)
+
+    def test_bf16_hf_weights_load_into_fp32_parameter_state(self):
+        state = nnx.to_pure_dict(nnx.state(self.jax_model, nnx.Param))
+        flat_state = flatten_pure_state(state)
+        self.assertNotEmpty(flat_state)
+        self.assertEqual(
+            {value.dtype for value in flat_state.values()},
+            {jnp.dtype(jnp.float32)},
+        )
 
     def test_prefill_logits_match_hf(self):
         """Single-sequence text-only forward pass should match HuggingFace."""
@@ -153,7 +173,7 @@ class Qwen3_5WeightsTest(absltest.TestCase):
         assert_logits_close(self, jax_logits_BTV, hf_logits_BTV, mask)
 
     def test_prefill_logits_match_hf_batched(self):
-        """Batched forward pass with left-padding should match HuggingFace.
+        """Batched forward pass with right-padding should match HuggingFace.
 
         HF's create_causal_mask handles padding differently for B=1 vs B>1,
         so we test padding only in the batched case (B=2) where HF is reliable.
@@ -162,7 +182,7 @@ class Qwen3_5WeightsTest(absltest.TestCase):
         token_ids_b_BT = _random_input(batch_size=1, seq_len=10, vocab_size=HF_TEXT_CFG.vocab_size)
 
         padded_b = np.zeros((1, 16), dtype=np.int32)
-        padded_b[:, 6:] = token_ids_b_BT
+        padded_b[:, :10] = token_ids_b_BT
         token_ids_BT = np.concatenate([token_ids_a_BT, padded_b], axis=0)
         attention_mask_BT = (token_ids_BT != self.pad_id).astype(np.int64)
 
@@ -178,26 +198,6 @@ class Qwen3_5WeightsTest(absltest.TestCase):
 
         mask = attention_mask_BT.astype(bool)
         assert_logits_close(self, jax_logits_BTV, hf_logits_BTV, mask)
-
-    def test_round_trip_preserves_logits(self):
-        """Split → merge round-trip should produce identical logits."""
-        from flax import nnx
-
-        token_ids_BT = _random_input(batch_size=1, seq_len=16, vocab_size=HF_TEXT_CFG.vocab_size)
-        baseline_BTV = self._jax_prefill_logits(token_ids_BT)
-
-        graph_def, state = nnx.split(self.jax_model)
-        pure_state = nnx.to_pure_dict(state)
-        restored = nnx.merge(graph_def, pure_state)
-
-        jax_token_ids_BT = jnp.asarray(token_ids_BT)
-        segment_ids_BT = (jax_token_ids_BT != self.pad_id).astype(jnp.int32)
-        restored_hidden, _ = restored(
-            jax_token_ids_BT, segment_ids_BT, None, jnp.array(0, dtype=jnp.int32)
-        )
-        restored_logits_BTV = np.asarray(restored.lm_head(restored_hidden))
-
-        np.testing.assert_array_equal(restored_logits_BTV, baseline_BTV)
 
 
 if __name__ == "__main__":

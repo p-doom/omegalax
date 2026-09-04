@@ -1,9 +1,4 @@
-"""Qwen3 / Qwen3.5 SFT collators (ChatML format, vision tokens).
-
-Tokenize chat conversations and produce loss masks. Both collators output
-numpy dicts ready for ``shard_batch_dict``. Model-specific to Qwen3-VL and
-Qwen3.5 (ChatML delimiters, assistant-based loss, Qwen image processor).
-"""
+"""Qwen3 and Qwen3.5 SFT collators."""
 
 from __future__ import annotations
 
@@ -14,9 +9,14 @@ import ml_dtypes
 import numpy as np
 from transformers import BaseImageProcessor, PreTrainedTokenizer
 
-from omegalax.data.qwen3_encoding import (
-    encode_qwen_messages as _encode_qwen_messages,
-)
+from omegalax.data.qwen3_encoding import Qwen3MessageEncoder
+
+
+def _require_supervision(encoded: dict[str, np.ndarray]) -> np.ndarray:
+    loss_mask = encoded["loss_mask"]
+    if not np.any(loss_mask):
+        raise ValueError("each training example must contain supervised tokens")
+    return loss_mask
 
 
 class TextSFTCollator:
@@ -26,12 +26,17 @@ class TextSFTCollator:
     ``(B, max_length)`` int32.
     """
 
-    def __init__(self, tokenizer: PreTrainedTokenizer, max_length: int) -> None:
+    def __init__(
+        self,
+        tokenizer: PreTrainedTokenizer,
+        max_length: int,
+        model_type: str,
+    ) -> None:
         self.tokenizer = tokenizer
         self.max_length = max_length
-        assert tokenizer.pad_token_id is not None, (
-            "tokenizer must have pad_token_id set (e.g. Qwen3-VL, Qwen3.5)"
-        )
+        if tokenizer.pad_token_id is None:
+            raise ValueError("tokenizer must define pad_token_id")
+        self._encoder = Qwen3MessageEncoder(tokenizer, None, model_type)
 
     def __call__(self, examples: Sequence[dict[str, Any]]) -> dict[str, np.ndarray]:
         batch_ids: list[np.ndarray] = []
@@ -40,11 +45,9 @@ class TextSFTCollator:
 
         for ex in examples:
             messages = ex["messages"]
-            encoded = _encode_qwen_messages(
-                messages,
-                tokenizer=self.tokenizer,
-            )
+            encoded = self._encoder.encode(messages)
             full_ids = encoded["input_ids"]
+            loss_mask = _require_supervision(encoded)
             if len(full_ids) > self.max_length:
                 raise ValueError(
                     f"Encoded example length {len(full_ids)} exceeds max_length={self.max_length}; "
@@ -55,11 +58,6 @@ class TextSFTCollator:
             pad_len = self.max_length - seq_len
             token_ids = np.array(full_ids, dtype=np.int32)
             attn_mask = np.ones(seq_len, dtype=np.int32)
-
-            # Assistant loss mask built from message structure during encoding, so
-            # literal ChatML markers in user/context text can't leak supervision.
-            loss_mask = np.asarray(encoded["loss_mask"], dtype=np.int32)
-
             if pad_len > 0:
                 token_ids = np.pad(
                     token_ids, (0, pad_len), constant_values=self.tokenizer.pad_token_id
@@ -105,11 +103,14 @@ def _pad_vision_arrays(
     num_dummies = max_images - real_images
     extra_patches = max_patches - real_patches
 
-    if num_dummies < 0 or extra_patches < 0:
+    exceeded = []
+    if num_dummies < 0:
+        exceeded.append(f"real_images={real_images} > max_images={max_images}")
+    if extra_patches < 0:
+        exceeded.append(f"real_patches={real_patches} > max_patches={max_patches}")
+    if exceeded:
         raise ValueError(
-            f"Batch exceeds padding budget: real_images={real_images} > "
-            f"max_images={max_images} or real_patches={real_patches} > "
-            f"max_patches={max_patches}. Increase the per-sample limits."
+            f"Batch exceeds padding budget: {', '.join(exceeded)}. Increase the per-sample limits."
         )
 
     if num_dummies == 0 and extra_patches == 0:
@@ -171,14 +172,12 @@ class VLMSFTCollator:
     """Collate Qwen multimodal chat examples into padded numpy arrays with loss masks.
 
     Expects messages in the Qwen structured-content format where images are
-    inline ``{"type": "image", "url": "..."}`` blocks inside ``content``
-    lists.  Builds ChatML text with the correct number of image pad tokens
-    and encodes via ``tokenizer.encode``.  Images are preprocessed by the
-    HF image processor (slow path, NumPy backend).
+    inline ``{"type": "image", "image": ...}`` blocks inside ``content`` lists.
 
-    Outputs ``{"token_ids_BT", "attention_mask_BT", "loss_mask_BT"}`` plus
-    ``"pixel_values"``, ``"image_grid_thw"``, and ``"position_ids_ZBT"``
-    when images are present.
+    Every key is always present at a fixed shape, images or not, so ``train_step``
+    never recompiles: ``token_ids_BT``, ``attention_mask_BT``, ``loss_mask_BT``,
+    ``pixel_values``, ``vision_patch_valid``, ``image_grid_thw``,
+    ``vision_cu_seqlens``, ``position_ids_ZBT``.
 
     ``position_ids_ZBT`` is precomputed here (on CPU, via numpy) so the
     model's ``get_rope_index`` never needs to run inside ``jax.jit``.
@@ -189,6 +188,7 @@ class VLMSFTCollator:
         tokenizer: PreTrainedTokenizer,
         max_length: int,
         image_processor: BaseImageProcessor,
+        model_type: str,
         *,
         max_vision_patches_per_sample: int | None = None,
         max_vision_images_per_sample: int | None = None,
@@ -200,9 +200,9 @@ class VLMSFTCollator:
         self._max_vision_patches_per_sample = max_vision_patches_per_sample
         self._max_vision_images_per_sample = max_vision_images_per_sample
         self._pixel_values_dtype = pixel_values_dtype
-        assert tokenizer.pad_token_id is not None, (
-            "tokenizer must have pad_token_id set (e.g. Qwen3-VL, Qwen3.5)"
-        )
+        if tokenizer.pad_token_id is None:
+            raise ValueError("tokenizer must define pad_token_id")
+        self._encoder = Qwen3MessageEncoder(tokenizer, image_processor, model_type)
 
         self._image_token_id = tokenizer.convert_tokens_to_ids("<|image_pad|>")
         self._video_token_id = tokenizer.convert_tokens_to_ids("<|video_pad|>")
@@ -229,13 +229,9 @@ class VLMSFTCollator:
 
         for ex in examples:
             messages = ex["messages"]
-            encoded = _encode_qwen_messages(
-                messages,
-                tokenizer=self.tokenizer,
-                image_processor=self.image_processor,
-                include_pixels=True,
-            )
+            encoded = self._encoder.encode(messages)
             full_ids = encoded["input_ids"]
+            loss_mask = _require_supervision(encoded)
             if len(full_ids) > self.max_length:
                 raise ValueError(
                     f"Encoded example length {len(full_ids)} exceeds max_length={self.max_length}; "
@@ -250,12 +246,6 @@ class VLMSFTCollator:
             pad_len = self.max_length - seq_len
             token_ids = np.array(full_ids, dtype=np.int32)
             attn_mask = np.ones(seq_len, dtype=np.int32)
-
-            # Assistant loss mask built from message structure during encoding, so
-            # literal ChatML markers in user/context text can't leak supervision
-            # onto user turns or image pad tokens.
-            loss_mask = np.asarray(encoded["loss_mask"], dtype=np.int32)
-
             if pad_len > 0:
                 token_ids = np.pad(
                     token_ids, (0, pad_len), constant_values=self.tokenizer.pad_token_id
@@ -279,6 +269,7 @@ class VLMSFTCollator:
         else:
             pixel_values = np.zeros((0, self._patch_feat_dim), dtype=np.float32)
             image_grid_thw = np.zeros((0, 3), dtype=np.int32)
+        num_real_patches = pixel_values.shape[0]
 
         # Compute position_ids from REAL (unpadded) grid — these only
         # depend on real <|image_pad|> positions in token_ids_BT.
@@ -312,6 +303,7 @@ class VLMSFTCollator:
             vision_cu_seqlens = _compute_vision_cu_seqlens(image_grid_thw)
 
         result["pixel_values"] = pixel_values.astype(self._pixel_values_dtype, copy=False)
+        result["vision_patch_valid"] = np.arange(pixel_values.shape[0]) < num_real_patches
         result["image_grid_thw"] = image_grid_thw
         result["vision_cu_seqlens"] = vision_cu_seqlens
 

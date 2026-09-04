@@ -1,6 +1,6 @@
 """Module-level numerical equivalence tests.
 
-Each test feeds the **identical** input (produced by HF) into both the JAX
+Each test feeds the identical input (produced by HF) into both the JAX
 and HuggingFace implementations of a single module so that per-module error
 is measured in isolation, without accumulation from prior layers.
 
@@ -134,7 +134,7 @@ class Qwen3ModuleTest(absltest.TestCase):
             hf_cos, hf_sin = self.hf_model.model.rotary_emb(self.hf_emb, position_ids_torch)
 
         position_ids_jax = jnp.arange(seq_len, dtype=jnp.int32)[None, :]
-        jax_sin, jax_cos = generate_pos_embeddings(position_ids_jax, head_dim)
+        jax_sin, jax_cos = generate_pos_embeddings(position_ids_jax, head_dim, self.cfg.rope_theta)
 
         hf_cos_half = _to_np(hf_cos)[..., : head_dim // 2]
         hf_sin_half = _to_np(hf_sin)[..., : head_dim // 2]

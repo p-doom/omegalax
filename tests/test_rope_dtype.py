@@ -7,6 +7,7 @@ application functions to capture the dtypes that actually flow through the model
 """
 
 import dataclasses
+import inspect
 import os
 from unittest import mock
 
@@ -16,6 +17,7 @@ import jax.numpy as jnp
 from absl.testing import absltest
 
 from omegalax.distributed.mesh import mesh_rules_for
+from omegalax.models.sharding_runtime import set_attn_backend
 
 MODEL_DTYPE = jnp.bfloat16
 
@@ -28,21 +30,32 @@ class _RopeDtypeTestBase(absltest.TestCase):
         self.enterContext(mesh_rules_for(tp_size=1, fsdp_size=1, dp_size=1))
 
 
+def _bind_and_capture(original_fn, captured: list, args, kwargs):
+    """Append {arg_name: dtype} for every array argument, keyed by *original_fn*'s
+    parameter names. Binding against the real signature is what keeps a spy from
+    drifting away from the function it doubles."""
+    bound = inspect.signature(original_fn).bind(*args, **kwargs)
+    bound.apply_defaults()
+    captured.append({n: v.dtype for n, v in bound.arguments.items() if hasattr(v, "dtype")})
+    return bound
+
+
 def _make_spy(original_fn, captured: list):
-    """Wrap *original_fn* so every call appends {arg_name: dtype} for all array args."""
+    def spy(*args, **kwargs):
+        _bind_and_capture(original_fn, captured, args, kwargs)
+        return original_fn(*args, **kwargs)
+
+    return spy
+
+
+def _make_passthrough_spy(original_fn, captured: list, passthrough: str):
+    """Spy that returns its *passthrough* argument instead of running the body.
+
+    The vision blocks trace a dynamic slice the CPU backend rejects, so their rope
+    dtypes have to be read at the block boundary."""
 
     def spy(*args, **kwargs):
-        dtypes = {}
-        import inspect
-
-        sig = inspect.signature(original_fn)
-        bound = sig.bind(*args, **kwargs)
-        bound.apply_defaults()
-        for name, val in bound.arguments.items():
-            if hasattr(val, "dtype"):
-                dtypes[name] = val.dtype
-        captured.append(dtypes)
-        return original_fn(*args, **kwargs)
+        return _bind_and_capture(original_fn, captured, args, kwargs).arguments[passthrough]
 
     return spy
 
@@ -58,6 +71,9 @@ class Qwen3RopeDtypeTest(_RopeDtypeTestBase):
 
         cfg = dataclasses.replace(make_config("qwen3-smoke"), dtype=MODEL_DTYPE)
         attn = attn_mod.Attention(cfg, rngs=nnx.Rngs(0))
+        # This module runs on CPU, where the default mosaic_gpu backend raises
+        # before any assertion below executes.
+        set_attn_backend(attn, text_backend="xla")
 
         gen_calls, apply_calls = [], []
         orig_gen = rope_mod.generate_pos_embeddings
@@ -77,7 +93,7 @@ class Qwen3RopeDtypeTest(_RopeDtypeTestBase):
             attn(hidden, None, seg)
 
         self.assertLen(gen_calls, 1)
-        gen_out_sin, gen_out_cos = orig_gen(jnp.arange(T)[None, :], cfg.head_dim)
+        gen_out_sin, gen_out_cos = orig_gen(jnp.arange(T)[None, :], cfg.head_dim, cfg.rope_theta)
         self.assertEqual(
             gen_out_sin.dtype, jnp.float32, "generate_pos_embeddings must produce float32"
         )
@@ -114,17 +130,20 @@ class Qwen3_5TextRopeDtypeTest(_RopeDtypeTestBase):
         cfg = make_config("qwen3.5-smoke")
         text_cfg = dataclasses.replace(cfg.text_config, dtype=MODEL_DTYPE)
         model = model_mod.Qwen3_5ForCausalLM(text_cfg, rngs=nnx.Rngs(0))
+        # This module runs on CPU, where the default mosaic_gpu backend raises
+        # before any assertion below executes.
+        set_attn_backend(model, text_backend="xla")
 
         gen_calls = []
         orig_gen = rope_mod.generate_text_rope
         gen_spy = _make_spy(orig_gen, gen_calls)
 
         layer_calls = []
-        orig_layer_call = model_mod.DecoderLayer.__call__
+        orig_layer = model_mod.DecoderLayer.__call__
 
-        def layer_spy(self_layer, hidden, cos_BTK, sin_BTK, seg, pos, attn_mask=None):
-            layer_calls.append({"cos": cos_BTK.dtype, "sin": sin_BTK.dtype})
-            return orig_layer_call(self_layer, hidden, cos_BTK, sin_BTK, seg, pos, attn_mask)
+        def layer_spy(*args, **kwargs):
+            bound = _bind_and_capture(orig_layer, layer_calls, args, kwargs)
+            return bound.arguments["hidden_BTD"], jnp.array(0.0, dtype=jnp.float32)
 
         B, T = 1, 8
         tokens = jnp.ones((B, T), dtype=jnp.int32)
@@ -153,10 +172,14 @@ class Qwen3_5TextRopeDtypeTest(_RopeDtypeTestBase):
         self.assertGreater(len(layer_calls), 0)
         for i, call in enumerate(layer_calls):
             self.assertEqual(
-                call["cos"], MODEL_DTYPE, f"Layer {i}: cos_BTK should be {MODEL_DTYPE} after cast"
+                call["cos_BTK"],
+                MODEL_DTYPE,
+                f"Layer {i}: cos_BTK should be {MODEL_DTYPE} after cast",
             )
             self.assertEqual(
-                call["sin"], MODEL_DTYPE, f"Layer {i}: sin_BTK should be {MODEL_DTYPE} after cast"
+                call["sin_BTK"],
+                MODEL_DTYPE,
+                f"Layer {i}: sin_BTK should be {MODEL_DTYPE} after cast",
             )
 
 
@@ -174,10 +197,7 @@ class Qwen3_5VisionRopeDtypeTest(_RopeDtypeTestBase):
         vision = vis_mod.VisionModel(vis_cfg, shd_cfg=cfg.text_config.shd_cfg, rngs=nnx.Rngs(0))
 
         block_calls = []
-
-        def block_spy(self_blk, hidden, cu_seqlens, cos_NK, sin_NK):
-            block_calls.append({"cos": cos_NK.dtype, "sin": sin_NK.dtype})
-            return hidden  # skip actual block to avoid JAX dynamic-slice tracing issue
+        block_spy = _make_passthrough_spy(vis_mod.VisionBlock.__call__, block_calls, "hidden_ND")
 
         ms = vis_cfg.spatial_merge_size
         h, w = 2 * ms, 2 * ms
@@ -193,10 +213,10 @@ class Qwen3_5VisionRopeDtypeTest(_RopeDtypeTestBase):
         self.assertGreater(len(block_calls), 0)
         for i, call in enumerate(block_calls):
             self.assertEqual(
-                call["cos"], vis_cfg.dtype, f"Vision block {i}: cos_NK should be {vis_cfg.dtype}"
+                call["cos_NK"], vis_cfg.dtype, f"Vision block {i}: cos_NK should be {vis_cfg.dtype}"
             )
             self.assertEqual(
-                call["sin"], vis_cfg.dtype, f"Vision block {i}: sin_NK should be {vis_cfg.dtype}"
+                call["sin_NK"], vis_cfg.dtype, f"Vision block {i}: sin_NK should be {vis_cfg.dtype}"
             )
 
 
@@ -211,17 +231,16 @@ class Qwen3VLRopeDtypeTest(_RopeDtypeTestBase):
         base_cfg = make_vl_config("qwen3-vl-smoke")
         cfg = dataclasses.replace(base_cfg, dtype=MODEL_DTYPE)
         model = model_mod.Qwen3VL(cfg, rngs=nnx.Rngs(0))
+        # This module runs on CPU, where the default mosaic_gpu backend raises
+        # before any assertion below executes.
+        set_attn_backend(model, text_backend="xla")
 
         gen_calls = []
         orig_gen = model_mod.compute_mrope_pos_embeddings
         gen_spy = _make_spy(orig_gen, gen_calls)
 
         layer_calls = []
-        orig_layer_call = model_mod.TextDecoderLayer.__call__
-
-        def layer_spy(self_layer, hidden, sin_BTK, cos_BTK, mask):
-            layer_calls.append({"sin": sin_BTK.dtype, "cos": cos_BTK.dtype})
-            return orig_layer_call(self_layer, hidden, sin_BTK, cos_BTK, mask)
+        layer_spy = _make_spy(model_mod.TextDecoderLayer.__call__, layer_calls)
 
         B, T = 1, 8
         tokens = jnp.ones((B, T), dtype=jnp.int32)
@@ -231,7 +250,11 @@ class Qwen3VLRopeDtypeTest(_RopeDtypeTestBase):
             mock.patch.object(model_mod, "compute_mrope_pos_embeddings", gen_spy),
             mock.patch.object(model_mod.TextDecoderLayer, "__call__", layer_spy),
         ):
-            model(tokens, attn_mask)
+            model(
+                tokens,
+                attn_mask,
+                vision_patch_valid=jnp.empty((0,), dtype=jnp.bool_),
+            )
 
         self.assertLen(gen_calls, 1)
         gen_out_sin, gen_out_cos = orig_gen(
@@ -250,10 +273,14 @@ class Qwen3VLRopeDtypeTest(_RopeDtypeTestBase):
         self.assertGreater(len(layer_calls), 0)
         for i, call in enumerate(layer_calls):
             self.assertEqual(
-                call["sin"], MODEL_DTYPE, f"Layer {i}: sin_BTK should be {MODEL_DTYPE} after cast"
+                call["sin_BTK"],
+                MODEL_DTYPE,
+                f"Layer {i}: sin_BTK should be {MODEL_DTYPE} after cast",
             )
             self.assertEqual(
-                call["cos"], MODEL_DTYPE, f"Layer {i}: cos_BTK should be {MODEL_DTYPE} after cast"
+                call["cos_BTK"],
+                MODEL_DTYPE,
+                f"Layer {i}: cos_BTK should be {MODEL_DTYPE} after cast",
             )
 
 
@@ -271,10 +298,7 @@ class Qwen3VLVisionRopeDtypeTest(_RopeDtypeTestBase):
         vision = vis_mod.VisionModel(vis_cfg, shd_cfg=base_cfg.shd_cfg, rngs=nnx.Rngs(0))
 
         block_calls = []
-
-        def block_spy(self_blk, hidden, cu_seqlens, cos_NK, sin_NK):
-            block_calls.append({"cos": cos_NK.dtype, "sin": sin_NK.dtype})
-            return hidden  # skip actual block to avoid JAX dynamic-slice tracing issue
+        block_spy = _make_passthrough_spy(vis_mod.VisionBlock.__call__, block_calls, "hidden_ND")
 
         ms = vis_cfg.spatial_merge_size
         h, w = 2 * ms, 2 * ms
@@ -292,10 +316,10 @@ class Qwen3VLVisionRopeDtypeTest(_RopeDtypeTestBase):
         self.assertGreater(len(block_calls), 0)
         for i, call in enumerate(block_calls):
             self.assertEqual(
-                call["cos"], vis_cfg.dtype, f"Vision block {i}: cos_NK should be {vis_cfg.dtype}"
+                call["cos_NK"], vis_cfg.dtype, f"Vision block {i}: cos_NK should be {vis_cfg.dtype}"
             )
             self.assertEqual(
-                call["sin"], vis_cfg.dtype, f"Vision block {i}: sin_NK should be {vis_cfg.dtype}"
+                call["sin_NK"], vis_cfg.dtype, f"Vision block {i}: sin_NK should be {vis_cfg.dtype}"
             )
 
 
