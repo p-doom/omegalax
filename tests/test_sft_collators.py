@@ -9,6 +9,7 @@ import pickle
 import ml_dtypes
 import numpy as np
 from absl.testing import absltest
+from jinja2.exceptions import TemplateError
 from PIL import Image
 from transformers import AutoImageProcessor, AutoTokenizer
 
@@ -256,10 +257,26 @@ class TextEncodingTest(absltest.TestCase):
             for messages in (no_user, late_system):
                 with self.assertRaises(ValueError):
                     encoder.encode(messages)
-                with self.assertRaises(Exception):
+                with self.assertRaises(TemplateError):
                     tokenizer.apply_chat_template(
                         messages, tokenize=True, add_generation_prompt=False
                     )
+
+    def test_tool_response_text_is_not_treated_as_a_user_query(self):
+        messages = [
+            {"role": "user", "content": "<tool_response>result</tool_response>"},
+            {"role": "assistant", "content": "answer"},
+        ]
+        tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B", local_files_only=True)
+        encoded = Qwen3MessageEncoder(tokenizer, None, "qwen3").encode(messages)
+        reference = tokenizer.apply_chat_template(
+            messages, tokenize=True, add_generation_prompt=False
+        )["input_ids"]
+        np.testing.assert_array_equal(encoded["input_ids"], reference)
+
+        tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3.5-0.8B", local_files_only=True)
+        with self.assertRaisesRegex(ValueError, "user query"):
+            Qwen3MessageEncoder(tokenizer, None, "qwen3_5").encode(messages)
 
     def test_user_chatml_tokens_do_not_change_supervision(self):
         for model, model_type in TEXT_MODELS:
@@ -437,9 +454,7 @@ class VLMEncodingTest(absltest.TestCase):
                 {"role": "assistant", "content": "<think>\nkept\n</think>\n\nsecond"},
             ],
         ]
-        encoder = Qwen3MessageEncoder(
-            self.tokenizer, self.image_processor, VLM_MODEL_TYPE
-        )
+        encoder = Qwen3MessageEncoder(self.tokenizer, self.image_processor, VLM_MODEL_TYPE)
         for messages in cases:
             encoded = encoder.encode(messages)
             reference = self.tokenizer.apply_chat_template(
@@ -665,9 +680,9 @@ class ConversationMeasurementTest(absltest.TestCase):
         prepare = pickle.loads(
             pickle.dumps(make_conversation_measure_fn(tokenizer, None, model_type))
         )
-        result = prepare(
-            [{"role": "user", "content": "q"}, {"role": "assistant", "content": "a"}]
-        )(0, 2)
+        result = prepare([{"role": "user", "content": "q"}, {"role": "assistant", "content": "a"}])(
+            0, 2
+        )
         self.assertGreater(result["supervised_tokens"], 0)
 
 
