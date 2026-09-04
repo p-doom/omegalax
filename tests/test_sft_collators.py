@@ -262,6 +262,20 @@ class TextEncodingTest(absltest.TestCase):
         with self.assertRaisesRegex(ValueError, "must contain supervised tokens"):
             TextSFTCollator(tokenizer, max_length=64, model_type=model_type)([example])
 
+    def test_collator_does_not_impose_a_conversation_role_sequence(self):
+        model, model_type = TEXT_MODELS[0]
+        tokenizer = AutoTokenizer.from_pretrained(model, local_files_only=True)
+        messages = [
+            {"role": "system", "content": "first context"},
+            {"role": "system", "content": "second context"},
+            {"role": "user", "content": "first input"},
+            {"role": "user", "content": "second input"},
+            {"role": "assistant", "content": "first target"},
+            {"role": "assistant", "content": "second target"},
+        ]
+        batch = TextSFTCollator(tokenizer, 256, model_type)([{"messages": messages}])
+        self.assertGreater(int(batch["loss_mask_BT"].sum()), 0)
+
     def test_video_placeholder_is_rejected(self):
         model, model_type = TEXT_MODELS[0]
         tokenizer = AutoTokenizer.from_pretrained(model, local_files_only=True)
@@ -396,9 +410,9 @@ class VLMEncodingTest(absltest.TestCase):
                 literal
             )
         with self.assertRaisesRegex(ValueError, "video content"):
-            make_message_length_fn(
-                self.tokenizer, self.image_processor, VLM_MODEL_TYPE
-            ).reject_unmeasurable(literal)
+            make_message_length_fn(self.tokenizer, self.image_processor, VLM_MODEL_TYPE)(
+                literal[0]
+            )
         with self.assertRaisesRegex(ValueError, "image content requires"):
             make_message_length_fn(self.tokenizer, None, VLM_MODEL_TYPE)(
                 self._messages(Image.new("RGB", (8, 8)))[1]

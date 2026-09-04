@@ -346,33 +346,6 @@ def _measure_init(measure_message) -> None:
     _measure_fn = measure_message
 
 
-def _preflight_measure_fn(measure_message, tasks, chat_path) -> None:
-    """Reject a whole-run misconfiguration in the PARENT, before spawning workers.
-
-    A measure fn that cannot handle a message raises on the first one — but that
-    happens inside a pool worker, so the operator sees a child traceback with the
-    pool machinery stacked on top, after the job has started, instead of the flag
-    they forgot. The task list is already fully enumerated here, so the same
-    check is affordable up front.
-
-    The condition itself lives on the measure fn (``reject_unmeasurable``), not
-    here, so the two boundaries cannot disagree about what is measurable. A
-    caller's own measure fn that does not declare one is left alone: an arbitrary
-    callable has no contract this could check.
-    """
-    reject_unmeasurable = getattr(measure_message, "reject_unmeasurable", None)
-    if reject_unmeasurable is None:
-        return
-    for conv_idx, messages in tasks:
-        try:
-            reject_unmeasurable(messages)
-        except ValueError as exc:
-            raise ValueError(
-                f"{Path(chat_path).name} conversation {conv_idx}: {exc} "
-                "Every worker would fail on it."
-            ) from exc
-
-
 def _compute_message_lengths_from_chat(chat_path, measure_message, num_workers) -> dict:
     """Measure every message in a chat.jsonl under ``spawn``.
 
@@ -383,14 +356,11 @@ def _compute_message_lengths_from_chat(chat_path, measure_message, num_workers) 
     clean; ``measure_message`` is shipped to each worker via the pool
     initializer since spawn does not inherit globals.
     """
-    conversations: list[tuple[int, list[dict[str, Any]]]] = []
     tasks: list[tuple[tuple[int, int], dict[str, Any]]] = []
     for conv_idx, _sid, _meta, messages in _iter_chat_conversations(chat_path):
-        conversations.append((conv_idx, messages))
         tasks.extend(((conv_idx, offset), message) for offset, message in enumerate(messages))
     if not tasks:
         return {}
-    _preflight_measure_fn(measure_message, conversations, chat_path)
     ctx = mp.get_context("spawn")
     chunksize = max(1, min(32, len(tasks) // num_workers))
     with ctx.Pool(num_workers, initializer=_measure_init, initargs=(measure_message,)) as pool:

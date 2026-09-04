@@ -179,26 +179,6 @@ def _validate_message(message: dict[str, Any], *, multimodal: bool, family: str)
             raise ValueError("images are supported only in user turns")
 
 
-def _validate_messages(messages: list[dict[str, Any]], *, multimodal: bool, family: str) -> None:
-    if not isinstance(messages, list) or not messages:
-        raise ValueError("messages must be a non-empty list")
-    expected_role = (
-        "system"
-        if isinstance(messages[0], dict) and messages[0].get("role") == "system"
-        else "user"
-    )
-    for index, message in enumerate(messages):
-        _validate_message(message, multimodal=multimodal, family=family)
-        if message["role"] != expected_role:
-            raise ValueError(
-                f"messages[{index}].role must be {expected_role!r}, got {message['role']!r}"
-            )
-        if message["role"] == "system":
-            expected_role = "user"
-        else:
-            expected_role = "user" if message["role"] == "assistant" else "assistant"
-
-
 def _assistant_loss_mask(block_ids: np.ndarray) -> np.ndarray:
     mask = np.zeros(len(block_ids), dtype=np.int32)
     mask[_CHATML_HEADER_TOKENS:-_CHATML_TRAILING_TOKENS] = 1
@@ -280,7 +260,10 @@ class Qwen3MessageEncoder:
 
     def encode(self, messages: list[dict[str, Any]]) -> dict[str, np.ndarray]:
         multimodal = self.image_processor is not None
-        _validate_messages(messages, multimodal=multimodal, family=self.family)
+        if not isinstance(messages, list) or not messages:
+            raise ValueError("messages must be a non-empty list")
+        for message in messages:
+            _validate_message(message, multimodal=multimodal, family=self.family)
         images_by_turn = [_extract_images([message]) for message in messages]
         images = [image for turn_images in images_by_turn for image in turn_images]
         pixel_values, grids = self._process_images(images)
@@ -345,13 +328,6 @@ class _MessageLengthFn:
         model_type: str,
     ) -> None:
         self.encoder = Qwen3MessageEncoder(tokenizer, image_processor, model_type)
-
-    def reject_unmeasurable(self, messages: list[dict[str, Any]]) -> None:
-        _validate_messages(
-            messages,
-            multimodal=self.encoder.image_processor is not None,
-            family=self.encoder.family,
-        )
 
     def __call__(self, message: dict[str, Any]) -> dict[str, Any]:
         return self.encoder.measure(message)
