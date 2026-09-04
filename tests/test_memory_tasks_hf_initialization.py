@@ -21,6 +21,7 @@ from omegalax.distributed.mesh import mesh_rules_for
 from omegalax.models.qwen3_5.config import make_config
 from omegalax.models.qwen3_5.model import Qwen3_5ForConditionalGeneration
 from omegalax.models.qwen3_5.params import export_qwen3_5_to_safetensors
+from omegalax.text.checkpoint import resolve_checkpoint
 from omegalax.trainers import tail_pretrain
 from scripts import train_memory_tasks
 from tests.pretrain_real_data_test_utils import test_temp_dir
@@ -235,6 +236,56 @@ class MemoryTaskHfInitializationTest(absltest.TestCase):
                 )
 
             self.assertTrue((save_dir / "000002").is_dir())
+
+    def test_model_checkpoint_offset_uses_local_save_interval(self):
+        with test_temp_dir() as tmp:
+            tmpdir = Path(tmp)
+            source = tmpdir / "hf"
+            _write_tiny_hf_source(source)
+
+            source_dir = tmpdir / "source"
+            with contextlib.redirect_stdout(io.StringIO()):
+                train_memory_tasks.main(
+                    [
+                        "--task=exact",
+                        "--condition=state",
+                        f"--save_dir={source_dir}",
+                        f"--init_hf_model_path={source}",
+                        "--num_steps=1",
+                        "--pairs_per_batch=1",
+                        "--save_every=1",
+                        "--log_every=0",
+                        f"--jax_cache_dir={tmpdir / 'source-jax-cache'}",
+                        "--text_attn_backend=xla",
+                        f"--run_plan_sha256={'d' * 64}",
+                        "--success_criterion=source checkpoint for local save interval test",
+                    ]
+                )
+
+            tail_dir = tmpdir / "tail"
+            with contextlib.redirect_stdout(io.StringIO()):
+                train_memory_tasks.main(
+                    [
+                        "--task=exact",
+                        "--condition=state",
+                        f"--save_dir={tail_dir}",
+                        f"--init_model_checkpoint={source_dir / '000001'}",
+                        "--num_steps=4",
+                        "--pairs_per_batch=1",
+                        "--save_every=2",
+                        "--log_every=0",
+                        f"--jax_cache_dir={tmpdir / 'tail-jax-cache'}",
+                        "--text_attn_backend=xla",
+                        f"--run_plan_sha256={'e' * 64}",
+                        "--success_criterion=local save interval with non-aligned global offset",
+                    ]
+                )
+
+            self.assertTrue((tail_dir / "000003").is_dir())
+            self.assertTrue((tail_dir / "000005").is_dir())
+            self.assertEqual(resolve_checkpoint(tail_dir).step, 5)
+            cursor = json.loads((tail_dir / "000005/input_iter/process_0-of-1.json").read_text())
+            self.assertEqual(cursor["next_index"], 4)
 
     def test_real_scratch_stop_and_exact_resume_path(self):
         with test_temp_dir() as tmp:
