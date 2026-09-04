@@ -42,7 +42,7 @@ class DispatcherTest(absltest.TestCase):
     def setUp(self):
         super().setUp()
         # test_qwen3_5_deltanet_xla_hf_smoke.py sets this env var at import time,
-        # so a shared pytest process leaks it in; every case here sets its own.
+        # so a shared test process leaks it in; every case here sets its own.
         patcher = mock.patch.dict(os.environ)
         patcher.start()
         self.addCleanup(patcher.stop)
