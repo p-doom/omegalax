@@ -51,15 +51,15 @@ def _legacy_loss_mask(input_ids: np.ndarray, tokenizer) -> np.ndarray:
 class TextEncodingTest(absltest.TestCase):
     def test_qwen3_and_qwen35_match_their_chat_templates(self):
         messages = [
-            {"role": "system", "content": "system"},
-            {"role": "user", "content": "first"},
+            {"role": "system", "content": "  system  "},
+            {"role": "user", "content": "  first  "},
             {
                 "role": "assistant",
-                "reasoning_content": "historical reasoning",
-                "content": "answer one",
+                "reasoning_content": "  historical reasoning  ",
+                "content": "  answer one  ",
             },
-            {"role": "user", "content": "second"},
-            {"role": "assistant", "content": "answer two"},
+            {"role": "user", "content": "  second  "},
+            {"role": "assistant", "content": "  answer two  "},
         ]
         for model, model_type in TEXT_MODELS:
             tokenizer = AutoTokenizer.from_pretrained(model, local_files_only=True)
@@ -410,9 +410,7 @@ class VLMEncodingTest(absltest.TestCase):
                 literal
             )
         with self.assertRaisesRegex(ValueError, "video content"):
-            make_message_length_fn(self.tokenizer, self.image_processor, VLM_MODEL_TYPE)(
-                literal[0]
-            )
+            make_message_length_fn(self.tokenizer, self.image_processor, VLM_MODEL_TYPE)(literal[0])
         with self.assertRaisesRegex(ValueError, "image content requires"):
             make_message_length_fn(self.tokenizer, None, VLM_MODEL_TYPE)(
                 self._messages(Image.new("RGB", (8, 8)))[1]

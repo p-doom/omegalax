@@ -14,12 +14,11 @@ import numpy as np
 from PIL import Image
 from transformers import BaseImageProcessor, PreTrainedTokenizer
 
+from omegalax.data.qwen3_renderers import renderer_for_model_type
+
 _ARRAYRECORD_IMAGE_CACHE_SIZE = int(os.environ.get("OMEGALAX_ARRAYRECORD_IMAGE_CACHE_SIZE", "128"))
 _ARRAYRECORD_IMAGE_SOURCES: OrderedDict[str, Any] = OrderedDict()
 
-_QWEN3_MODEL_TYPES = {"qwen3", "qwen3_moe"}
-_QWEN3_VL_MODEL_TYPES = {"qwen3_vl", "qwen3_vl_moe"}
-_QWEN3_5_MODEL_TYPES = {"qwen3_5", "qwen3_5_moe"}
 _CHATML_HEADER_TOKENS = 3
 _CHATML_TRAILING_TOKENS = 1
 
@@ -113,17 +112,7 @@ def _extract_images(messages: list[dict[str, Any]]) -> list[Image.Image]:
 atexit.register(_close_arrayrecord_image_sources)
 
 
-def _family(model_type: str) -> str:
-    if model_type in _QWEN3_MODEL_TYPES:
-        return "qwen3"
-    if model_type in _QWEN3_VL_MODEL_TYPES:
-        return "qwen3_vl"
-    if model_type in _QWEN3_5_MODEL_TYPES:
-        return "qwen3_5"
-    raise ValueError(f"unsupported Qwen model_type: {model_type!r}")
-
-
-def _validate_message(message: dict[str, Any], *, multimodal: bool, family: str) -> None:
+def _validate_message(message: dict[str, Any], *, multimodal: bool) -> None:
     if (
         not isinstance(message, dict)
         or not {"role", "content"} <= set(message)
@@ -148,10 +137,6 @@ def _validate_message(message: dict[str, Any], *, multimodal: bool, family: str)
     if isinstance(content, str):
         if "<|video_pad|>" in content:
             raise ValueError("video content is not supported")
-        if role == "assistant" and family == "qwen3" and content.startswith("\n"):
-            raise ValueError("Qwen3 assistant content must not start with a newline")
-        if role == "assistant" and family != "qwen3_vl" and "</think>" in content:
-            raise ValueError("pre-rendered reasoning content is not supported")
         return
     if not isinstance(content, list) or not content:
         raise ValueError("message content must be a string or a non-empty multimodal part list")
@@ -171,8 +156,6 @@ def _validate_message(message: dict[str, Any], *, multimodal: bool, family: str)
                 raise ValueError("text parts must contain exactly type and string text")
             if "<|video_pad|>" in part["text"]:
                 raise ValueError("video content is not supported")
-            if role == "assistant" and family != "qwen3_vl" and "</think>" in part["text"]:
-                raise ValueError("pre-rendered reasoning content is not supported")
         elif set(part) != {"type", "image"}:
             raise ValueError("image parts must contain exactly type and image")
         elif role != "user":
@@ -189,12 +172,6 @@ def _message_is_supervised(message: dict[str, Any]) -> bool:
     return message["role"] == "assistant" and message.get("loss", True)
 
 
-def _reasoning_prefix(message: dict[str, Any], family: str) -> str:
-    reasoning = message.get("reasoning_content") or ""
-    reasoning = reasoning.strip("\n") if family == "qwen3" else reasoning.strip()
-    return f"<think>\n{reasoning}\n</think>\n\n"
-
-
 class Qwen3MessageEncoder:
     def __init__(
         self,
@@ -204,8 +181,8 @@ class Qwen3MessageEncoder:
     ) -> None:
         self.tokenizer = tokenizer
         self.image_processor = image_processor
-        self.family = _family(model_type)
-        if self.family == "qwen3" and image_processor is not None:
+        self._renderer, supports_images = renderer_for_model_type(model_type)
+        if image_processor is not None and not supports_images:
             raise ValueError("Qwen3 text encoding does not accept an image processor")
         self.merge_size = int(getattr(image_processor, "merge_size", 1))
 
@@ -236,20 +213,13 @@ class Qwen3MessageEncoder:
                         "<|vision_start|>" + "<|image_pad|>" * image_tokens + "<|vision_end|>"
                     )
             text = "".join(parts)
-        return text.strip() if self.family == "qwen3_5" else text
+        return text
 
-    def _block(
-        self,
-        message: dict[str, Any],
-        grids: np.ndarray,
-        *,
-        terminal_assistant: bool,
-    ) -> tuple[np.ndarray, np.ndarray]:
+    def _render(self, message: dict[str, Any], grids: np.ndarray) -> tuple[str, str]:
         content = self._content(message, grids)
-        role = message["role"]
-        if terminal_assistant and role == "assistant" and self.family != "qwen3_vl":
-            content = _reasoning_prefix(message, self.family) + content
-        text = f"<|im_start|>{role}\n{content}<|im_end|>\n"
+        return self._renderer(message, content)
+
+    def _encode_block(self, message: dict[str, Any], text: str) -> tuple[np.ndarray, np.ndarray]:
         ids = np.asarray(self.tokenizer.encode(text, add_special_tokens=False), dtype=np.int32)
         mask = (
             _assistant_loss_mask(ids)
@@ -263,7 +233,7 @@ class Qwen3MessageEncoder:
         if not isinstance(messages, list) or not messages:
             raise ValueError("messages must be a non-empty list")
         for message in messages:
-            _validate_message(message, multimodal=multimodal, family=self.family)
+            _validate_message(message, multimodal=multimodal)
         images_by_turn = [_extract_images([message]) for message in messages]
         images = [image for turn_images in images_by_turn for image in turn_images]
         pixel_values, grids = self._process_images(images)
@@ -274,10 +244,9 @@ class Qwen3MessageEncoder:
         for index, (message, turn_images) in enumerate(zip(messages, images_by_turn, strict=True)):
             turn_grids = grids[grid_offset : grid_offset + len(turn_images)]
             grid_offset += len(turn_images)
-            ids, mask = self._block(
-                message,
-                turn_grids,
-                terminal_assistant=index == len(messages) - 1,
+            historical, terminal = self._render(message, turn_grids)
+            ids, mask = self._encode_block(
+                message, terminal if index == len(messages) - 1 else historical
             )
             id_parts.append(ids)
             mask_parts.append(mask)
@@ -293,26 +262,22 @@ class Qwen3MessageEncoder:
 
     def measure(self, message: dict[str, Any]) -> dict[str, Any]:
         multimodal = self.image_processor is not None
-        _validate_message(message, multimodal=multimodal, family=self.family)
+        _validate_message(message, multimodal=multimodal)
         images = _extract_images([message])
         _, grids = self._process_images(images)
-        ids, mask = self._block(message, grids, terminal_assistant=False)
+        historical, terminal = self._render(message, grids)
+        ids, mask = self._encode_block(message, historical)
+        if terminal == historical:
+            terminal_ids, terminal_mask = ids, mask
+        else:
+            terminal_ids, terminal_mask = self._encode_block(message, terminal)
         vision_patches = sum(int(np.prod(grid, dtype=np.int64)) for grid in grids)
         vision_tokens = vision_patches // self.merge_size**2
-        terminal_delta = 0
-        if message["role"] == "assistant" and self.family != "qwen3_vl":
-            terminal_delta = len(
-                self.tokenizer.encode(
-                    _reasoning_prefix(message, self.family), add_special_tokens=False
-                )
-            )
         return {
             "length": len(ids),
-            "terminal_length_delta": terminal_delta,
+            "terminal_length_delta": len(terminal_ids) - len(ids),
             "supervised_tokens": int(mask.sum()),
-            "terminal_supervised_tokens_delta": (
-                terminal_delta if _message_is_supervised(message) else 0
-            ),
+            "terminal_supervised_tokens_delta": int(terminal_mask.sum() - mask.sum()),
             "vision_tokens": vision_tokens,
             "vision_patches": vision_patches,
             "num_images": len(grids),
