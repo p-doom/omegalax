@@ -98,6 +98,26 @@ class MemoryTaskEvalSubmitterTest(absltest.TestCase):
         )
         self.assertEqual(rendered_python, f"PYTHON_BIN={venv_python}")
 
+    def test_renderer_allows_raw_only_eval_without_wiki_mirror(self):
+        with test_temp_dir() as tmp:
+            tmpdir = Path(tmp)
+            eval_args = [
+                argument
+                for argument in self._eval_args(tmpdir / "checkpoint")
+                if not argument.startswith("--wiki_mirror_dir=")
+            ]
+            script = submit_memory_tasks_eval_slurm.render_sbatch(
+                repo_root=tmpdir / "repo",
+                python_bin=tmpdir / "python",
+                job_name="memory-eval-test",
+                log_dir=tmpdir / "logs",
+                time_limit="02:00:00",
+                eval_args=eval_args,
+                expected_commit="test-commit",
+            )
+
+        self.assertNotIn("--wiki_mirror_dir", script)
+
     def test_renderer_requires_the_canonical_pair_manifest(self):
         with test_temp_dir() as tmp:
             tmpdir = Path(tmp)

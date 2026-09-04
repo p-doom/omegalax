@@ -1340,7 +1340,6 @@ class MemoryTaskTest(parameterized.TestCase):
                 "--pairs_per_batch=1",
                 "--text_attn_backend=xla",
                 f"--jax_cache_dir={tmpdir / 'eval_jax_cache'}",
-                f"--wiki_mirror_dir={mirror_dir}",
             ]
             incomplete_manifest = json.loads(manifest_path.read_text())
             incomplete_manifest["pollution_guard"]["training_streams"] = [
@@ -1387,11 +1386,15 @@ class MemoryTaskTest(parameterized.TestCase):
                     "deltanet_kernel": "xla",
                 },
             )
+            self.assertTrue((eval_dir / "raw.jsonl").is_file())
+            self.assertTrue((eval_dir / "summary.json").is_file())
             self.assertTrue((eval_dir / "artifact_manifest.json").is_file())
-            self.assertTrue((mirror_dir / "accuracy.svg").is_file())
-            self.assertTrue((mirror_dir / "answer_nll.svg").is_file())
-            self.assertTrue((mirror_dir / "README.md").is_file())
-            self.assertFalse((mirror_dir / "raw.jsonl").exists())
+            self.assertTrue((eval_dir / "plots" / "accuracy.svg").is_file())
+            self.assertTrue((eval_dir / "plots" / "answer_nll.svg").is_file())
+            self.assertEqual(
+                json.loads((eval_dir / "status.json").read_text()), {"status": "complete"}
+            )
+            self.assertFalse(mirror_dir.exists())
 
             final_manifest_path = tmpdir / "final_eval_manifest.json"
             with contextlib.redirect_stdout(io.StringIO()):
@@ -1473,6 +1476,11 @@ class MemoryTaskTest(parameterized.TestCase):
             final_eval_config = json.loads((final_eval_dir / "eval_config.json").read_text())
             self.assertEqual(final_eval_config["eval_role"], "final")
             self.assertTrue((final_eval_dir / "artifact_manifest.json").is_file())
+            final_mirror_dir = tmpdir / "final_wiki_mirror"
+            self.assertTrue((final_mirror_dir / "accuracy.svg").is_file())
+            self.assertTrue((final_mirror_dir / "answer_nll.svg").is_file())
+            self.assertTrue((final_mirror_dir / "README.md").is_file())
+            self.assertFalse((final_mirror_dir / "raw.jsonl").exists())
 
     def test_zero_shot_horizon_override_runs_real_cli_and_preserves_immutable_outputs(self):
         # This is deliberately end-to-end: train_memory_tasks creates the

@@ -128,7 +128,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--dp_size", type=int, default=1)
     parser.add_argument("--text_attn_backend", default="mosaic_gpu")
     parser.add_argument("--jax_cache_dir", type=Path, required=True)
-    parser.add_argument("--wiki_mirror_dir", type=Path, required=True)
+    parser.add_argument("--wiki_mirror_dir", type=Path)
     return parser
 
 
@@ -661,7 +661,8 @@ def main(argv: list[str] | None = None) -> None:
     _write_json(run_dir / "summary.json", summary)
     _plot(mode_summary, run_dir / "plots")
     artifact_manifest = _write_artifact_manifest(run_dir)
-    _mirror_svgs(run_dir, args.wiki_mirror_dir, artifact_manifest)
+    if args.wiki_mirror_dir is not None:
+        _mirror_svgs(run_dir, args.wiki_mirror_dir, artifact_manifest)
     _write_json(run_dir / "status.json", {"status": "complete"})
     print(json.dumps({"run_dir": str(run_dir), **summary}, sort_keys=True))
 
