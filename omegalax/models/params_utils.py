@@ -406,16 +406,7 @@ def flatten_pure_state(tree: dict[str, Any]) -> dict[str, Any]:
 
 
 def save_hf_tensors(hf_tensors: dict[str, np.ndarray], tensor_path: str | epath.Path):
-    """Serialize HF-layout tensors to a safetensors file, rewriting `hf_tensors` in place.
-
-    safetensors copies each tensor straight off `ctypes.data` for `nbytes` and
-    ignores strides, so a transposed or permuted view is written as its
-    pre-transpose buffer under the post-transpose shape: a file that loads at
-    the right shape with the wrong values. `inverse_transform` returns such a
-    view for every LINEAR kernel, so this is the common case, not the corner.
-    Each copy replaces its view in the caller's dict rather than accumulating
-    into a second one, which would hold two whole models in host memory.
-    """
+    """Write HF tensors after making transformed NumPy views contiguous."""
     for key in list(hf_tensors):
         hf_tensors[key] = np.ascontiguousarray(hf_tensors[key])
     stnp.save_file(hf_tensors, str(tensor_path))
