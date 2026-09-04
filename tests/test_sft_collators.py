@@ -2,7 +2,6 @@
 
 import os
 
-os.environ.setdefault("HF_HOME", "/fast/project/HFMI_SynergyUnit/p-doom_shared/huggingface")
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
 import pickle
