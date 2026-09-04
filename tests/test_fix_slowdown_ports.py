@@ -85,16 +85,17 @@ class CuDnnPackedVisionAttentionTest(absltest.TestCase):
         k = rng.randn(N, H, K).astype(np.float32) * 0.1
         v = rng.randn(N, H, K).astype(np.float32) * 0.1
         cu = np.concatenate([[0], np.cumsum(seg_sizes)]).astype(np.int32)
+        grid = np.asarray([[1, 1, size] for size in seg_sizes], dtype=np.int32)
 
         with mesh_rules_for(tp_size=1, fsdp_size=1, dp_size=1) as mesh:
             replicated = NamedSharding(mesh, PartitionSpec())
             q_jax = jax.device_put(jnp.asarray(q, dtype=jnp.bfloat16), replicated)
             k_jax = jax.device_put(jnp.asarray(k, dtype=jnp.bfloat16), replicated)
             v_jax = jax.device_put(jnp.asarray(v, dtype=jnp.bfloat16), replicated)
-            cu_jax = jax.device_put(jnp.asarray(cu), replicated)
+            grid_jax = jax.device_put(jnp.asarray(grid), replicated)
 
             scale = 1.0 / (K**0.5)
-            out_cudnn = _cudnn_packed_vision_attention(q_jax, k_jax, v_jax, cu_jax, scale)
+            out_cudnn = _cudnn_packed_vision_attention(q_jax, k_jax, v_jax, grid_jax, scale)
             out_ref = _block_diag_reference(q_jax, k_jax, v_jax, cu, scale)
 
         np.testing.assert_allclose(

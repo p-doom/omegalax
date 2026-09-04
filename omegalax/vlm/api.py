@@ -7,6 +7,7 @@ from pathlib import Path
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import nnx
 from jax.sharding import Mesh, PartitionSpec
 
@@ -44,6 +45,77 @@ from omegalax.models.sharding_runtime import (
 )
 
 VLMConfig = Qwen3_5Config | Qwen3VLConfig
+
+
+def _validate_qwen3_5_process_local_batch(batch: dict, cfg: Qwen3_5Config, mesh: Mesh) -> None:
+    required = {
+        "token_ids_BT",
+        "pixel_values",
+        "vision_patch_valid",
+        "image_grid_thw",
+        "vision_cu_seqlens",
+    }
+    missing = required - batch.keys()
+    if missing:
+        raise ValueError(f"Qwen3.5 vision batch is missing {sorted(missing)}")
+
+    expected_axis = "fsdp" if mesh.shape["fsdp"] > 1 else None
+    if (
+        tuple(mesh.axis_names) != ("tp", "fsdp", "dp")
+        or mesh.shape["tp"] != 1
+        or mesh.shape["dp"] != 1
+        or cfg.text_config.shd_cfg.act_btd[0] != expected_axis
+        or jax.process_count() != mesh.shape["fsdp"]
+        or jax.local_device_count() != 1
+    ):
+        raise ValueError(
+            "Qwen3.5 vision batches require tp=1, dp=1, one local device per process, "
+            "process_count=fsdp, and batch sharding on fsdp"
+        )
+
+    token_ids = np.asarray(batch["token_ids_BT"])
+    pixel_values = np.asarray(batch["pixel_values"])
+    patch_valid = np.asarray(batch["vision_patch_valid"])
+    grid_thw = np.asarray(batch["image_grid_thw"])
+    cu_seqlens = np.asarray(batch["vision_cu_seqlens"])
+    if token_ids.ndim != 2 or token_ids.shape[0] != 1:
+        raise ValueError(
+            "Qwen3.5 vision sharding requires exactly one padded sample per process; "
+            f"got token_ids_BT shape {token_ids.shape}"
+        )
+    if pixel_values.ndim != 2 or pixel_values.shape[0] == 0:
+        raise ValueError(
+            "Qwen3.5 vision sharding requires a non-empty fixed pixel_values block per process"
+        )
+    if grid_thw.ndim != 2 or grid_thw.shape[1] != 3 or np.any(grid_thw <= 0):
+        raise ValueError(
+            f"Qwen3.5 image_grid_thw must have positive shape (M, 3); got {grid_thw.shape}"
+        )
+    if np.any(grid_thw[:, 0] != 1):
+        raise ValueError("Qwen3.5 vision sharding supports images only; every grid t must equal 1")
+
+    expected_cu = np.concatenate(
+        [
+            np.zeros(1, dtype=np.int32),
+            np.cumsum(np.prod(grid_thw, axis=-1, dtype=np.int32), dtype=np.int32),
+        ]
+    )
+    if pixel_values.shape[0] != int(expected_cu[-1]):
+        raise ValueError(
+            "Qwen3.5 process-local pixel_values and image_grid_thw disagree: "
+            f"{pixel_values.shape[0]} patches != {int(expected_cu[-1])} grid patches"
+        )
+    if cu_seqlens.shape != expected_cu.shape or not np.array_equal(cu_seqlens, expected_cu):
+        raise ValueError(
+            "Qwen3.5 vision_cu_seqlens must match the padded image_grid_thw boundaries"
+        )
+    if patch_valid.shape != (pixel_values.shape[0],):
+        raise ValueError(
+            "Qwen3.5 vision_patch_valid must have one entry per pixel patch; "
+            f"got {patch_valid.shape} for {pixel_values.shape[0]} patches"
+        )
+    if np.any(patch_valid[1:] > patch_valid[:-1]):
+        raise ValueError("Qwen3.5 vision_patch_valid must be a valid-prefix mask")
 
 
 def resolve_config(model_or_id: str | VLMConfig) -> VLMConfig:
@@ -104,7 +176,7 @@ def shard_batch(token_ids_BT: jax.Array, cfg: VLMConfig, mesh: Mesh) -> jax.Arra
 def shard_batch_dict(batch: dict, cfg: VLMConfig, mesh: Mesh) -> dict[str, jax.Array]:
     """Shard every array in a batch dict (batch dim sharded, rest replicated)."""
     if isinstance(cfg, Qwen3_5Config):
-        # Process-local cumulative offsets cannot be concatenated across hosts.
+        _validate_qwen3_5_process_local_batch(batch, cfg, mesh)
         batch = {key: value for key, value in batch.items() if key != "vision_cu_seqlens"}
         return runtime_shard_batch_dict(batch, cfg.text_config.shd_cfg, mesh)
     if isinstance(cfg, Qwen3VLConfig):

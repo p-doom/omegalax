@@ -60,19 +60,54 @@ def _cudnn_packed_vision_attention(
     q_NHK: jax.Array,
     k_NHK: jax.Array,
     v_NHK: jax.Array,
-    cu_seqlens: jax.Array,
+    image_grid_thw: jax.Array,
     scale: float,
 ) -> jax.Array:
     sharding = jax.typeof(q_NHK).sharding
+    for name, value in (("k", k_NHK), ("v", v_NHK)):
+        if jax.typeof(value).sharding != sharding:
+            raise ValueError(f"Qwen3.5 vision {name} sharding must match q sharding")
+    grid_sharding = jax.typeof(image_grid_thw).sharding
+    if tuple(sharding.mesh.axis_names) != ("tp", "fsdp", "dp"):
+        raise ValueError(
+            "Qwen3.5 vision attention requires mesh axes ('tp', 'fsdp', 'dp')"
+        )
+    if sharding.mesh.shape["tp"] != 1 or sharding.mesh.shape["dp"] != 1:
+        raise ValueError(
+            "Qwen3.5 vision attention requires tp=1 and dp=1; "
+            f"got tp={sharding.mesh.shape['tp']} and dp={sharding.mesh.shape['dp']}"
+        )
+    if grid_sharding.mesh != sharding.mesh:
+        raise ValueError("q/k/v and image_grid_thw must use the same mesh")
+
+    sequence_axis = "fsdp" if sharding.mesh.shape["fsdp"] > 1 else None
     qkv_spec = sharding.spec
-    cu_spec = jax.typeof(cu_seqlens).sharding.spec
+    grid_spec = grid_sharding.spec
+    if qkv_spec != P(sequence_axis, None, None):
+        raise ValueError(
+            "Qwen3.5 vision q/k/v must shard only the sequence axis over fsdp; "
+            f"got {qkv_spec}"
+        )
+    if grid_spec != P(sequence_axis, None):
+        raise ValueError(
+            "Qwen3.5 image_grid_thw must shard its image axis over fsdp; "
+            f"got {grid_spec}"
+        )
+
+    def local_attention(q, k, v, grid):
+        segment_lengths = jnp.prod(grid, axis=-1, dtype=jnp.int32)
+        cu_seqlens = jnp.concatenate(
+            [jnp.zeros(1, dtype=jnp.int32), jnp.cumsum(segment_lengths, dtype=jnp.int32)]
+        )
+        return _cudnn_packed_vision_attention_local(q, k, v, cu_seqlens, scale)
+
     return jax.shard_map(
-        lambda q, k, v, cu: _cudnn_packed_vision_attention_local(q, k, v, cu, scale),
+        local_attention,
         mesh=sharding.mesh,
-        in_specs=(qkv_spec, qkv_spec, qkv_spec, cu_spec),
+        in_specs=(qkv_spec, qkv_spec, qkv_spec, grid_spec),
         out_specs=qkv_spec,
         check_vma=False,
-    )(q_NHK, k_NHK, v_NHK, cu_seqlens)
+    )(q_NHK, k_NHK, v_NHK, image_grid_thw)
 
 
 def _token_spatial_coords(
@@ -218,7 +253,7 @@ class VisionAttention(nnx.Module):
     def __call__(
         self,
         hidden_ND: jax.Array,
-        cu_seqlens: jax.Array,
+        image_grid_thw: jax.Array,
         cos_NK: jax.Array,
         sin_NK: jax.Array,
     ) -> jax.Array:
@@ -232,17 +267,11 @@ class VisionAttention(nnx.Module):
 
         q_NHK, k_NHK = apply_vision_rope(q_NHK, k_NHK, cos_NK, sin_NK)
 
-        # Equal token shards can split images, invalidating packed offsets.
-        attn_in_shd = P(None, self.heads_shd[1], self.heads_shd[2])
-        q_NHK = reshard(q_NHK, attn_in_shd)
-        k_NHK = reshard(k_NHK, attn_in_shd)
-        v_NHK = reshard(v_NHK, attn_in_shd)
-
         attn_NHK = _cudnn_packed_vision_attention(
             q_NHK,
             k_NHK,
             v_NHK,
-            cu_seqlens,
+            image_grid_thw,
             self.scale,
         )
         outputs_ND = attn_NHK.reshape(N, -1)
@@ -266,8 +295,10 @@ class VisionBlock(nnx.Module):
         self.hidden_shd = hidden_shd
 
     @partial(jax.remat, static_argnums=0)
-    def __call__(self, hidden_ND, cu_seqlens, cos_NK, sin_NK):
-        hidden_ND = hidden_ND + self.attn(self.norm1(hidden_ND), cu_seqlens, cos_NK, sin_NK)
+    def __call__(self, hidden_ND, image_grid_thw, cos_NK, sin_NK):
+        hidden_ND = hidden_ND + self.attn(
+            self.norm1(hidden_ND), image_grid_thw, cos_NK, sin_NK
+        )
         hidden_ND = hidden_ND + self.mlp(self.norm2(hidden_ND))
         return hidden_ND
 
@@ -407,6 +438,7 @@ class VisionModel(nnx.Module):
         pixel_values: jax.Array,
         grid_thw: jax.Array,
     ) -> jax.Array:
+        sharded_grid_thw = grid_thw
         grid_thw = reshard(grid_thw, P())
         hidden_ND = self.patch_embed(pixel_values)
         total_tokens: int = hidden_ND.shape[0]
@@ -422,12 +454,7 @@ class VisionModel(nnx.Module):
         cos_NK = cos_NK.astype(self.cfg.dtype)
         sin_NK = sin_NK.astype(self.cfg.dtype)
 
-        segment_lengths = jnp.prod(grid_thw, axis=-1, dtype=jnp.int32)
-        cu_seqlens = jnp.concatenate(
-            [jnp.zeros(1, dtype=jnp.int32), jnp.cumsum(segment_lengths, dtype=jnp.int32)]
-        )
-
         for blk in self.blocks:
-            hidden_ND = blk(hidden_ND, cu_seqlens, cos_NK, sin_NK)
+            hidden_ND = blk(hidden_ND, sharded_grid_thw, cos_NK, sin_NK)
 
         return self.merger(hidden_ND, self.cfg.spatial_merge_size)

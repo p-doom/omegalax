@@ -65,6 +65,32 @@ def _put(mesh, value, spec):
     return jax.device_put(jnp.asarray(value), NamedSharding(mesh, spec))
 
 
+def _vision_batch():
+    grids = np.tile(
+        np.asarray([[1, 1, 1], [1, 1, 3]], dtype=np.int32),
+        (4, 1),
+    )
+    return {
+        "token_ids_BT": np.full((4, 4), 2, dtype=np.int32),
+        "attention_mask_BT": np.ones((4, 4), dtype=np.int32),
+        "loss_mask_BT": np.tile(np.asarray([[0, 1, 1, 1]], dtype=np.int32), (4, 1)),
+        "pixel_values": np.arange(16, dtype=np.float32).reshape(16, 1),
+        "vision_patch_valid": np.ones((16,), dtype=np.bool_),
+        "image_grid_thw": grids,
+        "position_ids_ZBT": np.broadcast_to(np.arange(4, dtype=np.int32), (3, 4, 4)).copy(),
+    }
+
+
+def _shard_global_batch(batch, mesh):
+    sharded = {}
+    for key, value in batch.items():
+        spec = P(None, "fsdp", None) if key == "position_ids_ZBT" else P(
+            "fsdp", *((None,) * (value.ndim - 1))
+        )
+        sharded[key] = _put(mesh, value, spec)
+    return sharded
+
+
 def _assert_embedding_and_output_weight(model, mesh):
     token_ids = _put(mesh, np.arange(16, dtype=np.int32).reshape(4, 4), P("fsdp", None))
 
@@ -92,18 +118,7 @@ def _assert_embedding_and_output_weight(model, mesh):
 
 
 def _assert_trainer_consumer(model, cfg, mesh):
-    batch = {
-        "token_ids_BT": np.full((4, 4), cfg.image_token_id, dtype=np.int32),
-        "attention_mask_BT": np.ones((4, 4), dtype=np.int32),
-        "loss_mask_BT": np.tile(np.asarray([[0, 1, 1, 1]], dtype=np.int32), (4, 1)),
-        "pixel_values": np.arange(16, dtype=np.float32).reshape(16, 1),
-        "vision_patch_valid": np.ones((16,), dtype=np.bool_),
-        "image_grid_thw": np.tile(np.asarray([[1, 2, 2]], dtype=np.int32), (4, 1)),
-        "vision_cu_seqlens": np.asarray([0, 4, 8, 12, 16], dtype=np.int32),
-        "position_ids_ZBT": np.broadcast_to(np.arange(4, dtype=np.int32), (3, 4, 4)).copy(),
-    }
-    sharded = vlm_api.shard_batch_dict(batch, cfg, mesh)
-    assert "vision_cu_seqlens" not in sharded
+    sharded = _shard_global_batch(_vision_batch(), mesh)
     optimizer = MixedPrecisionOptimizer(model, optax.sgd(1e-3))
     train_step = make_sft_train_step(cfg, num_loss_tiles=1)
     loss, metrics = train_step(optimizer, (sharded,))
@@ -115,28 +130,22 @@ def _assert_trainer_consumer(model, cfg, mesh):
     assert int(optimizer.step[...]) == 1
 
 
-def _assert_batch_ingress_drops_local_offsets(cfg, mesh):
-    batch = {
-        "token_ids_BT": np.ones((4, 4), dtype=np.int32),
-        "attention_mask_BT": np.ones((4, 4), dtype=np.int32),
-        "loss_mask_BT": np.ones((4, 4), dtype=np.int32),
-        "position_ids_ZBT": np.zeros((3, 4, 4), dtype=np.int32),
-        "pixel_values": np.ones((16, 1), dtype=np.float32),
-        "vision_patch_valid": np.ones((16,), dtype=np.bool_),
-        "image_grid_thw": np.tile(np.asarray([[1, 2, 2]], dtype=np.int32), (4, 1)),
-        # The leading M+1 dimension cannot be evenly sharded on this mesh.
-        "vision_cu_seqlens": np.asarray([0, 4, 8, 12, 16], dtype=np.int32),
-    }
-    sharded = vlm_api.shard_batch_dict(batch, cfg, mesh)
-    assert "vision_cu_seqlens" not in sharded
-    assert sharded["image_grid_thw"].sharding.spec == P("fsdp", None)
+def _assert_batch_ingress_rejects_process_misalignment(cfg, mesh):
+    batch = _vision_batch()
+    batch["vision_cu_seqlens"] = np.asarray([0, 1, 4], dtype=np.int32)
+    try:
+        vlm_api.shard_batch_dict(batch, cfg, mesh)
+    except ValueError as error:
+        assert "one local device per process" in str(error)
+    else:
+        raise AssertionError("single-process four-device vision ingress was accepted")
 
 
 def _install_checked_attention():
     def checked_local(q, _k, v, cu, _scale):
-        assert q.shape[0] == 16
-        assert cu.shape == (5,)
-        expected_cu = jnp.arange(5, dtype=jnp.int32) * 4
+        assert q.shape[0] == 4
+        assert cu.shape == (3,)
+        expected_cu = jnp.asarray([0, 1, 4], dtype=jnp.int32)
         valid = jnp.all(cu == expected_cu)
         return jnp.where(valid, v, jnp.full_like(v, jnp.nan))
 
@@ -149,7 +158,7 @@ def main():
     model, cfg = vlm_api.init_model(_config(), jax.random.key(0), tp_size=1, fsdp_size=4, dp_size=1)
     _install_checked_attention()
     _assert_embedding_and_output_weight(model, mesh)
-    _assert_batch_ingress_drops_local_offsets(cfg, mesh)
+    _assert_batch_ingress_rejects_process_misalignment(cfg, mesh)
     _assert_trainer_consumer(model, cfg, mesh)
 
 
