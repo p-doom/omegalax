@@ -215,10 +215,6 @@ class Qwen3MessageEncoder:
             text = "".join(parts)
         return text
 
-    def _render(self, message: dict[str, Any], grids: np.ndarray) -> tuple[str, str]:
-        content = self._content(message, grids)
-        return self._renderer(message, content)
-
     def _encode_block(self, message: dict[str, Any], text: str) -> tuple[np.ndarray, np.ndarray]:
         ids = np.asarray(self.tokenizer.encode(text, add_special_tokens=False), dtype=np.int32)
         mask = (
@@ -228,28 +224,86 @@ class Qwen3MessageEncoder:
         )
         return ids, mask
 
-    def encode(self, messages: list[dict[str, Any]]) -> dict[str, np.ndarray]:
-        multimodal = self.image_processor is not None
+    def _validate(self, messages: list[dict[str, Any]]) -> None:
         if not isinstance(messages, list) or not messages:
             raise ValueError("messages must be a non-empty list")
+        multimodal = self.image_processor is not None
         for message in messages:
             _validate_message(message, multimodal=multimodal)
+
+    def _prepare_turns(
+        self, messages: list[dict[str, Any]]
+    ) -> tuple[np.ndarray | None, list[np.ndarray], list[str]]:
         images_by_turn = [_extract_images([message]) for message in messages]
         images = [image for turn_images in images_by_turn for image in turn_images]
         pixel_values, grids = self._process_images(images)
-
-        id_parts: list[np.ndarray] = []
-        mask_parts: list[np.ndarray] = []
+        grids_by_turn: list[np.ndarray] = []
+        contents: list[str] = []
         grid_offset = 0
-        for index, (message, turn_images) in enumerate(zip(messages, images_by_turn, strict=True)):
+        for message, turn_images in zip(messages, images_by_turn, strict=True):
             turn_grids = grids[grid_offset : grid_offset + len(turn_images)]
             grid_offset += len(turn_images)
-            historical, terminal = self._render(message, turn_grids)
-            ids, mask = self._encode_block(
-                message, terminal if index == len(messages) - 1 else historical
-            )
+            grids_by_turn.append(turn_grids)
+            contents.append(self._content(message, turn_grids))
+        return pixel_values, grids_by_turn, contents
+
+    def _encode_prepared(
+        self,
+        messages: list[dict[str, Any]],
+        grids_by_turn: list[np.ndarray],
+        contents: list[str],
+    ) -> tuple[list[np.ndarray], list[np.ndarray]]:
+        blocks = self._renderer(messages, contents)
+        id_parts: list[np.ndarray] = []
+        mask_parts: list[np.ndarray] = []
+        for message, block in zip(messages, blocks, strict=True):
+            if block is None:
+                ids = np.empty(0, dtype=np.int32)
+                mask = np.empty(0, dtype=np.int32)
+            else:
+                ids, mask = self._encode_block(message, block)
             id_parts.append(ids)
             mask_parts.append(mask)
+        return id_parts, mask_parts
+
+    def _measure_prepared(
+        self,
+        messages: list[dict[str, Any]],
+        grids_by_turn: list[np.ndarray],
+        contents: list[str],
+    ) -> dict[str, Any]:
+        id_parts, mask_parts = self._encode_prepared(messages, grids_by_turn, contents)
+        message_measurements: list[dict[str, Any]] = []
+        for ids, mask, grids in zip(id_parts, mask_parts, grids_by_turn, strict=True):
+            vision_patches = sum(int(np.prod(grid, dtype=np.int64)) for grid in grids)
+            message_measurements.append(
+                {
+                    "length": len(ids),
+                    "supervised_tokens": int(mask.sum()),
+                    "vision_tokens": vision_patches // self.merge_size**2,
+                    "vision_patches": vision_patches,
+                    "num_images": len(grids),
+                    "image_grid_thw": grids.tolist(),
+                }
+            )
+        return {
+            "length": sum(item["length"] for item in message_measurements),
+            "supervised_tokens": sum(
+                item["supervised_tokens"] for item in message_measurements
+            ),
+            "vision_tokens": sum(item["vision_tokens"] for item in message_measurements),
+            "vision_patches": sum(item["vision_patches"] for item in message_measurements),
+            "num_images": sum(item["num_images"] for item in message_measurements),
+            "image_grid_thw": [
+                grid for item in message_measurements for grid in item["image_grid_thw"]
+            ],
+            "message_measurements": message_measurements,
+        }
+
+    def encode(self, messages: list[dict[str, Any]]) -> dict[str, np.ndarray]:
+        self._validate(messages)
+        pixel_values, grids_by_turn, contents = self._prepare_turns(messages)
+        id_parts, mask_parts = self._encode_prepared(messages, grids_by_turn, contents)
 
         result = {
             "input_ids": np.concatenate(id_parts),
@@ -257,35 +311,49 @@ class Qwen3MessageEncoder:
         }
         if pixel_values is not None:
             result["pixel_values"] = pixel_values
-            result["image_grid_thw"] = grids
+            result["image_grid_thw"] = np.concatenate(grids_by_turn)
         return result
 
-    def measure(self, message: dict[str, Any]) -> dict[str, Any]:
-        multimodal = self.image_processor is not None
-        _validate_message(message, multimodal=multimodal)
-        images = _extract_images([message])
-        _, grids = self._process_images(images)
-        historical, terminal = self._render(message, grids)
-        ids, mask = self._encode_block(message, historical)
-        if terminal == historical:
-            terminal_ids, terminal_mask = ids, mask
-        else:
-            terminal_ids, terminal_mask = self._encode_block(message, terminal)
-        vision_patches = sum(int(np.prod(grid, dtype=np.int64)) for grid in grids)
-        vision_tokens = vision_patches // self.merge_size**2
-        return {
-            "length": len(ids),
-            "terminal_length_delta": len(terminal_ids) - len(ids),
-            "supervised_tokens": int(mask.sum()),
-            "terminal_supervised_tokens_delta": int(terminal_mask.sum() - mask.sum()),
-            "vision_tokens": vision_tokens,
-            "vision_patches": vision_patches,
-            "num_images": len(grids),
-            "image_grid_thw": grids.tolist(),
-        }
+    def measure(self, messages: list[dict[str, Any]]) -> dict[str, Any]:
+        self._validate(messages)
+        _, grids_by_turn, contents = self._prepare_turns(messages)
+        return self._measure_prepared(messages, grids_by_turn, contents)
+
+    def prepare(self, messages: list[dict[str, Any]]) -> _PreparedConversation:
+        self._validate(messages)
+        _, grids_by_turn, contents = self._prepare_turns(messages)
+        return _PreparedConversation(self, messages, grids_by_turn, contents)
 
 
-class _MessageLengthFn:
+class _PreparedConversation:
+    def __init__(
+        self,
+        encoder: Qwen3MessageEncoder,
+        messages: list[dict[str, Any]],
+        grids_by_turn: list[np.ndarray],
+        contents: list[str],
+    ) -> None:
+        self._encoder = encoder
+        self._messages = messages
+        self._grids_by_turn = grids_by_turn
+        self._contents = contents
+        self._cache: dict[tuple[int, int], dict[str, Any]] = {}
+        self.message_measurements = self(0, len(messages))["message_measurements"]
+
+    def __call__(self, start: int, end: int) -> dict[str, Any]:
+        if not 0 <= start < end <= len(self._messages):
+            raise ValueError(f"invalid conversation span [{start}, {end})")
+        key = (start, end)
+        if key not in self._cache:
+            self._cache[key] = self._encoder._measure_prepared(
+                self._messages[start:end],
+                self._grids_by_turn[start:end],
+                self._contents[start:end],
+            )
+        return self._cache[key]
+
+
+class _ConversationMeasureFn:
     def __init__(
         self,
         tokenizer: PreTrainedTokenizer,
@@ -294,13 +362,13 @@ class _MessageLengthFn:
     ) -> None:
         self.encoder = Qwen3MessageEncoder(tokenizer, image_processor, model_type)
 
-    def __call__(self, message: dict[str, Any]) -> dict[str, Any]:
-        return self.encoder.measure(message)
+    def __call__(self, messages: list[dict[str, Any]]) -> _PreparedConversation:
+        return self.encoder.prepare(messages)
 
 
-def make_message_length_fn(
+def make_conversation_measure_fn(
     tokenizer: PreTrainedTokenizer,
     image_processor: BaseImageProcessor | None,
     model_type: str,
-) -> _MessageLengthFn:
-    return _MessageLengthFn(tokenizer, image_processor, model_type)
+) -> _ConversationMeasureFn:
+    return _ConversationMeasureFn(tokenizer, image_processor, model_type)

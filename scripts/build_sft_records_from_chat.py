@@ -16,7 +16,7 @@ from absl import app, flags
 from transformers import AutoConfig, AutoImageProcessor, AutoTokenizer
 
 from omegalax.data.grain_pipeline import build_records_from_chat
-from omegalax.data.qwen3_encoding import make_message_length_fn
+from omegalax.data.qwen3_encoding import make_conversation_measure_fn
 from omegalax.registry import resolve_hf_repo_id
 
 FLAGS = flags.FLAGS
@@ -84,12 +84,12 @@ def main(_) -> None:
             FLAGS.processor, use_fast=False, **ip_kwargs
         )
 
-    measure_message = make_message_length_fn(tokenizer, image_processor, model_type)
+    prepare_conversation = make_conversation_measure_fn(tokenizer, image_processor, model_type)
     out_dir = build_records_from_chat(
         FLAGS.data_path,
         FLAGS.out_dir,
         max_length=FLAGS.max_length,
-        measure_message=measure_message,
+        prepare_conversation=prepare_conversation,
         records_per_shard=FLAGS.records_per_shard,
         overwrite=FLAGS.overwrite,
         num_workers=FLAGS.num_workers,

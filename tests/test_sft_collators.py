@@ -13,9 +13,13 @@ from PIL import Image
 from transformers import AutoImageProcessor, AutoTokenizer
 
 from omegalax.data.collator_qwen3 import TextSFTCollator, VLMSFTCollator
-from omegalax.data.qwen3_encoding import Qwen3MessageEncoder, make_message_length_fn
+from omegalax.data.qwen3_encoding import (
+    Qwen3MessageEncoder,
+    make_conversation_measure_fn,
+)
 
 TEXT_MODELS = (("Qwen/Qwen3-0.6B", "qwen3"), ("Qwen/Qwen3.5-0.8B", "qwen3_5"))
+QWEN35_LARGE_MODEL = "Qwen/Qwen3.5-35B-A3B"
 VLM_MODEL = "Qwen/Qwen3-VL-2B-Instruct"
 VLM_MODEL_TYPE = "qwen3_vl"
 QWEN35_VLM_MODEL = "Qwen/Qwen3.5-0.8B"
@@ -48,6 +52,14 @@ def _legacy_loss_mask(input_ids: np.ndarray, tokenizer) -> np.ndarray:
 
 
 class TextEncodingTest(absltest.TestCase):
+    def _assert_template_parity(self, model, model_type, messages):
+        tokenizer = AutoTokenizer.from_pretrained(model, local_files_only=True)
+        encoded = Qwen3MessageEncoder(tokenizer, None, model_type).encode(messages)
+        reference = tokenizer.apply_chat_template(
+            messages, tokenize=True, add_generation_prompt=False
+        )["input_ids"]
+        np.testing.assert_array_equal(encoded["input_ids"], reference)
+
     def test_qwen3_and_qwen35_match_their_chat_templates(self):
         messages = [
             {"role": "system", "content": "  system  "},
@@ -105,9 +117,8 @@ class TextEncodingTest(absltest.TestCase):
             clean_encoded = encoder.encode(clean)
             marked_encoded = encoder.encode(marked)
             np.testing.assert_array_equal(marked_encoded["input_ids"], clean_encoded["input_ids"])
-            measurement = encoder.measure(marked[1])
+            measurement = encoder.measure(marked[:2])["message_measurements"][1]
             self.assertEqual(measurement["supervised_tokens"], 0)
-            self.assertEqual(measurement["terminal_supervised_tokens_delta"], 0)
             spans = [
                 tokenizer.decode(marked_encoded["input_ids"][start:end])
                 for start, end in _runs(marked_encoded["loss_mask"])
@@ -167,6 +178,88 @@ class TextEncodingTest(absltest.TestCase):
                 messages, tokenize=True, add_generation_prompt=False
             )["input_ids"]
             np.testing.assert_array_equal(encoded["input_ids"], reference)
+
+    def test_consecutive_assistant_reasoning_matches_chat_templates_and_masks(self):
+        messages = [
+            {"role": "user", "content": "question"},
+            {"role": "assistant", "reasoning_content": "first", "content": "answer one"},
+            {"role": "assistant", "reasoning_content": "second", "content": "answer two"},
+        ]
+        for model, model_type in TEXT_MODELS:
+            self._assert_template_parity(model, model_type, messages)
+            tokenizer = AutoTokenizer.from_pretrained(model, local_files_only=True)
+            encoded = Qwen3MessageEncoder(tokenizer, None, model_type).encode(messages)
+            spans = [
+                tokenizer.decode(encoded["input_ids"][start:end])
+                for start, end in _runs(encoded["loss_mask"])
+            ]
+            self.assertEqual(
+                spans,
+                [
+                    "<think>\nfirst\n</think>\n\nanswer one<|im_end|>",
+                    "<think>\nsecond\n</think>\n\nanswer two<|im_end|>",
+                ],
+            )
+
+    def test_qwen3_reasoning_and_whitespace_edges_match_chat_template(self):
+        cases = [
+            [{"role": "assistant", "reasoning_content": "hidden", "content": "answer"}],
+            [
+                {"role": "user", "content": "question"},
+                {"role": "assistant", "reasoning_content": "reason", "content": "\n\nanswer"},
+            ],
+            [
+                {"role": "user", "content": "question"},
+                {"role": "assistant", "content": "<think>\nreason\n</think>\n\nanswer"},
+            ],
+            [
+                {"role": "user", "content": "question"},
+                {"role": "system", "content": "later system"},
+                {"role": "assistant", "content": "answer"},
+            ],
+        ]
+        for messages in cases:
+            self._assert_template_parity("Qwen/Qwen3-0.6B", "qwen3", messages)
+
+    def test_qwen35_reasoning_edges_match_both_template_variants(self):
+        cases = [
+            [
+                {"role": "user", "content": "question"},
+                {"role": "assistant", "reasoning_content": "reason", "content": "\n\nanswer"},
+            ],
+            [
+                {"role": "user", "content": "question"},
+                {"role": "assistant", "content": "<think>\nreason\n</think>\n\nanswer"},
+            ],
+            [
+                {"role": "system", "content": "  system  "},
+                {"role": "user", "content": "  question  "},
+                {"role": "assistant", "reasoning_content": "  reason  ", "content": "  answer  "},
+            ],
+        ]
+        for model in ("Qwen/Qwen3.5-0.8B", QWEN35_LARGE_MODEL):
+            for messages in cases:
+                self._assert_template_parity(model, "qwen3_5", messages)
+
+    def test_family_specific_user_and_system_constraints_match_templates(self):
+        no_user = [{"role": "assistant", "content": "answer"}]
+        late_system = [
+            {"role": "user", "content": "question"},
+            {"role": "system", "content": "later system"},
+            {"role": "assistant", "content": "answer"},
+        ]
+        self._assert_template_parity("Qwen/Qwen3-0.6B", "qwen3", no_user)
+        self._assert_template_parity("Qwen/Qwen3-0.6B", "qwen3", late_system)
+        for model in ("Qwen/Qwen3.5-0.8B", QWEN35_LARGE_MODEL):
+            tokenizer = AutoTokenizer.from_pretrained(model, local_files_only=True)
+            encoder = Qwen3MessageEncoder(tokenizer, None, "qwen3_5")
+            for messages in (no_user, late_system):
+                with self.assertRaises(ValueError):
+                    encoder.encode(messages)
+                with self.assertRaises(Exception):
+                    tokenizer.apply_chat_template(
+                        messages, tokenize=True, add_generation_prompt=False
+                    )
 
     def test_user_chatml_tokens_do_not_change_supervision(self):
         for model, model_type in TEXT_MODELS:
@@ -330,6 +423,30 @@ class VLMEncodingTest(absltest.TestCase):
             "square<|im_end|>",
         )
 
+    def test_qwen3_vl_role_and_reasoning_behavior_matches_chat_template(self):
+        cases = [
+            [{"role": "assistant", "reasoning_content": "ignored", "content": "answer"}],
+            [
+                {"role": "user", "content": "question"},
+                {"role": "system", "content": "ignored system"},
+                {"role": "assistant", "content": "answer"},
+            ],
+            [
+                {"role": "user", "content": "question"},
+                {"role": "assistant", "reasoning_content": "ignored", "content": "first"},
+                {"role": "assistant", "content": "<think>\nkept\n</think>\n\nsecond"},
+            ],
+        ]
+        encoder = Qwen3MessageEncoder(
+            self.tokenizer, self.image_processor, VLM_MODEL_TYPE
+        )
+        for messages in cases:
+            encoded = encoder.encode(messages)
+            reference = self.tokenizer.apply_chat_template(
+                messages, tokenize=True, add_generation_prompt=False
+            )["input_ids"]
+            np.testing.assert_array_equal(encoded["input_ids"], reference)
+
     def test_vlm_collator_preserves_geometry(self):
         image = Image.new("RGB", (112, 112), (80, 40, 20))
         batch = VLMSFTCollator(self.tokenizer, 256, self.image_processor, VLM_MODEL_TYPE)(
@@ -409,10 +526,12 @@ class VLMEncodingTest(absltest.TestCase):
                 literal
             )
         with self.assertRaisesRegex(ValueError, "video content"):
-            make_message_length_fn(self.tokenizer, self.image_processor, VLM_MODEL_TYPE)(literal[0])
+            make_conversation_measure_fn(self.tokenizer, self.image_processor, VLM_MODEL_TYPE)(
+                literal
+            )
         with self.assertRaisesRegex(ValueError, "image content requires"):
-            make_message_length_fn(self.tokenizer, None, VLM_MODEL_TYPE)(
-                self._messages(Image.new("RGB", (8, 8)))[1]
+            make_conversation_measure_fn(self.tokenizer, None, VLM_MODEL_TYPE)(
+                [self._messages(Image.new("RGB", (8, 8)))[1]]
             )
 
 
@@ -501,7 +620,7 @@ class Qwen35VLMEncodingTest(absltest.TestCase):
 
 
 class ConversationMeasurementTest(absltest.TestCase):
-    def test_measurements_are_additive_with_terminal_template_delta(self):
+    def test_every_prepared_span_matches_the_encoder(self):
         conversations = [
             [
                 {"role": "user", "content": "first"},
@@ -524,22 +643,31 @@ class ConversationMeasurementTest(absltest.TestCase):
         ]
         for model, model_type in (*TEXT_MODELS, (VLM_MODEL, VLM_MODEL_TYPE)):
             tokenizer = AutoTokenizer.from_pretrained(model, local_files_only=True)
-            measure = make_message_length_fn(tokenizer, None, model_type)
+            prepare = make_conversation_measure_fn(tokenizer, None, model_type)
             for messages in conversations:
-                measurements = [measure(message) for message in messages]
-                encoded = Qwen3MessageEncoder(tokenizer, None, model_type).encode(messages)
-                total = sum(item["length"] for item in measurements)
-                total += measurements[-1]["terminal_length_delta"]
-                supervised = sum(item["supervised_tokens"] for item in measurements)
-                supervised += measurements[-1]["terminal_supervised_tokens_delta"]
-                self.assertEqual(total, len(encoded["input_ids"]))
-                self.assertEqual(supervised, int(encoded["loss_mask"].sum()))
+                prepared = prepare(messages)
+                encoder = Qwen3MessageEncoder(tokenizer, None, model_type)
+                for start in range(len(messages)):
+                    for end in range(start + 1, len(messages) + 1):
+                        try:
+                            measurement = prepared(start, end)
+                            encoded = encoder.encode(messages[start:end])
+                        except ValueError:
+                            continue
+                        self.assertEqual(measurement["length"], len(encoded["input_ids"]))
+                        self.assertEqual(
+                            measurement["supervised_tokens"], int(encoded["loss_mask"].sum())
+                        )
 
     def test_measurement_callable_survives_spawn_pickling(self):
         model, model_type = TEXT_MODELS[0]
         tokenizer = AutoTokenizer.from_pretrained(model, local_files_only=True)
-        measure = pickle.loads(pickle.dumps(make_message_length_fn(tokenizer, None, model_type)))
-        result = measure({"role": "assistant", "content": "a"})
+        prepare = pickle.loads(
+            pickle.dumps(make_conversation_measure_fn(tokenizer, None, model_type))
+        )
+        result = prepare(
+            [{"role": "user", "content": "q"}, {"role": "assistant", "content": "a"}]
+        )(0, 2)
         self.assertGreater(result["supervised_tokens"], 0)
 
 

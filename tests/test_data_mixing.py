@@ -40,19 +40,34 @@ def _write_jsonl(path: Path, rows: list[dict]) -> None:
             f.write(json.dumps(row) + "\n")
 
 
-# build_records_from_chat measures messages in a `spawn` multiprocessing pool, so
-# the measure_message callable must be picklable -- a local lambda is not.
-def _measure_one(message):
-    return {
-        "length": 1,
-        "terminal_length_delta": 0,
-        "supervised_tokens": int(message["role"] == "assistant"),
-        "terminal_supervised_tokens_delta": 0,
-        "vision_tokens": 0,
-        "vision_patches": 0,
-        "num_images": 0,
-        "image_grid_thw": [],
-    }
+class _PreparedMeasurements:
+    def __init__(self, messages):
+        self.message_measurements = [
+            {
+                "length": 1,
+                "supervised_tokens": int(message["role"] == "assistant"),
+                "vision_tokens": 0,
+                "vision_patches": 0,
+                "num_images": 0,
+                "image_grid_thw": [],
+            }
+            for message in messages
+        ]
+
+    def __call__(self, start, end):
+        items = self.message_measurements[start:end]
+        return {
+            "length": len(items),
+            "supervised_tokens": sum(item["supervised_tokens"] for item in items),
+            "vision_tokens": 0,
+            "vision_patches": 0,
+            "num_images": 0,
+            "image_grid_thw": [],
+        }
+
+
+def _prepare_conversation(messages):
+    return _PreparedMeasurements(messages)
 
 
 def _build_chunked_source(
@@ -85,7 +100,7 @@ def _build_chunked_source(
         src,
         tmpdir / f"{name}_records",
         max_length=2,
-        measure_message=_measure_one,
+        prepare_conversation=_prepare_conversation,
         records_per_shard=8,
     )
 

@@ -13,6 +13,7 @@ import jax.numpy as jnp
 import numpy as np
 import orbax.checkpoint as ocp
 from absl.testing import absltest
+from transformers import AutoTokenizer
 
 from omegalax.data.grain_pipeline import (
     COMPILED_DATASET_VERSION,
@@ -24,6 +25,7 @@ from omegalax.data.grain_pipeline import (
     make_grain_read_options,
     resolve_arrayrecord_paths,
 )
+from omegalax.data.qwen3_encoding import Qwen3MessageEncoder, make_conversation_measure_fn
 from omegalax.trainers import checkpoint_utils
 
 
@@ -33,18 +35,12 @@ def _batch_starts(examples):
     }
 
 
-# build_records_from_chat measures messages in a `spawn` multiprocessing pool, so
-# the measure_message callable must be picklable (importable by qualified name) --
-# a local lambda is not. This module-level stand-in counts every message as one
-# token.
 def _measurement(message, length=1):
     return {
         "length": length,
-        "terminal_length_delta": 0,
         "supervised_tokens": (
             length if message["role"] == "assistant" and message.get("loss", True) else 0
         ),
-        "terminal_supervised_tokens_delta": 0,
         "vision_tokens": 0,
         "vision_patches": 0,
         "num_images": 0,
@@ -52,12 +48,30 @@ def _measurement(message, length=1):
     }
 
 
-def _measure_one(message):
-    return _measurement(message)
+class _PreparedMeasurements:
+    def __init__(self, messages, *, declared=False):
+        self.message_measurements = [
+            message["measurement"] if declared else _measurement(message) for message in messages
+        ]
+
+    def __call__(self, start, end):
+        items = self.message_measurements[start:end]
+        return {
+            "length": sum(item["length"] for item in items),
+            "supervised_tokens": sum(item["supervised_tokens"] for item in items),
+            "vision_tokens": sum(item["vision_tokens"] for item in items),
+            "vision_patches": sum(item["vision_patches"] for item in items),
+            "num_images": sum(item["num_images"] for item in items),
+            "image_grid_thw": [grid for item in items for grid in item["image_grid_thw"]],
+        }
 
 
-def _measure_declared(message):
-    return message["measurement"]
+def _prepare_one(messages):
+    return _PreparedMeasurements(messages)
+
+
+def _prepare_declared(messages):
+    return _PreparedMeasurements(messages, declared=True)
 
 
 def _measured(role, content, length=1, vision_tokens=0):
@@ -66,9 +80,7 @@ def _measured(role, content, length=1, vision_tokens=0):
         "content": content,
         "measurement": {
             "length": length,
-            "terminal_length_delta": 0,
             "supervised_tokens": length if role == "assistant" else 0,
-            "terminal_supervised_tokens_delta": 0,
             "vision_tokens": vision_tokens,
             "vision_patches": vision_tokens * 4,
             "num_images": int(vision_tokens > 0),
@@ -108,7 +120,7 @@ class GrainPipelineTest(absltest.TestCase):
         tmpdir,
         messages,
         max_length,
-        measure=_measure_one,
+        prepare=_prepare_one,
     ):
         src = Path(tmpdir) / "train.jsonl"
         self._write_jsonl(src, [{"messages": messages}])
@@ -116,7 +128,7 @@ class GrainPipelineTest(absltest.TestCase):
             src,
             Path(tmpdir) / "records",
             max_length=max_length,
-            measure_message=measure,
+            prepare_conversation=prepare,
             records_per_shard=8,
             overflow_mode="split",
         )
@@ -163,7 +175,7 @@ class GrainPipelineTest(absltest.TestCase):
                 src,
                 Path(tmpdir) / "records",
                 max_length=3,
-                measure_message=_measure_one,
+                prepare_conversation=_prepare_one,
                 records_per_shard=8,
             )
 
@@ -211,7 +223,7 @@ class GrainPipelineTest(absltest.TestCase):
                 src,
                 Path(tmpdir) / "records",
                 max_length=3,
-                measure_message=_measure_one,
+                prepare_conversation=_prepare_one,
                 records_per_shard=8,
                 overflow_mode="truncate",
             )
@@ -250,7 +262,7 @@ class GrainPipelineTest(absltest.TestCase):
                 src,
                 Path(tmpdir) / "records",
                 max_length=2,
-                measure_message=_measure_one,
+                prepare_conversation=_prepare_one,
                 records_per_shard=8,
                 overflow_mode="split",
             )
@@ -286,7 +298,9 @@ class GrainPipelineTest(absltest.TestCase):
                 _measured("user", "2", length=5),
                 _measured("assistant", "3"),
             ]
-            records_dir, records = self._build_split(tmpdir, messages, 2, measure=_measure_declared)
+            records_dir, records = self._build_split(
+                tmpdir, messages, 2, prepare=_prepare_declared
+            )
             self.assertEqual(
                 [[message["content"] for message in record["messages"]] for record in records],
                 [["0", "1"]],
@@ -305,7 +319,7 @@ class GrainPipelineTest(absltest.TestCase):
                 _measured("user", "2", length=2),
                 _measured("assistant", "3"),
             ]
-            records_dir, _ = self._build_split(tmpdir, messages, 2, measure=_measure_declared)
+            records_dir, _ = self._build_split(tmpdir, messages, 2, prepare=_prepare_declared)
             stats = json.loads((records_dir / "truncation_stats.json").read_text())
             self.assertEqual(stats["tokens"]["dropped"], 2)
             self.assertEqual(
@@ -345,7 +359,7 @@ class GrainPipelineTest(absltest.TestCase):
                 src,
                 Path(tmpdir) / "records",
                 max_length=2,
-                measure_message=_measure_one,
+                prepare_conversation=_prepare_one,
                 records_per_shard=8,
                 overflow_mode="split",
             )
@@ -436,7 +450,7 @@ class GrainPipelineTest(absltest.TestCase):
                 src,
                 Path(tmpdir) / "records",
                 max_length=2,
-                measure_message=_measure_one,
+                prepare_conversation=_prepare_one,
                 records_per_shard=8,
                 overflow_mode="split",
             )
@@ -501,7 +515,7 @@ class GrainPipelineTest(absltest.TestCase):
                 # tracking value stays at messages[0] and the assistant-turn filter
                 # is satisfied (one chunk per session).
                 max_length=2,
-                measure_message=_measure_one,
+                prepare_conversation=_prepare_one,
                 records_per_shard=8,
             )
 
@@ -549,21 +563,17 @@ class GrainPipelineTest(absltest.TestCase):
             {"role": "user", "content": "question"},
             {"role": "assistant", "content": "context", "loss": False},
         ]
-        precomputed = {(0, index): _measurement(message) for index, message in enumerate(messages)}
-        precomputed[(0, 1)]["terminal_length_delta"] = 2
         result = _process_conversation(
-            0,
             "session-0",
             {},
             messages,
-            precomputed,
+            _prepare_one(messages),
             effective_max=100,
             overflow_mode="split",
-            truncate_offset=None,
         )
         self.assertEmpty(result["examples"])
         self.assertEqual(result["dropped_messages"], 2)
-        self.assertEqual(result["dropped_tokens"], 4)
+        self.assertEqual(result["dropped_tokens"], 2)
 
     def test_mixed_loss_chunk_is_preserved(self):
         messages = [
@@ -573,18 +583,56 @@ class GrainPipelineTest(absltest.TestCase):
             {"role": "assistant", "content": "target"},
         ]
         result = _process_conversation(
-            0,
             "session-0",
             {},
             messages,
-            {(0, index): _measurement(message) for index, message in enumerate(messages)},
+            _prepare_one(messages),
             effective_max=100,
             overflow_mode="split",
-            truncate_offset=None,
         )
         self.assertLen(result["examples"], 1)
         self.assertEqual(result["examples"][0]["messages"], messages)
         self.assertEqual(result["chunk_supervised_tokens"], [1])
+
+    def test_chunk_metadata_matches_each_emitted_conversation(self):
+        tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B", local_files_only=True)
+        encoder = Qwen3MessageEncoder(tokenizer, None, "qwen3")
+        messages = [
+            {"role": "user", "content": "first"},
+            {
+                "role": "assistant",
+                "reasoning_content": "reasoning one",
+                "content": "answer one",
+            },
+            {"role": "user", "content": "second"},
+            {
+                "role": "assistant",
+                "reasoning_content": "reasoning two",
+                "content": "answer two",
+            },
+        ]
+        prepared = make_conversation_measure_fn(tokenizer, None, "qwen3")(messages)
+        effective_max = max(prepared(0, 2)["length"], prepared(2, 4)["length"])
+        result = _process_conversation(
+            "session-0",
+            {},
+            messages,
+            prepared,
+            effective_max=effective_max,
+            overflow_mode="split",
+        )
+
+        self.assertLen(result["examples"], 2)
+        for example, length, supervised in zip(
+            result["examples"],
+            result["chunk_lengths"],
+            result["chunk_supervised_tokens"],
+            strict=True,
+        ):
+            encoded = encoder.encode(example["messages"])
+            self.assertEqual(example["_omegalax_measured_length"], len(encoded["input_ids"]))
+            self.assertEqual(length, len(encoded["input_ids"]))
+            self.assertEqual(supervised, int(encoded["loss_mask"].sum()))
 
 
 if __name__ == "__main__":
