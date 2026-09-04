@@ -444,6 +444,8 @@ class MemoryTaskTest(parameterized.TestCase):
     @parameterized.parameters(
         "32f307dc07996ab71d09f6a8aa660238447a817e9be31d27464a97d386478478",
         "fe8d88245437d92c8c096624f2aa112ef46b506fe41e1fc6aa17f0c611c4c03e",
+        "e8b1a5abf304cc8c9163b717254fe54568e242b8d12c9ad3db26b50f4c0e8ad2",
+        "c382c3dfbd0e9f4113e12320cab0761d3ed4377a961c096e7f0e7ac85b5bdd9f",
     )
     def test_known_previous_v2_training_content_hash_remains_reconstructable(self, content_sha256):
         config = MemoryTaskConfig(
