@@ -14,7 +14,7 @@ import numpy as np
 from PIL import Image
 from transformers import BaseImageProcessor, PreTrainedTokenizer
 
-from omegalax.data.qwen3_renderers import renderer_for_model_type
+from omegalax.data.qwen_renderers import renderer_for_model_type
 
 _ARRAYRECORD_IMAGE_CACHE_SIZE = int(os.environ.get("OMEGALAX_ARRAYRECORD_IMAGE_CACHE_SIZE", "128"))
 _ARRAYRECORD_IMAGE_SOURCES: OrderedDict[str, Any] = OrderedDict()
