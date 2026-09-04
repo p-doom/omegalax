@@ -2,8 +2,6 @@
 
 import inspect
 import os
-import tempfile
-from pathlib import Path
 from unittest import mock
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
@@ -44,30 +42,26 @@ class VLMTrainingContractTest(absltest.TestCase):
         self.assertEqual(mesh.size, 1)
 
     def test_resume_requires_exact_generation(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            save_path = Path(tmpdir)
-            self.assertTrue(
-                vlm._validate_resume_request(
-                    checkpoint_utils.ResumeMode.REQUIRED,
-                    4,
-                    save_path,
-                    10,
-                )
-            )
-            with self.assertRaisesRegex(ValueError, "requires save_dir and resume_step"):
-                vlm._validate_resume_request(
-                    checkpoint_utils.ResumeMode.REQUIRED,
-                    None,
-                    save_path,
-                    10,
-                )
-            with self.assertRaisesRegex(ValueError, "only valid"):
-                vlm._validate_resume_request(
-                    checkpoint_utils.ResumeMode.NEVER,
-                    4,
-                    save_path,
-                    10,
-                )
+        train_cfg = vlm.TrainConfig(num_steps=10, schedule_horizon=10)
+        cases = (
+            (
+                {"resume": checkpoint_utils.ResumeMode.REQUIRED, "save_dir": "unused"},
+                "requires save_dir and resume_step",
+            ),
+            (
+                {"resume": checkpoint_utils.ResumeMode.NEVER, "resume_step": 4},
+                "only valid",
+            ),
+            (
+                {"resume": checkpoint_utils.ResumeMode.IF_PRESENT},
+                "does not support",
+            ),
+        )
+        for kwargs, error in cases:
+            with self.subTest(kwargs=kwargs):
+                data_iter = _Closable([], "train")
+                with self.assertRaisesRegex(ValueError, error):
+                    vlm.run_sft("unused", train_cfg, data_iter, **kwargs)
 
     def test_gradient_sum_accumulates_in_fp32(self):
         total = initialize_gradient_sum({"weight": jnp.asarray([1.0], dtype=jnp.bfloat16)})

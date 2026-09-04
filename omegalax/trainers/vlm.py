@@ -69,25 +69,6 @@ def _require_healthy_at_boundary(healthy: jax.Array, step: int) -> None:
         raise FloatingPointError(f"Non-finite optimizer inputs at step {step}")
 
 
-def _validate_resume_request(
-    resume: checkpoint_utils.ResumeMode,
-    resume_step: int | None,
-    save_path: Path | None,
-    num_steps: int,
-) -> bool:
-    if resume not in (checkpoint_utils.ResumeMode.NEVER, checkpoint_utils.ResumeMode.REQUIRED):
-        raise ValueError(f"VLM training does not support resume={resume.value!r}")
-    will_resume = resume == checkpoint_utils.ResumeMode.REQUIRED
-    if will_resume:
-        if save_path is None or resume_step is None:
-            raise ValueError("resume='required' requires save_dir and resume_step")
-        if resume_step <= 0 or resume_step >= num_steps:
-            raise ValueError(f"resume_step must be in [1, {num_steps}), got {resume_step}")
-    elif resume_step is not None:
-        raise ValueError("resume_step is only valid with resume='required'")
-    return will_resume
-
-
 def _validate_train_config(train_cfg: TrainConfig) -> None:
     if train_cfg.num_steps <= 0:
         raise ValueError(f"num_steps must be > 0, got {train_cfg.num_steps}")
@@ -490,7 +471,18 @@ def _run_sft(
     """
     _validate_train_config(train_cfg)
     save_path = Path(save_dir).expanduser().resolve() if save_dir is not None else None
-    will_resume = _validate_resume_request(resume, resume_step, save_path, train_cfg.num_steps)
+    if resume not in (checkpoint_utils.ResumeMode.NEVER, checkpoint_utils.ResumeMode.REQUIRED):
+        raise ValueError(f"VLM training does not support resume={resume.value!r}")
+    will_resume = resume == checkpoint_utils.ResumeMode.REQUIRED
+    if will_resume:
+        if save_path is None or resume_step is None:
+            raise ValueError("resume='required' requires save_dir and resume_step")
+        if resume_step <= 0 or resume_step >= train_cfg.num_steps:
+            raise ValueError(
+                f"resume_step must be in [1, {train_cfg.num_steps}), got {resume_step}"
+            )
+    elif resume_step is not None:
+        raise ValueError("resume_step is only valid with resume='required'")
 
     checkpoint_manager: ocp.CheckpointManager | None = None
     if save_path is not None:
