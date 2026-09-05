@@ -16,7 +16,9 @@ from omegalax.data.collator_qwen3 import (
     TextSFTCollator,
     VLMSFTCollator,
 )
+from omegalax.data.grain_pipeline import _process_conversation
 from omegalax.data.qwen3_encoding import (
+    build_chatml_blocks as _build_chatml_blocks,
     build_chatml_text as _build_chatml_text,
     encode_qwen_messages,
 )
@@ -283,6 +285,97 @@ class ChatMLLeakageTest(absltest.TestCase):
         self.assertEqual(mask[im_end_positions[-1]], 1)
         for pos in im_end_positions[:-1]:
             self.assertEqual(mask[pos], 0)
+
+
+class PerMessageLossFieldTest(absltest.TestCase):
+    def setUp(self):
+        super().setUp()
+        self.tokenizer = _make_tokenizer()
+
+    def _encode(self, messages):
+        encoded = encode_qwen_messages(messages, tokenizer=self.tokenizer)
+        return encoded["input_ids"], encoded["loss_mask"]
+
+    def _block_bounds(self, messages):
+        bounds = []
+        start = 0
+        for _, block_text in _build_chatml_blocks(messages, image_grids=[], merge_size=2):
+            n = len(self.tokenizer.encode(block_text, add_special_tokens=False))
+            bounds.append((start, start + n))
+            start += n
+        return bounds
+
+    def _multiturn(self, *, context_only: bool):
+        first = {"role": "assistant", "content": "Hello!"}
+        if context_only:
+            first["loss"] = False
+        return [
+            {"role": "user", "content": "Hi"},
+            first,
+            {"role": "user", "content": "How are you?"},
+            {"role": "assistant", "content": "I am fine, thanks."},
+        ]
+
+    def test_loss_false_masks_only_the_marked_assistant(self):
+        clean_ids, _ = self._encode(self._multiturn(context_only=False))
+        messages = self._multiturn(context_only=True)
+        marked_ids, mask = self._encode(messages)
+        np.testing.assert_array_equal(marked_ids, clean_ids)
+        bounds = self._block_bounds(messages)
+        for lo, hi in bounds[:3]:
+            self.assertEqual(int(np.sum(mask[lo:hi])), 0)
+        lo, hi = bounds[3]
+        expected = np.zeros(hi - lo, dtype=np.int32)
+        expected[3 : hi - lo - 1] = 1
+        np.testing.assert_array_equal(mask[lo:hi], expected)
+
+    def test_all_assistants_loss_false_yields_all_zero_mask(self):
+        messages = [
+            {"role": "assistant", "content": "one", "loss": False},
+            {"role": "assistant", "content": "two", "loss": False},
+        ]
+        ids, mask = self._encode(messages)
+        self.assertEqual(len(ids), len(mask))
+        self.assertEqual(int(np.sum(mask)), 0)
+
+    def test_loss_field_rejects_every_other_shape(self):
+        invalid = [
+            {"role": "assistant", "content": "answer", "loss": True},
+            {"role": "assistant", "content": "answer", "loss": 0},
+            {"role": "user", "content": "question", "loss": False},
+        ]
+        for message in invalid:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(ValueError, "false on an assistant"):
+                    self._encode([{"role": "assistant", "content": "first"}, message])
+
+    def test_record_builder_drops_a_context_only_chunk(self):
+        messages = [
+            {"role": "user", "content": "question"},
+            {"role": "assistant", "content": "context", "loss": False},
+        ]
+        self.assertEmpty(self._process(messages)["examples"])
+
+    def test_record_builder_preserves_a_mixed_chunk(self):
+        messages = [
+            {"role": "assistant", "content": "context", "loss": False},
+            {"role": "assistant", "content": "target"},
+        ]
+        result = self._process(messages)
+        self.assertLen(result["examples"], 1)
+        self.assertEqual(result["examples"][0]["messages"], messages)
+
+    def _process(self, messages):
+        return _process_conversation(
+            0,
+            "session-0",
+            {},
+            messages,
+            {(0, offset): 1 for offset in range(len(messages))},
+            effective_max=100,
+            overflow_mode="split",
+            truncate_offset=None,
+        )
 
 
 class BuildChatMLTextTest(absltest.TestCase):

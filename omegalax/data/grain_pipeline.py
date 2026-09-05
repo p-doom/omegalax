@@ -19,6 +19,8 @@ from array_record.python.array_record_module import ArrayRecordWriter
 import grain
 import jax
 
+from omegalax.data.qwen3_encoding import _message_is_supervised
+
 COMPILED_DATASET_VERSION = 1
 COMPILED_METADATA_FILENAME = "metadata.json"
 TOKEN_STATS_FILENAME = "token_stats.json"
@@ -588,8 +590,8 @@ def _process_conversation(
         """
         if not cur_msgs:
             return None
-        # Skip chunks whose loss mask would be all zeros (no assistant tokens).
-        if not any(m.get("role") == "assistant" for m in cur_msgs):
+        supervised = [_message_is_supervised(message) for message in cur_msgs]
+        if not any(supervised):
             return None
         example = dict(session_meta)
         example["messages"] = list(cur_msgs)
