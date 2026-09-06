@@ -68,9 +68,11 @@ def init_model(
     tp_size: int | None = None,
     fsdp_size: int | None = None,
     dp_size: int | None = None,
+    cp_size: int = 1,
 ) -> tuple[nnx.Module, text_api.TextConfig]:
     return text_api.init_model(
-        cfg_or_model_id, rng, tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size
+        cfg_or_model_id, rng, tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size,
+        cp_size=cp_size,
     )
 
 
@@ -174,27 +176,48 @@ def make_sft_train_step(cfg, pad_id: int = 0):
     ``loss_mask_BT`` (all ``(B, T)`` int32).
     """
 
+    # Context parallelism: when the T axis is sequence-sharded on "cp" the
+    # ``align_config_to_mesh``-filtered spec keeps "cp" in act_btd[1] (else None).
+    # Under CP the next-token +1 shift crosses cp shard boundaries, so it is done
+    # shift-BEFORE-shard in ``shard_batch_dict`` (which adds a ``targets_BT`` key
+    # and left-shifts ``loss_mask_BT``); here the loss consumes those
+    # position-aligned arrays with shift=False + cp_axis (global reduce over cp).
+    cp_axis = cfg.shd_cfg.act_btd[1]
+
     @nnx.jit(donate_argnums=0)
     def sft_train_step(optimizer: MixedPrecisionOptimizer, batch: dict[str, jax.Array]):
         token_ids_BT = batch["token_ids_BT"]
         attention_mask_BT = batch["attention_mask_BT"]
         loss_mask_BT = batch["loss_mask_BT"]
+        # Under CP, targets are the shift-before-shard next tokens; otherwise the
+        # loss shifts token_ids internally (targets == inputs). position_ids_BT is
+        # present only when zig-zag CP permuted the sequence (carries true positions).
+        targets_BT = batch["targets_BT"] if cp_axis is not None else token_ids_BT
+        position_ids_BT = batch.get("position_ids_BT")
 
         def loss_fn(model):
-            hidden_BTD, aux_loss = text_api.forward(model, token_ids_BT, pad_id, cfg)
+            hidden_BTD, aux_loss = text_api.forward(
+                model, token_ids_BT, pad_id, cfg, position_ids_BT=position_ids_BT
+            )
             lm_weight = model.lm_head.kernel[...]
             loss = (
                 chunked_cross_entropy_loss(
                     hidden_BTD,
                     lm_weight,
-                    token_ids_BT,
+                    targets_BT,
                     loss_mask_BT,
                     num_tiles=_NUM_LOSS_TILES,
                     logits_out_sharding=cfg.shd_cfg.logits_btv,
+                    shift=cp_axis is None,
+                    cp_axis=cp_axis,
                 )
                 + aux_loss
             )
-            supervised_tokens = jnp.sum(loss_mask_BT[:, 1:].astype(jnp.float32))
+            if cp_axis is not None:
+                # loss_mask_BT is already the shifted next-token mask (== mask[:, 1:]).
+                supervised_tokens = jnp.sum(loss_mask_BT.astype(jnp.float32))
+            else:
+                supervised_tokens = jnp.sum(loss_mask_BT[:, 1:].astype(jnp.float32))
             total_tokens = jnp.sum(attention_mask_BT.astype(jnp.float32))
             return loss, (supervised_tokens, total_tokens)
 
@@ -216,25 +239,36 @@ def make_sft_train_step(cfg, pad_id: int = 0):
 def make_sft_eval_step(cfg, pad_id: int = 0):
     """Build a JIT-compiled text SFT eval step (forward only, no gradients)."""
 
+    cp_axis = cfg.shd_cfg.act_btd[1]
+
     @nnx.jit
     def sft_eval_step(model: nnx.Module, batch: dict[str, jax.Array]):
         token_ids_BT = batch["token_ids_BT"]
         loss_mask_BT = batch["loss_mask_BT"]
+        targets_BT = batch["targets_BT"] if cp_axis is not None else token_ids_BT
+        position_ids_BT = batch.get("position_ids_BT")
 
-        hidden_BTD, aux_loss = text_api.forward(model, token_ids_BT, pad_id, cfg)
+        hidden_BTD, aux_loss = text_api.forward(
+            model, token_ids_BT, pad_id, cfg, position_ids_BT=position_ids_BT
+        )
         lm_weight = model.lm_head.kernel[...]
         loss = (
             chunked_cross_entropy_loss(
                 hidden_BTD,
                 lm_weight,
-                token_ids_BT,
+                targets_BT,
                 loss_mask_BT,
                 num_tiles=_NUM_LOSS_TILES,
                 logits_out_sharding=cfg.shd_cfg.logits_btv,
+                shift=cp_axis is None,
+                cp_axis=cp_axis,
             )
             + aux_loss
         )
-        supervised_tokens = jnp.sum(loss_mask_BT[:, 1:].astype(jnp.float32))
+        if cp_axis is not None:
+            supervised_tokens = jnp.sum(loss_mask_BT.astype(jnp.float32))
+        else:
+            supervised_tokens = jnp.sum(loss_mask_BT[:, 1:].astype(jnp.float32))
         return loss, supervised_tokens
 
     return sft_eval_step
@@ -254,6 +288,7 @@ def run_sft(
     tp_size: int | None = None,
     fsdp_size: int | None = None,
     dp_size: int | None = None,
+    cp_size: int = 1,
     wandb_run=None,
     val_data_iter: checkpoint_utils.GrainIterator | None = None,
     val_every: int | None = None,
@@ -305,8 +340,9 @@ def run_sft(
         model_cfg = text_api.resolve_config(model_id_or_cfg)
         startup_log("resolved model config")
     startup_log(f"model_cfg={model_cfg}")
-    mesh = ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size)
-    startup_log("mesh ready (tp/fsdp/dp)")
+    mesh = ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size, cp_size=cp_size)
+    model_cfg = text_api.align_config_to_mesh(model_cfg, mesh)
+    startup_log("mesh ready (tp/cp/fsdp/dp)")
     batch_multiple = required_batch_multiple(text_api.batch_partition_spec(model_cfg), mesh)
     if train_cfg.batch_size % batch_multiple != 0:
         raise ValueError(
@@ -324,7 +360,8 @@ def run_sft(
     is_primary_process = jax.process_index() == 0
 
     model, model_cfg = init_model(
-        model_cfg, init_rng, tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size
+        model_cfg, init_rng, tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size,
+        cp_size=cp_size,
     )
     startup_log("initialized model")
     from omegalax.models.sharding_runtime import set_attn_backend

@@ -19,6 +19,7 @@ from transformers import AutoProcessor
 
 from omegalax import export as export_lib
 from omegalax import registry
+from omegalax.distributed import configure_gpu_xla_flags
 from omegalax.distributed.mesh import ensure_mesh, mesh_rules
 from omegalax.vlm import api as vlm_api
 
@@ -158,7 +159,9 @@ def _write_servable_config(out_dir: Path, cfg, model_source: Path) -> None:
 
 
 def main(_) -> None:
+    configure_gpu_xla_flags()  # must precede any jax backend creation
     model_source = registry.resolve_hf_model_source(FLAGS.model_id)
+    # One process holding all local GPUs, so not init_distributed(), which requires one per GPU.
     jax.distributed.initialize()
     model, cfg = load_model(model_source)
     model = _restore_trained_weights(model, Path(FLAGS.checkpoint_path).expanduser())

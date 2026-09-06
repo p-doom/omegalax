@@ -165,10 +165,7 @@ def _get_text_key_mapping():
             r"text.layers.\1.attn.k_norm.weight",
             Transform.SCALE,
         ),
-        p + r"layers\." + L + r"\.linear_attn\.in_proj_qkv\.weight": (
-            r"text.layers.\1.linear_attn.in_proj_qkv.kernel",
-            Transform.LINEAR,
-        ),
+        # in_proj_qkv is split into per-q/k/v kernels by ``_handle_linear_attn_specials``.
         p + r"layers\." + L + r"\.linear_attn\.in_proj_z\.weight": (
             r"text.layers.\1.linear_attn.in_proj_z.kernel",
             Transform.LINEAR,
@@ -228,6 +225,9 @@ def _get_non_expert_mapping():
 
 
 _CONV1D_RE = re.compile(r"model\.language_model\.layers\.(\d+)\.linear_attn\.conv1d\.weight")
+_IN_PROJ_QKV_RE = re.compile(
+    r"model\.language_model\.layers\.(\d+)\.linear_attn\.in_proj_qkv\.weight"
+)
 _DT_BIAS_RE = re.compile(r"model\.language_model\.layers\.(\d+)\.linear_attn\.dt_bias")
 _A_LOG_RE = re.compile(r"model\.language_model\.layers\.(\d+)\.linear_attn\.A_log")
 _EXPERT_GATE_UP_RE = re.compile(
@@ -253,9 +253,10 @@ def create_qwen3_5_from_safetensors(
     tp_size: int | None = None,
     fsdp_size: int | None = None,
     dp_size: int | None = None,
+    cp_size: int = 1,
 ) -> tuple[Qwen3_5ForConditionalGeneration, Qwen3_5Config]:
     """Load HuggingFace Qwen3.5 safetensors into a JAX Qwen3.5 model."""
-    mesh = ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size)
+    mesh = ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size, cp_size=cp_size)
 
     path = epath.Path(file_dir).expanduser()
     files = find_safetensors(file_dir)
@@ -283,15 +284,44 @@ def create_qwen3_5_from_safetensors(
 
     expert_buf: dict[tuple[int, str], dict[int, np.ndarray]] = defaultdict(dict)
 
+    tc = cfg.text_config
+    _key_dim = tc.linear_key_head_dim * tc.linear_num_key_heads
+
     def _handle_linear_attn_specials(torch_key: str, tensor):
+        m = _IN_PROJ_QKV_RE.match(torch_key)
+        if m:
+            # Fused HF in_proj_qkv weight (conv_dim, D) → per-q/k/v JAX kernels
+            # (D, key_dim/value_dim). Contiguous [q | k | v] split matches the
+            # split done in the forward pass; each ``.T`` mirrors Transform.LINEAR.
+            layer_idx = int(m.group(1))
+            fused_CD = np.asarray(tensor)
+            q_PD, k_PD, v_OD = np.split(fused_CD, [_key_dim, 2 * _key_dim], axis=0)
+            for name, part in (("q", q_PD), ("k", k_PD), ("v", v_OD)):
+                assign_to_state_dict(
+                    state_dict,
+                    f"text.layers.{layer_idx}.linear_attn.in_proj_{name}.kernel",
+                    jnp.asarray(part.T),
+                    torch_key,
+                    mesh=mesh,
+                    pspec_dict=pspec_dict,
+                )
+            return True
+
         m = _CONV1D_RE.match(torch_key)
         if m:
+            # Fused depthwise conv weight (conv_dim, K) → per-q/k/v channel slices.
             layer_idx = int(m.group(1))
-            value = jnp.asarray(tensor.squeeze(1))
-            target = f"text.layers.{layer_idx}.linear_attn.conv_weight"
-            assign_to_state_dict(
-                state_dict, target, value, torch_key, mesh=mesh, pspec_dict=pspec_dict
-            )
+            conv_CK = np.asarray(tensor.squeeze(1))
+            q_CK, k_CK, v_CK = np.split(conv_CK, [_key_dim, 2 * _key_dim], axis=0)
+            for name, part in (("q", q_CK), ("k", k_CK), ("v", v_CK)):
+                assign_to_state_dict(
+                    state_dict,
+                    f"text.layers.{layer_idx}.linear_attn.conv_weight_{name}",
+                    jnp.asarray(part),
+                    torch_key,
+                    mesh=mesh,
+                    pspec_dict=pspec_dict,
+                )
             return True
 
         m = _DT_BIAS_RE.match(torch_key)
@@ -502,6 +532,7 @@ def get_all_key_mappings():
 
 SPECIAL_KEY_PATTERNS = [
     _CONV1D_RE,
+    _IN_PROJ_QKV_RE,
     _DT_BIAS_RE,
     _A_LOG_RE,
     _EXPERT_GATE_UP_RE,

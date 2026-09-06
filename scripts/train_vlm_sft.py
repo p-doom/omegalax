@@ -23,6 +23,7 @@ from omegalax.data.grain_pipeline import (
     parse_data_mix,
     required_epochs_for_batches,
 )
+from omegalax.distributed import configure_gpu_xla_flags, init_distributed
 from omegalax.distributed.mesh import process_local_batch_size
 from omegalax.registry import resolve_hf_model_source
 from omegalax.trainers import vlm as vlm_trainer
@@ -77,6 +78,7 @@ flags.DEFINE_integer(
 )
 flags.DEFINE_integer("seed", None, "RNG seed.")
 flags.DEFINE_integer("tp_size", None, "Tensor parallelism size.")
+flags.DEFINE_integer("cp_size", 1, "Context (sequence) parallelism size (default 1 == disabled).")
 flags.DEFINE_integer("fsdp_size", None, "FSDP parallelism size.")
 flags.DEFINE_integer("dp_size", None, "Data parallelism size.")
 flags.DEFINE_string("save_dir", None, "Checkpoint save directory.")
@@ -245,6 +247,12 @@ def _validate_flags() -> None:
     if (FLAGS.data_path is None) == (FLAGS.data_mix is None):
         problems.append("exactly one of {data_path, data_mix} (got neither or both)")
 
+    # cp_size builds a `cp` mesh axis, but no shd_cfg ever names "cp": only
+    # ShardConfig.context_parallel() does, and nothing outside tests constructs it.
+    # cp_size > 1 would therefore replicate over N devices and shard nothing.
+    if FLAGS.cp_size != 1:
+        problems.append("cp_size must be 1 (context parallelism is not wired into the trainer)")
+
     if FLAGS.resume == ResumeMode.REQUIRED.value and FLAGS.resume_step is None:
         problems.append("resume_step (required when resume=required)")
     if FLAGS.resume == ResumeMode.NEVER.value and FLAGS.resume_step is not None:
@@ -353,13 +361,13 @@ def _grain_iter(
 
 
 def main(_) -> None:
+    configure_gpu_xla_flags()  # must precede any jax backend creation
     _validate_flags()
     model_source = resolve_hf_model_source(FLAGS.model_id)
     jax.config.update("jax_compilation_cache_dir", FLAGS.jax_cache_dir)
-    jax.distributed.initialize()
+    init_distributed()
     enable_ampere_packed_attention()
     startup_log(f"jax_compilation_cache_dir={FLAGS.jax_cache_dir}")
-    startup_log("jax.distributed initialized")
 
     tokenizer = AutoTokenizer.from_pretrained(model_source, local_files_only=True)
     model_type = AutoConfig.from_pretrained(model_source, local_files_only=True).model_type
@@ -515,6 +523,7 @@ def main(_) -> None:
             tp_size=FLAGS.tp_size,
             fsdp_size=FLAGS.fsdp_size,
             dp_size=FLAGS.dp_size,
+            cp_size=FLAGS.cp_size,
             wandb_run=wandb_run,
             val_data_iter=val_data_iter,
             val_every=FLAGS.val_every,
