@@ -304,6 +304,9 @@ class CpTrainStepTest(absltest.TestCase):
         rng = np.random.RandomState(0)
         tokens = rng.randint(1, cfg.vocab_size, size=(B, T)).astype(np.int32)
         mask = np.ones((B, T), dtype=np.float32)
+        # pad_id 0 is never drawn, so every position is a real token: the trainer's
+        # required attention mask is all ones and total_tokens must be exactly B*T.
+        attn = (tokens != 0).astype(np.int32)
         with mesh_rules(mesh):
             cfg_m = dataclasses.replace(cfg, shd_cfg=shard_config_for_mesh(
                 ShardConfig.context_parallel(), mesh
@@ -317,13 +320,15 @@ class CpTrainStepTest(absltest.TestCase):
             )
             step = text_trainer.make_sft_train_step(cfg_m, pad_id=0)
             batch = shard_batch_dict(
-                {"token_ids_BT": tokens, "loss_mask_BT": mask}, cfg_m.shd_cfg, mesh,
+                {"token_ids_BT": tokens, "loss_mask_BT": mask, "attention_mask_BT": attn},
+                cfg_m.shd_cfg, mesh,
                 cp_load_balance=False,
             )
             loss, metrics = step(opt, batch)
         self.assertTrue(np.isfinite(float(loss)), f"CP train-step loss not finite: {loss}")
         self.assertTrue(np.isfinite(float(metrics["grad_norm"])))
         self.assertGreater(float(metrics["supervised_tokens"]), 0.0)
+        self.assertEqual(float(metrics["total_tokens"]), float(B * T))
 
 
 class CpHybridEquivalenceTest(parameterized.TestCase):

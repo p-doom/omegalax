@@ -67,14 +67,19 @@ def _cudnn_packed_vision_attention(
         if jax.typeof(value).sharding != sharding:
             raise ValueError(f"Qwen3.5 vision {name} sharding must match q sharding")
     grid_sharding = jax.typeof(image_grid_thw).sharding
-    if tuple(sharding.mesh.axis_names) != ("tp", "fsdp", "dp"):
+    if tuple(sharding.mesh.axis_names) != ("tp", "cp", "fsdp", "dp"):
         raise ValueError(
-            "Qwen3.5 vision attention requires mesh axes ('tp', 'fsdp', 'dp')"
+            "Qwen3.5 vision attention requires mesh axes ('tp', 'cp', 'fsdp', 'dp')"
         )
-    if sharding.mesh.shape["tp"] != 1 or sharding.mesh.shape["dp"] != 1:
+    if (
+        sharding.mesh.shape["tp"] != 1
+        or sharding.mesh.shape["cp"] != 1
+        or sharding.mesh.shape["dp"] != 1
+    ):
         raise ValueError(
-            "Qwen3.5 vision attention requires tp=1 and dp=1; "
-            f"got tp={sharding.mesh.shape['tp']} and dp={sharding.mesh.shape['dp']}"
+            "Qwen3.5 vision attention requires tp=1, cp=1 and dp=1; "
+            f"got tp={sharding.mesh.shape['tp']}, cp={sharding.mesh.shape['cp']} "
+            f"and dp={sharding.mesh.shape['dp']}"
         )
     if grid_sharding.mesh != sharding.mesh:
         raise ValueError("q/k/v and image_grid_thw must use the same mesh")

@@ -379,18 +379,25 @@ class Qwen3VLScanEquivalenceTest(absltest.TestCase):
                 (rng.randint(8, cfg.vocab_size, size=(B, T))).astype(np.int32)
             )
             attention_mask_BT = jnp.ones((B, T), dtype=jnp.int32)
+            vision_patch_valid = jnp.empty((0,), dtype=jnp.bool_)
 
             def loss_fn(model):
-                hidden_BTD, aux = model(token_ids_BT, attention_mask_BT)
+                hidden_BTD, aux = model(
+                    token_ids_BT, attention_mask_BT, vision_patch_valid=vision_patch_valid
+                )
                 logits = model.lm_head(hidden_BTD)
                 return jnp.mean(logits**2) + aux, aux
 
             # Primary evidence: forward hidden states must be bit-identical
             # (this is what proves the scan is doing the same math as the loop).
             with _force_unrolled(cfg):
-                h_ref, _ = m_unrolled(token_ids_BT, attention_mask_BT)
+                h_ref, _ = m_unrolled(
+                    token_ids_BT, attention_mask_BT, vision_patch_valid=vision_patch_valid
+                )
                 (loss_ref, aux_ref), g_ref = nnx.value_and_grad(loss_fn, has_aux=True)(m_unrolled)
-            h_scan, _ = m_scan(token_ids_BT, attention_mask_BT)
+            h_scan, _ = m_scan(
+                token_ids_BT, attention_mask_BT, vision_patch_valid=vision_patch_valid
+            )
             (loss_scan, aux_scan), g_scan = nnx.value_and_grad(loss_fn, has_aux=True)(m_scan)
             fwd_max = float(jnp.max(jnp.abs(h_ref - h_scan)))
 
