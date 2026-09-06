@@ -61,15 +61,16 @@ def _validate_qwen3_5_process_local_batch(batch: dict, cfg: Qwen3_5Config, mesh:
 
     expected_axis = "fsdp" if mesh.shape["fsdp"] > 1 else None
     if (
-        tuple(mesh.axis_names) != ("tp", "fsdp", "dp")
+        tuple(mesh.axis_names) != ("tp", "cp", "fsdp", "dp")
         or mesh.shape["tp"] != 1
+        or mesh.shape["cp"] != 1
         or mesh.shape["dp"] != 1
         or cfg.text_config.shd_cfg.act_btd[0] != expected_axis
         or jax.process_count() != mesh.shape["fsdp"]
         or jax.local_device_count() != 1
     ):
         raise ValueError(
-            "Qwen3.5 vision batches require tp=1, dp=1, one local device per process, "
+            "Qwen3.5 vision batches require tp=1, cp=1, dp=1, one local device per process, "
             "process_count=fsdp, and batch sharding on fsdp"
         )
 
@@ -199,10 +200,11 @@ def init_model(
     tp_size: int | None = None,
     fsdp_size: int | None = None,
     dp_size: int | None = None,
+    cp_size: int = 1,
 ) -> tuple[nnx.Module, VLMConfig]:
     """Initialize a vision-language model."""
     cfg = resolve_config(model_or_id)
-    mesh = ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size)
+    mesh = ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size, cp_size=cp_size)
     cfg = align_config_to_mesh(cfg, mesh)
 
     axis_rules = axis_rules_for_mesh(mesh)
@@ -267,6 +269,7 @@ def load_pretrained(
     tp_size: int | None = None,
     fsdp_size: int | None = None,
     dp_size: int | None = None,
+    cp_size: int = 1,
 ) -> tuple[nnx.Module, VLMConfig]:
     """Load a pretrained VLM from HuggingFace safetensors."""
     from omegalax.models.qwen3_5 import create_qwen3_5_from_safetensors
@@ -276,17 +279,17 @@ def load_pretrained(
     if not (local_dir / "config.json").is_file():
         raise ValueError(f"model_source must be a local HuggingFace model directory: {local_dir}")
     cfg = resolve_config(str(local_dir))
-    # Validates any active mesh matches the requested (tp, fsdp, dp); the loaders
+    # Validates any active mesh matches the requested (tp, cp, fsdp, dp); the loaders
     # below build their own mesh from these sizes, so the return value is unused.
-    ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size)
+    ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size, cp_size=cp_size)
     if isinstance(cfg, Qwen3VLConfig):
         model, cfg = create_qwen3_vl_from_safetensors(
-            local_dir, tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size
+            local_dir, tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size, cp_size=cp_size
         )
         return model, cfg
     if isinstance(cfg, Qwen3_5Config):
         model, cfg = create_qwen3_5_from_safetensors(
-            local_dir, tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size
+            local_dir, tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size, cp_size=cp_size
         )
         return model, cfg
     raise ValueError(f"Unsupported VLM config type for pretrained loading: {type(cfg)}")

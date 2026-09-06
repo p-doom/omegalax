@@ -381,7 +381,15 @@ class LoRATest(absltest.TestCase):
                 self.assertIsInstance(getattr(layer, name), LoRALinear)
         self.assertTupleEqual(
             QWEN3_5_DELTANET_TARGET_MODULES,
-            ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "out_proj"),
+            (
+                "in_proj_q",
+                "in_proj_k",
+                "in_proj_v",
+                "in_proj_z",
+                "in_proj_b",
+                "in_proj_a",
+                "out_proj",
+            ),
         )
 
     def test_deltanet_target_names_do_not_change_a_non_deltanet_model(self):

@@ -141,6 +141,7 @@ def init_model(
     tp_size: int | None = None,
     fsdp_size: int | None = None,
     dp_size: int | None = None,
+    cp_size: int = 1,
 ) -> nnx.Module:
     model, _ = vlm_api.init_model(
         cfg_or_model_id,
@@ -148,6 +149,7 @@ def init_model(
         tp_size=tp_size,
         fsdp_size=fsdp_size,
         dp_size=dp_size,
+        cp_size=cp_size,
     )
     return model
 
@@ -447,6 +449,7 @@ def _run_sft(
     tp_size: int | None = None,
     fsdp_size: int | None = None,
     dp_size: int | None = None,
+    cp_size: int = 1,
     wandb_run=None,
     val_data_iter: checkpoint_utils.GrainIterator | None = None,
     val_every: int | None = None,
@@ -510,8 +513,9 @@ def _run_sft(
         startup_log("resolved model config")
     require_zero_router_aux_loss(model_cfg)
     startup_log(f"model_cfg={model_cfg}")
-    mesh = ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size)
-    startup_log("mesh ready (tp/fsdp/dp)")
+    mesh = ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size, cp_size=cp_size)
+    model_cfg = vlm_api.align_config_to_mesh(model_cfg, mesh)
+    startup_log("mesh ready (tp/cp/fsdp/dp)")
     batch_multiple = required_batch_multiple(vlm_api.batch_partition_spec(model_cfg), mesh)
     if train_cfg.batch_size % batch_multiple != 0:
         raise ValueError(
@@ -543,6 +547,7 @@ def _run_sft(
             tp_size=tp_size,
             fsdp_size=fsdp_size,
             dp_size=dp_size,
+            cp_size=cp_size,
         )
         startup_log("loaded pretrained model")
     else:
@@ -552,6 +557,7 @@ def _run_sft(
             tp_size=tp_size,
             fsdp_size=fsdp_size,
             dp_size=dp_size,
+            cp_size=cp_size,
         )
         startup_log("initialized model (random init)")
     if wandb_run is not None and is_primary_process:
