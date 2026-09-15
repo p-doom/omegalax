@@ -473,10 +473,8 @@ def _validate_stage1_common_c_holdout(
     ):
         raise ValueError("Stage-1 ancestry does not bind the protected training streams")
     actual_stream_ids = [
-        _canonical_json_sha256(
-            {"task": dataclasses.asdict(stream.config), "train_pairs": stream.train_pairs}
-        )
-        for stream in actual_streams
+        _canonical_json_sha256({"task": stream["task"], "train_pairs": stream["train_pairs"]})
+        for stream in recorded_streams
     ]
     if any(
         stream_id not in stream_ids
