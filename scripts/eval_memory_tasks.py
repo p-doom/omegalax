@@ -468,13 +468,23 @@ def _validate_stage1_common_c_holdout(
         if isinstance(item, dict)
     }
     if any(
-        stream_id not in inventory_streams
-        or inventory_streams[stream_id].get("family") != family
-        or receipt["endpoint"]
-        not in inventory_streams[stream_id].get("originating_endpoint_keys", [])
+        stream_id not in inventory_streams or inventory_streams[stream_id].get("family") != family
         for stream_id in stream_ids
     ):
         raise ValueError("Stage-1 ancestry does not bind the protected training streams")
+    actual_stream_ids = [
+        _canonical_json_sha256(
+            {"task": dataclasses.asdict(stream.config), "train_pairs": stream.train_pairs}
+        )
+        for stream in actual_streams
+    ]
+    if any(
+        stream_id not in stream_ids
+        or receipt["endpoint"]
+        not in inventory_streams[stream_id].get("originating_endpoint_keys", [])
+        for stream_id in actual_stream_ids
+    ):
+        raise ValueError("Stage-1 endpoint ancestry is not covered by the protected streams")
     if eval_role != "final":
         raise ValueError("STAGE1_COMMON_C_HOLDOUT requires eval_role=final")
 
