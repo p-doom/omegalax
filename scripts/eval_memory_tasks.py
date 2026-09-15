@@ -121,6 +121,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--eval_role", choices=("gate", "final"))
     parser.add_argument("--eval_manifest", type=Path, required=True)
+    parser.add_argument("--stage1_receipt", type=Path)
     parser.add_argument("--num_pairs", type=int, required=True)
     parser.add_argument("--pairs_per_batch", type=int, default=8)
     parser.add_argument("--tp_size", type=int, default=1)
@@ -148,6 +149,47 @@ def _file_sha256(path: Path) -> str:
     with path.open("rb") as source:
         for block in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(block)
+    return digest.hexdigest()
+
+
+def _read_stage1_json(path: Path, label: str) -> dict[str, Any]:
+    try:
+        if not path.is_file() or path.is_symlink():
+            raise ValueError(f"{label} is not a regular file: {path}")
+        value = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Unreadable Stage-1 {label}: {path}") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"Stage-1 {label} must be a JSON object: {path}")
+    return value
+
+
+def _require_stage1_self_hash(value: dict[str, Any], label: str) -> None:
+    if value.get("sha256") != _canonical_json_sha256(
+        {name: item for name, item in value.items() if name != "sha256"}
+    ):
+        raise ValueError(f"Stage-1 {label} self-hash mismatch")
+
+
+def _checkpoint_tree_sha256(root: Path) -> str:
+    if not root.is_dir() or root.is_symlink():
+        raise ValueError(f"Stage-1 checkpoint is not a directory: {root}")
+    rows: list[tuple[str, str]] = []
+    for current, directories, files in os.walk(root, followlinks=False):
+        current_path = Path(current)
+        for name in directories:
+            child = current_path / name
+            if not child.is_dir() or child.is_symlink():
+                raise ValueError(f"Stage-1 checkpoint has invalid directory: {child}")
+            rows.append((child.relative_to(root).as_posix(), "D"))
+        for name in files:
+            child = current_path / name
+            if not child.is_file() or child.is_symlink():
+                raise ValueError(f"Stage-1 checkpoint has invalid file: {child}")
+            rows.append((child.relative_to(root).as_posix(), "F:" + _file_sha256(child)))
+    digest = hashlib.sha256()
+    for name, value in sorted(rows):
+        digest.update(name.encode() + b"\0" + value.encode() + b"\n")
     return digest.hexdigest()
 
 
@@ -258,6 +300,185 @@ def _eval_name(
     return f"{name}{role}_pollution_guard_v1"
 
 
+def _validate_stage1_common_c_holdout(
+    manifest: dict[str, Any],
+    path: Path,
+    task_config: MemoryTaskConfig,
+    *,
+    num_pairs: int,
+    checkpoint_root: Path,
+    checkpoint_step: int,
+    training_contract_sha256: str,
+    eval_role: str | None,
+    receipt_path: Path | None,
+) -> None:
+    if receipt_path is None:
+        raise ValueError("STAGE1_COMMON_C_HOLDOUT requires --stage1_receipt")
+    try:
+        manifest_task = MemoryTaskConfig(**manifest["task"])
+        protection = manifest["protection"]
+        selection = manifest["selection"]
+        pair_indices = manifest["pair_indices"]
+        family = manifest["family"]
+        c = manifest["c"]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"Unreadable STAGE1_COMMON_C_HOLDOUT manifest: {path}") from exc
+    _require_stage1_self_hash(manifest, "manifest")
+    if (
+        manifest_task != task_config
+        or family != f"{task_config.task.value}_{task_config.relevance_cue.value}"
+        or c != task_config.num_segments
+        or manifest_task.num_segments != c
+    ):
+        raise ValueError("STAGE1_COMMON_C_HOLDOUT task, family, or C does not match request")
+    if len(pair_indices) != num_pairs or len(set(pair_indices)) != num_pairs:
+        raise ValueError("STAGE1_COMMON_C_HOLDOUT pair indices do not match --num_pairs")
+    if not all(isinstance(index, int) for index in pair_indices):
+        raise ValueError("STAGE1_COMMON_C_HOLDOUT pair indices must be integers")
+    if (
+        not isinstance(protection, dict)
+        or protection.get("policy") != "filler_free_tables_and_pairs_v1"
+        or not isinstance(selection, dict)
+        or selection.get("selection_coordinate_only") is not True
+        or selection.get("cross_c_paired_task_claim") is not False
+        or selection.get("candidate_cap") != 204800
+    ):
+        raise ValueError("STAGE1_COMMON_C_HOLDOUT protection or selection is invalid")
+    receipt_path = receipt_path.expanduser().resolve()
+    receipt = _read_stage1_json(receipt_path, "endpoint receipt")
+    _require_stage1_self_hash(receipt, "endpoint receipt")
+    stage1_root = receipt_path.parent.parent
+    if receipt_path.parent != stage1_root / "receipts":
+        raise ValueError(f"Stage-1 receipt is outside the receipts directory: {receipt_path}")
+    expected_manifest_path = stage1_root / "manifests" / family / f"c{c}.json"
+    manifest_binding = receipt.get("manifest")
+    if (
+        receipt.get("kind") != "STAGE1_ENDPOINT_C_OVERLAP_RECEIPT"
+        or receipt.get("family") != family
+        or receipt.get("c") != c
+        or not isinstance(manifest_binding, dict)
+        or manifest_binding.get("path") != str(expected_manifest_path.relative_to(stage1_root))
+        or expected_manifest_path != path
+        or manifest_binding.get("file_sha256") != _file_sha256(path)
+        or manifest_binding.get("self_sha256") != manifest.get("sha256")
+    ):
+        raise ValueError("Stage-1 receipt does not bind the requested endpoint and manifest")
+    inventory = receipt.get("common_inventory")
+    if (
+        not isinstance(inventory, dict)
+        or inventory.get("source_projections_path") != "source_projections.json"
+        or inventory.get("ancestry_path") != "ancestry_inventory.json"
+    ):
+        raise ValueError("Stage-1 receipt has invalid common inventory paths")
+    source_path = stage1_root / inventory["source_projections_path"]
+    ancestry_path = stage1_root / inventory["ancestry_path"]
+    source_projections = _read_stage1_json(source_path, "source projections")
+    ancestry = _read_stage1_json(ancestry_path, "ancestry inventory")
+    if (
+        protection.get("source_projection_sha256") != _file_sha256(source_path)
+        or protection.get("ancestry_inventory_sha256") != _file_sha256(ancestry_path)
+        or inventory.get("source_projections_sha256") != _file_sha256(source_path)
+        or inventory.get("ancestry_sha256") != _file_sha256(ancestry_path)
+        or source_projections.get("kind") != "STAGE1_EXCLUSION_INVENTORY"
+        or ancestry.get("kind") != "STAGE1_ANCESTRY_INVENTORY"
+    ):
+        raise ValueError("Stage-1 source projection or ancestry binding mismatch")
+    source_keys = protection.get("compatible_source_keys")
+    stream_ids = protection.get("training_stream_ids")
+    if (
+        not isinstance(source_keys, list)
+        or len(source_keys) != len(set(source_keys))
+        or receipt.get("applicable_source_keys") != source_keys
+        or not isinstance(stream_ids, list)
+        or len(stream_ids) != len(set(stream_ids))
+        or receipt.get("applicable_training_stream_ids") != stream_ids
+    ):
+        raise ValueError("Stage-1 receipt protection bindings mismatch")
+    projection_by_key = {
+        item.get("source_key"): item
+        for item in source_projections.get("sources", [])
+        if isinstance(item, dict)
+    }
+    if len(projection_by_key) != len(source_projections.get("sources", [])) or any(
+        projection_by_key.get(key, {}).get("family_assignment") != family
+        or projection_by_key[key].get("applicability", {}).get(family) != "APPLICABLE"
+        for key in source_keys
+    ):
+        raise ValueError("Stage-1 source projection does not cover the manifest family")
+    overlap = receipt.get("overlap")
+    if (
+        not isinstance(overlap, dict)
+        or overlap.get("pair_core_intersection_count") != 0
+        or overlap.get("world_table_intersection_count") != 0
+        or overlap.get("candidate_pair_digest_set_sha256")
+        != manifest.get("concrete_pair_digest_set_sha256")
+        or overlap.get("candidate_table_digest_set_sha256")
+        != manifest.get("concrete_table_digest_set_sha256")
+        or overlap.get("pair_protection_digest_set_sha256")
+        != protection.get("pair_protection_digest_set_sha256")
+        or overlap.get("table_protection_digest_set_sha256")
+        != protection.get("table_protection_digest_set_sha256")
+    ):
+        raise ValueError("Stage-1 receipt does not prove null overlap")
+    endpoint_records = [
+        item
+        for item in ancestry.get("endpoints", [])
+        if isinstance(item, dict) and item.get("endpoint") == receipt["endpoint"]
+    ]
+    if len(endpoint_records) != 1:
+        raise ValueError("Stage-1 ancestry has no unique endpoint record")
+    endpoint_record = endpoint_records[0]
+    expected_checkpoint = checkpoint_root / f"{checkpoint_step:06d}"
+    if (
+        Path(endpoint_record.get("checkpoint", "")).expanduser().resolve() != expected_checkpoint
+        or inventory.get("endpoint_ancestry_record_sha256")
+        != _canonical_json_sha256(endpoint_record)
+        or endpoint_record.get("checkpoint_tree_sha256")
+        != _checkpoint_tree_sha256(expected_checkpoint)
+    ):
+        raise ValueError("Stage-1 ancestry checkpoint binding mismatch")
+    try:
+        actual_streams = load_training_streams(checkpoint_root, checkpoint_step)
+        recorded_streams = endpoint_record["streams"]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("Stage-1 ancestry has unreadable training streams") from exc
+    if len(recorded_streams) != len(actual_streams):
+        raise ValueError("Stage-1 ancestry length does not match checkpoint ancestry")
+    for recorded, actual in zip(recorded_streams, actual_streams, strict=True):
+        contract_path = actual.checkpoint_root / "memory_task_contract.json"
+        try:
+            recorded_task = MemoryTaskConfig(**recorded["task"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("Stage-1 ancestry has invalid training task") from exc
+        if (
+            recorded.get("checkpoint_root") != str(actual.checkpoint_root)
+            or recorded.get("checkpoint_step") != actual.checkpoint_step
+            or recorded.get("contract_path") != str(contract_path)
+            or recorded.get("contract_file_sha256") != _file_sha256(contract_path)
+            or recorded.get("contract_canonical_sha256") != actual.contract_sha256
+            or recorded.get("train_pairs") != actual.train_pairs
+            or recorded_task != actual.config
+        ):
+            raise ValueError("Stage-1 ancestry contract binding mismatch")
+    if actual_streams[0].contract_sha256 != training_contract_sha256:
+        raise ValueError("Evaluated checkpoint contract changed while loading Stage-1 manifest")
+    inventory_streams = {
+        item.get("stream_id"): item
+        for item in ancestry.get("deduplicated_training_streams", [])
+        if isinstance(item, dict)
+    }
+    if any(
+        stream_id not in inventory_streams
+        or inventory_streams[stream_id].get("family") != family
+        or receipt["endpoint"]
+        not in inventory_streams[stream_id].get("originating_endpoint_keys", [])
+        for stream_id in stream_ids
+    ):
+        raise ValueError("Stage-1 ancestry does not bind the protected training streams")
+    if eval_role != "final":
+        raise ValueError("STAGE1_COMMON_C_HOLDOUT requires eval_role=final")
+
+
 def _load_manifest(
     path: Path,
     task_config: MemoryTaskConfig,
@@ -267,10 +488,30 @@ def _load_manifest(
     checkpoint_step: int,
     training_contract_sha256: str,
     eval_role: str | None,
+    stage1_receipt: Path | None = None,
 ) -> dict[str, Any]:
     path = path.expanduser().resolve()
     try:
         manifest = json.loads(path.read_text())
+    except (FileNotFoundError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Unreadable memory-task eval manifest: {path}") from exc
+    if isinstance(manifest, dict) and manifest.get("kind") == "STAGE1_COMMON_C_HOLDOUT":
+        manifest = _read_stage1_json(path, "eval manifest")
+        _validate_stage1_common_c_holdout(
+            manifest,
+            path,
+            task_config,
+            num_pairs=num_pairs,
+            checkpoint_root=checkpoint_root,
+            checkpoint_step=checkpoint_step,
+            training_contract_sha256=training_contract_sha256,
+            eval_role=eval_role,
+            receipt_path=stage1_receipt,
+        )
+        return manifest
+    if stage1_receipt is not None:
+        raise ValueError("--stage1_receipt is only valid with STAGE1_COMMON_C_HOLDOUT")
+    try:
         manifest_config = MemoryTaskConfig(
             **{
                 field.name: manifest.get(field.name, field.default)
@@ -549,6 +790,7 @@ def main(argv: list[str] | None = None) -> None:
         checkpoint_step=resolved.step,
         training_contract_sha256=training_contract_sha256,
         eval_role=args.eval_role,
+        stage1_receipt=args.stage1_receipt,
     )
     config = {
         "schema_version": 4,
@@ -577,6 +819,12 @@ def main(argv: list[str] | None = None) -> None:
     }
     if args.eval_role is not None:
         config["eval_role"] = args.eval_role
+    if args.stage1_receipt is not None:
+        stage1_receipt_path = args.stage1_receipt.expanduser().resolve()
+        config["stage1_receipt"] = {
+            "path": str(stage1_receipt_path),
+            "file_sha256": _file_sha256(stage1_receipt_path),
+        }
     run_dir.mkdir(parents=True, exist_ok=True)
     _ensure_not_complete(run_dir, manifest, config)
     for path, value in (
