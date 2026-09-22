@@ -27,6 +27,7 @@ P = PartitionSpec
 FLAGS = flags.FLAGS
 
 flags.DEFINE_string("model", None, "Qwen3.5 config or local model directory.", required=True)
+flags.DEFINE_integer("tp_size", 1, "Tensor-parallel mesh size.")
 flags.DEFINE_integer("fsdp_size", None, "FSDP mesh size.", required=True)
 flags.DEFINE_integer("batch_size", None, "Global batch size.", required=True)
 flags.DEFINE_integer("seq_len", 2048, "Sequence length.")
@@ -68,7 +69,7 @@ def _print_device_memory(phase: str) -> dict[int, dict]:
 
 def main(_) -> None:
     jax.distributed.initialize()
-    mesh = ensure_mesh(tp_size=1, fsdp_size=FLAGS.fsdp_size, dp_size=1)
+    mesh = ensure_mesh(tp_size=FLAGS.tp_size, fsdp_size=FLAGS.fsdp_size, dp_size=1)
     local_batch_size = process_local_batch_size(FLAGS.batch_size, 1, FLAGS.fsdp_size)
     print(
         f"runtime jax={jax.__version__} nccl={importlib.metadata.version('nvidia-nccl-cu12')} "
@@ -85,9 +86,18 @@ def main(_) -> None:
             project="omegalax",
             group=FLAGS.wandb_group,
             name=FLAGS.wandb_name,
-            tags=["test", "capacity", "statepassing", "c4", model_tag, f"fsdp{FLAGS.fsdp_size}"],
+            tags=[
+                "test",
+                "capacity",
+                "statepassing",
+                "c4",
+                model_tag,
+                f"tp{FLAGS.tp_size}",
+                f"fsdp{FLAGS.fsdp_size}",
+            ],
             config={
                 "model": FLAGS.model,
+                "tp_size": FLAGS.tp_size,
                 "fsdp_size": FLAGS.fsdp_size,
                 "global_batch_size": FLAGS.batch_size,
                 "local_batch_size": local_batch_size,
@@ -102,7 +112,7 @@ def main(_) -> None:
     model, cfg = text_api.init_model(
         FLAGS.model,
         init_rng,
-        tp_size=1,
+        tp_size=FLAGS.tp_size,
         fsdp_size=FLAGS.fsdp_size,
         dp_size=1,
     )
