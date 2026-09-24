@@ -7,28 +7,44 @@ import dataclasses
 from enum import StrEnum
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
+import socket
 import subprocess
+import sys
 
-from absl import flags
-import jax
-import wandb
 
-import omegalax
-from omegalax.data.memory_tasks import (
+def _require_slurm_job() -> None:
+    slurm_node = os.environ.get("SLURMD_NODENAME", "").split(".", 1)[0]
+    current_node = socket.gethostname().split(".", 1)[0]
+    if not os.environ.get("SLURM_JOB_ID") or not slurm_node or slurm_node != current_node:
+        raise RuntimeError(
+            "Refusing to train a memory task outside a Slurm compute node; submit it with sbatch"
+        )
+
+
+if __name__ == "__main__" and not {"-h", "--help"}.intersection(sys.argv[1:]):
+    _require_slurm_job()
+
+from absl import flags  # noqa: E402
+import jax  # noqa: E402
+import wandb  # noqa: E402
+
+import omegalax  # noqa: E402
+from omegalax.data.memory_tasks import (  # noqa: E402
     MemoryTask,
     MemoryTaskConfig,
     MemoryTaskCue,
     MemoryTaskSplit,
     make_memory_task_iterator,
 )
-from omegalax.models.qwen3_5.kernels import _resolve_backend
-from omegalax.text import api as text_api
-from omegalax.text.checkpoint import resolve_checkpoint
-from omegalax.trainers import pretrain as pretrain_trainer
-from omegalax.trainers import tail_pretrain
-from omegalax.trainers.checkpoint_utils import ResumeMode
+from omegalax.models.qwen3_5.kernels import _resolve_backend  # noqa: E402
+from omegalax.text import api as text_api  # noqa: E402
+from omegalax.text.checkpoint import resolve_checkpoint  # noqa: E402
+from omegalax.trainers import pretrain as pretrain_trainer  # noqa: E402
+from omegalax.trainers import tail_pretrain  # noqa: E402
+from omegalax.trainers.checkpoint_utils import ResumeMode  # noqa: E402
 
 
 class TrainingCondition(StrEnum):
@@ -108,6 +124,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--bank_value_alphabet", type=int, default=256)
     parser.add_argument("--num_rule_examples", type=int, default=5)
     parser.add_argument("--num_exact_bindings", type=int, default=1)
+    parser.add_argument("--exact_sequence_length", type=int, default=1)
     parser.add_argument("--generator_version", type=int, choices=(1, 2), default=1)
     parser.add_argument(
         "--relevance_cue",
@@ -257,6 +274,8 @@ def _ensure_contract(save_dir: Path, contract: dict[str, object]) -> None:
             existing["task"].setdefault("generator_version", 1)
         if "bank_value_alphabet" in contract["task"]:
             existing["task"].setdefault("bank_value_alphabet", 256)
+        if "exact_sequence_length" in contract["task"]:
+            existing["task"].setdefault("exact_sequence_length", 1)
         existing.setdefault("model_seed", existing["task"]["seed"])
         if existing != contract:
             raise ValueError(f"Memory-task contract mismatch at {path}")
@@ -269,6 +288,7 @@ def _ensure_contract(save_dir: Path, contract: dict[str, object]) -> None:
 
 def main(argv: list[str] | None = None) -> None:
     args = _parser().parse_args(argv)
+    _require_slurm_job()
     if not args.success_criterion.strip():
         raise ValueError("--success_criterion must be non-empty")
     if args.init_model_checkpoint is not None and args.init_hf_model_path is not None:
@@ -289,6 +309,7 @@ def main(argv: list[str] | None = None) -> None:
         bank_value_alphabet=args.bank_value_alphabet,
         num_rule_examples=args.num_rule_examples,
         num_exact_bindings=args.num_exact_bindings,
+        exact_sequence_length=args.exact_sequence_length,
         relevance_cue=args.relevance_cue,
         split=MemoryTaskSplit.TRAIN,
         generator_version=args.generator_version,

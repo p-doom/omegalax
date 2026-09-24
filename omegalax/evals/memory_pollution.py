@@ -30,6 +30,8 @@ _COMPATIBLE_V2_CONTENT_SHA256 = frozenset(
         # Unique 230179f v2 content hash (currently only the clean A48 run): later
         # HF-init/provenance changes leave deterministic pair consumption unchanged.
         "971f564351b87e962092de318fcb260fa1c1552b6b1870ebc1c90834a6693610",
+        # Last single-token production content before exact_sequence_length was added.
+        "e8b1a5abf304cc8c9163b717254fe54568e242b8d12c9ad3db26b50f4c0e8ad2",
     }
 )
 
@@ -75,7 +77,7 @@ def _table_records(world: np.ndarray, config: MemoryTaskConfig) -> tuple[tuple[i
     early = world[:-1].reshape(-1)
     if config.task is MemoryTask.EXACT:
         tags = (memory_tasks._BIND, memory_tasks._DECOY_BIND)
-        width = 3
+        width = 2 + config.exact_sequence_length
     elif config.task is MemoryTask.DOMINANT_RULE:
         tags = (memory_tasks._DEMO,)
         width = 3

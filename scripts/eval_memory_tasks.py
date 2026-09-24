@@ -72,9 +72,37 @@ def summarize_rows(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
         mode_summary: dict[str, Any] = {
             "num_examples": len(mode_rows),
             "accuracy": float(np.mean([row["correct"] for row in mode_rows])),
+            "token_accuracy": float(
+                np.mean([row.get("token_accuracy", row["correct"]) for row in mode_rows])
+            ),
             "answer_nll": float(np.mean([row["answer_nll"] for row in mode_rows])),
             "donor_accuracy": float(np.mean([row["donor_correct"] for row in mode_rows])),
+            "donor_token_accuracy": float(
+                np.mean(
+                    [row.get("donor_token_accuracy", row["donor_correct"]) for row in mode_rows]
+                )
+            ),
             "donor_answer_nll": float(np.mean([row["donor_answer_nll"] for row in mode_rows])),
+            "answer_score_margin": float(
+                np.mean(
+                    [
+                        row.get(
+                            "answer_score_margin",
+                            row["donor_answer_nll"] - row["answer_nll"],
+                        )
+                        for row in mode_rows
+                    ]
+                )
+            ),
+        }
+        answer_length = len(mode_rows[0].get("position_correct", [mode_rows[0]["correct"]]))
+        mode_summary["accuracy_by_answer_position"] = {
+            str(position): float(
+                np.mean(
+                    [row.get("position_correct", [row["correct"]])[position] for row in mode_rows]
+                )
+            )
+            for position in range(answer_length)
         }
         for field in _STRATA_FIELDS:
             by_value: dict[int, list[dict[str, Any]]] = defaultdict(list)
@@ -105,6 +133,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--bank_value_alphabet", type=int, default=256)
     parser.add_argument("--num_rule_examples", type=int, default=5)
     parser.add_argument("--num_exact_bindings", type=int, default=1)
+    parser.add_argument("--exact_sequence_length", type=int, default=1)
     parser.add_argument("--generator_version", type=int, choices=(1, 2), default=1)
     parser.add_argument(
         "--relevance_cue",
@@ -186,6 +215,7 @@ def _read_training_contract(checkpoint_root: Path) -> tuple[dict[str, Any], dict
         trained_task = dict(contract["task"])
         trained_task.setdefault("generator_version", 1)
         trained_task.setdefault("bank_value_alphabet", 256)
+        trained_task.setdefault("exact_sequence_length", 1)
     except (json.JSONDecodeError, KeyError, TypeError) as exc:
         raise ValueError(f"Unreadable memory-task contract: {contract_path}") from exc
     if not isinstance(contract, dict) or not isinstance(trained_task, dict):
@@ -254,6 +284,8 @@ def _eval_name(
         )
     else:
         name = f"memory_{task_config.task.value}"
+    if task_config.exact_sequence_length > 1:
+        name = f"{name}_d{task_config.exact_sequence_length}"
     role = f"_{eval_role}" if eval_role is not None else ""
     return f"{name}{role}_pollution_guard_v1"
 
@@ -465,7 +497,7 @@ def _plot(summary: dict[str, dict[str, float]], plots_dir: Path) -> None:
         width,
         label="paired-world answer",
     )
-    axis.set_ylabel("Exact one-token accuracy")
+    axis.set_ylabel("Exact sequence accuracy")
     axis.set_ylim(0, 1)
     axis.set_xticks(x, labels)
     axis.legend()
@@ -483,7 +515,7 @@ def _plot(summary: dict[str, dict[str, float]], plots_dir: Path) -> None:
         width,
         label="paired-world answer",
     )
-    axis.set_ylabel("Answer-token NLL")
+    axis.set_ylabel("Mean answer-token NLL")
     axis.set_xticks(x, labels)
     axis.legend()
     figure.tight_layout()
@@ -523,6 +555,7 @@ def main(argv: list[str] | None = None) -> None:
         bank_value_alphabet=args.bank_value_alphabet,
         num_rule_examples=args.num_rule_examples,
         num_exact_bindings=args.num_exact_bindings,
+        exact_sequence_length=args.exact_sequence_length,
         relevance_cue=args.relevance_cue,
         split=MemoryTaskSplit.EVAL,
         generator_version=args.generator_version,
@@ -551,7 +584,7 @@ def main(argv: list[str] | None = None) -> None:
         eval_role=args.eval_role,
     )
     config = {
-        "schema_version": 4,
+        "schema_version": 5,
         "checkpoint_root": str(resolved.root),
         "checkpoint_step": resolved.step,
         "manifest_path": str(args.eval_manifest.expanduser().resolve()),
@@ -612,23 +645,49 @@ def main(argv: list[str] | None = None) -> None:
             flatten=False,
         )
         metadata = dict(batch[BATCH_PRETRAIN_METADATA_KEY])
-        answers_B = np.asarray(metadata["answer_token_B"])
-        donor_answers_B = answers_B[np.arange(answers_B.size) ^ 1]
+        answers_BD = np.asarray(metadata["answer_tokens_BD"])
+        donor_answers_BD = answers_BD[np.arange(answers_BD.shape[0]) ^ 1]
         results = evaluate_batch(model, batch)
         for mode, result in results.items():
-            for idx in range(answers_B.size):
-                prediction = int(result.predictions_B[idx])
+            for idx in range(answers_BD.shape[0]):
+                answer_tokens = [int(token) for token in answers_BD[idx]]
+                donor_answer_tokens = [int(token) for token in donor_answers_BD[idx]]
+                prediction_tokens = [int(token) for token in result.predictions_BD[idx]]
+                position_correct = [
+                    prediction == answer
+                    for prediction, answer in zip(prediction_tokens, answer_tokens, strict=True)
+                ]
+                donor_position_correct = [
+                    prediction == answer
+                    for prediction, answer in zip(
+                        prediction_tokens, donor_answer_tokens, strict=True
+                    )
+                ]
                 row = {
                     "mode": mode.value,
                     "pair_index": int(metadata["pair_index_B"][idx]),
                     "world": int(metadata["world_B"][idx]),
-                    "answer_token": int(answers_B[idx]),
-                    "donor_answer_token": int(donor_answers_B[idx]),
-                    "prediction": prediction,
-                    "correct": prediction == int(answers_B[idx]),
-                    "donor_correct": prediction == int(donor_answers_B[idx]),
+                    "answer_token": answer_tokens[-1],
+                    "donor_answer_token": donor_answer_tokens[-1],
+                    "prediction": prediction_tokens[-1],
+                    "answer_tokens": answer_tokens,
+                    "donor_answer_tokens": donor_answer_tokens,
+                    "prediction_tokens": prediction_tokens,
+                    "position_correct": position_correct,
+                    "donor_position_correct": donor_position_correct,
+                    "correct": all(position_correct),
+                    "token_accuracy": float(np.mean(position_correct)),
+                    "donor_correct": all(donor_position_correct),
+                    "donor_token_accuracy": float(np.mean(donor_position_correct)),
                     "answer_nll": float(result.answer_nll_B[idx]),
                     "donor_answer_nll": float(result.donor_answer_nll_B[idx]),
+                    "answer_nll_by_position": [float(value) for value in result.answer_nll_BD[idx]],
+                    "donor_answer_nll_by_position": [
+                        float(value) for value in result.donor_answer_nll_BD[idx]
+                    ],
+                    "answer_total_nll": float(np.sum(result.answer_nll_BD[idx])),
+                    "donor_answer_total_nll": float(np.sum(result.donor_answer_nll_BD[idx])),
+                    "answer_score_margin": float(result.answer_score_margin_B[idx]),
                 }
                 for row_key, metadata_key in (
                     ("target_slot", "target_slot_B"),
@@ -648,10 +707,18 @@ def main(argv: list[str] | None = None) -> None:
     effects = {
         "correct_minus_counterfactual_accuracy": mode_summary["correct_state"]["accuracy"]
         - mode_summary["counterfactual_state"]["accuracy"],
+        "correct_minus_counterfactual_token_accuracy": mode_summary["correct_state"][
+            "token_accuracy"
+        ]
+        - mode_summary["counterfactual_state"]["token_accuracy"],
         "counterfactual_donor_minus_own_accuracy": mode_summary["counterfactual_state"][
             "donor_accuracy"
         ]
         - mode_summary["counterfactual_state"]["accuracy"],
+        "counterfactual_donor_minus_own_token_accuracy": mode_summary["counterfactual_state"][
+            "donor_token_accuracy"
+        ]
+        - mode_summary["counterfactual_state"]["token_accuracy"],
         "correct_minus_counterfactual_answer_nll": mode_summary["counterfactual_state"][
             "answer_nll"
         ]

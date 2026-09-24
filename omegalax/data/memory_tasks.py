@@ -50,6 +50,7 @@ class MemoryTaskConfig:
     bank_value_alphabet: int = 256
     num_rule_examples: int = 5
     num_exact_bindings: int = 1
+    exact_sequence_length: int = 1
     relevance_cue: MemoryTaskCue | str = MemoryTaskCue.MARKED
     split: MemoryTaskSplit | str = MemoryTaskSplit.TRAIN
     generator_version: int = 1
@@ -72,6 +73,8 @@ class MemoryTaskConfig:
             raise ValueError("num_rule_examples must be odd and >= 3")
         if self.num_exact_bindings < 1:
             raise ValueError("num_exact_bindings must be >= 1")
+        if self.exact_sequence_length < 1:
+            raise ValueError("exact_sequence_length must be >= 1")
         if self.task is MemoryTask.DOMINANT_RULE:
             required = 1 + 3 * self.num_rule_examples
             if self.segment_length < required:
@@ -84,16 +87,32 @@ class MemoryTaskConfig:
                     f"{self.num_rule_examples + 1} pairwise-distinct rule items "
                     f"but only {_RULE_ITEMS.size} exist"
                 )
-            if self.num_exact_bindings != 1 or self.relevance_cue is not MemoryTaskCue.MARKED:
+            if (
+                self.num_exact_bindings != 1
+                or self.exact_sequence_length != 1
+                or self.relevance_cue is not MemoryTaskCue.MARKED
+            ):
                 raise ValueError(
-                    "num_exact_bindings/relevance_cue are only defined for MemoryTask.EXACT"
+                    "num_exact_bindings/exact_sequence_length/relevance_cue are only defined "
+                    "for MemoryTask.EXACT"
                 )
         if self.task is MemoryTask.EXACT:
-            required = 1 + 3 * self.num_exact_bindings
+            if self.exact_sequence_length > 1 and (
+                self.num_exact_bindings != 1 or self.relevance_cue is not MemoryTaskCue.MARKED
+            ):
+                raise ValueError(
+                    "exact_sequence_length > 1 requires num_exact_bindings=1 and "
+                    "relevance_cue=marked"
+                )
+            required = max(
+                1 + 3 * self.num_exact_bindings,
+                4 + self.exact_sequence_length,
+            )
             if self.segment_length < required:
                 raise ValueError(
                     f"segment_length must be >= {required} for "
-                    f"{self.num_exact_bindings} exact bindings"
+                    f"{self.num_exact_bindings} exact bindings and "
+                    f"exact_sequence_length={self.exact_sequence_length}"
                 )
             if self.num_exact_bindings + 1 > _VALUES.size:
                 raise ValueError(
@@ -108,9 +127,14 @@ class MemoryTaskConfig:
                 raise ValueError("num_segments must be == 4 for MemoryTask.ASSOCIATIVE_BANK")
             if self.vocab_size < 1024:
                 raise ValueError("vocab_size must be >= 1024 for MemoryTask.ASSOCIATIVE_BANK")
-            if self.num_exact_bindings != 1 or self.relevance_cue is not MemoryTaskCue.MARKED:
+            if (
+                self.num_exact_bindings != 1
+                or self.exact_sequence_length != 1
+                or self.relevance_cue is not MemoryTaskCue.MARKED
+            ):
                 raise ValueError(
-                    "num_exact_bindings/relevance_cue are only defined for MemoryTask.EXACT"
+                    "num_exact_bindings/exact_sequence_length/relevance_cue are only defined "
+                    "for MemoryTask.EXACT"
                 )
             if (
                 type(self.bank_value_alphabet) is not int
@@ -128,9 +152,14 @@ class MemoryTaskConfig:
                 raise ValueError("num_segments must be == 5 for MemoryTask.RULE_BANK")
             if self.vocab_size < 1024:
                 raise ValueError("vocab_size must be >= 1024 for MemoryTask.RULE_BANK")
-            if self.num_exact_bindings != 1 or self.relevance_cue is not MemoryTaskCue.MARKED:
+            if (
+                self.num_exact_bindings != 1
+                or self.exact_sequence_length != 1
+                or self.relevance_cue is not MemoryTaskCue.MARKED
+            ):
                 raise ValueError(
-                    "num_exact_bindings/relevance_cue are only defined for MemoryTask.EXACT"
+                    "num_exact_bindings/exact_sequence_length/relevance_cue are only defined "
+                    "for MemoryTask.EXACT"
                 )
         if self.relevance_cue is MemoryTaskCue.SURPRISE and self.num_exact_bindings < 3:
             raise ValueError("relevance_cue=surprise requires num_exact_bindings >= 3")
@@ -393,15 +422,29 @@ def _paired_tokens(pair_index: int, config: MemoryTaskConfig) -> tuple[np.ndarra
     if config.task is MemoryTask.EXACT:
         if config.num_exact_bindings == 1:
             key = int(rng.choice(_KEYS))
-            values = rng.choice(_VALUES, size=2, replace=False)
+            # Keep the two worlds different at every answer position so token-level
+            # donor metrics stay unambiguous, but allow realistic repetitions across
+            # positions. One draw per position preserves the historical D=1 stream.
+            values = np.stack(
+                [
+                    rng.choice(_VALUES, size=2, replace=False)
+                    for _ in range(config.exact_sequence_length)
+                ],
+                axis=1,
+            )
             for world in (0, 1):
-                paired[world, 0, :4] = (_EXACT_TASK, _BIND, key, values[world])
-                paired[world, -1, -5:] = (
+                paired[world, 0, : 3 + config.exact_sequence_length] = (
+                    _EXACT_TASK,
+                    _BIND,
+                    key,
+                    *values[world],
+                )
+                paired[world, -1, -(4 + config.exact_sequence_length) :] = (
                     _EXACT_TASK,
                     _QUERY,
                     key,
                     _ANSWER,
-                    values[world],
+                    *values[world],
                 )
             return paired, 0
         return _multi_slot_exact_tokens(rng, paired, config)
@@ -454,7 +497,8 @@ def build_memory_task_batch(
     num_windows = token_ids_BCT.shape[0]
     attention_mask_BCT = np.ones_like(token_ids_BCT, dtype=np.int32)
     loss_mask_BCT = np.zeros_like(token_ids_BCT, dtype=np.int32)
-    loss_mask_BCT[:, -1, -1] = 1
+    answer_length = config.exact_sequence_length if config.task is MemoryTask.EXACT else 1
+    loss_mask_BCT[:, -1, -answer_length:] = 1
     chunk_idx_BC = np.broadcast_to(
         np.arange(config.num_segments, dtype=np.int32),
         (num_windows, config.num_segments),
@@ -466,6 +510,11 @@ def build_memory_task_batch(
         "world_B": np.tile(np.asarray((0, 1), dtype=np.int32), len(pair_indices)),
         "answer_token_B": token_ids_BCT[:, -1, -1].copy(),
         "answer_position_B": np.full(num_windows, config.segment_length - 1, dtype=np.int32),
+        "answer_tokens_BD": token_ids_BCT[:, -1, -answer_length:].copy(),
+        "answer_positions_BD": np.broadcast_to(
+            np.arange(config.segment_length - answer_length, config.segment_length, dtype=np.int32),
+            (num_windows, answer_length),
+        ).copy(),
     }
     if config.task is MemoryTask.RULE_BANK:
         # RULE_BANK's generic target_slot is the query namespace itself, so a

@@ -26,12 +26,18 @@ class MemoryEvalMode(StrEnum):
 @dataclasses.dataclass(frozen=True, slots=True)
 class MemoryEvalResult:
     accuracy: float
+    token_accuracy: float
     answer_nll: float
     donor_accuracy: float
+    donor_token_accuracy: float
     donor_answer_nll: float
     predictions_B: np.ndarray
     answer_nll_B: np.ndarray
     donor_answer_nll_B: np.ndarray
+    predictions_BD: np.ndarray
+    answer_nll_BD: np.ndarray
+    donor_answer_nll_BD: np.ndarray
+    answer_score_margin_B: np.ndarray
 
 
 def _counterfactual_indices(
@@ -165,6 +171,32 @@ def _score_answer_arrays(
     return predictions_B, answer_nll_B, donor_answer_nll_B
 
 
+def _score_sequence_arrays(
+    output_weight_DV: jax.Array,
+    hidden_BTD: jax.Array,
+    positions_BD: jax.Array,
+    answers_BD: jax.Array,
+) -> tuple[jax.Array, jax.Array]:
+    batch_indices_B1 = jnp.arange(hidden_BTD.shape[0], dtype=jnp.int32)[:, None]
+    answer_hidden_BDH = hidden_BTD[batch_indices_B1, positions_BD - 1]
+    logits_BDV = jnp.einsum("BDH,HV->BDV", answer_hidden_BDH, output_weight_DV)
+    predictions_BD = jnp.argmax(logits_BDV, axis=-1)
+    answer_logits_BD = jnp.take_along_axis(logits_BDV, answers_BD[..., None], axis=-1)[..., 0]
+    answer_nll_BD = jax.nn.logsumexp(logits_BDV, axis=-1) - answer_logits_BD
+    return predictions_BD, answer_nll_BD
+
+
+def _predict_at_positions(
+    output_weight_DV: jax.Array,
+    hidden_BTD: jax.Array,
+    positions_B: jax.Array,
+) -> jax.Array:
+    batch_indices_B = jnp.arange(hidden_BTD.shape[0], dtype=jnp.int32)
+    answer_hidden_BH = hidden_BTD[batch_indices_B, positions_B - 1]
+    logits_BV = jnp.einsum("BH,HV->BV", answer_hidden_BH, output_weight_DV)
+    return jnp.argmax(logits_BV, axis=-1)
+
+
 def make_memory_evaluator(model_config):
     """Create reusable JITs for fixed-shape causal-memory eval batches.
 
@@ -224,6 +256,139 @@ def make_memory_evaluator(model_config):
         )
 
     score_answers = jax.jit(_score_answer_arrays)
+    score_sequences = jax.jit(_score_sequence_arrays)
+    predict_at_positions = jax.jit(_predict_at_positions)
+
+    def evaluate_sequences(
+        model,
+        token_ids_BCT: jax.Array,
+        attention_mask_BCT: jax.Array,
+        metadata: dict[str, Any],
+    ) -> dict[MemoryEvalMode, MemoryEvalResult]:
+        pair_index_B = np.asarray(metadata["pair_index_B"])
+        world_B = np.asarray(metadata["world_B"])
+        donor_indices_B = jnp.asarray(
+            _counterfactual_indices(pair_index_B, world_B), dtype=jnp.int32
+        )
+        answers_BD = jnp.asarray(metadata["answer_tokens_BD"], dtype=jnp.int32)
+        donor_answers_BD = answers_BD[donor_indices_B]
+        local_positions_BD = jnp.asarray(metadata["answer_positions_BD"], dtype=jnp.int32)
+        batch_size, num_segments, segment_length = token_ids_BCT.shape
+        batch_indices_B1 = jnp.arange(batch_size, dtype=jnp.int32)[:, None]
+
+        correct_initial_states = None
+        if num_segments > 1:
+            _, _, correct_initial_states = run_initial_segment(
+                model, token_ids_BCT[:, 0], attention_mask_BCT[:, 0]
+            )
+            for segment_idx in range(1, num_segments - 1):
+                _, _, correct_initial_states = run_carried_segment(
+                    model,
+                    token_ids_BCT[:, segment_idx],
+                    attention_mask_BCT[:, segment_idx],
+                    correct_initial_states,
+                )
+
+        def run_mode(mode: MemoryEvalMode, candidate_tokens_BCT: jax.Array) -> jax.Array:
+            if mode is MemoryEvalMode.FULL_CONTEXT:
+                hidden_BTD = run_full_context(
+                    model,
+                    candidate_tokens_BCT.reshape(batch_size, num_segments * segment_length),
+                    attention_mask_BCT.reshape(batch_size, num_segments * segment_length),
+                )
+                return hidden_BTD
+            if mode is MemoryEvalMode.RESET or correct_initial_states is None:
+                hidden_BTD, _, _ = run_initial_segment(
+                    model,
+                    candidate_tokens_BCT[:, -1],
+                    attention_mask_BCT[:, -1],
+                )
+                return hidden_BTD
+            initial_states = correct_initial_states
+            if mode is MemoryEvalMode.ZERO_STATE:
+                initial_states = tuple(jnp.zeros_like(state) for state in correct_initial_states)
+            elif mode is MemoryEvalMode.COUNTERFACTUAL_STATE:
+                initial_states = tuple(state[donor_indices_B] for state in correct_initial_states)
+            hidden_BTD, _, _ = run_carried_segment(
+                model,
+                candidate_tokens_BCT[:, -1],
+                attention_mask_BCT[:, -1],
+                initial_states,
+            )
+            return hidden_BTD
+
+        donor_tokens_BCT = token_ids_BCT.at[
+            batch_indices_B1,
+            -1,
+            local_positions_BD,
+        ].set(donor_answers_BD)
+        output_weight_DV = model.output_weight()
+        results: dict[MemoryEvalMode, MemoryEvalResult] = {}
+        for mode in MemoryEvalMode:
+            positions_BD = local_positions_BD
+            if mode is MemoryEvalMode.FULL_CONTEXT:
+                positions_BD = positions_BD + (num_segments - 1) * segment_length
+
+            own_hidden_BTD = run_mode(mode, token_ids_BCT)
+            _, answer_nll_BD = score_sequences(
+                output_weight_DV,
+                own_hidden_BTD,
+                positions_BD,
+                answers_BD,
+            )
+            donor_hidden_BTD = run_mode(mode, donor_tokens_BCT)
+            _, donor_answer_nll_BD = score_sequences(
+                output_weight_DV,
+                donor_hidden_BTD,
+                positions_BD,
+                donor_answers_BD,
+            )
+
+            working_tokens_BCT = token_ids_BCT
+            predictions = []
+            for answer_idx in range(answers_BD.shape[1]):
+                hidden_BTD = (
+                    own_hidden_BTD if answer_idx == 0 else run_mode(mode, working_tokens_BCT)
+                )
+                prediction_B = predict_at_positions(
+                    output_weight_DV,
+                    hidden_BTD,
+                    positions_BD[:, answer_idx],
+                )
+                predictions.append(prediction_B)
+                working_tokens_BCT = working_tokens_BCT.at[
+                    jnp.arange(batch_size, dtype=jnp.int32),
+                    -1,
+                    local_positions_BD[:, answer_idx],
+                ].set(prediction_B)
+
+            predictions_BD = np.asarray(jax.device_get(jnp.stack(predictions, axis=1)))
+            answer_nll_BD = np.asarray(jax.device_get(answer_nll_BD))
+            donor_answer_nll_BD = np.asarray(jax.device_get(donor_answer_nll_BD))
+            answers = np.asarray(answers_BD)
+            donor_answers = np.asarray(donor_answers_BD)
+            own_match_BD = predictions_BD == answers
+            donor_match_BD = predictions_BD == donor_answers
+            answer_score_margin_B = np.sum(
+                donor_answer_nll_BD - answer_nll_BD,
+                axis=1,
+            )
+            results[mode] = MemoryEvalResult(
+                accuracy=float(np.mean(np.all(own_match_BD, axis=1))),
+                token_accuracy=float(np.mean(own_match_BD)),
+                answer_nll=float(np.mean(answer_nll_BD)),
+                donor_accuracy=float(np.mean(np.all(donor_match_BD, axis=1))),
+                donor_token_accuracy=float(np.mean(donor_match_BD)),
+                donor_answer_nll=float(np.mean(donor_answer_nll_BD)),
+                predictions_B=predictions_BD[:, -1],
+                answer_nll_B=np.mean(answer_nll_BD, axis=1),
+                donor_answer_nll_B=np.mean(donor_answer_nll_BD, axis=1),
+                predictions_BD=predictions_BD,
+                answer_nll_BD=answer_nll_BD,
+                donor_answer_nll_BD=donor_answer_nll_BD,
+                answer_score_margin_B=answer_score_margin_B,
+            )
+        return results
 
     def evaluate(model, batch: dict[str, Any]) -> dict[MemoryEvalMode, MemoryEvalResult]:
         token_ids_BCT = jnp.asarray(batch["token_ids_BCT"], dtype=jnp.int32)
@@ -232,10 +397,13 @@ def make_memory_evaluator(model_config):
         metadata = dict(batch[BATCH_PRETRAIN_METADATA_KEY])
         pair_index_B = np.asarray(metadata["pair_index_B"])
         world_B = np.asarray(metadata["world_B"])
+        _assert_reset_only_at_segment_zero(reset_state_BC)
+        answers_BD = np.asarray(metadata["answer_tokens_BD"])
+        if answers_BD.shape[1] > 1:
+            return evaluate_sequences(model, token_ids_BCT, attention_mask_BCT, metadata)
         donor_indices_B = jnp.asarray(
             _counterfactual_indices(pair_index_B, world_B), dtype=jnp.int32
         )
-        _assert_reset_only_at_segment_zero(reset_state_BC)
         answers_B = jnp.asarray(metadata["answer_token_B"], dtype=jnp.int32)
         donor_answers_B = answers_B[donor_indices_B]
         local_positions_B = jnp.asarray(metadata["answer_position_B"], dtype=jnp.int32)
@@ -321,12 +489,18 @@ def make_memory_evaluator(model_config):
             donor_answer_nll_B = np.asarray(jax.device_get(donor_answer_nll_B))
             results[mode] = MemoryEvalResult(
                 accuracy=float(np.mean(predictions_B == np.asarray(answers_B))),
+                token_accuracy=float(np.mean(predictions_B == np.asarray(answers_B))),
                 answer_nll=float(np.mean(answer_nll_B)),
                 donor_accuracy=float(np.mean(predictions_B == np.asarray(donor_answers_B))),
+                donor_token_accuracy=float(np.mean(predictions_B == np.asarray(donor_answers_B))),
                 donor_answer_nll=float(np.mean(donor_answer_nll_B)),
                 predictions_B=predictions_B,
                 answer_nll_B=answer_nll_B,
                 donor_answer_nll_B=donor_answer_nll_B,
+                predictions_BD=predictions_B[:, None],
+                answer_nll_BD=answer_nll_B[:, None],
+                donor_answer_nll_BD=donor_answer_nll_B[:, None],
+                answer_score_margin_B=donor_answer_nll_B - answer_nll_B,
             )
         return results
 
@@ -386,12 +560,18 @@ def _evaluate_memory_batch_eager(
         )
         results[mode] = MemoryEvalResult(
             accuracy=accuracy,
+            token_accuracy=accuracy,
             answer_nll=answer_nll,
             donor_accuracy=donor_accuracy,
+            donor_token_accuracy=donor_accuracy,
             donor_answer_nll=donor_answer_nll,
             predictions_B=predictions_B,
             answer_nll_B=answer_nll_B,
             donor_answer_nll_B=donor_answer_nll_B,
+            predictions_BD=predictions_B[:, None],
+            answer_nll_BD=answer_nll_B[:, None],
+            donor_answer_nll_BD=donor_answer_nll_B[:, None],
+            answer_score_margin_B=donor_answer_nll_B - answer_nll_B,
         )
     return results
 

@@ -133,6 +133,18 @@ class MemoryTaskTest(parameterized.TestCase):
                 "--wiki_mirror_dir=/missing/wiki",
             ],
         ),
+        (
+            "memory_trainer",
+            train_memory_tasks.main,
+            [
+                "--task=exact",
+                "--condition=full_context",
+                "--save_dir=/missing/run",
+                "--jax_cache_dir=/missing/cache",
+                "--run_plan_sha256=" + "0" * 64,
+                "--success_criterion=guard test",
+            ],
+        ),
     )
     def test_heavy_entrypoints_require_slurm(self, entrypoint, argv):
         with mock.patch.dict(
@@ -146,6 +158,7 @@ class MemoryTaskTest(parameterized.TestCase):
         "build_memory_task_eval_manifest.py",
         "audit_memory_task_overlap.py",
         "eval_memory_tasks.py",
+        "train_memory_tasks.py",
     )
     def test_direct_cli_rejects_before_third_party_imports(self, script_name):
         environment = dict(os.environ)
@@ -168,6 +181,7 @@ class MemoryTaskTest(parameterized.TestCase):
         "build_memory_task_eval_manifest.py",
         "audit_memory_task_overlap.py",
         "eval_memory_tasks.py",
+        "train_memory_tasks.py",
     )
     def test_direct_cli_allows_local_help(self, script_name):
         environment = dict(os.environ)
@@ -422,7 +436,8 @@ class MemoryTaskTest(parameterized.TestCase):
                 "task": {
                     name: value
                     for name, value in dataclasses.asdict(config).items()
-                    if name not in ("bank_value_alphabet", "generator_version")
+                    if name
+                    not in ("bank_value_alphabet", "exact_sequence_length", "generator_version")
                 },
                 "source": {"model_id": "qwen3.5-smoke-dense"},
                 "pairs_per_batch": 2,
@@ -444,6 +459,7 @@ class MemoryTaskTest(parameterized.TestCase):
     @parameterized.parameters(
         "32f307dc07996ab71d09f6a8aa660238447a817e9be31d27464a97d386478478",
         "fe8d88245437d92c8c096624f2aa112ef46b506fe41e1fc6aa17f0c611c4c03e",
+        "e8b1a5abf304cc8c9163b717254fe54568e242b8d12c9ad3db26b50f4c0e8ad2",
     )
     def test_known_previous_v2_training_content_hash_remains_reconstructable(self, content_sha256):
         config = MemoryTaskConfig(
@@ -459,7 +475,7 @@ class MemoryTaskTest(parameterized.TestCase):
                 "task": {
                     name: value
                     for name, value in dataclasses.asdict(config).items()
-                    if name != "bank_value_alphabet"
+                    if name not in ("bank_value_alphabet", "exact_sequence_length")
                 },
                 "source": {"model_id": "qwen3.5-smoke-dense"},
                 "pairs_per_batch": 2,
@@ -563,6 +579,67 @@ class MemoryTaskTest(parameterized.TestCase):
         flat = build_memory_task_batch((3,), config, flatten=True)
         np.testing.assert_array_equal(flat["token_ids_BT"], batch["token_ids_BCT"].reshape(2, 32))
         np.testing.assert_array_equal(flat["loss_mask_BT"].sum(axis=1), [1, 1])
+
+    def test_exact_sequence_supervises_and_retrieves_all_seven_tokens(self):
+        config = MemoryTaskConfig(
+            task=MemoryTask.EXACT,
+            seed=17,
+            segment_length=16,
+            num_segments=2,
+            exact_sequence_length=7,
+        )
+        batch = build_memory_task_batch((3,), config, flatten=False)
+        tokens = batch["token_ids_BCT"]
+        metadata = batch[BATCH_PRETRAIN_METADATA_KEY]
+
+        np.testing.assert_array_equal(batch["loss_mask_BCT"].sum(axis=(1, 2)), [7, 7])
+        np.testing.assert_array_equal(batch["loss_mask_BCT"][:, -1, -7:], 1)
+        np.testing.assert_array_equal(metadata["answer_tokens_BD"], tokens[:, -1, -7:])
+        np.testing.assert_array_equal(
+            metadata["answer_positions_BD"],
+            np.broadcast_to(np.arange(9, 16), (2, 7)),
+        )
+        np.testing.assert_array_equal(tokens[0, -1, :-7], tokens[1, -1, :-7])
+        self.assertEqual(np.flatnonzero(tokens[0, 0] != tokens[1, 0]).tolist(), list(range(3, 10)))
+        self.assertTrue(np.all(tokens[0, 0, 3:10] != tokens[1, 0, 3:10]))
+        last_value_mutated = tokens[0].copy()
+        last_value_mutated[0, 9] = tokens[1, 0, 9]
+        self.assertNotEqual(
+            table_digest(tokens[0], config),
+            table_digest(last_value_mutated, config),
+        )
+
+        flat = build_memory_task_batch((3,), config, flatten=True)
+        np.testing.assert_array_equal(flat["loss_mask_BT"].sum(axis=1), [7, 7])
+
+    def test_exact_sequence_allows_repeated_values_across_positions(self):
+        config = MemoryTaskConfig(
+            task=MemoryTask.EXACT,
+            seed=17,
+            segment_length=16,
+            num_segments=2,
+            exact_sequence_length=7,
+        )
+        batch = build_memory_task_batch(tuple(range(32)), config, flatten=False)
+        values_BD = batch["token_ids_BCT"][:, 0, 3:10]
+
+        self.assertTrue(np.all(values_BD[0::2] != values_BD[1::2]))
+        self.assertTrue(any(len(set(values.tolist())) < 7 for values in values_BD))
+
+    def test_exact_sequence_is_scoped_to_one_marked_binding(self):
+        for kwargs in (
+            {"num_exact_bindings": 3},
+            {"num_exact_bindings": 3, "relevance_cue": MemoryTaskCue.SURPRISE},
+        ):
+            with self.assertRaisesRegex(ValueError, "exact_sequence_length"):
+                MemoryTaskConfig(
+                    task=MemoryTask.EXACT,
+                    seed=1,
+                    segment_length=16,
+                    num_segments=2,
+                    exact_sequence_length=7,
+                    **kwargs,
+                )
 
     def test_multi_slot_pair_mutates_only_target_slot_value_between_worlds(self):
         # Canary against the primary implementation risk of the multi-slot
@@ -1082,26 +1159,42 @@ class MemoryTaskTest(parameterized.TestCase):
         dict(
             condition=TrainingCondition.STATE,
             num_exact_bindings=1,
+            exact_sequence_length=1,
             relevance_cue=MemoryTaskCue.MARKED,
         ),
         dict(
             condition=TrainingCondition.STATE,
             num_exact_bindings=3,
+            exact_sequence_length=1,
             relevance_cue=MemoryTaskCue.SURPRISE,
         ),
         dict(
             condition=TrainingCondition.RESET,
             num_exact_bindings=1,
+            exact_sequence_length=1,
             relevance_cue=MemoryTaskCue.MARKED,
         ),
         dict(
             condition=TrainingCondition.FULL_CONTEXT,
             num_exact_bindings=3,
+            exact_sequence_length=1,
             relevance_cue=MemoryTaskCue.SURPRISE,
+        ),
+        dict(
+            condition=TrainingCondition.FULL_CONTEXT,
+            num_exact_bindings=1,
+            exact_sequence_length=7,
+            relevance_cue=MemoryTaskCue.MARKED,
+        ),
+        dict(
+            condition=TrainingCondition.STATE,
+            num_exact_bindings=1,
+            exact_sequence_length=7,
+            relevance_cue=MemoryTaskCue.MARKED,
         ),
     )
     def test_real_trainer_consumes_answer_only_batch_across_conditions(
-        self, condition, num_exact_bindings, relevance_cue
+        self, condition, num_exact_bindings, exact_sequence_length, relevance_cue
     ):
         # Layout (batch_size/seq_len/flatten/pretrain_mode/bptt_chunks/
         # pass_gdn_state) comes from training_layout -- the same function
@@ -1116,6 +1209,7 @@ class MemoryTaskTest(parameterized.TestCase):
             num_segments=2,
             vocab_size=512,
             num_exact_bindings=num_exact_bindings,
+            exact_sequence_length=exact_sequence_length,
             relevance_cue=relevance_cue,
         )
         layout = training_layout(
@@ -1158,9 +1252,9 @@ class MemoryTaskTest(parameterized.TestCase):
         )
 
         self.assertTrue(np.isfinite(metrics["loss"]))
-        self.assertEqual(metrics["supervised_tokens"], 2.0)
+        self.assertEqual(metrics["supervised_tokens"], 2.0 * exact_sequence_length)
 
-    def test_contract_accepts_legacy_implicit_model_seed_and_bank_alphabet(self):
+    def test_contract_accepts_legacy_implicit_model_seed_bank_alphabet_and_sequence_length(self):
         with test_temp_dir() as tmp:
             save_dir = Path(tmp)
             legacy_contract = {"schema_version": 2, "task": {"seed": 7}}
@@ -1171,7 +1265,11 @@ class MemoryTaskTest(parameterized.TestCase):
                 {
                     **legacy_contract,
                     "model_seed": 7,
-                    "task": {"seed": 7, "bank_value_alphabet": 256},
+                    "task": {
+                        "seed": 7,
+                        "bank_value_alphabet": 256,
+                        "exact_sequence_length": 1,
+                    },
                 },
             )
 
@@ -1180,7 +1278,7 @@ class MemoryTaskTest(parameterized.TestCase):
                 legacy_contract,
             )
 
-    def test_cli_trains_one_step_with_explicit_adam_hparams_and_device_memory(self):
+    def test_d7_cli_trains_builds_manifest_and_evaluates_real_checkpoint(self):
         # Exercises the real argparse -> Grain iterator -> Qwen3.5 ->
         # run_pretrain -> optimizer -> checkpoint path through
         # scripts.train_memory_tasks.main, rather than calling run_pretrain
@@ -1196,6 +1294,8 @@ class MemoryTaskTest(parameterized.TestCase):
                 "--model_id=qwen3.5-smoke-dense",
                 "--seed=7",
                 "--data_seed=11",
+                "--exact_sequence_length=7",
+                "--generator_version=2",
                 "--num_steps=1",
                 "--pairs_per_batch=1",
                 "--grad_accum_steps=2",
@@ -1218,6 +1318,7 @@ class MemoryTaskTest(parameterized.TestCase):
 
             self.assertEqual(contract["model_seed"], 7)
             self.assertEqual(contract["task"]["seed"], 11)
+            self.assertEqual(contract["task"]["exact_sequence_length"], 7)
             self.assertEqual(contract["optimizer"]["adam_beta1"], 0.8)
             self.assertEqual(contract["optimizer"]["adam_beta2"], 0.9)
             self.assertEqual(contract["optimizer"]["adam_eps"], 1e-6)
@@ -1247,6 +1348,47 @@ class MemoryTaskTest(parameterized.TestCase):
             self.assertTrue((save_dir / "config.json").exists())
             self.assertIn("device_memory", metrics)
             self.assertIsInstance(metrics["device_memory"], list)
+
+            manifest_path = tmpdir / "eval_manifest.json"
+            with contextlib.redirect_stdout(io.StringIO()):
+                build_memory_task_eval_manifest.main(
+                    [
+                        f"--checkpoint={save_dir}",
+                        f"--output={manifest_path}",
+                        "--task=exact",
+                        "--exact_sequence_length=7",
+                        "--generator_version=2",
+                        "--num_pairs=2",
+                    ]
+                )
+            with (
+                mock.patch.dict(eval_memory_tasks._CANONICAL_NUM_PAIRS, {MemoryTask.EXACT: 2}),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                eval_memory_tasks.main(
+                    [
+                        f"--checkpoint={save_dir}",
+                        "--task=exact",
+                        "--exact_sequence_length=7",
+                        "--generator_version=2",
+                        f"--eval_manifest={manifest_path}",
+                        "--num_pairs=2",
+                        "--pairs_per_batch=1",
+                        "--text_attn_backend=xla",
+                        f"--jax_cache_dir={tmpdir / 'eval_jax_cache'}",
+                        f"--wiki_mirror_dir={tmpdir / 'wiki_mirror'}",
+                    ]
+                )
+
+            eval_dir = save_dir / "evals" / "memory_exact_d7_pollution_guard_v1" / "step_1"
+            rows = [json.loads(line) for line in (eval_dir / "raw.jsonl").read_text().splitlines()]
+            self.assertLen(rows, 20)
+            self.assertTrue(all(len(row["prediction_tokens"]) == 7 for row in rows))
+            summary = json.loads((eval_dir / "summary.json").read_text())
+            self.assertEqual(
+                set(summary["modes"]["correct_state"]["accuracy_by_answer_position"]),
+                {str(position) for position in range(7)},
+            )
 
     def test_training_cli_defaults_to_mosaic_gpu_attention(self):
         action = next(
@@ -1577,11 +1719,24 @@ class MemoryTaskTest(parameterized.TestCase):
                 eval_memory_tasks.main([*base_eval_argv, "--allow_zero_shot_horizon_override"])
 
     @parameterized.parameters(
-        dict(num_exact_bindings=1, relevance_cue=MemoryTaskCue.MARKED),
-        dict(num_exact_bindings=3, relevance_cue=MemoryTaskCue.SURPRISE),
+        dict(
+            num_exact_bindings=1,
+            exact_sequence_length=1,
+            relevance_cue=MemoryTaskCue.MARKED,
+        ),
+        dict(
+            num_exact_bindings=3,
+            exact_sequence_length=1,
+            relevance_cue=MemoryTaskCue.SURPRISE,
+        ),
+        dict(
+            num_exact_bindings=1,
+            exact_sequence_length=7,
+            relevance_cue=MemoryTaskCue.MARKED,
+        ),
     )
     def test_real_model_evaluator_runs_all_causal_conditions(
-        self, num_exact_bindings, relevance_cue
+        self, num_exact_bindings, exact_sequence_length, relevance_cue
     ):
         config = MemoryTaskConfig(
             task=MemoryTask.EXACT,
@@ -1590,6 +1745,7 @@ class MemoryTaskTest(parameterized.TestCase):
             num_segments=2,
             vocab_size=512,
             num_exact_bindings=num_exact_bindings,
+            exact_sequence_length=exact_sequence_length,
             relevance_cue=relevance_cue,
         )
         batch = build_memory_task_batch((0,), config, flatten=False)
@@ -1606,11 +1762,15 @@ class MemoryTaskTest(parameterized.TestCase):
         self.assertEqual(set(results), set(MemoryEvalMode))
         for result in results.values():
             self.assertBetween(result.accuracy, 0.0, 1.0)
+            self.assertBetween(result.token_accuracy, 0.0, 1.0)
             self.assertTrue(np.isfinite(result.answer_nll))
             self.assertEqual(result.predictions_B.shape, (2,))
+            self.assertEqual(result.predictions_BD.shape, (2, exact_sequence_length))
+            self.assertEqual(result.answer_nll_BD.shape, (2, exact_sequence_length))
+            self.assertEqual(result.answer_score_margin_B.shape, (2,))
         np.testing.assert_array_equal(
-            results[MemoryEvalMode.RESET].predictions_B,
-            results[MemoryEvalMode.ZERO_STATE].predictions_B,
+            results[MemoryEvalMode.RESET].predictions_BD,
+            results[MemoryEvalMode.ZERO_STATE].predictions_BD,
         )
         self.assertAlmostEqual(
             results[MemoryEvalMode.RESET].answer_nll,
@@ -1679,6 +1839,129 @@ class MemoryTaskTest(parameterized.TestCase):
                 eager.donor_answer_nll_B,
                 rtol=nll_tolerance,
                 atol=nll_tolerance,
+            )
+
+    def test_d7_jitted_evaluator_matches_autoregressive_eager_qwen_path(self):
+        config = MemoryTaskConfig(
+            task=MemoryTask.EXACT,
+            seed=73,
+            segment_length=16,
+            num_segments=2,
+            vocab_size=512,
+            exact_sequence_length=7,
+        )
+        batch = build_memory_task_batch((0,), config, flatten=False)
+        model, model_config = text_api.init_model(
+            _tiny_gdn_config(),
+            jax.random.key(0),
+            tp_size=1,
+            fsdp_size=1,
+            dp_size=1,
+        )
+        actual = memory_evals.make_memory_evaluator(model_config)(model, batch)
+        tokens_BCT = jnp.asarray(batch["token_ids_BCT"], dtype=jnp.int32)
+        attention_BCT = jnp.asarray(batch["attention_mask_BCT"], dtype=jnp.int32)
+        reset_BC = np.asarray(batch["reset_state_BC"])
+        metadata = batch[BATCH_PRETRAIN_METADATA_KEY]
+        pair_index_B = np.asarray(metadata["pair_index_B"])
+        world_B = np.asarray(metadata["world_B"])
+        answers_BD = jnp.asarray(metadata["answer_tokens_BD"], dtype=jnp.int32)
+        donor_indices_B = jnp.asarray(
+            memory_evals._counterfactual_indices(pair_index_B, world_B), dtype=jnp.int32
+        )
+        donor_answers_BD = answers_BD[donor_indices_B]
+        local_positions_BD = jnp.asarray(metadata["answer_positions_BD"], dtype=jnp.int32)
+        batch_indices_B1 = jnp.arange(tokens_BCT.shape[0], dtype=jnp.int32)[:, None]
+        donor_tokens_BCT = tokens_BCT.at[
+            batch_indices_B1,
+            -1,
+            local_positions_BD,
+        ].set(donor_answers_BD)
+
+        def eager_hidden(candidate_tokens_BCT, mode):
+            if mode is MemoryEvalMode.FULL_CONTEXT:
+                hidden_BTD, _ = text_api.forward(
+                    model,
+                    candidate_tokens_BCT.reshape(candidate_tokens_BCT.shape[0], -1),
+                    0,
+                    model_config,
+                    attention_mask_BT=attention_BCT.reshape(attention_BCT.shape[0], -1),
+                )
+                return hidden_BTD, local_positions_BD + config.segment_length
+            return (
+                memory_evals._segmented_final_hidden(
+                    model,
+                    model_config,
+                    candidate_tokens_BCT,
+                    attention_BCT,
+                    reset_BC,
+                    mode,
+                    pair_index_B=pair_index_B,
+                    world_B=world_B,
+                ),
+                local_positions_BD,
+            )
+
+        for mode in MemoryEvalMode:
+            own_hidden_BTD, positions_BD = eager_hidden(tokens_BCT, mode)
+            donor_hidden_BTD, _ = eager_hidden(donor_tokens_BCT, mode)
+            own_nll_columns = []
+            donor_nll_columns = []
+            for answer_idx in range(config.exact_sequence_length):
+                _, _, _, own_nll_B = memory_evals._score_answers(
+                    model,
+                    own_hidden_BTD,
+                    positions_BD[:, answer_idx],
+                    answers_BD[:, answer_idx],
+                )
+                _, _, _, donor_nll_B = memory_evals._score_answers(
+                    model,
+                    donor_hidden_BTD,
+                    positions_BD[:, answer_idx],
+                    donor_answers_BD[:, answer_idx],
+                )
+                own_nll_columns.append(own_nll_B)
+                donor_nll_columns.append(donor_nll_B)
+            expected_own_nll_BD = np.stack(own_nll_columns, axis=1)
+            expected_donor_nll_BD = np.stack(donor_nll_columns, axis=1)
+            np.testing.assert_allclose(
+                actual[mode].answer_nll_BD,
+                expected_own_nll_BD,
+                rtol=2e-5,
+                atol=2e-5,
+            )
+            np.testing.assert_allclose(
+                actual[mode].donor_answer_nll_BD,
+                expected_donor_nll_BD,
+                rtol=2e-5,
+                atol=2e-5,
+            )
+            np.testing.assert_allclose(
+                actual[mode].answer_score_margin_B,
+                np.sum(expected_donor_nll_BD - expected_own_nll_BD, axis=1),
+                rtol=2e-5,
+                atol=2e-5,
+            )
+
+            working_tokens_BCT = tokens_BCT
+            expected_predictions = []
+            for answer_idx in range(config.exact_sequence_length):
+                hidden_BTD, positions_BD = eager_hidden(working_tokens_BCT, mode)
+                _, _, predictions_B, _ = memory_evals._score_answers(
+                    model,
+                    hidden_BTD,
+                    positions_BD[:, answer_idx],
+                    answers_BD[:, answer_idx],
+                )
+                expected_predictions.append(predictions_B)
+                working_tokens_BCT = working_tokens_BCT.at[
+                    jnp.arange(tokens_BCT.shape[0], dtype=jnp.int32),
+                    -1,
+                    local_positions_BD[:, answer_idx],
+                ].set(jnp.asarray(predictions_B, dtype=jnp.int32))
+            np.testing.assert_array_equal(
+                actual[mode].predictions_BD,
+                np.stack(expected_predictions, axis=1),
             )
 
     def test_counterfactual_swap_uses_the_other_world_in_each_pair(self):
@@ -1767,13 +2050,17 @@ class MemoryTaskTest(parameterized.TestCase):
             atol=1e-6,
         )
 
-    def test_evaluator_rejects_reset_state_that_violates_segment_zero_invariant(self):
+    @parameterized.parameters(1, 7)
+    def test_evaluator_rejects_reset_state_that_violates_segment_zero_invariant(
+        self, exact_sequence_length
+    ):
         config = MemoryTaskConfig(
             task=MemoryTask.EXACT,
             seed=41,
             segment_length=16,
             num_segments=2,
             vocab_size=512,
+            exact_sequence_length=exact_sequence_length,
         )
         batch = build_memory_task_batch((0,), config, flatten=False)
         batch["reset_state_BC"][:, 1] = True
@@ -1917,6 +2204,33 @@ class MemoryTaskTest(parameterized.TestCase):
                         train_config,
                         split=MemoryTaskSplit.EVAL,
                         bank_value_alphabet=48,
+                    ),
+                )
+
+    def test_eval_contract_treats_legacy_exact_sequence_length_as_one_only(self):
+        train_config = MemoryTaskConfig(
+            task=MemoryTask.EXACT,
+            seed=0,
+            segment_length=16,
+            num_segments=2,
+        )
+        legacy_task = dataclasses.asdict(train_config)
+        del legacy_task["exact_sequence_length"]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "memory_task_contract.json").write_text(json.dumps({"task": legacy_task}))
+
+            _validate_training_contract(
+                root,
+                dataclasses.replace(train_config, split=MemoryTaskSplit.EVAL),
+            )
+            with self.assertRaisesRegex(ValueError, "mismatched memory-task config"):
+                _validate_training_contract(
+                    root,
+                    dataclasses.replace(
+                        train_config,
+                        exact_sequence_length=7,
+                        split=MemoryTaskSplit.EVAL,
                     ),
                 )
 

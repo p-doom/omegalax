@@ -62,6 +62,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--bank_value_alphabet", type=int, default=256)
     parser.add_argument("--num_rule_examples", type=int, default=5)
     parser.add_argument("--num_exact_bindings", type=int, default=1)
+    parser.add_argument("--exact_sequence_length", type=int, default=1)
     parser.add_argument("--generator_version", type=int, choices=(1, 2), default=1)
     parser.add_argument(
         "--relevance_cue",
@@ -107,6 +108,7 @@ def main(argv: list[str] | None = None) -> None:
         bank_value_alphabet=args.bank_value_alphabet,
         num_rule_examples=args.num_rule_examples,
         num_exact_bindings=args.num_exact_bindings,
+        exact_sequence_length=args.exact_sequence_length,
         relevance_cue=args.relevance_cue,
         split=MemoryTaskSplit.EVAL,
         generator_version=args.generator_version,
