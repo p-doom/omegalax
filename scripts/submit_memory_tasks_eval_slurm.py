@@ -82,10 +82,11 @@ def _validate_eval_args(args: list[str]) -> list[str]:
         "num_pairs",
         "pairs_per_batch",
         "jax_cache_dir",
-        "wiki_mirror_dir",
     ):
         if not _flag_value(args, name):
             raise ValueError(f"--{name} is required in eval_args")
+    if _flag_value(args, "wiki_mirror_dir") == "":
+        raise ValueError("--wiki_mirror_dir requires a non-empty value in eval_args")
     task = _flag_value(args, "task")
     try:
         expected_num_pairs = _CANONICAL_NUM_PAIRS_BY_TASK[task]

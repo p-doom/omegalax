@@ -217,6 +217,65 @@ class MemoryEvalHoldoutTest(absltest.TestCase):
             with self.assertRaisesRegex(ValueError, "exclusion manifest table digest"):
                 validate_pollution_free_manifest(final)
 
+    def test_joint_builder_uses_one_list_clean_for_every_requested_c(self):
+        c2 = dataclasses.replace(
+            _config(MemoryTaskSplit.EVAL),
+            generator_version=1,
+            num_exact_bindings=3,
+        )
+        c4 = dataclasses.replace(c2, num_segments=4)
+        training_stream = dataclasses.replace(
+            _empty_training_stream(),
+            config=dataclasses.replace(c2, seed=0, split=MemoryTaskSplit.TRAIN),
+        )
+        gate = build_pollution_free_manifest(c4, num_pairs=1, training_streams=(training_stream,))
+        gate_pair, _ = memory_pollution.memory_tasks._paired_tokens(0, c4)
+        c2_pair, _ = memory_pollution.memory_tasks._paired_tokens(0, c2)
+        self.assertNotEqual(pair_digest(gate_pair, c4), pair_digest(c2_pair, c2))
+        self.assertTrue(
+            {table_digest(gate_pair[world], c4) for world in (0, 1)}.isdisjoint(
+                table_digest(c2_pair[world], c2) for world in (0, 1)
+            )
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            gate_path = Path(tmp) / "gate.json"
+            _write_manifest(gate_path, gate)
+            manifests = memory_pollution.build_joint_pollution_free_manifests(
+                (c2, c4),
+                num_pairs=2,
+                training_streams=(training_stream,),
+                exclude_manifests=(gate_path,),
+                final_holdout=True,
+            )
+
+            self.assertEqual(set(manifests), {2, 4})
+            self.assertEqual(manifests[2]["pair_indices"], manifests[4]["pair_indices"])
+            self.assertNotIn(0, manifests[2]["pair_indices"])
+            self.assertIsNot(manifests[2]["pair_indices"], manifests[4]["pair_indices"])
+            self.assertIsNot(
+                manifests[2]["pollution_guard"]["joint_selection"],
+                manifests[4]["pollution_guard"]["joint_selection"],
+            )
+            for config in (c2, c4):
+                manifest = manifests[config.num_segments]
+                validate_pollution_free_manifest(manifest)
+                guard = manifest["pollution_guard"]
+                self.assertEqual(guard["joint_selection"]["num_segments"], [2, 4])
+                self.assertEqual(
+                    guard["candidate_groups_considered"],
+                    guard["joint_selection"]["candidate_groups_considered"],
+                )
+                self.assertGreaterEqual(guard["joint_selection"]["rejected_groups"], 1)
+
+    def test_joint_builder_rejects_configs_that_differ_beyond_c(self):
+        c2 = _config(MemoryTaskSplit.EVAL)
+        with self.assertRaisesRegex(ValueError, "only in num_segments"):
+            memory_pollution.build_joint_pollution_free_manifests(
+                (c2, dataclasses.replace(c2, num_segments=4, seed=3)),
+                num_pairs=1,
+                training_streams=(_empty_training_stream(),),
+            )
+
     def test_cli_accepts_repeated_exclusion_manifests(self):
         args = build_memory_task_eval_manifest._parser().parse_args(
             [

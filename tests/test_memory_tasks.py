@@ -460,6 +460,7 @@ class MemoryTaskTest(parameterized.TestCase):
         "32f307dc07996ab71d09f6a8aa660238447a817e9be31d27464a97d386478478",
         "fe8d88245437d92c8c096624f2aa112ef46b506fe41e1fc6aa17f0c611c4c03e",
         "e8b1a5abf304cc8c9163b717254fe54568e242b8d12c9ad3db26b50f4c0e8ad2",
+        "c382c3dfbd0e9f4113e12320cab0761d3ed4377a961c096e7f0e7ac85b5bdd9f",
     )
     def test_known_previous_v2_training_content_hash_remains_reconstructable(self, content_sha256):
         config = MemoryTaskConfig(
@@ -1480,7 +1481,6 @@ class MemoryTaskTest(parameterized.TestCase):
                 "--pairs_per_batch=1",
                 "--text_attn_backend=xla",
                 f"--jax_cache_dir={tmpdir / 'eval_jax_cache'}",
-                f"--wiki_mirror_dir={mirror_dir}",
             ]
             incomplete_manifest = json.loads(manifest_path.read_text())
             incomplete_manifest["pollution_guard"]["training_streams"] = [
@@ -1527,11 +1527,15 @@ class MemoryTaskTest(parameterized.TestCase):
                     "deltanet_kernel": "xla",
                 },
             )
+            self.assertTrue((eval_dir / "raw.jsonl").is_file())
+            self.assertTrue((eval_dir / "summary.json").is_file())
             self.assertTrue((eval_dir / "artifact_manifest.json").is_file())
-            self.assertTrue((mirror_dir / "accuracy.svg").is_file())
-            self.assertTrue((mirror_dir / "answer_nll.svg").is_file())
-            self.assertTrue((mirror_dir / "README.md").is_file())
-            self.assertFalse((mirror_dir / "raw.jsonl").exists())
+            self.assertTrue((eval_dir / "plots" / "accuracy.svg").is_file())
+            self.assertTrue((eval_dir / "plots" / "answer_nll.svg").is_file())
+            self.assertEqual(
+                json.loads((eval_dir / "status.json").read_text()), {"status": "complete"}
+            )
+            self.assertFalse(mirror_dir.exists())
 
             final_manifest_path = tmpdir / "final_eval_manifest.json"
             with contextlib.redirect_stdout(io.StringIO()):
@@ -1613,6 +1617,11 @@ class MemoryTaskTest(parameterized.TestCase):
             final_eval_config = json.loads((final_eval_dir / "eval_config.json").read_text())
             self.assertEqual(final_eval_config["eval_role"], "final")
             self.assertTrue((final_eval_dir / "artifact_manifest.json").is_file())
+            final_mirror_dir = tmpdir / "final_wiki_mirror"
+            self.assertTrue((final_mirror_dir / "accuracy.svg").is_file())
+            self.assertTrue((final_mirror_dir / "answer_nll.svg").is_file())
+            self.assertTrue((final_mirror_dir / "README.md").is_file())
+            self.assertFalse((final_mirror_dir / "raw.jsonl").exists())
 
     def test_zero_shot_horizon_override_runs_real_cli_and_preserves_immutable_outputs(self):
         # This is deliberately end-to-end: train_memory_tasks creates the

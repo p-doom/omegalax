@@ -652,6 +652,7 @@ def run_tail_pretrain(
                 global_step,
                 data_iter,
                 lr_contract=requested_lr_contract,
+                force=True,
             )
         if requeue_requested():
             if not (save_every and local_step % save_every == 0):

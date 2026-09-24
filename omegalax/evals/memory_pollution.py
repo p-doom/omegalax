@@ -30,8 +30,12 @@ _COMPATIBLE_V2_CONTENT_SHA256 = frozenset(
         # Unique 230179f v2 content hash (currently only the clean A48 run): later
         # HF-init/provenance changes leave deterministic pair consumption unchanged.
         "971f564351b87e962092de318fcb260fa1c1552b6b1870ebc1c90834a6693610",
-        # Last single-token production content before exact_sequence_length was added.
+        # Last single-token production content before exact_sequence_length was added;
+        # its scheduled-save policy does not affect generator semantics or pair consumption.
         "e8b1a5abf304cc8c9163b717254fe54568e242b8d12c9ad3db26b50f4c0e8ad2",
+        # 402e59f only forces scheduled checkpoint saves through Orbax's save policy;
+        # generator semantics and deterministic pair consumption are unchanged.
+        "c382c3dfbd0e9f4113e12320cab0761d3ed4377a961c096e7f0e7ac85b5bdd9f",
     }
 )
 
@@ -429,6 +433,175 @@ def build_pollution_free_manifest(
         "pollution_guard": pollution_guard,
     }
     return manifest | {"sha256": canonical_json_sha256(manifest)}
+
+
+def build_joint_pollution_free_manifests(
+    eval_configs: Sequence[MemoryTaskConfig],
+    *,
+    num_pairs: int,
+    training_streams: Sequence[MemoryTrainingStream],
+    exclude_manifests: Sequence[Path] = (),
+    final_holdout: bool = False,
+) -> dict[int, dict[str, Any]]:
+    """Build one shared pair list that is clean for every requested C."""
+    if not eval_configs:
+        raise ValueError("At least one eval config is required")
+    if not training_streams:
+        raise ValueError("At least one training stream is required")
+    if num_pairs <= 0:
+        raise ValueError("num_pairs must be > 0")
+    if final_holdout and not exclude_manifests:
+        raise ValueError("A final holdout requires at least one exclusion manifest")
+
+    reference_config = eval_configs[0]
+    if reference_config.split is not MemoryTaskSplit.EVAL:
+        raise ValueError("Eval configs must use split=eval")
+    reference_fields = dataclasses.asdict(reference_config)
+    configs_by_segments: dict[int, MemoryTaskConfig] = {}
+    for eval_config in eval_configs:
+        if eval_config.split is not MemoryTaskSplit.EVAL:
+            raise ValueError("Eval configs must use split=eval")
+        differences = {
+            name: (reference_fields[name], value)
+            for name, value in dataclasses.asdict(eval_config).items()
+            if name != "num_segments" and reference_fields[name] != value
+        }
+        if differences:
+            raise ValueError(f"Joint eval configs may differ only in num_segments: {differences}")
+        if eval_config.num_segments in configs_by_segments:
+            raise ValueError("Joint eval configs must have distinct num_segments")
+        configs_by_segments[eval_config.num_segments] = eval_config
+
+    group_size = _eval_group_size(reference_config.task)
+    if num_pairs % group_size:
+        raise ValueError(f"num_pairs={num_pairs} must be divisible by eval group size {group_size}")
+    for stream in training_streams:
+        for eval_config in configs_by_segments.values():
+            _validate_stream_config(stream, eval_config)
+
+    normalized_streams = sorted(
+        training_streams,
+        key=lambda stream: (str(stream.checkpoint_root), stream.checkpoint_step),
+    )
+    identities = [
+        (str(stream.checkpoint_root), stream.checkpoint_step) for stream in normalized_streams
+    ]
+    if len(set(identities)) != len(identities):
+        raise ValueError("Training streams must not contain duplicate checkpoint references")
+
+    train_pair_digests: set[bytes] = set()
+    train_table_digests: set[bytes] = set()
+    scanned_streams: set[tuple[MemoryTaskConfig, int]] = set()
+    for stream in normalized_streams:
+        stream_key = (stream.config, stream.train_pairs)
+        if stream_key in scanned_streams:
+            continue
+        scanned_streams.add(stream_key)
+        for pair_index in range(stream.train_pairs):
+            pair, _ = memory_tasks._paired_tokens(pair_index, stream.config)
+            train_pair_digests.add(pair_digest(pair, stream.config))
+            train_table_digests.update(table_digest(pair[world], stream.config) for world in (0, 1))
+
+    exclusion_references = []
+    exclusion_paths = sorted(path.expanduser().resolve() for path in exclude_manifests)
+    if len(set(exclusion_paths)) != len(exclusion_paths):
+        raise ValueError("Exclusion manifests must not contain duplicate paths")
+    for path in exclusion_paths:
+        reference, exclusion_manifest = _load_exclusion_manifest(path)
+        exclusion_config = _manifest_config(exclusion_manifest, path)
+        for eval_config in configs_by_segments.values():
+            _validate_exclusion_config(exclusion_config, eval_config, path)
+        excluded_pair_digests, excluded_table_digests = _manifest_digests(
+            exclusion_manifest, exclusion_config
+        )
+        train_pair_digests.update(excluded_pair_digests)
+        train_table_digests.update(excluded_table_digests)
+        exclusion_references.append(reference)
+
+    target_groups = num_pairs // group_size
+    candidate_group_limit = target_groups * 100
+    selected: list[int] = []
+    collision_counts = {
+        num_segments: {"pair": 0, "table": 0} for num_segments in configs_by_segments
+    }
+    considered_groups = 0
+    rejected_joint_groups = 0
+    for group_index in range(candidate_group_limit):
+        considered_groups += 1
+        group_indices = tuple(range(group_index * group_size, (group_index + 1) * group_size))
+        reject_group = False
+        for num_segments, eval_config in configs_by_segments.items():
+            pair_collision = False
+            table_collision = False
+            for pair_index in group_indices:
+                pair, _ = memory_tasks._paired_tokens(pair_index, eval_config)
+                pair_collision |= pair_digest(pair, eval_config) in train_pair_digests
+                table_collision |= any(
+                    table_digest(pair[world], eval_config) in train_table_digests
+                    for world in (0, 1)
+                )
+            if pair_collision:
+                collision_counts[num_segments]["pair"] += 1
+            if table_collision:
+                collision_counts[num_segments]["table"] += 1
+            reject_group |= pair_collision or table_collision
+        if reject_group:
+            rejected_joint_groups += 1
+            continue
+        selected.extend(group_indices)
+        if len(selected) == num_pairs:
+            break
+    if len(selected) != num_pairs:
+        raise ValueError(
+            f"Could not select {num_pairs} jointly disjoint eval pairs after checking "
+            f"{considered_groups * group_size} candidates"
+        )
+
+    joint_selection = {
+        "num_segments": sorted(configs_by_segments),
+        "candidate_groups_considered": considered_groups,
+        "rejected_groups": rejected_joint_groups,
+    }
+    manifests = {}
+    for num_segments, eval_config in configs_by_segments.items():
+        pollution_guard = {
+            "policy": _POLICY,
+            "digest": "sha256",
+            "ignored_content": "filler_tokens",
+            "table_order": "ignored",
+            "collision_action": "reject",
+            "eval_group_size": group_size,
+            "candidate_groups_considered": considered_groups,
+            "pair_collision_groups": collision_counts[num_segments]["pair"],
+            "table_collision_groups": collision_counts[num_segments]["table"],
+            "training_streams": [
+                {
+                    "checkpoint_root": str(stream.checkpoint_root),
+                    "checkpoint_step": stream.checkpoint_step,
+                    "contract_sha256": stream.contract_sha256,
+                    "train_pairs": stream.train_pairs,
+                }
+                for stream in normalized_streams
+            ],
+            "joint_selection": {
+                **joint_selection,
+                "num_segments": list(joint_selection["num_segments"]),
+            },
+        }
+        if exclusion_references:
+            pollution_guard["exclusion_manifests"] = [
+                dict(reference) for reference in exclusion_references
+            ]
+        if final_holdout:
+            pollution_guard["final_holdout"] = True
+        manifest = {
+            "schema_version": 2,
+            **dataclasses.asdict(eval_config),
+            "pair_indices": list(selected),
+            "pollution_guard": pollution_guard,
+        }
+        manifests[num_segments] = manifest | {"sha256": canonical_json_sha256(manifest)}
+    return manifests
 
 
 def validate_pollution_free_manifest(manifest: dict[str, Any]) -> None:
