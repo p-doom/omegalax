@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import socket
 import subprocess
 import sys
@@ -122,6 +123,15 @@ def summarize_rows(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     return summary
 
 
+def _result_suffix(value: str) -> str:
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", value):
+        raise argparse.ArgumentTypeError(
+            "result suffix must be 1-64 lowercase letters, digits, '_' or '-', "
+            "starting with a letter or digit"
+        )
+    return value
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=Path, required=True)
@@ -149,6 +159,7 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--eval_role", choices=("gate", "final"))
+    parser.add_argument("--result_suffix", type=_result_suffix)
     parser.add_argument("--eval_manifest", type=Path, required=True)
     parser.add_argument("--stage1_receipt", type=Path)
     parser.add_argument("--num_pairs", type=int, required=True)
@@ -822,6 +833,8 @@ def main(argv: list[str] | None = None) -> None:
         allow_zero_shot_horizon_override=args.allow_zero_shot_horizon_override,
         eval_role=args.eval_role,
     )
+    if args.result_suffix is not None:
+        eval_name = f"{eval_name}_{args.result_suffix}"
     run_dir = resolved.root / "evals" / eval_name / f"step_{resolved.step}"
     manifest = _load_manifest(
         args.eval_manifest,
@@ -866,6 +879,8 @@ def main(argv: list[str] | None = None) -> None:
             "path": str(stage1_receipt_path),
             "file_sha256": _file_sha256(stage1_receipt_path),
         }
+    if args.result_suffix is not None:
+        config["result_suffix"] = args.result_suffix
     run_dir.mkdir(parents=True, exist_ok=True)
     _ensure_not_complete(run_dir, manifest, config)
     for path, value in (

@@ -264,6 +264,24 @@ class MemoryTaskEvalSubmitterTest(absltest.TestCase):
 
         self.assertIn("--eval_role=final", script)
 
+    def test_renderer_forwards_a_result_suffix(self):
+        with test_temp_dir() as tmp:
+            tmpdir = Path(tmp)
+            script = submit_memory_tasks_eval_slurm.render_sbatch(
+                repo_root=tmpdir / "repo",
+                python_bin=tmpdir / "python",
+                job_name="memory-eval-suffix-test",
+                log_dir=tmpdir / "logs",
+                time_limit="02:00:00",
+                eval_args=[
+                    *self._eval_args(tmpdir / "checkpoint"),
+                    "--result_suffix=provenance_v5",
+                ],
+                expected_commit="test-commit",
+            )
+
+        self.assertIn("--result_suffix=provenance_v5", script)
+
     def test_default_cli_only_renders_and_the_script_passes_bash_n(self):
         with test_temp_dir() as tmp:
             tmpdir = Path(tmp)

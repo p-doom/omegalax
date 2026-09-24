@@ -1,5 +1,6 @@
 """Production-contract tests for the controlled symbolic memory tasks."""
 
+import argparse
 import contextlib
 import dataclasses
 import hashlib
@@ -1399,6 +1400,10 @@ class MemoryTaskTest(parameterized.TestCase):
         )
         self.assertEqual(action.default, "mosaic_gpu")
 
+    def test_eval_result_suffix_rejects_paths(self):
+        with self.assertRaises(argparse.ArgumentTypeError):
+            eval_memory_tasks._result_suffix("../provenance_v5")
+
     def test_tail_cli_and_eval_run_from_a_real_tiny_checkpoint(self):
         with test_temp_dir() as tmp:
             tmpdir = Path(tmp)
@@ -1556,13 +1561,19 @@ class MemoryTaskTest(parameterized.TestCase):
                 "--seed=2",
                 f"--eval_manifest={final_manifest_path}",
                 "--eval_role=final",
+                "--result_suffix=provenance_v5",
                 "--num_pairs=2",
                 "--pairs_per_batch=1",
                 "--text_attn_backend=xla",
                 f"--jax_cache_dir={tmpdir / 'final_eval_jax_cache'}",
                 f"--wiki_mirror_dir={tmpdir / 'final_wiki_mirror'}",
             ]
-            final_eval_dir = tail_dir / "evals" / "memory_exact_final_pollution_guard_v1" / "step_2"
+            final_eval_dir = (
+                tail_dir
+                / "evals"
+                / "memory_exact_final_pollution_guard_v1_provenance_v5"
+                / "step_2"
+            )
             with (
                 mock.patch.dict(eval_memory_tasks._CANONICAL_NUM_PAIRS, {MemoryTask.EXACT: 2}),
                 self.assertRaisesRegex(ValueError, "requires a final-holdout"),
@@ -1615,7 +1626,9 @@ class MemoryTaskTest(parameterized.TestCase):
                 eval_memory_tasks.main(final_eval_argv)
 
             final_eval_config = json.loads((final_eval_dir / "eval_config.json").read_text())
+            self.assertEqual(final_eval_config["schema_version"], 5)
             self.assertEqual(final_eval_config["eval_role"], "final")
+            self.assertEqual(final_eval_config["result_suffix"], "provenance_v5")
             self.assertTrue((final_eval_dir / "artifact_manifest.json").is_file())
             final_mirror_dir = tmpdir / "final_wiki_mirror"
             self.assertTrue((final_mirror_dir / "accuracy.svg").is_file())
