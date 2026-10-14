@@ -63,13 +63,13 @@ def _counterfactual_indices(
 
 
 def swap_counterfactual_pairs(
-    states: tuple[jax.Array, ...],
+    states,
     *,
     pair_index_B: np.ndarray,
     world_B: np.ndarray,
-) -> tuple[jax.Array, ...]:
+):
     donor_indices = jnp.asarray(_counterfactual_indices(pair_index_B, world_B), dtype=jnp.int32)
-    return tuple(state[donor_indices] for state in states)
+    return jax.tree.map(lambda state: state[donor_indices], states)
 
 
 def _assert_reset_only_at_segment_zero(reset_state_BC: np.ndarray) -> None:
@@ -90,6 +90,46 @@ def _assert_reset_only_at_segment_zero(reset_state_BC: np.ndarray) -> None:
         )
 
 
+def _forward_segment(
+    model,
+    model_config,
+    token_ids_BT: jax.Array,
+    attention_mask_BT: jax.Array,
+    carry: tuple,
+    *,
+    pass_gdn_state: bool,
+    pass_conv_state: bool,
+):
+    """One trainer-identical segment forward over the carried memory bundle.
+
+    ``carry`` is ``(gdn_states, conv_states, rmt_memory_BMD)``; ``None`` marks a channel
+    that is disabled or reinitialized, so Reset/Zero/Counterfactual act on all channels at
+    once. RMT is carried whenever the model has memory tokens. ``hidden_BTD`` holds only
+    text positions, so answer positions and scores never see the memory tokens.
+    """
+    gdn_states, conv_states, rmt_memory_BMD = carry
+    num_rmt_tokens = model_config.num_rmt_tokens
+    hidden_BTD, _, final_gdn_states, *extra = text_api.forward_with_gdn_state(
+        model,
+        token_ids_BT,
+        0,
+        model_config,
+        attention_mask_BT=attention_mask_BT,
+        initial_gdn_states=gdn_states,
+        initial_conv_states=conv_states,
+        return_conv_states=pass_conv_state,
+        initial_rmt_memory_BMD=rmt_memory_BMD,
+        return_rmt_memory=num_rmt_tokens > 0,
+    )
+    final_conv_states = extra.pop(0) if pass_conv_state else None
+    final_rmt_memory_BMD = extra.pop(0) if num_rmt_tokens > 0 else None
+    return hidden_BTD, (
+        final_gdn_states if pass_gdn_state else None,
+        final_conv_states,
+        final_rmt_memory_BMD,
+    )
+
+
 def _segmented_final_hidden(
     model,
     model_config,
@@ -100,33 +140,34 @@ def _segmented_final_hidden(
     *,
     pair_index_B: np.ndarray,
     world_B: np.ndarray,
+    pass_gdn_state: bool = True,
+    pass_conv_state: bool = False,
 ) -> jax.Array:
     _assert_reset_only_at_segment_zero(reset_state_BC)
-    carried_states = None
+    carry = (None, None, None)
     final_hidden = None
     for segment_idx in range(token_ids_BCT.shape[1]):
-        initial_states = carried_states
+        initial_carry = carry
         if mode is MemoryEvalMode.RESET:
-            initial_states = None
-        elif mode is MemoryEvalMode.ZERO_STATE and carried_states is not None:
-            initial_states = tuple(jnp.zeros_like(state) for state in carried_states)
-        elif (
-            mode is MemoryEvalMode.COUNTERFACTUAL_STATE
-            and segment_idx == token_ids_BCT.shape[1] - 1
-            and carried_states is not None
+            initial_carry = (None, None, None)
+        elif mode is MemoryEvalMode.ZERO_STATE:
+            initial_carry = jax.tree.map(jnp.zeros_like, carry)
+        elif mode is MemoryEvalMode.COUNTERFACTUAL_STATE and segment_idx == (
+            token_ids_BCT.shape[1] - 1
         ):
-            initial_states = swap_counterfactual_pairs(
-                carried_states,
+            initial_carry = swap_counterfactual_pairs(
+                carry,
                 pair_index_B=pair_index_B,
                 world_B=world_B,
             )
-        final_hidden, _, carried_states = text_api.forward_with_gdn_state(
+        final_hidden, carry = _forward_segment(
             model,
-            token_ids_BCT[:, segment_idx],
-            0,
             model_config,
-            attention_mask_BT=attention_mask_BCT[:, segment_idx],
-            initial_gdn_states=initial_states,
+            token_ids_BCT[:, segment_idx],
+            attention_mask_BCT[:, segment_idx],
+            initial_carry,
+            pass_gdn_state=pass_gdn_state,
+            pass_conv_state=pass_conv_state,
         )
     if final_hidden is None:
         raise ValueError("A memory-task batch must contain at least one segment")
@@ -197,8 +238,21 @@ def _predict_at_positions(
     return jnp.argmax(logits_BV, axis=-1)
 
 
-def make_memory_evaluator(model_config):
+def make_memory_evaluator(
+    model_config,
+    *,
+    pass_gdn_state: bool = True,
+    pass_conv_state: bool = False,
+):
     """Create reusable JITs for fixed-shape causal-memory eval batches.
+
+    ``pass_gdn_state``/``pass_conv_state`` select the carried recurrent states (the CLI
+    resolves them from the checkpoint contract) and RMT memory is carried whenever
+    ``model_config.num_rmt_tokens > 0``. These enabled channels form one memory bundle that
+    CORRECT_STATE carries, RESET reinitializes, ZERO_STATE zeroes and COUNTERFACTUAL_STATE
+    swaps between paired worlds. FULL_CONTEXT is a separate direct-access diagnostic: one
+    forward over the concatenated segments with no carry (GDN/conv continue inside the
+    sequence; RMT reads its learned initial memory).
 
     The command-line evaluator creates this once after restoring a checkpoint and
     then reuses it for every batch. Keeping the NNX transform alive is important:
@@ -225,34 +279,20 @@ def make_memory_evaluator(model_config):
         return hidden_BTD
 
     @nnx.jit
-    def run_initial_segment(
+    def run_segment(
         model,
         token_ids_BT: jax.Array,
         attention_mask_BT: jax.Array,
+        carry: tuple,
     ):
-        return text_api.forward_with_gdn_state(
+        return _forward_segment(
             model,
-            token_ids_BT,
-            0,
             model_config,
-            attention_mask_BT=attention_mask_BT,
-            initial_gdn_states=None,
-        )
-
-    @nnx.jit
-    def run_carried_segment(
-        model,
-        token_ids_BT: jax.Array,
-        attention_mask_BT: jax.Array,
-        initial_gdn_states: tuple[jax.Array, ...],
-    ):
-        return text_api.forward_with_gdn_state(
-            model,
             token_ids_BT,
-            0,
-            model_config,
-            attention_mask_BT=attention_mask_BT,
-            initial_gdn_states=initial_gdn_states,
+            attention_mask_BT,
+            carry,
+            pass_gdn_state=pass_gdn_state,
+            pass_conv_state=pass_conv_state,
         )
 
     score_answers = jax.jit(_score_answer_arrays)
@@ -276,17 +316,15 @@ def make_memory_evaluator(model_config):
         batch_size, num_segments, segment_length = token_ids_BCT.shape
         batch_indices_B1 = jnp.arange(batch_size, dtype=jnp.int32)[:, None]
 
-        correct_initial_states = None
+        correct_carry = None
         if num_segments > 1:
-            _, _, correct_initial_states = run_initial_segment(
-                model, token_ids_BCT[:, 0], attention_mask_BCT[:, 0]
-            )
-            for segment_idx in range(1, num_segments - 1):
-                _, _, correct_initial_states = run_carried_segment(
+            correct_carry = (None, None, None)
+            for segment_idx in range(num_segments - 1):
+                _, correct_carry = run_segment(
                     model,
                     token_ids_BCT[:, segment_idx],
                     attention_mask_BCT[:, segment_idx],
-                    correct_initial_states,
+                    correct_carry,
                 )
 
         def run_mode(mode: MemoryEvalMode, candidate_tokens_BCT: jax.Array) -> jax.Array:
@@ -297,23 +335,19 @@ def make_memory_evaluator(model_config):
                     attention_mask_BCT.reshape(batch_size, num_segments * segment_length),
                 )
                 return hidden_BTD
-            if mode is MemoryEvalMode.RESET or correct_initial_states is None:
-                hidden_BTD, _, _ = run_initial_segment(
-                    model,
-                    candidate_tokens_BCT[:, -1],
-                    attention_mask_BCT[:, -1],
-                )
-                return hidden_BTD
-            initial_states = correct_initial_states
-            if mode is MemoryEvalMode.ZERO_STATE:
-                initial_states = tuple(jnp.zeros_like(state) for state in correct_initial_states)
+            if mode is MemoryEvalMode.RESET or correct_carry is None:
+                initial_carry = (None, None, None)
+            elif mode is MemoryEvalMode.ZERO_STATE:
+                initial_carry = jax.tree.map(jnp.zeros_like, correct_carry)
             elif mode is MemoryEvalMode.COUNTERFACTUAL_STATE:
-                initial_states = tuple(state[donor_indices_B] for state in correct_initial_states)
-            hidden_BTD, _, _ = run_carried_segment(
+                initial_carry = jax.tree.map(lambda state: state[donor_indices_B], correct_carry)
+            else:
+                initial_carry = correct_carry
+            hidden_BTD, _ = run_segment(
                 model,
                 candidate_tokens_BCT[:, -1],
                 attention_mask_BCT[:, -1],
-                initial_states,
+                initial_carry,
             )
             return hidden_BTD
 
@@ -414,41 +448,39 @@ def make_memory_evaluator(model_config):
             token_ids_BCT.reshape(batch_size, num_segments * segment_length),
             attention_mask_BCT.reshape(batch_size, num_segments * segment_length),
         )
-        reset_hidden_BTD, _, _ = run_initial_segment(
-            model, token_ids_BCT[:, -1], attention_mask_BCT[:, -1]
+        reset_hidden_BTD, _ = run_segment(
+            model, token_ids_BCT[:, -1], attention_mask_BCT[:, -1], (None, None, None)
         )
         if num_segments == 1:
             correct_hidden_BTD = reset_hidden_BTD
             zero_hidden_BTD = reset_hidden_BTD
             counterfactual_hidden_BTD = reset_hidden_BTD
         else:
-            _, _, correct_initial_states = run_initial_segment(
-                model, token_ids_BCT[:, 0], attention_mask_BCT[:, 0]
-            )
-            for segment_idx in range(1, num_segments - 1):
-                _, _, correct_initial_states = run_carried_segment(
+            correct_carry = (None, None, None)
+            for segment_idx in range(num_segments - 1):
+                _, correct_carry = run_segment(
                     model,
                     token_ids_BCT[:, segment_idx],
                     attention_mask_BCT[:, segment_idx],
-                    correct_initial_states,
+                    correct_carry,
                 )
-            correct_hidden_BTD, _, _ = run_carried_segment(
+            correct_hidden_BTD, _ = run_segment(
                 model,
                 token_ids_BCT[:, -1],
                 attention_mask_BCT[:, -1],
-                correct_initial_states,
+                correct_carry,
             )
-            zero_hidden_BTD, _, _ = run_carried_segment(
+            zero_hidden_BTD, _ = run_segment(
                 model,
                 token_ids_BCT[:, -1],
                 attention_mask_BCT[:, -1],
-                tuple(jnp.zeros_like(state) for state in correct_initial_states),
+                jax.tree.map(jnp.zeros_like, correct_carry),
             )
-            counterfactual_hidden_BTD, _, _ = run_carried_segment(
+            counterfactual_hidden_BTD, _ = run_segment(
                 model,
                 token_ids_BCT[:, -1],
                 attention_mask_BCT[:, -1],
-                tuple(state[donor_indices_B] for state in correct_initial_states),
+                jax.tree.map(lambda state: state[donor_indices_B], correct_carry),
             )
         output_weight_DV = model.output_weight()
         raw_results = (

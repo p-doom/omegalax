@@ -131,6 +131,8 @@ def _parser() -> argparse.ArgumentParser:
         choices=[cue.value for cue in MemoryTaskCue],
         default=MemoryTaskCue.MARKED.value,
     )
+    parser.add_argument("--pass_conv_state", action="store_true")
+    parser.add_argument("--num_rmt_tokens", type=int, default=0)
     parser.add_argument("--pairs_per_batch", type=int, default=8)
     parser.add_argument("--num_steps", type=int, default=1000)
     parser.add_argument("--learning_rate", type=float, default=1e-3)
@@ -295,6 +297,12 @@ def main(argv: list[str] | None = None) -> None:
         raise ValueError("Provide at most one of --init_model_checkpoint or --init_hf_model_path")
     if args.resume_expected_step is not None and args.resume == ResumeMode.NEVER.value:
         raise ValueError("--resume_expected_step requires --resume=required or --resume=if_present")
+    if args.condition != TrainingCondition.STATE.value and (
+        args.pass_conv_state or args.num_rmt_tokens
+    ):
+        raise ValueError(
+            "--pass_conv_state and --num_rmt_tokens need a segmented condition with --condition=state"
+        )
     if not flags.FLAGS.is_parsed():
         flags.FLAGS(["train_memory_tasks.py"])
     wandb_identity = _wandb_identity(args)
@@ -401,7 +409,8 @@ def main(argv: list[str] | None = None) -> None:
             "pass_gdn_state": layout.pass_gdn_state,
             "bptt_chunks": layout.bptt_chunks,
             "pass_rope_positions": False,
-            "pass_conv_state": False,
+            "pass_conv_state": args.pass_conv_state,
+            **({"num_rmt_tokens": args.num_rmt_tokens} if args.num_rmt_tokens else {}),
         },
         "run_plan": {
             "sha256": args.run_plan_sha256,
@@ -484,7 +493,8 @@ def main(argv: list[str] | None = None) -> None:
                 bptt_chunks=layout.bptt_chunks,
                 pass_gdn_state=layout.pass_gdn_state,
                 pass_rope_positions=False,
-                pass_conv_state=False,
+                pass_conv_state=args.pass_conv_state,
+                num_rmt_tokens=args.num_rmt_tokens,
                 resume_expected_step=args.resume_expected_step,
                 stop_after_local_step=args.stop_after_local_step,
             )
@@ -525,7 +535,8 @@ def main(argv: list[str] | None = None) -> None:
                 bptt_chunks=layout.bptt_chunks,
                 pass_gdn_state=layout.pass_gdn_state,
                 pass_rope_positions=False,
-                pass_conv_state=False,
+                pass_conv_state=args.pass_conv_state,
+                num_rmt_tokens=args.num_rmt_tokens,
                 stop_after_local_step=args.stop_after_local_step,
                 init_hf_model_path=init_hf_model_path,
                 resume_expected_step=args.resume_expected_step,

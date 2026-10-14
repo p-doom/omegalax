@@ -33,12 +33,14 @@ class SegmentInputs:
     position_offsets_B: jax.Array
     gdn_states: tuple[jax.Array, ...] | None = None
     conv_states: tuple[jax.Array, ...] | None = None
+    rmt_memory_BMD: jax.Array | None = None
 
 
 @dataclass(frozen=True)
 class SegmentState:
     gdn_states: tuple[jax.Array, ...]
     conv_states: tuple[jax.Array, ...]
+    rmt_memory_BMD: jax.Array | None = None
 
 
 @dataclass(frozen=True)
@@ -106,8 +108,9 @@ def make_run_segment(mesh):
             initial_conv_states: tuple[jax.Array, ...] | None,
             *,
             pad_id: int,
+            initial_rmt_memory_BMD: jax.Array | None = None,
         ):
-            hidden_BTD, _, gdn_states, conv_states = text_api.forward_with_gdn_state(
+            forward_result = text_api.forward_with_gdn_state(
                 model,
                 token_ids_BT,
                 pad_id=pad_id,
@@ -117,7 +120,10 @@ def make_run_segment(mesh):
                 initial_conv_states=initial_conv_states,
                 position_ids_ZBT=_position_ids(position_offsets_B, token_ids_BT.shape[1]),
                 return_conv_states=True,
+                initial_rmt_memory_BMD=initial_rmt_memory_BMD,
+                return_rmt_memory=model.text.cfg.num_rmt_tokens > 0,
             )
+            hidden_BTD, _, gdn_states, conv_states = forward_result[:4]
 
             def document_stats(hidden_TD, targets_T, document_loss_masks_NT):
                 return chunked_cross_entropy_multi_stats(
@@ -133,7 +139,10 @@ def make_run_segment(mesh):
                 token_ids_BT,
                 loss_masks_BNT,
             )
-            return nll_sums_BN, token_counts_BN, gdn_states, conv_states
+            outputs = (nll_sums_BN, token_counts_BN, gdn_states, conv_states)
+            if model.text.cfg.num_rmt_tokens:
+                outputs += (forward_result[4],)
+            return outputs
 
     return run_segment
 
@@ -158,6 +167,11 @@ def make_run_entropy_segment(mesh):
                 attention_mask_BT=attention_mask_BT,
                 initial_gdn_states=None,
                 initial_conv_states=None,
+                initial_rmt_memory_BMD=(
+                    jnp.zeros_like(model.initial_rmt_memory(token_ids_BT.shape[0]))
+                    if model.text.cfg.num_rmt_tokens
+                    else None
+                ),
                 position_ids_ZBT=_position_ids(
                     jnp.zeros(token_ids_BT.shape[0], dtype=jnp.int32),
                     token_ids_BT.shape[1],
@@ -195,7 +209,8 @@ def run_chain(
             selection_masks_BNT = batch.loss_mask_BCT[:, segment_idx, None, :]
         else:
             selection_masks_BNT = batch.selection_masks_BNCT[:, :, segment_idx, :]
-        nll_sums_BN, token_counts_BN, gdn_states, conv_states = run_segment(
+        rmt_kwargs = {"initial_rmt_memory_BMD": inputs.rmt_memory_BMD} if cfg.num_rmt_tokens else {}
+        nll_sums_BN, token_counts_BN, gdn_states, conv_states, *rmt_memory = run_segment(
             model,
             token_ids_BT,
             batch.attention_mask_BCT[:, segment_idx],
@@ -204,8 +219,13 @@ def run_chain(
             inputs.gdn_states,
             inputs.conv_states,
             pad_id=pad_id,
+            **rmt_kwargs,
         )
-        previous_state = SegmentState(gdn_states=gdn_states, conv_states=conv_states)
+        previous_state = SegmentState(
+            gdn_states=gdn_states,
+            conv_states=conv_states,
+            rmt_memory_BMD=rmt_memory[0] if rmt_memory else None,
+        )
         nll_sums_by_selection = {
             selection: nll_sums_BN[:, selection_idx]
             for selection_idx, selection in enumerate(batch.selection_names)

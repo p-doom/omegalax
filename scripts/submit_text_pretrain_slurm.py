@@ -130,6 +130,9 @@ flags.DEFINE_enum(
 )
 flags.DEFINE_bool("submit_pass_rope_positions", False, "Pass chunk-aware RoPE position ids.")
 flags.DEFINE_bool("submit_pass_conv_state", False, "Pass 1D conv state between chunks.")
+flags.DEFINE_integer(
+    "submit_num_rmt_tokens", 0, "RMT read/write memory tokens per chunk (0 disables RMT)."
+)
 flags.DEFINE_integer("submit_grain_read_threads", 2, "Grain read threads.")
 flags.DEFINE_integer(
     "submit_grain_read_prefetch_buffer_size", 4, "Grain read prefetch buffer size."
@@ -625,6 +628,8 @@ def _train_flags(
     gdn_layer_limit = _flag_value("submit_gdn_layer_limit")
     if gdn_layer_limit is not None:
         flags_out.append(f"--gdn_layer_limit={gdn_layer_limit}")
+    if _flag_value("submit_num_rmt_tokens"):
+        flags_out.append(f"--num_rmt_tokens={_flag_value('submit_num_rmt_tokens')}")
     if single_process_per_run:
         flags_out.extend(["--iterator_fsdp_size=1", "--iterator_dp_size=1"])
     elif single_process_per_node:

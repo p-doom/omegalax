@@ -105,6 +105,7 @@ def run_gdn_experiment(
                 pass_state=state_config.pass_conv_state,
                 layer_limit=layer_limit,
             ),
+            rmt_memory_BMD=previous_state.rmt_memory_BMD,
         )
 
     true_result = run_chain(
@@ -143,6 +144,7 @@ def run_gdn_experiment(
                 pass_state=state_config.pass_conv_state,
                 layer_limit=layer_limit,
             ),
+            rmt_memory_BMD=true_state.rmt_memory_BMD,
         )
 
     zero_result = run_chain(
@@ -213,6 +215,7 @@ def run_conv_experiment(
                 pass_state=True,
                 layer_limit=layer_limit,
             ),
+            rmt_memory_BMD=previous_state.rmt_memory_BMD,
         )
 
     true_result = run_chain(
@@ -251,6 +254,7 @@ def run_conv_experiment(
                 pass_state=True,
                 layer_limit=layer_limit,
             ),
+            rmt_memory_BMD=true_state.rmt_memory_BMD,
         )
 
     zero_result = run_chain(

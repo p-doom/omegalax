@@ -64,6 +64,26 @@ def resolve_config(model_or_id: str | TextConfig) -> TextConfig:
     )
 
 
+def with_num_rmt_tokens(
+    cfg: TextConfig, num_rmt_tokens: int, *, resumed: bool = False
+) -> TextConfig:
+    """Return ``cfg`` with ``num_rmt_tokens`` memory tokens, never overriding another value.
+
+    A fresh run may add RMT to a config without it; a resumed run must match its checkpoint.
+    """
+    current = getattr(cfg, "num_rmt_tokens", 0)
+    if current != num_rmt_tokens and (resumed or current != 0):
+        raise ValueError(
+            f"Model config has num_rmt_tokens={current} but num_rmt_tokens={num_rmt_tokens} "
+            "was requested."
+        )
+    if current == num_rmt_tokens:
+        return cfg
+    if not isinstance(cfg, Qwen3_5TextConfig):
+        raise ValueError("RMT memory tokens are only supported for Qwen3.5 text models.")
+    return dataclasses.replace(cfg, num_rmt_tokens=num_rmt_tokens)
+
+
 def align_config_to_mesh(cfg: TextConfig, mesh: Mesh) -> TextConfig:
     """Drop singleton mesh axes from sharding specs to avoid degenerate constraints."""
     if isinstance(cfg, (qwen3_registry.Qwen3Config, Qwen3_5TextConfig)):
@@ -179,11 +199,15 @@ def forward_with_gdn_state(
     position_ids_ZBT: jax.Array | None = None,
     return_conv_states: bool = False,
     cache=None,
-) -> (
-    tuple[jax.Array, jax.Array, tuple[jax.Array, ...]]
-    | tuple[jax.Array, jax.Array, tuple[jax.Array, ...], tuple[jax.Array, ...]]
-):
-    """Qwen3.5 forward pass that returns one final GDN state per linear layer."""
+    initial_rmt_memory_BMD: jax.Array | None = None,
+    return_rmt_memory: bool = False,
+) -> tuple:
+    """Qwen3.5 forward pass that returns one final GDN state per linear layer.
+
+    Returns ``(hidden_BTD, aux_loss, gdn_states[, conv_states][, rmt_memory_BMD])``. For a
+    model with ``num_rmt_tokens > 0``, ``initial_rmt_memory_BMD`` is the read memory (default:
+    the learned initial memory) and ``rmt_memory_BMD`` the write memory to carry forward.
+    """
     segment_ids_BT = segment_ids_from_inputs(
         token_ids_BT,
         pad_id,
@@ -202,8 +226,16 @@ def forward_with_gdn_state(
             position_ids_ZBT=position_ids_ZBT,
             return_gdn_states=True,
             return_conv_states=return_conv_states,
+            rmt_initial_memory_BMD=initial_rmt_memory_BMD,
+            return_rmt_memory=return_rmt_memory,
         )
     raise ValueError("GDN state forwarding is only supported for Qwen3.5 text models.")
+
+
+def apply_rmt_reset(model: nnx.Module, memory_BMD: jax.Array, reset_B: jax.Array) -> jax.Array:
+    """Replace the carried memory of reset rows (document starts) by the learned initial memory."""
+    initial_BMD = model.initial_rmt_memory(memory_BMD.shape[0]).astype(memory_BMD.dtype)
+    return jnp.where(reset_B.astype(jnp.bool_)[:, None, None], initial_BMD, memory_BMD)
 
 
 def decode(model: nnx.Module, cache: Cache, token_ids_BT: jax.Array, pad_id: int, cfg: TextConfig):

@@ -60,7 +60,105 @@ class EvalExecutorTest(absltest.TestCase):
         return SegmentInputs(
             gdn_states=previous_state.gdn_states,
             conv_states=previous_state.conv_states,
+            rmt_memory_BMD=previous_state.rmt_memory_BMD,
             position_offsets_B=offsets,
+        )
+
+    def test_rmt32_chain_carries_the_real_write_memory_and_keeps_text_counts(self):
+        cfg = dataclasses.replace(tiny_hybrid_config(), num_rmt_tokens=32, param_dtype=jnp.float32)
+        model, cfg = text_api.init_model(cfg, jax.random.key(0), tp_size=1, fsdp_size=1, dp_size=1)
+        set_attn_backend(model, "xla")
+        batch = self._batch()
+        result = run_chain(
+            model,
+            cfg,
+            batch,
+            pad_id=0,
+            condition="rmt32",
+            segment_input_fn=lambda idx, previous: self._global_inputs(
+                batch, idx, previous, carry=True
+            ),
+        )
+        gdn, conv, memory = None, None, None
+        for segment_idx, segment in enumerate(result.segments):
+            tokens = batch.token_ids_BCT[:, segment_idx]
+            offsets = batch.chunk_indices_BC[:, segment_idx] * tokens.shape[1]
+            hidden, _, gdn, conv, memory = text_api.forward_with_gdn_state(
+                model,
+                tokens,
+                0,
+                cfg,
+                attention_mask_BT=batch.attention_mask_BCT[:, segment_idx],
+                initial_gdn_states=gdn,
+                initial_conv_states=conv,
+                initial_rmt_memory_BMD=memory,
+                position_ids_ZBT=_position_ids(offsets, tokens.shape[1]),
+                return_conv_states=True,
+                return_rmt_memory=True,
+            )
+            # The long GDN prefix accumulates small eager-versus-fused rounding differences.
+            np.testing.assert_allclose(segment.state.rmt_memory_BMD, memory, rtol=1e-4, atol=1e-4)
+            self.assertEqual(segment.state.rmt_memory_BMD.shape, (2, 32, cfg.hidden_size))
+            for document_idx in range(2):
+                nll, _ = chunked_cross_entropy_stats(
+                    hidden[document_idx : document_idx + 1],
+                    model.output_weight(),
+                    tokens[document_idx : document_idx + 1],
+                    batch.loss_mask_BCT[document_idx : document_idx + 1, segment_idx],
+                    num_tiles=1,
+                )
+                self.assertAlmostEqual(
+                    float(segment.nll_sum_B[document_idx]), float(nll), delta=1e-3
+                )
+        np.testing.assert_array_equal(result.token_count_B, [7, 8])
+        reset_memory = run_chain(
+            model,
+            cfg,
+            batch,
+            pad_id=0,
+            condition="rmt-reset-regression",
+            segment_input_fn=lambda idx, previous: dataclasses.replace(
+                self._global_inputs(batch, idx, previous, carry=True), rmt_memory_BMD=None
+            ),
+        )
+        self.assertGreater(float(jnp.abs(result.nll_sum_B - reset_memory.nll_sum_B).max()), 1e-2)
+
+        from omegalax.evals.experiments import run_gdn_experiment
+        from omegalax.text.chat import StatePassingConfig
+
+        experiment = run_gdn_experiment(
+            model,
+            cfg,
+            batch,
+            state_config=StatePassingConfig(True, None, True, True),
+            donor_indices_B=jnp.asarray([1, 0]),
+            pad_id=0,
+            checkpoint="rmt32-test",
+        )
+        np.testing.assert_allclose(
+            experiment.conditions["true_gdn"].nll_sum_B, result.nll_sum_B, rtol=1e-5, atol=1e-5
+        )
+        zero = run_chain(
+            model,
+            cfg,
+            batch,
+            pad_id=0,
+            condition="zero-gdn-oracle",
+            segment_input_fn=lambda idx, _: SegmentInputs(
+                position_offsets_B=batch.chunk_indices_BC[:, idx] * batch.token_ids_BCT.shape[-1],
+                gdn_states=(
+                    tuple(
+                        jnp.zeros_like(state) for state in result.segments[idx - 1].state.gdn_states
+                    )
+                    if idx
+                    else None
+                ),
+                conv_states=result.segments[idx - 1].state.conv_states if idx else None,
+                rmt_memory_BMD=result.segments[idx - 1].state.rmt_memory_BMD if idx else None,
+            ),
+        )
+        np.testing.assert_allclose(
+            experiment.conditions["zero_gdn"].nll_sum_B, zero.nll_sum_B, rtol=1e-5, atol=1e-5
         )
 
     def test_segment_executor_is_jitted_and_uses_bounded_loss_tiles(self):

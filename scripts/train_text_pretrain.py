@@ -140,6 +140,11 @@ flags.DEFINE_enum(
 )
 flags.DEFINE_bool("pass_rope_positions", False, "Pass chunk-aware RoPE position ids.")
 flags.DEFINE_bool("pass_conv_state", False, "Pass 1D conv state between chunks.")
+flags.DEFINE_integer(
+    "num_rmt_tokens",
+    0,
+    "RMT read/write memory tokens per chunk, carried between chunks (0 disables RMT).",
+)
 flags.DEFINE_integer("grain_read_threads", 2, "Grain read threads.")
 flags.DEFINE_integer("grain_read_prefetch_buffer_size", 4, "Grain read prefetch buffer size.")
 flags.DEFINE_integer("grain_workers", 8, "Grain multiprocessing workers.")
@@ -324,6 +329,7 @@ def _runtime_kwargs() -> dict[str, object]:
         "gdn_state_routing": FLAGS.gdn_state_routing,
         "pass_rope_positions": FLAGS.pass_rope_positions,
         "pass_conv_state": FLAGS.pass_conv_state,
+        "num_rmt_tokens": FLAGS.num_rmt_tokens,
     }
 
 

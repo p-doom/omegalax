@@ -65,6 +65,13 @@ class Qwen3_5TextConfig:
     dtype: Any = jnp.bfloat16
     param_dtype: Any = jnp.bfloat16
 
+    # Recurrent Memory Transformer read/write memory tokens per segment (0 disables RMT).
+    num_rmt_tokens: int = 0
+
+    def __post_init__(self):
+        if self.num_rmt_tokens < 0:
+            raise ValueError(f"num_rmt_tokens must be >= 0, got {self.num_rmt_tokens}")
+
     @property
     def is_moe(self) -> bool:
         return self.num_experts > 0
@@ -362,6 +369,7 @@ def make_config_from_hf(hf_cfg: dict[str, Any]) -> Qwen3_5Config:
         "linear_num_value_heads": _required(txt, "linear_num_value_heads", "hf_cfg['text_config']"),
         "linear_value_head_dim": _required(txt, "linear_value_head_dim", "hf_cfg['text_config']"),
         "dtype": text_dtype,
+        "num_rmt_tokens": txt.get("num_rmt_tokens", 0),
     }
 
     if has_moe:

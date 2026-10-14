@@ -359,6 +359,8 @@ def prepare_pretrain_batch(
 
 
 def _iid_loss_stats(model, batch: dict[str, jax.Array], cfg, pad_id: int):
+    if getattr(cfg, "num_rmt_tokens", 0):
+        raise ValueError("RMT memory is carried between segments and needs a statepassing mode")
     token_ids_BT = batch["token_ids_BT"]
     attention_mask_BT = batch["attention_mask_BT"]
     loss_mask_BT = batch["loss_mask_BT"]
@@ -421,6 +423,7 @@ def _statepassing_loss_stats(
     aux_losses = []
     carried_states = None
     carried_conv_states = None
+    carried_memory = None
     for segment_idx in range(C):
         if carried_states is not None:
             carried_states = _prepare_carried_states_for_segment(
@@ -438,6 +441,15 @@ def _statepassing_loss_stats(
             carried_conv_states = apply_state_reset(
                 carried_conv_states, reset_state_BC[:, segment_idx]
             )
+        if carried_memory is not None:
+            (carried_memory,) = _prepare_carried_states_for_segment(
+                (carried_memory,),
+                segment_idx=segment_idx,
+                bptt_chunks=resolved_bptt_chunks,
+            )
+            carried_memory = text_api.apply_rmt_reset(
+                model, carried_memory, reset_state_BC[:, segment_idx]
+            )
         forward_kwargs = {
             "attention_mask_BT": attention_mask_BCT[:, segment_idx, :],
             "initial_gdn_states": carried_states,
@@ -445,6 +457,9 @@ def _statepassing_loss_stats(
         if pass_conv_state:
             forward_kwargs["initial_conv_states"] = carried_conv_states
             forward_kwargs["return_conv_states"] = True
+        if cfg.num_rmt_tokens:
+            forward_kwargs["initial_rmt_memory_BMD"] = carried_memory
+            forward_kwargs["return_rmt_memory"] = True
         if pass_rope_positions:
             forward_kwargs["position_ids_ZBT"] = _position_ids_zbt_from_chunk_idx(
                 chunk_idx_BC[:, segment_idx],
@@ -457,6 +472,8 @@ def _statepassing_loss_stats(
             cfg,
             **forward_kwargs,
         )
+        if cfg.num_rmt_tokens:
+            *forward_result, carried_memory = forward_result
         if pass_conv_state:
             hidden_BTD, aux_loss, final_states, final_conv_states = forward_result
         else:
@@ -842,6 +859,7 @@ def run_pretrain(
     gdn_state_routing: GdnStateRouting | str = GdnStateRouting.SAME_LAYER,
     pass_rope_positions: bool = False,
     pass_conv_state: bool = False,
+    num_rmt_tokens: int = 0,
     lr_contract_explicit_fields: Collection[str] | None = None,
     init_hf_model_path: str | Path | None = None,
     restore_input_iter: bool = True,
@@ -878,10 +896,14 @@ def run_pretrain(
         explicit_fields=lr_contract_explicit_fields,
     )
 
-    model_cfg = (
-        text_api.resolve_config(str(save_path))
-        if will_resume
-        else text_api.resolve_config(model_id_or_cfg)
+    model_cfg = text_api.with_num_rmt_tokens(
+        (
+            text_api.resolve_config(str(save_path))
+            if will_resume
+            else text_api.resolve_config(model_id_or_cfg)
+        ),
+        num_rmt_tokens,
+        resumed=will_resume,
     )
     mesh = ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size)
     model_cfg = text_api.align_config_to_mesh(model_cfg, mesh)
@@ -906,6 +928,8 @@ def run_pretrain(
             fsdp_size=fsdp_size,
             dp_size=dp_size,
             text_only=True,
+            num_rmt_tokens=model_cfg.num_rmt_tokens,
+            rmt_rng=init_rng,
         )
         startup_log(f"loaded text model parameters from {Path(init_hf_model_path).resolve()}")
     else:
@@ -1186,6 +1210,7 @@ def run_statepassing_curriculum(
     gdn_state_routing: GdnStateRouting | str = GdnStateRouting.SAME_LAYER,
     pass_rope_positions: bool = False,
     pass_conv_state: bool = False,
+    num_rmt_tokens: int = 0,
     lr_contract_explicit_fields: Collection[str] | None = None,
 ) -> tuple[MixedPrecisionOptimizer, dict[str, float]]:
     pretrain_mode = PretrainMode(pretrain_mode)
@@ -1223,10 +1248,14 @@ def run_statepassing_curriculum(
         explicit_fields=lr_contract_explicit_fields,
     )
 
-    model_cfg = (
-        text_api.resolve_config(str(save_path))
-        if will_resume
-        else text_api.resolve_config(model_id_or_cfg)
+    model_cfg = text_api.with_num_rmt_tokens(
+        (
+            text_api.resolve_config(str(save_path))
+            if will_resume
+            else text_api.resolve_config(model_id_or_cfg)
+        ),
+        num_rmt_tokens,
+        resumed=will_resume,
     )
     mesh = ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size)
     model_cfg = text_api.align_config_to_mesh(model_cfg, mesh)

@@ -7,6 +7,7 @@ import gc
 import re
 from collections import defaultdict
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import safetensors
@@ -305,8 +306,14 @@ def create_qwen3_5_from_safetensors(
     fsdp_size: int | None = None,
     dp_size: int | None = None,
     text_only: bool = False,
+    num_rmt_tokens: int = 0,
+    rmt_rng: jax.Array | None = None,
 ) -> tuple[Qwen3_5ForConditionalGeneration | Qwen3_5ForCausalLM, Qwen3_5Config]:
-    """Load HuggingFace Qwen3.5 safetensors into a JAX Qwen3.5 model."""
+    """Load HuggingFace Qwen3.5 safetensors into a JAX Qwen3.5 model.
+
+    ``num_rmt_tokens > 0`` (text-only) adds the learned RMT initial memory, which HuggingFace
+    checkpoints do not contain; it is drawn from ``rmt_rng``.
+    """
     mesh = ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size)
 
     path = epath.Path(file_dir).expanduser()
@@ -315,6 +322,18 @@ def create_qwen3_5_from_safetensors(
     hf_cfg = load_hf_config(path)
     cfg = make_config_from_hf(hf_cfg)
     _assert_config(cfg, hf_cfg)
+    if num_rmt_tokens != cfg.text_config.num_rmt_tokens:
+        if cfg.text_config.num_rmt_tokens:
+            raise ValueError(
+                f"HuggingFace config has num_rmt_tokens={cfg.text_config.num_rmt_tokens}, "
+                f"requested {num_rmt_tokens}"
+            )
+        cfg = dataclasses.replace(
+            cfg,
+            text_config=dataclasses.replace(cfg.text_config, num_rmt_tokens=num_rmt_tokens),
+        )
+    if cfg.text_config.num_rmt_tokens and (not text_only or rmt_rng is None):
+        raise ValueError("RMT memory requires text_only=True and an rmt_rng")
     cfg = dataclasses.replace(
         cfg,
         text_config=dataclasses.replace(
@@ -563,6 +582,20 @@ def create_qwen3_5_from_safetensors(
             + "\n".join(sorted(missing_mtp_keys))
         )
     check_conversion_errors(unmatched_hf_keys)
+
+    if cfg.text_config.num_rmt_tokens:
+        assign_to_state_dict(
+            state_dict,
+            "rmt_memory",
+            nnx.initializers.normal(stddev=0.02)(
+                rmt_rng,
+                (cfg.text_config.num_rmt_tokens, cfg.text_config.hidden_size),
+                cfg.text_config.param_dtype,
+            ),
+            "rmt_memory",
+            mesh=mesh,
+            pspec_dict=pspec_dict,
+        )
 
     if cfg.text_config.tie_word_embeddings and not text_only:
         state_dict["lm_head"]["kernel"] = state_dict["text"]["embedder"]["embedding"].T

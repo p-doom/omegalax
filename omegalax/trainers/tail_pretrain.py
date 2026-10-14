@@ -402,6 +402,7 @@ def run_tail_pretrain(
     gdn_state_routing: GdnStateRouting | str = GdnStateRouting.SAME_LAYER,
     pass_rope_positions: bool = False,
     pass_conv_state: bool = False,
+    num_rmt_tokens: int = 0,
     stop_after_local_step: int | None = None,
     init_hf_model_path: str | Path | None = None,
     restore_input_iter: bool = True,
@@ -446,12 +447,20 @@ def run_tail_pretrain(
                 f"({config.global_step_offset}, {config.global_stop_step}]"
             )
 
-    model_cfg = text_api.resolve_config(
-        str(save_path)
-        if will_resume
-        else str(
-            init_hf_model_path if init_hf_model_path is not None else source_checkpoint.config_path
-        )
+    if enable_lora and num_rmt_tokens:
+        raise ValueError("LoRA freezes the backbone and would leave the RMT memory untrained")
+    model_cfg = text_api.with_num_rmt_tokens(
+        text_api.resolve_config(
+            str(save_path)
+            if will_resume
+            else str(
+                init_hf_model_path
+                if init_hf_model_path is not None
+                else source_checkpoint.config_path
+            )
+        ),
+        num_rmt_tokens,
+        resumed=will_resume or source_checkpoint is not None,
     )
     mesh = ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size)
     model_cfg = text_api.align_config_to_mesh(model_cfg, mesh)
@@ -475,6 +484,8 @@ def run_tail_pretrain(
             fsdp_size=fsdp_size,
             dp_size=dp_size,
             text_only=True,
+            num_rmt_tokens=model_cfg.num_rmt_tokens,
+            rmt_rng=jax.device_put(init_rng, replicated),
         )
         startup_log(f"loaded text model parameters from {Path(init_hf_model_path).resolve()}")
     else:

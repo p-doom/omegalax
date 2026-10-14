@@ -89,6 +89,9 @@ flags.DEFINE_enum(
 )
 flags.DEFINE_bool("pass_rope_positions", False, "Pass chunk-aware RoPE positions.")
 flags.DEFINE_bool("pass_conv_state", True, "Pass causal convolution state.")
+flags.DEFINE_integer(
+    "num_rmt_tokens", 0, "Number of additional RMT memory tokens (0 disables RMT)."
+)
 flags.DEFINE_integer("pad_id", 0, "Padding token id.")
 flags.DEFINE_integer("eos_id", 248046, "Expected tail-index EOS id.")
 flags.DEFINE_integer("tp_size", 1, "Tensor parallel size.")
@@ -396,6 +399,7 @@ def main(_) -> None:
             pass_rope_positions=FLAGS.pass_rope_positions,
             pass_conv_state=FLAGS.pass_conv_state,
             stop_after_local_step=FLAGS.stop_after_local_step,
+            num_rmt_tokens=FLAGS.num_rmt_tokens,
             init_hf_model_path=FLAGS.init_hf_model_path,
             restore_input_iter=FLAGS.restore_input_iter,
             resume_expected_step=FLAGS.resume_expected_step,

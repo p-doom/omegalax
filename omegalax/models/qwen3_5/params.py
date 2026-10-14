@@ -73,6 +73,9 @@ def qwen3_5_to_hf_config_dict(cfg: Qwen3_5Config) -> dict[str, Any]:
         "model_type": f"{top_model_type}_text",
     }
 
+    if txt.num_rmt_tokens:
+        text_dict["num_rmt_tokens"] = txt.num_rmt_tokens
+
     if is_moe:
         text_dict.update(
             moe_intermediate_size=txt.moe_intermediate_size,

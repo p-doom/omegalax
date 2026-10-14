@@ -276,6 +276,41 @@ def _read_training_contract(checkpoint_root: Path) -> tuple[dict[str, Any], dict
     return contract, trained_task
 
 
+def _resolve_memory_channels(contract: dict[str, Any], model_config) -> dict[str, Any]:
+    """Diagnostic GDN carry, recorded Conv1D carry, and the saved model's RMT channel."""
+    try:
+        state = contract["state"]
+        pass_gdn_state = state["pass_gdn_state"]
+        pass_conv_state = state["pass_conv_state"]
+    except (KeyError, TypeError) as exc:
+        raise ValueError(
+            "Memory-task contract has no state.pass_gdn_state/state.pass_conv_state"
+        ) from exc
+    if not isinstance(pass_gdn_state, bool) or not isinstance(pass_conv_state, bool):
+        raise ValueError(f"Memory-task contract state flags must be booleans: {state!r}")
+    num_rmt_tokens = state.get("num_rmt_tokens", 0)
+    if num_rmt_tokens != model_config.num_rmt_tokens:
+        raise ValueError(
+            f"Memory-task contract records num_rmt_tokens={num_rmt_tokens} but the saved model "
+            f"config has num_rmt_tokens={model_config.num_rmt_tokens}"
+        )
+    return {
+        # Correct/counterfactual diagnostics also carry GDN for reset/full-context
+        # trained checkpoints, preserving the original evaluation protocol.
+        "pass_gdn_state": True,
+        "pass_conv_state": pass_conv_state,
+        "num_rmt_tokens": num_rmt_tokens,
+        "full_context": {
+            "carry_applied": False,
+            "rmt": (
+                "learned initial read memory before the concatenated text; write block unused"
+                if num_rmt_tokens
+                else "none"
+            ),
+        },
+    }
+
+
 def _validate_training_contract(
     checkpoint_root: Path,
     task_config: MemoryTaskConfig,
@@ -826,7 +861,9 @@ def main(argv: list[str] | None = None) -> None:
         task_config,
         allow_zero_shot_horizon_override=args.allow_zero_shot_horizon_override,
     )
-    _, source_training_task = _read_training_contract(resolved.root)
+    training_contract, source_training_task = _read_training_contract(resolved.root)
+    model_config = text_api.resolve_config(str(resolved.config_path))
+    memory_channels = _resolve_memory_channels(training_contract, model_config)
     _require_canonical_num_pairs(source_training_task["task"], args.num_pairs)
     eval_name = _eval_name(
         task_config,
@@ -869,6 +906,7 @@ def main(argv: list[str] | None = None) -> None:
         "text_attn_backend": args.text_attn_backend,
         "runtime": runtime,
         "conditions": [mode.value for mode in MemoryEvalMode],
+        "memory_channels": memory_channels,
         "revision": _revision(),
     }
     if args.eval_role is not None:
@@ -891,7 +929,6 @@ def main(argv: list[str] | None = None) -> None:
             raise ValueError(f"Refusing to change immutable eval input: {path}")
         _write_json(path, value)
     _write_json(run_dir / "status.json", {"status": "running"})
-    model_config = text_api.resolve_config(str(resolved.config_path))
     if task_config.vocab_size > model_config.vocab_size:
         raise ValueError(
             f"Task vocab_size={task_config.vocab_size} exceeds model vocab_size={model_config.vocab_size}"
@@ -905,7 +942,11 @@ def main(argv: list[str] | None = None) -> None:
     )
     restore_model_params(model, resolved)
     set_attn_backend(model, text_backend=args.text_attn_backend)
-    evaluate_batch = make_memory_evaluator(model_config)
+    evaluate_batch = make_memory_evaluator(
+        model_config,
+        pass_gdn_state=memory_channels["pass_gdn_state"],
+        pass_conv_state=memory_channels["pass_conv_state"],
+    )
 
     rows: list[dict[str, Any]] = []
     pair_indices = [int(index) for index in manifest["pair_indices"]]

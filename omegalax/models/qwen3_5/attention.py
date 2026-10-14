@@ -10,7 +10,7 @@ Key differences from standard Qwen3 attention:
 import jax
 import jax.numpy as jnp
 from flax import nnx
-from jax.sharding import PartitionSpec
+from jax.sharding import PartitionSpec, reshard
 from tokamax import dot_product_attention
 
 from .config import Qwen3_5TextConfig
@@ -78,6 +78,7 @@ class Attention(nnx.Module):
         self.num_heads = nh
         self.num_kv_heads = nkv
         self.head_dim = hd
+        self.num_rmt_tokens = cfg.num_rmt_tokens
         self.n_rep = nh // nkv
         self.scale = hd**-0.5
         self.hidden_shd = cfg.shd_cfg.act_btd
@@ -85,6 +86,64 @@ class Attention(nnx.Module):
         object.__setattr__(self, "_q_sharding_spec", P(*cfg.shd_cfg.act_btnh))
         object.__setattr__(self, "_attn_backend", "mosaic_gpu")
         object.__setattr__(self, "_attn_kind", "text")
+
+    def _rmt_attention(
+        self,
+        q_BSHK: jax.Array,
+        k_BSGK: jax.Array,
+        v_BSGK: jax.Array,
+        attention_mask_BS: jax.Array,
+    ) -> jax.Array:
+        """Attention over ``[read | text | write]`` (``M`` memory tokens on each side).
+
+        Text queries are causal over ``[read | text]`` and never see the write block.
+        Read queries see only the read block; write queries see the read block, every
+        non-padded text token and the whole write block (full attention inside a block).
+        """
+        M = self.num_rmt_tokens
+        B, S = q_BSHK.shape[:2]
+        if attention_mask_BS is None:
+            raise ValueError("RMT attention requires the full-length attention mask")
+        text_BTHK = dot_product_attention(
+            q_BSHK[:, :-M],
+            k_BSGK[:, :-M],
+            v_BSGK[:, :-M],
+            is_causal=True,
+            scale=self.scale,
+            implementation=self._attn_backend,
+            q_sharding=self._q_sharding,
+        )[:, M:]
+
+        memory_q_BQHK = jnp.concatenate([q_BSHK[:, :M], q_BSHK[:, -M:]], axis=1)
+        heads_shd = self.shd_cfg.act_btnh
+        memory_q_BQGRK = jax.lax.reshape(
+            memory_q_BQHK,
+            (B, 2 * M, self.num_kv_heads, self.n_rep, self.head_dim),
+            out_sharding=P(heads_shd[0], heads_shd[1], heads_shd[2], None, None),
+        )
+        logits_BQSGR = jnp.einsum("BQGRK,BSGK->BQSGR", memory_q_BQGRK, k_BSGK) * self.scale
+        read_rows_BMS = jnp.broadcast_to((jnp.arange(S) < M)[None, None, :], (B, M, S))
+        write_rows_BMS = jnp.broadcast_to((attention_mask_BS > 0)[:, None, :], (B, M, S))
+        batch_rows_shd = P(heads_shd[0], None, None)
+        visible_BQS = jnp.concatenate(
+            [reshard(read_rows_BMS, batch_rows_shd), reshard(write_rows_BMS, batch_rows_shd)],
+            axis=1,
+        )
+        logits_BQSGR = jnp.where(
+            visible_BQS[:, :, :, None, None],
+            logits_BQSGR,
+            _mask_value(logits_BQSGR.dtype),
+        )
+        weights_BQSGR = jax.nn.softmax(logits_BQSGR.astype(jnp.float32), axis=2).astype(
+            logits_BQSGR.dtype
+        )
+        memory_BQGRK = jnp.einsum("BQSGR,BSGK->BQGRK", weights_BQSGR, v_BSGK)
+        memory_BQHK = jax.lax.reshape(
+            memory_BQGRK,
+            (B, 2 * M, self.num_heads, self.head_dim),
+            out_sharding=self.shd_cfg.act_btnh,
+        )
+        return jnp.concatenate([memory_BQHK[:, :M], text_BTHK, memory_BQHK[:, M:]], axis=1)
 
     @jax.named_scope("attention")
     def __call__(
@@ -96,6 +155,7 @@ class Attention(nnx.Module):
         position_ids_BT: jax.Array,
         *,
         cache=None,
+        attention_mask_BT: jax.Array | None = None,
     ) -> jax.Array:
         B, T, _ = hidden_BTD.shape
 
@@ -126,7 +186,9 @@ class Attention(nnx.Module):
 
         q_BTHK, k_BTGK = apply_text_rope(q_BTHK, k_BTGK, cos_BTK, sin_BTK)
 
-        if cache is None:
+        if cache is None and self.num_rmt_tokens:
+            attn_BTHK = self._rmt_attention(q_BTHK, k_BTGK, v_BTGK, attention_mask_BT)
+        elif cache is None:
             attn_BTHK = dot_product_attention(
                 q_BTHK,
                 k_BTGK,

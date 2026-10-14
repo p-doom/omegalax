@@ -193,6 +193,7 @@ class DecoderLayer(nnx.Module):
     def __init__(self, cfg: Qwen3_5TextConfig, layer_idx: int, *, rngs: nnx.Rngs):
         self.layer_type = cfg.layer_types[layer_idx]
         self.is_moe = cfg.is_moe
+        self.num_rmt_tokens = cfg.num_rmt_tokens
 
         if self.layer_type == "full_attention":
             self.attn = Attention(cfg, rngs=rngs)
@@ -244,7 +245,27 @@ class DecoderLayer(nnx.Module):
                 segment_ids_BT,
                 position_ids_BT,
                 cache=cache,
+                attention_mask_BT=attention_mask_BT,
             )
+        elif self.num_rmt_tokens:
+            # The carried GDN/conv states end at the last text token, as without RMT; the
+            # write block continues from them and does not change what is carried.
+            M = self.num_rmt_tokens
+            read_text_out_BTD, gdn_final_state_BHAU, conv_final_state_BCS = self.linear_attn(
+                normed_BTD[:, :-M],
+                attention_mask_BT[:, :-M],
+                gdn_initial_state_BHAU,
+                initial_conv_state_BCS=conv_initial_state_BCS,
+                return_final_state=True,
+                return_conv_state=True,
+            )
+            write_out_BMD = self.linear_attn(
+                normed_BTD[:, -M:],
+                None,
+                gdn_final_state_BHAU,
+                initial_conv_state_BCS=conv_final_state_BCS,
+            )
+            attn_out_BTD = jnp.concatenate([read_text_out_BTD, write_out_BMD], axis=1)
         else:
             needs_stateful_call = (
                 return_gdn_state
@@ -351,12 +372,21 @@ class TextModel(nnx.Module):
         cache=None,
         return_gdn_states: bool = False,
         return_conv_states: bool = False,
-    ) -> (
-        tuple[jax.Array, jax.Array]
-        | tuple[jax.Array, jax.Array, tuple[jax.Array, ...]]
-        | tuple[jax.Array, jax.Array, tuple[jax.Array, ...], tuple[jax.Array, ...]]
-    ):
+        rmt_memory_BMD: jax.Array | None = None,
+        return_rmt_memory: bool = False,
+    ) -> tuple:
+        """Returns ``(hidden_BTD, aux_loss[, gdn_states][, conv_states][, rmt_memory_BMD])``.
+
+        With ``cfg.num_rmt_tokens = M > 0`` the layers run on ``[memory | text | memory]``
+        where ``rmt_memory_BMD`` is the old memory; ``hidden_BTD`` holds only the text
+        positions and the returned memory is the last-layer hidden states of the write block.
+        """
         cfg = self.cfg
+        M = cfg.num_rmt_tokens
+        if (rmt_memory_BMD is not None or return_rmt_memory) and not M:
+            raise ValueError("RMT memory requires num_rmt_tokens > 0")
+        if M and (rmt_memory_BMD is None or cache is not None):
+            raise ValueError("num_rmt_tokens > 0 requires rmt_memory_BMD and no KV cache")
 
         if inputs_embeds_BTD is None:
             hidden_BTD = jnp.astype(
@@ -377,6 +407,27 @@ class TextModel(nnx.Module):
             position_ids_ZBT = jnp.stack([position_ids_BT] * 3, axis=0)
         elif position_ids_ZBT.ndim == 2:
             position_ids_ZBT = jnp.stack([position_ids_ZBT] * 3, axis=0)
+
+        if M:
+            if rmt_memory_BMD.shape != (B, M, hidden_BTD.shape[-1]):
+                raise ValueError(
+                    f"Expected RMT memory shape {(B, M, hidden_BTD.shape[-1])}, "
+                    f"got {rmt_memory_BMD.shape}"
+                )
+            memory_BMD = reshard(jnp.astype(rmt_memory_BMD, hidden_BTD.dtype), self.out_emb_shd)
+            hidden_BTD = jnp.concatenate([memory_BMD, hidden_BTD, memory_BMD], axis=1)
+            memory_ids_BM = jnp.broadcast_to(jnp.ones_like(segment_ids_BT[:, :1]), (B, M))
+            segment_ids_BT = jnp.concatenate([memory_ids_BM, segment_ids_BT, memory_ids_BM], axis=1)
+            # Text keeps its own positions; read/write tokens sit right before/after it.
+            offsets_M = jnp.arange(M, dtype=position_ids_ZBT.dtype)
+            position_ids_ZBT = jnp.concatenate(
+                [
+                    position_ids_ZBT[:, :, :1] - M + offsets_M,
+                    position_ids_ZBT,
+                    position_ids_ZBT[:, :, -1:] + 1 + offsets_M,
+                ],
+                axis=2,
+            )
 
         cos_BTK, sin_BTK = generate_text_rope(
             position_ids_ZBT,
@@ -480,14 +531,18 @@ class TextModel(nnx.Module):
             aux_losses.append(aux)
 
         hidden_BTD = self.final_norm(hidden_BTD)
+        if M:
+            write_memory_BMD = hidden_BTD[:, -M:]
+            hidden_BTD = hidden_BTD[:, M:-M]
         total_aux = jnp.sum(jnp.stack(aux_losses)) if aux_losses else jnp.array(0.0)
-        if return_gdn_states and return_conv_states:
-            return hidden_BTD, total_aux, tuple(gdn_final_states), tuple(conv_final_states)
+        outputs = (hidden_BTD, total_aux)
         if return_gdn_states:
-            return hidden_BTD, total_aux, tuple(gdn_final_states)
+            outputs += (tuple(gdn_final_states),)
         if return_conv_states:
-            return hidden_BTD, total_aux, tuple(conv_final_states)
-        return hidden_BTD, total_aux
+            outputs += (tuple(conv_final_states),)
+        if return_rmt_memory:
+            outputs += (write_memory_BMD,)
+        return outputs
 
 
 # Causal LM
@@ -510,6 +565,20 @@ class Qwen3_5ForCausalLM(nnx.Module):
                 param_dtype=cfg.param_dtype,
                 kernel_init=wp(lm_head_init, ("embed", "vocab")),
             )
+        if cfg.num_rmt_tokens:
+            # Drawn after every other parameter so the base initialization is the same
+            # with and without RMT.
+            self.rmt_memory = nnx.Param(
+                nnx.initializers.normal(stddev=0.02)(
+                    rngs.params(), (cfg.num_rmt_tokens, cfg.hidden_size), cfg.param_dtype
+                ),
+                sharding=(None, None),
+            )
+
+    def initial_rmt_memory(self, batch_size: int) -> jax.Array:
+        """Learned initial memory (batch_size, M, D)."""
+        memory_MD = self.rmt_memory[...]
+        return jnp.broadcast_to(memory_MD[None], (batch_size, *memory_MD.shape))
 
     def output_weight(self) -> jax.Array:
         """Weight matrix used as the LM output projection: (hidden, vocab)."""
@@ -529,8 +598,12 @@ class Qwen3_5ForCausalLM(nnx.Module):
         position_ids_ZBT: jax.Array | None = None,
         return_gdn_states: bool = False,
         return_conv_states: bool = False,
+        rmt_initial_memory_BMD: jax.Array | None = None,
+        return_rmt_memory: bool = False,
     ):
         del num_right_pads
+        if rmt_initial_memory_BMD is None and self.text.cfg.num_rmt_tokens:
+            rmt_initial_memory_BMD = self.initial_rmt_memory(token_ids_BT.shape[0])
         return self.text(
             token_ids_BT=token_ids_BT,
             segment_ids_BT=segment_ids_BT,
@@ -540,6 +613,8 @@ class Qwen3_5ForCausalLM(nnx.Module):
             cache=cache,
             return_gdn_states=return_gdn_states,
             return_conv_states=return_conv_states,
+            rmt_memory_BMD=rmt_initial_memory_BMD,
+            return_rmt_memory=return_rmt_memory,
         )
 
 

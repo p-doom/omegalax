@@ -587,6 +587,7 @@ class SubmitTextPretrainSlurmScriptTest(absltest.TestCase):
             submit_gdn_state_routing="last_to_first",
             submit_pass_rope_positions=True,
             submit_pass_conv_state=True,
+            submit_num_rmt_tokens=32,
         ):
             index_script = submit_text_pretrain_slurm.render_index_sbatch(
                 repo_root="/repo",
@@ -631,6 +632,7 @@ class SubmitTextPretrainSlurmScriptTest(absltest.TestCase):
         self.assertIn("--gdn_state_routing=last_to_first", train_flags)
         self.assertIn("--pass_rope_positions=True", train_flags)
         self.assertIn("--pass_conv_state=True", train_flags)
+        self.assertIn("--num_rmt_tokens=32", train_flags)
 
     def test_train_flags_forward_run_specific_submit_overrides(self):
         with flagsaver.flagsaver(
@@ -666,6 +668,7 @@ class SubmitTextPretrainSlurmScriptTest(absltest.TestCase):
         self.assertIn("--grain_read_prefetch_buffer_size=8", train_flags)
         self.assertIn("--grain_workers=16", train_flags)
         self.assertIn("--grain_worker_buffer_size=2", train_flags)
+        self.assertFalse(any(flag.startswith("--num_rmt_tokens") for flag in train_flags))
 
     def test_render_train_sbatch_can_request_memory(self):
         script = submit_text_pretrain_slurm.render_train_sbatch(
