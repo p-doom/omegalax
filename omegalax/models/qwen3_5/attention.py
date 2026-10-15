@@ -104,15 +104,26 @@ class Attention(nnx.Module):
         B, S = q_BSHK.shape[:2]
         if attention_mask_BS is None:
             raise ValueError("RMT attention requires the full-length attention mask")
+        text_end = S - M
+        text_q_BTHK = q_BSHK[:, :text_end]
+        text_k_BTGK = k_BSGK[:, :text_end]
+        text_v_BTGK = v_BSGK[:, :text_end]
+        if self._attn_backend == "mosaic_gpu":
+            # Keep the Mosaic VJP on complete 128-position tiles. Appended keys
+            # are in the causal future of every retained query.
+            padding = ((0, 0), (0, -text_end % 128), (0, 0), (0, 0))
+            text_q_BTHK, text_k_BTGK, text_v_BTGK = (
+                jnp.pad(value, padding) for value in (text_q_BTHK, text_k_BTGK, text_v_BTGK)
+            )
         text_BTHK = dot_product_attention(
-            q_BSHK[:, :-M],
-            k_BSGK[:, :-M],
-            v_BSGK[:, :-M],
+            text_q_BTHK,
+            text_k_BTGK,
+            text_v_BTGK,
             is_causal=True,
             scale=self.scale,
             implementation=self._attn_backend,
             q_sharding=self._q_sharding,
-        )[:, M:]
+        )[:, M:text_end]
 
         memory_q_BQHK = jnp.concatenate([q_BSHK[:, :M], q_BSHK[:, -M:]], axis=1)
         heads_shd = self.shd_cfg.act_btnh
