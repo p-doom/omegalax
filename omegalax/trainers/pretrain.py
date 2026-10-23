@@ -1057,12 +1057,15 @@ def run_pretrain(
     stop_after_local_step: int | None = None,
     tokamax_cache_dir: str | Path | None = None,
     training_objective: TrainingObjective | str = TrainingObjective.NEXT_TOKEN,
+    teacher_segment_buckets: Sequence[int] = (),
 ) -> tuple[MixedPrecisionOptimizer, dict[str, float]]:
     pretrain_mode = PretrainMode(pretrain_mode)
     training_objective = TrainingObjective(training_objective)
     teacher_objective = training_objective is TrainingObjective.TEACHER_TOP512_SPECIAL_TAIL_KL
     if teacher_objective and not pretrain_mode.is_statepassing:
         raise ValueError(f"{training_objective} requires a statepassing pretrain mode")
+    if teacher_objective and not teacher_segment_buckets:
+        raise ValueError(f"{training_objective} requires the configured teacher_segment_buckets")
     save_path = Path(save_dir).expanduser().resolve() if save_dir is not None else None
 
     checkpoint_manager = None
@@ -1102,6 +1105,14 @@ def run_pretrain(
     if train_cfg.batch_size % batch_multiple != 0:
         raise ValueError(
             f"Global batch size {train_cfg.batch_size} must be divisible by {batch_multiple}."
+        )
+    # prepare_pretrain_batch checks only the buckets training reaches; check every configured
+    # bucket against this mesh before the model is built or any batch is read.
+    for num_segments in teacher_segment_buckets:
+        _validate_statepassing_global_batch(
+            global_batch_size=train_cfg.batch_size,
+            num_segments=int(num_segments),
+            batch_multiple=batch_multiple,
         )
     replicated_rng_sharding = NamedSharding(mesh, P())
     root_rng = jax.device_put(jax.random.key(train_cfg.seed), replicated_rng_sharding)

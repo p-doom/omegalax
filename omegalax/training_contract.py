@@ -115,7 +115,8 @@ def build_training_contract(
     """Build the immutable run contract.
 
     ``teacher_distillation`` holds the run settings of a teacher-distillation run
-    (objective, pretrain mode, BPTT span, seed, global segment batch). It is required
+    (objective, pretrain mode, BPTT span, seed, global segment batch, accumulation steps,
+    iterator data shards). It is required
     exactly for rollout-teacher indexes; next-token contracts keep their legacy layout.
     """
     index_path = Path(train_index_path).expanduser().resolve()

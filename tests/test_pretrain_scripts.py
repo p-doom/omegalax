@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import socket
 import subprocess
 import sys
 import tempfile
@@ -442,6 +443,25 @@ print(json.dumps(errors))
         self.assertIn("--val_index_path", output["val_index"])
         self.assertIn("--num_steps", output["no_num_steps"])
         self.assertIn("Excluded-prefix", output["excluded_prefix"])
+
+    def test_direct_training_script_refuses_foreign_allocation_before_numerical_imports(self):
+        for override in ({"SLURM_JOB_ID": ""}, {"SLURMD_NODENAME": f"not-{socket.gethostname()}"}):
+            result = subprocess.run(
+                [sys.executable, "-X", "importtime", "scripts/train_text_pretrain.py"],
+                cwd=Path(__file__).resolve().parents[1],
+                env=dict(os.environ, **override),
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(result.returncode, 1, result.stderr[-2000:])
+            self.assertIn("Refusing to run outside a Slurm compute node", result.stderr)
+            imported = {
+                line.rsplit("|", 1)[1].strip()
+                for line in result.stderr.splitlines()
+                if line.startswith("import time:")
+            }
+            self.assertIn("socket", imported)
+            self.assertTrue(imported.isdisjoint({"numpy", "jax", "omegalax"}), sorted(imported))
 
     def test_eos_validation_rejects_wrong_dominant_id(self):
         with self.assertRaisesRegex(ValueError, "EOS sanity check failed"):

@@ -127,6 +127,7 @@ def _run_kwargs(**overrides) -> dict:
         fsdp_size=1,
         dp_size=1,
         text_attn_backend="xla",
+        teacher_segment_buckets=BUCKETS,
         **STATE_FLAGS,
     )
     values.update(overrides)
@@ -195,6 +196,26 @@ def _dp_worker(index_path: str, out_dir: str, dp_size: int) -> None:
     (out / "metrics.json").write_text(json.dumps(metrics))
 
 
+def _bucket_sharding_worker(index_path: str, out_path: str) -> None:
+    """Starts training on dp=4 CPU devices; runs in a fresh process."""
+    assert jax.device_count() == 4, jax.devices()
+    iterator = _iterator(index_path, shuffle=False)
+    initial_state = iterator.get_state()
+    try:
+        pretrain_trainer.run_pretrain(
+            _tiny_teacher_config(ShardConfig.default()),
+            _train_config(),
+            iterator,
+            **_run_kwargs(dp_size=4),
+        )
+        error = None
+    except ValueError as exc:
+        error = str(exc)
+    Path(out_path).write_text(
+        json.dumps({"error": error, "iterator_unread": iterator.get_state() == initial_state})
+    )
+
+
 class RolloutTeacherTrainingTest(absltest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -215,6 +236,10 @@ class RolloutTeacherTrainingTest(absltest.TestCase):
         )
         assert metadata["splits"]["val"]["num_targets"] == VAL_TARGETS
         assert metadata["splits"]["train"]["num_targets"] == sum(UNSHUFFLED_TRAIN_TARGETS)
+        cls.val_samples = metadata["splits"]["val"]["num_samples"]
+        cls.model_dir = cls.tmp / "tiny_model"
+        cls.model_dir.mkdir()
+        save_hf_config(model_config_to_hf_dict(_tiny_teacher_config()), cls.model_dir)
 
     @classmethod
     def tearDownClass(cls):
@@ -450,6 +475,7 @@ class RolloutTeacherTrainingTest(absltest.TestCase):
             lr_schedule="cosine",
             weight_decay=0.01,
             max_grad_norm=1.0,
+            grad_accum_steps=2,
         )
 
         def run(records, recorder, **kwargs):
@@ -495,6 +521,9 @@ class RolloutTeacherTrainingTest(absltest.TestCase):
                 run(interrupted_records, interrupted_log, save_dir=checkpoint_dir)
             request_requeue.assert_called_once_with(True)
             self.assertTrue((checkpoint_dir / "000001").is_dir())
+            # The interrupted update saved after reading both of its microbatches.
+            saved_iterator = checkpoint_dir / "000001" / "input_iter" / "process_0-of-1.json"
+            self.assertEqual(json.loads(saved_iterator.read_text()), {"next_index": 2})
             resumed_optimizer, resumed_metrics = run(
                 interrupted_records,
                 interrupted_log,
@@ -508,10 +537,13 @@ class RolloutTeacherTrainingTest(absltest.TestCase):
         def train_batches(records):
             return [record for record in records if record[0] == "train"]
 
-        # Same sample and target identities in the same order, across an epoch boundary.
-        self.assertLen(train_batches(uninterrupted_records), 6)
+        # Same sample and target identities in the same order: 6 updates of 2 microbatches
+        # cross two epoch boundaries of the 4-batch train split.
+        self.assertLen(train_batches(uninterrupted_records), 12)
         self.assertEqual(train_batches(interrupted_records), train_batches(uninterrupted_records))
-        self.assertEqual({record[1] for record in train_batches(uninterrupted_records)}, set(range(6)))
+        self.assertEqual(
+            {record[1] for record in train_batches(uninterrupted_records)}, set(range(12))
+        )
         self.assertEqual(resumed_metrics["step"], 6)
         np.testing.assert_allclose(
             resumed_metrics["teacher_kl"], uninterrupted_metrics["teacher_kl"], rtol=1e-6
@@ -574,54 +606,84 @@ class RolloutTeacherTrainingTest(absltest.TestCase):
                 dp_gradient[key], single, rtol=1e-4, atol=1e-5 * np.abs(single).max(), err_msg=key
             )
 
-    def test_cli_trains_resumes_and_rejects_changed_teacher_contract(self):
-        model_dir = self.tmp / "tiny_model"
-        model_dir.mkdir()
-        save_hf_config(model_config_to_hf_dict(_tiny_teacher_config()), model_dir)
-        save_dir = self.tmp / "cli_checkpoint"
+    def test_every_bucket_is_checked_against_the_device_mesh_before_training(self):
+        # One loading process, dp=4 devices, 4 global segments: C=1 gives 4 chains but C=2
+        # only 2. The unshuffled first batch is C=1, so a per-batch check alone would train it.
+        out_path = self.tmp / "bucket_sharding.json"
+        env = dict(
+            os.environ,
+            JAX_PLATFORMS="cpu",
+            XLA_FLAGS="--xla_force_host_platform_device_count=4",
+        )
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import sys; from tests.test_rollout_teacher_training import "
+                "_bucket_sharding_worker; _bucket_sharding_worker(sys.argv[1], sys.argv[2])",
+                str(self.index),
+                str(out_path),
+            ],
+            check=True,
+            cwd=REPO,
+            env=env,
+        )
+        result = json.loads(out_path.read_text())
+        self.assertEqual(
+            result["error"],
+            "Global statepassing window batch size 2 must be divisible by batch sharding "
+            "multiple 4.",
+        )
+        self.assertTrue(result["iterator_unread"])
+
+    def _cli_args(self, save_dir: Path, *extra: str) -> list[str]:
+        return [
+            "--pretrain_mode=statepassing_bptt",
+            "--training_objective=teacher_top512_special_tail_kl",
+            "--teacher_selection=graded",
+            f"--teacher_segment_buckets={','.join(map(str, BUCKETS))}",
+            f"--train_index_path={self.index}",
+            f"--model_id={self.model_dir}",
+            f"--seq_len={T}",
+            f"--batch_size={SEGMENT_BATCH}",
+            "--lr_schedule_steps=4",
+            "--warmup_tokens=0",
+            f"--save_dir={save_dir}",
+            "--save_every=1",
+            "--log_every=1",
+            "--val_every=2",
+            "--val_steps=4",
+            "--bptt_chunks=1",
+            "--pass_conv_state",
+            "--pass_rope_positions",
+            "--grain_workers=0",
+            "--grain_read_threads=1",
+            "--grain_read_prefetch_buffer_size=1",
+            "--tp_size=1",
+            "--fsdp_size=1",
+            "--dp_size=1",
+            "--text_attn_backend=xla",
+            f"--jax_cache_dir={self.tmp / 'jax_cache'}",
+            *extra,
+        ]
+
+    def _run_cli(self, args: list[str]) -> subprocess.CompletedProcess:
         with socket.socket() as probe:
             probe.bind(("", 0))
             coordinator_port = probe.getsockname()[1]
-        env = dict(os.environ, JAX_COORDINATOR_PORT=str(coordinator_port))
+        return subprocess.run(
+            [sys.executable, "scripts/train_text_pretrain.py", *args],
+            cwd=REPO,
+            env=dict(os.environ, JAX_COORDINATOR_PORT=str(coordinator_port)),
+            text=True,
+            capture_output=True,
+        )
+
+    def test_cli_trains_resumes_and_rejects_changed_teacher_contract(self):
+        save_dir = self.tmp / "cli_checkpoint"
 
         def train(*extra):
-            return subprocess.run(
-                [
-                    sys.executable,
-                    "scripts/train_text_pretrain.py",
-                    "--pretrain_mode=statepassing_bptt",
-                    "--training_objective=teacher_top512_special_tail_kl",
-                    "--teacher_selection=graded",
-                    f"--teacher_segment_buckets={','.join(map(str, BUCKETS))}",
-                    f"--train_index_path={self.index}",
-                    f"--model_id={model_dir}",
-                    f"--seq_len={T}",
-                    f"--batch_size={SEGMENT_BATCH}",
-                    "--lr_schedule_steps=4",
-                    "--warmup_tokens=0",
-                    f"--save_dir={save_dir}",
-                    "--save_every=1",
-                    "--log_every=1",
-                    "--val_every=2",
-                    "--val_steps=4",
-                    "--bptt_chunks=1",
-                    "--pass_conv_state",
-                    "--pass_rope_positions",
-                    "--grain_workers=0",
-                    "--grain_read_threads=1",
-                    "--grain_read_prefetch_buffer_size=1",
-                    "--tp_size=1",
-                    "--fsdp_size=1",
-                    "--dp_size=1",
-                    "--text_attn_backend=xla",
-                    f"--jax_cache_dir={self.tmp / 'jax_cache'}",
-                    *extra,
-                ],
-                cwd=REPO,
-                env=env,
-                text=True,
-                capture_output=True,
-            )
+            return self._run_cli(self._cli_args(save_dir, *extra))
 
         fresh = train("--num_steps=2")
         self.assertEqual(fresh.returncode, 0, fresh.stderr[-4000:])
@@ -634,11 +696,43 @@ class RolloutTeacherTrainingTest(absltest.TestCase):
             ("graded", T, BUCKETS),
         )
         self.assertEqual((teacher["bptt_chunks"], teacher["seed"], teacher["batch_size"]), (1, 0, 4))
+        self.assertEqual((teacher["grad_accum_steps"], teacher["iterator_data_shards"]), (1, 1))
         self.assertEqual(contract["horizon_by_step"][0]["c_train"], max(BUCKETS))
+        # The logged host size equals the arrays of the largest real batch of this layout.
+        logged_bytes = int(
+            fresh.stdout.split("teacher largest per-process host batch bytes=", 1)[1].split()[0]
+        )
+        self.assertEqual(
+            logged_bytes,
+            max(
+                sum(
+                    value.nbytes
+                    for value in (*raw.values(), *raw["metadata"].values())
+                    if isinstance(value, np.ndarray)
+                )
+                for raw in _iterator(self.index, shuffle=False, num_epochs=1)
+            ),
+        )
+        # --val_steps=4 covers both val batches: no partial-validation warning.
+        self.assertIn(
+            f"teacher val split batches=2 samples={self.val_samples} targets={VAL_TARGETS} "
+            "val_steps=4",
+            fresh.stdout,
+        )
+        self.assertNotIn("WARNING", fresh.stdout)
 
-        resumed = train("--num_steps=3", "--resume=required", "--resume_expected_step=2")
+        # val_steps is not part of the contract; a one-batch prefix is reported as partial.
+        resumed = train(
+            "--num_steps=3", "--resume=required", "--resume_expected_step=2", "--val_steps=1"
+        )
         self.assertEqual(resumed.returncode, 0, resumed.stderr[-4000:])
         self.assertIn("finished step=3 teacher_kl=", resumed.stdout)
+        self.assertIn(
+            "WARNING: --val_steps=1 evaluates only the first 1 of 2 val batches.", resumed.stdout
+        )
+        self.assertIn(
+            "NOT whole-split validation; the full val split needs --val_steps=2.", resumed.stdout
+        )
 
         changed_seed = train("--num_steps=4", "--resume=required", "--seed=1")
         self.assertNotEqual(changed_seed.returncode, 0)
@@ -647,6 +741,53 @@ class RolloutTeacherTrainingTest(absltest.TestCase):
         self.assertNotEqual(changed_selection.returncode, 0)
         self.assertIn("selection is 'graded'", changed_selection.stderr)
         self.assertEqual(sorted(path.name for path in save_dir.glob("00000*")), ["000001", "000002", "000003"])
+
+    def test_cli_resume_rejects_changed_accumulation(self):
+        save_dir = self.tmp / "cli_accumulation"
+        initial = self._run_cli(self._cli_args(save_dir, "--num_steps=1", "--grad_accum_steps=2"))
+        self.assertEqual(initial.returncode, 0, initial.stderr[-4000:])
+        teacher = json.loads((save_dir / "training_contract.json").read_text())[
+            "teacher_distillation"
+        ]
+        self.assertEqual(teacher["grad_accum_steps"], 2)
+        # Same explicit LR horizon; MultiSteps state of accumulation 2 and 3 has one schema.
+        changed = self._run_cli(
+            self._cli_args(
+                save_dir,
+                "--num_steps=2",
+                "--grad_accum_steps=3",
+                "--resume=required",
+                "--resume_expected_step=1",
+            )
+        )
+        self.assertNotEqual(changed.returncode, 0)
+        self.assertIn("Training contract conflicts", changed.stderr)
+        self.assertEqual([path.name for path in save_dir.glob("00000*")], ["000001"])
+
+    def test_cli_rejects_unloaded_iterator_shard_and_implicit_grain_workers(self):
+        save_dir = self.tmp / "cli_rejected"
+        # A second iterator shard has no loading process, so its chains would never be read.
+        extra_shard = self._run_cli(
+            self._cli_args(save_dir, "--num_steps=1", "--iterator_dp_size=2")
+        )
+        self.assertNotEqual(extra_shard.returncode, 0)
+        self.assertIn(
+            "iterator_dp_size=2 x iterator_fsdp_size=1 must equal the 1 loading processes",
+            extra_shard.stderr,
+        )
+        implicit_workers = self._run_cli(
+            [
+                arg
+                for arg in self._cli_args(save_dir, "--num_steps=1")
+                if not arg.startswith("--grain_workers=")
+            ]
+        )
+        self.assertNotEqual(implicit_workers.returncode, 0)
+        self.assertIn(
+            "requires explicit --grain_workers and --grain_read_prefetch_buffer_size",
+            implicit_workers.stderr,
+        )
+        self.assertFalse(save_dir.exists())
 
 
 if __name__ == "__main__":

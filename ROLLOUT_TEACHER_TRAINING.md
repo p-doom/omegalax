@@ -36,13 +36,27 @@ Teacher targets at segment boundaries.
 
 The existing `--batch_size` convention is a global number of segments. A bucket with C
 segments therefore has `batch_size / C` global sample slots, also subject to process and
-device divisibility. All data shards use the same bucket shape at a given step.
-Residual sample slots are padded and masked rather than dropped or duplicated. Teacher
-rows have a fixed padded capacity per bucket; context and padded positions get no KL.
+device divisibility. Before the model is built or a batch is read, training checks every
+configured bucket against the actual device mesh with the same batch-sharding rule that
+each batch must satisfy, so a later bucket cannot fail after earlier updates. Each JAX
+process loads one iterator data shard of `batch_size / process_count` segments; the CLI
+rejects `--iterator_dp_size` x `--iterator_fsdp_size` different from the process count,
+because a shard without a loading process would silently miss its chains. All data shards
+use the same bucket shape at a given step. Residual sample slots are padded and masked
+rather than dropped or duplicated. Teacher rows have a fixed padded capacity per bucket;
+context and padded positions get no KL.
 
-Loading uses the existing Grain worker/prefetch flags. Each Teacher row occupies about
-4.24 kB on the host, before token arrays and temporary copies. Worker count, prefetch and
-gradient accumulation retain multiple batches, so choose their memory budget together.
+Teacher runs require explicit `--grain_workers` and `--grain_read_prefetch_buffer_size`;
+the pretraining defaults were sized for much smaller CE batches. Startup logs the largest
+per-process host batch in bytes, computed from the bucket's sample slots, Teacher-row
+capacity and the iterator's array dtypes (about 4.24 kB per Teacher row) without building
+a batch. This size excludes transient copies and the other microbatches of an update,
+which are read together before the first one trains. Multiply it by the batches that are
+in flight, which depend on the Grain worker, worker-buffer and prefetch settings. A CPU
+measurement of this iterator's Grain structure behind a stalled consumer counted 65 built
+elements after one was consumed with 8 workers, 2 read threads, prefetch 4 and worker
+buffer 1; 17 with 2 workers and 5 with 0 workers. These counts are operational evidence
+for choosing the flags, not a measured GPU-run memory failure or a universal bound.
 
 ## Training, loss and validation
 
@@ -52,7 +66,14 @@ Use `scripts/train_text_pretrain.py` with the explicit objective above, a Statep
 The index contains both splits; do not supply a separate `--val_index_path` in this mode.
 Model initialization, learning rate, batch size, accumulation, State/conv/RoPE/BPTT
 settings, checkpointing and validation budget remain run choices through the existing
-flags. Execute the builder and training under Slurm on compute nodes.
+flags. Without `--init_hf_model_path` or `--model_id` the script trains its existing
+randomly initialized default Student (12 layers, width 768, full vocabulary). Learning
+rate 3e-4, `--warmup_tokens=150000000`, weight decay 0.1 and the cosine schedule are
+inherited pretraining defaults unless specified. A production run must choose
+initialization and these optimizer settings explicitly in its Objective-Contract.
+Execute the builder and training under Slurm on compute nodes. Both entrypoints refuse
+direct execution before importing NumPy, JAX or OmegaLAX unless `SLURM_JOB_ID` and
+`SLURMD_NODENAME` are set and the node name matches the actual hostname.
 
 The loss is grouped forward KL at temperature 1. It compares each unique Top512 ID,
 each of the 33 special IDs not already present, and one aggregate class for the remaining
@@ -67,17 +88,25 @@ by the total valid Teacher-target count across data shards and all microbatches 
 optimizer update.
 
 Metrics include `teacher_kl`, its sum and target count, actual context-token count,
-Teacher targets/s and context tokens/s. KL is not reported as CE perplexity. Validation
-restarts the same deterministic validation order at each evaluation; `--val_steps`
-controls how much of that order is evaluated.
+Teacher targets/s and context tokens/s. KL is not reported as CE perplexity. KL by family
+or segment position and peak-GPU-memory telemetry are not implemented.
+
+Validation restarts the same deterministic validation order at each evaluation;
+`--val_steps` controls how much of that order is evaluated. The order is bucket-major from
+the smallest segment bucket. Startup logs the batches, samples and targets of the whole
+val split. If `--val_steps` is smaller than its batch count, startup warns that the
+evaluated prefix favors shorter chains and is not whole-split validation, and gives the
+full batch count. The chosen budget and order are not changed automatically; to measure
+the whole split, set `--val_steps` to at least the logged batch count.
 
 ## Resume and switching modes
 
 Checkpoints preserve the optimizer, RNG and Grain iterator position. The training
 contract additionally binds objective, source/index identity, selection, segment
-configuration and relevant run settings. Resume with the same contract to continue the
-same data stream. A different selection/objective/segmentation is a new experiment,
-rather than an unchanged resume.
+configuration and relevant run settings, including the global segment batch, gradient
+accumulation steps and the number of iterator data shards (loading processes). Resume
+with the same contract to continue the same data stream. A different
+selection/objective/segmentation is a new experiment, rather than an unchanged resume.
 
 The existing CE paths and dataset formats remain available through `next_token`.
 Historical Teacher building/scoring code remains relevant for dataset creation; it is

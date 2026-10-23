@@ -2,6 +2,22 @@
 
 from __future__ import annotations
 
+if __name__ == "__main__":
+    # Direct execution only; script unit tests import this module for its helpers.
+    import os
+    import socket
+    import sys
+
+    _job, _node, _host = (
+        os.environ.get("SLURM_JOB_ID"),
+        os.environ.get("SLURMD_NODENAME"),
+        socket.gethostname(),
+    )
+    if not _job or not _node or _node.split(".")[0] != _host.split(".")[0]:
+        sys.exit(
+            f"Refusing to run outside a Slurm compute node: job={_job} node={_node} host={_host}"
+        )
+
 import gc
 from pathlib import Path
 
@@ -325,6 +341,14 @@ def _teacher_run_inputs(
         ),
         fsdp_size=FLAGS.iterator_fsdp_size if FLAGS.iterator_fsdp_size is not None else 1,
     )
+    # Each process loads one data shard of per_process_batch segments; a shard without a
+    # loading process would silently drop its chains, an extra process would duplicate them.
+    if shards["dp_size"] * shards["fsdp_size"] != jax.process_count():
+        raise ValueError(
+            f"Teacher iterator data shards iterator_dp_size={shards['dp_size']} x "
+            f"iterator_fsdp_size={shards['fsdp_size']} must equal the "
+            f"{jax.process_count()} loading processes."
+        )
     epoch_batches = rollout_teacher_epoch_batches(
         index_metadata, split="train", batch_size=per_process_batch, **shards
     )
@@ -335,6 +359,50 @@ def _teacher_run_inputs(
         f"train_batches_per_epoch={epoch_batches} "
         f"epochs={FLAGS.num_steps * FLAGS.grad_accum_steps / epoch_batches:.3f}"
     )
+    # Host bytes of one iterator batch: per segment three int32 token arrays plus an int32
+    # chunk index and a bool reset; per Teacher row int32/float32 Top-K IDs and logits, the
+    # specials, positions, both normalizers, host target positions and a bool mask; per
+    # chain 17 bytes of metadata counters.
+    row_bytes = 8 * int(index_metadata["top_k"]) + 4 * len(index_metadata["special_ids"]) + 17
+    host_batch_bytes, host_batch_segments = max(
+        (
+            per_process_batch
+            // num_segments
+            * (num_segments * (12 * FLAGS.seq_len + 5) + int(capacity) * row_bytes + 17),
+            num_segments,
+        )
+        for num_segments, capacity in zip(
+            index_metadata["segment_buckets"], index_metadata["target_capacities"]
+        )
+    )
+    startup_log(
+        f"teacher largest per-process host batch bytes={host_batch_bytes} "
+        f"({host_batch_bytes / 2**30:.2f} GiB, C={host_batch_segments}); excludes transient "
+        f"copies and the other batches of the {FLAGS.grad_accum_steps}-microbatch update window; "
+        "Grain keeps several batches in flight depending on its worker and prefetch flags"
+    )
+    if not (FLAGS["grain_workers"].present and FLAGS["grain_read_prefetch_buffer_size"].present):
+        raise ValueError(
+            "The teacher objective requires explicit --grain_workers and "
+            f"--grain_read_prefetch_buffer_size; one Teacher batch takes up to {host_batch_bytes} "
+            "host bytes and the pretraining defaults keep many of them in flight."
+        )
+    if FLAGS.val_every:
+        val_split = index_metadata["splits"]["val"]
+        val_batches = rollout_teacher_epoch_batches(
+            index_metadata, split="val", batch_size=per_process_batch, **shards
+        )
+        startup_log(
+            f"teacher val split batches={val_batches} samples={val_split['num_samples']} "
+            f"targets={val_split['num_targets']} val_steps={FLAGS.val_steps}"
+        )
+        if FLAGS.val_steps < val_batches:
+            startup_log(
+                f"WARNING: --val_steps={FLAGS.val_steps} evaluates only the first "
+                f"{FLAGS.val_steps} of {val_batches} val batches. The val order is bucket-major "
+                "from the smallest segment bucket, so this prefix favors shorter chains and is "
+                f"NOT whole-split validation; the full val split needs --val_steps={val_batches}."
+            )
     common = dict(
         **index_config,
         **shards,
@@ -617,6 +685,9 @@ def main(_) -> None:
                     "bptt_chunks": FLAGS.bptt_chunks,
                     "seed": FLAGS.seed,
                     "batch_size": FLAGS.batch_size,
+                    "grad_accum_steps": FLAGS.grad_accum_steps,
+                    # _teacher_run_inputs checked that the iterator shards are the processes.
+                    "iterator_data_shards": jax.process_count(),
                 }
                 if teacher_objective
                 else None
@@ -704,6 +775,11 @@ def main(_) -> None:
                 resume_expected_step=FLAGS.resume_expected_step,
                 tokamax_cache_dir=FLAGS.tokamax_cache_dir,
                 training_objective=training_objective,
+                teacher_segment_buckets=(
+                    [int(value) for value in FLAGS.teacher_segment_buckets]
+                    if teacher_objective
+                    else ()
+                ),
                 **runtime_kwargs,
             )
     finally:
