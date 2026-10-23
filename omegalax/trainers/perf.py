@@ -575,9 +575,13 @@ def maybe_log_step_metrics(
     )
 
     if wandb_run is not None and is_primary_process:
-        _SKIP = {"step"}
+        _SKIP = {"step", "nll"}
         wandb_run.log(
-            {f"train/{k}": v for k, v in host_metrics.items() if k not in _SKIP},
+            {
+                f"train/{k}": v
+                for k, v in host_metrics.items()
+                if k not in _SKIP and not k.startswith(("iid_comparable_", "boundary_"))
+            },
             step=step_to_log,
         )
 

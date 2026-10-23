@@ -1114,7 +1114,14 @@ def run_pretrain(
                 _accumulate_metric_sums(val_acc, val_metrics)
             val_host = _finalize_accumulated_metrics(val_acc)
             if wandb_run is not None and is_primary_process:
-                wandb_run.log({f"val/{key}": value for key, value in val_host.items()}, step=step)
+                wandb_run.log(
+                    {
+                        f"val/{key}": value
+                        for key, value in val_host.items()
+                        if key != "nll" and not key.startswith(("iid_comparable_", "boundary_"))
+                    },
+                    step=step,
+                )
 
         if requeue_requested():
             startup_log(f"[signal] saving checkpoint at step={step} after signal")
