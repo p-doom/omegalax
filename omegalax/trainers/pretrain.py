@@ -25,6 +25,7 @@ import optax
 import orbax.checkpoint as ocp
 
 from omegalax.data.pretrain_data_set import pop_pretrain_metadata
+from omegalax.data.rollout_teacher_pipeline import TEACHER_BATCH_KEYS
 from omegalax.distributed.mesh import ensure_mesh, mesh_rules, required_batch_multiple
 from omegalax.text import api as text_api
 from omegalax.trainers import checkpoint_utils
@@ -32,6 +33,7 @@ from omegalax.trainers import tokamax_cache as tokamax_cache_lib
 from omegalax.trainers.loss import (
     chunked_cross_entropy_multi_stats,
     chunked_cross_entropy_stats,
+    chunked_teacher_kl_stats,
 )
 from omegalax.trainers.lr_schedule import build_lr_schedule
 from omegalax.trainers.optim import MixedPrecisionOptimizer
@@ -91,6 +93,13 @@ class PretrainMode(enum.StrEnum):
 class GdnStateRouting(enum.StrEnum):
     SAME_LAYER = "same_layer"
     LAST_TO_FIRST = "last_to_first"
+
+
+class TrainingObjective(enum.StrEnum):
+    NEXT_TOKEN = "next_token"
+    # Grouped forward KL at temperature 1 over unique stored Top512 + 33 specials and one
+    # aggregate tail class; not a full-vocabulary KL and no added CE term.
+    TEACHER_TOP512_SPECIAL_TAIL_KL = "teacher_top512_special_tail_kl"
 
 
 def validate_gdn_state_routing(
@@ -316,7 +325,12 @@ def prepare_pretrain_batch(
     *,
     global_batch_size: int,
     pass_rope_positions: bool = False,
+    training_objective: TrainingObjective | str = TrainingObjective.NEXT_TOKEN,
 ) -> tuple[dict[str, jax.Array], dict[str, Any] | None, dict[str, Any]]:
+    training_objective = TrainingObjective(training_objective)
+    teacher_objective = training_objective is TrainingObjective.TEACHER_TOP512_SPECIAL_TAIL_KL
+    if teacher_objective and not pretrain_mode.is_statepassing:
+        raise ValueError(f"{training_objective} requires a statepassing pretrain mode")
     metadata = pop_pretrain_metadata(batch)
     chunk_idx_B = batch.pop("chunk_idx_B", None)
     chunk_idx_BC = batch.pop("chunk_idx_BC", None)
@@ -327,6 +341,8 @@ def prepare_pretrain_batch(
 
     if pretrain_mode is PretrainMode.IID_BASELINE:
         required = ("token_ids_BT", "attention_mask_BT", "loss_mask_BT")
+    elif teacher_objective:
+        required = ("token_ids_BCT", "attention_mask_BCT", "reset_state_BC", *TEACHER_BATCH_KEYS)
     else:
         required = ("token_ids_BCT", "attention_mask_BCT", "loss_mask_BCT", "reset_state_BC")
     missing = [key for key in required if key not in batch]
@@ -339,6 +355,17 @@ def prepare_pretrain_batch(
             num_segments=int(batch["token_ids_BCT"].shape[1]),
             batch_multiple=batch_multiple,
         )
+    if teacher_objective:
+        # Variable-C buckets keep the global segment budget: every process contributes
+        # global_batch_size / process_count segments, i.e. that many / C whole chains.
+        local_samples, num_segments = batch["token_ids_BCT"].shape[:2]
+        local_segments = int(local_samples) * int(num_segments)
+        if local_segments * jax.process_count() != global_batch_size:
+            raise ValueError(
+                f"Teacher batch has {local_samples} local chains x C={num_segments} segments "
+                f"on {jax.process_count()} processes; expected global segment batch "
+                f"{global_batch_size}."
+            )
 
     device_batch = {key: batch[key] for key in required}
     if pass_rope_positions:
@@ -392,7 +419,7 @@ def _iid_loss_stats(model, batch: dict[str, jax.Array], cfg, pad_id: int):
     return loss, metrics
 
 
-def _statepassing_loss_stats(
+def _statepassing_hidden_states(
     model,
     batch: dict[str, jax.Array],
     cfg,
@@ -404,10 +431,9 @@ def _statepassing_loss_stats(
     gdn_state_routing: GdnStateRouting | str = GdnStateRouting.SAME_LAYER,
     pass_rope_positions: bool = False,
     pass_conv_state: bool = False,
-):
+) -> tuple[jax.Array, jax.Array]:
     token_ids_BCT = batch["token_ids_BCT"]
     attention_mask_BCT = batch["attention_mask_BCT"]
-    loss_mask_BCT = batch["loss_mask_BCT"]
     reset_state_BC = batch["reset_state_BC"]
     C = token_ids_BCT.shape[1]
     chunk_idx_BC = batch.get("chunk_idx_BC")
@@ -477,6 +503,40 @@ def _statepassing_loss_stats(
         aux_losses.append(aux_loss)
 
     hidden_BT_D = jnp.concatenate(hidden_segments, axis=1)
+    aux_loss = jnp.sum(jnp.stack(aux_losses)) / float(C)
+    return hidden_BT_D, aux_loss
+
+
+def _statepassing_loss_stats(
+    model,
+    batch: dict[str, jax.Array],
+    cfg,
+    pad_id: int,
+    pretrain_mode: PretrainMode,
+    bptt_chunks: int | None = None,
+    pass_gdn_state: bool = True,
+    gdn_layer_limit: int | None = None,
+    gdn_state_routing: GdnStateRouting | str = GdnStateRouting.SAME_LAYER,
+    pass_rope_positions: bool = False,
+    pass_conv_state: bool = False,
+):
+    token_ids_BCT = batch["token_ids_BCT"]
+    loss_mask_BCT = batch["loss_mask_BCT"]
+    reset_state_BC = batch["reset_state_BC"]
+    C = token_ids_BCT.shape[1]
+    hidden_BT_D, aux_loss = _statepassing_hidden_states(
+        model,
+        batch,
+        cfg,
+        pad_id,
+        pretrain_mode,
+        bptt_chunks=bptt_chunks,
+        pass_gdn_state=pass_gdn_state,
+        gdn_layer_limit=gdn_layer_limit,
+        gdn_state_routing=gdn_state_routing,
+        pass_rope_positions=pass_rope_positions,
+        pass_conv_state=pass_conv_state,
+    )
     token_ids_BT = token_ids_BCT.reshape(token_ids_BCT.shape[0], -1)
     masks = statepassing_target_masks(loss_mask_BCT, reset_state_BC, bptt_chunks=bptt_chunks)
     mask_names = ("total", "iid_comparable", "boundary") + tuple(
@@ -496,7 +556,6 @@ def _statepassing_loss_stats(
     )
 
     total_nll = _nll(nll_sums[0], token_counts[0])
-    aux_loss = jnp.sum(jnp.stack(aux_losses)) / float(C)
     loss = total_nll + aux_loss
     metrics = {
         "loss": loss,
@@ -511,6 +570,51 @@ def _statepassing_loss_stats(
     return loss, metrics
 
 
+def _teacher_loss_stats(
+    model,
+    batch: dict[str, jax.Array],
+    cfg,
+    pad_id: int,
+    pretrain_mode: PretrainMode,
+    bptt_chunks: int | None = None,
+    pass_gdn_state: bool = True,
+    gdn_layer_limit: int | None = None,
+    gdn_state_routing: GdnStateRouting | str = GdnStateRouting.SAME_LAYER,
+    pass_rope_positions: bool = False,
+    pass_conv_state: bool = False,
+):
+    C = batch["token_ids_BCT"].shape[1]
+    hidden_BT_D, aux_loss = _statepassing_hidden_states(
+        model,
+        batch,
+        cfg,
+        pad_id,
+        pretrain_mode,
+        # A whole-chain bucket may be shorter than the BPTT span; any span >= C has no cut.
+        bptt_chunks=None if bptt_chunks is None else min(int(bptt_chunks), C),
+        pass_gdn_state=pass_gdn_state,
+        gdn_layer_limit=gdn_layer_limit,
+        gdn_state_routing=gdn_state_routing,
+        pass_rope_positions=pass_rope_positions,
+        pass_conv_state=pass_conv_state,
+    )
+    # Teacher rows address hidden positions of the concatenated C*T chain directly, so
+    # segment-boundary targets are kept at every BPTT cut; BPTT only detaches state.
+    kl_sum, target_count = chunked_teacher_kl_stats(
+        hidden_BT_D,
+        _model_output_weight(model),
+        {key: batch[key] for key in TEACHER_BATCH_KEYS},
+        logits_out_sharding=cfg.shd_cfg.logits_btv,
+    )
+    metrics = {
+        "aux_loss": aux_loss,
+        "teacher_kl_sum": kl_sum,
+        "teacher_targets": target_count,
+        "context_tokens": jnp.sum(batch["attention_mask_BCT"].astype(jnp.float32)),
+    }
+    return kl_sum, aux_loss, metrics
+
+
 def make_pretrain_train_step(
     pretrain_mode: PretrainMode,
     cfg,
@@ -521,7 +625,44 @@ def make_pretrain_train_step(
     gdn_state_routing: GdnStateRouting | str = GdnStateRouting.SAME_LAYER,
     pass_rope_positions: bool = False,
     pass_conv_state: bool = False,
+    training_objective: TrainingObjective | str = TrainingObjective.NEXT_TOKEN,
 ):
+    if TrainingObjective(training_objective) is TrainingObjective.TEACHER_TOP512_SPECIAL_TAIL_KL:
+
+        @nnx.jit(donate_argnums=0)
+        def teacher_train_step(
+            optimizer: MixedPrecisionOptimizer,
+            batch: dict[str, jax.Array],
+            loss_denominator: jax.Array,
+        ):
+            # loss_denominator = N_update / grad_accum_steps, so MultiSteps' microbatch
+            # gradient mean equals the gradient of sum(kl_sum) / N_update.
+            def loss_fn(model):
+                kl_sum, aux_loss, metrics = _teacher_loss_stats(
+                    model,
+                    batch,
+                    cfg,
+                    pad_id,
+                    pretrain_mode,
+                    bptt_chunks=bptt_chunks,
+                    pass_gdn_state=pass_gdn_state,
+                    gdn_layer_limit=gdn_layer_limit,
+                    gdn_state_routing=gdn_state_routing,
+                    pass_rope_positions=pass_rope_positions,
+                    pass_conv_state=pass_conv_state,
+                )
+                return kl_sum / loss_denominator + aux_loss, metrics
+
+            (loss, aux_metrics), grads = nnx.value_and_grad(loss_fn, has_aux=True)(
+                optimizer.model
+            )
+            optimizer.update(grads)
+            metrics = dict(aux_metrics)
+            metrics["grad_norm"] = optax.tree.norm(grads)
+            return loss, metrics
+
+        return teacher_train_step
+
     @nnx.jit(donate_argnums=0)
     def pretrain_train_step(optimizer: MixedPrecisionOptimizer, batch: dict[str, jax.Array]):
         def loss_fn(model):
@@ -560,7 +701,29 @@ def make_pretrain_eval_step(
     gdn_state_routing: GdnStateRouting | str = GdnStateRouting.SAME_LAYER,
     pass_rope_positions: bool = False,
     pass_conv_state: bool = False,
+    training_objective: TrainingObjective | str = TrainingObjective.NEXT_TOKEN,
 ):
+    if TrainingObjective(training_objective) is TrainingObjective.TEACHER_TOP512_SPECIAL_TAIL_KL:
+
+        @nnx.jit
+        def teacher_eval_step(model: nnx.Module, batch: dict[str, jax.Array]):
+            _, _, metrics = _teacher_loss_stats(
+                model,
+                batch,
+                cfg,
+                pad_id,
+                pretrain_mode,
+                bptt_chunks=bptt_chunks,
+                pass_gdn_state=pass_gdn_state,
+                gdn_layer_limit=gdn_layer_limit,
+                gdn_state_routing=gdn_state_routing,
+                pass_rope_positions=pass_rope_positions,
+                pass_conv_state=pass_conv_state,
+            )
+            return metrics
+
+        return teacher_eval_step
+
     @nnx.jit
     def pretrain_eval_step(model: nnx.Module, batch: dict[str, jax.Array]):
         if pretrain_mode is PretrainMode.IID_BASELINE:
@@ -665,6 +828,51 @@ def _finalize_accumulated_metrics(acc: dict[str, float]) -> dict[str, float]:
         out[f"{prefix}_ppl"] = math.exp(min(prefix_nll, 20.0))
         out[tokens_key] = tokens_value
     return out
+
+
+_TEACHER_SUM_METRICS = ("teacher_kl_sum", "teacher_targets", "context_tokens", "aux_loss")
+
+
+def _accumulate_teacher_metric_sums(acc: dict[str, float], metrics: dict[str, Any]) -> None:
+    for key in _TEACHER_SUM_METRICS:
+        acc[key] = acc.get(key, 0.0) + _host_float(metrics[key])
+    acc["steps"] = acc.get("steps", 0.0) + 1.0
+
+
+def _finalize_teacher_metrics(acc: dict[str, float]) -> dict[str, float]:
+    # Token-weighted over all microbatches and DP shards: summed KL / summed target count.
+    targets = acc.get("teacher_targets", 0.0)
+    kl = acc.get("teacher_kl_sum", 0.0) / max(targets, 1.0)
+    aux_loss = acc.get("aux_loss", 0.0) / max(acc.get("steps", 0.0), 1.0)
+    return {
+        "loss": kl + aux_loss,
+        "teacher_kl": kl,
+        "teacher_kl_sum": acc.get("teacher_kl_sum", 0.0),
+        "teacher_targets": targets,
+        "context_tokens": acc.get("context_tokens", 0.0),
+        "aux_loss": aux_loss,
+    }
+
+
+def _teacher_update_window(
+    data_iter: checkpoint_utils.GrainIterator,
+    accum_steps: int,
+    model_cfg: text_api.TextConfig,
+    mesh,
+) -> tuple[list[dict[str, Any]], jax.Array]:
+    """Read all microbatches of one optimizer update and their shared loss denominator."""
+    raw_batches = [next(data_iter) for _ in range(accum_steps)]
+    update_targets = sum(
+        jnp.sum(
+            text_api.shard_batch_dict(
+                {"teacher_mask_BR": raw_batch["teacher_mask_BR"]}, model_cfg, mesh
+            )["teacher_mask_BR"],
+            dtype=jnp.float32,
+        )
+        for raw_batch in raw_batches
+    )
+    # An update without valid targets contributes zero KL instead of dividing by zero.
+    return raw_batches, jnp.maximum(update_targets, 1.0) / accum_steps
 
 
 def _curriculum_train_state(
@@ -848,8 +1056,13 @@ def run_pretrain(
     resume_expected_step: int | None = None,
     stop_after_local_step: int | None = None,
     tokamax_cache_dir: str | Path | None = None,
+    training_objective: TrainingObjective | str = TrainingObjective.NEXT_TOKEN,
 ) -> tuple[MixedPrecisionOptimizer, dict[str, float]]:
     pretrain_mode = PretrainMode(pretrain_mode)
+    training_objective = TrainingObjective(training_objective)
+    teacher_objective = training_objective is TrainingObjective.TEACHER_TOP512_SPECIAL_TAIL_KL
+    if teacher_objective and not pretrain_mode.is_statepassing:
+        raise ValueError(f"{training_objective} requires a statepassing pretrain mode")
     save_path = Path(save_dir).expanduser().resolve() if save_dir is not None else None
 
     checkpoint_manager = None
@@ -936,6 +1149,7 @@ def run_pretrain(
         gdn_state_routing=gdn_state_routing,
         pass_rope_positions=pass_rope_positions,
         pass_conv_state=pass_conv_state,
+        training_objective=training_objective,
     )
     eval_step = make_pretrain_eval_step(
         pretrain_mode,
@@ -947,6 +1161,7 @@ def run_pretrain(
         gdn_state_routing=gdn_state_routing,
         pass_rope_positions=pass_rope_positions,
         pass_conv_state=pass_conv_state,
+        training_objective=training_objective,
     )
 
     if checkpoint_manager is not None and not will_resume and is_primary_process:
@@ -1006,11 +1221,16 @@ def run_pretrain(
 
     autotune_result = None
     pending_batch = None
+    pending_window = None
     if tokamax_cache_dir is not None:
         autotune_result = tokamax_cache_lib.try_load(tokamax_cache_dir)
         if autotune_result is None:
             startup_log("priming tokamax autotuning with first training batch")
-            raw_batch = next(data_iter)
+            if teacher_objective:
+                pending_window = _teacher_update_window(data_iter, accum_steps, model_cfg, mesh)
+                raw_batch = pending_window[0][0]
+            else:
+                raw_batch = next(data_iter)
             pending_batch, _, _ = prepare_pretrain_batch(
                 raw_batch,
                 pretrain_mode,
@@ -1018,13 +1238,19 @@ def run_pretrain(
                 mesh,
                 global_batch_size=train_cfg.batch_size,
                 pass_rope_positions=pass_rope_positions,
+                training_objective=training_objective,
             )
+            autotune_args = (pending_batch,) + ((pending_window[1],) if teacher_objective else ())
             autotune_result = tokamax_cache_lib.autotune_and_save(
-                tokamax_cache_dir, train_step, optimizer, pending_batch
+                tokamax_cache_dir, train_step, optimizer, *autotune_args
             )
 
     _autotune_ctx = autotune_result if autotune_result is not None else contextlib.nullcontext()
     _autotune_ctx.__enter__()
+
+    val_initial_state = (
+        val_data_iter.get_state() if teacher_objective and val_data_iter is not None else None
+    )
 
     startup_log(f"entering pretrain loop mode={pretrain_mode}")
     for step_idx in range(start_step, local_stop_step):
@@ -1035,10 +1261,18 @@ def run_pretrain(
         accum_time = datetime.timedelta(0)
         accum_data_wait_s = 0.0
 
+        if teacher_objective:
+            wait_start = time.perf_counter()
+            if pending_window is None:
+                pending_window = _teacher_update_window(data_iter, accum_steps, model_cfg, mesh)
+            raw_window, loss_denominator = pending_window
+            pending_window = None
+            accum_data_wait_s += time.perf_counter() - wait_start
+
         for _micro in range(accum_steps):
             wait_start = time.perf_counter()
             if pending_batch is None:
-                raw_batch = next(data_iter)
+                raw_batch = raw_window[_micro] if teacher_objective else next(data_iter)
                 batch, _, _ = prepare_pretrain_batch(
                     raw_batch,
                     pretrain_mode,
@@ -1046,6 +1280,7 @@ def run_pretrain(
                     mesh,
                     global_batch_size=train_cfg.batch_size,
                     pass_rope_positions=pass_rope_positions,
+                    training_objective=training_objective,
                 )
             else:
                 batch = pending_batch
@@ -1056,10 +1291,16 @@ def run_pretrain(
                 train_cfg.seq_len,
                 train_cfg.batch_size,
             )
-            _, metrics = train_step(optimizer, batch)
+            if teacher_objective:
+                _, metrics = train_step(optimizer, batch, loss_denominator)
+            else:
+                _, metrics = train_step(optimizer, batch)
             micro_delta = timer.step()
 
-            _accumulate_metric_sums(accum, metrics)
+            if teacher_objective:
+                _accumulate_teacher_metric_sums(accum, metrics)
+            else:
+                _accumulate_metric_sums(accum, metrics)
             accum_grad_norm = accum_grad_norm + metrics["grad_norm"]
             accum_flops += micro_flops
             accum_time += micro_delta
@@ -1070,7 +1311,11 @@ def run_pretrain(
                 if callable(lr_schedule_fn)
                 else float(lr_schedule_fn)
             )
-        window_metrics = _finalize_accumulated_metrics(accum)
+        window_metrics = (
+            _finalize_teacher_metrics(accum)
+            if teacher_objective
+            else _finalize_accumulated_metrics(accum)
+        )
         window_metrics["grad_norm"] = accum_grad_norm / accum_steps
         window_metrics["lr"] = current_lr
         window_metrics["total_tokens"] = step * global_tokens_per_step
@@ -1079,6 +1324,13 @@ def run_pretrain(
         window_metrics["data_wait_frac"] = (
             accum_data_wait_s / step_time_s if step_time_s > 0 else 0.0
         )
+        if teacher_objective and step_time_s > 0:
+            window_metrics["teacher_targets_per_sec"] = (
+                window_metrics["teacher_targets"] / step_time_s
+            )
+            window_metrics["context_tokens_per_sec"] = (
+                window_metrics["context_tokens"] / step_time_s
+            )
         if is_primary_process:
             window_metrics.update(_gpu_util_snapshot())
 
@@ -1100,8 +1352,17 @@ def run_pretrain(
 
         if val_data_iter is not None and val_every and step % val_every == 0:
             val_acc = {}
+            if teacher_objective:
+                # Every teacher validation replays the same deterministic val batches; a
+                # finite val iterator ends the pass early instead of failing.
+                val_data_iter.set_state(val_initial_state)
             for _ in range(val_steps):
-                raw_val_batch = next(val_data_iter)
+                if teacher_objective:
+                    raw_val_batch = next(val_data_iter, None)
+                    if raw_val_batch is None:
+                        break
+                else:
+                    raw_val_batch = next(val_data_iter)
                 val_batch, _, _ = prepare_pretrain_batch(
                     raw_val_batch,
                     pretrain_mode,
@@ -1109,10 +1370,18 @@ def run_pretrain(
                     mesh,
                     global_batch_size=train_cfg.batch_size,
                     pass_rope_positions=pass_rope_positions,
+                    training_objective=training_objective,
                 )
                 val_metrics = eval_step(optimizer.model, val_batch)
-                _accumulate_metric_sums(val_acc, val_metrics)
-            val_host = _finalize_accumulated_metrics(val_acc)
+                if teacher_objective:
+                    _accumulate_teacher_metric_sums(val_acc, val_metrics)
+                else:
+                    _accumulate_metric_sums(val_acc, val_metrics)
+            val_host = (
+                _finalize_teacher_metrics(val_acc)
+                if teacher_objective
+                else _finalize_accumulated_metrics(val_acc)
+            )
             if wandb_run is not None and is_primary_process:
                 wandb_run.log(
                     {

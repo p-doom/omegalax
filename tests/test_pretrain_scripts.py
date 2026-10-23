@@ -402,6 +402,47 @@ print(json.dumps({
         self.assertEqual(output["statepassing_steps"], 12)
         self.assertEqual(output["iid_steps"], 36)
 
+    def test_teacher_run_inputs_require_explicit_run_choices(self):
+        output = self._run_train_script_probe(
+            """
+import json
+from absl.testing import flagsaver
+from scripts import train_text_pretrain
+from omegalax.trainers.pretrain import PretrainMode
+
+train_text_pretrain.FLAGS(["probe", "--train_index_path=/idx"])
+teacher = dict(
+    training_objective="teacher_top512_special_tail_kl",
+    teacher_selection="graded",
+    teacher_segment_buckets=["2", "4"],
+    num_steps=3,
+)
+cases = {
+    "iid_mode": (PretrainMode.IID_BASELINE, {}),
+    "no_selection": (PretrainMode.STATEPASSING_BPTT, {"teacher_selection": None}),
+    "no_buckets": (PretrainMode.STATEPASSING_BPTT, {"teacher_segment_buckets": []}),
+    "val_index": (PretrainMode.STATEPASSING_BPTT, {"val_index_path": "/val"}),
+    "no_num_steps": (PretrainMode.STATEPASSING_BPTT, {"num_steps": None}),
+    "excluded_prefix": (PretrainMode.STATEPASSING_BPTT, {"iterator_excluded_prefix_count": 5}),
+}
+errors = {}
+for name, (mode, overrides) in cases.items():
+    with flagsaver.flagsaver(**(teacher | overrides)):
+        try:
+            train_text_pretrain._teacher_run_inputs(mode, 4, None)
+        except ValueError as error:
+            errors[name] = str(error)
+print(json.dumps(errors))
+"""
+        )
+
+        self.assertIn("statepassing", output["iid_mode"])
+        self.assertIn("--teacher_selection", output["no_selection"])
+        self.assertIn("--teacher_segment_buckets", output["no_buckets"])
+        self.assertIn("--val_index_path", output["val_index"])
+        self.assertIn("--num_steps", output["no_num_steps"])
+        self.assertIn("Excluded-prefix", output["excluded_prefix"])
+
     def test_eos_validation_rejects_wrong_dominant_id(self):
         with self.assertRaisesRegex(ValueError, "EOS sanity check failed"):
             build_pretrain_indexes.validate_eos_stats(

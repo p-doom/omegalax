@@ -22,7 +22,14 @@ from omegalax.data.pretrain_statepassing import (
     STATEPASSING_FIXED_C_INDEX_FORMAT,
     make_statepassing_iterator,
 )
+from omegalax.data.rollout_teacher_pipeline import (
+    ROLLOUT_TEACHER_SELECTIONS,
+    load_rollout_teacher_index,
+    make_rollout_teacher_iterator,
+    rollout_teacher_epoch_batches,
+)
 from omegalax.models.qwen3_5.config import Qwen3_5TextConfig
+from omegalax.text import api as text_api
 from omegalax.training_contract import build_training_contract, ensure_training_contract
 from omegalax.trainers import pretrain as pretrain_trainer
 from omegalax.trainers.checkpoint_utils import ResumeMode
@@ -49,6 +56,24 @@ flags.DEFINE_enum(
     pretrain_trainer.PretrainMode.IID_BASELINE.value,
     [mode.value for mode in pretrain_trainer.PretrainMode],
     "Pretraining experiment mode.",
+)
+flags.DEFINE_enum(
+    "training_objective",
+    pretrain_trainer.TrainingObjective.NEXT_TOKEN.value,
+    [objective.value for objective in pretrain_trainer.TrainingObjective],
+    "Training objective; teacher_top512_special_tail_kl trains on a rollout-teacher index.",
+)
+flags.DEFINE_enum(
+    "teacher_selection",
+    None,
+    list(ROLLOUT_TEACHER_SELECTIONS),
+    "Rollout-teacher sample selection; required for the teacher objective, checked against the index.",
+)
+flags.DEFINE_list(
+    "teacher_segment_buckets",
+    [],
+    "Rollout-teacher segment-count buckets C; required for the teacher objective, checked "
+    "against the index.",
 )
 flags.DEFINE_string("model_id", None, "Optional supported/local text model config source.")
 flags.DEFINE_string(
@@ -258,6 +283,83 @@ def _make_iterator(
     )
 
 
+def _teacher_run_inputs(
+    pretrain_mode: pretrain_trainer.PretrainMode,
+    per_process_batch: int,
+    model_source,
+):
+    if not pretrain_mode.is_statepassing:
+        raise ValueError("The teacher objective requires a statepassing --pretrain_mode.")
+    if FLAGS.teacher_selection is None or not FLAGS.teacher_segment_buckets:
+        raise ValueError(
+            "The teacher objective requires explicit --teacher_selection and "
+            "--teacher_segment_buckets."
+        )
+    if FLAGS.val_index_path:
+        raise ValueError(
+            "The teacher objective reads its train and val splits from --train_index_path; "
+            "--val_index_path is not supported."
+        )
+    if FLAGS.num_steps is None:
+        raise ValueError(
+            "The teacher objective requires an explicit --num_steps; the --max_tokens default "
+            "is a pretraining budget."
+        )
+    if FLAGS.iterator_excluded_prefix_count:
+        raise ValueError("Excluded-prefix iterator migration is not supported for teacher runs.")
+    index_config = dict(
+        selection=FLAGS.teacher_selection,
+        segment_length=FLAGS.seq_len,
+        segment_buckets=[int(value) for value in FLAGS.teacher_segment_buckets],
+    )
+    index_metadata = load_rollout_teacher_index(FLAGS.train_index_path, **index_config)
+    vocab_size = text_api.resolve_config(model_source).vocab_size
+    if vocab_size != int(index_metadata["vocab_size"]):
+        raise ValueError(
+            f"Student vocab_size={vocab_size} differs from the teacher index vocab_size="
+            f"{index_metadata['vocab_size']}."
+        )
+    shards = dict(
+        dp_size=(
+            FLAGS.iterator_dp_size if FLAGS.iterator_dp_size is not None else jax.process_count()
+        ),
+        fsdp_size=FLAGS.iterator_fsdp_size if FLAGS.iterator_fsdp_size is not None else 1,
+    )
+    epoch_batches = rollout_teacher_epoch_batches(
+        index_metadata, split="train", batch_size=per_process_batch, **shards
+    )
+    startup_log(
+        f"teacher index selection={index_metadata['selection']} "
+        f"segment_length={index_metadata['segment_length']} "
+        f"segment_buckets={index_metadata['segment_buckets']} "
+        f"train_batches_per_epoch={epoch_batches} "
+        f"epochs={FLAGS.num_steps * FLAGS.grad_accum_steps / epoch_batches:.3f}"
+    )
+    common = dict(
+        **index_config,
+        **shards,
+        batch_size=per_process_batch,
+        seed=FLAGS.seed,
+        process_index=jax.process_index(),
+        pad_id=FLAGS.pad_id,
+        grain_workers=FLAGS.grain_workers,
+        grain_worker_buffer_size=FLAGS.grain_worker_buffer_size,
+        grain_read_threads=FLAGS.grain_read_threads,
+        grain_read_prefetch_buffer_size=FLAGS.grain_read_prefetch_buffer_size,
+    )
+    train_iter = make_rollout_teacher_iterator(
+        FLAGS.train_index_path, split="train", shuffle=True, num_epochs=None, **common
+    )
+    val_iter = (
+        make_rollout_teacher_iterator(
+            FLAGS.train_index_path, split="val", shuffle=False, num_epochs=1, **common
+        )
+        if FLAGS.val_every
+        else None
+    )
+    return int(FLAGS.num_steps), _warmup_steps(), train_iter, val_iter
+
+
 def _maybe_statepassing_bundle_metadata(index_path: str | Path) -> dict[str, object] | None:
     try:
         metadata = load_arrayrecord_metadata(index_path)
@@ -329,6 +431,10 @@ def _runtime_kwargs() -> dict[str, object]:
 
 def main(_) -> None:
     pretrain_mode = pretrain_trainer.PretrainMode(FLAGS.pretrain_mode)
+    training_objective = pretrain_trainer.TrainingObjective(FLAGS.training_objective)
+    teacher_objective = (
+        training_objective is pretrain_trainer.TrainingObjective.TEACHER_TOP512_SPECIAL_TAIL_KL
+    )
     runtime_kwargs = _runtime_kwargs()
     jax.config.update("jax_compilation_cache_dir", FLAGS.jax_cache_dir)
     jax.distributed.initialize()
@@ -353,8 +459,13 @@ def main(_) -> None:
     curriculum_phase_steps = None
     phase_iter_factory = None
     val_iter = None
+    model_source = FLAGS.init_hf_model_path or FLAGS.model_id or _default_pretrain_config()
 
-    if bundle_metadata is None:
+    if teacher_objective:
+        num_steps, warmup_steps, train_iter, val_iter = _teacher_run_inputs(
+            pretrain_mode, per_process_batch, model_source
+        )
+    elif bundle_metadata is None:
         num_steps, warmup_steps = _num_steps_and_warmup()
         train_iter = _make_iterator(
             FLAGS.train_index_path, pretrain_mode, per_process_batch, shuffle=True
@@ -453,7 +564,6 @@ def main(_) -> None:
     else:
         raise ValueError(f"Unsupported pretraining bundle format: {bundle_format}")
 
-    model_source = FLAGS.init_hf_model_path or FLAGS.model_id or _default_pretrain_config()
     _validate_model_sharding(model_source)
     train_cfg = pretrain_trainer.TrainConfig(
         seed=FLAGS.seed,
@@ -500,6 +610,17 @@ def main(_) -> None:
             pass_rope_positions=FLAGS.pass_rope_positions,
             pad_id=FLAGS.pad_id,
             eos_id=FLAGS.eos_id,
+            teacher_distillation=(
+                {
+                    "objective": training_objective.value,
+                    "pretrain_mode": pretrain_mode.value,
+                    "bptt_chunks": FLAGS.bptt_chunks,
+                    "seed": FLAGS.seed,
+                    "batch_size": FLAGS.batch_size,
+                }
+                if teacher_objective
+                else None
+            ),
         )
         if jax.process_index() == 0:
             contract_hash = ensure_training_contract(save_dir, training_contract)
@@ -582,6 +703,7 @@ def main(_) -> None:
                 restore_input_iter=FLAGS.restore_input_iter,
                 resume_expected_step=FLAGS.resume_expected_step,
                 tokamax_cache_dir=FLAGS.tokamax_cache_dir,
+                training_objective=training_objective,
                 **runtime_kwargs,
             )
     finally:
@@ -590,7 +712,12 @@ def main(_) -> None:
         if wandb_run is not None:
             wandb_run.finish()
 
-    if last_metrics:
+    if last_metrics and teacher_objective:
+        print(
+            f"finished step={int(last_metrics['step'])} "
+            f"teacher_kl={last_metrics['teacher_kl']:.4f}"
+        )
+    elif last_metrics:
         print(f"finished step={int(last_metrics['step'])} nll={last_metrics['nll']:.4f}")
 
 
