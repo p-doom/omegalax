@@ -63,7 +63,7 @@ class Qwen3_5TextConfig:
     router_aux_loss_coef: float = 0.001
     shd_cfg: ShardConfig = dataclasses.field(default_factory=ShardConfig.default)
     dtype: Any = jnp.bfloat16
-    param_dtype: Any = jnp.bfloat16
+    param_dtype: Any = jnp.float32
 
     # Recurrent Memory Transformer read/write memory tokens per segment (0 disables RMT).
     num_rmt_tokens: int = 0
