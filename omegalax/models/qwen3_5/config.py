@@ -63,7 +63,7 @@ class Qwen3_5TextConfig:
     router_aux_loss_coef: float = 0.001
     shd_cfg: ShardConfig = dataclasses.field(default_factory=ShardConfig.default)
     dtype: Any = jnp.bfloat16
-    param_dtype: Any = jnp.bfloat16
+    param_dtype: Any = jnp.float32
 
     @property
     def is_moe(self) -> bool:
