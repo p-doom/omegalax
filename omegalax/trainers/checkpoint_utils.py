@@ -6,6 +6,8 @@ from enum import StrEnum
 from typing import Any, Mapping, TypeAlias, cast
 
 import grain
+import jax
+import jax.numpy as jnp
 import orbax.checkpoint as ocp
 
 # NOTE: plain `TypeAlias` (not the PEP 695 `type X = ...` statement) so the module
@@ -70,8 +72,16 @@ def make_grain_save_args(
 def make_grain_restore_args(
     abstract_train_state: Any, input_iter: GrainIterator
 ) -> ocp.args.Composite:
+    # Upcast arrays restored into fp32 targets, e.g. bf16-param checkpoints into fp32 params;
+    # every other array restores exactly as before.
+    restore_args = jax.tree.map(
+        lambda value: ocp.ArrayRestoreArgs(
+            sharding=value.sharding, dtype=jnp.float32 if value.dtype == jnp.float32 else None
+        ),
+        abstract_train_state,
+    )
     items: dict[str, Any] = {
-        "train_state": ocp.args.PyTreeRestore(abstract_train_state),
+        "train_state": ocp.args.PyTreeRestore(abstract_train_state, restore_args=restore_args),
         "input_iter": grain.checkpoint.CheckpointRestore(input_iter),
     }
     return ocp.args.Composite(**items)
