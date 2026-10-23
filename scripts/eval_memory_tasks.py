@@ -39,6 +39,8 @@ from omegalax.data.memory_tasks import (  # noqa: E402
     MemoryTaskConfig,
     MemoryTaskCue,
     MemoryTaskSplit,
+    build_double_marked_eval_batch,
+    build_memory_interference_batch,
     build_memory_task_batch,
 )
 from omegalax.data.pretrain_data_set import BATCH_PRETRAIN_METADATA_KEY  # noqa: E402
@@ -54,6 +56,7 @@ from omegalax.text.checkpoint import (  # noqa: E402
     resolve_checkpoint,
     restore_model_params,
 )
+from structured_interference_compat import allow_verified_d7_training_content  # noqa: E402
 
 
 # target_slot/target_segment/target_age double as recency rank (segment 0 writes
@@ -160,6 +163,11 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--eval_role", choices=("gate", "final"))
     parser.add_argument("--result_suffix", type=_result_suffix)
+    parser.add_argument("--interference_num_segments", type=int)
+    parser.add_argument("--interference_condition", choices=("filler", "structured"))
+    parser.add_argument("--double_marked_variant", choices=("one", "first", "second"))
+    parser.add_argument("--output_root", type=Path)
+    parser.add_argument("--smoke_pairs", type=int)
     parser.add_argument("--eval_manifest", type=Path, required=True)
     parser.add_argument("--stage1_receipt", type=Path)
     parser.add_argument("--num_pairs", type=int, required=True)
@@ -617,7 +625,7 @@ def _load_manifest(
     return manifest
 
 
-def _revision() -> dict[str, Any]:
+def _revision(*, interference: bool = False) -> dict[str, Any]:
     repo = Path(__file__).resolve().parents[1]
     commit = subprocess.run(
         ["git", "rev-parse", "HEAD"],
@@ -642,6 +650,8 @@ def _revision() -> dict[str, Any]:
         repo / "omegalax/evals/memory_pollution.py",
         repo / "scripts/build_memory_task_eval_manifest.py",
     )
+    if interference:
+        relevant_paths += (repo / "scripts/structured_interference_compat.py",)
     digest = hashlib.sha256()
     for path in relevant_paths:
         resolved = path.resolve()
@@ -820,6 +830,30 @@ def main(argv: list[str] | None = None) -> None:
         split=MemoryTaskSplit.EVAL,
         generator_version=args.generator_version,
     )
+    if args.interference_num_segments is not None and task_config.exact_sequence_length == 7:
+        allow_verified_d7_training_content()
+    interference = args.interference_num_segments is not None
+    if interference != (args.interference_condition is not None):
+        raise ValueError("Interference C and condition must be supplied together")
+    if interference and (args.allow_zero_shot_horizon_override or args.stage1_receipt):
+        raise ValueError("Interference eval requires the original trained task config")
+    if interference and args.interference_num_segments <= task_config.num_segments:
+        raise ValueError("Interference eval C must exceed the trained C")
+    if args.double_marked_variant is not None and (
+        not interference
+        or args.interference_condition
+        != ("filler" if args.double_marked_variant == "one" else "structured")
+    ):
+        raise ValueError("Double-marked variant requires its matching interference condition")
+    if args.smoke_pairs is not None and (
+        not interference
+        or args.smoke_pairs <= 0
+        or args.smoke_pairs > args.num_pairs
+        or args.smoke_pairs % args.pairs_per_batch
+    ):
+        raise ValueError(
+            "smoke_pairs must be positive, <= num_pairs, and divisible by pairs_per_batch"
+        )
     resolved = resolve_checkpoint(args.checkpoint)
     training_contract_sha256 = _validate_training_contract(
         resolved.root,
@@ -835,7 +869,17 @@ def main(argv: list[str] | None = None) -> None:
     )
     if args.result_suffix is not None:
         eval_name = f"{eval_name}_{args.result_suffix}"
-    run_dir = resolved.root / "evals" / eval_name / f"step_{resolved.step}"
+    if interference:
+        eval_name = f"{eval_name}_interference_c{args.interference_num_segments}_{args.interference_condition}"
+    if args.double_marked_variant is not None:
+        eval_name = f"{eval_name}_double_marked_{args.double_marked_variant}"
+    if args.smoke_pairs is not None:
+        eval_name = f"{eval_name}_smoke{args.smoke_pairs}"
+    run_dir = (
+        (args.output_root if args.output_root is not None else resolved.root / "evals")
+        / eval_name
+        / f"step_{resolved.step}"
+    )
     manifest = _load_manifest(
         args.eval_manifest,
         task_config,
@@ -869,8 +913,33 @@ def main(argv: list[str] | None = None) -> None:
         "text_attn_backend": args.text_attn_backend,
         "runtime": runtime,
         "conditions": [mode.value for mode in MemoryEvalMode],
-        "revision": _revision(),
+        "revision": _revision(interference=interference),
     }
+    if interference:
+        config["interference"] = {
+            "eval_num_segments": args.interference_num_segments,
+            "condition": args.interference_condition,
+            "generator": (
+                "build_double_marked_eval_batch"
+                if args.double_marked_variant is not None
+                else "build_memory_interference_batch"
+            ),
+        }
+        if args.double_marked_variant is not None:
+            config["interference"]["double_marked_variant"] = args.double_marked_variant
+        if (
+            task_config.task is MemoryTask.EXACT
+            and task_config.relevance_cue is MemoryTaskCue.SURPRISE
+            and args.interference_condition == "structured"
+        ):
+            config["interference"]["distractor_bindings"] = 5 * (
+                args.interference_num_segments - task_config.num_segments
+            )
+            config["interference"]["distinct_distractor_keys"] = min(
+                config["interference"]["distractor_bindings"], 32 - task_config.num_exact_bindings
+            )
+    if args.smoke_pairs is not None:
+        config["smoke_pairs"] = args.smoke_pairs
     if args.eval_role is not None:
         config["eval_role"] = args.eval_role
     if args.stage1_receipt is not None:
@@ -909,12 +978,25 @@ def main(argv: list[str] | None = None) -> None:
 
     rows: list[dict[str, Any]] = []
     pair_indices = [int(index) for index in manifest["pair_indices"]]
-    for start in range(0, args.num_pairs, args.pairs_per_batch):
-        batch = build_memory_task_batch(
-            tuple(pair_indices[start : start + args.pairs_per_batch]),
-            task_config,
-            flatten=False,
-        )
+    for start in range(0, args.smoke_pairs or args.num_pairs, args.pairs_per_batch):
+        selected_indices = tuple(pair_indices[start : start + args.pairs_per_batch])
+        if args.double_marked_variant is not None:
+            batch = build_double_marked_eval_batch(
+                selected_indices,
+                task_config,
+                eval_num_segments=args.interference_num_segments,
+                variant=args.double_marked_variant,
+            )
+        elif interference:
+            batch = build_memory_interference_batch(
+                selected_indices,
+                task_config,
+                eval_num_segments=args.interference_num_segments,
+                structured=args.interference_condition == "structured",
+                flatten=False,
+            )
+        else:
+            batch = build_memory_task_batch(selected_indices, task_config, flatten=False)
         metadata = dict(batch[BATCH_PRETRAIN_METADATA_KEY])
         answers_BD = np.asarray(metadata["answer_tokens_BD"])
         donor_answers_BD = answers_BD[np.arange(answers_BD.shape[0]) ^ 1]

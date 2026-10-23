@@ -302,9 +302,6 @@ def _load_exclusion_manifest(path: Path) -> tuple[dict[str, str], dict[str, Any]
         raise ValueError(f"Unreadable exclusion manifest: {path}") from exc
     if not isinstance(manifest, dict):
         raise ValueError(f"Exclusion manifest must contain a JSON object: {path}")
-    pollution_guard = manifest.get("pollution_guard")
-    if isinstance(pollution_guard, dict) and pollution_guard.get("exclusion_manifests"):
-        raise ValueError(f"Exclusion source must be a gate manifest: {path}")
     validate_pollution_free_manifest(manifest)
     return {"path": str(path), "sha256": hashlib.sha256(content).hexdigest()}, manifest
 

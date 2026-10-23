@@ -26,6 +26,8 @@ from omegalax.data.memory_tasks import (
     MemoryTaskConfig,
     MemoryTaskCue,
     MemoryTaskSplit,
+    build_double_marked_eval_batch,
+    build_memory_interference_batch,
     build_memory_task_batch,
     make_memory_task_iterator,
 )
@@ -534,6 +536,222 @@ class MemoryTaskTest(parameterized.TestCase):
                 self.assertEqual(
                     table_digest(pair_c2[world], c2), table_digest(pair_c32[world], c32)
                 )
+
+    @parameterized.named_parameters(
+        ("exact_marked", dict(task=MemoryTask.EXACT, num_exact_bindings=3), (4, 8, 16, 32)),
+        (
+            "exact_surprise",
+            dict(task=MemoryTask.EXACT, num_exact_bindings=3, relevance_cue=MemoryTaskCue.SURPRISE),
+            (4, 8, 16, 32),
+        ),
+        ("dominant_rule", dict(task=MemoryTask.DOMINANT_RULE), (4, 8, 16, 32)),
+        ("exact_d7", dict(task=MemoryTask.EXACT, exact_sequence_length=7), (4, 8, 16, 32)),
+        ("associative_bank", dict(task=MemoryTask.ASSOCIATIVE_BANK), (5, 6, 8)),
+        ("rule_bank", dict(task=MemoryTask.RULE_BANK), (6, 7, 9)),
+    )
+    def test_interference_batch_preserves_pair_and_builds_task_distractors(
+        self, task_kwargs, lengths
+    ):
+        bank = task_kwargs["task"] in (MemoryTask.ASSOCIATIVE_BANK, MemoryTask.RULE_BANK)
+        config = MemoryTaskConfig(
+            seed=19,
+            segment_length=64 if bank else 16,
+            num_segments=4
+            if task_kwargs["task"] is MemoryTask.ASSOCIATIVE_BANK
+            else 5
+            if task_kwargs["task"] is MemoryTask.RULE_BANK
+            else 2,
+            split=MemoryTaskSplit.EVAL,
+            generator_version=2,
+            **task_kwargs,
+        )
+        original = build_memory_task_batch((3,), config, flatten=False)
+        original_tokens = original["token_ids_BCT"]
+        previous_added = None
+        previous_filler = None
+        for eval_c in lengths:
+            filler = build_memory_interference_batch(
+                (3,), config, eval_num_segments=eval_c, structured=False, flatten=False
+            )
+            structured = build_memory_interference_batch(
+                (3,), config, eval_num_segments=eval_c, structured=True, flatten=False
+            )
+            start = config.num_segments - 1
+            for batch in (filler, structured):
+                tokens = batch["token_ids_BCT"]
+                self.assertEqual(tokens.shape, (2, eval_c, config.segment_length))
+                np.testing.assert_array_equal(tokens[:, :start], original_tokens[:, :-1])
+                np.testing.assert_array_equal(tokens[:, -1], original_tokens[:, -1])
+                np.testing.assert_array_equal(tokens[0, start:-1], tokens[1, start:-1])
+                np.testing.assert_array_equal(
+                    batch["loss_mask_BCT"][:, -1], original["loss_mask_BCT"][:, -1]
+                )
+                self.assertEqual(int(batch["loss_mask_BCT"][:, :-1].sum()), 0)
+                np.testing.assert_array_equal(batch["chunk_idx_BC"][0], np.arange(eval_c))
+                self.assertEqual(
+                    batch["reset_state_BC"][0].tolist(), [True] + [False] * (eval_c - 1)
+                )
+                for key, value in original[BATCH_PRETRAIN_METADATA_KEY].items():
+                    if key == "target_age_B":
+                        np.testing.assert_array_equal(
+                            batch[BATCH_PRETRAIN_METADATA_KEY][key],
+                            eval_c - 1 - original[BATCH_PRETRAIN_METADATA_KEY]["target_segment_B"],
+                        )
+                    else:
+                        np.testing.assert_array_equal(
+                            batch[BATCH_PRETRAIN_METADATA_KEY][key], value
+                        )
+            added_filler = filler["token_ids_BCT"][0, start:-1]
+            self.assertTrue(np.all(added_filler >= (492 if bank else 256)))
+            added = structured["token_ids_BCT"][0, start:-1]
+            self.assertFalse(np.array_equal(added_filler, added))
+            self.assertTrue(np.any(added < 256 if not bank else added < 492))
+            filler_start = (
+                (10 if config.exact_sequence_length == 7 else 15)
+                if not bank
+                else (24 if config.task is MemoryTask.ASSOCIATIVE_BANK else 57)
+            )
+            np.testing.assert_array_equal(added[:, filler_start:], added_filler[:, filler_start:])
+            if previous_added is not None:
+                np.testing.assert_array_equal(added[: len(previous_added)], previous_added)
+                np.testing.assert_array_equal(added_filler[: len(previous_filler)], previous_filler)
+            previous_added = added.copy()
+            previous_filler = added_filler.copy()
+
+        added = previous_added
+        if config.task is MemoryTask.EXACT and config.exact_sequence_length == 7:
+            self.assertTrue(np.all(added[:, 0] == 1))
+            self.assertTrue(np.all(added[:, 1] == 3))
+            self.assertEqual(len(set(added[:, 2])), len(added))
+            self.assertNotIn(int(original_tokens[0, 0, 2]), added[:, 2])
+            self.assertTrue(np.all((added[:, 3:10] >= 64) & (added[:, 3:10] < 96)))
+        elif config.task is MemoryTask.EXACT:
+            triples = added[:, :15].reshape(-1, 3)
+            self.assertTrue(
+                np.all(
+                    triples[:, 0] == (3 if config.relevance_cue is MemoryTaskCue.SURPRISE else 7)
+                )
+            )
+            original_keys = set(original_tokens[0, 0, 2:10:3])
+            self.assertFalse(original_keys.intersection(triples[:, 1]))
+            self.assertEqual(len(set(triples[:, 1])), 29)
+            for key in np.unique(triples[:, 1]):
+                self.assertEqual(len(set(triples[triples[:, 1] == key, 2])), 1)
+        elif config.task is MemoryTask.DOMINANT_RULE:
+            triples = added[:, :15].reshape(-1, 3)
+            self.assertTrue(np.all(triples[:, 0] == 4))
+            self.assertEqual(int(np.sum(triples[:, 2] == 160)), len(triples) // 2)
+            self.assertEqual(int(np.sum(triples[:, 2] == 161)), len(triples) // 2)
+            for item in np.unique(triples[:, 1]):
+                self.assertEqual(len(set(triples[triples[:, 1] == item, 2])), 1)
+            original_items = set(original_tokens[0, 0, 2:16:3])
+            original_items.add(int(original_tokens[0, -1, -3]))
+            self.assertFalse(original_items.intersection(triples[:, 1]))
+        elif config.task is MemoryTask.ASSOCIATIVE_BANK:
+            triples = added[:, :24].reshape(-1, 3)
+            self.assertTrue(np.all(triples[:, 0] == 3))
+            self.assertEqual(len(set(triples[:, 1])), len(triples))
+            original_keys = set(original_tokens[0, 0, 2:25:3])
+            original_keys.update(original_tokens[0, 1:3, 1:24:3].reshape(-1))
+            self.assertFalse(original_keys.intersection(triples[:, 1]))
+        else:
+            self.assertTrue(np.all(added[:, 0] == 9))
+            demos = added[:, 1:57].reshape(-1, 4)
+            self.assertTrue(np.all(demos[:, 0] == 4))
+            self.assertEqual(len(set(demos[:, 2])), len(demos))
+            self.assertNotIn(int(original_tokens[0, -1, -3]), demos[:, 1])
+            self.assertFalse(
+                set(original_tokens[0, :4, 1:57].reshape(-1, 4)[:, 2]).intersection(demos[:, 2])
+            )
+            for segment in added:
+                _, counts = np.unique(segment[1:57].reshape(-1, 4)[:, 1], return_counts=True)
+                self.assertEqual(counts.tolist(), [2] * 7)
+
+        flat = build_memory_interference_batch(
+            (3,), config, eval_num_segments=lengths[-1], structured=True, flatten=True
+        )
+        np.testing.assert_array_equal(
+            flat["token_ids_BT"], structured["token_ids_BCT"].reshape(2, -1)
+        )
+        np.testing.assert_array_equal(
+            flat["loss_mask_BT"], structured["loss_mask_BCT"].reshape(2, -1)
+        )
+
+    def test_interference_keeps_legacy_generation_and_shared_bank_identity(self):
+        exact = MemoryTaskConfig(
+            task=MemoryTask.EXACT,
+            seed=7,
+            segment_length=16,
+            num_segments=2,
+            num_exact_bindings=3,
+            generator_version=1,
+        )
+        original = build_memory_task_batch((5,), exact, flatten=False)["token_ids_BCT"]
+        extended = build_memory_interference_batch(
+            (5,), exact, eval_num_segments=32, structured=True, flatten=False
+        )["token_ids_BCT"]
+        np.testing.assert_array_equal(extended[:, 0], original[:, 0])
+        np.testing.assert_array_equal(extended[:, -1], original[:, -1])
+
+        bank = MemoryTaskConfig(
+            task=MemoryTask.ASSOCIATIVE_BANK,
+            seed=7,
+            segment_length=64,
+            num_segments=4,
+            split=MemoryTaskSplit.EVAL,
+        )
+        batch = build_memory_interference_batch(
+            (0, 1), bank, eval_num_segments=8, structured=True, flatten=False
+        )
+        np.testing.assert_array_equal(
+            batch["token_ids_BCT"][0, 3:7], batch["token_ids_BCT"][2, 3:7]
+        )
+
+    def test_double_marked_eval_queries_each_real_binding(self):
+        config = MemoryTaskConfig(
+            task=MemoryTask.EXACT,
+            seed=4,
+            segment_length=16,
+            num_segments=2,
+            num_exact_bindings=3,
+            relevance_cue=MemoryTaskCue.MARKED,
+            split=MemoryTaskSplit.EVAL,
+            generator_version=2,
+        )
+        for eval_c in (4, 32):
+            batches = {
+                variant: build_double_marked_eval_batch(
+                    (3, 7), config, eval_num_segments=eval_c, variant=variant
+                )
+                for variant in ("one", "first", "second")
+            }
+            one = batches["one"]["token_ids_BCT"]
+            first = batches["first"]["token_ids_BCT"]
+            second = batches["second"]["token_ids_BCT"]
+            np.testing.assert_array_equal(one[:, 0], first[:, 0])
+            np.testing.assert_array_equal(first[:, 0], second[:, 0])
+            np.testing.assert_array_equal(first[:, 1], second[:, 1])
+            np.testing.assert_array_equal(one[:, 2:-1], first[:, 2:-1])
+            self.assertTrue(np.all(first[:, 1, 0] == 3))
+            self.assertTrue(np.all(first[:, 1, 3:] >= 256))
+            for row in range(4):
+                self.assertNotIn(first[row, 1, 1], first[row, 0, 2:10:3])
+                self.assertNotIn(first[row, 1, 2], first[row, 0, 3:10:3])
+                self.assertEqual(first[row, -1, -3], one[row, -1, -3])
+                self.assertEqual(second[row, -1, -3], second[row, 1, 1])
+                self.assertEqual(first[row, -1, -1], one[row, -1, -1])
+                self.assertEqual(second[row, -1, -1], second[row, 1, 2])
+            self.assertTrue(np.all(first[0::2, 1, 2] != first[1::2, 1, 2]))
+            for variant, batch in batches.items():
+                tokens = batch["token_ids_BCT"]
+                metadata = batch[BATCH_PRETRAIN_METADATA_KEY]
+                np.testing.assert_array_equal(metadata["answer_tokens_BD"][:, 0], tokens[:, -1, -1])
+                self.assertEqual(int(batch["loss_mask_BCT"].sum()), 4)
+                self.assertTrue(np.all(batch["loss_mask_BCT"][:, -1, -1] == 1))
+                if variant != "one":
+                    self.assertTrue(
+                        np.all(metadata["target_segment_B"] == int(variant == "second"))
+                    )
 
     def test_training_conditions_have_matched_token_budgets(self):
         layouts = {
