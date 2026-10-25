@@ -685,3 +685,227 @@ def make_rollout_teacher_iterator(
             )
         )
     return iter(iter_dataset)
+
+
+ROLLOUT_UPDATE_PLAN_FORMAT = "omegalax_rollout_update_plan_v1"
+PLANNED_MICROBATCH_CHAINS = 4
+
+
+def build_rollout_update_plan(dataset_root: str | Path, out_path: str | Path) -> dict[str, Any]:
+    """Freeze whole-chain membership once, without reading the large target arrays."""
+    root = Path(dataset_root).resolve()
+    manifest, hashes = _source_hashes(root)
+    dataset = rt.TeacherDataset(root)
+    prepared = json.loads((root / manifest["prepared"]["path"]).read_text())
+    snapshot = json.loads((root / manifest["snapshot"]["path"]).read_text())
+    _require(
+        hashes["prepared_sha256"] == manifest["prepared"]["sha256"]
+        and hashes["snapshot_sha256"] == manifest["snapshot"]["sha256"],
+        "Dataset metadata does not match frozen manifest",
+    )
+    by_id = {e["sequence_id"]: e for e in prepared["sequences"]}
+    attempts = {a["attempt_id"]: a for a in snapshot["attempts"]}
+    records = []
+    for entry in dataset.sequences:
+        original = by_id[entry["sequence_id"]]
+        _require(all(entry[k] == v for k, v in original.items()), "Catalog/prepared mismatch")
+        if not 20000 <= entry["token_count"] <= 55000:
+            continue
+        if set(entry["target_counts"]) != {"complete"}:
+            continue
+        labels = set()
+        for alias in entry["aliases"]:
+            attempt = attempts[alias["attempt_id"]]
+            _require(
+                attempt["state"] == "included" and attempt["task_key"] == entry["task_key"],
+                "Alias is not an included same-task attempt",
+            )
+            result = attempt["result"]
+            label = _attempt_label(result)
+            if (
+                result.get("error") is not None
+                or result.get("finish_reason") != "stop"
+                or result.get("token_count_complete") is not True
+            ):
+                label = None
+            labels.add(label)
+        if len(labels) != 1 or None in labels:
+            continue
+        records.append({**entry, "label": labels.pop()})
+    records.sort(key=lambda e: e["sequence_id"])
+    train = [i for i, r in enumerate(records) if r["split"] == "train"]
+    val = [i for i, r in enumerate(records) if r["split"] == "val"]
+    _require(train and val, "Filtered train/val splits must both be nonempty")
+    _require(
+        not ({records[i]["task_key"] for i in train} & {records[i]["task_key"] for i in val}),
+        "Task split leakage",
+    )
+    mean = sum(records[i]["token_count"] for i in train) / len(train)
+    chains_per_update = PLANNED_MICROBATCH_CHAINS * max(
+        1, round(500000 / (mean * PLANNED_MICROBATCH_CHAINS))
+    )
+    updates = []
+    cumulative = 0
+    for epoch in range(2):
+        order = sorted(
+            train, key=lambda i: _json_sha256(["comparison", 0, epoch, records[i]["sequence_id"]])
+        )
+        for start in range(0, len(order), chains_per_update):
+            members = order[start : start + chains_per_update]
+            tokens = sum(records[i]["token_count"] for i in members)
+            cumulative += tokens
+            identity = [
+                {
+                    k: records[i][k]
+                    for k in ("sequence_id", "content_key", "token_count", "target_count")
+                }
+                for i in members
+            ]
+            updates.append(
+                {
+                    "epoch": epoch,
+                    "members": members,
+                    "context_tokens": tokens,
+                    "cumulative_tokens": cumulative,
+                    "identity_sha256": _json_sha256(identity),
+                }
+            )
+    # The schedule uses each completed update's cumulative REAL tokens. Final applied LR is zero.
+    # warmup_end counts completed warmup updates; first post-warmup update has index warmup_end+1.
+    warmup_end = next(
+        i + 1 for i, u in enumerate(updates) if u["cumulative_tokens"] >= 0.02 * cumulative
+    )
+    # Save immediately BEFORE the first update whose endpoint enters the final 10%.
+    preanneal = next(i for i, u in enumerate(updates) if u["cumulative_tokens"] > 0.9 * cumulative)
+    checkpoints = sorted(
+        {*range(warmup_end + 500, preanneal + 1, 500), preanneal, len(updates)} - {0}
+    )
+    plan = {
+        "format": ROLLOUT_UPDATE_PLAN_FORMAT,
+        "source": {
+            "dataset_root": str(root),
+            **hashes,
+            "scoring_binding": dataset.binding,
+            "dataset_binding": rt.dataset_source_binding(manifest),
+        },
+        "selection": "completed_boolean_graded_complete_turns_20000_55000",
+        "seed": 0,
+        "epochs": 2,
+        "chains_per_update": chains_per_update,
+        "microbatch_chains": PLANNED_MICROBATCH_CHAINS,
+        "microbatches_per_update": chains_per_update // PLANNED_MICROBATCH_CHAINS,
+        "max_context_tokens": 55000,
+        "target_capacity": -(-max(r["target_count"] for r in records) // 1024) * 1024,
+        "records": records,
+        "validation_members": val,
+        "updates": updates,
+        "total_context_tokens": cumulative,
+        "warmup_end_update": warmup_end,
+        "preanneal_update": preanneal,
+        "checkpoint_updates": checkpoints,
+        "lr": {
+            "peak": 2e-5,
+            "warmup_token_fraction": 0.02,
+            "decay_token_fraction": 0.1,
+            "position": "completed_update_cumulative_real_tokens",
+            "final": 0.0,
+        },
+    }
+    plan["plan_sha256"] = _json_sha256(plan)
+    path = Path(out_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("x") as f:
+        json.dump(plan, f, sort_keys=True, separators=(",", ":"))
+        f.write("\n")
+    return plan
+
+
+def load_rollout_update_plan(path: str | Path) -> dict[str, Any]:
+    plan = json.loads(Path(path).read_text())
+    _require(plan["format"] == ROLLOUT_UPDATE_PLAN_FORMAT, "Unknown common update plan")
+    _require(
+        plan["plan_sha256"] == _json_sha256({k: v for k, v in plan.items() if k != "plan_sha256"}),
+        "Common update plan digest mismatch",
+    )
+    _, hashes = _source_hashes(Path(plan["source"]["dataset_root"]))
+    _require(all(plan["source"][k] == v for k, v in hashes.items()), "Common plan source changed")
+    return plan
+
+
+class _PlannedTeacherBatchBuilder:
+    def __init__(self, plan: Mapping[str, Any], segment_length: int, split: str, pad_id: int):
+        self.plan = plan
+        self.split = split
+        self.segment_length = segment_length
+        C = -(-plan["max_context_tokens"] // segment_length)
+        self.builder = _RolloutTeacherBatchBuilder(
+            index_path=Path("."),
+            metadata={
+                "source": plan["source"],
+                "segment_length": segment_length,
+                "segment_buckets": [C],
+                "target_capacities": [plan["target_capacity"]],
+                "splits": {split: {"shard_paths": []}},
+            },
+            split=split,
+            plan=[(0, len(plan["records"]), 1, len(plan["records"]))],
+            data_shards=1,
+            shard_index=0,
+            shuffle=False,
+            seed=0,
+            pad_id=pad_id,
+        )
+
+    def __call__(self, cursor: int) -> dict[str, Any]:
+        microbatches = -(-self.plan["chains_per_update"] // PLANNED_MICROBATCH_CHAINS)
+        if self.split == "train":
+            update_idx, micro = divmod(cursor, microbatches)
+            members = self.plan["updates"][update_idx]["members"]
+        else:
+            update_idx, micro = -1, cursor
+            members = self.plan["validation_members"]
+        selected = members[
+            micro * PLANNED_MICROBATCH_CHAINS : (micro + 1) * PLANNED_MICROBATCH_CHAINS
+        ]
+        records = [
+            {
+                **self.plan["records"][member],
+                "sample_idx": member,
+                "bucket_idx": 0,
+                "num_segments": -(
+                    -self.plan["records"][member]["token_count"] // self.segment_length
+                ),
+            }
+            for member in selected
+        ]
+        records += [None] * (PLANNED_MICROBATCH_CHAINS - len(records))
+        batch = self.builder._make_batch(records, 0)
+        batch[BATCH_PRETRAIN_METADATA_KEY].update(
+            common_plan_sha256=self.plan["plan_sha256"],
+            common_update_idx=update_idx,
+            common_micro_idx=micro,
+            common_cursor=cursor,
+        )
+        return batch
+
+
+def make_planned_rollout_teacher_iterator(
+    plan: Mapping[str, Any],
+    *,
+    segment_length: int,
+    split: str = "train",
+    pad_id: int = DEFAULT_PAD_ID,
+):
+    """Single loading controller, four complete chains per microbatch; checkpointable Grain cursor."""
+    _require(segment_length in (8192, 2048, 512), "Controlled segment length must be 8192/2048/512")
+    _require(split in ("train", "val"), "Expected train/val split")
+    count = (
+        len(plan["updates"]) * -(-plan["chains_per_update"] // PLANNED_MICROBATCH_CHAINS)
+        if split == "train"
+        else -(-len(plan["validation_members"]) // PLANNED_MICROBATCH_CHAINS)
+    )
+    return iter(
+        grain.MapDataset.range(count)
+        .map(_PlannedTeacherBatchBuilder(plan, segment_length, split, pad_id))
+        .to_iter_dataset(grain.ReadOptions(num_threads=1, prefetch_buffer_size=1))
+    )

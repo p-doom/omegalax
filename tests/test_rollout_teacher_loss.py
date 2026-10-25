@@ -1,7 +1,8 @@
 """Tests the production grouped teacher KL loss against independent float64 math.
 
 All cases use the real 248320-wide vocabulary with few hidden/target rows. The sharded
-case runs in a fresh four-device CPU process with a real tiny Qwen3.5 model.
+case runs in a fresh four-device CPU process with a real tiny Qwen3.5 model. The
+boundary-window NLL diagnostic uses the real 8192/256 windows on chains of 33280 tokens.
 """
 
 import os
@@ -194,6 +195,168 @@ def _base_case():
     return hidden, kernel, _targets(rows, positions, mask)
 
 
+STRIDE, WINDOW = 8192, 256
+BOUNDARY_KEYS = (
+    "teacher_boundary_nll_sum",
+    "teacher_boundary_nll_tokens",
+    "teacher_boundary_windows",
+    "teacher_boundary_rollouts",
+)
+
+
+def _window(b, lo=0, hi=WINDOW):
+    return list(range(b + lo, b + hi))
+
+
+def _boundary_case():
+    """Four chains of 65 * 512 positions with target rows j at the real 8192/256 windows.
+
+    b0: complete windows at 8192 and 16384, plus targets 8191, 8448, 16383, 16640, so a
+        window shifted by one in either direction would look complete as well.
+    b1: near misses only: 8192 lacks 8209 (its row exists but is masked), 16384 holds
+        [16385, 16641) and 24576 holds [24575, 24831).
+    b2: complete window at 24576; 8192 lacks 8447, 16384 has its row 16500 masked, and the
+        window at 32768 is cut by the chain end after 128 targets.
+    b3: padding; its masked rows would form a complete window at 8192.
+    Rows are in position order with masked rows behind the valid ones. The hidden rows that
+    predict the targets right before and after each complete window are scaled up, so a
+    window or predictor slipped by one position changes the NLL sum by far more than noise.
+    """
+    rng = np.random.default_rng(2)
+    B, L, D, R = 4, 65 * 512, 8, 1024
+    chains = [  # (valid target positions, masked target positions)
+        (
+            list(range(100, 140))
+            + [8191]
+            + _window(8192)
+            + [8448, 16383]
+            + _window(16384)
+            + [16640, 24575, 24832],
+            [],
+        ),
+        (
+            [8191]
+            + [j for j in _window(8192) if j != 8209]
+            + [8448]
+            + _window(16384, 1, 257)
+            + _window(24576, -1, 255),
+            [8209],
+        ),
+        (
+            [j for j in _window(8192) if j != 8447]
+            + [j for j in _window(16384) if j != 16500]
+            + _window(24576)
+            + _window(32768, 0, 128),
+            [16500],
+        ),
+        ([], _window(8192)),
+    ]
+    positions = np.zeros((B, R), np.int32)
+    mask = np.zeros((B, R), bool)
+    for b, (valid, masked) in enumerate(chains):
+        rows = np.asarray(valid + masked, np.int32)
+        positions[b, : len(rows)] = rows - 1  # hidden position j - 1 predicts target j
+        mask[b, : len(valid)] = True
+    base = rng.integers(0, V, size=(B, R, 1))
+    targets = {
+        "teacher_positions_BR": positions,
+        "teacher_mask_BR": mask,
+        "teacher_top512_ids_BRK": ((base + 481 * np.arange(K)) % V).astype(np.int32),
+        "teacher_top512_logits_BRK": -np.sort(rng.exponential(size=(B, R, K)), axis=-1).astype(
+            np.float32
+        ),
+        "teacher_special_logits_BRS": (rng.normal(size=(B, R, len(SPECIAL_IDS))) - 3.0).astype(
+            np.float32
+        ),
+        "teacher_logz_all_BR": (8.0 + rng.random((B, R))).astype(np.float32),
+    }
+    targets["teacher_logz_tail_BR"] = targets["teacher_logz_all_BR"] - np.float32(1.0)
+    hidden = rng.normal(size=(B, L, D)).astype(np.float32)
+    for b, boundary in ((0, 8192), (0, 16384), (2, 24576)):
+        hidden[b, [boundary - 2, boundary + WINDOW - 1]] *= 30.0
+    kernel = (0.3 * rng.normal(size=(D, V))).astype(np.float32)
+    token_ids = rng.integers(0, V, size=(B, L)).astype(np.int32)
+    return hidden, kernel, targets, token_ids
+
+
+def _reference_windows(targets, length):
+    """Eligible (b, boundary) pairs from the plain set definition of a complete window."""
+    windows = []
+    for b in range(targets["teacher_mask_BR"].shape[0]):
+        valid = set(
+            (targets["teacher_positions_BR"][b][targets["teacher_mask_BR"][b]] + 1).tolist()
+        )
+        for boundary in range(STRIDE, length - WINDOW + 1, STRIDE):
+            if valid.issuperset(range(boundary, boundary + WINDOW)):
+                windows.append((b, boundary))
+    return windows
+
+
+def _reference_nll(hidden, kernel, token_ids, windows, hidden_shift=-1, window_shift=0):
+    """Float64 NLL sum of token j from hidden j + hidden_shift over the given windows."""
+    h, w = np.asarray(hidden, np.float64), np.asarray(kernel, np.float64)
+    total = 0.0
+    for b, boundary in windows:
+        j = np.arange(boundary, boundary + WINDOW) + window_shift
+        z = h[b, j + hidden_shift] @ w
+        m = np.max(z, axis=-1)
+        lse = m + np.log(np.sum(np.exp(z - m[:, None]), axis=-1))
+        total += float(np.sum(lse - z[np.arange(WINDOW), token_ids[b, j]]))
+    return total
+
+
+@functools.cache
+def _boundary_fn(block_size, logits_out_sharding=None):
+    def fn(hidden_BTD, kernel_DV, targets, token_ids_BT):
+        return chunked_teacher_kl_stats(
+            hidden_BTD,
+            kernel_DV,
+            targets,
+            block_size=block_size,
+            logits_out_sharding=logits_out_sharding,
+            boundary_token_ids_BT=token_ids_BT,
+        )
+
+    return jax.jit(fn)
+
+
+def _boundary_stats(block_size, hidden, kernel, targets, token_ids, logits_out_sharding=None):
+    kl, count, stats = _boundary_fn(block_size, logits_out_sharding)(
+        hidden, kernel, targets, token_ids
+    )
+    return float(kl), float(count), {key: float(stats[key]) for key in BOUNDARY_KEYS}
+
+
+@functools.cache
+def _boundary_kl_and_grad(block_size):
+    def kl_fn(hidden_BTD, kernel_DV, targets, token_ids_BT):
+        kl, count, stats = chunked_teacher_kl_stats(
+            hidden_BTD,
+            kernel_DV,
+            targets,
+            block_size=block_size,
+            boundary_token_ids_BT=token_ids_BT,
+        )
+        return kl, (count, stats)
+
+    return jax.jit(jax.value_and_grad(kl_fn, argnums=(0, 1), has_aux=True))
+
+
+@functools.cache
+def _boundary_nll_grad(block_size):
+    def nll_fn(hidden_BTD, kernel_DV, targets, token_ids_BT):
+        _, _, stats = chunked_teacher_kl_stats(
+            hidden_BTD,
+            kernel_DV,
+            targets,
+            block_size=block_size,
+            boundary_token_ids_BT=token_ids_BT,
+        )
+        return stats["teacher_boundary_nll_sum"]
+
+    return jax.jit(jax.grad(nll_fn, argnums=(0, 1)))
+
+
 class TeacherKLTest(absltest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -352,6 +515,137 @@ class TeacherKLTest(absltest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout[-4000:] + result.stderr[-8000:])
         reports = [json.loads(line) for line in result.stdout.splitlines() if line.startswith("{")]
         self.assertEqual([r["mesh"] for r in reports], [[1, 1, 4], [2, 2, 1]])
+        for report in reports:
+            self.assertEqual(report["boundary_windows"], 3.0)
+
+
+class TeacherBoundaryNLLTest(absltest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.hidden, cls.kernel, cls.targets, cls.token_ids = _boundary_case()
+        cls.windows = _reference_windows(cls.targets, cls.hidden.shape[1])
+        cls.nll_ref = _reference_nll(cls.hidden, cls.kernel, cls.token_ids, cls.windows)
+        cls.stats = _boundary_stats(256, cls.hidden, cls.kernel, cls.targets, cls.token_ids)
+
+    def _sub_batch(self, rows):
+        return (
+            self.hidden[rows],
+            self.kernel,
+            {name: value[rows] for name, value in self.targets.items()},
+            self.token_ids[rows],
+        )
+
+    def test_reference_finds_exactly_the_designed_windows(self):
+        self.assertEqual(self.windows, [(0, 8192), (0, 16384), (2, 24576)])
+
+    def test_matches_float64_reference_with_hidden_j_minus_1_alignment(self):
+        _, count, stats = self.stats
+        self.assertEqual(count, float(self.targets["teacher_mask_BR"].sum()))
+        self.assertEqual(stats["teacher_boundary_windows"], 3.0)
+        self.assertEqual(stats["teacher_boundary_rollouts"], 2.0)
+        self.assertEqual(stats["teacher_boundary_nll_tokens"], 3.0 * WINDOW)
+        np.testing.assert_allclose(stats["teacher_boundary_nll_sum"], self.nll_ref, rtol=1e-5)
+        # The reference resolves a one-position slip of the predictor or of the window.
+        for shift in ({"hidden_shift": 0}, {"window_shift": 1}, {"window_shift": -1}):
+            with self.subTest(**shift):
+                shifted = _reference_nll(
+                    self.hidden, self.kernel, self.token_ids, self.windows, **shift
+                )
+                self.assertGreater(abs(shifted - stats["teacher_boundary_nll_sum"]), 30.0)
+
+    def test_block_size_row_order_and_masked_garbage_are_neutral(self):
+        rng = np.random.default_rng(3)
+        perm = np.stack(
+            [rng.permutation(self.targets["teacher_mask_BR"].shape[1]) for _ in range(4)]
+        )
+        shuffled = {
+            name: np.take_along_axis(value, perm.reshape(perm.shape + (1,) * (value.ndim - 2)), 1)
+            for name, value in self.targets.items()
+        }
+        # Masked rows of b1 and b3 keep the positions that would complete a window.
+        masked = ~shuffled["teacher_mask_BR"]
+        padding = masked & (shuffled["teacher_positions_BR"] == 0)
+        shuffled["teacher_positions_BR"][padding] = rng.choice([10**6, -3], padding.sum())
+        shuffled["teacher_top512_ids_BRK"][masked] = V + 5
+        shuffled["teacher_top512_logits_BRK"][masked] = np.nan
+        for block in (100, 256):
+            with self.subTest(block_size=block):
+                kl, count, stats = _boundary_stats(
+                    block, self.hidden, self.kernel, shuffled, self.token_ids
+                )
+                np.testing.assert_allclose(kl, self.stats[0], rtol=1e-6)
+                self.assertEqual(count, self.stats[1])
+                for key in BOUNDARY_KEYS[1:]:
+                    self.assertEqual(stats[key], self.stats[2][key])
+                np.testing.assert_allclose(
+                    stats["teacher_boundary_nll_sum"],
+                    self.stats[2]["teacher_boundary_nll_sum"],
+                    rtol=1e-6,
+                )
+
+    def test_near_misses_padding_and_short_chains_give_zero_sums(self):
+        _, _, stats = _boundary_stats(256, *self._sub_batch([1, 3]))
+        self.assertEqual(stats, dict.fromkeys(BOUNDARY_KEYS, 0.0))
+        # Position 0 is no boundary: targets 1..255 plus one padding row (read as target 1).
+        targets = {name: value[:1, :WINDOW].copy() for name, value in self.targets.items()}
+        targets["teacher_positions_BR"][0] = np.arange(WINDOW) % (WINDOW - 1)
+        targets["teacher_mask_BR"][0] = np.arange(WINDOW) < WINDOW - 1
+        _, _, stats = _boundary_stats(
+            256, self.hidden[:1, :512], self.kernel, targets, self.token_ids[:1, :512]
+        )
+        self.assertEqual(stats, dict.fromkeys(BOUNDARY_KEYS, 0.0))
+        hidden, kernel, targets = _base_case()
+        token_ids = np.ones(hidden.shape[:2], np.int32)
+        _, _, stats = _boundary_stats(4, hidden, kernel, targets, token_ids)
+        self.assertEqual(stats, dict.fromkeys(BOUNDARY_KEYS, 0.0))
+
+    def test_microbatch_sums_add_up_to_token_weighted_update_mean(self):
+        # Update = microbatches {b0, b1}, {b2, b3} and an all-ineligible {b1, b3}.
+        parts = [
+            _boundary_stats(256, *self._sub_batch(rows))[2] for rows in ([0, 1], [2, 3], [1, 3])
+        ]
+        totals = {key: sum(part[key] for part in parts) for key in BOUNDARY_KEYS}
+        for key in BOUNDARY_KEYS[1:]:
+            self.assertEqual(totals[key], self.stats[2][key])
+        np.testing.assert_allclose(
+            totals["teacher_boundary_nll_sum"], self.stats[2]["teacher_boundary_nll_sum"], rtol=1e-6
+        )
+        update_nll = totals["teacher_boundary_nll_sum"] / totals["teacher_boundary_nll_tokens"]
+        np.testing.assert_allclose(update_nll, self.nll_ref / (3 * WINDOW), rtol=1e-5)
+        # Microbatches hold 2 and 1 windows, so a mean of their means is a different number.
+        means = [
+            p["teacher_boundary_nll_sum"] / p["teacher_boundary_nll_tokens"] for p in parts[:2]
+        ]
+        self.assertGreater(abs(np.mean(means) - update_nll), 1e-3)
+
+    def test_kl_and_gradients_are_unchanged_and_nll_has_no_gradient(self):
+        base = _base_case()
+        cases = {
+            "boundary_case": (256, self.hidden, self.kernel, self.targets, self.token_ids),
+            "base_case": (4, *base, np.ones(base[0].shape[:2], np.int32)),
+        }
+        for name, (block, hidden, kernel, targets, token_ids) in cases.items():
+            with self.subTest(case=name):
+                (kl, count), grads = _kl_and_grad(block)(hidden, kernel, targets)
+                (kl_b, (count_b, _)), grads_b = _boundary_kl_and_grad(block)(
+                    hidden, kernel, targets, token_ids
+                )
+                np.testing.assert_array_equal(kl_b, kl)
+                np.testing.assert_array_equal(count_b, count)
+                for grad, grad_b in zip(grads, grads_b):
+                    self.assertTrue(np.isfinite(np.asarray(grad)).all())
+                    np.testing.assert_array_equal(np.asarray(grad_b), np.asarray(grad))
+                for grad in _boundary_nll_grad(block)(hidden, kernel, targets, token_ids):
+                    self.assertFalse(np.any(np.asarray(grad)))
+
+    def test_rejects_token_ids_of_another_layout(self):
+        with self.assertRaisesRegex(ValueError, "boundary_token_ids_BT"):
+            chunked_teacher_kl_stats(
+                jnp.asarray(self.hidden),
+                jnp.asarray(self.kernel),
+                {name: jnp.asarray(value) for name, value in self.targets.items()},
+                boundary_token_ids_BT=jnp.asarray(self.token_ids[:, :-1]),
+            )
 
 
 def _sharded_child():
@@ -380,6 +674,10 @@ def _sharded_child():
     ]
     positions = [[0, 6, 0], [0, 9, 15], [4, 0, 0], [0, 0, 0]]
     targets_np = _targets(rows, positions, [[r is not None for r in batch] for batch in rows])
+    _, _, boundary_targets, boundary_ids = _boundary_case()
+    boundary_hidden = rng.normal(size=boundary_ids.shape + (base_cfg.hidden_size,)).astype(
+        jnp.bfloat16
+    )
 
     for tp, fsdp, dp in ((1, 1, 4), (2, 2, 1)):
         with mesh_rules(make_mesh(tp_size=tp, fsdp_size=fsdp, dp_size=dp)) as mesh:
@@ -400,7 +698,36 @@ def _sharded_child():
                 # Pure DP: rows stay local, so no gather of indices, logits or hidden states.
                 hlo = _kl_and_grad(2, cfg.shd_cfg.logits_btv).lower(hidden, kernel, batch)
                 assert "all-gather" not in hlo.compile().as_text()
+            b_batch = text_api.shard_batch_dict(
+                {"token_ids_BT": boundary_ids, **boundary_targets}, cfg, mesh
+            )
+            b_ids = b_batch.pop("token_ids_BT")
+            b_hidden = jax.device_put(
+                boundary_hidden, jax.sharding.NamedSharding(mesh, cfg.shd_cfg.act_btd)
+            )
+            b_kl, b_count, b_stats = _boundary_stats(
+                256, b_hidden, kernel, b_batch, b_ids, cfg.shd_cfg.logits_btv
+            )
+            if tp == fsdp == 1:
+                hlo = _boundary_fn(256, cfg.shd_cfg.logits_btv).lower(
+                    b_hidden, kernel, b_batch, b_ids
+                )
+                assert "all-gather" not in hlo.compile().as_text()
             hidden, kernel = np.asarray(hidden), np.asarray(kernel)
+        b_unsharded = _boundary_stats(256, boundary_hidden, kernel, boundary_targets, boundary_ids)
+        b_windows = _reference_windows(boundary_targets, boundary_ids.shape[1])
+        b_nll_ref = _reference_nll(boundary_hidden, kernel, boundary_ids, b_windows)
+        assert b_windows == [(0, 8192), (0, 16384), (2, 24576)], b_windows
+        for key in BOUNDARY_KEYS[1:]:
+            assert b_stats[key] == b_unsharded[2][key], (key, b_stats, b_unsharded)
+        assert b_count == b_unsharded[1], (b_count, b_unsharded[1])
+        np.testing.assert_allclose(b_kl, b_unsharded[0], rtol=1e-6)
+        np.testing.assert_allclose(
+            b_stats["teacher_boundary_nll_sum"],
+            b_unsharded[2]["teacher_boundary_nll_sum"],
+            rtol=1e-6,
+        )
+        np.testing.assert_allclose(b_stats["teacher_boundary_nll_sum"], b_nll_ref, rtol=1e-5)
         unsharded = _run(2, hidden, kernel, targets_np)
         kl_ref, count_ref, grad_h_ref, grad_w_ref = _reference(hidden, kernel, targets_np)
         assert count == count_ref == 5, (count, count_ref)
@@ -410,7 +737,19 @@ def _sharded_child():
         _assert_close(grad_h.astype(np.float64), grad_h_ref, 1e-2)
         np.testing.assert_allclose(kl, unsharded[0], rtol=1e-6)
         _assert_close(grad_w, unsharded[3], 1e-5)
-        print(json.dumps({"mesh": [tp, fsdp, dp], "kl": kl, "kl_reference": kl_ref}), flush=True)
+        print(
+            json.dumps(
+                {
+                    "mesh": [tp, fsdp, dp],
+                    "kl": kl,
+                    "kl_reference": kl_ref,
+                    "boundary_windows": b_stats["teacher_boundary_windows"],
+                    "boundary_nll_sum": b_stats["teacher_boundary_nll_sum"],
+                    "boundary_nll_reference": b_nll_ref,
+                }
+            ),
+            flush=True,
+        )
 
 
 if __name__ == "__main__":

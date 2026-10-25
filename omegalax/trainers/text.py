@@ -184,7 +184,9 @@ def init_model(
     )
 
 
-def build_optimizer(model: nnx.Module, train_cfg: TrainConfig) -> MixedPrecisionOptimizer:
+def build_optimizer(
+    model: nnx.Module, train_cfg: TrainConfig, *, lr_schedule=None
+) -> MixedPrecisionOptimizer:
     lr = build_lr_schedule(
         peak_lr=train_cfg.learning_rate,
         num_steps=train_cfg.resolved_lr_schedule_steps,
@@ -193,6 +195,8 @@ def build_optimizer(model: nnx.Module, train_cfg: TrainConfig) -> MixedPrecision
         end_factor=train_cfg.lr_end_factor,
         stable_fraction=train_cfg.lr_stable_fraction,
     )
+    if lr_schedule is not None:
+        lr = lr_schedule
     chain = []
     if train_cfg.max_grad_norm > 0:
         chain.append(optax.clip_by_global_norm(train_cfg.max_grad_norm))

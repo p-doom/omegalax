@@ -24,8 +24,8 @@ from jax.sharding import NamedSharding, PartitionSpec
 import optax
 import orbax.checkpoint as ocp
 
-from omegalax.data.pretrain_data_set import pop_pretrain_metadata
-from omegalax.data.rollout_teacher_pipeline import TEACHER_BATCH_KEYS
+from omegalax.data.pretrain_data_set import BATCH_PRETRAIN_METADATA_KEY, pop_pretrain_metadata
+from omegalax.data.rollout_teacher_pipeline import TEACHER_BATCH_KEYS, PLANNED_MICROBATCH_CHAINS
 from omegalax.distributed.mesh import ensure_mesh, mesh_rules, required_batch_multiple
 from omegalax.text import api as text_api
 from omegalax.trainers import checkpoint_utils
@@ -35,7 +35,7 @@ from omegalax.trainers.loss import (
     chunked_cross_entropy_stats,
     chunked_teacher_kl_stats,
 )
-from omegalax.trainers.lr_schedule import build_lr_schedule
+from omegalax.trainers.lr_schedule import build_common_token_schedule, build_lr_schedule
 from omegalax.trainers.optim import MixedPrecisionOptimizer
 from omegalax.trainers.perf import (
     maybe_log_step_metrics,
@@ -600,13 +600,16 @@ def _teacher_loss_stats(
     )
     # Teacher rows address hidden positions of the concatenated C*T chain directly, so
     # segment-boundary targets are kept at every BPTT cut; BPTT only detaches state.
-    kl_sum, target_count = chunked_teacher_kl_stats(
+    B, C, T = batch["token_ids_BCT"].shape
+    kl_sum, target_count, boundary_stats = chunked_teacher_kl_stats(
         hidden_BT_D,
         _model_output_weight(model),
         {key: batch[key] for key in TEACHER_BATCH_KEYS},
         logits_out_sharding=cfg.shd_cfg.logits_btv,
+        boundary_token_ids_BT=batch["token_ids_BCT"].reshape(B, C * T),
     )
     metrics = {
+        **boundary_stats,
         "aux_loss": aux_loss,
         "teacher_kl_sum": kl_sum,
         "teacher_targets": target_count,
@@ -653,9 +656,7 @@ def make_pretrain_train_step(
                 )
                 return kl_sum / loss_denominator + aux_loss, metrics
 
-            (loss, aux_metrics), grads = nnx.value_and_grad(loss_fn, has_aux=True)(
-                optimizer.model
-            )
+            (loss, aux_metrics), grads = nnx.value_and_grad(loss_fn, has_aux=True)(optimizer.model)
             optimizer.update(grads)
             metrics = dict(aux_metrics)
             metrics["grad_norm"] = optax.tree.norm(grads)
@@ -830,7 +831,16 @@ def _finalize_accumulated_metrics(acc: dict[str, float]) -> dict[str, float]:
     return out
 
 
-_TEACHER_SUM_METRICS = ("teacher_kl_sum", "teacher_targets", "context_tokens", "aux_loss")
+_TEACHER_SUM_METRICS = (
+    "teacher_kl_sum",
+    "teacher_targets",
+    "context_tokens",
+    "aux_loss",
+    "teacher_boundary_nll_sum",
+    "teacher_boundary_nll_tokens",
+    "teacher_boundary_windows",
+    "teacher_boundary_rollouts",
+)
 
 
 def _accumulate_teacher_metric_sums(acc: dict[str, float], metrics: dict[str, Any]) -> None:
@@ -844,7 +854,7 @@ def _finalize_teacher_metrics(acc: dict[str, float]) -> dict[str, float]:
     targets = acc.get("teacher_targets", 0.0)
     kl = acc.get("teacher_kl_sum", 0.0) / max(targets, 1.0)
     aux_loss = acc.get("aux_loss", 0.0) / max(acc.get("steps", 0.0), 1.0)
-    return {
+    out = {
         "loss": kl + aux_loss,
         "teacher_kl": kl,
         "teacher_kl_sum": acc.get("teacher_kl_sum", 0.0),
@@ -852,6 +862,19 @@ def _finalize_teacher_metrics(acc: dict[str, float]) -> dict[str, float]:
         "context_tokens": acc.get("context_tokens", 0.0),
         "aux_loss": aux_loss,
     }
+
+    for key in (
+        "teacher_boundary_nll_sum",
+        "teacher_boundary_nll_tokens",
+        "teacher_boundary_windows",
+        "teacher_boundary_rollouts",
+    ):
+        out[key] = acc.get(key, 0.0)
+    if out["teacher_boundary_windows"] > 0:
+        out["teacher_boundary_nll"] = (
+            out["teacher_boundary_nll_sum"] / out["teacher_boundary_nll_tokens"]
+        )
+    return out
 
 
 def _teacher_update_window(
@@ -1058,6 +1081,7 @@ def run_pretrain(
     tokamax_cache_dir: str | Path | None = None,
     training_objective: TrainingObjective | str = TrainingObjective.NEXT_TOKEN,
     teacher_segment_buckets: Sequence[int] = (),
+    common_update_plan: dict[str, Any] | None = None,
 ) -> tuple[MixedPrecisionOptimizer, dict[str, float]]:
     pretrain_mode = PretrainMode(pretrain_mode)
     training_objective = TrainingObjective(training_objective)
@@ -1066,6 +1090,32 @@ def run_pretrain(
         raise ValueError(f"{training_objective} requires a statepassing pretrain mode")
     if teacher_objective and not teacher_segment_buckets:
         raise ValueError(f"{training_objective} requires the configured teacher_segment_buckets")
+    if common_update_plan is not None:
+        if not teacher_objective or train_cfg.num_steps != len(common_update_plan["updates"]):
+            raise ValueError(
+                "Common plan requires teacher objective and its exact full schedule length"
+            )
+        if train_cfg.grad_accum_steps != -(
+            -common_update_plan["chains_per_update"] // PLANNED_MICROBATCH_CHAINS
+        ):
+            raise ValueError("Accumulation must match common plan groups of four chains")
+        if pretrain_mode is not PretrainMode.STATEPASSING_BPTT:
+            raise ValueError("Common comparison requires full BPTT mode")
+        if (
+            not restore_input_iter
+            or bptt_chunks is not None
+            or not pass_gdn_state
+            or pass_conv_state
+            or pass_rope_positions
+            or gdn_layer_limit is not None
+        ):
+            raise ValueError(
+                "Common plan requires restored cursor, full-chain BPTT and all GDN only"
+            )
+        if init_hf_model_path is None:
+            raise ValueError("Common comparison requires true pretrained initialization")
+        if tokamax_cache_dir is not None:
+            raise ValueError("Common comparison gate must run without mutating autotune priming")
     save_path = Path(save_dir).expanduser().resolve() if save_dir is not None else None
 
     checkpoint_manager = None
@@ -1093,6 +1143,32 @@ def run_pretrain(
         will_resume=will_resume,
         explicit_fields=lr_contract_explicit_fields,
     )
+
+    if common_update_plan is not None and save_path is not None:
+        import json
+
+        common_contract = {
+            "plan_sha256": common_update_plan["plan_sha256"],
+            "schedule": common_update_plan["lr"],
+            "schedule_steps": len(common_update_plan["updates"]),
+            "microbatch_chains": PLANNED_MICROBATCH_CHAINS,
+            "grad_accum_steps": train_cfg.grad_accum_steps,
+            "seq_len": train_cfg.seq_len,
+            "checkpoint_updates": common_update_plan["checkpoint_updates"],
+            "optimizer": dataclasses.asdict(train_cfg),
+            "pretrained_snapshot": str(Path(init_hf_model_path).resolve()),
+        }
+        contract_path = save_path / "common_update_contract.json"
+        if contract_path.exists():
+            if json.loads(contract_path.read_text()) != common_contract:
+                raise ValueError(
+                    "Common update plan / optimizer / schedule contract differs on resume"
+                )
+        elif will_resume:
+            raise ValueError("Checkpoint lacks common update plan resume contract")
+        elif jax.process_index() == 0:
+            with contract_path.open("x") as stream:
+                json.dump(common_contract, stream, sort_keys=True)
 
     model_cfg = (
         text_api.resolve_config(str(save_path))
@@ -1140,7 +1216,15 @@ def run_pretrain(
 
     set_attn_backend(model, text_backend=text_attn_backend)
     with mesh_rules(mesh):
-        optimizer = build_optimizer(model, train_cfg)
+        optimizer = build_optimizer(
+            model,
+            train_cfg,
+            **(
+                {"lr_schedule": build_common_token_schedule(common_update_plan)}
+                if common_update_plan is not None
+                else {}
+            ),
+        )
 
     lr_schedule_fn = build_lr_schedule(
         peak_lr=train_cfg.learning_rate,
@@ -1150,6 +1234,8 @@ def run_pretrain(
         end_factor=train_cfg.lr_end_factor,
         stable_fraction=train_cfg.lr_stable_fraction,
     )
+    if common_update_plan is not None:
+        lr_schedule_fn = build_common_token_schedule(common_update_plan)
     train_step = make_pretrain_train_step(
         pretrain_mode,
         model_cfg,
@@ -1220,7 +1306,11 @@ def run_pretrain(
             log_every=log_every,
             force=force,
             per_device_flops=step_per_device_flops,
-            global_tokens_per_step=global_tokens_per_step,
+            global_tokens_per_step=(
+                int(metrics_to_log["context_tokens"])
+                if common_update_plan is not None
+                else global_tokens_per_step
+            ),
             peak_tflops=peak_tflops,
             wandb_run=wandb_run,
             batch_size=train_cfg.batch_size * accum_steps,
@@ -1266,6 +1356,7 @@ def run_pretrain(
     startup_log(f"entering pretrain loop mode={pretrain_mode}")
     for step_idx in range(start_step, local_stop_step):
         step = step_idx + 1
+        common_update_start = time.perf_counter()
         accum = {}
         accum_grad_norm = 0.0
         accum_flops = 0.0
@@ -1277,6 +1368,39 @@ def run_pretrain(
             if pending_window is None:
                 pending_window = _teacher_update_window(data_iter, accum_steps, model_cfg, mesh)
             raw_window, loss_denominator = pending_window
+            if common_update_plan is not None:
+                import hashlib
+
+                actual_tokens = hashlib.sha256()
+                actual_targets = hashlib.sha256()
+                members = common_update_plan["updates"][step_idx]["members"]
+                for micro, raw in enumerate(raw_window):
+                    identity = raw[BATCH_PRETRAIN_METADATA_KEY]
+                    selected = members[
+                        micro * PLANNED_MICROBATCH_CHAINS : (micro + 1) * PLANNED_MICROBATCH_CHAINS
+                    ]
+                    expected_ids = [
+                        common_update_plan["records"][i]["sequence_id"] for i in selected
+                    ]
+                    expected_ids += [None] * (PLANNED_MICROBATCH_CHAINS - len(expected_ids))
+                    if (
+                        identity["common_plan_sha256"] != common_update_plan["plan_sha256"]
+                        or identity["common_update_idx"] != step_idx
+                        or identity["common_micro_idx"] != micro
+                        or identity["sequence_ids"] != expected_ids
+                    ):
+                        raise ValueError(
+                            "Restored iterator membership differs from common optimizer update"
+                        )
+                    for row, sequence_id in enumerate(expected_ids):
+                        if sequence_id is None:
+                            continue
+                        n = int(identity["token_count_B"][row])
+                        actual_tokens.update(raw["token_ids_BCT"][row].reshape(-1)[:n].tobytes())
+                        positions = (
+                            raw["teacher_positions_BR"][row][raw["teacher_mask_BR"][row]] + 1
+                        )
+                        actual_targets.update(positions.tobytes())
             pending_window = None
             accum_data_wait_s += time.perf_counter() - wait_start
 
@@ -1329,7 +1453,45 @@ def run_pretrain(
         )
         window_metrics["grad_norm"] = accum_grad_norm / accum_steps
         window_metrics["lr"] = current_lr
-        window_metrics["total_tokens"] = step * global_tokens_per_step
+        window_metrics["total_tokens"] = (
+            common_update_plan["updates"][step_idx]["cumulative_tokens"]
+            if common_update_plan is not None
+            else step * global_tokens_per_step
+        )
+        if common_update_plan is not None and save_path is not None and is_primary_process:
+            import json
+
+            update = common_update_plan["updates"][step_idx]
+            update_targets = sum(
+                common_update_plan["records"][i]["target_count"] for i in update["members"]
+            )
+            if (
+                window_metrics["context_tokens"] != update["context_tokens"]
+                or window_metrics["teacher_targets"] != update_targets
+            ):
+                raise ValueError("Actual update token/Teacher counts differ from common plan")
+            evidence = {
+                "actual_token_ids_sha256": actual_tokens.hexdigest(),
+                "actual_target_positions_sha256": actual_targets.hexdigest(),
+                "step": step,
+                "plan_sha256": common_update_plan["plan_sha256"],
+                **update,
+                "lr": current_lr,
+                "sequence_ids": [
+                    common_update_plan["records"][i]["sequence_id"] for i in update["members"]
+                ],
+            }
+            with (save_path / "update_identities.jsonl").open("a") as stream:
+                stream.write(json.dumps(evidence, sort_keys=True) + "\n")
+        if common_update_plan is not None:
+            import math
+
+            if not all(
+                math.isfinite(float(window_metrics[k])) for k in ("teacher_kl", "grad_norm", "lr")
+            ):
+                raise FloatingPointError(f"Nonfinite common update {step}: {window_metrics}")
+            global_tokens_per_step = common_update_plan["updates"][step_idx]["context_tokens"]
+            accum_time = datetime.timedelta(seconds=time.perf_counter() - common_update_start)
         window_metrics["data_wait_s"] = accum_data_wait_s
         step_time_s = accum_time.total_seconds()
         window_metrics["data_wait_frac"] = (
@@ -1344,11 +1506,29 @@ def run_pretrain(
             )
         if is_primary_process:
             window_metrics.update(_gpu_util_snapshot())
+        if common_update_plan is not None and save_path is not None and is_primary_process:
+            with (save_path / "update_metrics.jsonl").open("a") as stream:
+                stream.write(
+                    json.dumps(
+                        {
+                            "step": step,
+                            "wall_seconds_including_compile": step_time_s,
+                            **{k: float(v) for k, v in window_metrics.items()},
+                        },
+                        sort_keys=True,
+                    )
+                    + "\n"
+                )
 
         _log_prev_metrics()
         prev_metrics = (step, window_metrics, accum_time, accum_flops)
 
-        if checkpoint_manager is not None and save_every and step % save_every == 0:
+        save_this_update = (
+            step in common_update_plan["checkpoint_updates"]
+            if common_update_plan is not None
+            else bool(save_every and step % save_every == 0)
+        )
+        if checkpoint_manager is not None and save_this_update:
             _save_sft_checkpoint(
                 checkpoint_manager,
                 optimizer,
@@ -1356,6 +1536,7 @@ def run_pretrain(
                 step,
                 data_iter,
                 lr_contract=lr_contract,
+                force=common_update_plan is not None,
             )
 
         if gc_period and step % gc_period == 0:
@@ -1406,7 +1587,9 @@ def run_pretrain(
         if requeue_requested():
             startup_log(f"[signal] saving checkpoint at step={step} after signal")
             if checkpoint_manager is not None:
-                if not (save_every and step % save_every == 0):
+                if not save_this_update and (
+                    common_update_plan is None or step <= common_update_plan["preanneal_update"]
+                ):
                     _save_sft_checkpoint(
                         checkpoint_manager,
                         optimizer,
@@ -1429,7 +1612,15 @@ def run_pretrain(
     _log_prev_metrics(force=True)
 
     if checkpoint_manager is not None:
-        if last_metrics and (not save_every or last_metrics["step"] % save_every != 0):
+        if (
+            last_metrics
+            and not save_this_update
+            and (
+                common_update_plan is None
+                or step == len(common_update_plan["updates"])
+                or step <= common_update_plan["preanneal_update"]
+            )
+        ):
             _save_sft_checkpoint(
                 checkpoint_manager,
                 optimizer,
