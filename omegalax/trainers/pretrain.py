@@ -443,6 +443,55 @@ def _statepassing_hidden_states(
         pretrain_mode, num_segments=C, bptt_chunks=bptt_chunks
     )
 
+    if (
+        C > 1
+        and resolved_bptt_chunks == C
+        and pass_gdn_state
+        and gdn_layer_limit is None
+        and gdn_state_routing == GdnStateRouting.SAME_LAYER
+        and not pass_rope_positions
+        and not pass_conv_state
+    ):
+        # Bootstrap with None exactly as in the unrolled path; scan requires a fixed
+        # carry structure, so only the remaining segments use the returned GDN states.
+        first_hidden, first_aux, first_states = text_api.forward_with_gdn_state(
+            model,
+            token_ids_BCT[:, 0, :],
+            pad_id,
+            cfg,
+            attention_mask_BT=attention_mask_BCT[:, 0, :],
+            initial_gdn_states=None,
+        )
+
+        @nnx.scan(
+            in_axes=(None, nnx.Carry, 1, 1, 1),
+            out_axes=(nnx.Carry, (1, 0)),
+        )
+        def segment_forward(model, states, token_ids_BT, attention_mask_BT, reset_B):
+            hidden, aux, states = text_api.forward_with_gdn_state(
+                model,
+                token_ids_BT,
+                pad_id,
+                cfg,
+                attention_mask_BT=attention_mask_BT,
+                initial_gdn_states=apply_state_reset(states, reset_B),
+            )
+            return states, (hidden, aux)
+
+        _, (remaining_hidden, remaining_aux) = segment_forward(
+            model,
+            first_states,
+            token_ids_BCT[:, 1:, :],
+            attention_mask_BCT[:, 1:, :],
+            reset_state_BC[:, 1:],
+        )
+        hidden_BT_D = jnp.concatenate(
+            [first_hidden, remaining_hidden.reshape(first_hidden.shape[0], -1, first_hidden.shape[2])],
+            axis=1,
+        )
+        aux_loss = jnp.sum(jnp.concatenate([first_aux[None], remaining_aux])) / float(C)
+        return hidden_BT_D, aux_loss
+
     hidden_segments = []
     aux_losses = []
     carried_states = None
