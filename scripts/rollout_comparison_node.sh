@@ -37,5 +37,5 @@ if test "$MODE" = gate; then
     "$PYTHON" scripts/launch_rollout_comparison.py verify-gate --launch-root "$OUTPUT" --plan "$PLAN"
 else
     test "$ARM" = 8192 || test "$ARM" = 2048 || test "$ARM" = 512
-    "$PYTHON" scripts/train_rollout_comparison.py --plan "$PLAN" --segment-length "$ARM" --init-hf-model-path "$MODEL" --output "$OUTPUT/T${ARM}" --resume if_present --wandb-project rollout-comparison
+    exec "$PYTHON" scripts/train_rollout_comparison.py --plan "$PLAN" --segment-length "$ARM" --init-hf-model-path "$MODEL" --output "$OUTPUT/T${ARM}" --resume if_present --wandb-project rollout-comparison
 fi
