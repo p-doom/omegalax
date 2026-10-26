@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import socket
 import subprocess
 import sys
 import tempfile
@@ -401,6 +402,66 @@ print(json.dumps({
         self.assertEqual(output["iid_path"], "/bundle/iid/train")
         self.assertEqual(output["statepassing_steps"], 12)
         self.assertEqual(output["iid_steps"], 36)
+
+    def test_teacher_run_inputs_require_explicit_run_choices(self):
+        output = self._run_train_script_probe(
+            """
+import json
+from absl.testing import flagsaver
+from scripts import train_text_pretrain
+from omegalax.trainers.pretrain import PretrainMode
+
+train_text_pretrain.FLAGS(["probe", "--train_index_path=/idx"])
+teacher = dict(
+    training_objective="teacher_top512_special_tail_kl",
+    teacher_selection="graded",
+    teacher_segment_buckets=["2", "4"],
+    num_steps=3,
+)
+cases = {
+    "iid_mode": (PretrainMode.IID_BASELINE, {}),
+    "no_selection": (PretrainMode.STATEPASSING_BPTT, {"teacher_selection": None}),
+    "no_buckets": (PretrainMode.STATEPASSING_BPTT, {"teacher_segment_buckets": []}),
+    "val_index": (PretrainMode.STATEPASSING_BPTT, {"val_index_path": "/val"}),
+    "no_num_steps": (PretrainMode.STATEPASSING_BPTT, {"num_steps": None}),
+    "excluded_prefix": (PretrainMode.STATEPASSING_BPTT, {"iterator_excluded_prefix_count": 5}),
+}
+errors = {}
+for name, (mode, overrides) in cases.items():
+    with flagsaver.flagsaver(**(teacher | overrides)):
+        try:
+            train_text_pretrain._teacher_run_inputs(mode, 4, None)
+        except ValueError as error:
+            errors[name] = str(error)
+print(json.dumps(errors))
+"""
+        )
+
+        self.assertIn("statepassing", output["iid_mode"])
+        self.assertIn("--teacher_selection", output["no_selection"])
+        self.assertIn("--teacher_segment_buckets", output["no_buckets"])
+        self.assertIn("--val_index_path", output["val_index"])
+        self.assertIn("--num_steps", output["no_num_steps"])
+        self.assertIn("Excluded-prefix", output["excluded_prefix"])
+
+    def test_direct_training_script_refuses_foreign_allocation_before_numerical_imports(self):
+        for override in ({"SLURM_JOB_ID": ""}, {"SLURMD_NODENAME": f"not-{socket.gethostname()}"}):
+            result = subprocess.run(
+                [sys.executable, "-X", "importtime", "scripts/train_text_pretrain.py"],
+                cwd=Path(__file__).resolve().parents[1],
+                env=dict(os.environ, **override),
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(result.returncode, 1, result.stderr[-2000:])
+            self.assertIn("Refusing to run outside a Slurm compute node", result.stderr)
+            imported = {
+                line.rsplit("|", 1)[1].strip()
+                for line in result.stderr.splitlines()
+                if line.startswith("import time:")
+            }
+            self.assertIn("socket", imported)
+            self.assertTrue(imported.isdisjoint({"numpy", "jax", "omegalax"}), sorted(imported))
 
     def test_eos_validation_rejects_wrong_dominant_id(self):
         with self.assertRaisesRegex(ValueError, "EOS sanity check failed"):

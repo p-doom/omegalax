@@ -69,3 +69,18 @@ def build_lr_schedule(
         return optax.join_schedules(schedules, boundaries)
 
     raise ValueError(f"Unknown lr_schedule={schedule!r}. Expected 'linear', 'cosine', or 'wsd'.")
+
+
+def build_common_token_schedule(plan):
+    """Immutable per-update WSD using real token endpoints shared by all arms."""
+    import jax.numpy as jnp
+
+    total = plan["total_context_tokens"]
+    rates = []
+    for update in plan["updates"]:
+        fraction = update["cumulative_tokens"] / total
+        rates.append(
+            plan["lr"]["peak"] * min(1.0, fraction / 0.02, max(0.0, (1.0 - fraction) / 0.1))
+        )
+    values = jnp.asarray(rates, dtype=jnp.float32)
+    return lambda count: values[jnp.minimum(count, len(rates) - 1)]
