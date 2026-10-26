@@ -253,7 +253,7 @@ def run_sft(
     val_data_iter: checkpoint_utils.GrainIterator | None = None,
     val_every: int | None = None,
     val_steps: int = 10,
-    text_attn_backend: str = "mosaic_gpu",
+    text_attn_backend: str | None = None,
     gc_period: int = 0,
 ) -> tuple[MixedPrecisionOptimizer, dict[str, float]]:
     """SFT a text model from a Grain iterator; returns final optimizer + last metrics.
@@ -325,7 +325,8 @@ def run_sft(
     startup_log("initialized model")
     from omegalax.models.sharding_runtime import set_attn_backend
 
-    set_attn_backend(model, text_backend=text_attn_backend)
+    if text_attn_backend is not None:
+        set_attn_backend(model, text_backend=text_attn_backend)
     startup_log(f"set attn backend: text={text_attn_backend}")
     with mesh_rules(mesh):
         optimizer = build_optimizer(model, train_cfg)
