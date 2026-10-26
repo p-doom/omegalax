@@ -24,11 +24,22 @@ def main():
     parser.add_argument("--segment-length", type=int, choices=[8192, 2048, 512], required=True)
     parser.add_argument("--init-hf-model-path", required=True)
     parser.add_argument("--output", required=True)
-    parser.add_argument("--resume", choices=["never", "required"], default="never")
+    parser.add_argument("--resume", choices=["never", "if_present", "required"], default="never")
     parser.add_argument("--stop-after-update", type=int)
     parser.add_argument("--wandb-project")
-    parser.add_argument("--text-attn-backend", default="mosaic_gpu")
+    parser.add_argument("--text-attn-backend", default="triton")
     args = parser.parse_args()
+    output = Path(args.output).resolve()
+    output.mkdir(parents=True, exist_ok=True)
+    environment = {
+        key: value for key, value in sorted(os.environ.items())
+        if key.startswith(("JAX", "XLA", "NCCL", "TF_", "OMEGALAX"))
+    }
+    (output / f"numerical_environment_{job}_{os.getpid()}.json").write_text(
+        json.dumps({"job": job, "host": host, "source": str(Path(__file__).resolve().parents[1]),
+                    "text_attn_backend": args.text_attn_backend, "environment": environment}, indent=2)
+        + "\n"
+    )
     from absl import flags
 
     # Tokamax reads Abseil defaults lazily; our CLI belongs to argparse.
@@ -79,7 +90,6 @@ def main():
         grad_accum_steps=-(-plan["chains_per_update"] // PLANNED_MICROBATCH_CHAINS),
         max_grad_norm=1.0,
     )
-    output = Path(args.output).resolve()
     contract = {
         "schema_version": 1,
         "common_plan_sha256": plan["plan_sha256"],
@@ -90,6 +100,8 @@ def main():
         "train_config": vars(train_cfg),
         "pretrained_snapshot": str(Path(args.init_hf_model_path).resolve()),
         "mesh": {"dp": 1, "fsdp": 4, "tp": 1},
+        "text_attn_backend": args.text_attn_backend,
+        "xla_flags": os.environ.get("XLA_FLAGS", ""),
         "objective": "teacher_top512_special_tail_kl",
         "eval_statepassing_config": {
             "pass_gdn_state": True,

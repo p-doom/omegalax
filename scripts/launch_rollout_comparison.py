@@ -10,6 +10,7 @@ import argparse
 import fcntl
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import shutil
@@ -120,7 +121,7 @@ def submit(root, state, key, script, extra):
 
 def verify_gate(root, plan):
     results = {}
-    for T in (8192, 512):
+    for T in (8192, 2048, 512):
         gradient = json.loads((root / f"gradient_T{T}.json").read_text())
         assert gradient["status"] == "PASS"
         resumed = json.loads((root / f"T{T}/resumed/result_step2.json").read_text())
@@ -131,7 +132,27 @@ def verify_gate(root, plan):
             and resumed["optimizer_state_sha256"] == continuous["optimizer_state_sha256"]
         )
         assert len(resumed["devices"]) == 4
-        results[str(T)] = {"gradient": gradient, "resumed": resumed, "continuous": continuous}
+        tail = json.loads((root / f"T{T}/resumed/result_step3.json").read_text())
+        tail_update = plan["updates"][2]
+        tail_identity = next(
+            row
+            for line in (root / f"T{T}/resumed/update_identities.jsonl").read_text().splitlines()
+            if (row := json.loads(line))["step"] == 3
+        )
+        assert tail["plan_sha256"] == tail_identity["plan_sha256"] == plan["plan_sha256"]
+        assert plan["chains_per_update"] == 16 and len(tail_update["members"]) == 13
+        assert tail_identity["members"] == tail_update["members"]
+        assert len(tail_identity["sequence_ids"]) == 13
+        assert tail["metrics"]["step"] == 3 and len(tail["devices"]) == 4
+        assert all(math.isfinite(tail["metrics"][k]) for k in ("teacher_kl", "grad_norm", "lr"))
+        assert tail["metrics"]["context_tokens"] == tail_update["context_tokens"]
+        assert tail["metrics"]["teacher_targets"] == sum(
+            plan["records"][i]["target_count"] for i in tail_update["members"]
+        )
+        results[str(T)] = {
+            "gradient": gradient, "resumed": resumed, "continuous": continuous,
+            "tail": tail, "tail_identity": tail_identity,
+        }
     state = json.loads((root / "launch.json").read_text())
     write_json(
         root / "GATE_PASSED.json",
@@ -222,31 +243,22 @@ def main():
                 # Use a genuine production update containing the longest selected chain.
                 # This retains production MultiSteps buffers and ~500k actual tokens/update.
                 gate_update = next(u for u in plan["updates"] if largest in u["members"])
-                members = gate_update["members"]
-                n = gate_update["context_tokens"]
-                identity = [
-                    {
-                        k: plan["records"][i][k]
-                        for k in ("sequence_id", "content_key", "token_count", "target_count")
-                    }
-                    for i in members
-                ]
+                tail_update = plan["updates"][821]
+                assert plan["chains_per_update"] == 16 and len(tail_update["members"]) == 13
+                assert tail_update["epoch"] == 0 and plan["updates"][822]["epoch"] == 1
+                gate_updates = []
+                cumulative = 0
+                for update in (gate_update, gate_update, tail_update):
+                    cumulative += update["context_tokens"]
+                    gate_updates.append({**update, "cumulative_tokens": cumulative})
                 plan.update(
                     gate_parent_plan_sha256=parent,
-                    total_context_tokens=3 * n,
+                    gate_epoch_tail_update=822,
+                    total_context_tokens=cumulative,
                     warmup_end_update=1,
                     preanneal_update=2,
                     checkpoint_updates=[1, 2, 3],
-                    updates=[
-                        {
-                            "epoch": 0,
-                            "members": members,
-                            "context_tokens": n,
-                            "cumulative_tokens": (i + 1) * n,
-                            "identity_sha256": digest_json(identity),
-                        }
-                        for i in range(3)
-                    ],
+                    updates=gate_updates,
                 )
                 plan["plan_sha256"] = digest_json(
                     {k: v for k, v in plan.items() if k != "plan_sha256"}

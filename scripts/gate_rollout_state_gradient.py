@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import socket
+from types import FunctionType
 
 assert os.environ.get("SLURM_JOB_ID")
 assert os.environ.get("SLURMD_NODENAME") == socket.gethostname().split(".")[0]
@@ -21,15 +22,25 @@ from omegalax.distributed.mesh import ensure_mesh, mesh_rules
 from omegalax.models.qwen3_5.params import create_qwen3_5_from_safetensors
 from omegalax.models.sharding_runtime import set_attn_backend
 from omegalax.text import api as text_api
-from omegalax.trainers.pretrain import _statepassing_hidden_states, PretrainMode
+from omegalax.trainers.pretrain import _statepassing_hidden_states, PretrainMode, apply_state_reset
 
 
 def measure_state_gradient(model, cfg, batch):
     results = {}
     T = batch["token_ids_BCT"].shape[2]
     boundary = (batch["token_ids_BCT"].shape[1] - 1) * T
+    # Detach the carry while retaining the same compact segment scan in both arms.
+    control_globals = dict(_statepassing_hidden_states.__globals__)
+    control_globals["apply_state_reset"] = lambda states, mask: jax.tree.map(
+        jax.lax.stop_gradient, apply_state_reset(states, mask)
+    )
+    detached_hidden = FunctionType(
+        _statepassing_hidden_states.__code__, control_globals,
+        argdefs=_statepassing_hidden_states.__defaults__,
+        closure=_statepassing_hidden_states.__closure__,
+    )
     for mode in ("full", "detached_control"):
-        chunks = None if mode == "full" else 1
+        hidden_states = _statepassing_hidden_states if mode == "full" else detached_hidden
 
         @nnx.jit
         def probe(model, delta):
@@ -38,13 +49,13 @@ def measure_state_gradient(model, cfg, batch):
                 original = embedding[...]
                 # Token100 occurs ONLY before the handoff; later loss depends on it ONLY through GDN.
                 embedding[...] = original.at[100].add(delta)
-                hidden, _ = _statepassing_hidden_states(
+                hidden, _ = hidden_states(
                     model,
                     batch,
                     cfg,
                     0,
                     PretrainMode.STATEPASSING_BPTT,
-                    bptt_chunks=chunks,
+                    bptt_chunks=None,
                     pass_gdn_state=True,
                     pass_conv_state=False,
                     pass_rope_positions=False,
@@ -66,7 +77,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--init-hf-model-path", required=True)
     parser.add_argument("--output", required=True)
-    parser.add_argument("--segment-length", type=int, required=True, choices=[512, 8192])
+    parser.add_argument("--segment-length", type=int, required=True, choices=[512, 2048, 8192])
     args = parser.parse_args()
     from absl import flags
 
@@ -78,7 +89,7 @@ def main():
         args.init_hf_model_path, tp_size=1, fsdp_size=4, dp_size=1, text_only=True
     )
     cfg = text_api.align_config_to_mesh(cfg.text_config, mesh)
-    set_attn_backend(model, text_backend="mosaic_gpu")
+    set_attn_backend(model, text_backend="triton")
     T = args.segment_length
     # Probe the actual handoff at absolute context position16384, beyond the old16k limit.
     C = 16384 // T + 1
@@ -98,6 +109,7 @@ def main():
     assert all(jnp.isfinite(x["early_embedding_to_late_hidden_gradient"]) for x in results.values())
     assert abs(results["full"]["early_embedding_to_late_hidden_gradient"]) > 0
     assert results["detached_control"]["early_embedding_to_late_hidden_gradient"] == 0
+    assert results["full"]["loss"] == results["detached_control"]["loss"]
     with Path(args.output).open("x") as stream:
         json.dump(
             {
