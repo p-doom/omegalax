@@ -373,79 +373,88 @@ class PretrainMaskAndLossTest(absltest.TestCase):
 
     def test_full_bptt_segment_scan_matches_unrolled_segment_loop(self):
         # gdn_layer_limit equal to the number of GDN layers carries every state unchanged
-        # (_select_layer_states_for_carry), so it is the same computation through the
-        # unrolled Python loop instead of the nnx.scan fast path.
-        cfg = dataclasses.replace(
+        # (_select_layer_states_for_carry, also for conv states), so it is the same computation
+        # through the unrolled Python loop instead of the nnx.scan fast path. The scan carry
+        # also holds conv states and RMT memory, reset at the same rows as the GDN state.
+        base_cfg = dataclasses.replace(
             _tiny_qwen3_5_config(),
             num_hidden_layers=3,
             layer_types=("linear_attention", "full_attention", "linear_attention"),
         )
         num_gdn_layers = 2
         B, T = 2, 4
-        for C in (2, 3, 8):
-            rng = np.random.RandomState(C)
-            token_ids = rng.randint(1, cfg.vocab_size, size=(B, C, T)).astype(np.int32)
-            attention_mask = np.ones((B, C, T), dtype=np.int32)
-            attention_mask[1, -1, 2:] = 0
-            token_ids[attention_mask == 0] = 0
-            reset_state = np.zeros((B, C), dtype=bool)
-            reset_state[:, 0] = True
-            reset_state[1, C // 2] = True
-            batch = {
-                "token_ids_BCT": jnp.asarray(token_ids),
-                "attention_mask_BCT": jnp.asarray(attention_mask),
-                "loss_mask_BCT": jnp.asarray(attention_mask),
-                "reset_state_BC": jnp.asarray(reset_state),
-            }
+        for pass_conv_state, num_rmt_tokens in ((False, 0), (True, 0), (False, 2), (True, 2)):
+            cfg = dataclasses.replace(base_cfg, num_rmt_tokens=num_rmt_tokens)
+            for C in (2, 3, 8):
+                rng = np.random.RandomState(C)
+                token_ids = rng.randint(1, cfg.vocab_size, size=(B, C, T)).astype(np.int32)
+                attention_mask = np.ones((B, C, T), dtype=np.int32)
+                attention_mask[1, -1, 2:] = 0
+                token_ids[attention_mask == 0] = 0
+                reset_state = np.zeros((B, C), dtype=bool)
+                reset_state[:, 0] = True
+                reset_state[1, C // 2] = True
+                batch = {
+                    "token_ids_BCT": jnp.asarray(token_ids),
+                    "attention_mask_BCT": jnp.asarray(attention_mask),
+                    "loss_mask_BCT": jnp.asarray(attention_mask),
+                    "reset_state_BC": jnp.asarray(reset_state),
+                }
 
-            def value_and_grad(gdn_layer_limit, batch=batch):
-                model, _ = text_api.init_model(
-                    cfg, jax.random.PRNGKey(0), tp_size=1, fsdp_size=1, dp_size=1
+                def value_and_grad(
+                    gdn_layer_limit, batch=batch, cfg=cfg, pass_conv_state=pass_conv_state
+                ):
+                    model, _ = text_api.init_model(
+                        cfg, jax.random.PRNGKey(0), tp_size=1, fsdp_size=1, dp_size=1
+                    )
+                    set_attn_backend(model, text_backend="xla")
+
+                    @nnx.jit
+                    def run(model):
+                        def loss_fn(inner_model):
+                            loss, _ = pretrain_trainer._statepassing_loss_stats(
+                                inner_model,
+                                batch,
+                                cfg,
+                                0,
+                                pretrain_trainer.PretrainMode.STATEPASSING_BPTT,
+                                gdn_layer_limit=gdn_layer_limit,
+                                pass_conv_state=pass_conv_state,
+                            )
+                            return loss
+
+                        return nnx.value_and_grad(loss_fn)(model)
+
+                    return run(model)
+
+                with mesh_rules_for(tp_size=1, fsdp_size=1, dp_size=1):
+                    scan_loss, scan_grads = value_and_grad(None)
+                    loop_loss, loop_grads = value_and_grad(num_gdn_layers)
+
+                np.testing.assert_allclose(scan_loss, loop_loss, rtol=1e-6, atol=0)
+                self.assertEqual(jax.tree.structure(scan_grads), jax.tree.structure(loop_grads))
+                # Both programs sum the same fp32 terms in a different XLA order. That reordering
+                # grows with C but stays far below 1e-4 (the tolerance of the other BPTT
+                # equivalence tests here); a wrong state, reset or segment order is O(1e-1).
+                max_rel_l2 = 0.0
+                for scan_grad, loop_grad in zip(
+                    jax.tree.leaves(scan_grads), jax.tree.leaves(loop_grads), strict=True
+                ):
+                    scan_grad, loop_grad = np.asarray(scan_grad), np.asarray(loop_grad)
+                    scale = float(np.abs(loop_grad).max())
+                    np.testing.assert_allclose(
+                        scan_grad, loop_grad, rtol=0, atol=1e-4 * scale + 1e-12
+                    )
+                    rel_l2 = float(np.linalg.norm(scan_grad - loop_grad)) / max(
+                        float(np.linalg.norm(loop_grad)), 1e-30
+                    )
+                    self.assertLess(rel_l2, 1e-4)
+                    max_rel_l2 = max(max_rel_l2, rel_l2)
+                print(
+                    f"scan_vs_loop conv={pass_conv_state} rmt={num_rmt_tokens} C={C} "
+                    f"loss_abs_diff={abs(float(scan_loss) - float(loop_loss)):.3e} "
+                    f"grad_max_rel_l2={max_rel_l2:.3e}"
                 )
-                set_attn_backend(model, text_backend="xla")
-
-                @nnx.jit
-                def run(model):
-                    def loss_fn(inner_model):
-                        loss, _ = pretrain_trainer._statepassing_loss_stats(
-                            inner_model,
-                            batch,
-                            cfg,
-                            0,
-                            pretrain_trainer.PretrainMode.STATEPASSING_BPTT,
-                            gdn_layer_limit=gdn_layer_limit,
-                        )
-                        return loss
-
-                    return nnx.value_and_grad(loss_fn)(model)
-
-                return run(model)
-
-            with mesh_rules_for(tp_size=1, fsdp_size=1, dp_size=1):
-                scan_loss, scan_grads = value_and_grad(None)
-                loop_loss, loop_grads = value_and_grad(num_gdn_layers)
-
-            np.testing.assert_allclose(scan_loss, loop_loss, rtol=1e-6, atol=0)
-            self.assertEqual(jax.tree.structure(scan_grads), jax.tree.structure(loop_grads))
-            # Both programs sum the same fp32 terms in a different XLA order. That reordering
-            # grows with C but stays far below 1e-4 (the tolerance of the other BPTT
-            # equivalence tests here); a wrong state, reset or segment order is O(1e-1).
-            max_rel_l2 = 0.0
-            for scan_grad, loop_grad in zip(
-                jax.tree.leaves(scan_grads), jax.tree.leaves(loop_grads), strict=True
-            ):
-                scan_grad, loop_grad = np.asarray(scan_grad), np.asarray(loop_grad)
-                scale = float(np.abs(loop_grad).max())
-                np.testing.assert_allclose(scan_grad, loop_grad, rtol=0, atol=1e-4 * scale + 1e-12)
-                rel_l2 = float(np.linalg.norm(scan_grad - loop_grad)) / max(
-                    float(np.linalg.norm(loop_grad)), 1e-30
-                )
-                self.assertLess(rel_l2, 1e-4)
-                max_rel_l2 = max(max_rel_l2, rel_l2)
-            print(
-                f"scan_vs_loop C={C} loss_abs_diff={abs(float(scan_loss) - float(loop_loss)):.3e} "
-                f"grad_max_rel_l2={max_rel_l2:.3e}"
-            )
 
     def test_statepassing_loss_applies_bptt_remainder_groups(self):
         class LmHead:

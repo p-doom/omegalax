@@ -452,37 +452,57 @@ def _statepassing_hidden_states(
         and gdn_layer_limit is None
         and gdn_state_routing == GdnStateRouting.SAME_LAYER
         and not pass_rope_positions
-        and not pass_conv_state
     ):
+        # Carry = (GDN states, conv states or None, RMT memory or None), each reset at the
+        # same rows and segments as in the unrolled path.
+        def forward_segment(model, carry, token_ids_BT, attention_mask_BT):
+            states, conv_states, memory = carry
+            forward_kwargs = {}
+            if pass_conv_state:
+                forward_kwargs["initial_conv_states"] = conv_states
+                forward_kwargs["return_conv_states"] = True
+            if cfg.num_rmt_tokens:
+                forward_kwargs["initial_rmt_memory_BMD"] = memory
+                forward_kwargs["return_rmt_memory"] = True
+            hidden, aux, states, *rest = text_api.forward_with_gdn_state(
+                model,
+                token_ids_BT,
+                pad_id,
+                cfg,
+                attention_mask_BT=attention_mask_BT,
+                initial_gdn_states=states,
+                **forward_kwargs,
+            )
+            conv_states = rest.pop(0) if pass_conv_state else None
+            memory = rest.pop(0) if cfg.num_rmt_tokens else None
+            return (states, conv_states, memory), hidden, aux
+
         # Bootstrap with None exactly as in the unrolled path; scan requires a fixed
-        # carry structure, so only the remaining segments use the returned GDN states.
-        first_hidden, first_aux, first_states = text_api.forward_with_gdn_state(
+        # carry structure, so only the remaining segments use the returned states.
+        first_carry, first_hidden, first_aux = forward_segment(
             model,
+            (None, None, None),
             token_ids_BCT[:, 0, :],
-            pad_id,
-            cfg,
-            attention_mask_BT=attention_mask_BCT[:, 0, :],
-            initial_gdn_states=None,
+            attention_mask_BCT[:, 0, :],
         )
 
         @nnx.scan(
             in_axes=(None, nnx.Carry, 1, 1, 1),
             out_axes=(nnx.Carry, (1, 0)),
         )
-        def segment_forward(model, states, token_ids_BT, attention_mask_BT, reset_B):
-            hidden, aux, states = text_api.forward_with_gdn_state(
-                model,
-                token_ids_BT,
-                pad_id,
-                cfg,
-                attention_mask_BT=attention_mask_BT,
-                initial_gdn_states=apply_state_reset(states, reset_B),
+        def segment_forward(model, carry, token_ids_BT, attention_mask_BT, reset_B):
+            states, conv_states, memory = carry
+            carry = (
+                apply_state_reset(states, reset_B),
+                None if conv_states is None else apply_state_reset(conv_states, reset_B),
+                None if memory is None else text_api.apply_rmt_reset(model, memory, reset_B),
             )
-            return states, (hidden, aux)
+            carry, hidden, aux = forward_segment(model, carry, token_ids_BT, attention_mask_BT)
+            return carry, (hidden, aux)
 
         _, (remaining_hidden, remaining_aux) = segment_forward(
             model,
-            first_states,
+            first_carry,
             token_ids_BCT[:, 1:, :],
             attention_mask_BCT[:, 1:, :],
             reset_state_BC[:, 1:],
