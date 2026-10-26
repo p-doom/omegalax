@@ -1195,12 +1195,11 @@ def run_pretrain(
             not restore_input_iter
             or bptt_chunks is not None
             or not pass_gdn_state
-            or pass_conv_state
             or pass_rope_positions
             or gdn_layer_limit is not None
         ):
             raise ValueError(
-                "Common plan requires restored cursor, full-chain BPTT and all GDN only"
+                "Common plan requires restored cursor, full-chain BPTT and all GDN layers"
             )
         if init_hf_model_path is None:
             raise ValueError("Common comparison requires true pretrained initialization")

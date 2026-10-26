@@ -29,6 +29,8 @@ def main():
     parser.add_argument("--wandb-project")
     parser.add_argument("--text-attn-backend", default="triton")
     parser.add_argument("--peak-tflops", default="h100_sxm")
+    parser.add_argument("--pass-conv-state", action="store_true")
+    parser.add_argument("--num-rmt-tokens", type=int, default=0)
     args = parser.parse_args()
     output = Path(args.output).resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -108,23 +110,29 @@ def main():
         "eval_statepassing_config": {
             "pass_gdn_state": True,
             "gdn_layer_limit": None,
-            "pass_conv_state": False,
+            "pass_conv_state": args.pass_conv_state,
             "pass_rope_positions": False,
             "pad_id": 0,
             "eos_id": 248046,
         },
         "horizon_by_step": [{"start_step": 1, "end_step": None, "c_train": C}],
         "resume": "optimizer update cursor = restored Grain cursor / ceil(chains_per_update / 4); verified before every update",
+        **({"num_rmt_tokens": args.num_rmt_tokens} if args.num_rmt_tokens else {}),
     }
     ensure_training_contract(output, contract)
     wandb_run = None
     if args.wandb_project:
         import wandb
 
+        arm = (
+            f"T{args.segment_length}"
+            + ("_conv" if args.pass_conv_state else "")
+            + (f"_rmt{args.num_rmt_tokens}" if args.num_rmt_tokens else "")
+        )
         wandb_run = wandb.init(
             project=args.wandb_project,
-            name=f"rollouts_T{args.segment_length}_fast",
-            id=f"{plan['plan_sha256'][:12]}_T{args.segment_length}_fast",
+            name=f"rollouts_{arm}_fast",
+            id=f"{plan['plan_sha256'][:12]}_{arm}_fast",
             resume="allow",
             config=contract,
         )
@@ -149,7 +157,8 @@ def main():
         dp_size=1,
         bptt_chunks=None,
         pass_gdn_state=True,
-        pass_conv_state=False,
+        pass_conv_state=args.pass_conv_state,
+        num_rmt_tokens=args.num_rmt_tokens,
         pass_rope_positions=False,
         text_attn_backend=args.text_attn_backend,
         peak_tflops=resolve_peak_tflops(args.peak_tflops),

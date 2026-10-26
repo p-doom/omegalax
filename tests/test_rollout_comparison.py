@@ -184,6 +184,40 @@ class CommonUpdateTest(unittest.TestCase):
         self.assertEqual(rm["teacher_boundary_windows"], 0)
         self.assertNotIn("teacher_boundary_nll", rm)
         self.assertEqual(int(resumed.step[...]), 3)
+        # Conv1D and RMT memory passing; the memory is a new parameter drawn at HF init and
+        # must survive the checkpoint resume exactly like every other optimizer leaf.
+        rmt_kwargs = {**kwargs, "pass_conv_state": True, "num_rmt_tokens": 2}
+        rmt_continuous, rmt_cm = trainer.run_pretrain(
+            str(root / "pretrained"),
+            train_cfg,
+            iterator(),
+            save_dir=root / "rmt_continuous",
+            **rmt_kwargs,
+        )
+        trainer.run_pretrain(
+            str(root / "pretrained"),
+            train_cfg,
+            iterator(),
+            save_dir=root / "rmt_resumed",
+            stop_after_local_step=1,
+            **rmt_kwargs,
+        )
+        rmt_resumed, rmt_rm = trainer.run_pretrain(
+            str(root / "pretrained"),
+            train_cfg,
+            iterator(),
+            save_dir=root / "rmt_resumed",
+            resume=ResumeMode.REQUIRED,
+            **rmt_kwargs,
+        )
+        self.assertEqual(rmt_resumed.model.rmt_memory[...].shape, (2, cfg.hidden_size))
+        for left, right in zip(
+            jax.tree.leaves(nnx.state(rmt_continuous)), jax.tree.leaves(nnx.state(rmt_resumed))
+        ):
+            np.testing.assert_array_equal(np.asarray(left), np.asarray(right))
+        self.assertEqual(rmt_cm["total_tokens"], 4100)
+        self.assertEqual(rmt_rm["teacher_targets"], 4)
+        self.assertNotEqual(rmt_rm["teacher_kl"], rm["teacher_kl"])
         (root / "PASS.json").write_text(
             json.dumps(
                 {"status": "PASS", "metrics": rm, "gradient_at_16384": long_gradient}, indent=2
