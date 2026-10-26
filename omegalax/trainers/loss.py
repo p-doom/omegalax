@@ -300,8 +300,9 @@ def chunked_teacher_kl_stats(
     ``hidden_BTD`` holds all concatenated segments; row r of batch element b is predicted
     by ``hidden_BTD[b, teacher_positions_BR[b, r]]``. Only those rows are projected, at most
     ``block_size`` per batch element at a time with rematerialization, so the
-    ``(B, T, V)`` logits never exist. Masked rows read position and ID 0 and contribute
-    exactly zero value and gradient. Both results are float32 sums over the batch.
+    ``(B, T, V)`` logits never exist. Masked rows use zero-filled out-of-bounds gathers
+    and contribute exactly zero value and gradient. Both results are float32 sums
+    over the batch.
 
     With ``boundary_token_ids_BT``, the ``(B, T)`` stored token IDs of the same chains, a
     third result holds diagnostic sums of the student NLL of those IDs over boundary windows:
@@ -344,7 +345,25 @@ def chunked_teacher_kl_stats(
 
     mask_BR = targets["teacher_mask_BR"]
     positions_BR = jnp.where(mask_BR, targets["teacher_positions_BR"], 0)
-    hidden_BRD = jnp.take_along_axis(hidden_BTD, positions_BR[:, :, None], axis=1)
+    # Valid positions are unique; each masked row gets a distinct out-of-bounds index.
+    gather_positions_BR = jnp.where(
+        mask_BR, positions_BR, hidden_BTD.shape[1] + jnp.arange(R, dtype=positions_BR.dtype)
+    )
+    hidden_BRD = jax.lax.gather(
+        hidden_BTD,
+        gather_positions_BR[..., None],
+        jax.lax.GatherDimensionNumbers(
+            offset_dims=(2,),
+            collapsed_slice_dims=(1,),
+            start_index_map=(1,),
+            operand_batching_dims=(0,),
+            start_indices_batching_dims=(0,),
+        ),
+        slice_sizes=(1, 1, D),
+        mode="fill",
+        fill_value=0,
+        unique_indices=True,
+    )
     row_arrays = [
         hidden_BRD,
         mask_BR,
@@ -387,7 +406,21 @@ def chunked_teacher_kl_stats(
     # type them along a TP-sharded vocab axis, so that axis is left to the partitioner,
     # which reads locally and reduces only the gathered (B, S, G) values over TP.
     def take_classes(logits_BSV, class_ids_BSG):
-        return jnp.take_along_axis(logits_BSV, class_ids_BSG, axis=-1)
+        return jax.lax.gather(
+            logits_BSV,
+            class_ids_BSG[..., None],
+            jax.lax.GatherDimensionNumbers(
+                offset_dims=(),
+                collapsed_slice_dims=(2,),
+                start_index_map=(2,),
+                operand_batching_dims=(0, 1),
+                start_indices_batching_dims=(0, 1),
+            ),
+            slice_sizes=(1, 1, 1),
+            mode="fill",
+            fill_value=0,
+            unique_indices=True,
+        )
 
     def mark_classes(logits_BSV, class_ids_BSG):
         return jax.lax.scatter(
@@ -396,6 +429,7 @@ def chunked_teacher_kl_stats(
             jnp.ones_like(class_ids_BSG, dtype=jnp.bool_),
             _CLASS_SCATTER_DIMS,
             mode="drop",
+            unique_indices=True,
         )
 
     vocab_axis = None if logits_out_sharding is None else logits_out_sharding[2]
@@ -415,8 +449,18 @@ def chunked_teacher_kl_stats(
             "BSD,DV->BSV", h_BSD, lm_head_kernel_DV, out_sharding=logits_out_sharding
         ).astype(jnp.float32)
         ids_BSK = jnp.where(msk_BS[..., None], ids_BSK, 0)
+        special_in_top_BSS = jnp.any(ids_BSK[..., :, None] == special_ids, axis=-2)
+        class_keep_BSG = msk_BS[..., None] & jnp.concatenate(
+            [jnp.ones_like(ids_BSK, dtype=jnp.bool_), ~special_in_top_BSS], axis=-1
+        )
         class_ids_BSG = jnp.concatenate(
             [ids_BSK, jnp.zeros_like(special_BSS, dtype=ids_BSK.dtype) + special_ids], axis=-1
+        )
+        # Top512 and surviving specials are unique; excluded slots stay distinct too.
+        class_ids_BSG = jnp.where(
+            class_keep_BSG,
+            class_ids_BSG,
+            _TEACHER_VOCAB_SIZE + jnp.arange(class_ids_BSG.shape[-1], dtype=ids_BSK.dtype),
         )
         class_logits_BSG = take_classes(logits_BSV, class_ids_BSG)
         # Per-block membership mask for the tail complement; rematerialized, never stored.
@@ -428,15 +472,7 @@ def chunked_teacher_kl_stats(
             - log_z_BS[..., None]
         )
 
-        special_in_top_BSS = jnp.any(ids_BSK[..., :, None] == special_ids, axis=-2)
-        keep_BSG = msk_BS[..., None] & jnp.concatenate(
-            [
-                jnp.ones_like(ids_BSK, dtype=jnp.bool_),
-                ~special_in_top_BSS,
-                jnp.ones_like(msk_BS[..., None]),
-            ],
-            axis=-1,
-        )
+        keep_BSG = jnp.concatenate([class_keep_BSG, msk_BS[..., None]], axis=-1)
         teacher_BSG = (
             jnp.concatenate([top_BSK, special_BSS, logz_tail_BS[..., None]], axis=-1)
             - logz_all_BS[..., None]

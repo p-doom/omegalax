@@ -7,6 +7,7 @@
 #SBATCH --mem=360G
 #SBATCH --gres=gpu:4
 #SBATCH --time=1-00:00:00
+#SBATCH --signal=USR1@600
 set -euo pipefail
 SOURCE=$1 PLAN=$2 OUTPUT=$3 MODEL=$4 MODE=$5 ARM=${6:-}
 # One local JAX controller sees four GPUs. No cross-node JAX initialization.
