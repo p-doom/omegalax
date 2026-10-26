@@ -796,12 +796,14 @@ class PretrainMaskAndLossTest(absltest.TestCase):
                 pretrain_trainer.text_api, "forward_with_gdn_state", side_effect=fake_forward
             ),
         ):
+            # Full BPTT with conv passing takes the nnx.scan path, which cannot trace this
+            # patched forward; the unrolled loop passes the same (detached) values.
             pretrain_trainer._statepassing_loss_stats(
                 Model(),
                 batch,
                 _tiny_qwen3_5_config(),
                 pad_id=0,
-                pretrain_mode=pretrain_trainer.PretrainMode.STATEPASSING_BPTT,
+                pretrain_mode=pretrain_trainer.PretrainMode.STATEPASSING_NO_BPTT,
                 pass_conv_state=True,
             )
 
