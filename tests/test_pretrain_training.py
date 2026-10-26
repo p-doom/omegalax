@@ -34,6 +34,7 @@ from omegalax.distributed.mesh import required_batch_multiple
 from omegalax.models.qwen3_5.deltanet import GatedDeltaNet, _causal_depthwise_conv1d
 from omegalax.models.qwen3_5.config import Qwen3_5TextConfig
 from omegalax.models.shard_config import ShardConfig
+from omegalax.models.sharding_runtime import set_attn_backend
 from omegalax.text import api as text_api
 from omegalax.trainers.loss import chunked_cross_entropy_multi_stats
 from omegalax.trainers import checkpoint_utils
@@ -332,67 +333,119 @@ class PretrainMaskAndLossTest(absltest.TestCase):
         self.assertEqual(float(counts[2]), 1.0)
 
     def test_statepassing_loss_applies_bptt_mode_at_segment_handoff(self):
-        class LmHead:
-            kernel = jnp.eye(4, dtype=jnp.float32)
-
-        class Model:
-            lm_head = LmHead()
-
-        model = Model()
+        # Segment 0 tokens reach the only supervised target (segment 1, position 1) solely
+        # through the carried GDN state, so their embedding gradient isolates the handoff.
         cfg = _tiny_qwen3_5_config()
         batch = {
-            "token_ids_BCT": jnp.asarray([[[0, 0], [0, 1]]], dtype=jnp.int32),
+            "token_ids_BCT": jnp.asarray([[[10, 11], [12, 13]]], dtype=jnp.int32),
             "attention_mask_BCT": jnp.ones((1, 2, 2), dtype=jnp.int32),
             "loss_mask_BCT": jnp.asarray([[[0, 0], [0, 1]]], dtype=jnp.int32),
             "reset_state_BC": jnp.asarray([[True, False]], dtype=jnp.bool_),
         }
 
-        def loss_for_source(source, mode):
-            def fake_forward(
-                _model,
-                token_ids_BT,
-                _pad_id,
-                _cfg,
-                *,
-                attention_mask_BT=None,
-                segment_ids_BT=None,
-                initial_gdn_states=None,
-            ):
-                del attention_mask_BT, segment_ids_BT
-                B, T = token_ids_BT.shape
-                hidden = jnp.zeros((B, T, 4), dtype=jnp.float32)
-                if initial_gdn_states is None:
-                    final_state = (jnp.broadcast_to(source.reshape(1, 1, 1, 1), (B, 1, 1, 1)),)
-                    return hidden, jnp.array(0.0, dtype=jnp.float32), final_state
+        def segment0_embedding_grad(mode):
+            model, _ = text_api.init_model(
+                cfg, jax.random.PRNGKey(0), tp_size=1, fsdp_size=1, dp_size=1
+            )
 
-                carried = initial_gdn_states[0].reshape(B)
-                hidden = hidden.at[:, 0, 1].set(carried)
-                return hidden, jnp.array(0.0, dtype=jnp.float32), initial_gdn_states
-
-            with mock.patch.object(
-                pretrain_trainer.text_api, "forward_with_gdn_state", side_effect=fake_forward
-            ):
+            def loss_fn(inner_model):
                 loss, _ = pretrain_trainer._statepassing_loss_stats(
-                    model,
-                    batch,
-                    cfg,
-                    pad_id=0,
-                    pretrain_mode=mode,
+                    inner_model, batch, cfg, pad_id=0, pretrain_mode=mode
                 )
-            return loss
+                return loss
+
+            grads = nnx.jit(nnx.grad(loss_fn))(model)
+            (embedding_grad,) = [
+                leaf
+                for path, leaf in jax.tree_util.tree_flatten_with_path(grads)[0]
+                if "embedder" in jax.tree_util.keystr(path)
+            ]
+            return np.asarray(embedding_grad)[10:12]
 
         with mesh_rules_for(tp_size=1, fsdp_size=1, dp_size=1):
-            grad_no_bptt = jax.grad(loss_for_source, argnums=0)(
-                jnp.array(0.5, dtype=jnp.float32),
-                pretrain_trainer.PretrainMode.STATEPASSING_NO_BPTT,
+            grad_no_bptt = segment0_embedding_grad(
+                pretrain_trainer.PretrainMode.STATEPASSING_NO_BPTT
             )
-            grad_bptt = jax.grad(loss_for_source, argnums=0)(
-                jnp.array(0.5, dtype=jnp.float32),
-                pretrain_trainer.PretrainMode.STATEPASSING_BPTT,
-            )
+            grad_bptt = segment0_embedding_grad(pretrain_trainer.PretrainMode.STATEPASSING_BPTT)
 
-        self.assertEqual(float(grad_no_bptt), 0.0)
-        self.assertNotEqual(float(grad_bptt), 0.0)
+        np.testing.assert_array_equal(grad_no_bptt, 0.0)
+        self.assertGreater(float(np.abs(grad_bptt).max()), 0.0)
+
+    def test_full_bptt_segment_scan_matches_unrolled_segment_loop(self):
+        # gdn_layer_limit equal to the number of GDN layers carries every state unchanged
+        # (_select_layer_states_for_carry), so it is the same computation through the
+        # unrolled Python loop instead of the nnx.scan fast path.
+        cfg = dataclasses.replace(
+            _tiny_qwen3_5_config(),
+            num_hidden_layers=3,
+            layer_types=("linear_attention", "full_attention", "linear_attention"),
+        )
+        num_gdn_layers = 2
+        B, T = 2, 4
+        for C in (2, 3, 8):
+            rng = np.random.RandomState(C)
+            token_ids = rng.randint(1, cfg.vocab_size, size=(B, C, T)).astype(np.int32)
+            attention_mask = np.ones((B, C, T), dtype=np.int32)
+            attention_mask[1, -1, 2:] = 0
+            token_ids[attention_mask == 0] = 0
+            reset_state = np.zeros((B, C), dtype=bool)
+            reset_state[:, 0] = True
+            reset_state[1, C // 2] = True
+            batch = {
+                "token_ids_BCT": jnp.asarray(token_ids),
+                "attention_mask_BCT": jnp.asarray(attention_mask),
+                "loss_mask_BCT": jnp.asarray(attention_mask),
+                "reset_state_BC": jnp.asarray(reset_state),
+            }
+
+            def value_and_grad(gdn_layer_limit, batch=batch):
+                model, _ = text_api.init_model(
+                    cfg, jax.random.PRNGKey(0), tp_size=1, fsdp_size=1, dp_size=1
+                )
+                set_attn_backend(model, text_backend="xla")
+
+                @nnx.jit
+                def run(model):
+                    def loss_fn(inner_model):
+                        loss, _ = pretrain_trainer._statepassing_loss_stats(
+                            inner_model,
+                            batch,
+                            cfg,
+                            0,
+                            pretrain_trainer.PretrainMode.STATEPASSING_BPTT,
+                            gdn_layer_limit=gdn_layer_limit,
+                        )
+                        return loss
+
+                    return nnx.value_and_grad(loss_fn)(model)
+
+                return run(model)
+
+            with mesh_rules_for(tp_size=1, fsdp_size=1, dp_size=1):
+                scan_loss, scan_grads = value_and_grad(None)
+                loop_loss, loop_grads = value_and_grad(num_gdn_layers)
+
+            np.testing.assert_allclose(scan_loss, loop_loss, rtol=1e-6, atol=0)
+            self.assertEqual(jax.tree.structure(scan_grads), jax.tree.structure(loop_grads))
+            # Both programs sum the same fp32 terms in a different XLA order. That reordering
+            # grows with C but stays far below 1e-4 (the tolerance of the other BPTT
+            # equivalence tests here); a wrong state, reset or segment order is O(1e-1).
+            max_rel_l2 = 0.0
+            for scan_grad, loop_grad in zip(
+                jax.tree.leaves(scan_grads), jax.tree.leaves(loop_grads), strict=True
+            ):
+                scan_grad, loop_grad = np.asarray(scan_grad), np.asarray(loop_grad)
+                scale = float(np.abs(loop_grad).max())
+                np.testing.assert_allclose(scan_grad, loop_grad, rtol=0, atol=1e-4 * scale + 1e-12)
+                rel_l2 = float(np.linalg.norm(scan_grad - loop_grad)) / max(
+                    float(np.linalg.norm(loop_grad)), 1e-30
+                )
+                self.assertLess(rel_l2, 1e-4)
+                max_rel_l2 = max(max_rel_l2, rel_l2)
+            print(
+                f"scan_vs_loop C={C} loss_abs_diff={abs(float(scan_loss) - float(loop_loss)):.3e} "
+                f"grad_max_rel_l2={max_rel_l2:.3e}"
+            )
 
     def test_statepassing_loss_applies_bptt_remainder_groups(self):
         class LmHead:
