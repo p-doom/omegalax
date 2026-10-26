@@ -84,7 +84,7 @@ class Attention(nnx.Module):
         self.hidden_shd = cfg.shd_cfg.act_btd
         object.__setattr__(self, "_q_sharding", None)
         object.__setattr__(self, "_q_sharding_spec", P(*cfg.shd_cfg.act_btnh))
-        object.__setattr__(self, "_attn_backend", "mosaic_gpu")
+        object.__setattr__(self, "_attn_backend", "triton")
         object.__setattr__(self, "_attn_kind", "text")
 
     def _rmt_attention(

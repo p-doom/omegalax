@@ -16,6 +16,7 @@ from omegalax.data.pretrain_statepassing import (
     STATEPASSING_FIXED_C_INDEX_FORMAT,
     STATEPASSING_WINDOW_INDEX_FORMAT,
 )
+from omegalax.data.rollout_teacher_pipeline import ROLLOUT_TEACHER_INDEX_FORMAT
 
 
 TRAINING_CONTRACT_FILENAME = "training_contract.json"
@@ -109,14 +110,32 @@ def build_training_contract(
     pass_rope_positions: bool,
     pad_id: int,
     eos_id: int,
+    teacher_distillation: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
+    """Build the immutable run contract.
+
+    ``teacher_distillation`` holds the run settings of a teacher-distillation run
+    (objective, pretrain mode, BPTT span, seed, global segment batch, accumulation steps,
+    iterator data shards). It is required
+    exactly for rollout-teacher indexes; next-token contracts keep their legacy layout.
+    """
     index_path = Path(train_index_path).expanduser().resolve()
     metadata_path = index_path / COMPILED_METADATA_FILENAME
     if not metadata_path.is_file():
         raise ValueError(f"Training index has no metadata file: {metadata_path}")
     metadata = json.loads(metadata_path.read_text())
     index_format = metadata.get("format")
-    if index_format == STATEPASSING_CURRICULUM_INDEX_FORMAT:
+    if (index_format == ROLLOUT_TEACHER_INDEX_FORMAT) != (teacher_distillation is not None):
+        raise ValueError(
+            f"Teacher distillation settings are required exactly for {ROLLOUT_TEACHER_INDEX_FORMAT} "
+            f"indexes; got index format={index_format!r}"
+        )
+    if index_format == ROLLOUT_TEACHER_INDEX_FORMAT:
+        # Every sample is one whole chain, so the longest bucket bounds the state horizon.
+        horizons = [
+            {"start_step": 1, "end_step": None, "c_train": max(metadata["segment_buckets"])}
+        ]
+    elif index_format == STATEPASSING_CURRICULUM_INDEX_FORMAT:
         horizons = _curriculum_horizons(metadata)
     elif index_format in (
         STATEPASSING_FIXED_C_INDEX_FORMAT,
@@ -151,6 +170,18 @@ def build_training_contract(
     if gdn_state_routing != "same_layer":
         contract["training_statepassing_config"] = {
             "gdn_state_routing": gdn_state_routing,
+        }
+    if teacher_distillation is not None:
+        source = dict(metadata["source"])
+        contract["teacher_distillation"] = {
+            **teacher_distillation,
+            "index_binding": metadata["index_binding"],
+            "selection": metadata["selection"],
+            "segment_length": int(metadata["segment_length"]),
+            "segment_buckets": [int(value) for value in metadata["segment_buckets"]],
+            "target_capacities": [int(value) for value in metadata["target_capacities"]],
+            "dataset_binding": source["dataset_binding"],
+            "scoring_binding": source["scoring_binding"],
         }
     return contract
 

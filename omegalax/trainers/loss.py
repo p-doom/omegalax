@@ -250,3 +250,261 @@ def chunked_cross_entropy_loss(
         logits_out_sharding=logits_out_sharding,
     )
     return total_loss / jnp.maximum(total_mask, 1.0)
+
+
+# Fixed binding of the ``rollout_teacher_v1`` targets (see its ``manifest.json``).
+_TEACHER_VOCAB_SIZE = 248_320
+_TEACHER_TOP_K = 512
+_TEACHER_SPECIAL_IDS = tuple(range(248_044, 248_077))
+_TEACHER_TARGET_KEYS = (
+    "teacher_positions_BR",
+    "teacher_mask_BR",
+    "teacher_top512_ids_BRK",
+    "teacher_top512_logits_BRK",
+    "teacher_special_logits_BRS",
+    "teacher_logz_all_BR",
+    "teacher_logz_tail_BR",
+)
+# Diagnostic NLL windows: target positions [b, b + 256) after every absolute boundary
+# b = 8192, 16384, ... of a chain, where all compared segment lengths hand over state.
+_BOUNDARY_NLL_STRIDE = 8192
+_BOUNDARY_NLL_WINDOW = 256
+
+_CLASS_SCATTER_DIMS = jax.lax.ScatterDimensionNumbers(
+    update_window_dims=(),
+    inserted_window_dims=(2,),
+    scatter_dims_to_operand_dims=(2,),
+    operand_batching_dims=(0, 1),
+    scatter_indices_batching_dims=(0, 1),
+)
+
+
+def chunked_teacher_kl_stats(
+    hidden_BTD: jax.Array,
+    lm_head_kernel_DV: jax.Array,
+    targets: dict[str, jax.Array],
+    *,
+    block_size: int = 256,
+    logits_out_sharding: P | None = None,
+    boundary_token_ids_BT: jax.Array | None = None,
+) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, dict[str, jax.Array]]:
+    """Return ``(kl_sum, target_count)`` of grouped forward KL(teacher || student).
+
+    Per valid target row the classes are its unique Top512 IDs, the special IDs not
+    already in that Top512 (counted once), and one tail class holding the rest of the
+    vocabulary, all at temperature 1. Teacher log-probabilities are the stored logits and
+    ``logz_tail`` minus ``logz_all``. The student uses its full normalizer, and its tail
+    is a logsumexp over the complement, so a tiny tail is never a difference of
+    near-equal probabilities. This is not the exact full-vocabulary KL.
+
+    ``hidden_BTD`` holds all concatenated segments; row r of batch element b is predicted
+    by ``hidden_BTD[b, teacher_positions_BR[b, r]]``. Only those rows are projected, at most
+    ``block_size`` per batch element at a time with rematerialization, so the
+    ``(B, T, V)`` logits never exist. Masked rows use zero-filled out-of-bounds gathers
+    and contribute exactly zero value and gradient. Both results are float32 sums
+    over the batch.
+
+    With ``boundary_token_ids_BT``, the ``(B, T)`` stored token IDs of the same chains, a
+    third result holds diagnostic sums of the student NLL of those IDs over boundary windows:
+    target positions ``[b, b + 256)`` after each absolute ``b = 8192, 16384, ...``, where
+    target j is predicted by hidden j-1. A window counts only if all 256 positions are valid
+    teacher rows; valid rows of one batch element must have unique positions, as the stored
+    targets do. The NLL reuses each row's logits and normalizer and has no gradient.
+    """
+    if set(targets) != set(_TEACHER_TARGET_KEYS):
+        raise ValueError(f"targets must have exactly the keys {_TEACHER_TARGET_KEYS}")
+    B, _, D = hidden_BTD.shape
+    if lm_head_kernel_DV.shape != (D, _TEACHER_VOCAB_SIZE):
+        raise ValueError(
+            f"lm_head_kernel_DV must have shape ({D}, {_TEACHER_VOCAB_SIZE}) to match the "
+            f"teacher vocabulary, got {lm_head_kernel_DV.shape}"
+        )
+    R = targets["teacher_positions_BR"].shape[-1]
+    expected_shapes = {
+        "teacher_positions_BR": (B, R),
+        "teacher_mask_BR": (B, R),
+        "teacher_top512_ids_BRK": (B, R, _TEACHER_TOP_K),
+        "teacher_top512_logits_BRK": (B, R, _TEACHER_TOP_K),
+        "teacher_special_logits_BRS": (B, R, len(_TEACHER_SPECIAL_IDS)),
+        "teacher_logz_all_BR": (B, R),
+        "teacher_logz_tail_BR": (B, R),
+    }
+    for name, shape in expected_shapes.items():
+        if targets[name].shape != shape:
+            raise ValueError(f"{name} must have shape {shape}, got {targets[name].shape}")
+    if targets["teacher_mask_BR"].dtype != jnp.bool_:
+        raise ValueError("teacher_mask_BR must be bool")
+    if R < 1 or block_size < 1:
+        raise ValueError(f"Need R >= 1 and block_size >= 1, got R={R}, block_size={block_size}")
+    with_boundary = boundary_token_ids_BT is not None
+    if with_boundary and boundary_token_ids_BT.shape != hidden_BTD.shape[:2]:
+        raise ValueError(
+            f"boundary_token_ids_BT must have shape {hidden_BTD.shape[:2]}, "
+            f"got {boundary_token_ids_BT.shape}"
+        )
+
+    mask_BR = targets["teacher_mask_BR"]
+    positions_BR = jnp.where(mask_BR, targets["teacher_positions_BR"], 0)
+    # Valid positions are unique; each masked row gets a distinct out-of-bounds index.
+    gather_positions_BR = jnp.where(
+        mask_BR, positions_BR, hidden_BTD.shape[1] + jnp.arange(R, dtype=positions_BR.dtype)
+    )
+    hidden_BRD = jax.lax.gather(
+        hidden_BTD,
+        gather_positions_BR[..., None],
+        jax.lax.GatherDimensionNumbers(
+            offset_dims=(2,),
+            collapsed_slice_dims=(1,),
+            start_index_map=(1,),
+            operand_batching_dims=(0,),
+            start_indices_batching_dims=(0,),
+        ),
+        slice_sizes=(1, 1, D),
+        mode="fill",
+        fill_value=0,
+        unique_indices=True,
+    )
+    row_arrays = [
+        hidden_BRD,
+        mask_BR,
+        targets["teacher_top512_ids_BRK"],
+        targets["teacher_top512_logits_BRK"],
+        targets["teacher_special_logits_BRS"],
+        targets["teacher_logz_all_BR"],
+        targets["teacher_logz_tail_BR"],
+    ]
+    if with_boundary:
+        # Target j of a row is its hidden position + 1; masked rows read target 1, which
+        # lies before the first boundary.
+        target_pos_BR = positions_BR + 1
+        window_BR = target_pos_BR // _BOUNDARY_NLL_STRIDE
+        in_window_BR = (window_BR >= 1) & (
+            target_pos_BR % _BOUNDARY_NLL_STRIDE < _BOUNDARY_NLL_WINDOW
+        )
+        # Positions are unique, so a window is complete iff it holds 256 valid rows.
+        num_windows = (hidden_BTD.shape[1] - 1) // _BOUNDARY_NLL_STRIDE + 1
+        rows_BW = jnp.sum(
+            (window_BR[..., None] == jnp.arange(num_windows)) & in_window_BR[..., None],
+            axis=1,
+        )
+        eligible_BW = rows_BW == _BOUNDARY_NLL_WINDOW
+        nll_row_BR = in_window_BR & jnp.take_along_axis(eligible_BW, window_BR, axis=1)
+        token_ids_BR = jnp.take_along_axis(boundary_token_ids_BT, target_pos_BR, axis=1)
+        row_arrays += [nll_row_BR, token_ids_BR]
+
+    block = min(block_size, R)
+    num_blocks = -(-R // block)
+    pad_r = num_blocks * block - R
+    if pad_r > 0:
+        row_arrays = [
+            jnp.pad(x, ((0, 0), (0, pad_r)) + ((0, 0),) * (x.ndim - 2)) for x in row_arrays
+        ]
+    blocks = [jnp.moveaxis(x.reshape(B, num_blocks, block, *x.shape[2:]), 1, 0) for x in row_arrays]
+    special_ids = jnp.asarray(_TEACHER_SPECIAL_IDS, dtype=jnp.int32)
+
+    # Batched gather/scatter keep (B, S) local to each data shard. Explicit sharding cannot
+    # type them along a TP-sharded vocab axis, so that axis is left to the partitioner,
+    # which reads locally and reduces only the gathered (B, S, G) values over TP.
+    def take_classes(logits_BSV, class_ids_BSG):
+        return jax.lax.gather(
+            logits_BSV,
+            class_ids_BSG[..., None],
+            jax.lax.GatherDimensionNumbers(
+                offset_dims=(),
+                collapsed_slice_dims=(2,),
+                start_index_map=(2,),
+                operand_batching_dims=(0, 1),
+                start_indices_batching_dims=(0, 1),
+            ),
+            slice_sizes=(1, 1, 1),
+            mode="fill",
+            fill_value=0,
+            unique_indices=True,
+        )
+
+    def mark_classes(logits_BSV, class_ids_BSG):
+        return jax.lax.scatter(
+            jnp.zeros_like(logits_BSV, dtype=jnp.bool_),
+            class_ids_BSG[..., None],
+            jnp.ones_like(class_ids_BSG, dtype=jnp.bool_),
+            _CLASS_SCATTER_DIMS,
+            mode="drop",
+            unique_indices=True,
+        )
+
+    vocab_axis = None if logits_out_sharding is None else logits_out_sharding[2]
+    if vocab_axis is not None:
+        take_classes = jax.sharding.auto_axes(
+            take_classes, axes=vocab_axis, out_sharding=P(logits_out_sharding[0], None, None)
+        )
+        mark_classes = jax.sharding.auto_axes(
+            mark_classes, axes=vocab_axis, out_sharding=logits_out_sharding
+        )
+
+    @jax.remat
+    def _remat_block(
+        h_BSD, msk_BS, ids_BSK, top_BSK, special_BSS, logz_all_BS, logz_tail_BS, *boundary_BS
+    ):
+        logits_BSV = jnp.einsum(
+            "BSD,DV->BSV", h_BSD, lm_head_kernel_DV, out_sharding=logits_out_sharding
+        ).astype(jnp.float32)
+        ids_BSK = jnp.where(msk_BS[..., None], ids_BSK, 0)
+        special_in_top_BSS = jnp.any(ids_BSK[..., :, None] == special_ids, axis=-2)
+        class_keep_BSG = msk_BS[..., None] & jnp.concatenate(
+            [jnp.ones_like(ids_BSK, dtype=jnp.bool_), ~special_in_top_BSS], axis=-1
+        )
+        class_ids_BSG = jnp.concatenate(
+            [ids_BSK, jnp.zeros_like(special_BSS, dtype=ids_BSK.dtype) + special_ids], axis=-1
+        )
+        # Top512 and surviving specials are unique; excluded slots stay distinct too.
+        class_ids_BSG = jnp.where(
+            class_keep_BSG,
+            class_ids_BSG,
+            _TEACHER_VOCAB_SIZE + jnp.arange(class_ids_BSG.shape[-1], dtype=ids_BSK.dtype),
+        )
+        class_logits_BSG = take_classes(logits_BSV, class_ids_BSG)
+        # Per-block membership mask for the tail complement; rematerialized, never stored.
+        in_class_BSV = mark_classes(logits_BSV, class_ids_BSG)
+        log_z_BS = jax.nn.logsumexp(logits_BSV, axis=-1)
+        log_tail_BS = jax.nn.logsumexp(jnp.where(in_class_BSV, -jnp.inf, logits_BSV), axis=-1)
+        student_BSG = (
+            jnp.concatenate([class_logits_BSG, log_tail_BS[..., None]], axis=-1)
+            - log_z_BS[..., None]
+        )
+
+        keep_BSG = jnp.concatenate([class_keep_BSG, msk_BS[..., None]], axis=-1)
+        teacher_BSG = (
+            jnp.concatenate([top_BSK, special_BSS, logz_tail_BS[..., None]], axis=-1)
+            - logz_all_BS[..., None]
+        )
+        teacher_BSG = jnp.where(keep_BSG, teacher_BSG, 0.0)
+        teacher_prob_BSG = jnp.where(keep_BSG, jnp.exp(teacher_BSG), 0.0)
+        kl = jnp.sum(teacher_prob_BSG * (teacher_BSG - student_BSG))
+        if not boundary_BS:
+            return kl
+        nll_row_BS, token_ids_BS = boundary_BS
+        token_logit_BS = take_classes(logits_BSV, token_ids_BS[..., None])[..., 0]
+        nll_BS = jax.lax.stop_gradient(log_z_BS - token_logit_BS)
+        return kl, jnp.sum(jnp.where(nll_row_BS, nll_BS, 0.0))
+
+    def _scan_body(acc, block_data):
+        return jax.tree.map(jnp.add, acc, _remat_block(*block_data)), None
+
+    zero = jnp.array(0.0, dtype=jnp.float32)
+    sums, _ = jax.lax.scan(
+        _scan_body, (zero, zero) if with_boundary else zero, tuple(blocks), unroll=1
+    )
+    target_count = jnp.sum(mask_BR.astype(jnp.float32))
+    if not with_boundary:
+        return sums, target_count
+    kl_sum, nll_sum = sums
+    return (
+        kl_sum,
+        target_count,
+        {
+            "teacher_boundary_nll_sum": nll_sum,
+            "teacher_boundary_nll_tokens": jnp.sum(nll_row_BR.astype(jnp.float32)),
+            "teacher_boundary_windows": jnp.sum(eligible_BW.astype(jnp.float32)),
+            "teacher_boundary_rollouts": jnp.sum(jnp.any(eligible_BW, axis=1).astype(jnp.float32)),
+        },
+    )

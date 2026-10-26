@@ -101,7 +101,7 @@ _ATTN_BACKENDS = [
     "triton",
 ]
 flags.DEFINE_enum(
-    "text_attn_backend", "mosaic_gpu", _ATTN_BACKENDS, "Attention backend for the text decoder."
+    "text_attn_backend", None, _ATTN_BACKENDS, "Attention backend for the text decoder."
 )
 
 

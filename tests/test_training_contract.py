@@ -13,6 +13,7 @@ from omegalax.data.pretrain_statepassing import (
     STATEPASSING_CURRICULUM_INDEX_FORMAT,
     STATEPASSING_FIXED_C_INDEX_FORMAT,
 )
+from omegalax.data.rollout_teacher_pipeline import ROLLOUT_TEACHER_INDEX_FORMAT
 from omegalax.evals import runner
 from omegalax.evals.runner import CheckpointEvalRequest
 from omegalax.training_contract import (
@@ -47,6 +48,33 @@ def _write_metadata(path: Path, metadata: dict) -> None:
     (path / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
 
 
+def _teacher_index_metadata(**overrides) -> dict:
+    values = {
+        "format": ROLLOUT_TEACHER_INDEX_FORMAT,
+        "version": 1,
+        "selection": "graded",
+        "segment_length": 4096,
+        "segment_buckets": [8, 16, 32],
+        "target_capacities": [21504, 43008, 101376],
+        "source": {"dataset_binding": "sha-dataset", "scoring_binding": "sha-scoring"},
+        "index_binding": "sha-index",
+    }
+    values.update(overrides)
+    return values
+
+
+def _teacher_run(**overrides) -> dict:
+    values = {
+        "objective": "teacher_top512_special_tail_kl",
+        "pretrain_mode": "statepassing_bptt",
+        "bptt_chunks": 4,
+        "seed": 0,
+        "batch_size": 32,
+    }
+    values.update(overrides)
+    return values
+
+
 class TrainingContractTest(absltest.TestCase):
     def test_last_to_first_routing_is_resume_protected_without_changing_eval_config(self):
         with test_temp_dir() as tmp:
@@ -75,6 +103,67 @@ class TrainingContractTest(absltest.TestCase):
             ensure_training_contract(checkpoint, last_to_first)
             with self.assertRaisesRegex(ValueError, "conflicts"):
                 ensure_training_contract(checkpoint, same_layer)
+
+    def test_teacher_contract_binds_index_and_run_and_blocks_changed_resume(self):
+        with test_temp_dir() as tmp:
+            tmpdir = Path(tmp)
+            _write_metadata(tmpdir / "index", _teacher_index_metadata())
+            contract = build_training_contract(
+                tmpdir / "index", **_state_config(), teacher_distillation=_teacher_run()
+            )
+
+            self.assertEqual(
+                contract["teacher_distillation"],
+                _teacher_run()
+                | {
+                    "index_binding": "sha-index",
+                    "selection": "graded",
+                    "segment_length": 4096,
+                    "segment_buckets": [8, 16, 32],
+                    "target_capacities": [21504, 43008, 101376],
+                    "dataset_binding": "sha-dataset",
+                    "scoring_binding": "sha-scoring",
+                },
+            )
+            checkpoint = tmpdir / "checkpoint"
+            ensure_training_contract(checkpoint, contract)
+            self.assertEqual(resolve_eval_config(checkpoint, 7, None).c_train, 32)
+
+            _write_metadata(tmpdir / "correct", _teacher_index_metadata(selection="correct"))
+            changed = {
+                "selection": build_training_contract(
+                    tmpdir / "correct", **_state_config(), teacher_distillation=_teacher_run()
+                ),
+                "bptt_chunks": build_training_contract(
+                    tmpdir / "index",
+                    **_state_config(),
+                    teacher_distillation=_teacher_run(bptt_chunks=2),
+                ),
+                "seed": build_training_contract(
+                    tmpdir / "index", **_state_config(), teacher_distillation=_teacher_run(seed=1)
+                ),
+            }
+            for name, changed_contract in changed.items():
+                with self.subTest(name), self.assertRaisesRegex(ValueError, "conflicts"):
+                    ensure_training_contract(checkpoint, changed_contract)
+
+    def test_teacher_settings_require_teacher_index_and_vice_versa(self):
+        with test_temp_dir() as tmp:
+            tmpdir = Path(tmp)
+            _write_metadata(tmpdir / "teacher", _teacher_index_metadata())
+            _write_metadata(
+                tmpdir / "fixed_c",
+                {"format": STATEPASSING_FIXED_C_INDEX_FORMAT, "num_segments": 4},
+            )
+            with self.assertRaisesRegex(ValueError, "required exactly"):
+                build_training_contract(tmpdir / "teacher", **_state_config())
+            with self.assertRaisesRegex(ValueError, "required exactly"):
+                build_training_contract(
+                    tmpdir / "fixed_c", **_state_config(), teacher_distillation=_teacher_run()
+                )
+            self.assertNotIn(
+                "teacher_distillation", build_training_contract(tmpdir / "fixed_c", **_state_config())
+            )
 
     def test_fixed_c_contract_resolves_actual_num_segments(self):
         with test_temp_dir() as tmp:

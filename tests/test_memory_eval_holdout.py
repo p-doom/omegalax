@@ -144,6 +144,32 @@ class MemoryEvalHoldoutTest(absltest.TestCase):
                 final_holdout=True,
             )
 
+    def test_final_holdout_can_exclude_prior_final_holdout(self):
+        eval_config = _config(MemoryTaskSplit.EVAL)
+        stream = _empty_training_stream()
+        gate = build_pollution_free_manifest(eval_config, num_pairs=1, training_streams=(stream,))
+        with tempfile.TemporaryDirectory() as tmp:
+            gate_path = Path(tmp) / "gate.json"
+            prior_path = Path(tmp) / "prior.json"
+            _write_manifest(gate_path, gate)
+            prior = build_pollution_free_manifest(
+                eval_config,
+                num_pairs=1,
+                training_streams=(stream,),
+                exclude_manifests=(gate_path,),
+                final_holdout=True,
+            )
+            _write_manifest(prior_path, prior)
+            current = build_pollution_free_manifest(
+                eval_config,
+                num_pairs=1,
+                training_streams=(stream,),
+                exclude_manifests=(gate_path, prior_path),
+                final_holdout=True,
+            )
+            self.assertEqual(current["pair_indices"], [2])
+            validate_pollution_free_manifest(current)
+
     def test_validator_fails_closed_when_exclusion_file_changes(self):
         eval_config = _config(MemoryTaskSplit.EVAL)
         stream = _empty_training_stream()

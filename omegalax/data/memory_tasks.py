@@ -551,6 +551,220 @@ def build_memory_task_batch(
     }
 
 
+def build_memory_interference_batch(
+    pair_indices: Sequence[int],
+    config: MemoryTaskConfig,
+    *,
+    eval_num_segments: int,
+    structured: bool,
+    flatten: bool,
+) -> dict[str, object]:
+    """Insert matched filler or task-shaped segments before the original query."""
+    if eval_num_segments < config.num_segments:
+        raise ValueError("eval_num_segments must be >= the trained num_segments")
+    max_segments = {
+        MemoryTask.EXACT: 32,
+        MemoryTask.DOMINANT_RULE: 32,
+        MemoryTask.ASSOCIATIVE_BANK: 8,
+        MemoryTask.RULE_BANK: 9,
+    }[config.task]
+    if eval_num_segments > max_segments:
+        raise ValueError(f"eval_num_segments must be <= {max_segments} for {config.task}")
+    if config.task in (MemoryTask.EXACT, MemoryTask.DOMINANT_RULE):
+        if config.num_segments != 2 or config.segment_length != 16:
+            raise ValueError("L16 interference tasks require the original C2 geometry")
+        if config.task is MemoryTask.EXACT and not (
+            (config.num_exact_bindings == 3 and config.exact_sequence_length == 1)
+            or (config.num_exact_bindings == 1 and config.exact_sequence_length == 7)
+        ):
+            raise ValueError("Exact interference requires K3 or D7")
+        if config.task is MemoryTask.DOMINANT_RULE and config.num_rule_examples != 5:
+            raise ValueError("Dominant-rule interference requires five original demos")
+    if config.task is MemoryTask.DOMINANT_RULE and (eval_num_segments - 2) % 2:
+        raise ValueError("Dominant-rule extensions require an even number of segments")
+
+    base = build_memory_task_batch(pair_indices, config, flatten=False)
+    original = base["token_ids_BCT"]
+    num_added = eval_num_segments - config.num_segments
+    num_windows, _, segment_length = original.shape
+    tokens = np.empty((num_windows, eval_num_segments, segment_length), dtype=np.int32)
+    tokens[:, : config.num_segments - 1] = original[:, :-1]
+    tokens[:, -1] = original[:, -1]
+
+    for pair_offset, pair_index in enumerate(pair_indices):
+        source = original[2 * pair_offset]
+        if config.task is MemoryTask.ASSOCIATIVE_BANK and config.split is MemoryTaskSplit.EVAL:
+            random_index = int(pair_index) // _BANK_NUM_SLOTS
+        else:
+            random_index = int(pair_index)
+        entropy = (
+            config.seed,
+            random_index,
+            list(MemoryTask).index(config.task),
+            int(config.split is MemoryTaskSplit.EVAL),
+            config.generator_version,
+        )
+        filler_rng = np.random.default_rng(np.random.SeedSequence((*entropy, 2)))
+        added = filler_rng.integers(
+            _BANK_FILLER_START
+            if config.task in (MemoryTask.ASSOCIATIVE_BANK, MemoryTask.RULE_BANK)
+            else _FILLER_START,
+            _BANK_FILLER_END
+            if config.task in (MemoryTask.ASSOCIATIVE_BANK, MemoryTask.RULE_BANK)
+            else config.vocab_size,
+            size=(num_added, segment_length),
+            dtype=np.int32,
+        )
+        if structured and num_added:
+            rng = np.random.default_rng(np.random.SeedSequence((*entropy, 3)))
+            if config.task is MemoryTask.EXACT and config.exact_sequence_length == 7:
+                original_key = int(source[0, 2])
+                keys = rng.permutation(_KEYS[_KEYS != original_key])
+                for segment in range(num_added):
+                    values = rng.choice(_VALUES, size=7)
+                    added[segment, :10] = (_EXACT_TASK, _BIND, keys[segment % len(keys)], *values)
+            elif config.task is MemoryTask.EXACT:
+                original_keys = source[0, 2:10:3]
+                keys = rng.permutation(_KEYS[~np.isin(_KEYS, original_keys)])
+                values_by_key = {}
+                tag = _BIND if config.relevance_cue is MemoryTaskCue.SURPRISE else _DECOY_BIND
+                for slot in range(5 * num_added):
+                    key = int(keys[slot % len(keys)])
+                    if key not in values_by_key:
+                        values_by_key[key] = int(rng.choice(_VALUES))
+                    segment, pos = divmod(slot, 5)
+                    added[segment, 3 * pos : 3 * pos + 3] = (tag, key, values_by_key[key])
+            elif config.task is MemoryTask.DOMINANT_RULE:
+                used_items = np.append(source[0, 2:16:3], source[-1, -3])
+                available = rng.permutation(_RULE_ITEMS[~np.isin(_RULE_ITEMS, used_items)])
+                pools = (available[: len(available) // 2], available[len(available) // 2 :])
+                counts = [0, 0]
+                for segment_pair in range(num_added // 2):
+                    labels = np.asarray([0] * 5 + [1] * 5)
+                    rng.shuffle(labels)
+                    for offset, label in enumerate(labels):
+                        segment, pos = divmod(10 * segment_pair + offset, 5)
+                        item = pools[label][counts[label] % len(pools[label])]
+                        counts[label] += 1
+                        added[segment, 3 * pos : 3 * pos + 3] = (_DEMO, item, _RULE_LABELS[label])
+            elif config.task is MemoryTask.ASSOCIATIVE_BANK:
+                original_keys = original[2 * pair_offset, :3]
+                used_keys = np.concatenate(
+                    (original_keys[0, 2:25:3], original_keys[1:, 1:24:3].reshape(-1))
+                )
+                keys = rng.permutation(_BANK_KEYS[~np.isin(_BANK_KEYS, used_keys)])
+                for slot in range(8 * num_added):
+                    segment, pos = divmod(slot, 8)
+                    added[segment, 3 * pos : 3 * pos + 3] = (
+                        _BIND,
+                        keys[slot],
+                        rng.choice(_BANK_VALUES[: config.bank_value_alphabet]),
+                    )
+            elif config.task is MemoryTask.RULE_BANK:
+                original_demos = source[:4, 1:57].reshape(-1, 4)
+                items = rng.permutation(
+                    _RULE_BANK_ITEMS[~np.isin(_RULE_BANK_ITEMS, original_demos[:, 2])]
+                )
+                query_namespace = int(source[-1, -3])
+                namespaces = np.repeat(
+                    _RULE_BANK_NAMESPACES[_RULE_BANK_NAMESPACES != query_namespace], 2
+                )
+                for segment in range(num_added):
+                    for pos, namespace in enumerate(rng.permutation(namespaces)):
+                        added[segment, 0] = _RULE_BANK_TASK
+                        added[segment, 1 + 4 * pos : 5 + 4 * pos] = (
+                            _DEMO,
+                            namespace,
+                            items[14 * segment + pos],
+                            rng.choice(_RULE_BANK_LABELS),
+                        )
+        tokens[2 * pair_offset : 2 * pair_offset + 2, config.num_segments - 1 : -1] = added
+
+    loss_mask = np.zeros_like(tokens)
+    loss_mask[:, -1] = base["loss_mask_BCT"][:, -1]
+    metadata = dict(base[BATCH_PRETRAIN_METADATA_KEY])
+    if config.task is MemoryTask.ASSOCIATIVE_BANK:
+        metadata["target_age_B"] = eval_num_segments - 1 - metadata["target_segment_B"]
+    attention_mask = np.ones_like(tokens)
+    if flatten:
+        return {
+            "token_ids_BT": tokens.reshape(num_windows, -1),
+            "attention_mask_BT": attention_mask.reshape(num_windows, -1),
+            "loss_mask_BT": loss_mask.reshape(num_windows, -1),
+            "chunk_idx_B": np.zeros(num_windows, dtype=np.int32),
+            BATCH_PRETRAIN_METADATA_KEY: metadata,
+        }
+    chunk_idx = np.broadcast_to(
+        np.arange(eval_num_segments, dtype=np.int32), (num_windows, eval_num_segments)
+    ).copy()
+    reset_state = np.zeros((num_windows, eval_num_segments), dtype=np.bool_)
+    reset_state[:, 0] = True
+    return {
+        "token_ids_BCT": tokens,
+        "attention_mask_BCT": attention_mask,
+        "loss_mask_BCT": loss_mask,
+        "chunk_idx_BC": chunk_idx,
+        "reset_state_BC": reset_state,
+        BATCH_PRETRAIN_METADATA_KEY: metadata,
+    }
+
+
+def build_double_marked_eval_batch(
+    pair_indices: Sequence[int],
+    config: MemoryTaskConfig,
+    *,
+    eval_num_segments: int,
+    variant: str,
+) -> dict[str, object]:
+    if (
+        config.task is not MemoryTask.EXACT
+        or config.relevance_cue is not MemoryTaskCue.MARKED
+        or config.num_exact_bindings != 3
+        or config.exact_sequence_length != 1
+        or config.num_segments != 2
+        or config.segment_length != 16
+    ):
+        raise ValueError("Double-marked eval requires Exact Marked K3 at C2/L16")
+    if variant not in ("one", "first", "second"):
+        raise ValueError("Double-marked variant must be one, first, or second")
+    batch = build_memory_interference_batch(
+        pair_indices, config, eval_num_segments=eval_num_segments, structured=False, flatten=False
+    )
+    if variant == "one":
+        return batch
+
+    tokens = batch["token_ids_BCT"]
+    metadata = batch[BATCH_PRETRAIN_METADATA_KEY]
+    for pair_offset, pair_index in enumerate(pair_indices):
+        source = tokens[2 * pair_offset : 2 * pair_offset + 2, 0]
+        keys = source[0, 2:10:3]
+        values = source[:, 3:10:3]
+        entropy = (
+            config.seed,
+            int(pair_index),
+            list(MemoryTask).index(config.task),
+            int(config.split is MemoryTaskSplit.EVAL),
+            config.generator_version,
+            4,
+        )
+        rng = np.random.default_rng(np.random.SeedSequence(entropy))
+        new_key = int(rng.choice(_KEYS[~np.isin(_KEYS, keys)]))
+        new_values = rng.choice(_VALUES[~np.isin(_VALUES, values)], size=2, replace=False)
+        for world in (0, 1):
+            row = 2 * pair_offset + world
+            tokens[row, 1, :3] = (_BIND, new_key, new_values[world])
+            if variant == "second":
+                tokens[row, -1, -5:] = (_EXACT_TASK, _QUERY, new_key, _ANSWER, new_values[world])
+    if variant == "second":
+        metadata["answer_token_B"] = tokens[:, -1, -1].copy()
+        metadata["answer_tokens_BD"] = tokens[:, -1, -1:].copy()
+        metadata["target_slot_B"] = np.full(tokens.shape[0], 3, dtype=np.int32)
+    metadata["target_segment_B"] = np.full(
+        tokens.shape[0], int(variant == "second"), dtype=np.int32
+    )
+    return batch
+
+
 @dataclasses.dataclass(frozen=True, slots=True)
 class _PairIndex:
     dp_size: int
