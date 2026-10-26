@@ -188,7 +188,7 @@ flags.DEFINE_integer("grain_worker_buffer_size", 1, "Grain worker buffer size.")
 flags.DEFINE_integer("gc_period", 0, "If >0, collect Python GC every N steps.")
 flags.DEFINE_enum(
     "text_attn_backend",
-    "mosaic_gpu",
+    None,
     ["mosaic_tpu", "mosaic_gpu", "cudnn", "xla", "triton"],
     "Attention backend for full-attention layers.",
 )
@@ -790,8 +790,7 @@ def main(_) -> None:
 
     if last_metrics and teacher_objective:
         print(
-            f"finished step={int(last_metrics['step'])} "
-            f"teacher_kl={last_metrics['teacher_kl']:.4f}"
+            f"finished step={int(last_metrics['step'])} teacher_kl={last_metrics['teacher_kl']:.4f}"
         )
     elif last_metrics:
         print(f"finished step={int(last_metrics['step'])} nll={last_metrics['nll']:.4f}")

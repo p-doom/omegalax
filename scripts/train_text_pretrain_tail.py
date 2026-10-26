@@ -127,7 +127,7 @@ flags.DEFINE_integer(
 flags.DEFINE_enum(
     "resume", ResumeMode.IF_PRESENT.value, [m.value for m in ResumeMode], "Resume policy."
 )
-flags.DEFINE_string("text_attn_backend", "mosaic_gpu", "Text attention backend.")
+flags.DEFINE_string("text_attn_backend", None, "Text attention backend.")
 flags.DEFINE_string("jax_cache_dir", "/tmp/jax_cache", "JAX compilation cache.")
 flags.DEFINE_string("peak_tflops", None, "Peak TFLOPS specification.")
 flags.DEFINE_integer("gc_period", 0, "Disable automatic GC and collect every N steps if positive.")

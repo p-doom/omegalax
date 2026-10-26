@@ -59,7 +59,7 @@ class MemoryTaskSubmitterTest(absltest.TestCase):
         self.assertIn(f"WANDB_DIR={tmpdir / 'logs' / 'wandb'}", script)
         self.assertIn(f"WANDB_CACHE_DIR={tmpdir / 'wandb_cache'}", script)
         self.assertIn('mkdir -p "$LOG_DIR" "$WANDB_DIR" "$WANDB_CACHE_DIR"', script)
-        self.assertIn("--text_attn_backend=mosaic_gpu", script)
+        self.assertNotIn("--text_attn_backend", script)
         self.assertIn("--resume=if_present", script)
         self.assertIn("srun --cpu-bind=none", script)
         self.assertNotIn("trap on_usr1 USR1", script)

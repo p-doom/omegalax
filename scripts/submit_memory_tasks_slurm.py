@@ -61,14 +61,13 @@ def _validate_train_args(args: list[str]) -> list[str]:
             raise ValueError(f"--{name} is required in train_args")
     if not re.fullmatch(r"[0-9a-fA-F]{64}", _flag_value(args, "run_plan_sha256")):
         raise ValueError("--run_plan_sha256 must be exactly 64 hexadecimal characters")
-    for name in ("resume", "text_attn_backend"):
-        if _flag_value(args, name) is not None:
-            raise ValueError(f"--{name} is set by the renderer and must not appear in train_args")
+    if _flag_value(args, "resume") is not None:
+        raise ValueError("--resume is set by the renderer and must not appear in train_args")
     return args
 
 
 def _command_lines(train_args: list[str]) -> str:
-    forced_args = ["--resume=if_present", "--text_attn_backend=mosaic_gpu"]
+    forced_args = ["--resume=if_present"]
     all_args = [*train_args, *forced_args]
     return shlex.join(all_args)
 

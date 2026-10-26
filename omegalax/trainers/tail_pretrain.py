@@ -395,7 +395,7 @@ def run_tail_pretrain(
     fsdp_size: int | None = None,
     dp_size: int | None = None,
     wandb_run=None,
-    text_attn_backend: str = "mosaic_gpu",
+    text_attn_backend: str | None = None,
     bptt_chunks: int | None = None,
     pass_gdn_state: bool = True,
     gdn_layer_limit: int | None = None,
@@ -525,7 +525,8 @@ def run_tail_pretrain(
             will_resume=will_resume,
         )
 
-    set_attn_backend(model, text_backend=text_attn_backend)
+    if text_attn_backend is not None:
+        set_attn_backend(model, text_backend=text_attn_backend)
     schedule = build_tail_schedule(config)
     with mesh_rules(mesh):
         optimizer = build_tail_optimizer(model, schedule, config, wrt=wrt_filter)

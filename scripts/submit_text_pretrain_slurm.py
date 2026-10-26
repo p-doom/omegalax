@@ -130,6 +130,11 @@ flags.DEFINE_enum(
 )
 flags.DEFINE_bool("submit_pass_rope_positions", False, "Pass chunk-aware RoPE position ids.")
 flags.DEFINE_bool("submit_pass_conv_state", False, "Pass 1D conv state between chunks.")
+flags.DEFINE_string(
+    "submit_text_attn_backend",
+    None,
+    "Optional text attention backend; unset uses the model default.",
+)
 flags.DEFINE_integer("submit_grain_read_threads", 2, "Grain read threads.")
 flags.DEFINE_integer(
     "submit_grain_read_prefetch_buffer_size", 4, "Grain read prefetch buffer size."
@@ -603,7 +608,6 @@ def _train_flags(
         f"--val_steps={_flag_value('submit_val_steps')}",
         "--peak_tflops=h100_sxm",
         "--resume=if_present",
-        "--text_attn_backend=mosaic_gpu",
         f"--pass_gdn_state={_flag_value('submit_pass_gdn_state')}",
         f"--gdn_state_routing={_flag_value('submit_gdn_state_routing')}",
         f"--pass_rope_positions={_flag_value('submit_pass_rope_positions')}",
@@ -625,6 +629,9 @@ def _train_flags(
     gdn_layer_limit = _flag_value("submit_gdn_layer_limit")
     if gdn_layer_limit is not None:
         flags_out.append(f"--gdn_layer_limit={gdn_layer_limit}")
+    text_attn_backend = _flag_value("submit_text_attn_backend")
+    if text_attn_backend is not None:
+        flags_out.append(f"--text_attn_backend={text_attn_backend}")
     if single_process_per_run:
         flags_out.extend(["--iterator_fsdp_size=1", "--iterator_dp_size=1"])
     elif single_process_per_node:

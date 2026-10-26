@@ -486,7 +486,10 @@ def _statepassing_hidden_states(
             reset_state_BC[:, 1:],
         )
         hidden_BT_D = jnp.concatenate(
-            [first_hidden, remaining_hidden.reshape(first_hidden.shape[0], -1, first_hidden.shape[2])],
+            [
+                first_hidden,
+                remaining_hidden.reshape(first_hidden.shape[0], -1, first_hidden.shape[2]),
+            ],
             axis=1,
         )
         aux_loss = jnp.sum(jnp.concatenate([first_aux[None], remaining_aux])) / float(C)
@@ -1114,7 +1117,7 @@ def run_pretrain(
     val_data_iter: checkpoint_utils.GrainIterator | None = None,
     val_every: int | None = None,
     val_steps: int = 10,
-    text_attn_backend: str = "mosaic_gpu",
+    text_attn_backend: str | None = None,
     gc_period: int = 0,
     bptt_chunks: int | None = None,
     pass_gdn_state: bool = True,
@@ -1263,7 +1266,8 @@ def run_pretrain(
         )
     from omegalax.models.sharding_runtime import set_attn_backend
 
-    set_attn_backend(model, text_backend=text_attn_backend)
+    if text_attn_backend is not None:
+        set_attn_backend(model, text_backend=text_attn_backend)
     with mesh_rules(mesh):
         optimizer = build_optimizer(
             model,
@@ -1705,7 +1709,7 @@ def run_statepassing_curriculum(
     fsdp_size: int | None = None,
     dp_size: int | None = None,
     wandb_run=None,
-    text_attn_backend: str = "mosaic_gpu",
+    text_attn_backend: str | None = None,
     gc_period: int = 0,
     bptt_chunks: int | None = None,
     pass_gdn_state: bool = True,
@@ -1780,7 +1784,8 @@ def run_statepassing_curriculum(
     )
     from omegalax.models.sharding_runtime import set_attn_backend
 
-    set_attn_backend(model, text_backend=text_attn_backend)
+    if text_attn_backend is not None:
+        set_attn_backend(model, text_backend=text_attn_backend)
     with mesh_rules(mesh):
         optimizer = build_optimizer(model, train_cfg)
 

@@ -160,7 +160,7 @@ def _parser() -> argparse.ArgumentParser:
         type=int,
         help="Require the latest checkpoint to have exactly this global step.",
     )
-    parser.add_argument("--text_attn_backend", default="mosaic_gpu")
+    parser.add_argument("--text_attn_backend", default="triton")
     parser.add_argument("--jax_cache_dir", type=Path, required=True)
     parser.add_argument("--run_plan_sha256", required=True, type=_sha256_arg)
     parser.add_argument("--success_criterion", required=True)

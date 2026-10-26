@@ -1610,13 +1610,13 @@ class MemoryTaskTest(parameterized.TestCase):
                 {str(position) for position in range(7)},
             )
 
-    def test_training_cli_defaults_to_mosaic_gpu_attention(self):
+    def test_training_cli_defaults_to_triton_attention(self):
         action = next(
             action
             for action in train_memory_tasks._parser()._actions
             if action.dest == "text_attn_backend"
         )
-        self.assertEqual(action.default, "mosaic_gpu")
+        self.assertEqual(action.default, "triton")
 
     def test_eval_result_suffix_rejects_paths(self):
         with self.assertRaises(argparse.ArgumentTypeError):
