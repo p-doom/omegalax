@@ -121,8 +121,8 @@ def main():
 
         wandb_run = wandb.init(
             project=args.wandb_project,
-            name=f"rollouts_T{args.segment_length}",
-            id=f"{plan['plan_sha256'][:12]}_T{args.segment_length}",
+            name=f"rollouts_T{args.segment_length}_fast",
+            id=f"{plan['plan_sha256'][:12]}_T{args.segment_length}_fast",
             resume="allow",
             config=contract,
         )
