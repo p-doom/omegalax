@@ -436,6 +436,10 @@ class PretrainMaskAndLossTest(absltest.TestCase):
                 # Both programs sum the same fp32 terms in a different XLA order. That reordering
                 # grows with C but stays far below 1e-4 (the tolerance of the other BPTT
                 # equivalence tests here); a wrong state, reset or segment order is O(1e-1).
+                # Carrying RMT memory and conv state together makes this random model's chain
+                # ill-conditioned: an fp32-epsilon parameter perturbation moves its C=8 gradients
+                # by ~4e-2, and the reordering difference reaches ~5e-4 there.
+                grad_tol = 1e-3 if pass_conv_state and num_rmt_tokens else 1e-4
                 max_rel_l2 = 0.0
                 for scan_grad, loop_grad in zip(
                     jax.tree.leaves(scan_grads), jax.tree.leaves(loop_grads), strict=True
@@ -443,12 +447,12 @@ class PretrainMaskAndLossTest(absltest.TestCase):
                     scan_grad, loop_grad = np.asarray(scan_grad), np.asarray(loop_grad)
                     scale = float(np.abs(loop_grad).max())
                     np.testing.assert_allclose(
-                        scan_grad, loop_grad, rtol=0, atol=1e-4 * scale + 1e-12
+                        scan_grad, loop_grad, rtol=0, atol=grad_tol * scale + 1e-12
                     )
                     rel_l2 = float(np.linalg.norm(scan_grad - loop_grad)) / max(
                         float(np.linalg.norm(loop_grad)), 1e-30
                     )
-                    self.assertLess(rel_l2, 1e-4)
+                    self.assertLess(rel_l2, grad_tol)
                     max_rel_l2 = max(max_rel_l2, rel_l2)
                 print(
                     f"scan_vs_loop conv={pass_conv_state} rmt={num_rmt_tokens} C={C} "
