@@ -28,6 +28,7 @@ def main():
     parser.add_argument("--stop-after-update", type=int)
     parser.add_argument("--wandb-project")
     parser.add_argument("--text-attn-backend", default="triton")
+    parser.add_argument("--peak-tflops", default="h100_sxm")
     args = parser.parse_args()
     output = Path(args.output).resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -65,6 +66,7 @@ def main():
         PretrainMode,
     )
     from omegalax.trainers.checkpoint_utils import ResumeMode
+    from omegalax.trainers.perf import resolve_peak_tflops
 
     if (
         jax.process_count() != 1
@@ -150,6 +152,7 @@ def main():
         pass_conv_state=False,
         pass_rope_positions=False,
         text_attn_backend=args.text_attn_backend,
+        peak_tflops=resolve_peak_tflops(args.peak_tflops),
         wandb_run=wandb_run,
         val_data_iter=make_planned_rollout_teacher_iterator(
             plan, segment_length=args.segment_length, split="val"
