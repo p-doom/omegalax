@@ -749,6 +749,12 @@ def make_pretrain_train_step(
             optimizer.update(grads)
             metrics = dict(aux_metrics)
             metrics["grad_norm"] = optax.tree.norm(grads)
+            if getattr(cfg, "num_rmt_tokens", 0):
+                # Unclipped like grad_norm; clipping stays global over all parameters.
+                metrics["grad_norm_rmt_memory"] = optax.tree.norm(grads["rmt_memory"])
+                metrics["grad_norm_backbone"] = optax.tree.norm(
+                    {key: value for key, value in grads.items() if key != "rmt_memory"}
+                )
             return loss, metrics
 
         return teacher_train_step
@@ -1455,6 +1461,7 @@ def run_pretrain(
         common_update_start = time.perf_counter()
         accum = {}
         accum_grad_norm = 0.0
+        accum_rmt_grad_norms = {}
         accum_flops = 0.0
         accum_time = datetime.timedelta(0)
         accum_data_wait_s = 0.0
@@ -1533,6 +1540,9 @@ def run_pretrain(
             else:
                 _accumulate_metric_sums(accum, metrics)
             accum_grad_norm = accum_grad_norm + metrics["grad_norm"]
+            for key in ("grad_norm_rmt_memory", "grad_norm_backbone"):
+                if key in metrics:
+                    accum_rmt_grad_norms[key] = accum_rmt_grad_norms.get(key, 0.0) + metrics[key]
             accum_flops += micro_flops
             accum_time += micro_delta
 
@@ -1548,6 +1558,8 @@ def run_pretrain(
             else _finalize_accumulated_metrics(accum)
         )
         window_metrics["grad_norm"] = accum_grad_norm / accum_steps
+        for key, value in accum_rmt_grad_norms.items():
+            window_metrics[key] = value / accum_steps
         window_metrics["lr"] = current_lr
         window_metrics["total_tokens"] = (
             common_update_plan["updates"][step_idx]["cumulative_tokens"]

@@ -222,6 +222,22 @@ class CommonUpdateTest(unittest.TestCase):
         self.assertEqual(rmt_cm["total_tokens"], 4100)
         self.assertEqual(rmt_rm["teacher_targets"], 4)
         self.assertNotEqual(rmt_rm["teacher_kl"], rm["teacher_kl"])
+        # Unclipped RMT-memory and backbone gradient norms are logged only with RMT; with one
+        # microbatch per update they split grad_norm: grad_norm^2 = rmt^2 + backbone^2.
+        rmt_keys = {"grad_norm_rmt_memory", "grad_norm_backbone"}
+        self.assertFalse(rmt_keys & cm.keys())
+        self.assertLessEqual(rmt_keys, rmt_cm.keys())
+        for name, with_rmt in (("continuous", False), ("rmt_continuous", True)):
+            for line in (root / name / "update_metrics.jsonl").read_text().splitlines():
+                row = json.loads(line)
+                self.assertEqual(rmt_keys & row.keys(), rmt_keys if with_rmt else set())
+                if with_rmt:
+                    self.assertGreater(row["grad_norm_rmt_memory"], 0.0)
+                    np.testing.assert_allclose(
+                        row["grad_norm"] ** 2,
+                        row["grad_norm_rmt_memory"] ** 2 + row["grad_norm_backbone"] ** 2,
+                        rtol=1e-5,
+                    )
         # CLI: a deadline signal during the first update after a (re)start checkpoints and
         # requeues before any update is logged; the trainer must exit cleanly and resume. Only
         # the CLI's four-GPU guard sees GPUs (the run uses four real CPU devices), and a PATH
