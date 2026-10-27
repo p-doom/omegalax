@@ -7,7 +7,7 @@
 #SBATCH --mem=720G
 #SBATCH --gres=gpu:8
 #SBATCH --time=1-00:00:00
-#SBATCH --signal=USR1@600
+#SBATCH --signal=USR1@900
 set -euo pipefail
 SOURCE=$1 PLAN=$2 OUTPUT=$3 MODEL=$4
 shift 4
