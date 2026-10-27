@@ -206,6 +206,18 @@ class CommonUpdateTest(unittest.TestCase):
         self.assertEqual(per_update("nostate"), per_update("continuous"))
         self.assertEqual(nm["total_tokens"], cm["total_tokens"])
         self.assertNotEqual(nm["teacher_kl"], cm["teacher_kl"])
+        # Conv1D state passing through the full-BPTT segment scan.
+        _, conv_m = trainer.run_pretrain(
+            str(root / "pretrained"),
+            train_cfg,
+            iterator(),
+            save_dir=root / "conv",
+            pass_conv_state=True,
+            **kwargs,
+        )
+        self.assertEqual(per_update("conv"), per_update("continuous"))
+        self.assertEqual(conv_m["total_tokens"], cm["total_tokens"])
+        self.assertNotEqual(conv_m["teacher_kl"], cm["teacher_kl"])
         # CLI: a deadline signal during the first update after a (re)start checkpoints and
         # requeues before any update is logged; the trainer must exit cleanly and resume. Only
         # the CLI's four-GPU guard sees GPUs (the run uses four real CPU devices), and a PATH
