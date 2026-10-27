@@ -28,6 +28,7 @@ from absl.testing import absltest
 import omegalax
 from omegalax.data import rollout_teacher
 from omegalax.trainers import loss as loss_lib
+from omegalax.trainers import pretrain
 from omegalax.trainers.loss import chunked_teacher_kl_stats
 
 REPO = Path(__file__).resolve().parents[1]
@@ -343,7 +344,7 @@ def _boundary_kl_and_grad(block_size):
 
 
 @functools.cache
-def _boundary_nll_grad(block_size):
+def _boundary_nll_grad(block_size, key="teacher_boundary_nll_sum"):
     def nll_fn(hidden_BTD, kernel_DV, targets, token_ids_BT):
         _, _, stats = chunked_teacher_kl_stats(
             hidden_BTD,
@@ -352,7 +353,7 @@ def _boundary_nll_grad(block_size):
             block_size=block_size,
             boundary_token_ids_BT=token_ids_BT,
         )
-        return stats["teacher_boundary_nll_sum"]
+        return stats[key]
 
     return jax.jit(jax.grad(nll_fn, argnums=(0, 1)))
 
@@ -635,8 +636,72 @@ class TeacherBoundaryNLLTest(absltest.TestCase):
                 for grad, grad_b in zip(grads, grads_b):
                     self.assertTrue(np.isfinite(np.asarray(grad)).all())
                     np.testing.assert_array_equal(np.asarray(grad_b), np.asarray(grad))
-                for grad in _boundary_nll_grad(block)(hidden, kernel, targets, token_ids):
-                    self.assertFalse(np.any(np.asarray(grad)))
+                for key in (
+                    "teacher_boundary_nll_sum",
+                    "teacher_boundary_kl_sum",
+                    "teacher_nll_sum",
+                ):
+                    for grad in _boundary_nll_grad(block, key)(hidden, kernel, targets, token_ids):
+                        self.assertFalse(np.any(np.asarray(grad)))
+
+    def test_boundary_kl_is_the_mean_loss_kl_of_the_window_rows(self):
+        # b2 holds exactly one complete window, at 24576.
+        hidden, kernel, targets, token_ids = self._sub_batch([2])
+        kl, count, stats = _boundary_fn(256)(hidden, kernel, targets, token_ids)
+        target_pos = targets["teacher_positions_BR"] + 1
+        window_targets = dict(targets)
+        window_targets["teacher_mask_BR"] = (
+            targets["teacher_mask_BR"] & (target_pos >= 24576) & (target_pos < 24576 + WINDOW)
+        )
+        self.assertEqual(int(window_targets["teacher_mask_BR"].sum()), WINDOW)
+        (window_kl, window_count), _ = _kl_and_grad(256)(hidden, kernel, window_targets)
+        self.assertEqual(float(window_count), WINDOW)
+        self.assertEqual(float(stats["teacher_boundary_windows"]), 1.0)
+        self.assertEqual(float(stats["teacher_boundary_kl_tokens"]), WINDOW)
+        np.testing.assert_allclose(stats["teacher_boundary_kl_sum"], window_kl, rtol=1e-6)
+        reference_kl = _reference(hidden, kernel, window_targets)[0]
+        np.testing.assert_allclose(stats["teacher_boundary_kl_sum"], reference_kl, rtol=1e-5)
+        # The update metric is the mean per-position KL of those rows; the loss is unchanged.
+        acc = {}
+        pretrain._accumulate_teacher_metric_sums(
+            acc,
+            {
+                "teacher_kl_sum": kl,
+                "teacher_targets": count,
+                "context_tokens": 0.0,
+                "aux_loss": 0.0,
+                **stats,
+            },
+        )
+        out = pretrain._finalize_teacher_metrics(acc)
+        np.testing.assert_allclose(out["teacher_boundary_kl"], float(window_kl) / WINDOW, rtol=1e-6)
+        (plain_kl, plain_count), _ = _kl_and_grad(256)(hidden, kernel, targets)
+        np.testing.assert_array_equal(kl, plain_kl)
+        self.assertEqual(out["teacher_kl"], float(plain_kl) / float(plain_count))
+
+    def test_teacher_nll_is_the_next_token_nll_of_all_target_rows(self):
+        kl, count, stats = _boundary_fn(256)(self.hidden, self.kernel, self.targets, self.token_ids)
+        h, w = np.asarray(self.hidden, np.float64), np.asarray(self.kernel, np.float64)
+        reference = 0.0
+        for b, r in zip(*np.nonzero(self.targets["teacher_mask_BR"])):
+            pos = self.targets["teacher_positions_BR"][b, r]
+            z = h[b, pos] @ w
+            reference += _lse(z) - z[self.token_ids[b, pos + 1]]
+        self.assertEqual(float(stats["teacher_nll_tokens"]), float(count))
+        np.testing.assert_allclose(stats["teacher_nll_sum"], reference, rtol=1e-5)
+        acc = {}
+        pretrain._accumulate_teacher_metric_sums(
+            acc,
+            {
+                "teacher_kl_sum": kl,
+                "teacher_targets": count,
+                "context_tokens": 0.0,
+                "aux_loss": 0.0,
+                **stats,
+            },
+        )
+        out = pretrain._finalize_teacher_metrics(acc)
+        np.testing.assert_allclose(out["teacher_nll"], reference / float(count), rtol=1e-5)
 
     def test_rejects_token_ids_of_another_layout(self):
         with self.assertRaisesRegex(ValueError, "boundary_token_ids_BT"):

@@ -933,8 +933,12 @@ _TEACHER_SUM_METRICS = (
     "aux_loss",
     "teacher_boundary_nll_sum",
     "teacher_boundary_nll_tokens",
+    "teacher_boundary_kl_sum",
+    "teacher_boundary_kl_tokens",
     "teacher_boundary_windows",
     "teacher_boundary_rollouts",
+    "teacher_nll_sum",
+    "teacher_nll_tokens",
 )
 
 
@@ -961,13 +965,22 @@ def _finalize_teacher_metrics(acc: dict[str, float]) -> dict[str, float]:
     for key in (
         "teacher_boundary_nll_sum",
         "teacher_boundary_nll_tokens",
+        "teacher_boundary_kl_sum",
+        "teacher_boundary_kl_tokens",
         "teacher_boundary_windows",
         "teacher_boundary_rollouts",
+        "teacher_nll_sum",
+        "teacher_nll_tokens",
     ):
         out[key] = acc.get(key, 0.0)
+    if out["teacher_nll_tokens"] > 0:
+        out["teacher_nll"] = out["teacher_nll_sum"] / out["teacher_nll_tokens"]
     if out["teacher_boundary_windows"] > 0:
         out["teacher_boundary_nll"] = (
             out["teacher_boundary_nll_sum"] / out["teacher_boundary_nll_tokens"]
+        )
+        out["teacher_boundary_kl"] = (
+            out["teacher_boundary_kl_sum"] / out["teacher_boundary_kl_tokens"]
         )
     return out
 
