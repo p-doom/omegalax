@@ -179,6 +179,8 @@ def forward_with_gdn_state(
     position_ids_ZBT: jax.Array | None = None,
     return_conv_states: bool = False,
     cache=None,
+    block_pos_BT: jax.Array | None = None,
+    conv_block_pos_BT: jax.Array | None = None,
 ) -> (
     tuple[jax.Array, jax.Array, tuple[jax.Array, ...]]
     | tuple[jax.Array, jax.Array, tuple[jax.Array, ...], tuple[jax.Array, ...]]
@@ -202,6 +204,8 @@ def forward_with_gdn_state(
             position_ids_ZBT=position_ids_ZBT,
             return_gdn_states=True,
             return_conv_states=return_conv_states,
+            block_pos_BT=block_pos_BT,
+            conv_block_pos_BT=conv_block_pos_BT,
         )
     raise ValueError("GDN state forwarding is only supported for Qwen3.5 text models.")
 

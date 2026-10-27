@@ -226,6 +226,8 @@ class DecoderLayer(nnx.Module):
         conv_initial_state_BCS: jax.Array | None = None,
         return_conv_state: bool = False,
         cache=None,
+        block_pos_BT: jax.Array | None = None,
+        conv_block_pos_BT: jax.Array | None = None,
     ) -> (
         tuple[jax.Array, jax.Array]
         | tuple[jax.Array, jax.Array, jax.Array | None]
@@ -244,6 +246,7 @@ class DecoderLayer(nnx.Module):
                 segment_ids_BT,
                 position_ids_BT,
                 cache=cache,
+                block_pos_BT=block_pos_BT,
             )
         else:
             needs_stateful_call = (
@@ -260,13 +263,16 @@ class DecoderLayer(nnx.Module):
                     initial_conv_state_BCS=conv_initial_state_BCS,
                     return_final_state=True,
                     return_conv_state=return_conv_state or conv_initial_state_BCS is not None,
+                    block_pos_BT=conv_block_pos_BT,
                 )
                 if return_conv_state or conv_initial_state_BCS is not None:
                     attn_out_BTD, gdn_final_state_BHAU, conv_final_state_BCS = linear_result
                 else:
                     attn_out_BTD, gdn_final_state_BHAU = linear_result
             else:
-                attn_out_BTD = self.linear_attn(normed_BTD, attention_mask_BT)
+                attn_out_BTD = self.linear_attn(
+                    normed_BTD, attention_mask_BT, block_pos_BT=conv_block_pos_BT
+                )
 
         hidden_BTD = residual_BTD + attn_out_BTD
 
@@ -301,6 +307,8 @@ class DecoderLayer(nnx.Module):
         conv_initial_state_BCS: jax.Array | None = None,
         return_conv_state: bool = False,
         cache=None,
+        block_pos_BT: jax.Array | None = None,
+        conv_block_pos_BT: jax.Array | None = None,
     ):
         return self._forward(
             hidden_BTD,
@@ -314,6 +322,8 @@ class DecoderLayer(nnx.Module):
             conv_initial_state_BCS,
             return_conv_state,
             cache,
+            block_pos_BT,
+            conv_block_pos_BT,
         )
 
 
@@ -351,6 +361,8 @@ class TextModel(nnx.Module):
         cache=None,
         return_gdn_states: bool = False,
         return_conv_states: bool = False,
+        block_pos_BT: jax.Array | None = None,
+        conv_block_pos_BT: jax.Array | None = None,
     ) -> (
         tuple[jax.Array, jax.Array]
         | tuple[jax.Array, jax.Array, tuple[jax.Array, ...]]
@@ -422,6 +434,7 @@ class TextModel(nnx.Module):
                     None,
                     False,
                     None if cache is None else cache[layer_idx],
+                    block_pos_BT,
                 )
                 if cache is None:
                     hidden_BTD, aux = layer(*layer_args)
@@ -449,6 +462,8 @@ class TextModel(nnx.Module):
                         init_conv_state,
                         want_conv_state,
                         None,
+                        block_pos_BT,
+                        conv_block_pos_BT,
                     )
                     if want_gdn_state and want_conv_state:
                         hidden_BTD, aux, final_state, final_conv_state = layer_result
@@ -475,6 +490,8 @@ class TextModel(nnx.Module):
                         None,
                         False,
                         None,
+                        block_pos_BT,
+                        conv_block_pos_BT,
                     )
                 gdn_state_idx += 1
             aux_losses.append(aux)
@@ -529,6 +546,8 @@ class Qwen3_5ForCausalLM(nnx.Module):
         position_ids_ZBT: jax.Array | None = None,
         return_gdn_states: bool = False,
         return_conv_states: bool = False,
+        block_pos_BT: jax.Array | None = None,
+        conv_block_pos_BT: jax.Array | None = None,
     ):
         del num_right_pads
         return self.text(
@@ -540,6 +559,8 @@ class Qwen3_5ForCausalLM(nnx.Module):
             cache=cache,
             return_gdn_states=return_gdn_states,
             return_conv_states=return_conv_states,
+            block_pos_BT=block_pos_BT,
+            conv_block_pos_BT=conv_block_pos_BT,
         )
 
 

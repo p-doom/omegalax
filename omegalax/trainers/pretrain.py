@@ -326,6 +326,7 @@ def prepare_pretrain_batch(
     global_batch_size: int,
     pass_rope_positions: bool = False,
     training_objective: TrainingObjective | str = TrainingObjective.NEXT_TOKEN,
+    block_len: int | None = None,
 ) -> tuple[dict[str, jax.Array], dict[str, Any] | None, dict[str, Any]]:
     training_objective = TrainingObjective(training_objective)
     teacher_objective = training_objective is TrainingObjective.TEACHER_TOP512_SPECIAL_TAIL_KL
@@ -382,6 +383,10 @@ def prepare_pretrain_batch(
                     "pass_rope_positions=True requires chunk_idx_BC in statepassing batches"
                 )
             device_batch["chunk_idx_BC"] = chunk_idx_BC
+    if block_len is not None:
+        # Every rollout starts at a piece start, so a token's position in its T-block is t mod T.
+        B, C, T = device_batch["token_ids_BCT"].shape
+        device_batch["block_pos_BCT"] = np.tile(np.arange(T, dtype=np.int32) % block_len, (B, C, 1))
     return text_api.shard_batch_dict(device_batch, model_cfg, mesh), metadata, debug
 
 
@@ -437,6 +442,10 @@ def _statepassing_hidden_states(
     reset_state_BC = batch["reset_state_BC"]
     C = token_ids_BCT.shape[1]
     chunk_idx_BC = batch.get("chunk_idx_BC")
+    # Block-local curriculum: position of every token inside its T-block of a longer piece. It
+    # sets the RoPE positions and the block-local attention mask, and resets the conv at every
+    # block start unless the conv state is passed (then the conv runs on, as across segments).
+    block_pos_BCT = batch.get("block_pos_BCT")
     if pass_rope_positions and chunk_idx_BC is None:
         raise KeyError("pass_rope_positions=True requires chunk_idx_BC in statepassing batches")
     resolved_bptt_chunks = _resolve_bptt_chunks(
@@ -450,14 +459,24 @@ def _statepassing_hidden_states(
         and gdn_state_routing == GdnStateRouting.SAME_LAYER
         and not pass_rope_positions
     ):
+        if block_pos_BCT is not None and not pass_gdn_state:
+            raise ValueError(
+                "block_pos_BCT requires GDN state passing; the GDN runs through pieces"
+            )
+
         # Carry = (GDN states, conv states or None), each reset at the same rows and
         # segments as in the unrolled path.
-        def forward_segment(model, carry, token_ids_BT, attention_mask_BT):
+        def forward_segment(model, carry, token_ids_BT, attention_mask_BT, block_pos_BT):
             states, conv_states = carry
             forward_kwargs = {}
             if pass_conv_state:
                 forward_kwargs["initial_conv_states"] = conv_states
                 forward_kwargs["return_conv_states"] = True
+            if block_pos_BT is not None:
+                forward_kwargs["position_ids_ZBT"] = jnp.stack([block_pos_BT] * 3, axis=0)
+                forward_kwargs["block_pos_BT"] = block_pos_BT
+                if not pass_conv_state:
+                    forward_kwargs["conv_block_pos_BT"] = block_pos_BT
             hidden, aux, states, *rest = text_api.forward_with_gdn_state(
                 model,
                 token_ids_BT,
@@ -479,19 +498,22 @@ def _statepassing_hidden_states(
             (None, None),
             token_ids_BCT[:, 0, :],
             attention_mask_BCT[:, 0, :],
+            None if block_pos_BCT is None else block_pos_BCT[:, 0, :],
         )
 
         @nnx.scan(
-            in_axes=(None, nnx.Carry, 1, 1, 1),
+            in_axes=(None, nnx.Carry, 1, 1, 1, 1),
             out_axes=(nnx.Carry, (1, 0)),
         )
-        def segment_forward(model, carry, token_ids_BT, attention_mask_BT, reset_B):
+        def segment_forward(model, carry, token_ids_BT, attention_mask_BT, reset_B, block_pos_BT):
             states, conv_states = carry
             carry = (
                 apply_state_reset(states, reset_B) if pass_gdn_state else None,
                 None if conv_states is None else apply_state_reset(conv_states, reset_B),
             )
-            carry, hidden, aux = forward_segment(model, carry, token_ids_BT, attention_mask_BT)
+            carry, hidden, aux = forward_segment(
+                model, carry, token_ids_BT, attention_mask_BT, block_pos_BT
+            )
             return carry, (hidden, aux)
 
         _, (remaining_hidden, remaining_aux) = segment_forward(
@@ -500,6 +522,7 @@ def _statepassing_hidden_states(
             token_ids_BCT[:, 1:, :],
             attention_mask_BCT[:, 1:, :],
             reset_state_BC[:, 1:],
+            None if block_pos_BCT is None else block_pos_BCT[:, 1:, :],
         )
         hidden_BT_D = jnp.concatenate(
             [
@@ -511,6 +534,11 @@ def _statepassing_hidden_states(
         aux_loss = jnp.sum(jnp.concatenate([first_aux[None], remaining_aux])) / float(C)
         return hidden_BT_D, aux_loss
 
+    if block_pos_BCT is not None:
+        raise ValueError(
+            "block_pos_BCT requires the full-BPTT segment scan: C > 1 pieces, full BPTT, all "
+            "GDN layers on the same layer and no RoPE position passing"
+        )
     hidden_segments = []
     aux_losses = []
     carried_states = None
@@ -1163,7 +1191,13 @@ def run_pretrain(
     training_objective: TrainingObjective | str = TrainingObjective.NEXT_TOKEN,
     teacher_segment_buckets: Sequence[int] = (),
     common_update_plan: dict[str, Any] | None = None,
+    curriculum_phases: Sequence[tuple[int, int]] | None = None,
+    checkpoint_updates: Collection[int] | None = None,
 ) -> tuple[MixedPrecisionOptimizer, dict[str, float]]:
+    """``curriculum_phases`` = ((T, last update of the phase), ...): every update trains
+    T-block statepassing inside pieces of ``seq_len`` tokens (``block_pos_BCT``), and every
+    phase end validates at T = ``seq_len`` and at the phase's T. ``checkpoint_updates``
+    replaces the common plan's checkpoint list."""
     pretrain_mode = PretrainMode(pretrain_mode)
     training_objective = TrainingObjective(training_objective)
     teacher_objective = training_objective is TrainingObjective.TEACHER_TOP512_SPECIAL_TAIL_KL
@@ -1171,6 +1205,18 @@ def run_pretrain(
         raise ValueError(f"{training_objective} requires a statepassing pretrain mode")
     if teacher_objective and not teacher_segment_buckets:
         raise ValueError(f"{training_objective} requires the configured teacher_segment_buckets")
+    if curriculum_phases is not None and (
+        pretrain_mode is not PretrainMode.STATEPASSING_BPTT
+        or bptt_chunks is not None
+        or not pass_gdn_state
+        or gdn_layer_limit is not None
+        or GdnStateRouting(gdn_state_routing) is not GdnStateRouting.SAME_LAYER
+        or pass_rope_positions
+    ):
+        raise ValueError(
+            "Block-local curriculum requires full-chain BPTT with GDN state passing on all "
+            "layers (same layer) and no RoPE position passing"
+        )
     if common_update_plan is not None:
         if not teacher_objective or train_cfg.num_steps != len(common_update_plan["updates"]):
             raise ValueError(
@@ -1195,6 +1241,11 @@ def run_pretrain(
             raise ValueError("Common comparison requires true pretrained initialization")
         if tokamax_cache_dir is not None:
             raise ValueError("Common comparison gate must run without mutating autotune priming")
+    planned_checkpoints = (
+        common_update_plan["checkpoint_updates"] if common_update_plan is not None else None
+    )
+    if checkpoint_updates is not None:
+        planned_checkpoints = sorted(int(update) for update in checkpoint_updates)
     save_path = Path(save_dir).expanduser().resolve() if save_dir is not None else None
 
     checkpoint_manager = None
@@ -1222,6 +1273,22 @@ def run_pretrain(
         will_resume=will_resume,
         explicit_fields=lr_contract_explicit_fields,
     )
+    if curriculum_phases is not None:
+        phase_ends = [int(end) for _, end in curriculum_phases]
+        if (
+            phase_ends != sorted(set(phase_ends))
+            or phase_ends[-1] != train_cfg.num_steps
+            or any(int(T) < 1 or train_cfg.seq_len % int(T) for T, _ in curriculum_phases)
+        ):
+            raise ValueError(
+                f"Curriculum phases {curriculum_phases} must end at increasing updates up to "
+                f"{train_cfg.num_steps}, with block lengths dividing seq_len={train_cfg.seq_len}"
+            )
+
+    def block_len_for(step: int) -> int | None:
+        if curriculum_phases is None:
+            return None
+        return next(int(T) for T, end in curriculum_phases if step <= int(end))
 
     if common_update_plan is not None and save_path is not None:
         import json
@@ -1233,7 +1300,7 @@ def run_pretrain(
             "microbatch_chains": PLANNED_MICROBATCH_CHAINS,
             "grad_accum_steps": train_cfg.grad_accum_steps,
             "seq_len": train_cfg.seq_len,
-            "checkpoint_updates": common_update_plan["checkpoint_updates"],
+            "checkpoint_updates": planned_checkpoints,
             "optimizer": dataclasses.asdict(train_cfg),
             "pretrained_snapshot": str(Path(init_hf_model_path).resolve()),
         }
@@ -1420,6 +1487,7 @@ def run_pretrain(
                 global_batch_size=train_cfg.batch_size,
                 pass_rope_positions=pass_rope_positions,
                 training_objective=training_objective,
+                block_len=block_len_for(start_step + 1),
             )
             autotune_args = (pending_batch,) + ((pending_window[1],) if teacher_objective else ())
             autotune_result = tokamax_cache_lib.autotune_and_save(
@@ -1436,6 +1504,7 @@ def run_pretrain(
     startup_log(f"entering pretrain loop mode={pretrain_mode}")
     for step_idx in range(start_step, local_stop_step):
         step = step_idx + 1
+        block_len = block_len_for(step)
         common_update_start = time.perf_counter()
         accum = {}
         accum_grad_norm = 0.0
@@ -1496,6 +1565,7 @@ def run_pretrain(
                     global_batch_size=train_cfg.batch_size,
                     pass_rope_positions=pass_rope_positions,
                     training_objective=training_objective,
+                    block_len=block_len,
                 )
             else:
                 batch = pending_batch
@@ -1533,6 +1603,8 @@ def run_pretrain(
         )
         window_metrics["grad_norm"] = accum_grad_norm / accum_steps
         window_metrics["lr"] = current_lr
+        if block_len is not None:
+            window_metrics["block_len"] = block_len
         window_metrics["total_tokens"] = (
             common_update_plan["updates"][step_idx]["cumulative_tokens"]
             if common_update_plan is not None
@@ -1604,8 +1676,8 @@ def run_pretrain(
         prev_metrics = (step, window_metrics, accum_time, accum_flops)
 
         save_this_update = (
-            step in common_update_plan["checkpoint_updates"]
-            if common_update_plan is not None
+            step in planned_checkpoints
+            if planned_checkpoints is not None
             else bool(save_every and step % save_every == 0)
         )
         if checkpoint_manager is not None and save_this_update:
@@ -1622,7 +1694,14 @@ def run_pretrain(
         if gc_period and step % gc_period == 0:
             gc.collect()
 
-        if val_data_iter is not None and val_every and step % val_every == 0:
+        if curriculum_phases is not None:
+            # Every phase end validates at T = seq_len, as that control, and at the phase's T.
+            val_block_lens = (
+                list(dict.fromkeys((train_cfg.seq_len, block_len))) if step in phase_ends else []
+            )
+        else:
+            val_block_lens = [None] if val_every and step % val_every == 0 else []
+        for val_block_len in val_block_lens if val_data_iter is not None else []:
             val_acc = {}
             if teacher_objective:
                 # Every teacher validation replays the same deterministic val batches; a
@@ -1643,6 +1722,7 @@ def run_pretrain(
                     global_batch_size=train_cfg.batch_size,
                     pass_rope_positions=pass_rope_positions,
                     training_objective=training_objective,
+                    block_len=val_block_len,
                 )
                 val_metrics = eval_step(optimizer.model, val_batch)
                 if teacher_objective:
@@ -1654,15 +1734,29 @@ def run_pretrain(
                 if teacher_objective
                 else _finalize_accumulated_metrics(val_acc)
             )
+            prefixes = ["val"] if val_block_len in (None, train_cfg.seq_len) else []
+            if val_block_len is not None and val_block_len == block_len:
+                prefixes.append("val_phaseT")
             if wandb_run is not None and is_primary_process:
                 wandb_run.log(
                     {
-                        f"val/{key}": value
+                        f"{prefix}/{key}": value
+                        for prefix in prefixes
                         for key, value in val_host.items()
                         if key != "nll" and not key.startswith(("iid_comparable_", "boundary_"))
                     },
                     step=step,
                 )
+            if val_block_len is not None and save_path is not None and is_primary_process:
+                import json
+
+                with (save_path / "val_metrics.jsonl").open("a") as stream:
+                    stream.write(
+                        json.dumps(
+                            {"step": step, "block_len": val_block_len, **val_host}, sort_keys=True
+                        )
+                        + "\n"
+                    )
 
         if requeue_requested():
             startup_log(f"[signal] saving checkpoint at step={step} after signal")

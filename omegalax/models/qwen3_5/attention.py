@@ -12,6 +12,8 @@ import jax.numpy as jnp
 from flax import nnx
 from jax.sharding import PartitionSpec
 from tokamax import dot_product_attention
+from tokamax._src.ops.attention import api as tokamax_attention_api
+from tokamax._src.ops.attention.base import Mask as TokamaxMask
 
 from .config import Qwen3_5TextConfig
 from .norms import RMSNorm
@@ -96,6 +98,7 @@ class Attention(nnx.Module):
         position_ids_BT: jax.Array,
         *,
         cache=None,
+        block_pos_BT: jax.Array | None = None,
     ) -> jax.Array:
         B, T, _ = hidden_BTD.shape
 
@@ -126,7 +129,24 @@ class Attention(nnx.Module):
 
         q_BTHK, k_BTGK = apply_text_rope(q_BTHK, k_BTGK, cos_BTK, sin_BTK)
 
-        if cache is None:
+        if cache is None and block_pos_BT is not None:
+            # Block-local causal: query t sees key s iff t - block_pos[t] <= s <= t. The public
+            # tokamax API only takes dense masks, so call the backend with a k_start Mask.
+            k_start_B1T = (
+                jnp.arange(T, dtype=jnp.int32)[None, :] - block_pos_BT.astype(jnp.int32)
+            )[:, None, :]
+            attn_BTHK = tokamax_attention_api.IMPLEMENTATIONS[self._attn_backend](
+                q_BTHK,
+                k_BTGK,
+                v_BTGK,
+                bias=None,
+                mask=TokamaxMask(k_start=k_start_B1T, is_causal=True),
+                logits_scale=self.scale,
+                precision=None,
+                logits_soft_cap=None,
+                q_sharding=self._q_sharding,
+            )
+        elif cache is None:
             attn_BTHK = dot_product_attention(
                 q_BTHK,
                 k_BTGK,

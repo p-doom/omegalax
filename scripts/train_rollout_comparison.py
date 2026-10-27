@@ -31,7 +31,20 @@ def main():
     parser.add_argument("--peak-tflops", default="h100_sxm")
     parser.add_argument("--no-state-passing", action="store_true")
     parser.add_argument("--pass-conv-state", action="store_true")
+    # "T:last_update,...": T-block statepassing inside --segment-length pieces, T by update.
+    parser.add_argument("--curriculum-phases")
+    parser.add_argument("--checkpoint-updates", help="comma list replacing the plan's list")
     args = parser.parse_args()
+    curriculum_phases = (
+        None
+        if args.curriculum_phases is None
+        else [tuple(map(int, phase.split(":"))) for phase in args.curriculum_phases.split(",")]
+    )
+    checkpoint_updates = (
+        None
+        if args.checkpoint_updates is None
+        else [int(update) for update in args.checkpoint_updates.split(",")]
+    )
     output = Path(args.output).resolve()
     output.mkdir(parents=True, exist_ok=True)
     environment = {
@@ -118,12 +131,20 @@ def main():
         "horizon_by_step": [{"start_step": 1, "end_step": None, "c_train": C}],
         "resume": "optimizer update cursor = restored Grain cursor / ceil(chains_per_update / 4); verified before every update",
     }
+    if curriculum_phases is not None:
+        contract["curriculum_phases"] = curriculum_phases
+    if checkpoint_updates is not None:
+        contract["checkpoint_updates"] = checkpoint_updates
     ensure_training_contract(output, contract)
     wandb_run = None
     if args.wandb_project:
         import wandb
 
-        arm = f"T{args.segment_length}" + ("_conv" if args.pass_conv_state else "")
+        arm = (
+            f"T{args.segment_length}"
+            if curriculum_phases is None
+            else f"curr{curriculum_phases[0][0]}to{curriculum_phases[-1][0]}"
+        ) + ("_conv" if args.pass_conv_state else "")
         suffix = "_nostate_fast" if args.no_state_passing else "_fast"
         wandb_run = wandb.init(
             project=args.wandb_project,
@@ -161,8 +182,10 @@ def main():
         val_data_iter=make_planned_rollout_teacher_iterator(
             plan, segment_length=args.segment_length, split="val"
         ),
-        val_every=500,
+        val_every=500 if curriculum_phases is None else None,
         val_steps=-(-len(plan["validation_members"]) // PLANNED_MICROBATCH_CHAINS),
+        curriculum_phases=curriculum_phases,
+        checkpoint_updates=checkpoint_updates,
     )
     if not metrics:
         # A signal during the first update after a (re)start checkpoints and requeues before
