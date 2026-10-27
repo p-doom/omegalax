@@ -446,7 +446,6 @@ def _statepassing_hidden_states(
     if (
         C > 1
         and resolved_bptt_chunks == C
-        and pass_gdn_state
         and gdn_layer_limit is None
         and gdn_state_routing == GdnStateRouting.SAME_LAYER
         and not pass_rope_positions
@@ -454,6 +453,8 @@ def _statepassing_hidden_states(
     ):
         # Bootstrap with None exactly as in the unrolled path; scan requires a fixed
         # carry structure, so only the remaining segments use the returned GDN states.
+        # Without GDN state passing every segment starts from None (zero state) as in the
+        # unrolled path; the carry is then never read.
         first_hidden, first_aux, first_states = text_api.forward_with_gdn_state(
             model,
             token_ids_BCT[:, 0, :],
@@ -474,7 +475,7 @@ def _statepassing_hidden_states(
                 pad_id,
                 cfg,
                 attention_mask_BT=attention_mask_BT,
-                initial_gdn_states=apply_state_reset(states, reset_B),
+                initial_gdn_states=apply_state_reset(states, reset_B) if pass_gdn_state else None,
             )
             return states, (hidden, aux)
 
@@ -1166,13 +1167,12 @@ def run_pretrain(
         if (
             not restore_input_iter
             or bptt_chunks is not None
-            or not pass_gdn_state
             or pass_conv_state
             or pass_rope_positions
             or gdn_layer_limit is not None
         ):
             raise ValueError(
-                "Common plan requires restored cursor, full-chain BPTT and all GDN only"
+                "Common plan requires restored cursor, full-chain BPTT and all or no GDN only"
             )
         if init_hf_model_path is None:
             raise ValueError("Common comparison requires true pretrained initialization")

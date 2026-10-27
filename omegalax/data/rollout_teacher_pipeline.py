@@ -897,7 +897,11 @@ def make_planned_rollout_teacher_iterator(
     pad_id: int = DEFAULT_PAD_ID,
 ):
     """Single loading controller, four complete chains per microbatch; checkpointable Grain cursor."""
-    _require(segment_length in (8192, 2048, 512), "Controlled segment length must be 8192/2048/512")
+    # 57344 = 7 * 8192 holds every planned chain in one segment (full-rollout arm).
+    _require(
+        segment_length in (8192, 2048, 512, 57344),
+        "Controlled segment length must be 8192/2048/512 or 57344",
+    )
     _require(split in ("train", "val"), "Expected train/val split")
     count = (
         len(plan["updates"]) * -(-plan["chains_per_update"] // PLANNED_MICROBATCH_CHAINS)
