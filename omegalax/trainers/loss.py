@@ -309,7 +309,9 @@ def chunked_teacher_kl_stats(
     target positions ``[b, b + 256)`` after each absolute ``b = 8192, 16384, ...``, where
     target j is predicted by hidden j-1. A window counts only if all 256 positions are valid
     teacher rows; valid rows of one batch element must have unique positions, as the stored
-    targets do. The NLL reuses each row's logits and normalizer and has no gradient.
+    targets do. The NLL reuses each row's logits and normalizer and has no gradient; the
+    boundary KL sums the loss's own per-row KL over the same rows, also without gradient.
+    ``teacher_nll_sum`` is that NLL over all valid teacher rows (``teacher_nll_tokens`` of them).
     """
     if set(targets) != set(_TEACHER_TARGET_KEYS):
         raise ValueError(f"targets must have exactly the keys {_TEACHER_TARGET_KEYS}")
@@ -479,32 +481,44 @@ def chunked_teacher_kl_stats(
         )
         teacher_BSG = jnp.where(keep_BSG, teacher_BSG, 0.0)
         teacher_prob_BSG = jnp.where(keep_BSG, jnp.exp(teacher_BSG), 0.0)
-        kl = jnp.sum(teacher_prob_BSG * (teacher_BSG - student_BSG))
+        kl_BSG = teacher_prob_BSG * (teacher_BSG - student_BSG)
+        kl = jnp.sum(kl_BSG)
         if not boundary_BS:
             return kl
         nll_row_BS, token_ids_BS = boundary_BS
         token_logit_BS = take_classes(logits_BSV, token_ids_BS[..., None])[..., 0]
         nll_BS = jax.lax.stop_gradient(log_z_BS - token_logit_BS)
-        return kl, jnp.sum(jnp.where(nll_row_BS, nll_BS, 0.0))
+        # Per-row KL of the loss, summed over the same window rows as the NLL.
+        boundary_kl_BS = jax.lax.stop_gradient(jnp.sum(kl_BSG, axis=-1))
+        return (
+            kl,
+            jnp.sum(jnp.where(nll_row_BS, nll_BS, 0.0)),
+            jnp.sum(jnp.where(nll_row_BS, boundary_kl_BS, 0.0)),
+            jnp.sum(jnp.where(msk_BS, nll_BS, 0.0)),
+        )
 
     def _scan_body(acc, block_data):
         return jax.tree.map(jnp.add, acc, _remat_block(*block_data)), None
 
     zero = jnp.array(0.0, dtype=jnp.float32)
     sums, _ = jax.lax.scan(
-        _scan_body, (zero, zero) if with_boundary else zero, tuple(blocks), unroll=1
+        _scan_body, (zero,) * 4 if with_boundary else zero, tuple(blocks), unroll=1
     )
     target_count = jnp.sum(mask_BR.astype(jnp.float32))
     if not with_boundary:
         return sums, target_count
-    kl_sum, nll_sum = sums
+    kl_sum, nll_sum, boundary_kl_sum, teacher_nll_sum = sums
     return (
         kl_sum,
         target_count,
         {
             "teacher_boundary_nll_sum": nll_sum,
             "teacher_boundary_nll_tokens": jnp.sum(nll_row_BR.astype(jnp.float32)),
+            "teacher_boundary_kl_sum": boundary_kl_sum,
+            "teacher_boundary_kl_tokens": jnp.sum(nll_row_BR.astype(jnp.float32)),
             "teacher_boundary_windows": jnp.sum(eligible_BW.astype(jnp.float32)),
             "teacher_boundary_rollouts": jnp.sum(jnp.any(eligible_BW, axis=1).astype(jnp.float32)),
+            "teacher_nll_sum": teacher_nll_sum,
+            "teacher_nll_tokens": target_count,
         },
     )
