@@ -169,6 +169,12 @@ def main():
         val_every=500,
         val_steps=-(-len(plan["validation_members"]) // PLANNED_MICROBATCH_CHAINS),
     )
+    if not metrics:
+        # A signal during the first update after a (re)start checkpoints and requeues before
+        # any update is logged, so there is no result to check or write.
+        if wandb_run:
+            wandb_run.finish()
+        return
     if not all(np.isfinite(metrics[k]) for k in ("teacher_kl", "grad_norm", "lr")):
         raise RuntimeError(f"Nonfinite comparison result: {metrics}")
     state_digest = None

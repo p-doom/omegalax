@@ -10,6 +10,8 @@ os.environ["OMEGALAX_DELTANET_KERNEL"] = "xla"
 
 import json
 from pathlib import Path
+import subprocess
+import sys
 import unittest
 
 import jax
@@ -19,7 +21,9 @@ from flax import nnx
 from omegalax.data import rollout_teacher as rt
 from omegalax.data.rollout_teacher_pipeline import (
     _json_sha256,
+    _source_hashes,
     make_planned_rollout_teacher_iterator,
+    ROLLOUT_UPDATE_PLAN_FORMAT,
 )
 from omegalax.models.qwen3_5.config import Qwen3_5Config
 from omegalax.models.qwen3_5.params import export_qwen3_5_to_safetensors
@@ -218,6 +222,65 @@ class CommonUpdateTest(unittest.TestCase):
         self.assertEqual(rmt_cm["total_tokens"], 4100)
         self.assertEqual(rmt_rm["teacher_targets"], 4)
         self.assertNotEqual(rmt_rm["teacher_kl"], rm["teacher_kl"])
+        # CLI: a deadline signal during the first update after a (re)start checkpoints and
+        # requeues before any update is logged; the trainer must exit cleanly and resume. Only
+        # the CLI's four-GPU guard sees GPUs (the run uses four real CPU devices), and a PATH
+        # scontrol stub records the requeue instead of requeueing this test job.
+        cli_plan = {k: v for k, v in plan.items() if k != "plan_sha256"}
+        cli_plan["format"] = ROLLOUT_UPDATE_PLAN_FORMAT
+        cli_plan["source"] = {**plan["source"], **_source_hashes(dataset.root)[1]}
+        cli_plan["checkpoint_updates"] = [3]  # update 1 is saved only by the signal
+        cli_plan["plan_sha256"] = _json_sha256(cli_plan)
+        (root / "plan.json").write_text(json.dumps(cli_plan))
+        (root / "bin").mkdir()
+        (root / "bin" / "scontrol").write_text(f'#!/bin/bash\necho "$*" >> {root}/scontrol.log\n')
+        (root / "bin" / "scontrol").chmod(0o755)
+        driver = """
+import os, signal, sys
+import jax
+from omegalax.trainers import pretrain
+import scripts.train_rollout_comparison as cli
+devices, install = jax.devices, pretrain._install_requeue_signal_handler
+gpu = type("Gpu", (), {"platform": "gpu"})()
+jax.devices = lambda *a, **k: [gpu] * 4 if sys._getframe(1).f_code is cli.main.__code__ else devices(*a, **k)
+if sys.argv.pop(1) == "signal":
+    pretrain._install_requeue_signal_handler = lambda: (install(), os.kill(os.getpid(), signal.SIGUSR1))[0]
+cli.main()
+"""
+        env = {
+            **os.environ,
+            "PATH": f"{root}/bin:{os.environ['PATH']}",
+            "PYTHONPATH": str(Path(__file__).resolve().parents[1]),
+            "JAX_PLATFORMS": "cpu",
+            "XLA_FLAGS": "--xla_force_host_platform_device_count=4",
+        }
+        cli_args = [
+            *("--plan", str(root / "plan.json"), "--segment-length", "512"),
+            *("--init-hf-model-path", str(root / "pretrained"), "--output", str(root / "cli")),
+            *("--text-attn-backend", "xla"),
+        ]
+        run = subprocess.run(
+            [sys.executable, "-c", driver, "signal", *cli_args],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertEqual(
+            (root / "scontrol.log").read_text(), f"requeue {os.environ['SLURM_JOB_ID']}\n"
+        )
+        self.assertTrue((root / "cli" / "000001").is_dir())
+        self.assertEqual(list((root / "cli").glob("result_step*.json")), [])
+        run = subprocess.run(
+            [sys.executable, "-c", driver, "none", *cli_args, "--resume", "required"]
+            + ["--stop-after-update", "2"],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        result = json.loads((root / "cli" / "result_step2.json").read_text())
+        self.assertEqual(result["metrics"]["step"], 2)
         (root / "PASS.json").write_text(
             json.dumps(
                 {"status": "PASS", "metrics": rm, "gradient_at_16384": long_gradient}, indent=2
