@@ -453,6 +453,108 @@ class PretrainMaskAndLossTest(absltest.TestCase):
                     f"grad_max_rel_l2={max_rel_l2:.3e}"
                 )
 
+    def test_full_bptt_without_gdn_state_matches_independent_segment_forwards(self):
+        # Without GDN state passing the full-BPTT nnx.scan path must equal one zero-state
+        # forward per segment (hidden states, aux loss, all gradients).
+        cfg = dataclasses.replace(
+            _tiny_qwen3_5_config(),
+            num_hidden_layers=3,
+            layer_types=("linear_attention", "full_attention", "linear_attention"),
+        )
+        B, T = 2, 4
+        first_segment_token = cfg.vocab_size - 1
+        for C in (2, 3, 8):
+            rng = np.random.RandomState(C)
+            # Segment 0 alone holds first_segment_token, so its embedding row isolates any
+            # gradient that crosses a segment boundary.
+            token_ids = rng.randint(1, first_segment_token, size=(B, C, T)).astype(np.int32)
+            token_ids[:, 0, :] = first_segment_token
+            attention_mask = np.ones((B, C, T), dtype=np.int32)
+            attention_mask[1, -1, 2:] = 0
+            token_ids[attention_mask == 0] = 0
+            reset_state = np.zeros((B, C), dtype=bool)
+            reset_state[:, 0] = True
+            batch = {
+                "token_ids_BCT": jnp.asarray(token_ids),
+                "attention_mask_BCT": jnp.asarray(attention_mask),
+                "reset_state_BC": jnp.asarray(reset_state),
+            }
+            weight = jnp.asarray(rng.standard_normal((B, C * T, cfg.hidden_size)), jnp.float32)
+            later = jnp.asarray(np.arange(C * T) >= T, jnp.float32)[None, :, None]
+            model, _ = text_api.init_model(
+                cfg, jax.random.PRNGKey(0), tp_size=1, fsdp_size=1, dp_size=1
+            )
+            set_attn_backend(model, text_backend="xla")
+
+            def statepassing(inner_model, pass_gdn_state, scale, batch=batch, weight=weight):
+                hidden, aux = pretrain_trainer._statepassing_hidden_states(
+                    inner_model,
+                    batch,
+                    cfg,
+                    0,
+                    pretrain_trainer.PretrainMode.STATEPASSING_BPTT,
+                    pass_gdn_state=pass_gdn_state,
+                )
+                return jnp.sum(hidden * weight * scale) + aux, hidden
+
+            def independent(inner_model, batch=batch, weight=weight, C=C):
+                outputs = [
+                    text_api.forward_with_gdn_state(
+                        inner_model,
+                        batch["token_ids_BCT"][:, c, :],
+                        0,
+                        cfg,
+                        attention_mask_BT=batch["attention_mask_BCT"][:, c, :],
+                    )
+                    for c in range(C)
+                ]
+                hidden = jnp.concatenate([out[0] for out in outputs], axis=1)
+                aux = jnp.sum(jnp.stack([out[1] for out in outputs])) / float(C)
+                return jnp.sum(hidden * weight) + aux, hidden
+
+            def later_embedding_grad(pass_gdn_state):
+                grads = nnx.jit(nnx.grad(lambda m: statepassing(m, pass_gdn_state, later)[0]))(
+                    model
+                )
+                (embedding_grad,) = [
+                    leaf
+                    for path, leaf in jax.tree_util.tree_flatten_with_path(grads)[0]
+                    if "embedder" in jax.tree_util.keystr(path)
+                ]
+                return np.asarray(embedding_grad)[first_segment_token]
+
+            forward = text_api.forward_with_gdn_state
+            with mesh_rules_for(tp_size=1, fsdp_size=1, dp_size=1):
+                with mock.patch.object(
+                    pretrain_trainer.text_api, "forward_with_gdn_state", wraps=forward
+                ) as spy:
+                    (value, hidden), grads = nnx.jit(
+                        nnx.value_and_grad(lambda m: statepassing(m, False, 1.0), has_aux=True)
+                    )(model)
+                # nnx.scan traces one body for all later segments; the unrolled loop traces C.
+                self.assertEqual(spy.call_count, 2)
+                for call in spy.call_args_list:
+                    self.assertIsNone(call.kwargs["initial_gdn_states"])
+                (ref_value, ref_hidden), ref_grads = nnx.jit(
+                    nnx.value_and_grad(independent, has_aux=True)
+                )(model)
+                no_state_cross_grad = later_embedding_grad(False)
+                state_cross_grad = later_embedding_grad(True)
+
+            # Same fp32 terms in a different XLA order (scan vs. separate forwards), as in
+            # the scan-vs-loop tests; a carried state would differ by O(1e-1).
+            np.testing.assert_allclose(hidden, ref_hidden, rtol=1e-4, atol=1e-5)
+            np.testing.assert_allclose(value, ref_value, rtol=1e-5)
+            self.assertEqual(jax.tree.structure(grads), jax.tree.structure(ref_grads))
+            for grad, ref_grad in zip(
+                jax.tree.leaves(grads), jax.tree.leaves(ref_grads), strict=True
+            ):
+                grad, ref_grad = np.asarray(grad), np.asarray(ref_grad)
+                scale = float(np.abs(ref_grad).max())
+                np.testing.assert_allclose(grad, ref_grad, rtol=0, atol=1e-4 * scale + 1e-12)
+            np.testing.assert_array_equal(no_state_cross_grad, 0.0)
+            self.assertGreater(float(np.abs(state_cross_grad).max()), 0.0)
+
     def test_statepassing_loss_applies_bptt_remainder_groups(self):
         class LmHead:
             kernel = jnp.eye(4, dtype=jnp.float32)
@@ -516,55 +618,6 @@ class PretrainMaskAndLossTest(absltest.TestCase):
         self.assertEqual(float(grad[3]), 0.0)
         self.assertNotEqual(float(grad[4]), 0.0)
         self.assertEqual(float(grad[5]), 0.0)
-
-    def test_statepassing_loss_can_disable_gdn_state_passing(self):
-        class LmHead:
-            kernel = jnp.eye(4, dtype=jnp.float32)
-
-        class Model:
-            lm_head = LmHead()
-
-        batch = {
-            "token_ids_BCT": jnp.ones((1, 3, 2), dtype=jnp.int32),
-            "attention_mask_BCT": jnp.ones((1, 3, 2), dtype=jnp.int32),
-            "loss_mask_BCT": jnp.ones((1, 3, 2), dtype=jnp.int32),
-            "reset_state_BC": jnp.asarray([[True, False, False]]),
-        }
-        seen_initial_states = []
-
-        def fake_forward(
-            _model,
-            token_ids_BT,
-            _pad_id,
-            _cfg,
-            *,
-            attention_mask_BT=None,
-            segment_ids_BT=None,
-            initial_gdn_states=None,
-        ):
-            del attention_mask_BT, segment_ids_BT
-            seen_initial_states.append(initial_gdn_states)
-            B, T = token_ids_BT.shape
-            hidden = jnp.zeros((B, T, 4), dtype=jnp.float32)
-            state = (jnp.ones((B, 1, 1, 1), dtype=jnp.float32),)
-            return hidden, jnp.array(0.0, dtype=jnp.float32), state
-
-        with (
-            mesh_rules_for(tp_size=1, fsdp_size=1, dp_size=1),
-            mock.patch.object(
-                pretrain_trainer.text_api, "forward_with_gdn_state", side_effect=fake_forward
-            ),
-        ):
-            pretrain_trainer._statepassing_loss_stats(
-                Model(),
-                batch,
-                _tiny_qwen3_5_config(),
-                pad_id=0,
-                pretrain_mode=pretrain_trainer.PretrainMode.STATEPASSING_BPTT,
-                pass_gdn_state=False,
-            )
-
-        self.assertEqual(seen_initial_states, [None, None, None])
 
     def test_statepassing_loss_applies_gdn_layer_limit(self):
         class LmHead:

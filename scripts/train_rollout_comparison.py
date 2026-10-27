@@ -29,6 +29,7 @@ def main():
     parser.add_argument("--wandb-project")
     parser.add_argument("--text-attn-backend", default="triton")
     parser.add_argument("--peak-tflops", default="h100_sxm")
+    parser.add_argument("--no-state-passing", action="store_true")
     args = parser.parse_args()
     output = Path(args.output).resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -106,7 +107,7 @@ def main():
         "xla_flags": os.environ.get("XLA_FLAGS", ""),
         "objective": "teacher_top512_special_tail_kl",
         "eval_statepassing_config": {
-            "pass_gdn_state": True,
+            "pass_gdn_state": not args.no_state_passing,
             "gdn_layer_limit": None,
             "pass_conv_state": False,
             "pass_rope_positions": False,
@@ -121,10 +122,11 @@ def main():
     if args.wandb_project:
         import wandb
 
+        suffix = "_nostate_fast" if args.no_state_passing else "_fast"
         wandb_run = wandb.init(
             project=args.wandb_project,
-            name=f"rollouts_T{args.segment_length}_fast",
-            id=f"{plan['plan_sha256'][:12]}_T{args.segment_length}_fast",
+            name=f"rollouts_T{args.segment_length}{suffix}",
+            id=f"{plan['plan_sha256'][:12]}_T{args.segment_length}{suffix}",
             resume="allow",
             config=contract,
         )
@@ -148,7 +150,7 @@ def main():
         fsdp_size=4,
         dp_size=1,
         bptt_chunks=None,
-        pass_gdn_state=True,
+        pass_gdn_state=not args.no_state_passing,
         pass_conv_state=False,
         pass_rope_positions=False,
         text_attn_backend=args.text_attn_backend,

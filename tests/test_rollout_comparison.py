@@ -188,6 +188,24 @@ class CommonUpdateTest(unittest.TestCase):
         self.assertEqual(rm["teacher_boundary_windows"], 0)
         self.assertNotIn("teacher_boundary_nll", rm)
         self.assertEqual(int(resumed.step[...]), 3)
+        # Control arm: no GDN state passing.
+        _, nm = trainer.run_pretrain(
+            str(root / "pretrained"),
+            train_cfg,
+            iterator(),
+            save_dir=root / "nostate",
+            pass_gdn_state=False,
+            **kwargs,
+        )
+
+        def per_update(arm):
+            with (root / arm / "update_metrics.jsonl").open() as stream:
+                rows = [json.loads(line) for line in stream]
+            return [(r["step"], r["teacher_targets"], r["context_tokens"]) for r in rows]
+
+        self.assertEqual(per_update("nostate"), per_update("continuous"))
+        self.assertEqual(nm["total_tokens"], cm["total_tokens"])
+        self.assertNotEqual(nm["teacher_kl"], cm["teacher_kl"])
         # CLI: a deadline signal during the first update after a (re)start checkpoints and
         # requeues before any update is logged; the trainer must exit cleanly and resume. Only
         # the CLI's four-GPU guard sees GPUs (the run uses four real CPU devices), and a PATH
