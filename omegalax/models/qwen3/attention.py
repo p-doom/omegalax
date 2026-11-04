@@ -4,6 +4,7 @@ from flax import nnx
 from jax.sharding import PartitionSpec as P, reshard
 from tokamax import dot_product_attention
 
+from omegalax.attention import context_parallel_attention
 from .norms import RMSNorm
 from .rope import apply_rope, generate_pos_embeddings
 from .utils import compute_positions_from_segment_ids, count_left_pads
@@ -66,9 +67,18 @@ class Attention(nnx.Module):
         object.__setattr__(self, "_q_sharding_spec", P(*cfg.shd_cfg.act_btnh))
         object.__setattr__(self, "_attn_backend", "mosaic_gpu")
         object.__setattr__(self, "_attn_kind", "text")
+        # CP block-diagonal document mask; default off keeps CP causal-only ==
+        # the non-CP path. Toggle via set_cp_document_mask.
+        object.__setattr__(self, "_cp_document_mask", False)
 
     @jax.named_scope("attention")
-    def __call__(self, hidden_BTD: jax.Array, cache, segment_ids_BT: jax.Array) -> jax.Array:
+    def __call__(
+        self,
+        hidden_BTD: jax.Array,
+        cache,
+        segment_ids_BT: jax.Array,
+        position_ids_BT: jax.Array | None = None,
+    ) -> jax.Array:
         q_proj_BTF = self.q_proj(hidden_BTD, out_sharding=self.shd_cfg.act_btf)
         k_proj_BTF = self.k_proj(hidden_BTD, out_sharding=self.shd_cfg.act_btf)
         v_proj_BTF = self.v_proj(hidden_BTD, out_sharding=self.shd_cfg.act_btf)
@@ -92,7 +102,13 @@ class Attention(nnx.Module):
         )
 
         if cache is None:
-            positions_BT = compute_positions_from_segment_ids(segment_ids_BT)
+            # Positions for RoPE + causal mask. Under zig-zag CP the true positions
+            # are passed in (the local shard is permuted, so arange over segment_ids
+            # would be wrong); otherwise derive them from segment_ids.
+            if position_ids_BT is None:
+                positions_BT = compute_positions_from_segment_ids(segment_ids_BT)
+            else:
+                positions_BT = position_ids_BT
             sin_BTK, cos_BTK = generate_pos_embeddings(positions_BT, self.head_dim)
             sin_BTK = sin_BTK.astype(self.dtype)
             cos_BTK = cos_BTK.astype(self.dtype)
@@ -101,15 +117,36 @@ class Attention(nnx.Module):
             k_BTGK = apply_rope(k_BTGK, sin_BTK, cos_BTK)
 
             B, T, H, K = q_BTHK.shape
-            attn_BTHK = dot_product_attention(
-                q_BTHK,
-                k_BTGK,
-                v_BTGK,
-                is_causal=True,
-                scale=self.scale,
-                implementation=self._attn_backend,
-                q_sharding=self._q_sharding,
-            )
+            # Under CP (T sharded on "cp", cp_size > 1) use the all-gather-KV
+            # shard_map path (tokamax cannot do seq-sharded KV); else the TP
+            # head-sharded tokamax path. RoPE above is positionwise, so CP-safe.
+            heads_shd = self.shd_cfg.act_btnh
+            cp_axis = heads_shd[1]
+            mesh = jax.sharding.get_abstract_mesh()
+            if cp_axis is not None and mesh.shape[cp_axis] > 1:
+                seq_spec = P(heads_shd[0], cp_axis)
+                attn_BTHK = context_parallel_attention(
+                    q_BTHK,
+                    k_BTGK,
+                    v_BTGK,
+                    positions_BT,
+                    cp_axis=cp_axis,
+                    scale=self.scale,
+                    heads_spec=P(*heads_shd),
+                    seq_spec=seq_spec,
+                    q_segment_ids_BT=segment_ids_BT if self._cp_document_mask else None,
+                    implementation=self._attn_backend,
+                )
+            else:
+                attn_BTHK = dot_product_attention(
+                    q_BTHK,
+                    k_BTGK,
+                    v_BTGK,
+                    is_causal=True,
+                    scale=self.scale,
+                    implementation=self._attn_backend,
+                    q_sharding=self._q_sharding,
+                )
             out_BTD = self.o_proj(
                 jax.lax.reshape(
                     attn_BTHK, (B, T, self.num_heads * K), out_sharding=self.shd_cfg.act_btf

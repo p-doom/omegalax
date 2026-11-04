@@ -11,6 +11,8 @@ from flax import nnx
 from jax.sharding import PartitionSpec, reshard
 from tokamax import dot_product_attention
 
+from omegalax.models.moe_grouped import grouped_moe
+from omegalax.models.remat_policy import resolve_remat_policy
 from .config import Qwen3VLConfig
 from .vision import VisionModel
 
@@ -218,6 +220,14 @@ class TextMLP(nnx.Module):
 class TextMoEFeedForward(nnx.Module):
     """Sparse MoE MLP mirroring the Qwen3 MoE structure."""
 
+    # Logical sharding of the expert-stacked projections, read by
+    # trainers.lora.inject_lora to attach per-expert LoRA (mirrors the Params below).
+    _EXPERT_LORA_SHARDING = {
+        "gate_proj": (None, "embed", "mlp"),
+        "up_proj": (None, "embed", "mlp"),
+        "down_proj": (None, "mlp", "embed"),
+    }
+
     def __init__(self, cfg: Qwen3VLConfig, *, rngs: nnx.Rngs):
         self.cfg = cfg
         self.shd_cfg = cfg.shd_cfg
@@ -235,7 +245,13 @@ class TextMoEFeedForward(nnx.Module):
             init(rngs.params(), (E, F, D), dtype=cfg.param_dtype),
             sharding=(None, "mlp", "embed"),
         )
-        # Router math is fp32 for stable expert selection
+        # Optional per-expert LoRA adapters (populated by inject_lora; None = no-op).
+        # nnx.data(None) makes these data slots so a module can be assigned later
+        # (a plain None would be a static attribute).
+        self.gate_proj_lora = nnx.data(None)
+        self.up_proj_lora = nnx.data(None)
+        self.down_proj_lora = nnx.data(None)
+        # Router math is fp32 for stable expert selection.
         self.router = nnx.Linear(
             D,
             E,
@@ -249,10 +265,7 @@ class TextMoEFeedForward(nnx.Module):
     def __call__(self, hidden_BTD: jax.Array) -> tuple[jax.Array, jax.Array]:
         cfg = self.cfg
         batch_axis = self.shd_cfg.act_btd[0]
-        hidden_axis = self.shd_cfg.act_btd[2]
-        ff_axis = self.shd_cfg.act_btf[2]
 
-        # Router math is fp32 for stable expert selection
         router_logits_BTE = self.router(hidden_BTD, out_sharding=P(batch_axis, None, None))
         probs_BTE = jax.nn.softmax(router_logits_BTE, axis=-1)
         topk_weights_BTk, topk_idx_BTk = jax.lax.top_k(probs_BTE, cfg.num_experts_per_tok)
@@ -260,44 +273,32 @@ class TextMoEFeedForward(nnx.Module):
             topk_weights_BTk = topk_weights_BTk / jnp.clip(
                 jnp.sum(topk_weights_BTk, axis=-1, keepdims=True), min=1e-9
             )
-        # Cast back to activation dtype before mixing with expert outputs;
         topk_weights_BTk = topk_weights_BTk.astype(cfg.dtype)
 
         gate_proj_EDF = self.gate_proj[...].astype(cfg.dtype)
         up_proj_EDF = self.up_proj[...].astype(cfg.dtype)
         down_proj_EFD = self.down_proj[...].astype(cfg.dtype)
 
-        dense_hidden_BTD = reshard(hidden_BTD, P(batch_axis, None, None))
-        gate_BTEF = jnp.einsum(
-            "BTD,EDF->BTEF",
-            dense_hidden_BTD,
-            gate_proj_EDF,
-            out_sharding=P(batch_axis, None, None, ff_axis),
-        )
-        up_BTEF = jnp.einsum(
-            "BTD,EDF->BTEF",
-            dense_hidden_BTD,
-            up_proj_EDF,
-            out_sharding=P(batch_axis, None, None, ff_axis),
-        )
-        expert_hidden_BTEF = nnx.silu(gate_BTEF) * up_BTEF
-        expert_out_BTED = jnp.einsum(
-            "BTEF,EFD->BTED",
-            expert_hidden_BTEF,
-            down_proj_EFD,
-            out_sharding=P(batch_axis, None, None, hidden_axis),
-        )
-
         B, T = hidden_BTD.shape[:2]
-        flat_out = expert_out_BTED.reshape(B * T, cfg.num_experts, cfg.emb_dim)
-        flat_idx = topk_idx_BTk.reshape(B * T, cfg.num_experts_per_tok)
-        gathered = jnp.take_along_axis(flat_out, flat_idx[..., None], axis=1)
-        gathered = gathered.reshape(B, T, cfg.num_experts_per_tok, cfg.emb_dim)
-        merged_BTD = reshard(
-            jnp.sum(gathered * topk_weights_BTk[..., None], axis=-2), self.shd_cfg.act_btd
-        )
 
-        # Cast back to float32 for the aux_loss calculation
+        # Dropless grouped-GEMM MoE (single-device grouped path).
+        flat_hidden_ND = hidden_BTD.reshape(B * T, cfg.emb_dim)
+        flat_idx_Nk = topk_idx_BTk.reshape(B * T, cfg.num_experts_per_tok)
+        flat_w_Nk = topk_weights_BTk.reshape(B * T, cfg.num_experts_per_tok)
+        merged_ND = grouped_moe(
+            flat_hidden_ND,
+            flat_idx_Nk,
+            flat_w_Nk,
+            gate_proj_EDF,
+            up_proj_EDF,
+            down_proj_EFD,
+            num_experts=cfg.num_experts,
+            gate_lora=self.gate_proj_lora,
+            up_lora=self.up_proj_lora,
+            down_lora=self.down_proj_lora,
+        )
+        merged_BTD = reshard(merged_ND.reshape(B, T, cfg.emb_dim), self.shd_cfg.act_btd)
+
         expert_mask_BTkE = jax.nn.one_hot(topk_idx_BTk, cfg.num_experts, dtype=jnp.float32)
         tokens_per_expert = jnp.mean(expert_mask_BTkE, axis=(0, 1))
         router_prob_per_expert_E = jnp.mean(probs_BTE, axis=(0, 1))
@@ -349,6 +350,7 @@ class TextAttention(nnx.Module):
         )
         self.q_norm = RMSNorm(cfg.head_dim, cfg.norm_eps, rngs=rngs, sharding=(None,))
         self.k_norm = RMSNorm(cfg.head_dim, cfg.norm_eps, rngs=rngs, sharding=(None,))
+        self.dtype = cfg.dtype
         self.n_rep = cfg.num_heads // cfg.num_kv_heads
         self.scale = cfg.head_dim**-0.5
         self.head_dim = cfg.head_dim
@@ -386,17 +388,45 @@ class TextAttention(nnx.Module):
         q_BTHK = apply_rope(q_BTHK, sin_BTK, cos_BTK)
         k_BTGK = apply_rope(k_BTGK, sin_BTK, cos_BTK)
 
-        # force bfloat16 - tokamax attention only supports fp16/bf16
+        # tokamax's GPU kernels (mosaic_gpu/cudnn) only run in fp16/bf16; an fp32
+        # model must NOT be silently downcast, so route it to the fp32-capable "xla"
+        # backend. Precision reduction is thus explicit and gated on the dtype.
         attn_in_dtype = q_BTHK.dtype
-        attn_BTHK = dot_product_attention(
-            q_BTHK.astype(jnp.bfloat16),
-            k_BTGK.astype(jnp.bfloat16),
-            v_BTGK.astype(jnp.bfloat16),
-            is_causal=True,
-            scale=self.scale,
-            implementation=self._attn_backend,
-            q_sharding=self._q_sharding,
-        ).astype(attn_in_dtype)
+        if attn_in_dtype == jnp.float32:
+            # tokamax's "xla" reference expands GQA KV heads internally via
+            # jnp.repeat(axis=-2) WITHOUT an out_sharding, which raises under an
+            # explicit/auto mesh (the GPU mosaic_gpu/cudnn kernels handle GQA
+            # natively and never hit this). Expand the KV heads here instead, with
+            # the head-axis (TP) sharding attached, so tokamax sees full MHA
+            # (k.shape[-2] == q.shape[-2]) and its own repeat becomes a no-op.
+            if self.n_rep > 1:
+                k_BTHK = jnp.repeat(
+                    k_BTGK, self.n_rep, axis=-2, out_sharding=self.shd_cfg.act_btnh
+                )
+                v_BTHK = jnp.repeat(
+                    v_BTGK, self.n_rep, axis=-2, out_sharding=self.shd_cfg.act_btnh
+                )
+            else:
+                k_BTHK, v_BTHK = k_BTGK, v_BTGK
+            attn_BTHK = dot_product_attention(
+                q_BTHK,
+                k_BTHK,
+                v_BTHK,
+                is_causal=True,
+                scale=self.scale,
+                implementation="xla",
+                q_sharding=self._q_sharding,
+            )
+        else:
+            attn_BTHK = dot_product_attention(
+                q_BTHK.astype(jnp.bfloat16),
+                k_BTGK.astype(jnp.bfloat16),
+                v_BTGK.astype(jnp.bfloat16),
+                is_causal=True,
+                scale=self.scale,
+                implementation=self._attn_backend,
+                q_sharding=self._q_sharding,
+            ).astype(attn_in_dtype)
         out_BTD = self.o_proj(
             jax.lax.reshape(
                 attn_BTHK, (B, T, self.num_heads * self.head_dim), out_sharding=self.shd_cfg.act_btf
@@ -419,8 +449,17 @@ class TextDecoderLayer(nnx.Module):
         self.is_moe = cfg.is_moe_layer(layer_idx)
         self.mlp = TextMoEFeedForward(cfg, rngs=rngs) if self.is_moe else TextMLP(cfg, rngs=rngs)
 
-    @(partial(jax.remat, static_argnums=0) if DECODER_LAYER_REMAT else (lambda f: f))
+        self._remat_policy = resolve_remat_policy(cfg.remat_policy)
+
     def __call__(
+        self, hidden_BTD: jax.Array, sin_BTK: jax.Array, cos_BTK: jax.Array
+    ) -> tuple[jax.Array, jax.Array]:
+        # nnx.remat on the unbound method (no static_argnums); see qwen3/model.py.
+        return nnx.remat(type(self)._impl, policy=self._remat_policy)(
+            self, hidden_BTD, sin_BTK, cos_BTK
+        )
+
+    def _impl(
         self, hidden_BTD: jax.Array, sin_BTK: jax.Array, cos_BTK: jax.Array
     ) -> tuple[jax.Array, jax.Array]:
         hidden_BTD = hidden_BTD + self.attn(self.input_layernorm(hidden_BTD), sin_BTK, cos_BTK)
@@ -500,9 +539,12 @@ class Qwen3VL(nnx.Module):
                 pixel_values, image_grid_thw, vision_cu_seqlens
             )
 
-        embedding_VD = jnp.astype(self.text.embedder.embedding[...], self.text.embedder.dtype)
-        embedding_VD = reshard(embedding_VD, P())
-        inputs_embeds_BTD = embedding_VD.at[(token_ids_BT,)].get(out_sharding=self.text.out_emb_shd)
+        inputs_embeds_BTD = jnp.astype(
+            self.text.embedder.embedding[...]
+            .at[(token_ids_BT,)]
+            .get(out_sharding=self.text.out_emb_shd),
+            self.text.embedder.dtype,
+        )
 
         if image_features_ND is not None:
             image_mask_BT = token_ids_BT == cfg.image_token_id
@@ -545,7 +587,20 @@ class Qwen3VL(nnx.Module):
         )
 
         hidden_BTD = inputs_embeds_BTD
+
+        # Scan only a homogeneous text-only stack: DeepStack injects visual features
+        # BETWEEN layers (breaking the single-body assumption), so images and
+        # heterogeneous stacks use the unrolled loop below.
+        if deepstack_features is None and cfg.is_homogeneous:
+            hidden_BTD, total_aux = _scan_text_layers(
+                list(self.text.layers), hidden_BTD, sin_BTK, cos_BTK
+            )
+            hidden_BTD = self.text.final_norm(hidden_BTD)
+            return hidden_BTD, total_aux
+
         aux_losses = []
+        # Unrolled fallback (deepstack / heterogeneous): each layer self-remats with
+        # cfg.remat_policy (no double remat).
         for layer_idx, layer in enumerate(self.text.layers):
             hidden_BTD, aux_loss = layer(hidden_BTD, sin_BTK, cos_BTK)
             aux_losses.append(aux_loss)
@@ -562,6 +617,32 @@ class Qwen3VL(nnx.Module):
             jnp.sum(jnp.stack(aux_losses)) if aux_losses else jnp.array(0.0, dtype=jnp.float32)
         )
         return hidden_BTD, total_aux
+
+
+def _scan_text_layers(
+    layers: list[TextDecoderLayer],
+    hidden_BTD: jax.Array,
+    sin_BTK: jax.Array,
+    cos_BTK: jax.Array,
+) -> tuple[jax.Array, jax.Array]:
+    """Run homogeneous text-decoder layers with a single ``nnx.scan``: stack
+    per-layer state on a (replicated) layer axis (sharding preserved; layers
+    self-remat, no double remat; aux losses summed). The per-step output is cast
+    back to the carry dtype (invariant carry; MoE can promote bf16 -> fp32).
+    """
+    carry_dtype = hidden_BTD.dtype
+    graphdef, _ = nnx.split(layers[0])
+    states = [nnx.split(layer)[1] for layer in layers]
+    stacked_state = jax.tree.map(lambda *xs: jnp.stack(xs, axis=0), *states)
+
+    @nnx.scan(in_axes=(0, nnx.Carry, None, None), out_axes=(nnx.Carry, 0))
+    def run(layer_state, carry_BTD, sin_BTK, cos_BTK):
+        layer = nnx.merge(graphdef, layer_state)
+        out_BTD, aux = layer(carry_BTD, sin_BTK, cos_BTK)
+        return out_BTD.astype(carry_dtype), aux
+
+    hidden_BTD, aux_L = run(stacked_state, hidden_BTD, sin_BTK, cos_BTK)
+    return hidden_BTD, jnp.sum(aux_L)
 
 
 def _deepstack_process(

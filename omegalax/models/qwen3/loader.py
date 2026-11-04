@@ -126,9 +126,10 @@ def create_qwen3_from_safetensors(
     tp_size: int | None = None,
     fsdp_size: int | None = None,
     dp_size: int | None = None,
+    cp_size: int = 1,
 ) -> Qwen3:
     """Load HuggingFace Qwen3 safetensors (dense or MoE) into a JAX model."""
-    mesh = ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size)
+    mesh = ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size, cp_size=cp_size)
     files = find_safetensors(file_dir)
 
     hf_cfg = load_hf_config(epath.Path(file_dir))

@@ -155,9 +155,10 @@ def create_qwen3_vl_from_safetensors(
     tp_size: int | None = None,
     fsdp_size: int | None = None,
     dp_size: int | None = None,
+    cp_size: int = 1,
 ) -> tuple[Qwen3VL, Qwen3VLConfig]:
     """Load HuggingFace Qwen3-VL safetensors into a JAX Qwen3-VL model."""
-    mesh = ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size)
+    mesh = ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size, cp_size=cp_size)
 
     path = epath.Path(file_dir).expanduser()
     files = find_safetensors(file_dir)

@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from functools import partial
-
 import jax
 import jax.numpy as jnp
 from flax import nnx
@@ -14,8 +12,39 @@ from jax._src.cudnn.fused_attention_stablehlo import (
     dot_product_attention as _cudnn_dot_product_attention,
 )
 
+from omegalax.models.remat_policy import resolve_remat_policy
 from omegalax.models.shard_config import ShardConfig
 from .config import Qwen3VLVisionConfig
+
+
+def _xla_packed_vision_attention_local(
+    q_NHK: jax.Array,
+    k_NHK: jax.Array,
+    v_NHK: jax.Array,
+    cu_seqlens: jax.Array,
+    scale: float,
+) -> jax.Array:
+    """fp32-capable reference for packed vision attention.
+
+    cuDNN flash attention only runs in fp16/bf16/fp8, so an fp32 vision config
+    has no fp32 kernel available here. Rather than silently downcasting q/k/v to
+    bf16, fp32 is routed through this pure-jax einsum+softmax implementation so
+    the precision contract is honored. It builds a block-diagonal segment mask
+    from ``cu_seqlens`` (bidirectional attention within each image segment,
+    matching the cuDNN ``NO_MASK`` packed layout) and computes attention in the
+    input dtype with fp32 softmax accumulation.
+    """
+    N = q_NHK.shape[0]
+    cu = cu_seqlens.astype(jnp.int32)
+    # Per-token segment id, then a block-diagonal (same-segment) mask.
+    seg_id_N = jnp.searchsorted(cu[1:], jnp.arange(N, dtype=jnp.int32), side="right")
+    same_seg_NS = seg_id_N[:, None] == seg_id_N[None, :]
+
+    logits_HNS = jnp.einsum("nhk,shk->hns", q_NHK, k_NHK) * scale
+    mask_value = jnp.finfo(logits_HNS.dtype).min
+    logits_HNS = jnp.where(same_seg_NS[None], logits_HNS, mask_value)
+    weights_HNS = jax.nn.softmax(logits_HNS.astype(jnp.float32), axis=-1).astype(logits_HNS.dtype)
+    return jnp.einsum("hns,shk->nhk", weights_HNS, v_NHK)
 
 
 def _cudnn_packed_vision_attention_local(
@@ -26,6 +55,12 @@ def _cudnn_packed_vision_attention_local(
     seqlens: jax.Array,
     scale: float,
 ) -> jax.Array:
+    # No fp32 cuDNN flash kernel exists (fp16/bf16/fp8 only). In fp32, avoid a
+    # silent bf16 downcast by using the fp32-capable pure-jax reference; the
+    # bf16 cast below then only ever happens for a bf16/fp16 compute dtype.
+    if q_NHK.dtype == jnp.float32:
+        return _xla_packed_vision_attention_local(q_NHK, k_NHK, v_NHK, cu_seqlens, scale)
+
     cu = cu_seqlens.astype(jnp.int32)
     q_offsets = cu[None]
     kv_offsets = cu[None]
@@ -66,12 +101,33 @@ def _cudnn_packed_vision_attention(
     describes per-image segment boundaries; cuDNN uses these to skip
     cross-segment tiles entirely rather than materializing a full [T, S] mask.
 
-    Under multi-device dp sharding, cuDNN's internal ``_fix_seqlen_offsets``
-    runs ``jnp.nonzero(..., size=size)`` on ``q_seqlen``, which lowers to a
-    scatter that can't resolve an output sharding when any of its inputs are
-    dp-sharded.  We wrap the whole call in ``shard_map`` so each device sees
-    only its local shards (no explicit sharding inside), matching cuDNN's
-    per-device view.
+    The cuDNN call is wrapped in a manual-mode ``jax.shard_map`` on ANY
+    non-empty mesh (a no-op on a single-device mesh), so the SPMD/Shardy
+    partitioner never sees the underlying ``custom_partitioning`` op — the same
+    technique as the Qwen3.5 vision fix (97ce1c9). Failures otherwise observed
+    on a multi-device mesh (all GPU-reproduced with replicated q/k/v):
+
+    * Forward-only: the partitioned op emits ``@Sharding`` custom calls that
+      have no CUDA runtime handler — "No registered implementation for custom
+      call to Sharding for platform CUDA" at the first step.
+    * With gradients flowing through vision (full fine-tune), cuDNN's Shardy
+      sharding rule maps the softmax-stat output's leading dim to
+      ``CompoundFactor('batch', 'n')``; our packed layout has batch == 1, and
+      Shardy rejects a size-1 factor combined with others — "dim mapping can't
+      have a factor of size 1 if there are multiple factors" at lowering, even
+      when q/k/v are fully replicated. So the wrap must be unconditional, not
+      just for dp-sharded inputs.
+    * Under dp sharding of the packed dim, cuDNN's internal
+      ``_fix_seqlen_offsets`` runs ``jnp.nonzero(..., size=size)`` on
+      ``q_seqlen``, which lowers to a scatter that can't resolve an output
+      sharding when its inputs are dp-sharded.
+
+    Inside the wrap each device holds its local shard: with the packed dim
+    replicated every shard computes the full packed sequence (per-segment
+    attention stays correct); with the packed dim dp-sharded each device gets
+    its own segments and matching local ``cu_seqlens``/``seqlens``; a
+    tp-sharded heads dim is fine since heads are independent. ``in_specs``
+    mirror each argument's actual sharding, so no resharding is introduced.
 
     ``seqlens`` is passed in rather than computed via ``jnp.diff(cu_seqlens)``
     since ``diff`` would slice a sharded (dp*(M+1),) axis to (dp*(M+1) - 1,),
@@ -86,8 +142,9 @@ def _cudnn_packed_vision_attention(
         (N, num_heads, head_dim)
     """
     sharding = jax.typeof(q_NHK).sharding
-    dp_axis = sharding.spec[0]
-    if dp_axis is None:
+    if sharding.mesh.empty:
+        # No mesh in scope (eager/CPU unit-test path): there is no partitioner
+        # to hide the op from, and shard_map would reject the empty mesh.
         return _cudnn_packed_vision_attention_local(
             q_NHK,
             k_NHK,
@@ -97,13 +154,14 @@ def _cudnn_packed_vision_attention(
             scale,
         )
 
-    q_spec = P(dp_axis, None, None)
-    cu_spec = P(dp_axis)
+    qkv_spec = sharding.spec
+    cu_spec = jax.typeof(cu_seqlens).sharding.spec
+    sq_spec = jax.typeof(seqlens).sharding.spec
     return jax.shard_map(
         lambda q, k, v, cu, sq: _cudnn_packed_vision_attention_local(q, k, v, cu, sq, scale),
         mesh=sharding.mesh,
-        in_specs=(q_spec, q_spec, q_spec, cu_spec, cu_spec),
-        out_specs=q_spec,
+        in_specs=(qkv_spec, qkv_spec, qkv_spec, cu_spec, sq_spec),
+        out_specs=qkv_spec,
         check_vma=False,
     )(q_NHK, k_NHK, v_NHK, cu_seqlens, seqlens)
 
@@ -342,8 +400,25 @@ class VisionBlock(nnx.Module):
         self.mlp = VisionMLP(cfg, hidden_shd=hidden_shd, ff_shd=ff_shd, rngs=rngs)
         self.hidden_shd = hidden_shd
 
-    @(partial(jax.remat, static_argnums=0) if VISION_BLOCK_REMAT else (lambda f: f))
+        self._remat_policy = resolve_remat_policy(cfg.remat_policy)
+
     def __call__(
+        self,
+        hidden_ND: jax.Array,
+        cu_seqlens: jax.Array,
+        seqlens: jax.Array,
+        cos_NK: jax.Array,
+        sin_NK: jax.Array,
+    ) -> jax.Array:
+        # Inline nnx.remat on the UNBOUND method (no static_argnums): nnx
+        # functionalizes ``self`` via split/merge, so it must not be static.
+        # Building the transform inline keeps graphdefs equal across fresh
+        # instances (stable hash -> one trace, not one per instance).
+        return nnx.remat(type(self)._impl, policy=self._remat_policy)(
+            self, hidden_ND, cu_seqlens, seqlens, cos_NK, sin_NK
+        )
+
+    def _impl(
         self,
         hidden_ND: jax.Array,
         cu_seqlens: jax.Array,

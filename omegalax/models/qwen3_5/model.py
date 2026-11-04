@@ -7,6 +7,8 @@ import jax.numpy as jnp
 from flax import nnx
 from jax.sharding import PartitionSpec, reshard
 
+from omegalax.models.moe_grouped import grouped_moe
+from omegalax.models.remat_policy import resolve_remat_policy
 from omegalax.models.shard_config import ShardConfig
 from .attention import Attention
 from .config import Qwen3_5Config, Qwen3_5TextConfig
@@ -63,6 +65,14 @@ class MLP(nnx.Module):
 class MoEFeedForward(nnx.Module):
     """Sparse Mixture-of-Experts block with a shared expert and shared expert gate."""
 
+    # Logical sharding of the expert-stacked projections, read by
+    # trainers.lora.inject_lora to attach per-expert LoRA (mirrors the Params below).
+    _EXPERT_LORA_SHARDING = {
+        "gate_proj": (None, "embed", "mlp"),
+        "up_proj": (None, "embed", "mlp"),
+        "down_proj": (None, "mlp", "embed"),
+    }
+
     def __init__(self, cfg: Qwen3_5TextConfig, *, rngs: nnx.Rngs):
         self.cfg = cfg
         self.shd_cfg = cfg.shd_cfg
@@ -83,6 +93,12 @@ class MoEFeedForward(nnx.Module):
             init(rngs.params(), (E, F_moe, D)),
             sharding=(None, "mlp", "embed"),
         )
+        # Optional per-expert LoRA adapters (populated by inject_lora; None = no-op).
+        # nnx.data(None) makes these data slots so a module can be assigned later
+        # (a plain None would be a static attribute).
+        self.gate_proj_lora = nnx.data(None)
+        self.up_proj_lora = nnx.data(None)
+        self.down_proj_lora = nnx.data(None)
         self.router = nnx.Linear(
             D,
             E,
@@ -113,8 +129,6 @@ class MoEFeedForward(nnx.Module):
         cfg = self.cfg
         B, T = hidden_BTD.shape[:2]
         batch_axis = self.shd_cfg.act_btd[0]
-        ff_axis = self.shd_cfg.act_btf[2]
-        hidden_axis = self.shd_cfg.act_btd[2]
 
         router_logits_BTE = self.router(hidden_BTD, out_sharding=P(batch_axis, None, None))
         probs_BTE = jax.nn.softmax(router_logits_BTE.astype(jnp.float32), axis=-1)
@@ -129,42 +143,24 @@ class MoEFeedForward(nnx.Module):
         up_proj = jnp.astype(self.up_proj[...], compute_dtype)
         down_proj = jnp.astype(self.down_proj[...], compute_dtype)
 
-        dense_hidden_BTD = reshard(hidden_BTD, P(batch_axis, None, None))
-        gate_BTEF = jnp.einsum(
-            "BTD,EDF->BTEF",
-            dense_hidden_BTD,
+        # Dropless grouped-GEMM MoE for the routed experts (single-device grouped
+        # path). The shared expert / gate below are separate and unchanged.
+        flat_hidden_ND = hidden_BTD.reshape(B * T, cfg.hidden_size)
+        flat_idx_Nk = topk_idx_BTk.reshape(B * T, cfg.num_experts_per_tok)
+        flat_w_Nk = topk_weights_BTk.reshape(B * T, cfg.num_experts_per_tok)
+        moe_out_ND = grouped_moe(
+            flat_hidden_ND,
+            flat_idx_Nk,
+            flat_w_Nk,
             gate_proj,
-            out_sharding=P(batch_axis, None, None, ff_axis),
-        )
-        up_BTEF = jnp.einsum(
-            "BTD,EDF->BTEF",
-            dense_hidden_BTD,
             up_proj,
-            out_sharding=P(batch_axis, None, None, ff_axis),
-        )
-        expert_hidden_BTEF = nnx.silu(gate_BTEF) * up_BTEF
-        expert_out_BTED = jnp.einsum(
-            "BTEF,EFD->BTED",
-            expert_hidden_BTEF,
             down_proj,
-            out_sharding=P(batch_axis, None, None, hidden_axis),
+            num_experts=cfg.num_experts,
+            gate_lora=self.gate_proj_lora,
+            up_lora=self.up_proj_lora,
+            down_lora=self.down_proj_lora,
         )
-
-        flat_out = jax.lax.reshape(
-            expert_out_BTED,
-            (B * T, cfg.num_experts, cfg.hidden_size),
-            out_sharding=P(batch_axis, None, None),
-        )
-        flat_idx = topk_idx_BTk.reshape(B * T, cfg.num_experts_per_tok)
-        gathered = jnp.take_along_axis(flat_out, flat_idx[..., None], axis=1)
-        gathered = jax.lax.reshape(
-            gathered,
-            (B, T, cfg.num_experts_per_tok, cfg.hidden_size),
-            out_sharding=P(batch_axis, None, None, None),
-        )
-        moe_out_BTD = reshard(
-            jnp.sum(gathered * topk_weights_BTk[..., None], axis=-2), self.shd_cfg.act_btd
-        )
+        moe_out_BTD = reshard(moe_out_ND.reshape(B, T, cfg.hidden_size), self.shd_cfg.act_btd)
 
         shared_out_BTD = self.shared_expert(hidden_BTD)
         shared_gate = jax.nn.sigmoid(
@@ -206,8 +202,29 @@ class DecoderLayer(nnx.Module):
         self.input_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, rngs=rngs)
         self.post_attention_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, rngs=rngs)
 
-    @partial(jax.remat, static_argnums=0)
+        self._remat_policy = resolve_remat_policy(cfg.remat_policy)
+
     def __call__(
+        self,
+        hidden_BTD: jax.Array,
+        cos_BTK: jax.Array,
+        sin_BTK: jax.Array,
+        segment_ids_BT: jax.Array,
+        position_ids_BT: jax.Array,
+        attention_mask_BT: jax.Array | None = None,
+    ) -> tuple[jax.Array, jax.Array]:
+        # nnx.remat on the unbound method (no static_argnums); see qwen3/model.py.
+        return nnx.remat(type(self)._impl, policy=self._remat_policy)(
+            self,
+            hidden_BTD,
+            cos_BTK,
+            sin_BTK,
+            segment_ids_BT,
+            position_ids_BT,
+            attention_mask_BT,
+        )
+
+    def _impl(
         self,
         hidden_BTD: jax.Array,
         cos_BTK: jax.Array,
@@ -301,21 +318,81 @@ class TextModel(nnx.Module):
         attention_mask_BT = (segment_ids_BT != 0).astype(jnp.float32)
         text_position_ids_BT = position_ids_ZBT[0]
 
-        aux_losses = []
-        for layer in self.layers:
-            hidden_BTD, aux = layer(
-                hidden_BTD,
-                cos_BTK,
-                sin_BTK,
-                segment_ids_BT,
-                text_position_ids_BT,
-                attention_mask_BT,
+        layer_args = (cos_BTK, sin_BTK, segment_ids_BT, text_position_ids_BT, attention_mask_BT)
+
+        # Block-scan path: Qwen3.5 interleaves linear_attention and full_attention
+        # layers with DIFFERENT param pytrees, so they can't be one scan. Instead
+        # scan the repeating block (period p) over num_layers // p (MaxText Gemma3
+        # pattern): each of the p positions is homogeneous across blocks and stacked
+        # along the block axis. Irregular / disabled patterns use the loop below.
+        period = cfg.scan_block_period
+        # Need >= 2 blocks for a scan to buy anything.
+        if period is not None and period < len(self.layers):
+            hidden_BTD, total_aux = _scan_hybrid_blocks(
+                list(self.layers), period, hidden_BTD, layer_args
             )
+            hidden_BTD = self.final_norm(hidden_BTD)
+            return hidden_BTD, total_aux
+
+        aux_losses = []
+        # Unrolled fallback: each layer self-remats with cfg.remat_policy (no double remat).
+        for layer in self.layers:
+            hidden_BTD, aux = layer(hidden_BTD, *layer_args)
             aux_losses.append(aux)
 
         hidden_BTD = self.final_norm(hidden_BTD)
         total_aux = jnp.sum(jnp.stack(aux_losses)) if aux_losses else jnp.array(0.0)
         return hidden_BTD, total_aux
+
+
+def _scan_hybrid_blocks(
+    layers: list[DecoderLayer],
+    period: int,
+    hidden_BTD: jax.Array,
+    layer_args: tuple,
+) -> tuple[jax.Array, jax.Array]:
+    """Scan the repeating hybrid block over ``num_blocks = len(layers) // period``:
+    stack each of the ``period`` positions' per-layer state on a (replicated) block
+    axis; the scan body applies the ``period`` positions in order (a Python unroll).
+    Layers self-remat (no double remat); sharding preserved; aux losses summed.
+
+    The block output is cast back to the carry dtype (``nnx.scan`` needs an invariant
+    carry and the MoE block can promote bf16 -> fp32; no-op for fp32).
+    """
+    carry_dtype = hidden_BTD.dtype
+    n = len(layers)
+    num_blocks = n // period
+
+    # One (graphdef, stacked_state) per position within the block.
+    pos_graphdefs = []
+    pos_stacked = []
+    for pos in range(period):
+        pos_layers = [layers[b * period + pos] for b in range(num_blocks)]
+        graphdef, _ = nnx.split(pos_layers[0])
+        states = [nnx.split(layer)[1] for layer in pos_layers]
+        stacked = jax.tree.map(lambda *xs: jnp.stack(xs, axis=0), *states)
+        pos_graphdefs.append(graphdef)
+        pos_stacked.append(stacked)
+
+    # in_axes: one stacked state per position (block axis 0), Carry for hidden,
+    # None (broadcast) for the shared per-step layer args.
+    in_axes = (*([0] * period), nnx.Carry, *([None] * len(layer_args)))
+
+    @nnx.scan(in_axes=in_axes, out_axes=(nnx.Carry, 0))
+    def run(*args):
+        block_states = args[:period]
+        carry_BTD = args[period]
+        step_args = args[period + 1 :]
+
+        block_aux = jnp.array(0.0, dtype=jnp.float32)
+        for pos in range(period):
+            layer = nnx.merge(pos_graphdefs[pos], block_states[pos])
+            carry_BTD, aux = layer(carry_BTD, *step_args)
+            block_aux = block_aux + aux
+        return carry_BTD.astype(carry_dtype), block_aux
+
+    hidden_BTD, block_aux_L = run(*pos_stacked, hidden_BTD, *layer_args)
+    return hidden_BTD, jnp.sum(block_aux_L)
 
 
 # Causal LM
@@ -335,9 +412,17 @@ class Qwen3_5ForCausalLM(nnx.Module):
             kernel_init=wp(lm_head_init, ("embed", "vocab")),
         )
 
-    def __call__(self, token_ids_BT, segment_ids_BT, cache, num_right_pads):
+    def __call__(self, token_ids_BT, segment_ids_BT, cache, num_right_pads,
+                 position_ids_BT=None):
         del cache, num_right_pads
-        return self.text(token_ids_BT=token_ids_BT, segment_ids_BT=segment_ids_BT)
+        # position_ids_BT (zig-zag CP: each token's original index) broadcast across
+        # the 3 MRoPE sections downstream.
+        position_ids_ZBT = None if position_ids_BT is None else position_ids_BT
+        return self.text(
+            token_ids_BT=token_ids_BT,
+            segment_ids_BT=segment_ids_BT,
+            position_ids_ZBT=position_ids_ZBT,
+        )
 
 
 # VLM

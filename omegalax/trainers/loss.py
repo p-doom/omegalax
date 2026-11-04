@@ -1,11 +1,8 @@
-"""Memory-efficient cross-entropy loss with vocabulary tiling.
+"""Memory-efficient cross-entropy with vocabulary tiling (MaxText-style).
 
-Adapted from MaxText's vocabulary tiling approach. Instead of materializing the
-full ``(B*T, V)`` logit tensor, tiles over the batch-sequence axis and computes
-logits + cross-entropy per chunk using ``jax.lax.scan``.
-
-With ``num_tiles=1`` this is mathematically equivalent to the naive approach.
-With ``num_tiles>1`` peak memory drops from ``O(B*T*V)`` to ``O(B*T*V / num_tiles)``.
+Tiles over the batch-sequence axis instead of materializing the full ``(B*T, V)``
+logits: ``num_tiles=1`` is the naive path, ``num_tiles>1`` drops peak memory to
+``O(B*T*V / num_tiles)``.
 """
 
 from __future__ import annotations
@@ -13,6 +10,28 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
+
+
+def shift_for_next_token(
+    token_ids_BT: jax.Array,
+    loss_mask_BT: jax.Array,
+    pad_id: int = 0,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Shift-BEFORE-shard next-token alignment for context parallelism.
+
+    The next-token +1 shift crosses shard boundaries once the T axis is cp-sharded,
+    so under CP it must be applied on the FULL sequence before sharding. Returns
+    same-length ``(B, T)`` arrays (T stays cp-divisible): ``inputs`` == tokens,
+    ``targets`` == tokens rolled left one (last position masked out), ``loss_mask``
+    rolled left one with the final position forced to 0. The result is
+    position-aligned, so the CP loss consumes it with no further shift.
+    """
+    del pad_id  # masking is driven by loss_mask, not pad_id, matching the trainer.
+    targets_BT = jnp.roll(token_ids_BT, shift=-1, axis=1)
+    mask_shifted_BT = jnp.roll(loss_mask_BT, shift=-1, axis=1)
+    # Final position has no next token: force its mask to 0.
+    mask_shifted_BT = mask_shifted_BT.at[:, -1].set(0)
+    return token_ids_BT, targets_BT, mask_shifted_BT
 
 
 def _cross_entropy_with_logits(
@@ -42,41 +61,47 @@ def chunked_cross_entropy_loss(
     mask_BT: jax.Array,
     num_tiles: int = 8,
     logits_out_sharding: P | None = None,
+    *,
+    shift: bool = True,
+    cp_axis: str | None = None,
 ) -> jax.Array:
-    """Memory-efficient cross-entropy that never materializes the full logit tensor.
+    """Memory-efficient masked-mean cross-entropy that never materializes the full
+    logit tensor: each tile computes a ``(chunk, V)`` logit slice and its CE, then
+    discards the logits. ``hidden_BTD`` (B, T, D), ``lm_head_kernel_DV`` (D, V),
+    ``targets_BT``/``mask_BT`` (B, T); ``num_tiles`` must divide ``B*T``.
 
-    Tiles over the batch-sequence axis. Each tile computes ``hidden_chunk @ lm_head_kernel``
-    to get a ``(chunk_size, V)`` logit slice, then immediately computes the cross-entropy
-    for that slice and discards the logits.
+    ``shift``: True (default, non-CP) applies the next-token shift INSIDE the loss
+    (``hidden[:, :-1]`` vs ``targets[:, 1:]``). False expects already-aligned arrays
+    (CP uses this -- the +1 shift is applied shift-before-shard, see
+    :func:`shift_for_next_token`).
 
-    Args:
-        hidden_BTD: Hidden states after final norm, shape ``(B, T, D)``, any dtype.
-        lm_head_kernel_DV: LM head weight matrix, shape ``(D, V)``, any dtype.
-        targets_BT: Target token ids, shape ``(B, T)``, int32.
-        mask_BT: Loss mask, shape ``(B, T)``, int32/float32.
-        num_tiles: Number of tiles to split B*T into. Higher = less memory.
-            Must evenly divide ``B * T``.
-
-    Returns:
-        Scalar masked mean cross-entropy loss.
+    ``cp_axis``: when set, the T axis is cp-sharded; the ``(loss_sum, mask_sum)`` sum
+    over that axis is GLOBAL because this runs under an Explicit-sharding mesh where
+    ``jnp.sum`` over a cp axis already all-reduces (a manual psum would double-count),
+    and vocab tiling is disabled (its reshape would resplit the sharded T).
     """
     B, T, D = hidden_BTD.shape
 
-    # For next-token prediction: predict position t from hidden at t-1.
-    # Keep B separate (may be FSDP-sharded). Tile only within each sequence.
-    hidden_BTD = hidden_BTD[:, :-1, :]
-    targets_BT = targets_BT[:, 1:]
-    mask_BT = mask_BT[:, 1:]
-    T1 = T - 1
+    if shift:
+        # Next-token shift; valid only when T is NOT cp-sharded (CP passes shift=False).
+        hidden_BTD = hidden_BTD[:, :-1, :]
+        targets_BT = targets_BT[:, 1:]
+        mask_BT = mask_BT[:, 1:]
+        T1 = T - 1
+    else:
+        T1 = T
 
-    if num_tiles <= 1 or T1 < num_tiles:
+    # Under an Explicit-sharding mesh, jnp.sum over the cp-sharded T axis already
+    # all-reduces, so loss_sum / mask_sum is the correct global mean (no manual
+    # psum). Vocab tiling is skipped under CP (its reshape would resplit the T axis).
+    if cp_axis is not None or num_tiles <= 1 or T1 < num_tiles:
         logits_BTV = jnp.einsum(
             "BTD,DV->BTV", hidden_BTD, lm_head_kernel_DV, out_sharding=logits_out_sharding
         )
         loss_sum, mask_sum = _cross_entropy_with_logits(logits_BTV, targets_BT, mask_BT)
         return loss_sum / jnp.maximum(mask_sum, 1.0)
 
-    # Tile within each sequence (B stays intact, T gets chunked)
+    # Tile within each sequence (B intact, T chunked).
     chunk_size = -(-T1 // num_tiles)
     pad_t = chunk_size * num_tiles - T1
     if pad_t > 0:
@@ -102,9 +127,8 @@ def chunked_cross_entropy_loss(
         chunk_loss, chunk_mask = _remat_chunk(h_BSD, tgt_BS, msk_BS)
         return (loss_acc + chunk_loss, mask_acc + chunk_mask), None
 
-    # Scan over chunks (axis 1), keeping B (axis 0, possibly FSDP-sharded) intact.
-    # jax.remat on the body ensures logits are recomputed during backward instead
-    # of stored for all tiles (which would require O(num_tiles * B * chunk * V)).
+    # Scan over chunks (B intact); the body's jax.remat recomputes logits in the
+    # backward instead of storing all tiles' O(num_tiles * B * chunk * V).
     (total_loss, total_mask), _ = jax.lax.scan(
         _scan_body,
         (jnp.array(0.0, dtype=jnp.float32), jnp.array(0.0, dtype=jnp.float32)),

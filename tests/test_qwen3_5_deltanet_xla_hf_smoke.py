@@ -78,12 +78,21 @@ def _copy_linear(hf_linear: torch.nn.Linear, jax_linear: nnx.Linear) -> None:
 
 
 def _copy_hf_weights(hf_module: HFGatedDeltaNet, jax_module: GatedDeltaNet) -> None:
-    _copy_linear(hf_module.in_proj_qkv, jax_module.in_proj_qkv)
+    # The fused HF in_proj_qkv / conv1d are split into per-q/k/v params (see
+    # deltanet.py + loader), so slice them the same way here.
+    kd, vd = jax_module.key_dim, jax_module.value_dim
+    qkv_DC = _to_jax(hf_module.in_proj_qkv.weight).T  # (D, conv_dim)
+    jax_module.in_proj_q.kernel[...] = qkv_DC[:, :kd]
+    jax_module.in_proj_k.kernel[...] = qkv_DC[:, kd : 2 * kd]
+    jax_module.in_proj_v.kernel[...] = qkv_DC[:, 2 * kd :]
+    conv_CK = _to_jax(hf_module.conv1d.weight.squeeze(1))  # (conv_dim, K)
+    jax_module.conv_weight_q[...] = conv_CK[:kd]
+    jax_module.conv_weight_k[...] = conv_CK[kd : 2 * kd]
+    jax_module.conv_weight_v[...] = conv_CK[2 * kd :]
     _copy_linear(hf_module.in_proj_z, jax_module.in_proj_z)
     _copy_linear(hf_module.in_proj_b, jax_module.in_proj_b)
     _copy_linear(hf_module.in_proj_a, jax_module.in_proj_a)
     _copy_linear(hf_module.out_proj, jax_module.out_proj)
-    jax_module.conv_weight[...] = _to_jax(hf_module.conv1d.weight.squeeze(1))
     jax_module.dt_bias[...] = _to_jax(hf_module.dt_bias)
     jax_module.A_log[...] = _to_jax(hf_module.A_log)
     jax_module.norm.weight[...] = _to_jax(hf_module.norm.weight)

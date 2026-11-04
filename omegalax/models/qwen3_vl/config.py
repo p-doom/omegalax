@@ -9,6 +9,7 @@ import jax.numpy as jnp
 from etils import epath
 
 from omegalax.models.params_utils import load_hf_config_from_source
+from omegalax.models.remat_policy import DEFAULT_REMAT_POLICY
 from omegalax.models.shard_config import ShardConfig
 
 
@@ -26,6 +27,8 @@ class Qwen3VLVisionConfig:
     hidden_act: str
     num_position_embeddings: int
     deepstack_visual_indexes: tuple[int, ...]
+    # Activation checkpointing policy for vision blocks (see remat_policy.py).
+    remat_policy: str = DEFAULT_REMAT_POLICY
     dtype: Any = jnp.bfloat16
     param_dtype: Any = jnp.float32
 
@@ -54,6 +57,8 @@ class Qwen3VLConfig:
     mlp_only_layers: tuple[int, ...] = dataclasses.field(default_factory=tuple)
     decoder_sparse_step: int = 1
     norm_topk_prob: bool = True
+    # Activation checkpointing policy for text decoder layers (see remat_policy.py).
+    remat_policy: str = DEFAULT_REMAT_POLICY
     shd_cfg: ShardConfig = dataclasses.field(default_factory=ShardConfig.default)
     dtype: Any = jnp.bfloat16
     param_dtype: Any = jnp.float32
@@ -64,6 +69,18 @@ class Qwen3VLConfig:
             and layer_idx not in self.mlp_only_layers
             and (layer_idx + 1) % self.decoder_sparse_step == 0
         )
+
+    @property
+    def is_homogeneous(self) -> bool:
+        """True when every text-decoder layer has the same parameter structure.
+
+        Dense (num_experts == 0) is always homogeneous. MoE is homogeneous only
+        when every layer is a MoE layer. Mixed dense/MoE stacks cannot be
+        stacked into a single ``nnx.scan``.
+        """
+        if self.num_experts == 0:
+            return True
+        return all(self.is_moe_layer(i) for i in range(self.num_layers))
 
 
 _QWEN3_VL_SMOKE_SPECS: dict[str, dict[str, Any]] = {

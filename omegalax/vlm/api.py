@@ -116,10 +116,11 @@ def init_model(
     tp_size: int | None = None,
     fsdp_size: int | None = None,
     dp_size: int | None = None,
+    cp_size: int = 1,
 ) -> tuple[nnx.Module, VLMConfig]:
     """Initialize a vision-language model."""
     cfg = resolve_config(model_or_id)
-    mesh = ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size)
+    mesh = ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size, cp_size=cp_size)
     cfg = align_config_to_mesh(cfg, mesh)
 
     axis_rules = axis_rules_for_mesh(mesh)
@@ -180,6 +181,7 @@ def load_pretrained(
     tp_size: int | None = None,
     fsdp_size: int | None = None,
     dp_size: int | None = None,
+    cp_size: int = 1,
 ) -> tuple[nnx.Module, VLMConfig]:
     """Load a pretrained VLM from HuggingFace safetensors."""
     from huggingface_hub import snapshot_download
@@ -189,17 +191,17 @@ def load_pretrained(
 
     local_dir = snapshot_download(model_id)
     cfg = resolve_config(model_id)
-    # Validates any active mesh matches the requested (tp, fsdp, dp); the loaders
+    # Validates any active mesh matches the requested (tp, cp, fsdp, dp); the loaders
     # below build their own mesh from these sizes, so the return value is unused.
-    ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size)
+    ensure_mesh(tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size, cp_size=cp_size)
     if isinstance(cfg, Qwen3VLConfig):
         model, cfg = create_qwen3_vl_from_safetensors(
-            local_dir, tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size
+            local_dir, tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size, cp_size=cp_size
         )
         return model, cfg
     if isinstance(cfg, Qwen3_5Config):
         model, cfg = create_qwen3_5_from_safetensors(
-            local_dir, tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size
+            local_dir, tp_size=tp_size, fsdp_size=fsdp_size, dp_size=dp_size, cp_size=cp_size
         )
         return model, cfg
     raise ValueError(f"Unsupported VLM config type for pretrained loading: {type(cfg)}")
