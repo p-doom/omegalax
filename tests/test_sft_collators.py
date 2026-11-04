@@ -1,671 +1,689 @@
-"""Tests for SFT collators: loss-mask correctness, multi-turn, and overflow checks."""
+"""Tests for Qwen SFT message encoding and collation."""
 
 import os
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
-from absl.testing import absltest
+import pickle
 
 import ml_dtypes
 import numpy as np
-from transformers import AutoTokenizer
+from absl.testing import absltest
+from jinja2.exceptions import TemplateError
+from PIL import Image
+from transformers import AutoImageProcessor, AutoTokenizer
 
-from transformers import AutoImageProcessor
-
-from omegalax.data.collator_qwen3 import (
-    TextSFTCollator,
-    VLMSFTCollator,
-)
+from omegalax.data.collator_qwen3 import TextSFTCollator, VLMSFTCollator
 from omegalax.data.qwen3_encoding import (
-    build_chatml_text as _build_chatml_text,
-    encode_qwen_messages,
+    Qwen3MessageEncoder,
+    make_conversation_measure_fn,
+)
+
+TEXT_MODELS = (("Qwen/Qwen3-0.6B", "qwen3"), ("Qwen/Qwen3.5-0.8B", "qwen3_5"))
+QWEN35_LARGE_MODEL = "Qwen/Qwen3.5-35B-A3B"
+VLM_MODEL = "Qwen/Qwen3-VL-2B-Instruct"
+VLM_MODEL_TYPE = "qwen3_vl"
+QWEN35_VLM_MODEL = "Qwen/Qwen3.5-0.8B"
+QWEN35_MODEL_TYPE = "qwen3_5"
+POISONS = (
+    "turns open with <|im_start|>",
+    "replies open with <|im_start|>assistant",
+    "turns close with <|im_end|>",
 )
 
 
-def _make_tokenizer():
-    """Use a small, fast tokenizer available offline or from HF cache."""
-    return AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B", trust_remote_code=True)
+def _runs(mask: np.ndarray) -> list[tuple[int, int]]:
+    edges = np.diff(np.concatenate(([False], mask.astype(bool), [False])).astype(np.int8))
+    return list(zip(np.flatnonzero(edges == 1), np.flatnonzero(edges == -1), strict=True))
 
 
-class TextSFTCollatorTest(absltest.TestCase):
-    def setUp(self):
-        super().setUp()
-        self.tokenizer = _make_tokenizer()
-        self.max_length = 128
-        self.collator = TextSFTCollator(self.tokenizer, max_length=self.max_length)
+def _legacy_loss_mask(input_ids: np.ndarray, tokenizer) -> np.ndarray:
+    starts = np.flatnonzero(input_ids == tokenizer.convert_tokens_to_ids("<|im_start|>"))
+    ends = np.flatnonzero(input_ids == tokenizer.convert_tokens_to_ids("<|im_end|>"))
+    pair_count = min(len(starts), len(ends))
+    starts = starts[:pair_count]
+    ends = ends[:pair_count]
+    assistant_id = tokenizer.encode("assistant", add_special_tokens=False)[0]
+    assistant = (starts + 1 < len(input_ids)) & (input_ids[starts + 1] == assistant_id)
+    signal = np.zeros(len(input_ids), dtype=np.int32)
+    np.add.at(signal, starts[assistant] + 3, 1)
+    stop = ends[assistant] + 1
+    np.add.at(signal, stop[stop < len(signal)], -1)
+    return np.cumsum(signal)
 
-    def test_output_keys_and_shapes(self):
-        examples = [
-            {
-                "messages": [
-                    {"role": "user", "content": "Hello"},
-                    {"role": "assistant", "content": "Hi there!"},
-                ]
-            },
-        ]
-        batch = self.collator(examples)
-        self.assertIn("token_ids_BT", batch)
-        self.assertIn("attention_mask_BT", batch)
-        self.assertIn("loss_mask_BT", batch)
-        self.assertEqual(batch["token_ids_BT"].shape, (1, self.max_length))
-        self.assertEqual(batch["attention_mask_BT"].shape, (1, self.max_length))
-        self.assertEqual(batch["loss_mask_BT"].shape, (1, self.max_length))
 
-    def test_loss_mask_zero_on_padding(self):
-        examples = [
-            {
-                "messages": [
-                    {"role": "user", "content": "Say X"},
-                    {"role": "assistant", "content": "X"},
-                ]
-            },
-        ]
-        batch = self.collator(examples)
-        attn = batch["attention_mask_BT"][0]
-        mask = batch["loss_mask_BT"][0]
-        # Where attention is 0 (padding), loss_mask must also be 0
-        self.assertTrue(np.all(mask[attn == 0] == 0))
+class TextEncodingTest(absltest.TestCase):
+    def _assert_template_parity(self, model, model_type, messages):
+        tokenizer = AutoTokenizer.from_pretrained(model, local_files_only=True)
+        encoded = Qwen3MessageEncoder(tokenizer, None, model_type).encode(messages)
+        reference = tokenizer.apply_chat_template(
+            messages, tokenize=True, add_generation_prompt=False
+        )["input_ids"]
+        np.testing.assert_array_equal(encoded["input_ids"], reference)
 
-    def test_loss_mask_only_on_assistant_tokens(self):
+    def test_qwen3_and_qwen35_match_their_chat_templates(self):
         messages = [
-            {"role": "user", "content": "What is 2+2?"},
-            {"role": "assistant", "content": "The answer is 4."},
+            {"role": "system", "content": "  system  "},
+            {"role": "user", "content": "  first  "},
+            {
+                "role": "assistant",
+                "reasoning_content": "  historical reasoning  ",
+                "content": "  answer one  ",
+            },
+            {"role": "user", "content": "  second  "},
+            {"role": "assistant", "content": "  answer two  "},
         ]
-        examples = [{"messages": messages}]
-        batch = self.collator(examples)
-        mask = batch["loss_mask_BT"][0]
-        # At least some tokens should be supervised
-        self.assertGreater(np.sum(mask), 0)
-        # Supervised tokens should be fewer than non-padding tokens
-        attn = batch["attention_mask_BT"][0]
-        self.assertLess(np.sum(mask), np.sum(attn))
+        for model, model_type in TEXT_MODELS:
+            tokenizer = AutoTokenizer.from_pretrained(model, local_files_only=True)
+            encoded = Qwen3MessageEncoder(tokenizer, None, model_type).encode(messages)
+            reference = tokenizer.apply_chat_template(
+                messages, tokenize=True, add_generation_prompt=False
+            )["input_ids"]
+            np.testing.assert_array_equal(encoded["input_ids"], reference)
 
-    def test_multiturn_masks_all_assistant_spans(self):
+    def test_every_assistant_content_and_stop_token_is_supervised(self):
         messages = [
-            {"role": "user", "content": "Hi"},
-            {"role": "assistant", "content": "Hello!"},
-            {"role": "user", "content": "How are you?"},
-            {"role": "assistant", "content": "I am fine, thanks."},
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": "answer one"},
+            {"role": "user", "content": "second"},
+            {"role": "assistant", "content": "answer two"},
         ]
-        examples = [{"messages": messages}]
-        batch = self.collator(examples)
-        mask = batch["loss_mask_BT"][0]
-        self.assertGreater(np.sum(mask), 0)
-
-    def test_batch_size(self):
-        examples = [
-            {
-                "messages": [
-                    {"role": "user", "content": "A"},
-                    {"role": "assistant", "content": "B"},
-                ]
-            },
-            {
-                "messages": [
-                    {"role": "user", "content": "C"},
-                    {"role": "assistant", "content": "D"},
-                ]
-            },
-        ]
-        batch = self.collator(examples)
-        self.assertEqual(batch["token_ids_BT"].shape[0], 2)
-
-    def test_dtypes_are_int32(self):
-        examples = [
-            {
-                "messages": [
-                    {"role": "user", "content": "X"},
-                    {"role": "assistant", "content": "Y"},
-                ]
-            },
-        ]
-        batch = self.collator(examples)
-        for key in ("token_ids_BT", "attention_mask_BT", "loss_mask_BT"):
-            self.assertEqual(batch[key].dtype, np.int32, f"{key} dtype mismatch")
-
-    def test_raises_on_overflow(self):
-        collator = TextSFTCollator(self.tokenizer, max_length=8)
-        examples = [
-            {
-                "messages": [
-                    {"role": "user", "content": "Tell me a story in many words."},
-                    {
-                        "role": "assistant",
-                        "content": "This answer is intentionally too long for the tiny max length.",
-                    },
-                ]
-            },
-        ]
-        with self.assertRaisesRegex(ValueError, "exceeds max_length"):
-            collator(examples)
-
-
-class StructuralLossMaskTest(absltest.TestCase):
-    """Tests for the structural assistant loss mask returned by encode_qwen_messages."""
-
-    def setUp(self):
-        super().setUp()
-        self.tokenizer = _make_tokenizer()
-        self._im_end_id = self.tokenizer.convert_tokens_to_ids("<|im_end|>")
-
-    def _encode(self, messages):
-        encoded = encode_qwen_messages(messages, tokenizer=self.tokenizer)
-        return encoded["input_ids"], encoded["loss_mask"]
-
-    def test_mask_matches_input_length(self):
-        ids, mask = self._encode(
-            [
-                {"role": "user", "content": "Hello"},
-                {"role": "assistant", "content": "Hi!"},
+        for model, model_type in TEXT_MODELS:
+            tokenizer = AutoTokenizer.from_pretrained(model, local_files_only=True)
+            encoded = Qwen3MessageEncoder(tokenizer, None, model_type).encode(messages)
+            spans = [
+                tokenizer.decode(encoded["input_ids"][start:end])
+                for start, end in _runs(encoded["loss_mask"])
             ]
-        )
-        self.assertEqual(len(ids), len(mask))
+            self.assertEqual(
+                spans,
+                [
+                    "answer one<|im_end|>",
+                    "<think>\n\n</think>\n\nanswer two<|im_end|>",
+                ],
+            )
 
-    def test_single_turn(self):
-        ids, mask = self._encode(
-            [
-                {"role": "user", "content": "Hello"},
-                {"role": "assistant", "content": "Hi!"},
-            ]
-        )
-        self.assertGreater(np.sum(mask), 0)
-        # User tokens should not be supervised
-        self.assertLess(np.sum(mask), len(ids))
-
-    def test_multi_turn(self):
-        _, mask = self._encode(
-            [
-                {"role": "user", "content": "A"},
-                {"role": "assistant", "content": "B"},
-                {"role": "user", "content": "C"},
-                {"role": "assistant", "content": "D"},
-            ]
-        )
-        # Should have supervised tokens from both assistant turns
-        self.assertGreater(np.sum(mask), 0)
-
-    def test_no_assistant(self):
-        _, mask = self._encode(
-            [
-                {"role": "user", "content": "Hello"},
-            ]
-        )
-        self.assertEqual(np.sum(mask), 0)
-
-    def test_mask_includes_assistant_im_end(self):
-        ids, mask = self._encode(
-            [
-                {"role": "user", "content": "X"},
-                {"role": "assistant", "content": "Y"},
-            ]
-        )
-        # Assistant <|im_end|> should be supervised so the model learns to terminate.
-        # User <|im_end|> should not be supervised.
-        im_end_positions = np.where(ids == self._im_end_id)[0]
-        # First <|im_end|> is from user turn (not supervised)
-        self.assertEqual(mask[im_end_positions[0]], 0, "User <|im_end|> should not be supervised")
-        # Second <|im_end|> is from assistant turn (supervised)
-        self.assertEqual(mask[im_end_positions[1]], 1, "Assistant <|im_end|> should be supervised")
-
-    def test_header_tokens_not_supervised(self):
-        # The <|im_start|>assistant\n header must never be supervised — only the
-        # content and the terminating <|im_end|>.
-        im_start_id = self.tokenizer.convert_tokens_to_ids("<|im_start|>")
-        ids, mask = self._encode(
-            [
-                {"role": "user", "content": "Q"},
-                {"role": "assistant", "content": "A longer answer here."},
-            ]
-        )
-        for pos in np.where(ids == im_start_id)[0]:
-            self.assertEqual(mask[pos], 0, "<|im_start|> must not be supervised")
-            # role token and its trailing newline (the next two) are header, not content
-            self.assertEqual(mask[pos + 1], 0, "role token must not be supervised")
-            self.assertEqual(mask[pos + 2], 0, "header newline must not be supervised")
-
-
-class ChatMLLeakageTest(absltest.TestCase):
-    """Literal ChatML markers in user/context text must not corrupt the loss mask.
-
-    Regression for run lq3fgwvd (qwen3vl8b_fft_ds_v3_...): user/context text
-    containing literal ``<|im_start|>`` injected a spurious special token, which
-    broke the 1:1 start/end pairing of the old token-scanning mask so that later
-    user / image tokens were marked supervised (train/supervised_tokens spiked,
-    loss collapsed). The structural per-turn mask is immune to this.
-    """
-
-    def setUp(self):
-        super().setUp()
-        self.tokenizer = _make_tokenizer()
-        self._im_end_id = self.tokenizer.convert_tokens_to_ids("<|im_end|>")
-
-    def _supervised_count(self, messages):
-        return int(np.sum(encode_qwen_messages(messages, tokenizer=self.tokenizer)["loss_mask"]))
-
-    def test_literal_marker_in_user_text_keeps_supervised_count(self):
-        answer = "The scoring runs in three stages."
+    def test_loss_false_makes_an_assistant_turn_context_only(self):
         clean = [
-            {"role": "user", "content": "Trace the teacher scoring mechanism."},
-            {"role": "assistant", "content": answer},
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": "answer one"},
+            {"role": "user", "content": "second"},
+            {"role": "assistant", "content": "answer two"},
         ]
-        poisoned = [
+        marked = [dict(message) for message in clean]
+        marked[1]["loss"] = False
+        for model, model_type in TEXT_MODELS:
+            tokenizer = AutoTokenizer.from_pretrained(model, local_files_only=True)
+            encoder = Qwen3MessageEncoder(tokenizer, None, model_type)
+            clean_encoded = encoder.encode(clean)
+            marked_encoded = encoder.encode(marked)
+            np.testing.assert_array_equal(marked_encoded["input_ids"], clean_encoded["input_ids"])
+            measurement = encoder.measure(marked[:2])["message_measurements"][1]
+            self.assertEqual(measurement["supervised_tokens"], 0)
+            spans = [
+                tokenizer.decode(marked_encoded["input_ids"][start:end])
+                for start, end in _runs(marked_encoded["loss_mask"])
+            ]
+            self.assertEqual(spans, ["<think>\n\n</think>\n\nanswer two<|im_end|>"])
+
+    def test_loss_defaults_true(self):
+        clean = [
+            {"role": "user", "content": "question"},
+            {"role": "assistant", "content": "answer"},
+        ]
+        marked = [
+            {"role": "user", "content": "question"},
+            {"role": "assistant", "content": "answer", "loss": True},
+        ]
+        model, model_type = TEXT_MODELS[0]
+        tokenizer = AutoTokenizer.from_pretrained(model, local_files_only=True)
+        encoder = Qwen3MessageEncoder(tokenizer, None, model_type)
+        clean_encoded = encoder.encode(clean)
+        marked_encoded = encoder.encode(marked)
+        np.testing.assert_array_equal(marked_encoded["input_ids"], clean_encoded["input_ids"])
+        np.testing.assert_array_equal(marked_encoded["loss_mask"], clean_encoded["loss_mask"])
+
+    def test_loss_must_be_boolean(self):
+        model, model_type = TEXT_MODELS[0]
+        tokenizer = AutoTokenizer.from_pretrained(model, local_files_only=True)
+        messages = [
+            {"role": "user", "content": "question"},
+            {"role": "assistant", "content": "answer", "loss": 0},
+        ]
+        with self.assertRaisesRegex(ValueError, "loss must be a boolean"):
+            Qwen3MessageEncoder(tokenizer, None, model_type).encode(messages)
+
+    def test_loss_is_rejected_on_non_assistant_turns(self):
+        model, model_type = TEXT_MODELS[0]
+        tokenizer = AutoTokenizer.from_pretrained(model, local_files_only=True)
+        messages = [
+            {"role": "user", "content": "question", "loss": False},
+            {"role": "assistant", "content": "answer"},
+        ]
+        with self.assertRaisesRegex(ValueError, "only on assistant turns"):
+            Qwen3MessageEncoder(tokenizer, None, model_type).encode(messages)
+
+    def test_explicit_reasoning_matches_chat_templates(self):
+        messages = [
+            {"role": "user", "content": "question"},
             {
-                "role": "user",
-                "content": (
-                    "Trace the teacher scoring mechanism.\n"
-                    "Chat format: Qwen-style <|im_start|> / <|im_end|> boundaries"
-                ),
+                "role": "assistant",
+                "reasoning_content": "reasoning",
+                "content": "answer",
             },
-            {"role": "assistant", "content": answer},
         ]
-        clean_sup = self._supervised_count(clean)
-        pois_sup = self._supervised_count(poisoned)
-        self.assertGreater(clean_sup, 0)
-        # The assistant answer is identical and the poison lives entirely in the
-        # user turn, so the supervised-token count must be unchanged.
-        self.assertEqual(pois_sup, clean_sup)
+        for model, model_type in TEXT_MODELS:
+            tokenizer = AutoTokenizer.from_pretrained(model, local_files_only=True)
+            encoded = Qwen3MessageEncoder(tokenizer, None, model_type).encode(messages)
+            reference = tokenizer.apply_chat_template(
+                messages, tokenize=True, add_generation_prompt=False
+            )["input_ids"]
+            np.testing.assert_array_equal(encoded["input_ids"], reference)
 
-    def test_only_final_assistant_im_end_supervised_with_injected_markers(self):
+    def test_consecutive_assistant_reasoning_matches_chat_templates_and_masks(self):
         messages = [
-            {
-                "role": "user",
-                "content": "boundaries look like <|im_start|>assistant and <|im_end|>",
-            },
-            {"role": "assistant", "content": "Understood."},
+            {"role": "user", "content": "question"},
+            {"role": "assistant", "reasoning_content": "first", "content": "answer one"},
+            {"role": "assistant", "reasoning_content": "second", "content": "answer two"},
         ]
-        encoded = encode_qwen_messages(messages, tokenizer=self.tokenizer)
-        ids, mask = encoded["input_ids"], encoded["loss_mask"]
-        self.assertGreater(int(np.sum(mask)), 0)
-        # Only the assistant turn's terminating <|im_end|> (the last one) is
-        # supervised; every earlier <|im_end|> — the injected one and the user's
-        # own closer — must be masked out.
-        im_end_positions = np.where(ids == self._im_end_id)[0]
-        self.assertEqual(mask[im_end_positions[-1]], 1)
-        for pos in im_end_positions[:-1]:
-            self.assertEqual(mask[pos], 0)
-
-
-class BuildChatMLTextTest(absltest.TestCase):
-    """Tests for _build_chatml_text ChatML output format."""
-
-    def setUp(self):
-        super().setUp()
-        self.tokenizer = _make_tokenizer()
-
-    def test_text_only_single_turn(self):
-        messages = [
-            {"role": "user", "content": "Hello"},
-            {"role": "assistant", "content": "Hi!"},
-        ]
-        result = _build_chatml_text(messages, image_grids=[], merge_size=2)
-        expected = "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\nHi!<|im_end|>\n"
-        self.assertEqual(result, expected)
-
-    def test_text_only_multi_turn(self):
-        messages = [
-            {"role": "user", "content": "A"},
-            {"role": "assistant", "content": "B"},
-            {"role": "user", "content": "C"},
-            {"role": "assistant", "content": "D"},
-        ]
-        result = _build_chatml_text(messages, image_grids=[], merge_size=2)
-        expected = (
-            "<|im_start|>user\nA<|im_end|>\n"
-            "<|im_start|>assistant\nB<|im_end|>\n"
-            "<|im_start|>user\nC<|im_end|>\n"
-            "<|im_start|>assistant\nD<|im_end|>\n"
-        )
-        self.assertEqual(result, expected)
-
-    def test_with_system_prompt(self):
-        messages = [
-            {"role": "system", "content": "You are a helpful assistant."},
-            {"role": "user", "content": "Hello"},
-            {"role": "assistant", "content": "Hi!"},
-        ]
-        result = _build_chatml_text(messages, image_grids=[], merge_size=2)
-        expected = (
-            "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
-            "<|im_start|>user\nHello<|im_end|>\n"
-            "<|im_start|>assistant\nHi!<|im_end|>\n"
-        )
-        self.assertEqual(result, expected)
-
-    def test_image_tokens_inserted(self):
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image"},
-                    {"type": "text", "text": "Describe."},
+        for model, model_type in TEXT_MODELS:
+            self._assert_template_parity(model, model_type, messages)
+            tokenizer = AutoTokenizer.from_pretrained(model, local_files_only=True)
+            encoded = Qwen3MessageEncoder(tokenizer, None, model_type).encode(messages)
+            spans = [
+                tokenizer.decode(encoded["input_ids"][start:end])
+                for start, end in _runs(encoded["loss_mask"])
+            ]
+            self.assertEqual(
+                spans,
+                [
+                    "<think>\nfirst\n</think>\n\nanswer one<|im_end|>",
+                    "<think>\nsecond\n</think>\n\nanswer two<|im_end|>",
                 ],
-            },
-            {"role": "assistant", "content": "A cat."},
-        ]
-        grid = (1, 8, 8)
-        merge_size = 2
-        n_tokens = 1 * (8 // 2) * (8 // 2)  # = 16
+            )
 
-        result = _build_chatml_text(messages, image_grids=[grid], merge_size=merge_size)
-        self.assertIn("<|vision_start|>", result)
-        self.assertIn("<|vision_end|>", result)
-        self.assertEqual(result.count("<|image_pad|>"), n_tokens)
-
-    def test_multi_image(self):
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image"},
-                    {"type": "image"},
-                    {"type": "text", "text": "Compare."},
-                ],
-            },
-        ]
-        grids = [(1, 4, 4), (1, 8, 8)]
-        merge_size = 2
-        n1 = 1 * (4 // 2) * (4 // 2)  # = 4
-        n2 = 1 * (8 // 2) * (8 // 2)  # = 16
-
-        result = _build_chatml_text(messages, image_grids=grids, merge_size=merge_size)
-        self.assertEqual(result.count("<|image_pad|>"), n1 + n2)
-        self.assertEqual(result.count("<|vision_start|>"), 2)
-        self.assertEqual(result.count("<|vision_end|>"), 2)
-
-    def test_encodes_correctly(self):
-        """Verify that tokenizer.encode on our ChatML text produces valid token IDs."""
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image"},
-                    {"type": "text", "text": "What is this?"},
-                ],
-            },
-            {"role": "assistant", "content": "A photo."},
-        ]
-        grid = (1, 4, 4)
-        text = _build_chatml_text(messages, image_grids=[grid], merge_size=2)
-        ids = self.tokenizer.encode(text, add_special_tokens=False)
-
-        im_start_id = self.tokenizer.convert_tokens_to_ids("<|im_start|>")
-        im_end_id = self.tokenizer.convert_tokens_to_ids("<|im_end|>")
-        image_pad_id = self.tokenizer.convert_tokens_to_ids("<|image_pad|>")
-
-        self.assertEqual(ids.count(im_start_id), 2)
-        self.assertEqual(ids.count(im_end_id), 2)
-        n_expected = 1 * (4 // 2) * (4 // 2)  # = 4
-        self.assertEqual(ids.count(image_pad_id), n_expected)
-
-    def test_per_block_encoding_matches_full_encoding(self):
-        """encode_qwen_messages ids must equal a single full tokenizer.encode.
-
-        Guards the additive property that structural per-turn masking relies on:
-        ``<|im_start|>``/``<|im_end|>`` are hard BPE split points, so concatenating
-        the per-block token ids must reproduce ``tokenizer.encode`` of the whole
-        ChatML string exactly — even when the text embeds literal ChatML markers.
-        """
-        conversations = [
+    def test_qwen3_reasoning_and_whitespace_edges_match_chat_template(self):
+        cases = [
+            [{"role": "assistant", "reasoning_content": "hidden", "content": "answer"}],
             [
-                {"role": "user", "content": "Hello there"},
-                {"role": "assistant", "content": "General Kenobi"},
+                {"role": "user", "content": "question"},
+                {"role": "assistant", "reasoning_content": "reason", "content": "\n\nanswer"},
             ],
             [
-                {"role": "system", "content": "sys prompt"},
-                {"role": "user", "content": "boundary <|im_start|>x<|im_end|> test"},
-                {"role": "assistant", "content": "ok <|im_end|> done"},
+                {"role": "user", "content": "question"},
+                {"role": "assistant", "content": "<think>\nreason\n</think>\n\nanswer"},
+            ],
+            [
+                {"role": "user", "content": "question"},
+                {"role": "system", "content": "later system"},
+                {"role": "assistant", "content": "answer"},
             ],
         ]
-        for messages in conversations:
-            text = _build_chatml_text(messages, image_grids=[], merge_size=2)
-            full = np.asarray(self.tokenizer.encode(text, add_special_tokens=False), dtype=np.int32)
-            got = encode_qwen_messages(messages, tokenizer=self.tokenizer)["input_ids"]
-            np.testing.assert_array_equal(got, full)
+        for messages in cases:
+            self._assert_template_parity("Qwen/Qwen3-0.6B", "qwen3", messages)
 
-
-class VLMSFTCollatorTest(absltest.TestCase):
-    """Tests for the VLM SFT collator with real images."""
-
-    def setUp(self):
-        super().setUp()
-        self.tokenizer = _make_tokenizer()
-        self.image_processor = AutoImageProcessor.from_pretrained(
-            "Qwen/Qwen3-VL-2B-Instruct",
-            use_fast=False,  # force the numpy codepath
-        )
-        self.max_length = 256
-        self.collator = VLMSFTCollator(
-            self.tokenizer,
-            max_length=self.max_length,
-            image_processor=self.image_processor,
-        )
-
-    def test_text_only_example(self):
-        examples = [
-            {
-                "messages": [
-                    {"role": "user", "content": "Hello"},
-                    {"role": "assistant", "content": "Hi!"},
-                ]
-            },
+    def test_qwen35_reasoning_edges_match_both_template_variants(self):
+        cases = [
+            [
+                {"role": "user", "content": "question"},
+                {"role": "assistant", "reasoning_content": "reason", "content": "\n\nanswer"},
+            ],
+            [
+                {"role": "user", "content": "question"},
+                {"role": "assistant", "content": "<think>\nreason\n</think>\n\nanswer"},
+            ],
+            [
+                {"role": "system", "content": "  system  "},
+                {"role": "user", "content": "  question  "},
+                {"role": "assistant", "reasoning_content": "  reason  ", "content": "  answer  "},
+            ],
         ]
-        batch = self.collator(examples)
-        self.assertIn("token_ids_BT", batch)
-        self.assertEqual(batch["token_ids_BT"].shape, (1, self.max_length))
-        # Vision arrays are always emitted (as empty placeholders for text-only
-        # batches) so the JIT pytree structure stays constant and never recompiles.
-        self.assertIn("pixel_values", batch)
-        self.assertEqual(batch["pixel_values"].shape[0], 0)
-        self.assertIn("image_grid_thw", batch)
-        self.assertEqual(batch["image_grid_thw"].shape, (0, 3))
+        for model in ("Qwen/Qwen3.5-0.8B", QWEN35_LARGE_MODEL):
+            for messages in cases:
+                self._assert_template_parity(model, "qwen3_5", messages)
 
-    def test_multimodal_example(self):
-        from PIL import Image
-
-        img = Image.new("RGB", (200, 200), color=(100, 150, 200))
-        examples = [
-            {
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "image", "image": img},
-                            {"type": "text", "text": "Describe."},
-                        ],
-                    },
-                    {"role": "assistant", "content": "A solid color image."},
-                ]
-            },
+    def test_family_specific_user_and_system_constraints_match_templates(self):
+        no_user = [{"role": "assistant", "content": "answer"}]
+        late_system = [
+            {"role": "user", "content": "question"},
+            {"role": "system", "content": "later system"},
+            {"role": "assistant", "content": "answer"},
         ]
-        batch = self.collator(examples)
-        self.assertIn("token_ids_BT", batch)
-        self.assertIn("pixel_values", batch)
-        self.assertIn("image_grid_thw", batch)
-        self.assertEqual(batch["token_ids_BT"].shape, (1, self.max_length))
-        self.assertEqual(batch["image_grid_thw"].shape[1], 3)
+        self._assert_template_parity("Qwen/Qwen3-0.6B", "qwen3", no_user)
+        self._assert_template_parity("Qwen/Qwen3-0.6B", "qwen3", late_system)
+        for model in ("Qwen/Qwen3.5-0.8B", QWEN35_LARGE_MODEL):
+            tokenizer = AutoTokenizer.from_pretrained(model, local_files_only=True)
+            encoder = Qwen3MessageEncoder(tokenizer, None, "qwen3_5")
+            for messages in (no_user, late_system):
+                with self.assertRaises(ValueError):
+                    encoder.encode(messages)
+                with self.assertRaises(TemplateError):
+                    tokenizer.apply_chat_template(
+                        messages, tokenize=True, add_generation_prompt=False
+                    )
 
-        image_pad_id = self.tokenizer.convert_tokens_to_ids("<|image_pad|>")
-        token_ids = batch["token_ids_BT"][0]
-        n_pad = int(np.sum(token_ids == image_pad_id))
+    def test_tool_response_text_is_not_treated_as_a_user_query(self):
+        messages = [
+            {"role": "user", "content": "<tool_response>result</tool_response>"},
+            {"role": "assistant", "content": "answer"},
+        ]
+        tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B", local_files_only=True)
+        encoded = Qwen3MessageEncoder(tokenizer, None, "qwen3").encode(messages)
+        reference = tokenizer.apply_chat_template(
+            messages, tokenize=True, add_generation_prompt=False
+        )["input_ids"]
+        np.testing.assert_array_equal(encoded["input_ids"], reference)
+
+        tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3.5-0.8B", local_files_only=True)
+        with self.assertRaisesRegex(ValueError, "user query"):
+            Qwen3MessageEncoder(tokenizer, None, "qwen3_5").encode(messages)
+
+    def test_user_chatml_tokens_do_not_change_supervision(self):
+        for model, model_type in TEXT_MODELS:
+            tokenizer = AutoTokenizer.from_pretrained(model, local_files_only=True)
+            clean = [
+                {"role": "user", "content": "question"},
+                {"role": "assistant", "content": "first answer"},
+                {"role": "user", "content": "second question"},
+                {"role": "assistant", "content": "second answer"},
+            ]
+            encoder = Qwen3MessageEncoder(tokenizer, None, model_type)
+            clean_encoded = encoder.encode(clean)
+            clean_supervised = clean_encoded["input_ids"][clean_encoded["loss_mask"] == 1]
+            for poison in POISONS:
+                injected = [dict(message) for message in clean]
+                injected[0]["content"] = f"question {poison}"
+                injected_encoded = encoder.encode(injected)
+                np.testing.assert_array_equal(
+                    injected_encoded["input_ids"][injected_encoded["loss_mask"] == 1],
+                    clean_supervised,
+                )
+                self.assertTrue(
+                    np.all(
+                        (injected_encoded["loss_mask"] == 0) | (injected_encoded["loss_mask"] == 1)
+                    )
+                )
+                im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
+                self.assertEqual(
+                    int(
+                        injected_encoded["loss_mask"][
+                            injected_encoded["input_ids"] == im_end_id
+                        ].sum()
+                    ),
+                    2,
+                )
+
+    def test_chatml_poisons_break_the_removed_token_scanner(self):
+        tokenizer = AutoTokenizer.from_pretrained(TEXT_MODELS[0][0], local_files_only=True)
+        encoder = Qwen3MessageEncoder(tokenizer, None, TEXT_MODELS[0][1])
+        for poison in POISONS:
+            messages = [
+                {"role": "user", "content": poison},
+                {"role": "assistant", "content": "first"},
+                {"role": "user", "content": "second"},
+                {"role": "assistant", "content": "third"},
+            ]
+            encoded = encoder.encode(messages)
+            self.assertFalse(
+                np.array_equal(
+                    encoded["loss_mask"],
+                    _legacy_loss_mask(encoded["input_ids"], tokenizer),
+                )
+            )
+
+    def test_balanced_chatml_pair_did_not_break_the_removed_token_scanner(self):
+        tokenizer = AutoTokenizer.from_pretrained(TEXT_MODELS[0][0], local_files_only=True)
+        messages = [
+            {"role": "user", "content": "markers <|im_start|> / <|im_end|>"},
+            {"role": "assistant", "content": "answer"},
+        ]
+        encoded = Qwen3MessageEncoder(tokenizer, None, TEXT_MODELS[0][1]).encode(messages)
+        np.testing.assert_array_equal(
+            encoded["loss_mask"],
+            _legacy_loss_mask(encoded["input_ids"], tokenizer),
+        )
+
+    def test_collator_padding_and_overflow(self):
+        model, model_type = TEXT_MODELS[0]
+        tokenizer = AutoTokenizer.from_pretrained(model, local_files_only=True)
+        example = {
+            "messages": [
+                {"role": "user", "content": "q"},
+                {"role": "assistant", "content": "a"},
+            ]
+        }
+        batch = TextSFTCollator(tokenizer, max_length=64, model_type=model_type)([example])
+        self.assertEqual(batch["token_ids_BT"].shape, (1, 64))
+        self.assertEqual(batch["token_ids_BT"].dtype, np.int32)
+        self.assertTrue(np.all(batch["loss_mask_BT"][batch["attention_mask_BT"] == 0] == 0))
+        with self.assertRaisesRegex(ValueError, "exceeds max_length"):
+            TextSFTCollator(tokenizer, max_length=4, model_type=model_type)([example])
+
+    def test_text_collator_rejects_zero_supervision(self):
+        model, model_type = TEXT_MODELS[0]
+        tokenizer = AutoTokenizer.from_pretrained(model, local_files_only=True)
+        example = {
+            "messages": [
+                {"role": "user", "content": "question"},
+                {"role": "assistant", "content": "context", "loss": False},
+            ]
+        }
+        with self.assertRaisesRegex(ValueError, "must contain supervised tokens"):
+            TextSFTCollator(tokenizer, max_length=64, model_type=model_type)([example])
+
+    def test_collator_does_not_impose_a_conversation_role_sequence(self):
+        model, model_type = TEXT_MODELS[0]
+        tokenizer = AutoTokenizer.from_pretrained(model, local_files_only=True)
+        messages = [
+            {"role": "system", "content": "first context"},
+            {"role": "system", "content": "second context"},
+            {"role": "user", "content": "first input"},
+            {"role": "user", "content": "second input"},
+            {"role": "assistant", "content": "first target"},
+            {"role": "assistant", "content": "second target"},
+        ]
+        batch = TextSFTCollator(tokenizer, 256, model_type)([{"messages": messages}])
+        self.assertGreater(int(batch["loss_mask_BT"].sum()), 0)
+
+    def test_video_placeholder_is_rejected(self):
+        model, model_type = TEXT_MODELS[0]
+        tokenizer = AutoTokenizer.from_pretrained(model, local_files_only=True)
+        messages = [{"role": "user", "content": "look at <|video_pad|>"}]
+        with self.assertRaisesRegex(ValueError, "video content"):
+            Qwen3MessageEncoder(tokenizer, None, model_type).encode(messages)
+
+
+class VLMEncodingTest(absltest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.tokenizer = AutoTokenizer.from_pretrained(VLM_MODEL, local_files_only=True)
+        cls.image_processor = AutoImageProcessor.from_pretrained(
+            VLM_MODEL, use_fast=False, local_files_only=True
+        )
+
+    def _messages(self, image: Image.Image) -> list[dict]:
+        return [
+            {"role": "system", "content": [{"type": "text", "text": "system"}]},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "describe"},
+                    {"type": "image", "image": image},
+                ],
+            },
+            {"role": "assistant", "content": [{"type": "text", "text": "square"}]},
+        ]
+
+    def test_matches_hf_template_and_image_processor(self):
+        image = Image.new("RGB", (112, 112), (80, 40, 20))
+        messages = self._messages(image)
+        encoded = Qwen3MessageEncoder(self.tokenizer, self.image_processor, VLM_MODEL_TYPE).encode(
+            messages
+        )
+        processed = self.image_processor(images=[image], return_tensors="np")
+        grid = np.asarray(processed["image_grid_thw"])[0]
+        image_tokens = int(np.prod(grid)) // self.image_processor.merge_size**2
+        reference_text = self.tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=False
+        ).replace("<|image_pad|>", "<|image_pad|>" * image_tokens, 1)
+        reference_ids = self.tokenizer(
+            reference_text, add_special_tokens=False, return_attention_mask=False
+        )["input_ids"]
+        np.testing.assert_array_equal(encoded["input_ids"], reference_ids)
+        np.testing.assert_array_equal(encoded["image_grid_thw"], processed["image_grid_thw"])
+        np.testing.assert_allclose(encoded["pixel_values"], processed["pixel_values"])
+        image_token_id = self.tokenizer.convert_tokens_to_ids("<|image_pad|>")
+        self.assertEqual(int(np.sum(encoded["input_ids"] == image_token_id)), image_tokens)
+        self.assertEqual(
+            self.tokenizer.decode(encoded["input_ids"][encoded["loss_mask"] == 1]),
+            "square<|im_end|>",
+        )
+
+    def test_qwen3_vl_role_and_reasoning_behavior_matches_chat_template(self):
+        cases = [
+            [{"role": "assistant", "reasoning_content": "ignored", "content": "answer"}],
+            [
+                {"role": "user", "content": "question"},
+                {"role": "system", "content": "ignored system"},
+                {"role": "assistant", "content": "answer"},
+            ],
+            [
+                {"role": "user", "content": "question"},
+                {"role": "assistant", "reasoning_content": "ignored", "content": "first"},
+                {"role": "assistant", "content": "<think>\nkept\n</think>\n\nsecond"},
+            ],
+        ]
+        encoder = Qwen3MessageEncoder(self.tokenizer, self.image_processor, VLM_MODEL_TYPE)
+        for messages in cases:
+            encoded = encoder.encode(messages)
+            reference = self.tokenizer.apply_chat_template(
+                messages, tokenize=True, add_generation_prompt=False
+            )["input_ids"]
+            np.testing.assert_array_equal(encoded["input_ids"], reference)
+
+    def test_vlm_collator_preserves_geometry(self):
+        image = Image.new("RGB", (112, 112), (80, 40, 20))
+        batch = VLMSFTCollator(self.tokenizer, 256, self.image_processor, VLM_MODEL_TYPE)(
+            [{"messages": self._messages(image)}]
+        )
         grid = batch["image_grid_thw"][0]
-        expected_pads = int(grid[0]) * (int(grid[1]) // 2) * (int(grid[2]) // 2)
-        self.assertEqual(n_pad, expected_pads)
+        image_tokens = int(np.prod(grid)) // self.image_processor.merge_size**2
+        image_token_id = self.tokenizer.convert_tokens_to_ids("<|image_pad|>")
+        self.assertEqual(int(np.sum(batch["token_ids_BT"] == image_token_id)), image_tokens)
+        self.assertEqual(batch["pixel_values"].dtype, ml_dtypes.bfloat16)
+        self.assertTrue(np.all(batch["vision_patch_valid"]))
+        self.assertEqual(batch["position_ids_ZBT"].shape, (3, 1, 256))
 
-    def test_pixel_values_dtype_is_bf16_by_default(self):
-        from PIL import Image
+    def test_vlm_collator_rejects_zero_supervision(self):
+        messages = self._messages(Image.new("RGB", (112, 112), (80, 40, 20)))
+        messages[-1]["loss"] = False
+        with self.assertRaisesRegex(ValueError, "must contain supervised tokens"):
+            VLMSFTCollator(self.tokenizer, 256, self.image_processor, VLM_MODEL_TYPE)(
+                [{"messages": messages}]
+            )
 
-        img = Image.new("RGB", (100, 100), color=(10, 20, 30))
-        examples = [
-            {
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "image", "image": img},
-                            {"type": "text", "text": "Describe."},
-                        ],
-                    },
-                    {"role": "assistant", "content": "ok."},
-                ]
-            },
-        ]
-        # Default: pixel_values are downcast to bf16 (the vision patch embed
-        # computes in bf16 anyway), halving the input buffer with no numerical
-        # change vs the implicit fp32->bf16 cast inside the Linear.
-        self.assertEqual(self.collator(examples)["pixel_values"].dtype, ml_dtypes.bfloat16)
-
-        # The override is honored, e.g. for a full-fp32-compute run.
-        fp32_collator = VLMSFTCollator(
-            self.tokenizer,
-            max_length=self.max_length,
-            image_processor=self.image_processor,
-            pixel_values_dtype=np.float32,
+    def test_vlm_collator_emits_validity_for_text_only_batch(self):
+        batch = VLMSFTCollator(self.tokenizer, 256, self.image_processor, VLM_MODEL_TYPE)(
+            [
+                {
+                    "messages": [
+                        {"role": "user", "content": [{"type": "text", "text": "hello"}]},
+                        {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": "world"}],
+                        },
+                    ]
+                }
+            ]
         )
-        self.assertEqual(fp32_collator(examples)["pixel_values"].dtype, np.float32)
+        self.assertEqual(batch["vision_patch_valid"].shape, (0,))
 
-    def test_loss_mask_on_assistant_only(self):
-        from PIL import Image
-
-        img = Image.new("RGB", (100, 100), color=(50, 50, 50))
-        examples = [
-            {
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "image", "image": img},
-                            {"type": "text", "text": "What?"},
-                        ],
-                    },
-                    {"role": "assistant", "content": "Nothing special."},
-                ]
-            },
-        ]
-        batch = self.collator(examples)
-        mask = batch["loss_mask_BT"][0]
-        self.assertGreater(np.sum(mask), 0)
-        attn = batch["attention_mask_BT"][0]
-        self.assertLess(np.sum(mask), np.sum(attn))
-
-    def test_literal_chatml_in_user_text_does_not_supervise_image_pads(self):
-        """Regression (run lq3fgwvd): literal <|im_start|> in a user turn that also
-        carries an image must never flip that image's pad tokens to supervised."""
-        from PIL import Image
-
-        img = Image.new("RGB", (100, 100), color=(50, 50, 50))
-        poison_text = "Chat format: Qwen-style <|im_start|> / <|im_end|> boundaries"
-        answer = "Nothing special."
-
-        def _messages(user_text):
-            return [
+    def test_user_delimiters_do_not_supervise_image_tokens(self):
+        image = Image.new("RGB", (112, 112), (80, 40, 20))
+        encoder = Qwen3MessageEncoder(self.tokenizer, self.image_processor, VLM_MODEL_TYPE)
+        image_token_id = self.tokenizer.convert_tokens_to_ids("<|image_pad|>")
+        for poison in POISONS:
+            messages = [
+                {"role": "user", "content": [{"type": "text", "text": poison}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "noted"}]},
                 {
                     "role": "user",
                     "content": [
-                        {"type": "image", "image": img},
-                        {"type": "text", "text": user_text},
+                        {"type": "image", "image": image},
+                        {"type": "text", "text": "describe"},
                     ],
                 },
-                {"role": "assistant", "content": answer},
+                {"role": "assistant", "content": [{"type": "text", "text": "square"}]},
             ]
+            encoded = encoder.encode(messages)
+            image_mask = encoded["input_ids"] == image_token_id
+            self.assertGreater(int(image_mask.sum()), 0)
+            self.assertEqual(int(encoded["loss_mask"][image_mask].sum()), 0)
 
-        image_pad_id = self.tokenizer.convert_tokens_to_ids("<|image_pad|>")
+    def test_video_and_implicit_processor_are_rejected(self):
+        video = [{"role": "user", "content": [{"type": "video", "video": "clip.mp4"}]}]
+        with self.assertRaisesRegex(ValueError, "video content"):
+            Qwen3MessageEncoder(self.tokenizer, self.image_processor, VLM_MODEL_TYPE).encode(video)
+        malformed = [
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": "caption", "video": "clip.mp4"}],
+            }
+        ]
+        with self.assertRaisesRegex(ValueError, "video content"):
+            Qwen3MessageEncoder(self.tokenizer, self.image_processor, VLM_MODEL_TYPE).encode(
+                malformed
+            )
+        literal = [{"role": "user", "content": "look at <|video_pad|>"}]
+        with self.assertRaisesRegex(ValueError, "video content"):
+            Qwen3MessageEncoder(self.tokenizer, self.image_processor, VLM_MODEL_TYPE).encode(
+                literal
+            )
+        with self.assertRaisesRegex(ValueError, "video content"):
+            make_conversation_measure_fn(self.tokenizer, self.image_processor, VLM_MODEL_TYPE)(
+                literal
+            )
+        with self.assertRaisesRegex(ValueError, "image content requires"):
+            make_conversation_measure_fn(self.tokenizer, None, VLM_MODEL_TYPE)(
+                [self._messages(Image.new("RGB", (8, 8)))[1]]
+            )
 
-        poisoned = self.collator([{"messages": _messages(poison_text)}])
-        token_ids = poisoned["token_ids_BT"][0]
-        mask = poisoned["loss_mask_BT"][0]
 
-        n_pad = int(np.sum(token_ids == image_pad_id))
-        self.assertGreater(n_pad, 0, "sanity: the image should produce pad tokens")
-        # Not a single image pad token may be supervised.
-        self.assertEqual(int(np.sum(mask[token_ids == image_pad_id])), 0)
-
-        # And the assistant answer is supervised exactly as in the clean case —
-        # the poison in the user turn changes nothing about supervision.
-        clean = self.collator([{"messages": _messages("Describe the image.")}])
-        self.assertGreater(int(np.sum(mask)), 0)
-        self.assertEqual(int(np.sum(mask)), int(np.sum(clean["loss_mask_BT"][0])))
-
-    def test_raises_on_overflow(self):
-        from PIL import Image
-
-        img = Image.new("RGB", (200, 200), color=(100, 150, 200))
-        collator = VLMSFTCollator(
-            self.tokenizer,
-            max_length=8,
-            image_processor=self.image_processor,
+class Qwen35VLMEncodingTest(absltest.TestCase):
+    def test_video_is_rejected(self):
+        tokenizer = AutoTokenizer.from_pretrained(QWEN35_VLM_MODEL, local_files_only=True)
+        image_processor = AutoImageProcessor.from_pretrained(
+            QWEN35_VLM_MODEL, use_fast=False, local_files_only=True
         )
-        examples = [
+        messages = [{"role": "user", "content": [{"type": "video", "video": "clip.mp4"}]}]
+        with self.assertRaisesRegex(ValueError, "video content"):
+            Qwen3MessageEncoder(tokenizer, image_processor, QWEN35_MODEL_TYPE).encode(messages)
+
+    def test_template_processor_mask_and_positions_match(self):
+        tokenizer = AutoTokenizer.from_pretrained(QWEN35_VLM_MODEL, local_files_only=True)
+        image_processor = AutoImageProcessor.from_pretrained(
+            QWEN35_VLM_MODEL, use_fast=False, local_files_only=True
+        )
+        image = Image.new("RGB", (112, 112), (80, 40, 20))
+        messages = [
+            {"role": "system", "content": [{"type": "text", "text": "system"}]},
             {
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "image", "image": img},
-                            {"type": "text", "text": "Describe."},
-                        ],
-                    },
-                    {"role": "assistant", "content": "A solid color image."},
-                ]
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "describe"},
+                    {"type": "image", "image": image},
+                ],
             },
+            {"role": "assistant", "content": [{"type": "text", "text": "square"}]},
         ]
-        with self.assertRaisesRegex(ValueError, "exceeds max_length"):
-            collator(examples)
 
-    def test_heterogeneous_batch_text_and_multimodal(self):
-        """Batches that mix text-only and multimodal samples must collate cleanly.
+        encoded = Qwen3MessageEncoder(tokenizer, image_processor, QWEN35_MODEL_TYPE).encode(
+            messages
+        )
+        processed = image_processor(images=[image], return_tensors="np")
+        grid = np.asarray(processed["image_grid_thw"], dtype=np.int32)[0]
+        image_tokens = int(np.prod(grid)) // image_processor.merge_size**2
+        reference_text = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=False
+        ).replace("<|image_pad|>", "<|image_pad|>" * image_tokens, 1)
+        reference_ids = tokenizer(
+            reference_text, add_special_tokens=False, return_attention_mask=False
+        )["input_ids"]
 
-        This is the fundamental requirement that lets data mixing pull
-        instruction-tuning text into a VLM run for catastrophic-forgetting
-        mitigation. Vision tensors come from the image-having sample only;
-        text-only contributes zero patches and zero image-pad tokens.
-        """
-        from PIL import Image
+        np.testing.assert_array_equal(encoded["input_ids"], reference_ids)
+        np.testing.assert_array_equal(encoded["image_grid_thw"], processed["image_grid_thw"])
+        np.testing.assert_allclose(encoded["pixel_values"], processed["pixel_values"])
+        self.assertEqual(
+            tokenizer.decode(encoded["input_ids"][encoded["loss_mask"] == 1]),
+            "<think>\n\n</think>\n\nsquare<|im_end|>",
+        )
 
-        img = Image.new("RGB", (100, 100), color=(120, 30, 200))
-        examples = [
-            # Sample 0: text-only (would come from instruction-tuning data).
-            {
-                "messages": [
-                    {"role": "user", "content": "Quick question."},
-                    {"role": "assistant", "content": "Quick answer."},
-                ]
-            },
-            # Sample 1: multimodal (would come from VLM training data).
-            {
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "image", "image": img},
-                            {"type": "text", "text": "Describe."},
-                        ],
-                    },
-                    {"role": "assistant", "content": "A solid color image."},
-                ]
-            },
+        batch = VLMSFTCollator(tokenizer, 256, image_processor, QWEN35_MODEL_TYPE)(
+            [{"messages": messages}]
+        )
+        valid = batch["attention_mask_BT"][0].astype(bool)
+        token_ids = batch["token_ids_BT"][0, valid]
+        position_ids = batch["position_ids_ZBT"][:, 0, valid]
+        image_token_id = tokenizer.convert_tokens_to_ids("<|image_pad|>")
+        image_positions = np.flatnonzero(token_ids == image_token_id)
+        self.assertLen(image_positions, image_tokens)
+        start = int(image_positions[0])
+        end = int(image_positions[-1]) + 1
+        np.testing.assert_array_equal(image_positions, np.arange(start, end))
+
+        t, h, w = (int(value) for value in grid)
+        merged_h = h // image_processor.merge_size
+        merged_w = w // image_processor.merge_size
+        vision_positions = np.stack(
+            [
+                np.repeat(np.arange(t), merged_h * merged_w),
+                np.tile(np.repeat(np.arange(merged_h), merged_w), t),
+                np.tile(np.arange(merged_w), t * merged_h),
+            ]
+        )
+        tail_start = start + int(vision_positions.max()) + 1
+        expected_positions = np.concatenate(
+            [
+                np.tile(np.arange(start), (3, 1)),
+                vision_positions + start,
+                np.tile(np.arange(len(token_ids) - end) + tail_start, (3, 1)),
+            ],
+            axis=1,
+        )
+        np.testing.assert_array_equal(position_ids, expected_positions)
+
+
+class ConversationMeasurementTest(absltest.TestCase):
+    def test_every_prepared_span_matches_the_encoder(self):
+        conversations = [
+            [
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": "answer one"},
+                {"role": "user", "content": "second"},
+                {
+                    "role": "assistant",
+                    "reasoning_content": "reasoning",
+                    "content": "answer two",
+                },
+            ],
+            [
+                {"role": "user", "content": POISONS[0]},
+                {"role": "assistant", "content": "answer"},
+            ],
+            [
+                {"role": "user", "content": POISONS[2]},
+                {"role": "assistant", "content": POISONS[1]},
+            ],
         ]
-        batch = self.collator(examples)
+        for model, model_type in (*TEXT_MODELS, (VLM_MODEL, VLM_MODEL_TYPE)):
+            tokenizer = AutoTokenizer.from_pretrained(model, local_files_only=True)
+            prepare = make_conversation_measure_fn(tokenizer, None, model_type)
+            for messages in conversations:
+                prepared = prepare(messages)
+                encoder = Qwen3MessageEncoder(tokenizer, None, model_type)
+                for start in range(len(messages)):
+                    for end in range(start + 1, len(messages) + 1):
+                        try:
+                            measurement = prepared(start, end)
+                            encoded = encoder.encode(messages[start:end])
+                        except ValueError:
+                            continue
+                        self.assertEqual(measurement["length"], len(encoded["input_ids"]))
+                        self.assertEqual(
+                            measurement["supervised_tokens"], int(encoded["loss_mask"].sum())
+                        )
 
-        self.assertEqual(batch["token_ids_BT"].shape, (2, self.max_length))
-        # Vision keys present (because sample 1 has an image), with zero
-        # contribution from sample 0.
-        self.assertIn("pixel_values", batch)
-        self.assertIn("image_grid_thw", batch)
-        self.assertIn("vision_cu_seqlens", batch)
-        self.assertIn("position_ids_ZBT", batch)
-
-        # Sample 0 has no <|image_pad|> tokens, sample 1 has exactly the count
-        # implied by image_grid_thw — the alignment that lets the row-major
-        # image-token scatter in the model forward put the right embedding
-        # into the right position in a heterogeneous batch.
-        image_pad_id = self.tokenizer.convert_tokens_to_ids("<|image_pad|>")
-        n_pad_sample_0 = int(np.sum(batch["token_ids_BT"][0] == image_pad_id))
-        n_pad_sample_1 = int(np.sum(batch["token_ids_BT"][1] == image_pad_id))
-        self.assertEqual(n_pad_sample_0, 0)
-        self.assertEqual(batch["image_grid_thw"].shape, (1, 3))
-        grid = batch["image_grid_thw"][0]
-        expected_pads = int(grid[0]) * (int(grid[1]) // 2) * (int(grid[2]) // 2)
-        self.assertEqual(n_pad_sample_1, expected_pads)
+    def test_measurement_callable_survives_spawn_pickling(self):
+        model, model_type = TEXT_MODELS[0]
+        tokenizer = AutoTokenizer.from_pretrained(model, local_files_only=True)
+        prepare = pickle.loads(
+            pickle.dumps(make_conversation_measure_fn(tokenizer, None, model_type))
+        )
+        result = prepare([{"role": "user", "content": "q"}, {"role": "assistant", "content": "a"}])(
+            0, 2
+        )
+        self.assertGreater(result["supervised_tokens"], 0)
 
 
 if __name__ == "__main__":

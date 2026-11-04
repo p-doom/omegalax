@@ -35,15 +35,15 @@ def _cross_entropy_with_logits(
     return jnp.sum(nll_N * mask_f), jnp.sum(mask_f)
 
 
-def chunked_cross_entropy_loss(
+def chunked_cross_entropy_loss_sum(
     hidden_BTD: jax.Array,
     lm_head_kernel_DV: jax.Array,
     targets_BT: jax.Array,
     mask_BT: jax.Array,
     num_tiles: int = 8,
     logits_out_sharding: P | None = None,
-) -> jax.Array:
-    """Memory-efficient cross-entropy that never materializes the full logit tensor.
+) -> tuple[jax.Array, jax.Array]:
+    """Return the masked CE sum and supervised-token count.
 
     Tiles over the batch-sequence axis. Each tile computes ``hidden_chunk @ lm_head_kernel``
     to get a ``(chunk_size, V)`` logit slice, then immediately computes the cross-entropy
@@ -58,7 +58,7 @@ def chunked_cross_entropy_loss(
             Must evenly divide ``B * T``.
 
     Returns:
-        Scalar masked mean cross-entropy loss.
+        Masked loss sum and supervised-token count.
     """
     B, T, D = hidden_BTD.shape
 
@@ -74,7 +74,7 @@ def chunked_cross_entropy_loss(
             "BTD,DV->BTV", hidden_BTD, lm_head_kernel_DV, out_sharding=logits_out_sharding
         )
         loss_sum, mask_sum = _cross_entropy_with_logits(logits_BTV, targets_BT, mask_BT)
-        return loss_sum / jnp.maximum(mask_sum, 1.0)
+        return loss_sum, mask_sum
 
     # Tile within each sequence (B stays intact, T gets chunked)
     chunk_size = -(-T1 // num_tiles)
@@ -115,4 +115,23 @@ def chunked_cross_entropy_loss(
         ),
         unroll=1,
     )
-    return total_loss / jnp.maximum(total_mask, 1.0)
+    return total_loss, total_mask
+
+
+def chunked_cross_entropy_loss(
+    hidden_BTD: jax.Array,
+    lm_head_kernel_DV: jax.Array,
+    targets_BT: jax.Array,
+    mask_BT: jax.Array,
+    num_tiles: int = 8,
+    logits_out_sharding: P | None = None,
+) -> jax.Array:
+    loss_sum, mask_sum = chunked_cross_entropy_loss_sum(
+        hidden_BTD,
+        lm_head_kernel_DV,
+        targets_BT,
+        mask_BT,
+        num_tiles=num_tiles,
+        logits_out_sharding=logits_out_sharding,
+    )
+    return loss_sum / jnp.maximum(mask_sum, 1.0)

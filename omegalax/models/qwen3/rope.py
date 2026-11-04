@@ -2,7 +2,7 @@ import jax
 import jax.numpy as jnp
 
 
-def generate_pos_embeddings(positions_BT: jax.Array, head_dim: int, rope_theta: int = 1_000_000):
+def generate_pos_embeddings(positions_BT: jax.Array, head_dim: int, rope_theta: int):
     fraction = jnp.arange(0, head_dim, 2, dtype=jnp.float32) / head_dim
     timescale = rope_theta**fraction
     inv_freq_K = 1.0 / timescale

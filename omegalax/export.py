@@ -7,16 +7,41 @@ from pathlib import Path
 from omegalax.models.qwen3.config import Qwen3Config
 from omegalax.models.qwen3.model import Qwen3
 from omegalax.models.qwen3.params import export_qwen3_to_safetensors, qwen3_to_hf_config_dict
+from omegalax.models.qwen3_5.config import Qwen3_5Config
+from omegalax.models.qwen3_5.model import Qwen3_5ForConditionalGeneration
+from omegalax.models.qwen3_5.params import export_qwen3_5_to_safetensors, qwen3_5_to_hf_config_dict
 from omegalax.models.qwen3_vl.config import Qwen3VLConfig
 from omegalax.models.qwen3_vl.model import Qwen3VL
 from omegalax.models.qwen3_vl.params import (
     export_qwen3_vl_to_safetensors,
     qwen3_vl_to_hf_config_dict,
 )
-from omegalax.models.qwen3_5.config import Qwen3_5Config
-from omegalax.models.qwen3_5.model import Qwen3_5ForConditionalGeneration
-from omegalax.models.qwen3_5.params import export_qwen3_5_to_safetensors, qwen3_5_to_hf_config_dict
 from omegalax.trainers.lora import merge_lora_into_base
+
+
+def read_lora_metadata(save_dir: Path) -> dict:
+    """Return the LoRA settings persisted next to an Orbax checkpoint tree."""
+    import json
+
+    path = save_dir / "lora_metadata.json"
+    if not path.exists():
+        raise FileNotFoundError(
+            f"no lora_metadata.json next to the checkpoint at {save_dir}. Every "
+            "checkpoint written by omegalax.trainers.vlm has one; without it an "
+            "adapter checkpoint exports as the base model with no error. Write the "
+            "file from the training run's recipe."
+        )
+    metadata = json.loads(path.read_text())
+    missing = {
+        "enable_lora",
+        "lora_rank",
+        "lora_alpha",
+    } - metadata.keys()
+    if missing:
+        raise ValueError(f"{path} is missing {sorted(missing)}; refusing to guess model structure")
+    if type(metadata["enable_lora"]) is not bool:
+        raise ValueError(f"{path} field 'enable_lora' must be a boolean")
+    return metadata
 
 
 def export_model_to_hf(model, cfg, out_dir: str | Path) -> Path:
@@ -47,12 +72,32 @@ def export_model_to_hf(model, cfg, out_dir: str | Path) -> Path:
     )
 
 
+_HF_ARCHITECTURES = {
+    "qwen3": "Qwen3ForCausalLM",
+    "qwen3_moe": "Qwen3MoeForCausalLM",
+    "qwen3_vl": "Qwen3VLForConditionalGeneration",
+    "qwen3_vl_moe": "Qwen3VLMoeForConditionalGeneration",
+    "qwen3_5": "Qwen3_5ForConditionalGeneration",
+    "qwen3_5_moe": "Qwen3_5MoeForConditionalGeneration",
+}
+
+
 def model_config_to_hf_dict(cfg) -> dict:
     """Serialize a runtime config to HF config.json format."""
     if isinstance(cfg, Qwen3Config):
-        return qwen3_to_hf_config_dict(cfg)
-    if isinstance(cfg, Qwen3VLConfig):
-        return qwen3_vl_to_hf_config_dict(cfg)
-    if isinstance(cfg, Qwen3_5Config):
-        return qwen3_5_to_hf_config_dict(cfg)
-    raise ValueError(f"Unsupported config type for HF serialization: {type(cfg)}")
+        hf_cfg = qwen3_to_hf_config_dict(cfg)
+    elif isinstance(cfg, Qwen3VLConfig):
+        hf_cfg = qwen3_vl_to_hf_config_dict(cfg)
+    elif isinstance(cfg, Qwen3_5Config):
+        hf_cfg = qwen3_5_to_hf_config_dict(cfg)
+    else:
+        raise TypeError(f"Unsupported config type for HF serialization: {type(cfg)}")
+
+    model_type = hf_cfg["model_type"]
+    if model_type not in _HF_ARCHITECTURES:
+        raise ValueError(
+            f"No HF architecture registered for model_type {model_type!r}. Add it to "
+            f"_HF_ARCHITECTURES; an export without `architectures` cannot be served."
+        )
+    hf_cfg["architectures"] = [_HF_ARCHITECTURES[model_type]]
+    return hf_cfg

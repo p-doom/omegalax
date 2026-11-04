@@ -28,17 +28,21 @@ from .xla_reference import chunk_gated_delta_rule_xla
 __all__ = ["chunk_gated_delta_rule_xla"]
 
 
-def _resolve_backend():
+def resolve_backend():
     explicit = os.environ.get("OMEGALAX_DELTANET_KERNEL")
     if explicit is not None:
-        return explicit.lower()
+        backend = explicit.lower()
+        if backend not in {"xla", "pallas"}:
+            raise ValueError(
+                f"Unknown OMEGALAX_DELTANET_KERNEL={backend!r}. Use 'xla' or 'pallas'."
+            )
+        return backend
     # Implicit default: pallas if a GPU is reachable, else xla. We check
     # ``jax.devices()`` lazily so import order doesn't force a backend choice.
-    try:
-        if any(d.platform != "cpu" for d in jax.devices()):
-            return "pallas"
-    except Exception:
-        pass
+    # A failing probe must propagate: swallowing it substituted the XLA
+    # reference on GPU runs and then reported that throughput as pallas.
+    if any(d.platform != "cpu" for d in jax.devices()):
+        return "pallas"
     return "xla"
 
 
@@ -51,11 +55,9 @@ def chunk_gated_delta_rule(
     chunk_size: int = 64,
 ):
     """Dispatcher. Late-binds the backend so env-var changes take effect per process."""
-    backend = _resolve_backend()
+    backend = resolve_backend()
     if backend == "xla":
         return chunk_gated_delta_rule_xla(q_BTHA, k_BTHA, v_BTHU, g_BTH, beta_BTH, chunk_size)
-    if backend == "pallas":
-        from .pallas_triton import chunk_gated_delta_rule_pallas
+    from .pallas_triton import chunk_gated_delta_rule_pallas
 
-        return chunk_gated_delta_rule_pallas(q_BTHA, k_BTHA, v_BTHU, g_BTH, beta_BTH, chunk_size)
-    raise ValueError(f"Unknown OMEGALAX_DELTANET_KERNEL={backend!r}. Use 'xla' or 'pallas'.")
+    return chunk_gated_delta_rule_pallas(q_BTHA, k_BTHA, v_BTHU, g_BTH, beta_BTH, chunk_size)

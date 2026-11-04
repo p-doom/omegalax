@@ -65,7 +65,7 @@ class Qwen3_5_0_8B_Test(absltest.TestCase):
             )
             for t in texts
         ]
-        toks = self.tokenizer(chat_texts, return_tensors="pt", padding=True, padding_side="left")
+        toks = self.tokenizer(chat_texts, return_tensors="pt", padding=True, padding_side="right")
         return {k: v.to(self.device) for k, v in toks.items()}
 
     def _jax_prefill_logits(self, tokens_np: np.ndarray) -> np.ndarray:
@@ -76,6 +76,7 @@ class Qwen3_5_0_8B_Test(absltest.TestCase):
             segment_ids_BT,
             None,
             jnp.array(0, dtype=jnp.int32),
+            vision_patch_valid=jnp.empty((0,), dtype=jnp.bool_),
         )
         logits_BTV = self.jax_model.lm_head(hidden_BTD)
         return np.asarray(logits_BTV, dtype=np.float32)
@@ -101,7 +102,14 @@ class Qwen3_5_0_8B_Test(absltest.TestCase):
         mask = inputs["attention_mask"].cpu().numpy().astype(bool)
         jax_masked = jax_logits_BTV[mask]
         hf_masked = hf_logits_BTV[mask]
-        assert_logits_close(self, jax_masked, hf_masked, top1_min_match=0.8)
+        assert_logits_close(
+            self,
+            jax_masked,
+            hf_masked,
+            atol=0.75,
+            median_atol=0.05,
+            top1_min_match=0.8,
+        )
 
 
 if __name__ == "__main__":

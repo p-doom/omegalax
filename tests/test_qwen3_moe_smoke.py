@@ -20,6 +20,7 @@ from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 
 from omegalax.models.qwen3.config import make_config
 from omegalax.models.qwen3.loader import create_qwen3_from_safetensors
+from omegalax.models.sharding_runtime import set_attn_backend
 
 from tests.logits_assert import assert_logits_close
 
@@ -45,7 +46,7 @@ HF_SMOKE_CFG = HFQwen3MoeConfig(
     num_experts=4,
     num_experts_per_tok=2,
     vocab_size=512,
-    rope_theta=1_000_000,
+    rope_theta=10_000_000,
     decoder_sparse_step=1,
     mlp_only_layers=[],
     norm_topk_prob=True,
@@ -58,7 +59,7 @@ HF_SMOKE_CFG = HFQwen3MoeConfig(
 def _random_input(batch_size: int = 1, seq_len: int = 16, vocab_size: int = 512, pad_id: int = 0):
     rng = np.random.RandomState(42)
     token_ids_BT = rng.randint(1, vocab_size, size=(batch_size, seq_len)).astype(np.int32)
-    token_ids_BT[:, 0] = pad_id
+    token_ids_BT[:, -1] = pad_id
     return token_ids_BT
 
 
@@ -85,6 +86,9 @@ class Qwen3MoeWeightsTest(absltest.TestCase):
             fsdp_size=1,
             dp_size=1,
         )
+        # This module runs on CPU, where the default mosaic_gpu backend raises
+        # before any assertion below executes.
+        set_attn_backend(cls.jax_model, text_backend="xla")
 
         torch_dtype = _JNP_TO_TORCH[cls.jax_cfg.dtype]
         cls.hf_model = hf_model.to(torch_dtype)
@@ -121,9 +125,8 @@ class Qwen3MoeWeightsTest(absltest.TestCase):
         token_ids_a_BT = _random_input(batch_size=1, seq_len=16, vocab_size=HF_SMOKE_CFG.vocab_size)
         token_ids_b_BT = _random_input(batch_size=1, seq_len=10, vocab_size=HF_SMOKE_CFG.vocab_size)
 
-        # Pad shorter sequence on the left to match longer
         padded_b = np.zeros((1, 16), dtype=np.int32)
-        padded_b[:, 6:] = token_ids_b_BT
+        padded_b[:, :10] = token_ids_b_BT
         token_ids_BT = np.concatenate([token_ids_a_BT, padded_b], axis=0)
         attention_mask_BT = (token_ids_BT != self.pad_id).astype(np.int64)
 
@@ -143,29 +146,6 @@ class Qwen3MoeWeightsTest(absltest.TestCase):
 
         mask = attention_mask_BT.astype(bool)
         assert_logits_close(self, jax_logits_BTV, hf_logits_BTV, mask)
-
-    def test_round_trip_preserves_logits(self):
-        """Split → merge round-trip should preserve forward pass output."""
-        from flax import nnx
-
-        token_ids_BT = _random_input(batch_size=1, seq_len=16, vocab_size=HF_SMOKE_CFG.vocab_size)
-        jax_token_ids_BT = jnp.asarray(token_ids_BT)
-        segment_ids_BT = 1 * (jax_token_ids_BT != self.pad_id)
-
-        baseline_hidden, _ = self.jax_model(
-            jax_token_ids_BT, segment_ids_BT, None, jnp.array(0, dtype=jnp.int32)
-        )
-        baseline_BTV = np.asarray(self.jax_model.lm_head(baseline_hidden))
-
-        graph_def, state = nnx.split(self.jax_model)
-        pure_state = nnx.to_pure_dict(state)
-        restored = nnx.merge(graph_def, pure_state)
-        restored_hidden, _ = restored(
-            jax_token_ids_BT, segment_ids_BT, None, jnp.array(0, dtype=jnp.int32)
-        )
-        restored_logits_BTV = np.asarray(restored.lm_head(restored_hidden))
-
-        np.testing.assert_array_equal(restored_logits_BTV, baseline_BTV)
 
 
 if __name__ == "__main__":

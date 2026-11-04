@@ -5,7 +5,6 @@ from omegalax.data.grain_pipeline import (
     MixSource,
     build_records_from_chat,
     make_grain_iterator,
-    measure_message_lengths_from_chat,
     pop_source_ids,
 )
 
@@ -15,6 +14,5 @@ __all__ = [
     "VLMSFTCollator",
     "build_records_from_chat",
     "make_grain_iterator",
-    "measure_message_lengths_from_chat",
     "pop_source_ids",
 ]

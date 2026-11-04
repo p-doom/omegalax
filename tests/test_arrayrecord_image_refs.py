@@ -9,12 +9,13 @@ from pathlib import Path
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
+import numpy as np
 from absl.testing import absltest
 from array_record.python.array_record_module import ArrayRecordWriter
 from PIL import Image
 
 from omegalax.data import qwen3_encoding
-from omegalax.data.qwen3_encoding import extract_images
+from omegalax.data.qwen3_encoding import _extract_images
 
 
 def _jpeg_bytes(color: tuple[int, int, int]) -> bytes:
@@ -28,13 +29,15 @@ class ArrayRecordImageRefsTest(absltest.TestCase):
         qwen3_encoding._close_arrayrecord_image_sources()
         super().tearDown()
 
-    def test_extract_images_reads_arrayrecord_uri(self):
+    def test_extract_images_reads_the_arrayrecord_uri_fragment_as_the_record_index(self):
+        record_0 = _jpeg_bytes((255, 0, 0))
+        record_1 = _jpeg_bytes((0, 255, 0))
         with tempfile.TemporaryDirectory() as tmpdir:
             shard_path = Path(tmpdir) / "images.array_record"
             writer = ArrayRecordWriter(str(shard_path), "group_size:1")
             try:
-                writer.write(_jpeg_bytes((255, 0, 0)))
-                writer.write(_jpeg_bytes((0, 255, 0)))
+                writer.write(record_0)
+                writer.write(record_1)
             finally:
                 writer.close()
 
@@ -44,11 +47,17 @@ class ArrayRecordImageRefsTest(absltest.TestCase):
                     "content": [{"type": "image", "image": f"ar://{shard_path.as_posix()}#1"}],
                 }
             ]
-            images = extract_images(messages)
+            images = _extract_images(messages)
 
             self.assertLen(images, 1)
-            self.assertEqual(images[0].mode, "RGB")
-            self.assertEqual(images[0].size, (8, 6))
+            expected = np.asarray(Image.open(io.BytesIO(record_1)).convert("RGB"))
+            np.testing.assert_array_equal(np.asarray(images[0]), expected)
+            self.assertFalse(
+                np.array_equal(
+                    expected, np.asarray(Image.open(io.BytesIO(record_0)).convert("RGB"))
+                ),
+                "the two records must be distinguishable for this test to bite",
+            )
 
     def test_arrayrecord_reader_cache_evicts_and_closes_old_reader(self):
         old_cache_size = qwen3_encoding._ARRAYRECORD_IMAGE_CACHE_SIZE
@@ -65,7 +74,7 @@ class ArrayRecordImageRefsTest(absltest.TestCase):
                     finally:
                         writer.close()
 
-                extract_images(
+                _extract_images(
                     [
                         {
                             "role": "user",
@@ -75,7 +84,7 @@ class ArrayRecordImageRefsTest(absltest.TestCase):
                 )
                 reader_a = qwen3_encoding._ARRAYRECORD_IMAGE_SOURCES[str(shard_a)]
 
-                extract_images(
+                _extract_images(
                     [
                         {
                             "role": "user",

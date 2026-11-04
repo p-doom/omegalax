@@ -60,6 +60,7 @@ class Attention(nnx.Module):
         self.n_rep = cfg.num_heads // cfg.num_kv_heads
         self.scale = cfg.head_dim**-0.5
         self.head_dim = cfg.head_dim
+        self.rope_theta = cfg.rope_theta
         self.num_heads = cfg.num_heads
         self.num_kv_heads = cfg.num_kv_heads
         object.__setattr__(self, "_q_sharding", None)
@@ -93,7 +94,7 @@ class Attention(nnx.Module):
 
         if cache is None:
             positions_BT = compute_positions_from_segment_ids(segment_ids_BT)
-            sin_BTK, cos_BTK = generate_pos_embeddings(positions_BT, self.head_dim)
+            sin_BTK, cos_BTK = generate_pos_embeddings(positions_BT, self.head_dim, self.rope_theta)
             sin_BTK = sin_BTK.astype(self.dtype)
             cos_BTK = cos_BTK.astype(self.dtype)
 
@@ -124,7 +125,7 @@ class Attention(nnx.Module):
             jnp.where(cache.start_ind[...] < 0, left_pads_B, cache.start_ind[...])
         )
         positions_BT = compute_positions_from_segment_ids(segment_ids_BT) + cache.cur_ind[...]
-        sin_BTK, cos_BTK = generate_pos_embeddings(positions_BT, self.head_dim)
+        sin_BTK, cos_BTK = generate_pos_embeddings(positions_BT, self.head_dim, self.rope_theta)
         sin_BTK = sin_BTK.astype(self.dtype)
         cos_BTK = cos_BTK.astype(self.dtype)
         q_BTHK = apply_rope(q_BTHK, sin_BTK, cos_BTK)

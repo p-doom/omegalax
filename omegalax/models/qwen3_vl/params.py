@@ -9,7 +9,6 @@ from typing import Any
 import jax
 import numpy as np
 from flax import nnx
-from safetensors import numpy as stnp
 
 from omegalax.models.params_utils import (
     Transform,
@@ -17,6 +16,7 @@ from omegalax.models.params_utils import (
     flatten_pure_state,
     inverse_transform,
     save_hf_config,
+    save_hf_tensors,
     write_moe_experts_to_hf,
 )
 from .config import Qwen3VLConfig
@@ -80,6 +80,7 @@ def qwen3_vl_to_hf_config_dict(cfg: Qwen3VLConfig) -> dict[str, Any]:
         "image_token_id": cfg.image_token_id,
         "video_token_id": cfg.video_token_id,
         "vision_start_token_id": cfg.vision_start_token_id,
+        "vision_end_token_id": cfg.vision_end_token_id,
         "vision_config": {
             "hidden_size": cfg.vision.hidden_size,
             "intermediate_size": cfg.vision.intermediate_size,
@@ -191,7 +192,7 @@ def export_qwen3_vl_to_safetensors(model: Qwen3VL, cfg: Qwen3VLConfig, out_dir: 
             "Unmapped JAX parameters during export:\n" + "\n".join(sorted(unmatched))
         )
 
-    stnp.save_file(hf_tensors, tensor_path)
+    save_hf_tensors(hf_tensors, tensor_path)
     save_hf_config(qwen3_vl_to_hf_config_dict(cfg), out_path)
 
     return tensor_path

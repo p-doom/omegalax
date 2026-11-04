@@ -4,7 +4,7 @@ import unittest
 import jax.numpy as jnp
 
 from omegalax.models.qwen3_5.config import make_config_from_hf
-from omegalax.models.qwen3_vl.config import make_vl_config_from_hf
+from omegalax.models.qwen3_vl.config import make_vl_config, make_vl_config_from_hf
 
 
 def _qwen3_vl_hf_cfg() -> dict:
@@ -14,6 +14,7 @@ def _qwen3_vl_hf_cfg() -> dict:
         "image_token_id": 2,
         "video_token_id": 3,
         "vision_start_token_id": 4,
+        "vision_end_token_id": make_vl_config("qwen3-vl-smoke").vision_end_token_id,
         "text_config": {
             "dtype": "bfloat16",
             "num_hidden_layers": 2,
@@ -27,6 +28,7 @@ def _qwen3_vl_hf_cfg() -> dict:
             "rope_theta": 1_000_000,
             "rope_scaling": {
                 "mrope_section": [8, 4, 4],
+                "mrope_interleaved": True,
             },
         },
         "vision_config": {
@@ -111,10 +113,18 @@ class HFDtypeAlignmentTest(unittest.TestCase):
         self.assertEqual(cfg.dtype, jnp.bfloat16)
         self.assertEqual(cfg.vision.dtype, jnp.float32)
 
+    def test_qwen3_vl_rejects_non_interleaved_mrope(self):
+        hf_cfg = _qwen3_vl_hf_cfg()
+        hf_cfg["text_config"]["rope_scaling"]["mrope_interleaved"] = False
+        with self.assertRaisesRegex(ValueError, "mrope_interleaved=True"):
+            make_vl_config_from_hf(hf_cfg)
+
     def test_qwen3_5_defaults_vision_dtype_to_text_dtype(self):
         cfg = make_config_from_hf(_qwen3_5_hf_cfg())
         self.assertEqual(cfg.text_config.dtype, jnp.bfloat16)
         self.assertEqual(cfg.vision_config.dtype, cfg.text_config.dtype)
+        self.assertEqual(cfg.text_config.param_dtype, jnp.float32)
+        self.assertEqual(cfg.vision_config.param_dtype, jnp.float32)
 
     def test_qwen3_5_honors_explicit_vision_dtype(self):
         hf_cfg = copy.deepcopy(_qwen3_5_hf_cfg())
@@ -122,6 +132,14 @@ class HFDtypeAlignmentTest(unittest.TestCase):
         cfg = make_config_from_hf(hf_cfg)
         self.assertEqual(cfg.text_config.dtype, jnp.bfloat16)
         self.assertEqual(cfg.vision_config.dtype, jnp.float32)
+        self.assertEqual(cfg.text_config.param_dtype, jnp.float32)
+        self.assertEqual(cfg.vision_config.param_dtype, jnp.float32)
+
+    def test_qwen3_5_rejects_non_interleaved_mrope(self):
+        hf_cfg = _qwen3_5_hf_cfg()
+        hf_cfg["text_config"]["rope_parameters"]["mrope_interleaved"] = False
+        with self.assertRaisesRegex(ValueError, "mrope_interleaved=True"):
+            make_config_from_hf(hf_cfg)
 
 
 if __name__ == "__main__":

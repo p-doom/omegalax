@@ -150,14 +150,14 @@ For Qwen3.5 and Qwen3-VL, use `create_qwen3_5_from_safetensors(..., tp_size=1, f
 Tests use `absltest`:
 - Run all non-real-weight tests (default):
 ```bash
-uv run --extra=torch-tests -- python -m unittest discover -s tests -p "test_*.py"
+uv run -- python -m unittest discover -s tests -p "test_*.py"
 ```
 - Run everything including real-weight parity suites (downloads checkpoints; slow):
 ```bash
-OMEGALAX_RUN_REAL_WEIGHTS_TESTS=1 uv run --extra=torch-tests -- python -m unittest discover -s tests -p "test_*.py"
+OMEGALAX_RUN_REAL_WEIGHTS_TESTS=1 uv run -- python -m unittest discover -s tests -p "test_*.py"
 ```
 - Smoke/tiny-model checks only (CPU-friendly, no HF downloads):
 ```bash
-uv run --extra=torch-tests -- python -m unittest discover -s tests -p "test_*smoke.py"
+uv run -- python -m unittest discover -s tests -p "test_*smoke.py"
 ```
-Run a single suite via `uv run --extra=torch-tests -- python -m unittest tests.test_qwen3_0_6b`.
+Run a single suite via `uv run -- python -m unittest tests.test_qwen3_0_6b`.

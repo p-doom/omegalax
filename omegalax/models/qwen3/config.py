@@ -92,7 +92,7 @@ _QWEN3_SMOKE_SPECS: dict[str, dict[str, Any]] = {
         "mlp_only_layers": (),
         "decoder_sparse_step": 1,
         "norm_topk_prob": True,
-        "rope_theta": 1_000_000,
+        "rope_theta": 10_000_000,
         "rope_scaling_factor": None,
         "local_rope_theta": None,
         "norm_eps": 1e-6,
@@ -120,14 +120,6 @@ def _required(mapping: dict[str, Any], key: str, where: str) -> Any:
     if key not in mapping:
         raise ValueError(f"Missing required key '{key}' in {where}.")
     return mapping[key]
-
-
-def _required_any(mapping: dict[str, Any], keys: tuple[str, ...], where: str) -> Any:
-    for key in keys:
-        if key in mapping:
-            return mapping[key]
-    names = " or ".join(repr(key) for key in keys)
-    raise ValueError(f"Missing required key {names} in {where}.")
 
 
 def _hf_dtype_to_jnp(hf_dtype: str | None) -> Any:
@@ -209,14 +201,12 @@ def make_config_from_hf(hf_cfg: dict[str, Any]) -> Qwen3Config:
         norm_eps=_required(hf_cfg, "rms_norm_eps", "hf_cfg"),
         tie_word_embeddings=_required(hf_cfg, "tie_word_embeddings", "hf_cfg"),
         moe_intermediate_size=_required(hf_cfg, "moe_intermediate_size", "hf_cfg") if is_moe else 0,
-        num_experts=_required_any(hf_cfg, ("num_experts", "num_local_experts"), "hf_cfg")
-        if is_moe
-        else int(hf_cfg.get("num_experts", hf_cfg.get("num_local_experts", 0))),
+        num_experts=_required(hf_cfg, "num_experts", "hf_cfg") if is_moe else 0,
         num_experts_per_tok=_required(hf_cfg, "num_experts_per_tok", "hf_cfg") if is_moe else 0,
         mlp_only_layers=tuple(_required(hf_cfg, "mlp_only_layers", "hf_cfg")) if is_moe else (),
         decoder_sparse_step=_required(hf_cfg, "decoder_sparse_step", "hf_cfg") if is_moe else 1,
         norm_topk_prob=_required(hf_cfg, "norm_topk_prob", "hf_cfg") if is_moe else True,
-        aux_loss_coef=float(hf_cfg.get("router_aux_loss_coef", 0.0)),
+        aux_loss_coef=float(_required(hf_cfg, "router_aux_loss_coef", "hf_cfg")) if is_moe else 0.0,
         dtype=dtype,
     )
     return dataclasses.replace(cfg, shd_cfg=ShardConfig.default())

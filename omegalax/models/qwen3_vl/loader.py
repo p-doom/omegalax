@@ -79,12 +79,9 @@ def _assert_vl_config(cfg: Qwen3VLConfig, hf_cfg: dict):
 def _get_vision_key_mapping():
     T = Transform
     m: dict[str, tuple[str, Transform]] = {}
-    # Patch embedding
     m[r"model\.visual\.patch_embed\.proj\.weight"] = ("vision.patch_embed.proj.kernel", T.CONV3D)
     m[r"model\.visual\.patch_embed\.proj\.bias"] = ("vision.patch_embed.proj.bias", T.BIAS)
-    # Position embedding
     m[r"model\.visual\.pos_embed\.weight"] = ("vision.pos_embed.embedding", T.EMBED)
-    # Vision: blocks
     b = r"model\.visual\.blocks\.([0-9]+)"
     m[b + r"\.norm1\.weight"] = (r"vision.blocks.\1.norm1.scale", T.SCALE)
     m[b + r"\.norm1\.bias"] = (r"vision.blocks.\1.norm1.bias", T.BIAS)
@@ -98,14 +95,12 @@ def _get_vision_key_mapping():
     m[b + r"\.mlp\.linear_fc1\.bias"] = (r"vision.blocks.\1.mlp.fc1.bias", T.BIAS)
     m[b + r"\.mlp\.linear_fc2\.weight"] = (r"vision.blocks.\1.mlp.fc2.kernel", T.LINEAR)
     m[b + r"\.mlp\.linear_fc2\.bias"] = (r"vision.blocks.\1.mlp.fc2.bias", T.BIAS)
-    # Merger
     m[r"model\.visual\.merger\.norm\.weight"] = ("vision.merger.norm.scale", T.SCALE)
     m[r"model\.visual\.merger\.norm\.bias"] = ("vision.merger.norm.bias", T.BIAS)
     m[r"model\.visual\.merger\.linear_fc1\.weight"] = ("vision.merger.fc1.kernel", T.LINEAR)
     m[r"model\.visual\.merger\.linear_fc1\.bias"] = ("vision.merger.fc1.bias", T.BIAS)
     m[r"model\.visual\.merger\.linear_fc2\.weight"] = ("vision.merger.fc2.kernel", T.LINEAR)
     m[r"model\.visual\.merger\.linear_fc2\.bias"] = ("vision.merger.fc2.bias", T.BIAS)
-    # Deepstack mergers
     d = r"model\.visual\.deepstack_merger_list\.([0-9]+)"
     m[d + r"\.norm\.weight"] = (r"vision.deepstack_mergers.\1.norm.scale", T.SCALE)
     m[d + r"\.norm\.bias"] = (r"vision.deepstack_mergers.\1.norm.bias", T.BIAS)

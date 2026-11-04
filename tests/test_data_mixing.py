@@ -7,18 +7,18 @@ from pathlib import Path
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
-from absl.testing import absltest
 import numpy as np
 import orbax.checkpoint as ocp
+from absl.testing import absltest
 
 from omegalax.data.grain_pipeline import (
     BATCH_SOURCE_IDS_KEY,
     MixSource,
-    build_chunk_index,
-    compile_jsonl_to_arrayrecord,
+    build_records_from_chat,
     make_grain_iterator,
     make_grain_multiprocessing_options,
     make_grain_read_options,
+    parse_data_mix,
     pop_source_ids,
 )
 from omegalax.trainers import checkpoint_utils
@@ -40,18 +40,48 @@ def _write_jsonl(path: Path, rows: list[dict]) -> None:
             f.write(json.dumps(row) + "\n")
 
 
+class _PreparedMeasurements:
+    def __init__(self, messages):
+        self.message_measurements = [
+            {
+                "length": 1,
+                "supervised_tokens": int(message["role"] == "assistant"),
+                "vision_tokens": 0,
+                "vision_patches": 0,
+                "num_images": 0,
+                "image_grid_thw": [],
+            }
+            for message in messages
+        ]
+
+    def __call__(self, start, end):
+        items = self.message_measurements[start:end]
+        return {
+            "length": len(items),
+            "supervised_tokens": sum(item["supervised_tokens"] for item in items),
+            "vision_tokens": 0,
+            "vision_patches": 0,
+            "num_images": 0,
+            "image_grid_thw": [],
+        }
+
+
+def _prepare_conversation(messages):
+    return _PreparedMeasurements(messages)
+
+
 def _build_chunked_source(
     tmpdir: Path,
     *,
     name: str,
     contents: list[str],
 ) -> Path:
-    """Compile a user+assistant-per-session JSONL into a chunk-index dataset.
+    """Build an inline-records dataset from a user+assistant-per-session chat.jsonl.
 
-    Each session pairs the tracking value (carried as the user turn so tests can
+    Each session pairs the tracking value (stored as the user turn so tests can
     read it back at ``messages[0]``) with a trivial assistant turn, so the chunk
-    survives ``build_chunk_index``'s assistant-turn filter. ``max_length=2`` keeps
-    both messages in a single chunk, preserving one chunk per session.
+    survives ``build_records_from_chat``'s assistant-turn filter. ``max_length=2``
+    keeps both messages in a single chunk, preserving one record per session.
     """
     src = tmpdir / f"{name}.jsonl"
     _write_jsonl(
@@ -66,30 +96,23 @@ def _build_chunked_source(
             for value in contents
         ],
     )
-    payload = compile_jsonl_to_arrayrecord(
+    return build_records_from_chat(
         src,
-        tmpdir / f"{name}_payload",
-        messages_per_record=1,
-        records_per_shard=8,
-    )
-    chunked = build_chunk_index(
-        payload,
-        tmpdir / f"{name}_chunked",
+        tmpdir / f"{name}_records",
         max_length=2,
-        measure_message=lambda _msg: 1,
+        prepare_conversation=_prepare_conversation,
         records_per_shard=8,
     )
-    return chunked
 
 
-_FAST_OPTS = dict(
-    read_options=make_grain_read_options(num_threads=1, prefetch_buffer_size=1),
-    multiprocessing_options=make_grain_multiprocessing_options(
+_FAST_OPTS = {
+    "read_options": make_grain_read_options(num_threads=1, prefetch_buffer_size=1),
+    "multiprocessing_options": make_grain_multiprocessing_options(
         num_workers=0, per_worker_buffer_size=1
     ),
-    dp_size=1,
-    fsdp_size=1,
-)
+    "dp_size": 1,
+    "fsdp_size": 1,
+}
 
 
 class DataMixingTest(absltest.TestCase):
@@ -125,7 +148,7 @@ class DataMixingTest(absltest.TestCase):
         """The mixing iterator surfaces per-example source ids in each batch."""
         with tempfile.TemporaryDirectory() as tmp:
             tmpdir = Path(tmp)
-            a = _build_chunked_source(tmpdir, name="a", contents=[str(i) for i in range(0, 8)])
+            a = _build_chunked_source(tmpdir, name="a", contents=[str(i) for i in range(8)])
             b = _build_chunked_source(tmpdir, name="b", contents=[str(i) for i in range(100, 108)])
 
             it = make_grain_iterator(
@@ -225,6 +248,14 @@ class DataMixingTest(absltest.TestCase):
                     break
             self.assertFalse(seen_b)
 
+    def test_mix_entry_without_a_weight_rejected(self):
+        self.assertEqual(
+            parse_data_mix('[{"path": "/a", "weight": 0.25}]'),
+            [MixSource(path="/a", weight=0.25)],
+        )
+        with self.assertRaisesRegex(TypeError, "missing.*weight"):
+            parse_data_mix('[{"path": "/a"}]')
+
     def test_negative_weight_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmpdir = Path(tmp)
@@ -247,54 +278,6 @@ class DataMixingTest(absltest.TestCase):
             with self.assertRaisesRegex(ValueError, "weights must be > 0"):
                 make_grain_iterator(
                     [MixSource(path=a, weight=0.0), MixSource(path=a, weight=0.0)],
-                    batch_size=1,
-                    batch_fn=_batch_starts,
-                    shuffle=False,
-                    seed=0,
-                    num_epochs=1,
-                    **_FAST_OPTS,
-                )
-
-    def test_mixing_different_max_length_rejected(self):
-        """Mixing chunk indices built with different max_length is refused."""
-        with tempfile.TemporaryDirectory() as tmp:
-            tmpdir = Path(tmp)
-            # Build two payloads, then chunk-index them with different max_lengths.
-            src_a = tmpdir / "a.jsonl"
-            _write_jsonl(
-                src_a,
-                [
-                    {
-                        "messages": [
-                            {"role": "user", "content": "x"},
-                            {"role": "assistant", "content": "ok"},
-                        ]
-                    }
-                ],
-            )
-            payload_a = compile_jsonl_to_arrayrecord(
-                src_a,
-                tmpdir / "a_payload",
-                messages_per_record=1,
-                records_per_shard=8,
-            )
-            chunked_a_short = build_chunk_index(
-                payload_a,
-                tmpdir / "a_chunked_short",
-                max_length=1,
-                measure_message=lambda _m: 1,
-                records_per_shard=8,
-            )
-            chunked_a_long = build_chunk_index(
-                payload_a,
-                tmpdir / "a_chunked_long",
-                max_length=2,
-                measure_message=lambda _m: 1,
-                records_per_shard=8,
-            )
-            with self.assertRaisesRegex(ValueError, "different max_length"):
-                make_grain_iterator(
-                    [MixSource(path=chunked_a_short), MixSource(path=chunked_a_long)],
                     batch_size=1,
                     batch_fn=_batch_starts,
                     shuffle=False,

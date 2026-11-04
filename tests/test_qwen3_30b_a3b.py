@@ -63,7 +63,7 @@ class Qwen3_30B_A3B_Test(absltest.TestCase):
             )
             for t in texts
         ]
-        toks = self.tokenizer(chat_texts, return_tensors="pt", padding=True, padding_side="left")
+        toks = self.tokenizer(chat_texts, return_tensors="pt", padding=True, padding_side="right")
         return {k: v.to(self.device) for k, v in toks.items()}
 
     def _jax_prefill_logits(self, input_ids: torch.Tensor) -> np.ndarray:
