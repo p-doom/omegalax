@@ -6,10 +6,13 @@ import contextlib
 import dataclasses
 import datetime
 import gc
+import json
 import os
 import signal
 import subprocess
+import weakref
 from pathlib import Path
+from typing import Any, NamedTuple
 from flax import nnx
 import jax
 import jax.numpy as jnp
@@ -124,14 +127,40 @@ def _train_state(optimizer: MixedPrecisionOptimizer, rng: jax.Array) -> dict[str
     return {"optimizer": nnx.state(optimizer), "rng": rng}
 
 
-def _abstract_train_state(optimizer: MixedPrecisionOptimizer, rng: jax.Array) -> dict[str, object]:
-    return {
+class _RestoreSpec(NamedTuple):
+    graphdef: Any
+    item: dict[str, object]
+    restore_args: dict[str, object]
+    fresh_arrays: tuple[weakref.ReferenceType, ...]
+
+
+def _restore_spec(optimizer: MixedPrecisionOptimizer, rng: jax.Array) -> _RestoreSpec:
+    """Array-free material to restore into, plus weakrefs to the arrays the caller drops.
+
+    Orbax honours the trainer's shardings only when they arrive as explicit
+    ``ArrayRestoreArgs``; a bare ``ShapeDtypeStruct`` tree is ignored in favour of the
+    checkpoint's own ``_sharding`` file. Leaving ``dtype`` unset there keeps each
+    checkpointed dtype, so trained fp32 moments are not rounded into a fresh bf16 leaf.
+    """
+    graphdef, state = nnx.split(optimizer)
+    jax.block_until_ready(state)
+    item = {
         "optimizer": jax.tree.map(
             lambda value: jax.ShapeDtypeStruct(value.shape, value.dtype, sharding=value.sharding),
-            nnx.state(optimizer),
+            state,
         ),
         "rng": jax.ShapeDtypeStruct(rng.shape, rng.dtype, sharding=rng.sharding),
     }
+    return _RestoreSpec(
+        graphdef,
+        item,
+        jax.tree.map(
+            lambda value: ocp.ArrayRestoreArgs(sharding=value.sharding),
+            item,
+            is_leaf=lambda value: isinstance(value, jax.ShapeDtypeStruct),
+        ),
+        tuple(weakref.ref(value) for value in jax.tree.leaves(state)),
+    )
 
 
 def _make_checkpoint_manager(
@@ -139,8 +168,12 @@ def _make_checkpoint_manager(
     save_interval: int | None,
     keep_period: int | None = None,
     keep_latest: int | None = None,
+    read_only: bool = False,
 ) -> ocp.CheckpointManager:
     """Orbax requires an absolute checkpoint path.
+
+    ``read_only`` opens another run's tree to restore from without touching it (pass
+    ``save_interval=0``; orbax rejects a read-only manager that could still save).
 
     ``keep_period`` permanently retains every checkpoint whose step is a multiple
     of it (e.g. full-epoch boundaries); for it to ever fire it must be a multiple
@@ -164,8 +197,9 @@ def _make_checkpoint_manager(
     options = ocp.CheckpointManagerOptions(
         save_interval_steps=save_interval,
         step_format_fixed_length=6,
-        cleanup_tmp_directories=True,
+        cleanup_tmp_directories=not read_only,
         preservation_policy=preservation_policy,
+        read_only=read_only,
     )
     return ocp.CheckpointManager(save_dir, options=options, handler_registry=handler_registry)
 
@@ -180,8 +214,6 @@ def _write_lora_metadata(save_dir: Path, train_cfg: TrainConfig) -> None:
     The export driver reads this file to reconstruct the same optimizer
     shape at restore time. Absent file ⇒ checkpoint was full-FT.
     """
-    import json
-
     meta = {
         "enable_lora": bool(train_cfg.enable_lora),
         "lora_rank": int(train_cfg.lora_rank),
@@ -204,37 +236,112 @@ def _save_sft_checkpoint(
 
 def _restore_sft_checkpoint(
     checkpoint_manager: ocp.CheckpointManager,
-    optimizer: MixedPrecisionOptimizer,
-    rng: jax.Array,
-    input_iter: checkpoint_utils.GrainIterator,
-) -> tuple[MixedPrecisionOptimizer, int, jax.Array, checkpoint_utils.GrainIterator]:
-    latest_step = checkpoint_manager.latest_step()
-    if latest_step is None:
+    spec: _RestoreSpec,
+    input_iter: checkpoint_utils.GrainIterator | None,
+    *,
+    step: int | None = None,
+) -> tuple[MixedPrecisionOptimizer, int, jax.Array, checkpoint_utils.GrainIterator | None]:
+    """Rebuild an optimizer from a checkpoint; ``step`` defaults to the manager's latest.
+
+    ``input_iter=None`` leaves the Grain iterator out of the restore altogether: grain
+    mutates whatever iterator is handed to ``CheckpointRestore``, so asking for the item
+    and discarding the result would still resume the caller's live iterator.
+    """
+    step = checkpoint_manager.latest_step() if step is None else int(step)
+    if step is None:
         raise ValueError("No checkpoint found to restore.")
 
-    abstract_state = _abstract_train_state(optimizer, rng)
-    restore_args = checkpoint_utils.make_grain_restore_args(abstract_state, input_iter)
-    restored = checkpoint_manager.restore(latest_step, args=restore_args)
+    restore_args = (
+        ocp.args.Composite(
+            train_state=ocp.args.PyTreeRestore(spec.item, restore_args=spec.restore_args)
+        )
+        if input_iter is None
+        else checkpoint_utils.make_grain_restore_args(
+            spec.item, input_iter, restore_args=spec.restore_args
+        )
+    )
+    restored = checkpoint_manager.restore(step, args=restore_args)
     train_state = restored["train_state"]
-    # Canonicalize restored opt-state dtypes against the freshly-built
-    # optimizer's expectations: some prior checkpoints stored Adam's first
-    # moment in bf16; the optimizer now uses optax's default (fp32), so
-    # MultiSteps (grad_accum) would otherwise see a dtype mismatch between
-    # the passthrough branch (restored dtype) and the active-step branch
-    # (optax's expected dtype) and lax.cond would reject it at trace time.
-    expected_state = nnx.state(optimizer)
-    restored_state = jax.tree.map(
-        lambda exp, got: got.astype(exp.dtype) if exp.dtype != got.dtype else got,
-        expected_state,
-        train_state["optimizer"],
-    )
-    nnx.update(optimizer, restored_state)
     return (
-        optimizer,
-        int(latest_step),
+        nnx.merge(spec.graphdef, train_state["optimizer"]),
+        int(step),
         train_state["rng"],
-        checkpoint_utils.restored_input_iter(restored),
+        None if input_iter is None else checkpoint_utils.restored_input_iter(restored),
     )
+
+
+_RESET_BRANCHES = ("opt_state", "step")
+
+
+def _reset_optimizer_state_in_place(optimizer: MixedPrecisionOptimizer) -> tuple[int, int]:
+    """Zero every ``opt_state``/``step`` leaf; returns (leaves zeroed, nonzero elements before).
+
+    Zeroing the optax counters (``count``, ``mini_step``, ``gradient_step``) alongside
+    ``step`` is what restarts the LR schedule from warmup.
+    """
+    zeroed = 0
+    nonzero_before = 0
+
+    def rewrite(path, leaf):
+        nonlocal zeroed, nonzero_before
+        if path[0].key not in _RESET_BRANCHES:
+            return leaf
+        zeroed += 1
+        nonzero_before += int(jnp.count_nonzero(leaf))
+        # The replacement inherits the restored leaf's mesh NamedSharding; a merely
+        # concrete sharding does not match the mesh the train step is compiled for.
+        return jnp.zeros(leaf.shape, leaf.dtype, device=leaf.sharding)
+
+    nnx.update(optimizer, jax.tree_util.tree_map_with_path(rewrite, nnx.state(optimizer)))
+    if not zeroed:
+        raise RuntimeError(f"optimizer state tree has no {_RESET_BRANCHES} leaves to reset")
+    return zeroed, nonzero_before
+
+
+def _iterator_next_indices(state: Any) -> list[int]:
+    """Read position of every grain sub-iterator (``next_index_in_datasets`` is a count)."""
+    if isinstance(state, dict):
+        found = []
+        for key, value in state.items():
+            if key == "next_index" and isinstance(value, int):
+                found.append(value)
+            else:
+                found.extend(_iterator_next_indices(value))
+        return found
+    if isinstance(state, (list, tuple)):
+        return [index for value in state for index in _iterator_next_indices(value)]
+    return []
+
+
+def optimizer_reset_problems(
+    *,
+    resume: str | checkpoint_utils.ResumeMode,
+    init_from: str | Path | None,
+    reset_optimizer: bool,
+    save_dir: str | Path | None,
+) -> list[str]:
+    """Every ``init_from``/``reset_optimizer`` rule, checked before any device work."""
+    if not reset_optimizer:
+        return [] if init_from is None else ["init_from requires reset_optimizer"]
+    problems = []
+    if checkpoint_utils.ResumeMode(resume) is not checkpoint_utils.ResumeMode.NEVER:
+        problems.append(f"reset_optimizer requires resume=never, got {resume!r}")
+    if save_dir is None:
+        problems.append("save_dir (required when reset_optimizer is set)")
+    if init_from is None:
+        problems.append("init_from (required when reset_optimizer is set)")
+        return problems
+    step_dir = Path(init_from).expanduser().resolve()
+    if not step_dir.name.isdigit():
+        problems.append(
+            f"init_from must name one checkpoint step directory, e.g. /runs/prev/orbax/000900 "
+            f"(got {step_dir})"
+        )
+    elif not (step_dir / "train_state").is_dir():
+        problems.append(f"init_from has no train_state item: {step_dir}")
+    if save_dir is not None and step_dir.parent == Path(save_dir).expanduser().resolve():
+        problems.append(f"init_from must lie outside save_dir, got both under {step_dir.parent}")
+    return problems
 
 
 def make_sft_train_step(cfg, pad_id: int = 0, *, wrt=nnx.Param, num_loss_tiles: int = 4):
@@ -373,6 +480,8 @@ def run_sft(
     gc_period: int = 0,
     log_memory: bool = False,
     tokamax_cache_dir: str | Path | None = None,
+    init_from: str | Path | None = None,
+    reset_optimizer: bool = False,
 ) -> tuple[MixedPrecisionOptimizer, dict[str, float]]:
     """SFT a VLM from a Grain iterator; returns final optimizer + last metrics.
 
@@ -385,8 +494,23 @@ def run_sft(
 
     See :class:`omegalax.trainers.checkpoint_utils.ResumeMode` for the meaning of
     each ``resume`` mode.
+
+    ``init_from`` (one checkpoint step directory) plus ``reset_optimizer`` keeps that
+    checkpoint's weights but starts a new optimization: optimizer state, step counter,
+    RNG and Grain iterator all begin from scratch, which is what makes it safe on a
+    different dataset. Mutually exclusive with ``resume``.
     """
+    problems = optimizer_reset_problems(
+        resume=resume,
+        init_from=init_from,
+        reset_optimizer=reset_optimizer,
+        save_dir=save_dir,
+    )
+    if problems:
+        raise ValueError("invalid init_from/reset_optimizer flags:\n  " + "\n  ".join(problems))
+
     save_path = Path(save_dir).expanduser().resolve() if save_dir is not None else None
+    init_step_dir = Path(init_from).expanduser().resolve() if reset_optimizer else None
 
     # Build the canonical CheckpointManager up-front so a single ``latest_step()``
     # query drives both the model_cfg-source decision and the eventual restore.
@@ -402,6 +526,14 @@ def run_sft(
         )
 
     latest_step = checkpoint_manager.latest_step() if checkpoint_manager is not None else None
+
+    # A Slurm requeue re-runs the same command with save_dir now populated; hard-error
+    # rather than silently discarding those steps and re-initializing from init_from.
+    if reset_optimizer and latest_step is not None:
+        raise ValueError(
+            f"reset_optimizer needs an empty save_dir but {save_path} already holds "
+            f"checkpoints (latest_step={latest_step}); use resume to continue that run"
+        )
 
     if (
         latest_step is not None
@@ -433,6 +565,9 @@ def run_sft(
     if will_resume:
         model_cfg = vlm_api.resolve_config(str(save_path))
         startup_log(f"resolved model config from checkpoint {save_path!r}")
+    elif reset_optimizer:
+        model_cfg = vlm_api.resolve_config(str(init_step_dir.parent))
+        startup_log(f"resolved model config from init_from {str(init_step_dir.parent)!r}")
     else:
         model_cfg = vlm_api.resolve_config(model_id_or_cfg)
         startup_log("resolved model config")
@@ -465,7 +600,7 @@ def run_sft(
         stable_fraction=train_cfg.lr_stable_fraction,
     )
 
-    if not will_resume and isinstance(model_id_or_cfg, str):
+    if not (will_resume or reset_optimizer) and isinstance(model_id_or_cfg, str):
         model, model_cfg = vlm_api.load_pretrained(
             model_id_or_cfg,
             tp_size=tp_size,
@@ -534,6 +669,21 @@ def run_sft(
         )
         log_device_memory("after optimizer build", save_dir=save_path)
 
+    if will_resume or reset_optimizer:
+        # Orbax allocates the restored tree alongside the freshly initialized one unless
+        # every concrete reference is dropped first — ``optimizer`` and the ``model``
+        # alias it holds — which otherwise doubles peak HBM.
+        spec = _restore_spec(optimizer, rng)
+        del optimizer, model
+        gc.collect()
+        live = sum(reference() is not None for reference in spec.fresh_arrays)
+        if live:
+            raise RuntimeError(
+                f"{live}/{len(spec.fresh_arrays)} freshly initialized arrays are still "
+                "referenced; the restore would peak at fresh + restored size"
+            )
+        startup_log(f"released {len(spec.fresh_arrays)} freshly initialized arrays")
+
     sft_step = make_sft_train_step(
         model_cfg,
         pad_id=pad_id,
@@ -565,10 +715,38 @@ def run_sft(
     start_step = 0
     if will_resume:
         optimizer, start_step, rng, data_iter = _restore_sft_checkpoint(
-            checkpoint_manager, optimizer, rng, data_iter
+            checkpoint_manager, spec, data_iter
         )
         rng = jax.device_put(rng, replicated_rng_sharding)
         startup_log(f"restored checkpoint at step {start_step}")
+    elif reset_optimizer:
+        init_manager = _make_checkpoint_manager(
+            init_step_dir.parent, save_interval=0, read_only=True
+        )
+        try:
+            optimizer, source_step, restored_rng, _ = _restore_sft_checkpoint(
+                init_manager, spec, None, step=int(init_step_dir.name)
+            )
+        finally:
+            init_manager.close()
+        zeroed, nonzero_before = _reset_optimizer_state_in_place(optimizer)
+        rng = jax.device_put(
+            jax.random.split(jax.random.key(train_cfg.seed))[1], restored_rng.sharding
+        )
+        next_indices = _iterator_next_indices(data_iter.get_state())
+        if not next_indices or any(next_indices):
+            raise RuntimeError(
+                f"grain iterator is not at the dataset start: next_index={next_indices}"
+            )
+        receipt = {
+            "init_from": str(init_step_dir),
+            "continued_from_step": source_step,
+            "zeroed_leaves": zeroed,
+            "nonzero_elements_before_reset": nonzero_before,
+        }
+        if is_primary_process:
+            (save_path / "optimizer_reset_receipt.json").write_text(json.dumps(receipt, indent=2))
+        startup_log(f"optimizer reset: {receipt}")
 
     last_metrics: dict[str, float] = {}
     prev_metrics: tuple[int, dict[str, jax.Array], datetime.timedelta, float] | None = None

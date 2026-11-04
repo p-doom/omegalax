@@ -54,10 +54,10 @@ def make_grain_save_args(train_state: Any, input_iter: GrainIterator) -> ocp.arg
 
 
 def make_grain_restore_args(
-    abstract_train_state: Any, input_iter: GrainIterator
+    abstract_train_state: Any, input_iter: GrainIterator, restore_args: Any = None
 ) -> ocp.args.Composite:
     items: dict[str, Any] = {
-        "train_state": ocp.args.PyTreeRestore(abstract_train_state),
+        "train_state": ocp.args.PyTreeRestore(abstract_train_state, restore_args=restore_args),
         "input_iter": grain.checkpoint.CheckpointRestore(input_iter),
     }
     return ocp.args.Composite(**items)
