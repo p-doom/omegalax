@@ -13,7 +13,7 @@ from transformers import AutoImageProcessor, AutoTokenizer
 
 import omegalax.compat.cudnn_ampere_packed  # noqa: F401
 
-from omegalax.data.collator_qwen3 import VLMSFTCollator
+from omegalax.data.collator_qwen3 import PackedVLMSFTCollator, VLMSFTCollator
 from omegalax.data.grain_pipeline import (
     MixSource,
     make_grain_iterator,
@@ -165,6 +165,14 @@ flags.DEFINE_integer(
     "Number of tiles for chunked cross-entropy along the "
     "sequence axis. Must evenly divide (max_length - 1).",
 )
+flags.DEFINE_boolean(
+    "pack_sequences",
+    None,
+    "Enable sequence packing: concatenate whole records into <= max_length rows "
+    "(greedy next-fit) instead of padding one record per row. Attention is "
+    "block-diagonal per packed segment and next-token targets never cross a "
+    "segment boundary. Default off.",
+)
 
 _ATTN_BACKENDS = [
     "mosaic_tpu",
@@ -213,6 +221,7 @@ _REQUIRED = [
     "text_attn_backend",
     "enable_lora",
     "freeze_vision_tower",
+    "pack_sequences",
 ]
 
 
@@ -291,7 +300,7 @@ def _resolve_train_sources() -> list[MixSource]:
 
 def _grain_iter(
     sources: list[MixSource],
-    collator: VLMSFTCollator,
+    collator,
     per_process_batch_size: int,
     *,
     shuffle: bool,
@@ -300,7 +309,9 @@ def _grain_iter(
     dp_size: int,
     fsdp_size: int,
 ):
-    if len(sources) == 1:
+    if len(sources) == 1 and not FLAGS.pack_sequences:
+        # required_epochs assumes 1 record == 1 batch element; with packing the
+        # record->row ratio is variable, so fall back to indefinite repetition.
         num_epochs: int | None = required_epochs_for_batches(
             sources[0].path,
             batch_size=per_process_batch_size,
@@ -327,6 +338,8 @@ def _grain_iter(
         ),
         dp_size=dp_size,
         fsdp_size=fsdp_size,
+        pack_sequences=FLAGS.pack_sequences,
+        pack_max_length=FLAGS.max_length if FLAGS.pack_sequences else None,
     )
 
 
@@ -364,14 +377,15 @@ def main(_) -> None:
                 f"product is a multiple of {ms2}."
             )
 
-    collator = VLMSFTCollator(
+    collator_cls = PackedVLMSFTCollator if FLAGS.pack_sequences else VLMSFTCollator
+    collator = collator_cls(
         tokenizer,
         max_length=FLAGS.max_length,
         image_processor=image_processor,
         max_vision_patches_per_sample=FLAGS.max_vision_patches_per_sample or None,
         max_vision_images_per_sample=FLAGS.max_vision_images_per_sample or None,
     )
-    startup_log("built VLMSFTCollator")
+    startup_log(f"built {collator_cls.__name__}")
     train_sources = _resolve_train_sources()
     per_process_batch = process_local_batch_size(
         FLAGS.batch_size,
