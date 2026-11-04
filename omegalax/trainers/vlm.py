@@ -6,10 +6,14 @@ import contextlib
 import dataclasses
 import datetime
 import gc
+import hashlib
+import json
 import os
 import signal
 import subprocess
+import weakref
 from pathlib import Path
+from typing import Any
 from flax import nnx
 import jax
 import jax.numpy as jnp
@@ -125,13 +129,343 @@ def _train_state(optimizer: MixedPrecisionOptimizer, rng: jax.Array) -> dict[str
 
 
 def _abstract_train_state(optimizer: MixedPrecisionOptimizer, rng: jax.Array) -> dict[str, object]:
+    return _abstract_train_state_from_optimizer_state(nnx.state(optimizer), rng)
+
+
+def _abstract_train_state_from_optimizer_state(
+    optimizer_state: Any, rng: jax.Array
+) -> dict[str, object]:
     return {
         "optimizer": jax.tree.map(
             lambda value: jax.ShapeDtypeStruct(value.shape, value.dtype, sharding=value.sharding),
-            nnx.state(optimizer),
+            optimizer_state,
         ),
         "rng": jax.ShapeDtypeStruct(rng.shape, rng.dtype, sharding=rng.sharding),
     }
+
+
+@dataclasses.dataclass(frozen=True)
+class _MemorySafeRestoreBlueprint:
+    """Array-free material needed to restore and reconstruct an optimizer."""
+
+    optimizer_graphdef: Any
+    abstract_train_state: dict[str, object]
+    initialized_optimizer_ref: weakref.ReferenceType
+    initialized_model_ref: weakref.ReferenceType
+    initialized_array_refs: tuple[weakref.ReferenceType, ...]
+    device_bytes_in_use_before_release: dict[str, int]
+
+
+def _gpu_bytes_in_use() -> dict[str, int]:
+    result = {}
+    for device in jax.local_devices():
+        if device.platform != "gpu":
+            continue
+        stats = device.memory_stats()
+        if stats is not None and "bytes_in_use" in stats:
+            result[f"{device.platform}:{device.id}"] = int(stats["bytes_in_use"])
+    return result
+
+
+def _prepare_memory_safe_restore(
+    optimizer: MixedPrecisionOptimizer, rng: jax.Array
+) -> _MemorySafeRestoreBlueprint:
+    """Split off an array-free graph/restore spec before dropping fresh state."""
+    graphdef, initialized_state = nnx.split(optimizer)
+    jax.block_until_ready(initialized_state)
+    arrays = {}
+    for value in jax.tree.leaves(initialized_state):
+        if isinstance(value, jax.Array):
+            arrays.setdefault(id(value), value)
+    array_refs = tuple(weakref.ref(value) for value in arrays.values())
+    abstract_state = _abstract_train_state_from_optimizer_state(initialized_state, rng)
+    blueprint = _MemorySafeRestoreBlueprint(
+        optimizer_graphdef=graphdef,
+        abstract_train_state=abstract_state,
+        initialized_optimizer_ref=weakref.ref(optimizer),
+        initialized_model_ref=weakref.ref(optimizer.model),
+        initialized_array_refs=array_refs,
+        device_bytes_in_use_before_release=_gpu_bytes_in_use(),
+    )
+    # The caller still owns ``optimizer`` (and may own another ``model`` alias),
+    # but this helper must not leak a concrete-state alias in its return value.
+    del initialized_state, arrays
+    return blueprint
+
+
+def _verify_initialized_state_released(
+    blueprint: _MemorySafeRestoreBlueprint,
+) -> dict[str, object]:
+    """Fail unless all fresh model/optimizer objects and arrays were released."""
+    jax.clear_caches()
+    gc.collect()
+    jax.effects_barrier()
+    gc.collect()
+
+    optimizer_alive = blueprint.initialized_optimizer_ref() is not None
+    model_alive = blueprint.initialized_model_ref() is not None
+    live_array_count = sum(ref() is not None for ref in blueprint.initialized_array_refs)
+    memory_after = _gpu_bytes_in_use()
+    memory_before = blueprint.device_bytes_in_use_before_release
+    strict_gpu_telemetry = os.environ.get("OMEGALAX_REQUIRE_MEMORY_SAFE_RESTORE") == "1"
+    gpu_drop_verified = all(
+        key in memory_after and memory_after[key] < value for key, value in memory_before.items()
+    )
+    report = {
+        "schema_version": 1,
+        "artifact_type": "omegalax_vlm_memory_safe_restore_release",
+        "status": "release_pass",
+        "strict_gpu_telemetry_required": strict_gpu_telemetry,
+        "initialized_optimizer_collected": not optimizer_alive,
+        "initialized_model_collected": not model_alive,
+        "initialized_array_count": len(blueprint.initialized_array_refs),
+        "live_initialized_array_count_after_gc": live_array_count,
+        "device_bytes_in_use_before_release": memory_before,
+        "device_bytes_in_use_after_release": memory_after,
+        "device_bytes_released": {
+            key: value - memory_after.get(key, value) for key, value in memory_before.items()
+        },
+        "gpu_memory_drop_verified": gpu_drop_verified if memory_before else None,
+    }
+    if optimizer_alive or model_alive or live_array_count:
+        report["status"] = "fail"
+        raise RuntimeError(f"fresh initialized state still has live aliases: {report}")
+    if strict_gpu_telemetry and not memory_before:
+        report["status"] = "fail"
+        raise RuntimeError(f"strict restore requires GPU bytes_in_use telemetry: {report}")
+    if memory_before and not gpu_drop_verified:
+        report["status"] = "fail"
+        raise RuntimeError(f"GPU bytes_in_use did not drop after releasing fresh state: {report}")
+    return report
+
+
+def _write_restore_release_audit(save_dir: Path, report: dict[str, object]) -> None:
+    output = save_dir / "restore_memory_release.json"
+    temporary = output.with_name(f".{output.name}.{os.getpid()}.tmp")
+    temporary.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
+    temporary.replace(output)
+
+
+def _trained_promotion_group(path: tuple[Any, ...]) -> str | None:
+    """Return the exact trained-state branch allowed to promote bf16 to fp32."""
+    if len(path) > 2 and path[:2] == ("opt_state", "acc_grads"):
+        return "acc_grads"
+    if len(path) <= 4 or path[:2] != ("opt_state", "inner_opt_state"):
+        return None
+    markers = [
+        (index, entry)
+        for index, entry in enumerate(path[2:], start=2)
+        if entry in ("mu", "nu")
+    ]
+    if len(markers) != 1:
+        return None
+    marker_index, group = markers[0]
+    if (
+        marker_index == 2
+        or marker_index == len(path) - 1
+        or not all(isinstance(entry, int) for entry in path[2:marker_index])
+    ):
+        return None
+    return group
+
+
+def _assert_restored_optimizer_contract(expected: Any, restored: Any) -> dict[str, object]:
+    """Validate exact structure while preserving known trained-state promotions.
+
+    Fresh MultiSteps accumulators and Adam moments begin as bf16 because they
+    are initialized from bf16 LoRA parameters. Real fp32 gradients promote
+    ``acc_grads``, ``mu``, and ``nu`` after training starts. Those checkpoint
+    fp32 arrays are semantically correct trained state and must not be rounded
+    back to their fresh-zero dtype.
+    """
+    expected_flat = nnx.to_flat_state(expected)
+    restored_flat = nnx.to_flat_state(restored)
+    if len(expected_flat) != len(restored_flat):
+        raise RuntimeError("restored optimizer tree structure differs from fresh optimizer")
+    memory_before = _gpu_bytes_in_use()
+    records = []
+    groups: dict[str, dict[str, int]] = {}
+    for (expected_path, expected_var), (restored_path, restored_var) in zip(
+        expected_flat, restored_flat
+    ):
+        if expected_path != restored_path:
+            raise RuntimeError(f"restored optimizer path mismatch: {expected_path} != {restored_path}")
+        wanted = expected_var.get_value()
+        got = restored_var.get_value()
+        if (
+            tuple(got.shape) != tuple(wanted.shape)
+            or got.sharding != wanted.sharding
+        ):
+            raise RuntimeError(
+                f"restored optimizer contract mismatch at {expected_path}: "
+                f"{got.shape}/{got.dtype}/{got.sharding} != "
+                f"{wanted.shape}/{wanted.dtype}/{wanted.sharding}"
+            )
+        if got.dtype == wanted.dtype:
+            continue
+        group = _trained_promotion_group(expected_path)
+        if group is None or got.dtype != jnp.float32 or wanted.dtype != jnp.bfloat16:
+            raise RuntimeError(
+                f"unpermitted restored optimizer dtype mismatch at {expected_path}: "
+                f"{got.dtype} != {wanted.dtype}"
+            )
+        source_bytes = int(got.size * got.dtype.itemsize)
+        fresh_bytes = int(got.size * wanted.dtype.itemsize)
+        record = {
+            "path": list(expected_path),
+            "shape": list(got.shape),
+            "group": group,
+            "restored_trained_dtype": str(got.dtype),
+            "fresh_zero_state_dtype": str(wanted.dtype),
+            "restored_source_bytes": source_bytes,
+            "fresh_zero_state_bytes": fresh_bytes,
+            "preserved_without_cast": True,
+        }
+        records.append(record)
+        summary = groups.setdefault(
+            group,
+            {
+                "leaf_count": 0,
+                "numel": 0,
+                "restored_source_bytes": 0,
+                "fresh_zero_state_bytes": 0,
+            },
+        )
+        summary["leaf_count"] += 1
+        summary["numel"] += int(got.size)
+        summary["restored_source_bytes"] += source_bytes
+        summary["fresh_zero_state_bytes"] += fresh_bytes
+    memory_after = _gpu_bytes_in_use()
+    return {
+        "mode": "preserve_known_trained_fp32_promotions_without_cast",
+        "promoted_leaf_count": len(records),
+        "promoted_source_bytes": sum(item["restored_source_bytes"] for item in records),
+        "fresh_zero_state_bytes": sum(item["fresh_zero_state_bytes"] for item in records),
+        "converted_leaf_count": 0,
+        "all_shapes_and_shardings_exact": True,
+        "all_other_dtypes_exact": True,
+        "promoted_arrays_bitwise_untouched": True,
+        "groups": groups,
+        "promoted_leaf_records": records,
+        "device_bytes_in_use_before_contract": memory_before,
+        "device_bytes_in_use_after_contract": memory_after,
+        "contract_check_allocated_no_array_outputs": True,
+    }
+
+
+def _path_tuple(path: tuple[Any, ...]) -> tuple[str, ...]:
+    result = []
+    for entry in path:
+        value = getattr(entry, "key", getattr(entry, "name", getattr(entry, "idx", entry)))
+        result.append(str(value))
+    return tuple(result)
+
+
+_RESTORE_COUNTER_PATHS = {
+    ("step", "value"): "optimizer_micro_step",
+    ("opt_state", "gradient_step", "value"): "global_gradient_step",
+    ("opt_state", "mini_step", "value"): "gradient_accumulation_remainder",
+    ("opt_state", "inner_opt_state", "1", "0", "count", "value"): "adam_count_0",
+    ("opt_state", "inner_opt_state", "1", "2", "count", "value"): "adam_count_2",
+}
+
+
+def _restored_optimizer_counters(optimizer_state: Any) -> dict[str, int]:
+    counters = {}
+    for path, value in jax.tree_util.tree_leaves_with_path(optimizer_state):
+        name = _RESTORE_COUNTER_PATHS.get(_path_tuple(path))
+        if name is None:
+            continue
+        array = jax.device_get(value)
+        if tuple(array.shape) != () or not jnp.issubdtype(array.dtype, jnp.integer):
+            raise RuntimeError(f"restored optimizer counter {path} is not an integer scalar")
+        counters[name] = int(array)
+    return counters
+
+
+def _write_exact_restore_attestation(
+    checkpoint_root: Path,
+    step: int,
+    optimizer: MixedPrecisionOptimizer,
+    rng: jax.Array,
+    restored_input_iter: checkpoint_utils.GrainIterator,
+    contract_leaf_count: int,
+    target_topology: dict[str, int],
+    optimizer_contract: dict[str, object],
+) -> None:
+    """Optionally gate exact resume scalars and sealed iterator bytes pre-update."""
+    if os.environ.get("OMEGALAX_REQUIRE_EXACT_RESTORE_ATTESTATION") != "1":
+        return
+    required = (
+        "OMEGALAX_EXPECT_RESUME_STEP",
+        "OMEGALAX_EXPECT_OPTIMIZER_COUNTERS_JSON",
+        "OMEGALAX_EXPECT_RNG_KEY_DATA_JSON",
+        "OMEGALAX_EXPECT_ITERATOR_STATE_JSON",
+        "OMEGALAX_EXPECT_ITERATOR_SHA256",
+        "OMEGALAX_EXPECT_PROMOTED_OPTIMIZER_STATE_JSON",
+    )
+    missing = [name for name in required if name not in os.environ]
+    if missing:
+        raise RuntimeError(f"exact restore attestation environment is incomplete: {missing}")
+    expected_step = int(os.environ["OMEGALAX_EXPECT_RESUME_STEP"])
+    expected_counters = json.loads(os.environ["OMEGALAX_EXPECT_OPTIMIZER_COUNTERS_JSON"])
+    expected_rng = json.loads(os.environ["OMEGALAX_EXPECT_RNG_KEY_DATA_JSON"])
+    expected_iterator_state = json.loads(os.environ["OMEGALAX_EXPECT_ITERATOR_STATE_JSON"])
+    expected_iterator_sha = os.environ["OMEGALAX_EXPECT_ITERATOR_SHA256"]
+    expected_promoted_state = json.loads(
+        os.environ["OMEGALAX_EXPECT_PROMOTED_OPTIMIZER_STATE_JSON"]
+    )
+    actual_counters = _restored_optimizer_counters(nnx.state(optimizer))
+    actual_rng = [int(value) for value in jax.device_get(jax.random.key_data(rng)).reshape(-1)]
+    actual_iterator_state = restored_input_iter.get_state()
+    actual_iterator_bytes = json.dumps(actual_iterator_state, indent=4).encode()
+    actual_iterator_sha = hashlib.sha256(actual_iterator_bytes).hexdigest()
+    if step != expected_step:
+        raise RuntimeError(f"restored step mismatch: {step} != {expected_step}")
+    if actual_counters != expected_counters:
+        raise RuntimeError(
+            f"restored optimizer counter mismatch: {actual_counters} != {expected_counters}"
+        )
+    if actual_rng != expected_rng:
+        raise RuntimeError(f"restored RNG key-data mismatch: {actual_rng} != {expected_rng}")
+    if actual_iterator_state != expected_iterator_state:
+        raise RuntimeError(
+            f"live restored iterator state mismatch: {actual_iterator_state} "
+            f"!= {expected_iterator_state}"
+        )
+    if actual_iterator_sha != expected_iterator_sha:
+        raise RuntimeError(
+            f"restored iterator payload hash mismatch: {actual_iterator_sha} "
+            f"!= {expected_iterator_sha}"
+        )
+    observed_promoted_state = {
+        key: optimizer_contract[key]
+        for key in ("promoted_leaf_count", "promoted_source_bytes", "fresh_zero_state_bytes")
+    }
+    if observed_promoted_state != expected_promoted_state:
+        raise RuntimeError(
+            "restored promoted optimizer-state mismatch: "
+            f"{observed_promoted_state} != {expected_promoted_state}"
+        )
+    result = {
+        "schema_version": 1,
+        "artifact_type": "omegalax_vlm_exact_restore_attestation",
+        "status": "restore_pass",
+        "resume_step": step,
+        "optimizer_shape_dtype_sharding_contract_pass": True,
+        "optimizer_contract_leaf_count": contract_leaf_count,
+        "optimizer_counters": actual_counters,
+        "rng_key_data": actual_rng,
+        "restored_iterator_state": actual_iterator_state,
+        "input_iterator_sha256": actual_iterator_sha,
+        "target_topology": target_topology,
+        "optimizer_contract": optimizer_contract,
+        "written_before_first_optimizer_update": True,
+    }
+    output = checkpoint_root / "restore_exact_state.json"
+    temporary = output.with_name(f".{output.name}.{os.getpid()}.tmp")
+    temporary.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+    temporary.replace(output)
 
 
 def _make_checkpoint_manager(
@@ -204,36 +538,64 @@ def _save_sft_checkpoint(
 
 def _restore_sft_checkpoint(
     checkpoint_manager: ocp.CheckpointManager,
-    optimizer: MixedPrecisionOptimizer,
-    rng: jax.Array,
+    blueprint: _MemorySafeRestoreBlueprint,
     input_iter: checkpoint_utils.GrainIterator,
+    target_topology: dict[str, int],
 ) -> tuple[MixedPrecisionOptimizer, int, jax.Array, checkpoint_utils.GrainIterator]:
     latest_step = checkpoint_manager.latest_step()
     if latest_step is None:
         raise ValueError("No checkpoint found to restore.")
 
-    abstract_state = _abstract_train_state(optimizer, rng)
-    restore_args = checkpoint_utils.make_grain_restore_args(abstract_state, input_iter)
+    restore_args = checkpoint_utils.make_grain_restore_args(
+        blueprint.abstract_train_state, input_iter
+    )
     restored = checkpoint_manager.restore(latest_step, args=restore_args)
     train_state = restored["train_state"]
-    # Canonicalize restored opt-state dtypes against the freshly-built
-    # optimizer's expectations: some prior checkpoints stored Adam's first
-    # moment in bf16; the optimizer now uses optax's default (fp32), so
-    # MultiSteps (grad_accum) would otherwise see a dtype mismatch between
-    # the passthrough branch (restored dtype) and the active-step branch
-    # (optax's expected dtype) and lax.cond would reject it at trace time.
-    expected_state = nnx.state(optimizer)
-    restored_state = jax.tree.map(
-        lambda exp, got: got.astype(exp.dtype) if exp.dtype != got.dtype else got,
-        expected_state,
-        train_state["optimizer"],
+    # Orbax can preserve a checkpoint's trained fp32 accumulator/moment dtype
+    # even when the fresh abstract target is bf16. The contract below permits
+    # only those exact promotion branches and never casts restored arrays.
+    expected_optimizer = blueprint.abstract_train_state["optimizer"]
+    optimizer_contract = _assert_restored_optimizer_contract(
+        expected_optimizer, train_state["optimizer"]
     )
-    nnx.update(optimizer, restored_state)
+    optimizer = nnx.merge(blueprint.optimizer_graphdef, train_state["optimizer"])
+    merged_contract = _assert_restored_optimizer_contract(
+        expected_optimizer, nnx.state(optimizer)
+    )
+    for key in (
+        "mode",
+        "promoted_leaf_count",
+        "promoted_source_bytes",
+        "fresh_zero_state_bytes",
+        "converted_leaf_count",
+        "groups",
+        "promoted_leaf_records",
+    ):
+        if merged_contract[key] != optimizer_contract[key]:
+            raise RuntimeError(f"nnx.merge changed restored optimizer contract field {key}")
+    optimizer_contract["nnx_merge_preserved_promoted_state"] = True
+    optimizer_contract["device_bytes_in_use_after_nnx_merge"] = _gpu_bytes_in_use()
+    restored_input_iter = checkpoint_utils.restored_input_iter(restored)
+    _write_exact_restore_attestation(
+        Path(checkpoint_manager.directory),
+        int(latest_step),
+        optimizer,
+        train_state["rng"],
+        restored_input_iter,
+        len(
+            jax.tree.leaves(
+                expected_optimizer,
+                is_leaf=lambda value: isinstance(value, jax.ShapeDtypeStruct),
+            )
+        ),
+        target_topology,
+        optimizer_contract,
+    )
     return (
         optimizer,
         int(latest_step),
         train_state["rng"],
-        checkpoint_utils.restored_input_iter(restored),
+        restored_input_iter,
     )
 
 
@@ -534,6 +896,24 @@ def run_sft(
         )
         log_device_memory("after optimizer build", save_dir=save_path)
 
+    restore_blueprint = None
+    if will_resume:
+        # NNX graph metadata and ShapeDtypeStructs are sufficient to restore.
+        # Drop *both* concrete owners: ``optimizer.model`` and the local
+        # ``model`` alias otherwise keep the entire random initialization live
+        # while Orbax allocates the restored checkpoint beside it.
+        restore_blueprint = _prepare_memory_safe_restore(optimizer, rng)
+        del optimizer
+        del model
+        release_report = _verify_initialized_state_released(restore_blueprint)
+        if save_path is not None and is_primary_process:
+            _write_restore_release_audit(save_path, release_report)
+        startup_log(
+            "released fresh model/optimizer before restore: "
+            f"arrays={release_report['initialized_array_count']} "
+            f"gpu_bytes={release_report['device_bytes_released']}"
+        )
+
     sft_step = make_sft_train_step(
         model_cfg,
         pad_id=pad_id,
@@ -564,9 +944,15 @@ def run_sft(
 
     start_step = 0
     if will_resume:
+        if restore_blueprint is None or checkpoint_manager is None:
+            raise AssertionError("resume restore blueprint/manager was not initialized")
         optimizer, start_step, rng, data_iter = _restore_sft_checkpoint(
-            checkpoint_manager, optimizer, rng, data_iter
+            checkpoint_manager,
+            restore_blueprint,
+            data_iter,
+            {axis: int(size) for axis, size in mesh.shape.items()},
         )
+        del restore_blueprint
         rng = jax.device_put(rng, replicated_rng_sharding)
         startup_log(f"restored checkpoint at step {start_step}")
 
