@@ -137,6 +137,7 @@ def main():
         suffix = "_nostate_fast" if args.no_state_passing else "_fast"
         wandb_run = wandb.init(
             project=args.wandb_project,
+            entity="pdoom",
             name=f"rollouts_{arm}{suffix}",
             id=f"{plan['plan_sha256'][:12]}_{arm}{suffix}",
             resume="allow",
