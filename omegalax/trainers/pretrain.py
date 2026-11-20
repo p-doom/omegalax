@@ -725,8 +725,21 @@ def make_pretrain_train_step(
                 return kl_sum / loss_denominator + aux_loss, metrics
 
             (loss, aux_metrics), grads = nnx.value_and_grad(loss_fn, has_aux=True)(optimizer.model)
+            # The update clips and applies the mean of its microbatch gradients (MultiSteps'
+            # running mean); its norm after the last microbatch is the clipped quantity.
+            update_grad = nnx.pure(nnx.state(grads, optimizer.wrt))
+            opt_state = nnx.pure(optimizer.opt_state)
+            if isinstance(opt_state, optax.MultiStepsState):
+                count = (opt_state.mini_step + 1).astype(jnp.float32)
+                update_grad = jax.tree.map(
+                    lambda a, g: a + (g.astype(jnp.float32) - a) / count,
+                    opt_state.acc_grads,
+                    update_grad,
+                )
+            update_grad_norm = optax.tree.norm(update_grad)
             optimizer.update(grads)
             metrics = dict(aux_metrics)
+            metrics["update_grad_norm"] = update_grad_norm
             metrics["grad_norm"] = optax.tree.norm(grads)
             return loss, metrics
 
@@ -1545,6 +1558,8 @@ def run_pretrain(
             else _finalize_accumulated_metrics(accum)
         )
         window_metrics["grad_norm"] = accum_grad_norm / accum_steps
+        if teacher_objective:
+            window_metrics["update_grad_norm"] = _host_float(metrics["update_grad_norm"])
         window_metrics["lr"] = current_lr
         window_metrics["total_tokens"] = (
             common_update_plan["updates"][step_idx]["cumulative_tokens"]
@@ -1580,7 +1595,8 @@ def run_pretrain(
             import math
 
             if not all(
-                math.isfinite(float(window_metrics[k])) for k in ("teacher_kl", "grad_norm", "lr")
+                math.isfinite(float(window_metrics[k]))
+                for k in ("teacher_kl", "grad_norm", "update_grad_norm", "lr")
             ):
                 raise FloatingPointError(f"Nonfinite common update {step}: {window_metrics}")
             global_tokens_per_step = common_update_plan["updates"][step_idx]["context_tokens"]

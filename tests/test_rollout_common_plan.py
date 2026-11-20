@@ -372,7 +372,7 @@ class LearningRateTest(absltest.TestCase):
 
 
 class AccumulatedGradientTest(absltest.TestCase):
-    # Pins: an update of 2 real chains plus a padding-only microbatch hands Adam grad(sum KL / N_update); with clipping its norm is the clip value.
+    # Pins: an update of 2 real chains plus a padding-only microbatch hands Adam grad(sum KL / N_update); with clipping its norm is the clip value; update_grad_norm logs its unclipped norm.
     def test_short_update_gradient_and_clipping(self):
         plan = _plan(_main_dataset(), [2, 8, 8], [1, 2, 3])
         train = dict(weight_decay=0.0, adam_beta1=0.9)
@@ -409,11 +409,18 @@ class AccumulatedGradientTest(absltest.TestCase):
                 value, ref, rtol=1e-5, atol=1e-5 * float(np.max(np.abs(ref))), err_msg=key
             )
         self.assertGreater(_norm(got), 1.0)
+        # update_grad_norm is the norm of the update gradient that clipping sees (D6); the
+        # microbatch-mean grad_norm is not, it bounds it from above.
+        self.assertAlmostEqual(row["update_grad_norm"] / _norm(got), 1.0, delta=1e-5)
+        self.assertLessEqual(row["update_grad_norm"], row["grad_norm"])
 
+        clip_dir = _dir("short_clip")
         optimizer, _ = _run(
-            plan, _dir("short_clip"), stop_after_local_step=1, train=dict(train, max_grad_norm=1e-3)
+            plan, clip_dir, stop_after_local_step=1, train=dict(train, max_grad_norm=1e-3)
         )
         self.assertAlmostEqual(_norm(_adam_gradient(optimizer)) / 1e-3, 1.0, delta=1e-4)
+        clipped_row = _read_jsonl(clip_dir / "update_metrics.jsonl")[0]
+        self.assertAlmostEqual(clipped_row["update_grad_norm"] / _norm(got), 1.0, delta=1e-5)
 
 
 class ValidationTest(absltest.TestCase):
@@ -630,6 +637,10 @@ class EightDeviceTest(absltest.TestCase):
         self.assertEqual(row["teacher_targets"], ref_row["teacher_targets"])
         self.assertEqual(row["context_tokens"], ref_row["context_tokens"])
         self.assertAlmostEqual(row["teacher_kl_sum"] / ref_row["teacher_kl_sum"], 1.0, delta=1e-5)
+        # The clipped update norm does not depend on the microbatch layout (D6).
+        self.assertAlmostEqual(
+            row["update_grad_norm"] / ref_row["update_grad_norm"], 1.0, delta=1e-4
+        )
         self.assertEqual(
             *(_read_jsonl(root / d / "update_identities.jsonl")[0] for d in ("ref", "eight"))
         )
