@@ -12,7 +12,6 @@ import subprocess
 import sys
 import tempfile
 from types import SimpleNamespace
-import unittest
 from unittest import mock
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
@@ -864,9 +863,8 @@ class EvalPipelineReferenceTest(absltest.TestCase):
         self.assertFalse(tuple(root.glob("evals/state_usage_v2/*/raw/**/*.parquet")))
 
     # T9: the evaluated step and its stored c_train must belong together.
-    @unittest.expectedFailure
     def test_evaluated_step_and_c_train_belong_together(self):
-        # Defect: c_train is resolved for the latest step at request time, the eval later runs on a newer step.
+        # Regression V3: c_train was resolved for the latest step at request time, the eval later ran on a newer step.
         tmpdir = self.tmpdir / "moving_step"
         manifest_path, _ = _build_manifest(tmpdir / "data", documents_per_length=2)
         index = _write_index(

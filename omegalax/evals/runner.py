@@ -116,13 +116,15 @@ def resolve_checkpoint_eval_request(request: CheckpointEvalRequest) -> Checkpoin
         checkpoint_root = checkpoint.root
         checkpoint_step = checkpoint.step
     except ValueError:
+        checkpoint = None
         run_dir = _result_dir_from_checkpoint_request(request.checkpoint)
         identity = _identity_from_path(run_dir / "eval_config.json")
         checkpoint_root = Path(identity.checkpoint_root)
         checkpoint_step = identity.checkpoint_step
     config = resolve_eval_config(checkpoint_root, checkpoint_step, request.manual_config)
     return CheckpointEvalSpec(
-        checkpoint=request.checkpoint,
+        # The resolved config belongs to this step; a root would later resolve to a newer one.
+        checkpoint=checkpoint.step_path if checkpoint is not None else request.checkpoint,
         c_train=config.c_train,
         pass_gdn_state=config.pass_gdn_state,
         gdn_layer_limit=config.gdn_layer_limit,
