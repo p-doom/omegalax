@@ -630,9 +630,8 @@ class TrainerInvariantsTest(absltest.TestCase):
 
     # Pins: validation evaluates the same val batches every time and after a resume, and a
     # one-epoch val iterator shorter than all validations together does not end the run.
-    # Defect: the NTP val iterator is never reset and its position is not checkpointed, so each
-    # validation reads the next slice, a resume restarts at the first slice, and it can run dry.
-    @unittest.expectedFailure
+    # Regression N1: the NTP val iterator was never reset, so each validation read the next
+    # slice, a resume restarted at the first slice, and it could run dry.
     def test_validation_reads_same_data_every_time_and_after_resume(self):
         cfg = _tiny_qwen3_5_config()
         train_cfg = pretrain_trainer.TrainConfig(

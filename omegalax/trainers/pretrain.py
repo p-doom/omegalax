@@ -1455,9 +1455,7 @@ def run_pretrain(
     _autotune_ctx = autotune_result if autotune_result is not None else contextlib.nullcontext()
     _autotune_ctx.__enter__()
 
-    val_initial_state = (
-        val_data_iter.get_state() if teacher_objective and val_data_iter is not None else None
-    )
+    val_initial_state = val_data_iter.get_state() if val_data_iter is not None else None
 
     startup_log(f"entering pretrain loop mode={pretrain_mode}")
     for step_idx in range(start_step, local_stop_step):
@@ -1653,17 +1651,13 @@ def run_pretrain(
 
         if val_data_iter is not None and val_every and step % val_every == 0:
             val_acc = {}
-            if teacher_objective:
-                # Every teacher validation replays the same deterministic val batches; a
-                # finite val iterator ends the pass early instead of failing.
-                val_data_iter.set_state(val_initial_state)
+            # Every validation replays the same deterministic val batches, also after a resume;
+            # a finite val iterator ends the pass early instead of failing.
+            val_data_iter.set_state(val_initial_state)
             for _ in range(val_steps):
-                if teacher_objective:
-                    raw_val_batch = next(val_data_iter, None)
-                    if raw_val_batch is None:
-                        break
-                else:
-                    raw_val_batch = next(val_data_iter)
+                raw_val_batch = next(val_data_iter, None)
+                if raw_val_batch is None:
+                    break
                 val_batch, _, _ = prepare_pretrain_batch(
                     raw_val_batch,
                     pretrain_mode,
