@@ -795,9 +795,8 @@ class EvalPipelineReferenceTest(absltest.TestCase):
             resolve_checkpoint_eval_request(CheckpointEvalRequest(explicit_root))
 
     # T5: a training contract with gdn_state_routing=last_to_first must be rejected by the eval.
-    @unittest.expectedFailure
     def test_non_default_routing_contract_is_rejected(self):
-        # Defect: the eval ignores the trainer's last_to_first routing and feeds every GDN layer its own state.
+        # Regression V1: the eval ignored the trainer's last_to_first routing and fed every GDN layer its own state.
         tmpdir = self.tmpdir / "routing"
         index = _write_index(
             tmpdir / "index", {"format": STATEPASSING_FIXED_C_INDEX_FORMAT, "num_segments": 2}
