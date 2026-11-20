@@ -826,6 +826,26 @@ class TrainerInvariantsTest(absltest.TestCase):
     def test_curriculum_resume_after_signal_on_regular_save_step(self):
         self._curriculum_resume_matches({2: 2, 3: 2}, num_steps=4, save_every=1)
 
+    # Pins: a BPTT span longer than a later phase's chain is rejected before training starts.
+    # Regression N8: the run failed only at the switch to the shorter phase.
+    def test_curriculum_rejects_bptt_span_longer_than_a_phase(self):
+        train_cfg = pretrain_trainer.TrainConfig(
+            seed=0, batch_size=6, seq_len=4, num_steps=2, print_every=0
+        )
+        with self.assertRaisesRegex(ValueError, r"bptt_chunks must be in \[0, 2\]"):
+            pretrain_trainer.run_statepassing_curriculum(
+                _tiny_qwen3_5_config(),
+                train_cfg,
+                lambda c: None,
+                train_order=[3, 2],
+                phase_steps={3: 1, 2: 1},
+                pretrain_mode=BPTT,
+                bptt_chunks=3,
+                tp_size=1,
+                fsdp_size=1,
+                dp_size=1,
+            )
+
     # Pins: a non-finite loss stops the run with FloatingPointError before a non-finite
     # checkpoint is written.
     # Regression N7: outside the common-plan branch the loop had no finiteness check, so NaN

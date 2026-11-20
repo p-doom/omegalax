@@ -1788,6 +1788,14 @@ def run_statepassing_curriculum(
     total_phase_steps = sum(phase_steps_by_c[num_segments] for num_segments in train_order)
     if total_phase_steps <= 0:
         raise ValueError("Curriculum has no training steps")
+    # The loss rejects a BPTT span longer than the chain; check every phase before training
+    # instead of failing at the switch to the first shorter phase.
+    shortest_c = min(c for c in train_order if phase_steps_by_c[c] > 0)
+    if bptt_chunks is not None and not 0 <= bptt_chunks <= shortest_c:
+        raise ValueError(
+            f"bptt_chunks must be in [0, {shortest_c}] for curriculum phases {train_order}, "
+            f"got {bptt_chunks}"
+        )
     if train_cfg.num_steps != total_phase_steps:
         train_cfg = dataclasses.replace(train_cfg, num_steps=total_phase_steps)
 
