@@ -1193,6 +1193,13 @@ def run_pretrain(
             -common_update_plan["chains_per_update"] // PLANNED_MICROBATCH_CHAINS
         ):
             raise ValueError("Accumulation must match common plan groups of four chains")
+        if train_cfg.learning_rate != common_update_plan["lr"]["peak"]:
+            # The plan's token schedule replaces the TrainConfig schedule; a different
+            # learning_rate would be recorded in the contracts but never applied.
+            raise ValueError(
+                f"learning_rate={train_cfg.learning_rate} differs from the common plan's peak "
+                f"lr {common_update_plan['lr']['peak']}"
+            )
         if pretrain_mode is not PretrainMode.STATEPASSING_BPTT:
             raise ValueError("Common comparison requires full BPTT mode")
         if (

@@ -316,7 +316,7 @@ class LearningRateTest(absltest.TestCase):
         plan = {
             "updates": [{"cumulative_tokens": int(c)} for c in cumulative],
             "total_context_tokens": int(cumulative[-1]),
-            "lr": {"peak": 2e-5},
+            "lr": {"peak": 2e-5, "warmup_token_fraction": 0.02, "decay_token_fraction": 0.1},
         }
         schedule = build_common_token_schedule(plan)
         cfg = TrainConfig(
@@ -369,6 +369,12 @@ class LearningRateTest(absltest.TestCase):
         self.assertTrue(any(not np.array_equal(p10[k], p11[k]) for k in p11))
         for key in p11:
             np.testing.assert_array_equal(p11[key], p12[key], err_msg=key)
+
+    # Pins: a learning_rate other than the plan's peak is rejected instead of being recorded and ignored (D9).
+    def test_learning_rate_must_equal_plan_peak(self):
+        plan = _plan(_main_dataset(), SIZES, range(1, 13))
+        with self.assertRaisesRegex(ValueError, "common plan's peak lr"):
+            _run(plan, _dir("wrong_peak"), train=dict(learning_rate=1e-4))
 
 
 class AccumulatedGradientTest(absltest.TestCase):
