@@ -16,7 +16,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import unittest
 from pathlib import Path
 
 from absl import flags
@@ -606,28 +605,25 @@ class RestoreTreeMismatchTest(_CheckpointFixture):
             root = Path(tmp)
             _save_checkpoint(root, 5, source, source_cfg)
             checkpoint = resolve_checkpoint(root)
-            with self.assertRaises(Exception):
+            with self.assertRaisesRegex(ValueError, "does not match the model's parameter tree"):
                 restore_model_params(target, checkpoint)
 
     # Pins: a tied checkpoint (no lm_head) restored into an untied model must raise at restore time.
-    # Defect: restore returns and leaves lm_head.kernel as a ShapeDtypeStruct placeholder that fails only at first use.
-    @unittest.expectedFailure
+    # Regression M4: restore returned and left lm_head.kernel as a ShapeDtypeStruct placeholder that failed only at first use.
     def test_tied_checkpoint_into_untied_model_raises(self):
         source, source_cfg = self._init(self.tied, 0)
         target, _ = self._init(self.base, 1)
         self._restore(source, source_cfg, target)
 
     # Pins: an untied checkpoint restored into a tied model must raise at restore time.
-    # Defect: restore succeeds silently and the trained lm_head in the checkpoint is ignored.
-    @unittest.expectedFailure
+    # Regression M4: restore succeeded silently and ignored the trained lm_head in the checkpoint.
     def test_untied_checkpoint_into_tied_model_raises(self):
         source, source_cfg = self._init(self.base, 0)
         target, _ = self._init(self.tied, 1)
         self._restore(source, source_cfg, target)
 
     # Pins: a LoRA checkpoint without lora_metadata.json restored into a plain model must raise at restore time.
-    # Defect: restore returns and leaves the wrapped base kernels as placeholders that fail only at first use.
-    @unittest.expectedFailure
+    # Regression M4: restore returned and left the wrapped base kernels as placeholders that failed only at first use.
     def test_lora_checkpoint_without_metadata_raises(self):
         source, source_cfg = self._init(self.base, 0)
         with mesh_rules(ensure_mesh()):
