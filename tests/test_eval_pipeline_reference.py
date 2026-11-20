@@ -820,9 +820,8 @@ class EvalPipelineReferenceTest(absltest.TestCase):
             resolve_checkpoint_eval_request(CheckpointEvalRequest(root))
 
     # T6: training segment length and manifest chunk length must agree before inference.
-    @unittest.expectedFailure
     def test_segment_length_mismatch_is_rejected(self):
-        # Defect: the eval never compares the training segment length with the manifest chunk length.
+        # Regression V2: the eval never compared the training segment length with the manifest chunk length.
         tmpdir = self.tmpdir / "segment_length"
         manifest_path, manifest = _build_manifest(tmpdir / "data", documents_per_length=2)
         index = _write_index(
