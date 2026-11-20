@@ -665,6 +665,12 @@ def main(_) -> None:
         f"lr_schedule_steps={train_cfg.lr_schedule_steps!r} "
         f"warmup_steps={train_cfg.warmup_steps}"
     )
+    if train_cfg.warmup_steps >= train_cfg.resolved_lr_schedule_steps:
+        startup_log(
+            f"WARNING: warmup_steps={train_cfg.warmup_steps} (--warmup_tokens="
+            f"{FLAGS.warmup_tokens}) is not shorter than the {train_cfg.resolved_lr_schedule_steps} "
+            "schedule steps; the learning rate never reaches its peak"
+        )
     lr_contract_explicit_fields = _explicit_lr_contract_fields()
     resume_mode = ResumeMode(FLAGS.resume)
     save_dir = (
