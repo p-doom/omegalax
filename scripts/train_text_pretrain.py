@@ -1,0 +1,563 @@
+"""Run IID or fixed-window statepassing text pretraining."""
+
+from __future__ import annotations
+
+import gc
+from pathlib import Path
+
+import omegalax
+from absl import app, flags
+import jax
+import jax.numpy as jnp
+import wandb
+
+from omegalax.data.pretrain_data_set import (
+    DEFAULT_CHUNK_LENGTH,
+    DEFAULT_EOS_ID,
+    load_arrayrecord_metadata,
+)
+from omegalax.data.pretrain_iid_pipeline import make_iid_iterator
+from omegalax.data.pretrain_statepassing import (
+    STATEPASSING_CURRICULUM_INDEX_FORMAT,
+    STATEPASSING_FIXED_C_INDEX_FORMAT,
+    make_statepassing_iterator,
+)
+from omegalax.models.qwen3_5.config import Qwen3_5TextConfig
+from omegalax.training_contract import build_training_contract, ensure_training_contract
+from omegalax.trainers import pretrain as pretrain_trainer
+from omegalax.trainers.checkpoint_utils import ResumeMode
+from omegalax.trainers.perf import resolve_peak_tflops
+from omegalax.trainers.text import startup_log
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_NONPRODUCTION_MARKER = _REPO_ROOT / ".OMEGALAX_NONPRODUCTION"
+if _REPO_ROOT.name == "omegalax_optimization" or _NONPRODUCTION_MARKER.is_file():
+    raise RuntimeError(
+        f"Refusing to run production pretraining from non-production checkout: {_REPO_ROOT}"
+    )
+_IMPORTED_REPO_ROOT = Path(omegalax.__file__).resolve().parents[1]
+if _IMPORTED_REPO_ROOT != _REPO_ROOT:
+    raise RuntimeError(
+        "Entrypoint/package repo mismatch: "
+        f"script={_REPO_ROOT}, imported_omegalax={_IMPORTED_REPO_ROOT}"
+    )
+
+FLAGS = flags.FLAGS
+
+flags.DEFINE_enum(
+    "pretrain_mode",
+    pretrain_trainer.PretrainMode.IID_BASELINE.value,
+    [mode.value for mode in pretrain_trainer.PretrainMode],
+    "Pretraining experiment mode.",
+)
+flags.DEFINE_string("model_id", None, "Optional supported/local text model config source.")
+flags.DEFINE_string(
+    "init_hf_model_path",
+    None,
+    "Optional local HuggingFace Qwen3.5 checkpoint used for fresh initialization.",
+)
+flags.DEFINE_string("tokenizer", "Qwen/Qwen3.5-0.8B", "Fixed tokenizer name for run metadata.")
+flags.DEFINE_string("train_index_path", None, "Prebuilt train index path.", required=True)
+flags.DEFINE_string("val_index_path", None, "Optional prebuilt validation index path.")
+flags.DEFINE_integer("seq_len", DEFAULT_CHUNK_LENGTH, "Segment length.")
+flags.DEFINE_integer("batch_size", 8, "Global number of 4096-token segments per microstep.")
+flags.DEFINE_integer("num_steps", None, "Optimizer steps. Overrides --max_tokens if set.")
+flags.DEFINE_integer(
+    "lr_schedule_steps",
+    None,
+    "Optional LR schedule horizon, independent of the num_steps training stop.",
+)
+flags.DEFINE_integer("max_tokens", 15_000_000_000, "Total training token budget.")
+flags.DEFINE_integer("warmup_tokens", 150_000_000, "Warmup token budget.")
+flags.DEFINE_float("learning_rate", 3e-4, "Learning rate.")
+flags.DEFINE_float("weight_decay", 0.1, "Weight decay.")
+flags.DEFINE_float("adam_beta1", 0.9, "AdamW beta1.")
+flags.DEFINE_float("adam_beta2", 0.95, "AdamW beta2.")
+flags.DEFINE_float("adam_eps", 1e-8, "AdamW epsilon.")
+flags.DEFINE_enum("lr_schedule", "cosine", ["linear", "cosine", "wsd"], "LR schedule.")
+flags.DEFINE_float("lr_end_factor", 0.1, "Final LR as fraction of peak LR.")
+flags.DEFINE_float("lr_stable_fraction", 0.8, "Stable fraction for WSD.")
+flags.DEFINE_float("max_grad_norm", 1.0, "Max grad norm; 0 disables clipping.")
+flags.DEFINE_integer("grad_accum_steps", 1, "Gradient accumulation steps.")
+flags.DEFINE_integer("seed", 0, "RNG seed.")
+flags.DEFINE_integer("tp_size", None, "Tensor parallelism size.")
+flags.DEFINE_integer("fsdp_size", 1, "FSDP parallelism size.")
+flags.DEFINE_integer("dp_size", 1, "Data parallelism size.")
+flags.DEFINE_integer("iterator_fsdp_size", None, "Optional FSDP shard count for data iterator.")
+flags.DEFINE_integer("iterator_dp_size", None, "Optional DP shard count for data iterator.")
+flags.DEFINE_string("save_dir", None, "Checkpoint save directory.")
+flags.DEFINE_string("jax_cache_dir", "/tmp/jax_cache", "JAX persistent compilation cache dir.")
+flags.DEFINE_integer("save_every", 500, "Save checkpoint every N steps.")
+flags.DEFINE_integer("keep_latest", 10, "Retain the latest N checkpoints.")
+flags.DEFINE_integer("log_every", 10, "Log metrics every N steps.")
+flags.DEFINE_enum(
+    "resume",
+    ResumeMode.NEVER.value,
+    [mode.value for mode in ResumeMode],
+    "Checkpoint resume policy.",
+)
+flags.DEFINE_integer("pad_id", 0, "Padding token id.")
+flags.DEFINE_integer("eos_id", DEFAULT_EOS_ID, "EOS id expected by the prebuilt index.")
+flags.DEFINE_string("peak_tflops", None, "Peak TFLOPS for MFU calculation.")
+flags.DEFINE_string("wandb_entity", None, "Weights & Biases entity.")
+flags.DEFINE_string("wandb_project", None, "Weights & Biases project name.")
+flags.DEFINE_string("wandb_group", None, "Weights & Biases run group.")
+flags.DEFINE_string("wandb_name", None, "Weights & Biases run name.")
+flags.DEFINE_list("wandb_tags", [], "Comma-separated Weights & Biases tags.")
+flags.DEFINE_string("wandb_id", None, "Optional stable Weights & Biases run id for resume.")
+flags.DEFINE_string("wandb_resume", None, "Optional Weights & Biases resume policy.")
+flags.DEFINE_integer("val_every", None, "Run validation every N steps.")
+flags.DEFINE_integer("val_steps", 10, "Validation batches per validation run.")
+flags.DEFINE_integer("bptt_chunks", None, "Backpropagation span in chunks for statepassing.")
+flags.DEFINE_bool("pass_gdn_state", True, "Pass GDN recurrent state between chunks.")
+flags.DEFINE_integer("gdn_layer_limit", None, "Only pass state for the first N GDN layers.")
+flags.DEFINE_enum(
+    "gdn_state_routing",
+    pretrain_trainer.GdnStateRouting.SAME_LAYER.value,
+    [routing.value for routing in pretrain_trainer.GdnStateRouting],
+    "Route GDN state between chunks.",
+)
+flags.DEFINE_bool("pass_rope_positions", False, "Pass chunk-aware RoPE position ids.")
+flags.DEFINE_bool("pass_conv_state", False, "Pass 1D conv state between chunks.")
+flags.DEFINE_integer("grain_read_threads", 2, "Grain read threads.")
+flags.DEFINE_integer("grain_read_prefetch_buffer_size", 4, "Grain read prefetch buffer size.")
+flags.DEFINE_integer("grain_workers", 8, "Grain multiprocessing workers.")
+flags.DEFINE_integer("grain_worker_buffer_size", 1, "Grain worker buffer size.")
+flags.DEFINE_integer("gc_period", 0, "If >0, collect Python GC every N steps.")
+flags.DEFINE_enum(
+    "text_attn_backend",
+    "mosaic_gpu",
+    ["mosaic_tpu", "mosaic_gpu", "cudnn", "xla", "triton"],
+    "Attention backend for full-attention layers.",
+)
+
+
+def _default_pretrain_config() -> Qwen3_5TextConfig:
+    layer_types = tuple(
+        "full_attention" if (idx + 1) % 4 == 0 else "linear_attention" for idx in range(12)
+    )
+    return Qwen3_5TextConfig(
+        vocab_size=248_320,
+        hidden_size=768,
+        num_hidden_layers=12,
+        num_attention_heads=6,
+        num_key_value_heads=2,
+        head_dim=128,
+        rms_norm_eps=1e-6,
+        layer_types=layer_types,
+        rope_theta=10_000_000,
+        partial_rotary_factor=0.25,
+        mrope_section=(11, 11, 10),
+        tie_word_embeddings=False,
+        linear_conv_kernel_dim=4,
+        linear_key_head_dim=128,
+        linear_num_key_heads=6,
+        linear_num_value_heads=6,
+        linear_value_head_dim=128,
+        intermediate_size=3072,
+        dtype=jnp.bfloat16,
+    )
+
+
+def _default_save_dir(pretrain_mode: pretrain_trainer.PretrainMode) -> Path:
+    return Path("runs") / "text_pretrain" / pretrain_mode.value
+
+
+def _validate_model_sharding(model_source) -> None:
+    hidden_size = getattr(model_source, "hidden_size", None)
+    if hidden_size is not None and FLAGS.fsdp_size and hidden_size % FLAGS.fsdp_size != 0:
+        raise ValueError(f"fsdp_size={FLAGS.fsdp_size} must divide hidden_size={hidden_size}.")
+
+
+def _warmup_steps() -> int:
+    tokens_per_step = FLAGS.batch_size * FLAGS.seq_len * FLAGS.grad_accum_steps
+    if tokens_per_step <= 0:
+        raise ValueError("tokens_per_step must be positive")
+    warmup_steps = max(0, FLAGS.warmup_tokens // tokens_per_step)
+    return int(warmup_steps)
+
+
+def _explicit_lr_contract_fields() -> frozenset[str]:
+    flag_to_contract_field = {
+        "learning_rate": "learning_rate",
+        "warmup_tokens": "warmup_steps",
+        "lr_schedule": "lr_schedule",
+        "lr_end_factor": "lr_end_factor",
+        "lr_stable_fraction": "lr_stable_fraction",
+        "lr_schedule_steps": "lr_schedule_steps",
+    }
+    return frozenset(
+        contract_field
+        for flag_name, contract_field in flag_to_contract_field.items()
+        if FLAGS[flag_name].present
+    )
+
+
+def _num_steps_and_warmup() -> tuple[int, int]:
+    tokens_per_step = FLAGS.batch_size * FLAGS.seq_len * FLAGS.grad_accum_steps
+    if tokens_per_step <= 0:
+        raise ValueError("tokens_per_step must be positive")
+    num_steps = FLAGS.num_steps or max(1, FLAGS.max_tokens // tokens_per_step)
+    return int(num_steps), _warmup_steps()
+
+
+def _make_iterator(
+    index_path: str,
+    mode: pretrain_trainer.PretrainMode,
+    per_process_batch: int,
+    *,
+    shuffle: bool,
+    num_epochs: int | None = None,
+):
+    common = dict(
+        batch_size=per_process_batch,
+        chunk_length=FLAGS.seq_len,
+        pad_id=FLAGS.pad_id,
+        eos_id=FLAGS.eos_id,
+        shuffle=shuffle,
+        seed=FLAGS.seed,
+        num_epochs=num_epochs,
+        dp_size=FLAGS.iterator_dp_size if FLAGS.iterator_dp_size is not None else FLAGS.dp_size,
+        fsdp_size=(
+            FLAGS.iterator_fsdp_size if FLAGS.iterator_fsdp_size is not None else FLAGS.fsdp_size
+        ),
+        process_index=jax.process_index(),
+        grain_workers=FLAGS.grain_workers,
+        grain_worker_buffer_size=FLAGS.grain_worker_buffer_size,
+        grain_read_threads=FLAGS.grain_read_threads,
+        grain_read_prefetch_buffer_size=FLAGS.grain_read_prefetch_buffer_size,
+    )
+    if mode is pretrain_trainer.PretrainMode.IID_BASELINE:
+        return make_iid_iterator(index_path, **common)
+    return make_statepassing_iterator(index_path, **common)
+
+
+def _maybe_statepassing_bundle_metadata(index_path: str | Path) -> dict[str, object] | None:
+    try:
+        metadata = load_arrayrecord_metadata(index_path)
+    except ValueError:
+        return None
+    if metadata.get("format") not in (
+        STATEPASSING_CURRICULUM_INDEX_FORMAT,
+        STATEPASSING_FIXED_C_INDEX_FORMAT,
+    ):
+        return None
+    return metadata
+
+
+def _validate_trimmed_index_runtime_config(
+    metadata: dict[str, object],
+    *,
+    label: str,
+) -> None:
+    index_segments_per_update = int(metadata["trim_batch_size"]) * int(
+        metadata["trim_grad_accum_steps"]
+    )
+    runtime_segments_per_update = int(FLAGS.batch_size) * int(FLAGS.grad_accum_steps)
+    if runtime_segments_per_update != index_segments_per_update:
+        raise ValueError(
+            f"{label} index was trimmed for {index_segments_per_update} segments per "
+            f"optimizer update, got {runtime_segments_per_update}."
+        )
+
+
+def _validate_curriculum_runtime_config(metadata: dict[str, object]) -> None:
+    _validate_trimmed_index_runtime_config(metadata, label="Curriculum")
+
+
+def _fixed_c_index_path(
+    index_root: Path,
+    split_metadata: dict[str, object],
+    pretrain_mode: pretrain_trainer.PretrainMode,
+) -> Path:
+    if pretrain_mode is pretrain_trainer.PretrainMode.IID_BASELINE:
+        iid_metadata = dict(split_metadata["iid"])
+        return index_root / str(iid_metadata["path"])
+    return index_root / str(split_metadata["path"])
+
+
+def _fixed_c_steps(
+    split_metadata: dict[str, object],
+    pretrain_mode: pretrain_trainer.PretrainMode,
+) -> int:
+    if pretrain_mode is pretrain_trainer.PretrainMode.IID_BASELINE:
+        return int(dict(split_metadata["iid"])["iid_steps"])
+    return int(split_metadata["statepassing_steps"])
+
+
+def _runtime_kwargs() -> dict[str, object]:
+    pretrain_trainer.validate_gdn_state_routing(
+        pass_gdn_state=FLAGS.pass_gdn_state,
+        gdn_layer_limit=FLAGS.gdn_layer_limit,
+        gdn_state_routing=FLAGS.gdn_state_routing,
+    )
+    return {
+        "bptt_chunks": FLAGS.bptt_chunks,
+        "pass_gdn_state": FLAGS.pass_gdn_state,
+        "gdn_layer_limit": FLAGS.gdn_layer_limit,
+        "gdn_state_routing": FLAGS.gdn_state_routing,
+        "pass_rope_positions": FLAGS.pass_rope_positions,
+        "pass_conv_state": FLAGS.pass_conv_state,
+    }
+
+
+def main(_) -> None:
+    pretrain_mode = pretrain_trainer.PretrainMode(FLAGS.pretrain_mode)
+    runtime_kwargs = _runtime_kwargs()
+    jax.config.update("jax_compilation_cache_dir", FLAGS.jax_cache_dir)
+    jax.distributed.initialize()
+    startup_log("jax.distributed initialized")
+    startup_log(f"fixed tokenizer for metadata: {FLAGS.tokenizer!r}")
+
+    if FLAGS.batch_size % jax.process_count():
+        raise ValueError(
+            f"Global batch size {FLAGS.batch_size} must be divisible by "
+            f"process_count={jax.process_count()}."
+        )
+    per_process_batch = FLAGS.batch_size // jax.process_count()
+    bundle_metadata = _maybe_statepassing_bundle_metadata(FLAGS.train_index_path)
+    bundle_format = bundle_metadata.get("format") if bundle_metadata is not None else None
+    curriculum_train_order = None
+    curriculum_phase_steps = None
+    phase_iter_factory = None
+    val_iter = None
+
+    if bundle_metadata is None:
+        num_steps, warmup_steps = _num_steps_and_warmup()
+        train_iter = _make_iterator(
+            FLAGS.train_index_path, pretrain_mode, per_process_batch, shuffle=True
+        )
+        val_iter = (
+            _make_iterator(FLAGS.val_index_path, pretrain_mode, per_process_batch, shuffle=False)
+            if FLAGS.val_index_path
+            else None
+        )
+    elif bundle_format == STATEPASSING_CURRICULUM_INDEX_FORMAT:
+        _validate_curriculum_runtime_config(bundle_metadata)
+        if FLAGS.val_index_path:
+            raise ValueError("Validation is not wired for curriculum training yet")
+        index_root = Path(FLAGS.train_index_path).expanduser().resolve()
+        train_split = dict(bundle_metadata["splits"])["train"]
+        warmup_steps = _warmup_steps()
+        if pretrain_mode is pretrain_trainer.PretrainMode.IID_BASELINE:
+            iid_metadata = dict(train_split["iid"])
+            num_steps = int(iid_metadata["iid_steps"])
+            if FLAGS.num_steps is not None and int(FLAGS.num_steps) != num_steps:
+                raise ValueError("--num_steps cannot override curriculum iid_steps metadata")
+            train_iter = _make_iterator(
+                str(index_root / str(iid_metadata["path"])),
+                pretrain_mode,
+                per_process_batch,
+                shuffle=True,
+                num_epochs=1,
+            )
+        else:
+            curriculum_train_order = [
+                int(num_segments) for num_segments in bundle_metadata["train_order"]
+            ]
+            phase_metadata = dict(train_split["phases"])
+            curriculum_phase_steps = {
+                int(num_segments): int(phase_metadata[str(num_segments)]["phase_steps"])
+                for num_segments in curriculum_train_order
+            }
+            num_steps = sum(curriculum_phase_steps.values())
+            if FLAGS.num_steps is not None and int(FLAGS.num_steps) != num_steps:
+                raise ValueError("--num_steps cannot override curriculum phase_steps metadata")
+
+            def phase_iter_factory(num_segments: int):
+                phase_path = index_root / str(phase_metadata[str(int(num_segments))]["path"])
+                return _make_iterator(
+                    str(phase_path),
+                    pretrain_mode,
+                    per_process_batch,
+                    shuffle=True,
+                )
+
+            train_iter = None
+    elif bundle_format == STATEPASSING_FIXED_C_INDEX_FORMAT:
+        _validate_trimmed_index_runtime_config(bundle_metadata, label="Fixed-C")
+        index_root = Path(FLAGS.train_index_path).expanduser().resolve()
+        splits_metadata = dict(bundle_metadata["splits"])
+        train_split = dict(splits_metadata["train"])
+        warmup_steps = _warmup_steps()
+        available_steps = _fixed_c_steps(train_split, pretrain_mode)
+        if FLAGS.num_steps is not None:
+            num_steps = int(FLAGS.num_steps)
+        else:
+            tokens_per_step = FLAGS.batch_size * FLAGS.seq_len * FLAGS.grad_accum_steps
+            num_steps = int(FLAGS.max_tokens // tokens_per_step)
+        if num_steps <= 0:
+            raise ValueError("Requested token budget does not contain one optimizer update")
+        if num_steps > available_steps:
+            raise ValueError(
+                f"Requested {num_steps} fixed-C optimizer steps, but the index contains only "
+                f"{available_steps}; rebuilding or repeating the index is not supported."
+            )
+        if num_steps <= 0:
+            raise ValueError("Fixed-C index metadata has no training steps")
+        train_iter = _make_iterator(
+            str(_fixed_c_index_path(index_root, train_split, pretrain_mode)),
+            pretrain_mode,
+            per_process_batch,
+            shuffle=True,
+            num_epochs=1,
+        )
+        if FLAGS.val_index_path:
+            val_iter = _make_iterator(
+                FLAGS.val_index_path,
+                pretrain_mode,
+                per_process_batch,
+                shuffle=False,
+            )
+        elif "val" in splits_metadata:
+            val_split = dict(splits_metadata["val"])
+            val_iter = _make_iterator(
+                str(_fixed_c_index_path(index_root, val_split, pretrain_mode)),
+                pretrain_mode,
+                per_process_batch,
+                shuffle=False,
+                num_epochs=1,
+            )
+    else:
+        raise ValueError(f"Unsupported pretraining bundle format: {bundle_format}")
+
+    model_source = FLAGS.init_hf_model_path or FLAGS.model_id or _default_pretrain_config()
+    _validate_model_sharding(model_source)
+    train_cfg = pretrain_trainer.TrainConfig(
+        seed=FLAGS.seed,
+        batch_size=FLAGS.batch_size,
+        seq_len=FLAGS.seq_len,
+        num_steps=num_steps,
+        lr_schedule_steps=FLAGS.lr_schedule_steps,
+        learning_rate=FLAGS.learning_rate,
+        weight_decay=FLAGS.weight_decay,
+        adam_beta1=FLAGS.adam_beta1,
+        adam_beta2=FLAGS.adam_beta2,
+        adam_eps=FLAGS.adam_eps,
+        warmup_steps=warmup_steps,
+        lr_schedule=FLAGS.lr_schedule,
+        lr_end_factor=FLAGS.lr_end_factor,
+        lr_stable_fraction=FLAGS.lr_stable_fraction,
+        max_grad_norm=FLAGS.max_grad_norm,
+        grad_accum_steps=FLAGS.grad_accum_steps,
+        print_every=FLAGS.log_every,
+    )
+    startup_log(
+        f"requested train stop={train_cfg.num_steps} "
+        f"lr_schedule_steps={train_cfg.lr_schedule_steps!r} "
+        f"warmup_steps={train_cfg.warmup_steps}"
+    )
+    lr_contract_explicit_fields = _explicit_lr_contract_fields()
+    resume_mode = ResumeMode(FLAGS.resume)
+    save_dir = (
+        Path(FLAGS.save_dir)
+        if FLAGS.save_dir
+        else (
+            _default_save_dir(pretrain_mode)
+            if FLAGS.save_every > 0 or resume_mode is not ResumeMode.NEVER
+            else None
+        )
+    )
+    if pretrain_mode.is_statepassing and save_dir is not None:
+        training_contract = build_training_contract(
+            FLAGS.train_index_path,
+            pass_gdn_state=FLAGS.pass_gdn_state,
+            gdn_layer_limit=FLAGS.gdn_layer_limit,
+            gdn_state_routing=FLAGS.gdn_state_routing,
+            pass_conv_state=FLAGS.pass_conv_state,
+            pass_rope_positions=FLAGS.pass_rope_positions,
+            pad_id=FLAGS.pad_id,
+            eos_id=FLAGS.eos_id,
+        )
+        if jax.process_index() == 0:
+            contract_hash = ensure_training_contract(save_dir, training_contract)
+            startup_log(f"training contract ready: {contract_hash}")
+    peak_tflops = resolve_peak_tflops(FLAGS.peak_tflops)
+
+    wandb_run = None
+    if FLAGS.wandb_project and jax.process_index() == 0:
+        wandb_kwargs = {
+            "entity": FLAGS.wandb_entity,
+            "project": FLAGS.wandb_project,
+            "group": FLAGS.wandb_group,
+            "name": FLAGS.wandb_name,
+            "tags": FLAGS.wandb_tags or None,
+            "config": flags.FLAGS.flag_values_dict()
+            | {
+                "derived_num_steps": num_steps,
+                "derived_lr_schedule_steps": train_cfg.resolved_lr_schedule_steps,
+                "derived_warmup_steps": warmup_steps,
+                "tokenizer": FLAGS.tokenizer,
+            },
+        }
+        if FLAGS.wandb_id:
+            wandb_kwargs["id"] = FLAGS.wandb_id
+        if FLAGS.wandb_resume:
+            wandb_kwargs["resume"] = FLAGS.wandb_resume
+        wandb_run = wandb.init(**wandb_kwargs)
+    if FLAGS.gc_period:
+        gc.disable()
+
+    try:
+        if bundle_format == STATEPASSING_CURRICULUM_INDEX_FORMAT and pretrain_mode.is_statepassing:
+            _, last_metrics = pretrain_trainer.run_statepassing_curriculum(
+                model_source,
+                train_cfg,
+                phase_iter_factory,
+                train_order=curriculum_train_order,
+                phase_steps=curriculum_phase_steps,
+                pretrain_mode=pretrain_mode,
+                save_dir=save_dir,
+                save_every=FLAGS.save_every,
+                keep_latest=FLAGS.keep_latest,
+                log_every=FLAGS.log_every,
+                resume=resume_mode,
+                pad_id=FLAGS.pad_id,
+                peak_tflops=peak_tflops,
+                tp_size=FLAGS.tp_size,
+                fsdp_size=FLAGS.fsdp_size,
+                dp_size=FLAGS.dp_size,
+                wandb_run=wandb_run,
+                text_attn_backend=FLAGS.text_attn_backend,
+                gc_period=FLAGS.gc_period,
+                lr_contract_explicit_fields=lr_contract_explicit_fields,
+                **runtime_kwargs,
+            )
+        else:
+            _, last_metrics = pretrain_trainer.run_pretrain(
+                model_source,
+                train_cfg,
+                train_iter,
+                pretrain_mode=pretrain_mode,
+                save_dir=save_dir,
+                save_every=FLAGS.save_every,
+                keep_latest=FLAGS.keep_latest,
+                log_every=FLAGS.log_every,
+                resume=resume_mode,
+                pad_id=FLAGS.pad_id,
+                peak_tflops=peak_tflops,
+                tp_size=FLAGS.tp_size,
+                fsdp_size=FLAGS.fsdp_size,
+                dp_size=FLAGS.dp_size,
+                wandb_run=wandb_run,
+                val_data_iter=val_iter,
+                val_every=FLAGS.val_every,
+                val_steps=FLAGS.val_steps,
+                text_attn_backend=FLAGS.text_attn_backend,
+                gc_period=FLAGS.gc_period,
+                lr_contract_explicit_fields=lr_contract_explicit_fields,
+                init_hf_model_path=FLAGS.init_hf_model_path,
+                **runtime_kwargs,
+            )
+    finally:
+        if FLAGS.gc_period:
+            gc.enable()
+        if wandb_run is not None:
+            wandb_run.finish()
+
+    if last_metrics:
+        print(f"finished step={int(last_metrics['step'])} nll={last_metrics['nll']:.4f}")
+
+
+if __name__ == "__main__":
+    app.run(main)

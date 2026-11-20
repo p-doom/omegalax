@@ -6,7 +6,9 @@ import dataclasses
 import datetime
 import gc
 import os
+from collections.abc import Collection, Mapping
 from pathlib import Path
+from typing import Any
 
 from flax import nnx
 import jax
@@ -14,6 +16,7 @@ import jax.numpy as jnp
 from jax.sharding import NamedSharding, PartitionSpec
 import optax
 import orbax.checkpoint as ocp
+from orbax.checkpoint._src.multihost import multihost as orbax_multihost
 
 from omegalax.data.grain_pipeline import pop_source_ids
 from omegalax.distributed.mesh import ensure_mesh, mesh_rules, required_batch_multiple
@@ -26,12 +29,13 @@ from omegalax.trainers.lr_schedule import build_lr_schedule
 from omegalax.trainers.optim import MixedPrecisionOptimizer
 from omegalax.trainers.perf import (
     maybe_log_step_metrics,
-    per_device_step_flops,
-    StepFlops,
+    per_device_flops_per_step,
     StepTimer,
 )
 
 P = PartitionSpec
+
+_RESTORE_BARRIER_TIMEOUT_SECONDS = 600
 
 
 def startup_log(msg: str) -> None:
@@ -48,6 +52,7 @@ class TrainConfig:
     batch_size: int = 8
     seq_len: int = 64
     num_steps: int = 20
+    lr_schedule_steps: int | None = None
     learning_rate: float = 3e-4
     weight_decay: float = 0.01
     warmup_steps: int = 0
@@ -55,8 +60,115 @@ class TrainConfig:
     lr_end_factor: float = 0.0
     lr_stable_fraction: float = 0.8
     max_grad_norm: float = 0.0
+    adam_beta1: float = 0.9
+    adam_beta2: float = 0.999
+    adam_eps: float = 1e-8
     grad_accum_steps: int = 1
     print_every: int = 1
+
+    @property
+    def resolved_lr_schedule_steps(self) -> int:
+        schedule_steps = (
+            self.num_steps if self.lr_schedule_steps is None else self.lr_schedule_steps
+        )
+        if schedule_steps < self.num_steps:
+            raise ValueError(
+                "lr_schedule_steps must be greater than or equal to num_steps; "
+                f"got lr_schedule_steps={schedule_steps}, num_steps={self.num_steps}."
+            )
+        return schedule_steps
+
+
+LR_CONTRACT_FIELDS = (
+    "learning_rate",
+    "warmup_steps",
+    "lr_schedule",
+    "lr_end_factor",
+    "lr_stable_fraction",
+    "lr_schedule_steps",
+)
+
+
+def lr_contract_from_train_config(train_cfg: TrainConfig) -> dict[str, Any]:
+    return {
+        "learning_rate": float(train_cfg.learning_rate),
+        "warmup_steps": int(train_cfg.warmup_steps),
+        "lr_schedule": str(train_cfg.lr_schedule),
+        "lr_end_factor": float(train_cfg.lr_end_factor),
+        "lr_stable_fraction": float(train_cfg.lr_stable_fraction),
+        "lr_schedule_steps": int(train_cfg.resolved_lr_schedule_steps),
+    }
+
+
+def _normalize_lr_contract(lr_contract: Mapping[str, Any]) -> dict[str, Any]:
+    fields = set(lr_contract)
+    expected_fields = set(LR_CONTRACT_FIELDS)
+    if fields != expected_fields:
+        missing = sorted(expected_fields - fields)
+        unexpected = sorted(fields - expected_fields)
+        raise ValueError(
+            "Invalid LR contract fields: "
+            f"missing={missing or 'none'}, unexpected={unexpected or 'none'}."
+        )
+    try:
+        normalized = {
+            "learning_rate": float(lr_contract["learning_rate"]),
+            "warmup_steps": int(lr_contract["warmup_steps"]),
+            "lr_schedule": str(lr_contract["lr_schedule"]),
+            "lr_end_factor": float(lr_contract["lr_end_factor"]),
+            "lr_stable_fraction": float(lr_contract["lr_stable_fraction"]),
+            "lr_schedule_steps": int(lr_contract["lr_schedule_steps"]),
+        }
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid LR contract values: {lr_contract!r}.") from exc
+    if normalized["warmup_steps"] < 0:
+        raise ValueError("Invalid LR contract: warmup_steps must be >= 0.")
+    if normalized["lr_schedule_steps"] <= 0:
+        raise ValueError("Invalid LR contract: lr_schedule_steps must be > 0.")
+    return normalized
+
+
+def resolve_train_config_lr_contract(
+    train_cfg: TrainConfig,
+    stored_lr_contract: Mapping[str, Any] | None = None,
+    *,
+    explicit_fields: Collection[str] | None = None,
+) -> tuple[TrainConfig, dict[str, Any]]:
+    requested_contract = lr_contract_from_train_config(train_cfg)
+    if stored_lr_contract is None:
+        return train_cfg, requested_contract
+
+    stored_contract = _normalize_lr_contract(stored_lr_contract)
+    explicit = set(LR_CONTRACT_FIELDS if explicit_fields is None else explicit_fields)
+    unknown_fields = explicit - set(LR_CONTRACT_FIELDS)
+    if unknown_fields:
+        raise ValueError(f"Unknown explicit LR contract fields: {sorted(unknown_fields)}")
+
+    mismatches = {
+        field: (stored_contract[field], requested_contract[field])
+        for field in explicit
+        if stored_contract[field] != requested_contract[field]
+    }
+    if mismatches:
+        details = ", ".join(
+            f"{field}: checkpoint={checkpoint_value!r}, resume={resume_value!r}"
+            for field, (checkpoint_value, resume_value) in sorted(mismatches.items())
+        )
+        raise ValueError(
+            "LR contract mismatch on resume. Schedule fields cannot change: " + details
+        )
+
+    resolved_cfg = dataclasses.replace(
+        train_cfg,
+        learning_rate=stored_contract["learning_rate"],
+        warmup_steps=stored_contract["warmup_steps"],
+        lr_schedule=stored_contract["lr_schedule"],
+        lr_end_factor=stored_contract["lr_end_factor"],
+        lr_stable_fraction=stored_contract["lr_stable_fraction"],
+        lr_schedule_steps=stored_contract["lr_schedule_steps"],
+    )
+    _ = resolved_cfg.resolved_lr_schedule_steps
+    return resolved_cfg, stored_contract
 
 
 def init_model(
@@ -75,7 +187,7 @@ def init_model(
 def build_optimizer(model: nnx.Module, train_cfg: TrainConfig) -> MixedPrecisionOptimizer:
     lr = build_lr_schedule(
         peak_lr=train_cfg.learning_rate,
-        num_steps=train_cfg.num_steps,
+        num_steps=train_cfg.resolved_lr_schedule_steps,
         warmup_steps=train_cfg.warmup_steps,
         schedule=train_cfg.lr_schedule,
         end_factor=train_cfg.lr_end_factor,
@@ -84,14 +196,45 @@ def build_optimizer(model: nnx.Module, train_cfg: TrainConfig) -> MixedPrecision
     chain = []
     if train_cfg.max_grad_norm > 0:
         chain.append(optax.clip_by_global_norm(train_cfg.max_grad_norm))
-    chain.append(optax.adamw(lr, weight_decay=train_cfg.weight_decay))
+    # Storage dtype of Adam's first moment. Production keeps both moments in fp32,
+    # which MixedPrecisionOptimizer documents as deliberate T5X mixed-precision
+    # semantics. At ~2e9 parameters the two fp32 moments are about 16 GB, roughly a
+    # quarter of the measured 65.7 GB peak at batch 24 — so this is the largest
+    # single lever on peak memory, and peak memory is what caps the local batch,
+    # which is in turn the strongest measured lever on MFU.
+    #
+    # NOT numerically equivalent: a bf16 first moment changes the optimizer
+    # trajectory. This switch exists to measure the trade-off, not to change the
+    # default, and any adoption is a training-quality decision rather than a
+    # performance one. Default stays fp32.
+    _mu_dtype = {"fp32": None, "bf16": jnp.bfloat16}[os.environ.get("MFU_MU_DTYPE", "fp32")]
+    chain.append(
+        optax.adamw(
+            lr,
+            b1=train_cfg.adam_beta1,
+            b2=train_cfg.adam_beta2,
+            eps=train_cfg.adam_eps,
+            weight_decay=train_cfg.weight_decay,
+            mu_dtype=_mu_dtype,
+        )
+    )
     tx = optax.chain(*chain)
-    tx = optax.MultiSteps(tx, every_k_schedule=train_cfg.grad_accum_steps)
+    if train_cfg.grad_accum_steps > 1:
+        tx = optax.MultiSteps(tx, every_k_schedule=train_cfg.grad_accum_steps)
     opt = MixedPrecisionOptimizer(model, tx)
     return opt
 
 
-_NUM_LOSS_TILES = 4
+# Number of vocabulary tiles the chunked cross-entropy splits the logits into.
+# Trades peak memory against the number of separate passes over a
+# (tokens x vocab) tensor. With vocab=248320 and 24 segments of 2048 tokens that
+# tensor is ~49 GB in fp32, so this constant is one of the largest single levers
+# on step time: a trace of the baseline attributed 27.2 % of all GPU kernel time
+# to the loss path, 24.8 % of it to one vocab-sized multiply-reduce fusion.
+#
+# 4 was a round number, not a measured optimum. Overridable so it can be swept
+# without touching code; production default is unchanged.
+_NUM_LOSS_TILES = int(os.environ.get("MFU_NUM_LOSS_TILES", "4"))
 
 
 def _train_state(optimizer: MixedPrecisionOptimizer, rng: jax.Array) -> dict[str, object]:
@@ -108,22 +251,43 @@ def _abstract_train_state(optimizer: MixedPrecisionOptimizer, rng: jax.Array) ->
     }
 
 
-def _make_checkpoint_manager(save_dir: Path, save_interval: int | None) -> ocp.CheckpointManager:
+def _make_checkpoint_manager(
+    save_dir: Path, save_interval: int | None, *, max_to_keep: int | None = 2
+) -> ocp.CheckpointManager:
     """Orbax requires an absolute checkpoint path."""
+    orbax_multihost._DEFAULT_BARRIER_TIMEOUT = max(
+        orbax_multihost._DEFAULT_BARRIER_TIMEOUT, _RESTORE_BARRIER_TIMEOUT_SECONDS
+    )
     save_dir = Path(save_dir).expanduser().resolve()
+    save_dir.mkdir(parents=True, exist_ok=True)
+    active_processes = None
+    if jax.process_count() > 1:
+        active_processes = set(range(jax.process_count()))
     handler_registry = ocp.handlers.DefaultCheckpointHandlerRegistry()
     handler_registry.add("train_state", ocp.args.PyTreeSave, ocp.handlers.PyTreeCheckpointHandler)
     handler_registry.add(
         "train_state", ocp.args.PyTreeRestore, ocp.handlers.PyTreeCheckpointHandler
     )
     checkpoint_utils.register_grain_iterator_handler(handler_registry)
+    checkpoint_utils.register_lr_contract_handler(handler_registry)
     options = ocp.CheckpointManagerOptions(
         save_interval_steps=save_interval,
-        max_to_keep=2,
+        max_to_keep=max_to_keep,
         step_format_fixed_length=6,
+        create=False,
         cleanup_tmp_directories=True,
+        multiprocessing_options=ocp.options.MultiprocessingOptions(
+            active_processes=active_processes, barrier_sync_key_prefix="omegalax_checkpoint_manager"
+        ),
     )
     return ocp.CheckpointManager(save_dir, options=options, handler_registry=handler_registry)
+
+
+def _model_output_weight(model) -> jax.Array:
+    output_weight = getattr(model, "output_weight", None)
+    if output_weight is not None:
+        return output_weight()
+    return model.lm_head.kernel[...]
 
 
 def _write_checkpoint_config(save_dir: Path, cfg) -> None:
@@ -136,10 +300,15 @@ def _save_sft_checkpoint(
     rng: jax.Array,
     step: int,
     input_iter: checkpoint_utils.GrainIterator,
+    *,
+    lr_contract: Mapping[str, Any] | None = None,
+    force: bool = False,
 ) -> None:
     train_state = _train_state(optimizer, rng)
-    save_args = checkpoint_utils.make_grain_save_args(train_state, input_iter)
-    checkpoint_manager.save(step, args=save_args)
+    save_args = checkpoint_utils.make_grain_save_args(
+        train_state, input_iter, lr_contract=lr_contract
+    )
+    checkpoint_manager.save(step, args=save_args, force=force)
 
 
 def _restore_sft_checkpoint(
@@ -175,11 +344,14 @@ def make_sft_train_step(cfg, pad_id: int = 0):
     @nnx.jit(donate_argnums=0)
     def sft_train_step(optimizer: MixedPrecisionOptimizer, batch: dict[str, jax.Array]):
         token_ids_BT = batch["token_ids_BT"]
+        attention_mask_BT = batch.get("attention_mask_BT")
         loss_mask_BT = batch["loss_mask_BT"]
 
         def loss_fn(model):
-            hidden_BTD, aux_loss = text_api.forward(model, token_ids_BT, pad_id, cfg)
-            lm_weight = model.lm_head.kernel[...]
+            hidden_BTD, aux_loss = text_api.forward(
+                model, token_ids_BT, pad_id, cfg, attention_mask_BT=attention_mask_BT
+            )
+            lm_weight = _model_output_weight(model)
             loss = (
                 chunked_cross_entropy_loss(
                     hidden_BTD,
@@ -214,10 +386,13 @@ def make_sft_eval_step(cfg, pad_id: int = 0):
     @nnx.jit
     def sft_eval_step(model: nnx.Module, batch: dict[str, jax.Array]):
         token_ids_BT = batch["token_ids_BT"]
+        attention_mask_BT = batch.get("attention_mask_BT")
         loss_mask_BT = batch["loss_mask_BT"]
 
-        hidden_BTD, aux_loss = text_api.forward(model, token_ids_BT, pad_id, cfg)
-        lm_weight = model.lm_head.kernel[...]
+        hidden_BTD, aux_loss = text_api.forward(
+            model, token_ids_BT, pad_id, cfg, attention_mask_BT=attention_mask_BT
+        )
+        lm_weight = _model_output_weight(model)
         loss = (
             chunked_cross_entropy_loss(
                 hidden_BTD,
@@ -242,6 +417,7 @@ def run_sft(
     *,
     save_dir: str | Path | None = None,
     save_every: int = 0,
+    keep_latest: int | None = 2,
     log_every: int = 1,
     resume: checkpoint_utils.ResumeMode = checkpoint_utils.ResumeMode.NEVER,
     pad_id: int = 0,
@@ -253,7 +429,7 @@ def run_sft(
     val_data_iter: checkpoint_utils.GrainIterator | None = None,
     val_every: int | None = None,
     val_steps: int = 10,
-    text_attn_backend: str | None = None,
+    text_attn_backend: str = "mosaic_gpu",
     gc_period: int = 0,
 ) -> tuple[MixedPrecisionOptimizer, dict[str, float]]:
     """SFT a text model from a Grain iterator; returns final optimizer + last metrics.
@@ -272,7 +448,9 @@ def run_sft(
     checkpoint_manager: ocp.CheckpointManager | None = None
     if save_path is not None:
         save_path.mkdir(parents=True, exist_ok=True)
-        checkpoint_manager = _make_checkpoint_manager(save_path, save_interval=save_every or None)
+        checkpoint_manager = _make_checkpoint_manager(
+            save_path, save_interval=save_every or None, max_to_keep=keep_latest
+        )
 
     latest_step = checkpoint_manager.latest_step() if checkpoint_manager is not None else None
 
@@ -325,8 +503,7 @@ def run_sft(
     startup_log("initialized model")
     from omegalax.models.sharding_runtime import set_attn_backend
 
-    if text_attn_backend is not None:
-        set_attn_backend(model, text_backend=text_attn_backend)
+    set_attn_backend(model, text_backend=text_attn_backend)
     startup_log(f"set attn backend: text={text_attn_backend}")
     with mesh_rules(mesh):
         optimizer = build_optimizer(model, train_cfg)
@@ -334,7 +511,7 @@ def run_sft(
     # Init cpu learning rate scheduler function for logging
     lr_schedule_fn = build_lr_schedule(
         peak_lr=train_cfg.learning_rate,
-        num_steps=train_cfg.num_steps,
+        num_steps=train_cfg.resolved_lr_schedule_steps,
         warmup_steps=train_cfg.warmup_steps,
         schedule=train_cfg.lr_schedule,
         end_factor=train_cfg.lr_end_factor,
@@ -374,7 +551,7 @@ def run_sft(
         nonlocal last_metrics
         if prev_metrics is None:
             return
-        step_to_log, metrics_to_log, step_delta, step_flops = prev_metrics
+        step_to_log, metrics_to_log, step_delta, step_per_device_flops = prev_metrics
         result = maybe_log_step_metrics(
             step_to_log,
             metrics_to_log,
@@ -382,7 +559,7 @@ def run_sft(
             is_primary_process=is_primary_process,
             log_every=log_every,
             force=force,
-            step_flops=step_flops,
+            per_device_flops=step_per_device_flops,
             global_tokens_per_step=global_tokens_per_step,
             peak_tflops=peak_tflops,
             wandb_run=wandb_run,
@@ -398,8 +575,7 @@ def run_sft(
         accum_loss = 0.0
         accum_sup_tokens = 0.0
         accum_grad_norm = 0.0
-        accum_model_flops = 0.0
-        accum_hardware_flops = 0.0
+        accum_flops = 0.0
         accum_time = datetime.timedelta(0)
         source_counts: dict[int, int] = {}
 
@@ -409,14 +585,10 @@ def run_sft(
             if sids is not None:
                 for sid in sids.tolist():
                     source_counts[sid] = source_counts.get(sid, 0) + 1
-            # Full fine-tune; text decoder always remat. vision_trainable unused for text.
-            micro_flops = per_device_step_flops(
+            micro_flops = per_device_flops_per_step(
                 model_cfg,
                 train_cfg.seq_len,
                 train_cfg.batch_size,
-                base_weights_trainable=True,
-                vision_trainable=False,
-                decoder_remat=True,
             )
             batch = text_api.shard_batch_dict(batch, model_cfg, mesh)
             _, metrics = sft_step(optimizer, batch)
@@ -425,8 +597,7 @@ def run_sft(
             accum_loss = accum_loss + metrics["loss"]
             accum_sup_tokens = accum_sup_tokens + metrics["supervised_tokens"]
             accum_grad_norm = accum_grad_norm + metrics["grad_norm"]
-            accum_model_flops += micro_flops.model
-            accum_hardware_flops += micro_flops.hardware
+            accum_flops += micro_flops
             accum_time += micro_delta
 
         with jax.default_device("cpu"):
@@ -447,12 +618,7 @@ def run_sft(
             for sid, cnt in source_counts.items():
                 window_metrics[f"data_source_{sid}_frac"] = cnt / total
         _log_prev_metrics()
-        prev_metrics = (
-            step,
-            window_metrics,
-            accum_time,
-            StepFlops(model=accum_model_flops, hardware=accum_hardware_flops),
-        )
+        prev_metrics = (step, window_metrics, accum_time, accum_flops)
 
         if checkpoint_manager is not None and save_every and step % save_every == 0:
             _save_sft_checkpoint(checkpoint_manager, optimizer, rng, step, data_iter)

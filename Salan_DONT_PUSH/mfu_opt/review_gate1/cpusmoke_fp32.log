@@ -1,0 +1,39 @@
+
+=== arm=orig_a shape=padtail seed=0 tree=/fast/home/salan.isaqzoi/gh_projects/p(doom)/omegalax flags=(0, 0, 0)
+[child] omegalax -> /fast/home/salan.isaqzoi/gh_projects/p(doom)/omegalax/omegalax/__init__.py
+[child] dispatch={'forward_with_gdn_state': 2, 'cascade_loss_stats': 0, 'conv_btc': 0, 'conv_bct': 6, 'blocked_inverse': 0} switches={'deltanet._CONV_BTC': False, 'pallas_triton._TRI_BLOCKED': False, 'pallas_triton._TRI_INV': False, 'cascade.enabled': False, 'cascade._INSTALLED': False, 'cascade._SEGMENTS': None}
+[child] devices=['TFRT_CPU_0'] arrays=140 -> /fast/home/salan.isaqzoi/gh_projects/p(doom)/omegalax_optimization/Salan_DONT_PUSH/mfu_opt/review_gate1/gate1_w9e7bvrk/orig_a.npz
+
+=== arm=orig_b shape=padtail seed=0 tree=/fast/home/salan.isaqzoi/gh_projects/p(doom)/omegalax flags=(0, 0, 0)
+[child] omegalax -> /fast/home/salan.isaqzoi/gh_projects/p(doom)/omegalax/omegalax/__init__.py
+[child] dispatch={'forward_with_gdn_state': 2, 'cascade_loss_stats': 0, 'conv_btc': 0, 'conv_bct': 6, 'blocked_inverse': 0} switches={'deltanet._CONV_BTC': False, 'pallas_triton._TRI_BLOCKED': False, 'pallas_triton._TRI_INV': False, 'cascade.enabled': False, 'cascade._INSTALLED': False, 'cascade._SEGMENTS': None}
+[child] devices=['TFRT_CPU_0'] arrays=140 -> /fast/home/salan.isaqzoi/gh_projects/p(doom)/omegalax_optimization/Salan_DONT_PUSH/mfu_opt/review_gate1/gate1_w9e7bvrk/orig_b.npz
+
+=== arm=opt_cascade shape=padtail seed=0 tree=/fast/home/salan.isaqzoi/gh_projects/p(doom)/omegalax_optimization flags=(1, 0, 0)
+[child] omegalax -> /fast/home/salan.isaqzoi/gh_projects/p(doom)/omegalax_optimization/omegalax/__init__.py
+[child] dispatch={'forward_with_gdn_state': 1, 'cascade_loss_stats': 1, 'conv_btc': 0, 'conv_bct': 3, 'blocked_inverse': 0} switches={'deltanet._CONV_BTC': False, 'pallas_triton._TRI_BLOCKED': False, 'pallas_triton._TRI_INV': False, 'cascade.enabled': True, 'cascade._INSTALLED': True, 'cascade._SEGMENTS': 2}
+[child] devices=['TFRT_CPU_0'] arrays=134 -> /fast/home/salan.isaqzoi/gh_projects/p(doom)/omegalax_optimization/Salan_DONT_PUSH/mfu_opt/review_gate1/gate1_w9e7bvrk/opt_cascade.npz
+
+summary -> /fast/project/HFMI_SynergyUnit/p-doom_shared/salan/logs/mfu_opt/gate1/gate1_summary_cpusmoke_fp32.json
+
+=== dispatch verification
+ok    padtail/seed0/opt_cascade  
+ok    padtail/seed0/orig_a  
+ok    padtail/seed0/orig_b  
+
+=== step 1, vs orig_a. orig_b is the noise floor, not a result.
+
+-- shape=padtail seed=0
+arm                             family      status     max_abs      rel_l2       worst_rel_l2  cosine         p99(abs)     p99/rms
+orig_b                          hidden      compared   0.000e+00    0.000e+00    0.000e+00     1.000000000000   0.000e+00    0.000e+00
+orig_b                          state_final compared   0.000e+00    0.000e+00    0.000e+00     1.000000000000   0.000e+00    0.000e+00
+orig_b                          state_all   compared   0.000e+00    0.000e+00    0.000e+00     1.000000000000   0.000e+00    0.000e+00
+orig_b                          grad        compared   0.000e+00    0.000e+00    0.000e+00     1.000000000000   0.000e+00    0.000e+00
+orig_b                          metric      compared   0.000e+00    0.000e+00    0.000e+00     1.000000000000   0.000e+00    0.000e+00
+opt_cascade                     hidden      compared   0.000e+00    0.000e+00    0.000e+00     1.000000000000   0.000e+00    0.000e+00
+opt_cascade                     state_final compared   0.000e+00    0.000e+00    0.000e+00     1.000000000000   0.000e+00    0.000e+00
+opt_cascade                     state_all   not_comparable
+opt_cascade                     grad        compared   3.906e-03    9.539e-04    2.998e-03     0.999999545085   6.104e-05    2.756e-03
+opt_cascade                     metric      compared   0.000e+00    0.000e+00    0.000e+00     1.000000000000   0.000e+00    0.000e+00
+
+All arms proved their code path. No checkpoints were written.

@@ -15,6 +15,19 @@ import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
 
 
+
+import os as _os
+
+# Replace the one-hot readout of the target logit with a gather. Exact rewrite,
+# but NOT unconditionally safe -- see the comment in _cross_entropy_with_logits:
+# take_along_axis fails on a TP-sharded vocabulary, and the reshard it induces
+# breaks VJP sharding under FSDP. The one-hot formulation is therefore a
+# deliberate choice, not an oversight.
+#
+# Valid only when the vocabulary axis is not sharded, i.e. tp_size == 1. Default
+# OFF so that production multi-GPU runs keep the safe path; the benchmark turns
+# it on explicitly to measure what a sharding-safe version would be worth.
+_FAST_TARGET_GATHER = _os.environ.get("MFU_FAST_CE", "0") == "1"
 def _cross_entropy_with_logits(
     logits_NV: jax.Array,
     targets_N: jax.Array,
@@ -33,6 +46,206 @@ def _cross_entropy_with_logits(
     nll_N = logsumexp_N - target_logits_N
     mask_f = mask_N.astype(jnp.float32)
     return jnp.sum(nll_N * mask_f), jnp.sum(mask_f)
+
+
+def _cross_entropy_nll(logits_NV: jax.Array, targets_N: jax.Array) -> jax.Array:
+    logits_NV = logits_NV.astype(jnp.float32)
+
+    if _FAST_TARGET_GATHER:
+        # Pick the target logit with a gather instead of building a full one-hot
+        # matrix and reducing against it.
+        #
+        # The original expression was
+        #     one_hot = jax.nn.one_hot(targets_N, V, dtype=float32)
+        #     target_logits_N = jnp.sum(logits_NV * one_hot, axis=-1)
+        # which materialises a second (N, V) float32 tensor and does a multiply
+        # plus a reduction over the vocabulary to read out one element per row.
+        # With V = 248320 and 24 segments of 2048 tokens that is a ~49 GB tensor
+        # written and read back, and a profile of the baseline attributed 24.8 %
+        # of all GPU kernel time to a single "multiply reduce" fusion.
+        #
+        # take_along_axis selects exactly the same elements, so this is an exact
+        # rewrite and not an approximation: no reassociation, no precision change.
+        target_logits_N = jnp.take_along_axis(logits_NV, targets_N[..., None], axis=-1)[..., 0]
+    else:
+        one_hot = jax.nn.one_hot(targets_N, logits_NV.shape[-1], dtype=logits_NV.dtype)
+        target_logits_N = jnp.sum(logits_NV * one_hot, axis=-1)
+
+    max_logits_N = jnp.max(logits_NV, axis=-1)
+    stable_logits_NV = logits_NV - max_logits_N[..., None]
+    logsumexp_N = max_logits_N + jnp.log(jnp.sum(jnp.exp(stable_logits_NV), axis=-1))
+    return logsumexp_N - target_logits_N
+
+
+def _entropy_with_logits(logits_NV: jax.Array) -> jax.Array:
+    logits_NV = logits_NV.astype(jnp.float32)
+    log_probs_NV = jax.nn.log_softmax(logits_NV, axis=-1)
+    return -jnp.sum(jnp.exp(log_probs_NV) * log_probs_NV, axis=-1)
+
+
+def chunked_token_entropies(
+    hidden_BTD: jax.Array,
+    lm_head_kernel_DV: jax.Array,
+    num_tiles: int = 8,
+    logits_out_sharding: P | None = None,
+) -> jax.Array:
+    """Return predictive entropy for every next-token position, shape ``(B, T - 1)``."""
+    B, T, D = hidden_BTD.shape
+    hidden_BTD = hidden_BTD[:, :-1, :]
+    T1 = T - 1
+
+    if num_tiles <= 1 or T1 < num_tiles:
+        logits_BTV = jnp.einsum(
+            "BTD,DV->BTV", hidden_BTD, lm_head_kernel_DV, out_sharding=logits_out_sharding
+        )
+        return _entropy_with_logits(logits_BTV)
+
+    chunk_size = -(-T1 // num_tiles)
+    pad_t = chunk_size * num_tiles - T1
+    if pad_t > 0:
+        hidden_BTD = jnp.pad(hidden_BTD, ((0, 0), (0, pad_t), (0, 0)))
+    hidden_BCSD = hidden_BTD.reshape(B, num_tiles, chunk_size, D)
+
+    @jax.remat
+    def _remat_chunk(h_BSD):
+        logits_BSV = jnp.einsum(
+            "BSD,DV->BSV", h_BSD, lm_head_kernel_DV, out_sharding=logits_out_sharding
+        )
+        return _entropy_with_logits(logits_BSV)
+
+    entropy_CBS = jax.lax.map(_remat_chunk, jnp.moveaxis(hidden_BCSD, 1, 0))
+    entropy_BT = jnp.moveaxis(entropy_CBS, 0, 1).reshape(B, num_tiles * chunk_size)
+    return entropy_BT[:, :T1]
+
+
+def chunked_cross_entropy_stats(
+    hidden_BTD: jax.Array,
+    lm_head_kernel_DV: jax.Array,
+    targets_BT: jax.Array,
+    mask_BT: jax.Array,
+    num_tiles: int = 8,
+    logits_out_sharding: P | None = None,
+) -> tuple[jax.Array, jax.Array]:
+    """Return masked ``(nll_sum, token_count)`` for next-token prediction."""
+    B, T, D = hidden_BTD.shape
+
+    hidden_BTD = hidden_BTD[:, :-1, :]
+    targets_BT = targets_BT[:, 1:]
+    mask_BT = mask_BT[:, 1:]
+    T1 = T - 1
+
+    if num_tiles <= 1 or T1 < num_tiles:
+        logits_BTV = jnp.einsum(
+            "BTD,DV->BTV", hidden_BTD, lm_head_kernel_DV, out_sharding=logits_out_sharding
+        )
+        return _cross_entropy_with_logits(logits_BTV, targets_BT, mask_BT)
+
+    chunk_size = -(-T1 // num_tiles)
+    pad_t = chunk_size * num_tiles - T1
+    if pad_t > 0:
+        hidden_BTD = jnp.pad(hidden_BTD, ((0, 0), (0, pad_t), (0, 0)))
+        targets_BT = jnp.pad(targets_BT, ((0, 0), (0, pad_t)))
+        mask_BT = jnp.pad(mask_BT, ((0, 0), (0, pad_t)))
+
+    hidden_BCSD = hidden_BTD.reshape(B, num_tiles, chunk_size, D)
+    targets_BCS = targets_BT.reshape(B, num_tiles, chunk_size)
+    mask_BCS = mask_BT.reshape(B, num_tiles, chunk_size)
+
+    @jax.remat
+    def _remat_chunk(h_BSD, tgt_BS, msk_BS):
+        logits_BSV = jnp.einsum(
+            "BSD,DV->BSV", h_BSD, lm_head_kernel_DV, out_sharding=logits_out_sharding
+        )
+        return _cross_entropy_with_logits(logits_BSV, tgt_BS, msk_BS)
+
+    def _scan_body(acc, chunk_data):
+        loss_acc, mask_acc = acc
+        h_BSD, tgt_BS, msk_BS = chunk_data
+        chunk_loss, chunk_mask = _remat_chunk(h_BSD, tgt_BS, msk_BS)
+        return (loss_acc + chunk_loss, mask_acc + chunk_mask), None
+
+    (total_loss, total_mask), _ = jax.lax.scan(
+        _scan_body,
+        (jnp.array(0.0, dtype=jnp.float32), jnp.array(0.0, dtype=jnp.float32)),
+        (
+            jnp.moveaxis(hidden_BCSD, 1, 0),
+            jnp.moveaxis(targets_BCS, 1, 0),
+            jnp.moveaxis(mask_BCS, 1, 0),
+        ),
+        unroll=1,
+    )
+    return total_loss, total_mask
+
+
+def chunked_cross_entropy_multi_stats(
+    hidden_BTD: jax.Array,
+    lm_head_kernel_DV: jax.Array,
+    targets_BT: jax.Array,
+    masks_NBT: jax.Array,
+    num_tiles: int = 8,
+    logits_out_sharding: P | None = None,
+) -> tuple[jax.Array, jax.Array]:
+    """Return per-mask ``(nll_sum_N, token_count_N)`` with one logits pass."""
+    B, T, D = hidden_BTD.shape
+
+    hidden_BTD = hidden_BTD[:, :-1, :]
+    targets_BT = targets_BT[:, 1:]
+    masks_NBT = masks_NBT[:, :, 1:]
+    T1 = T - 1
+
+    if num_tiles <= 1 or T1 < num_tiles:
+        logits_BTV = jnp.einsum(
+            "BTD,DV->BTV", hidden_BTD, lm_head_kernel_DV, out_sharding=logits_out_sharding
+        )
+        nll_BT = _cross_entropy_nll(logits_BTV, targets_BT)
+        mask_f_NBT = masks_NBT.astype(jnp.float32)
+        return jnp.sum(mask_f_NBT * nll_BT[None, :, :], axis=(1, 2)), jnp.sum(
+            mask_f_NBT, axis=(1, 2)
+        )
+
+    chunk_size = -(-T1 // num_tiles)
+    pad_t = chunk_size * num_tiles - T1
+    if pad_t > 0:
+        hidden_BTD = jnp.pad(hidden_BTD, ((0, 0), (0, pad_t), (0, 0)))
+        targets_BT = jnp.pad(targets_BT, ((0, 0), (0, pad_t)))
+        masks_NBT = jnp.pad(masks_NBT, ((0, 0), (0, 0), (0, pad_t)))
+
+    hidden_BCSD = hidden_BTD.reshape(B, num_tiles, chunk_size, D)
+    targets_BCS = targets_BT.reshape(B, num_tiles, chunk_size)
+    masks_NBCS = masks_NBT.reshape(masks_NBT.shape[0], B, num_tiles, chunk_size)
+
+    @jax.remat
+    def _remat_chunk(h_BSD, tgt_BS, msk_NBS):
+        logits_BSV = jnp.einsum(
+            "BSD,DV->BSV", h_BSD, lm_head_kernel_DV, out_sharding=logits_out_sharding
+        )
+        nll_BS = _cross_entropy_nll(logits_BSV, tgt_BS)
+        mask_f_NBS = msk_NBS.astype(jnp.float32)
+        return jnp.sum(mask_f_NBS * nll_BS[None, :, :], axis=(1, 2)), jnp.sum(
+            mask_f_NBS, axis=(1, 2)
+        )
+
+    def _scan_body(acc, chunk_data):
+        loss_acc, mask_acc = acc
+        h_BSD, tgt_BS, msk_NBS = chunk_data
+        chunk_loss, chunk_mask = _remat_chunk(h_BSD, tgt_BS, msk_NBS)
+        return (loss_acc + chunk_loss, mask_acc + chunk_mask), None
+
+    init = (
+        jnp.zeros((masks_NBT.shape[0],), dtype=jnp.float32),
+        jnp.zeros((masks_NBT.shape[0],), dtype=jnp.float32),
+    )
+    (total_loss, total_mask), _ = jax.lax.scan(
+        _scan_body,
+        init,
+        (
+            jnp.moveaxis(hidden_BCSD, 1, 0),
+            jnp.moveaxis(targets_BCS, 1, 0),
+            jnp.moveaxis(masks_NBCS, 2, 0),
+        ),
+        unroll=1,
+    )
+    return total_loss, total_mask
 
 
 def chunked_cross_entropy_loss(
@@ -60,59 +273,12 @@ def chunked_cross_entropy_loss(
     Returns:
         Scalar masked mean cross-entropy loss.
     """
-    B, T, D = hidden_BTD.shape
-
-    # For next-token prediction: predict position t from hidden at t-1.
-    # Keep B separate (may be FSDP-sharded). Tile only within each sequence.
-    hidden_BTD = hidden_BTD[:, :-1, :]
-    targets_BT = targets_BT[:, 1:]
-    mask_BT = mask_BT[:, 1:]
-    T1 = T - 1
-
-    if num_tiles <= 1 or T1 < num_tiles:
-        logits_BTV = jnp.einsum(
-            "BTD,DV->BTV", hidden_BTD, lm_head_kernel_DV, out_sharding=logits_out_sharding
-        )
-        loss_sum, mask_sum = _cross_entropy_with_logits(logits_BTV, targets_BT, mask_BT)
-        return loss_sum / jnp.maximum(mask_sum, 1.0)
-
-    # Tile within each sequence (B stays intact, T gets chunked)
-    chunk_size = -(-T1 // num_tiles)
-    pad_t = chunk_size * num_tiles - T1
-    if pad_t > 0:
-        hidden_BTD = jnp.pad(hidden_BTD, ((0, 0), (0, pad_t), (0, 0)))
-        targets_BT = jnp.pad(targets_BT, ((0, 0), (0, pad_t)))
-        mask_BT = jnp.pad(mask_BT, ((0, 0), (0, pad_t)))
-
-    hidden_BCSD = hidden_BTD.reshape(B, num_tiles, chunk_size, D)
-    targets_BCS = targets_BT.reshape(B, num_tiles, chunk_size)
-    mask_BCS = mask_BT.reshape(B, num_tiles, chunk_size)
-
-    @jax.remat
-    def _remat_chunk(h_BSD, tgt_BS, msk_BS):
-        """Compute logits + CE for one chunk; remat discards logits in backward."""
-        logits_BSV = jnp.einsum(
-            "BSD,DV->BSV", h_BSD, lm_head_kernel_DV, out_sharding=logits_out_sharding
-        )
-        return _cross_entropy_with_logits(logits_BSV, tgt_BS, msk_BS)
-
-    def _scan_body(acc, chunk_data):
-        loss_acc, mask_acc = acc
-        h_BSD, tgt_BS, msk_BS = chunk_data
-        chunk_loss, chunk_mask = _remat_chunk(h_BSD, tgt_BS, msk_BS)
-        return (loss_acc + chunk_loss, mask_acc + chunk_mask), None
-
-    # Scan over chunks (axis 1), keeping B (axis 0, possibly FSDP-sharded) intact.
-    # jax.remat on the body ensures logits are recomputed during backward instead
-    # of stored for all tiles (which would require O(num_tiles * B * chunk * V)).
-    (total_loss, total_mask), _ = jax.lax.scan(
-        _scan_body,
-        (jnp.array(0.0, dtype=jnp.float32), jnp.array(0.0, dtype=jnp.float32)),
-        (
-            jnp.moveaxis(hidden_BCSD, 1, 0),  # (num_tiles, B, chunk_size, D)
-            jnp.moveaxis(targets_BCS, 1, 0),  # (num_tiles, B, chunk_size)
-            jnp.moveaxis(mask_BCS, 1, 0),  # (num_tiles, B, chunk_size)
-        ),
-        unroll=1,
+    total_loss, total_mask = chunked_cross_entropy_stats(
+        hidden_BTD,
+        lm_head_kernel_DV,
+        targets_BT,
+        mask_BT,
+        num_tiles=num_tiles,
+        logits_out_sharding=logits_out_sharding,
     )
     return total_loss / jnp.maximum(total_mask, 1.0)
