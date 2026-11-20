@@ -1444,19 +1444,20 @@ def run_pretrain(
             restore_input_iter=restore_input_iter,
         )
         rng = jax.device_put(rng, replicated_rng_sharding)
-        if common_update_plan is not None and save_path is not None and is_primary_process:
-            import json
+    if common_update_plan is not None and save_path is not None and is_primary_process:
+        import json
 
-            # A restart from an older checkpoint replays the updates after it; their rows from
-            # the abandoned attempt are dropped so that each update is recorded once.
-            for name in ("update_metrics.jsonl", "update_identities.jsonl"):
-                side_file = save_path / name
-                if side_file.exists():
-                    rows = side_file.read_text().splitlines(keepends=True)
-                    kept = [row for row in rows if json.loads(row)["step"] <= start_step]
-                    if len(kept) != len(rows):
-                        side_file.with_suffix(".tmp").write_text("".join(kept))
-                        side_file.with_suffix(".tmp").replace(side_file)
+        # A restart replays the updates after the restored checkpoint, or all of them without
+        # one; their rows from the abandoned attempt are dropped so that each update is
+        # recorded once.
+        for name in ("update_metrics.jsonl", "update_identities.jsonl", "val_metrics.jsonl"):
+            side_file = save_path / name
+            if side_file.exists():
+                rows = side_file.read_text().splitlines(keepends=True)
+                kept = [row for row in rows if json.loads(row)["step"] <= start_step]
+                if len(kept) != len(rows):
+                    side_file.with_suffix(".tmp").write_text("".join(kept))
+                    side_file.with_suffix(".tmp").replace(side_file)
 
     local_stop_step = (
         train_cfg.num_steps if stop_after_local_step is None else int(stop_after_local_step)

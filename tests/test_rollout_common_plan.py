@@ -805,6 +805,26 @@ class ResumeSideEffectsTest(absltest.TestCase):
         self.assertEqual(run["metrics"], list(range(1, 13)))
         self.assertEqual(run["identities"], list(range(1, 13)))
 
+    # Pins: after a crash before the first checkpoint and a restart from scratch, both side files hold steps 1..12 exactly once.
+    def test_restart_before_first_checkpoint_side_files_once(self):
+        class Crash(Recorder):
+            def log(self, values, step):
+                if int(step) == 2:
+                    raise RuntimeError("crash while logging update 2")
+                super().log(values, step)
+
+        plan = _plan(_main_dataset(), SIZES, [4, 8, 12])
+        save_dir = _dir("restart_before_first_checkpoint")
+        with self.assertRaisesRegex(RuntimeError, "crash while logging update 2"):
+            _run(plan, save_dir, Crash())
+        self.assertEqual([p for p in save_dir.iterdir() if p.name.isdigit()], [])
+        self.assertTrue(_read_jsonl(save_dir / "update_metrics.jsonl"))
+        _run(plan, save_dir, resume=ResumeMode.IF_PRESENT)
+        for name in ("update_metrics.jsonl", "update_identities.jsonl"):
+            self.assertEqual(
+                [r["step"] for r in _read_jsonl(save_dir / name)], list(range(1, 13)), name
+            )
+
     # Pins: after a decay-phase signal or a stop without checkpoint, every step 1..12 reaches the W&B stand-in.
     def test_decay_phase_interruptions_reach_wandb(self):
         for scenario in ("signal_decay", "stop_decay"):
