@@ -12,12 +12,20 @@ from unittest import mock
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
+import jax
 import jax.numpy as jnp
 from absl.testing import absltest
 
 from omegalax.distributed.mesh import mesh_rules_for
 
 MODEL_DTYPE = jnp.bfloat16
+
+
+def _has_cuda_device() -> bool:
+    try:
+        return any(device.platform == "gpu" for device in jax.devices())
+    except Exception:
+        return False
 
 
 class _RopeDtypeTestBase(absltest.TestCase):
@@ -50,6 +58,7 @@ def _make_spy(original_fn, captured: list):
 class Qwen3RopeDtypeTest(_RopeDtypeTestBase):
     """Qwen3 dense Attention: generate in fp32, apply_rope receives model-dtype sin/cos."""
 
+    @absltest.skipIf(not _has_cuda_device(), "requires CUDA GPU (default attention backend)")
     def test_rope_dtype_through_attention_forward(self):
         from flax import nnx
         from omegalax.models.qwen3.config import make_config
@@ -126,33 +135,9 @@ class Qwen3_5TextRopeDtypeTest(_RopeDtypeTestBase):
         layer_calls = []
         orig_layer_call = model_mod.DecoderLayer.__call__
 
-        def layer_spy(
-            self_layer,
-            hidden,
-            cos_BTK,
-            sin_BTK,
-            seg,
-            pos,
-            attn_mask=None,
-            gdn_initial_state=None,
-            return_gdn_state=False,
-            conv_initial_state=None,
-            return_conv_state=False,
-        ):
+        def layer_spy(self_layer, hidden, cos_BTK, sin_BTK, *args):
             layer_calls.append({"cos": cos_BTK.dtype, "sin": sin_BTK.dtype})
-            return orig_layer_call(
-                self_layer,
-                hidden,
-                cos_BTK,
-                sin_BTK,
-                seg,
-                pos,
-                attn_mask,
-                gdn_initial_state,
-                return_gdn_state,
-                conv_initial_state,
-                return_conv_state,
-            )
+            return orig_layer_call(self_layer, hidden, cos_BTK, sin_BTK, *args)
 
         B, T = 1, 8
         tokens = jnp.ones((B, T), dtype=jnp.int32)
@@ -231,6 +216,7 @@ class Qwen3_5VisionRopeDtypeTest(_RopeDtypeTestBase):
 class Qwen3VLRopeDtypeTest(_RopeDtypeTestBase):
     """Qwen3-VL: compute_mrope_pos_embeddings in fp32, sin/cos cast to model dtype before layers."""
 
+    @absltest.skipIf(not _has_cuda_device(), "requires CUDA GPU (default attention backend)")
     def test_rope_dtype_through_text_forward(self):
         from flax import nnx
         from omegalax.models.qwen3_vl.config import make_vl_config
@@ -247,9 +233,9 @@ class Qwen3VLRopeDtypeTest(_RopeDtypeTestBase):
         layer_calls = []
         orig_layer_call = model_mod.TextDecoderLayer.__call__
 
-        def layer_spy(self_layer, hidden, sin_BTK, cos_BTK, mask):
+        def layer_spy(self_layer, hidden, sin_BTK, cos_BTK, *args):
             layer_calls.append({"sin": sin_BTK.dtype, "cos": cos_BTK.dtype})
-            return orig_layer_call(self_layer, hidden, sin_BTK, cos_BTK, mask)
+            return orig_layer_call(self_layer, hidden, sin_BTK, cos_BTK, *args)
 
         B, T = 1, 8
         tokens = jnp.ones((B, T), dtype=jnp.int32)
@@ -300,7 +286,7 @@ class Qwen3VLVisionRopeDtypeTest(_RopeDtypeTestBase):
 
         block_calls = []
 
-        def block_spy(self_blk, hidden, cu_seqlens, cos_NK, sin_NK):
+        def block_spy(self_blk, hidden, cu_seqlens, seqlens, cos_NK, sin_NK):
             block_calls.append({"cos": cos_NK.dtype, "sin": sin_NK.dtype})
             return hidden  # skip actual block to avoid JAX dynamic-slice tracing issue
 

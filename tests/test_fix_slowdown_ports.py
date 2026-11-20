@@ -36,6 +36,13 @@ from omegalax.models.qwen3_5.vision import _cudnn_packed_vision_attention
 from omegalax.models.sharding_runtime import set_attn_backend
 
 
+def _has_cuda_device() -> bool:
+    try:
+        return any(device.platform == "gpu" for device in jax.devices())
+    except Exception:
+        return False
+
+
 def _block_diag_reference(
     q_NHK: jax.Array,
     k_NHK: jax.Array,
@@ -76,6 +83,7 @@ class CuDnnPackedVisionAttentionTest(absltest.TestCase):
     path used to handle on the old branch.
     """
 
+    @absltest.skipIf(not _has_cuda_device(), "requires CUDA GPU (default attention backend)")
     def test_unequal_segments_match_reference(self):
         rng = np.random.RandomState(0)
         # Three "images" of unequal token count.
@@ -127,6 +135,7 @@ def _qwen3_test_cfg() -> Qwen3Config:
 
 
 class Qwen3TextAttnBackendSwapTest(absltest.TestCase):
+    @absltest.skipIf(not _has_cuda_device(), "requires CUDA GPU (default attention backend)")
     def test_mosaic_gpu_and_cudnn_outputs_match(self):
         cfg = _qwen3_test_cfg()
         with mesh_rules_for(tp_size=1, fsdp_size=1, dp_size=1):
@@ -253,6 +262,7 @@ def _make_vlm_inputs(cfg: Qwen3_5Config, real_grids, max_images=None, max_patche
 class Qwen3_5PaddingNoOpTest(absltest.TestCase):
     """Padded-vs-unpadded outputs at non-pad text positions must match."""
 
+    @absltest.skipIf(not _has_cuda_device(), "requires CUDA GPU (default attention backend)")
     def test_padded_and_unpadded_match_at_real_positions(self):
         cfg = _qwen3_5_vlm_test_cfg()
         with mesh_rules_for(tp_size=1, fsdp_size=1, dp_size=1):
@@ -328,6 +338,7 @@ class Qwen3_5JitStabilityTest(absltest.TestCase):
     constant by max_length padding in the real collator (orthogonal concern).
     """
 
+    @absltest.skipIf(not _has_cuda_device(), "requires CUDA GPU (default attention backend)")
     def test_vision_encoder_no_recompile_across_real_counts(self):
         cfg = _qwen3_5_vlm_test_cfg()
         with mesh_rules_for(tp_size=1, fsdp_size=1, dp_size=1):

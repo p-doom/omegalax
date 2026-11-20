@@ -10,6 +10,7 @@ import tempfile
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import torch
@@ -93,6 +94,13 @@ HF_CFG = HFConfig(
 )
 
 
+def _has_cuda_device() -> bool:
+    try:
+        return any(device.platform == "gpu" for device in jax.devices())
+    except Exception:
+        return False
+
+
 def _random_input(
     batch_size: int = 1,
     seq_len: int = 16,
@@ -134,6 +142,7 @@ class Qwen3_5WeightsTest(absltest.TestCase):
     def test_weight_loading_succeeds(self):
         self.assertIsNotNone(self.jax_model)
 
+    @absltest.skipIf(not _has_cuda_device(), "requires CUDA GPU (default attention backend)")
     def test_prefill_logits_match_hf(self):
         """Single-sequence text-only forward pass should match HuggingFace."""
         token_ids_BT = _random_input(batch_size=1, seq_len=16, vocab_size=HF_TEXT_CFG.vocab_size)
@@ -152,6 +161,7 @@ class Qwen3_5WeightsTest(absltest.TestCase):
         mask = np.ones_like(token_ids_BT, dtype=bool)
         assert_logits_close(self, jax_logits_BTV, hf_logits_BTV, mask)
 
+    @absltest.skipIf(not _has_cuda_device(), "requires CUDA GPU (default attention backend)")
     def test_prefill_logits_match_hf_batched(self):
         """Batched forward pass with left-padding should match HuggingFace.
 
@@ -179,6 +189,7 @@ class Qwen3_5WeightsTest(absltest.TestCase):
         mask = attention_mask_BT.astype(bool)
         assert_logits_close(self, jax_logits_BTV, hf_logits_BTV, mask)
 
+    @absltest.skipIf(not _has_cuda_device(), "requires CUDA GPU (default attention backend)")
     def test_round_trip_preserves_logits(self):
         """Split → merge round-trip should produce identical logits."""
         from flax import nnx
