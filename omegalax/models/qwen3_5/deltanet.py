@@ -41,12 +41,16 @@ def _causal_depthwise_conv1d(
     attention_mask_BT: jax.Array | None = None,
     *,
     return_final_state: bool = False,
+    block_pos_BT: jax.Array | None = None,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """Depthwise causal conv1d.
 
     Args:
         x_BCT: (B, C, T)
         weight_CK: (C, K), per-channel kernel
+        block_pos_BT: optional (B, T) position of each token inside its block; taps that
+            reach before the block start contribute zero, as at a segment start
+            without conv passing.
     Returns:
         (B, C, T)
     """
@@ -67,7 +71,11 @@ def _causal_depthwise_conv1d(
     x_padded = jnp.concatenate([initial_state_BCS, x_BCT], axis=2)
     result = jnp.zeros_like(x_BCT)
     for k in range(K):
-        result = result + weight_CK[None, :, k : k + 1] * x_padded[:, :, k : k + T]
+        term = weight_CK[None, :, k : k + 1] * x_padded[:, :, k : k + T]
+        if block_pos_BT is not None and k < state_len:
+            # Tap k reads token t - (state_len - k).
+            term = jnp.where((block_pos_BT >= state_len - k)[:, None, :], term, 0.0)
+        result = result + term
     if return_final_state:
         if state_len == 0:
             return result, jnp.zeros((B, C, 0), dtype=x_BCT.dtype)
@@ -186,6 +194,7 @@ class GatedDeltaNet(nnx.Module):
         *,
         return_final_state: bool = False,
         return_conv_state: bool = False,
+        block_pos_BT: jax.Array | None = None,
     ) -> jax.Array | tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
         if attention_mask_BT is not None and attention_mask_BT.shape[1] > 1:
             hidden_BTD = hidden_BTD * attention_mask_BT[:, :, None]
@@ -222,6 +231,7 @@ class GatedDeltaNet(nnx.Module):
             initial_state_BCS=initial_conv_state_BCS,
             attention_mask_BT=attention_mask_BT,
             return_final_state=return_conv_state,
+            block_pos_BT=block_pos_BT,
         )
         if return_conv_state:
             mixed_qkv_BCT, final_conv_state_BCS = conv_result
