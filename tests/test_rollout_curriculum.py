@@ -126,7 +126,7 @@ class RolloutCurriculumTest(unittest.TestCase):
             "warmup_end_update": 1,
             "preanneal_update": 2,
             "checkpoint_updates": [3],
-            "lr": {"peak": 2e-5},
+            "lr": {"peak": 2e-5, "warmup_token_fraction": 0.02, "decay_token_fraction": 0.1},
         }
         plan["plan_sha256"] = _json_sha256(plan)
 
