@@ -2,6 +2,7 @@
 
 import dataclasses
 import os
+import tempfile
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
@@ -36,7 +37,8 @@ class CheckpointRestoreUpcastTest(absltest.TestCase):
         old = _optimizer(jnp.bfloat16)
         old.update(jax.tree.map(lambda p: jnp.ones_like(p) * 1e-3, nnx.state(old.model, nnx.Param)))
         saved = _curriculum_train_state(old, rng, global_step=7, phase_idx=1, phase_step=3)
-        path = os.path.join(self.create_tempdir().full_path, "ckpt")
+        # create_tempdir needs parsed absl flags, which `python -m unittest` does not provide.
+        path = os.path.join(self.enterContext(tempfile.TemporaryDirectory()), "ckpt")
         checkpointer = ocp.PyTreeCheckpointer()
         checkpointer.save(path, saved)
 

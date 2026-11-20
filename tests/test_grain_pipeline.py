@@ -220,7 +220,8 @@ class GrainPipelineTest(absltest.TestCase):
                 handler_registry=handler_registry,
             )
 
-            train_state = {"step": np.asarray(1, dtype=np.int32)}
+            # Train states hold sharded jax arrays, as in the trainer.
+            train_state = {"step": jnp.asarray(1, dtype=jnp.int32)}
             manager.save(1, args=checkpoint_utils.make_grain_save_args(train_state, iterator))
             manager.wait_until_finished()
 
@@ -240,7 +241,9 @@ class GrainPipelineTest(absltest.TestCase):
                 dp_size=1,
                 fsdp_size=1,
             )
-            abstract_state = {"step": jax.ShapeDtypeStruct((), jnp.int32)}
+            abstract_state = {
+                "step": jax.ShapeDtypeStruct((), jnp.int32, sharding=train_state["step"].sharding)
+            }
             restored = manager.restore(
                 1,
                 args=checkpoint_utils.make_grain_restore_args(abstract_state, restored_iterator),

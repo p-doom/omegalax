@@ -301,6 +301,13 @@ def resolve_eval_config(
         )
 
     contract, contract_hash = loaded
+    routing = contract.get("training_statepassing_config", {}).get("gdn_state_routing")
+    if routing not in (None, "same_layer"):
+        # The eval hands every GDN layer its own state (same_layer routing).
+        raise ValueError(
+            f"Checkpoint was trained with gdn_state_routing={routing!r}; the evaluation supports "
+            "only same_layer routing"
+        )
     contract_config = _contract_eval_config(contract, int(checkpoint_step))
     if manual_config is not None:
         _validate_manual_config(manual_config)

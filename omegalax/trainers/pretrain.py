@@ -753,8 +753,21 @@ def make_pretrain_train_step(
                 return kl_sum / loss_denominator + aux_loss, metrics
 
             (loss, aux_metrics), grads = nnx.value_and_grad(loss_fn, has_aux=True)(optimizer.model)
+            # The update clips and applies the mean of its microbatch gradients (MultiSteps'
+            # running mean); its norm after the last microbatch is the clipped quantity.
+            update_grad = nnx.pure(nnx.state(grads, optimizer.wrt))
+            opt_state = nnx.pure(optimizer.opt_state)
+            if isinstance(opt_state, optax.MultiStepsState):
+                count = (opt_state.mini_step + 1).astype(jnp.float32)
+                update_grad = jax.tree.map(
+                    lambda a, g: a + (g.astype(jnp.float32) - a) / count,
+                    opt_state.acc_grads,
+                    update_grad,
+                )
+            update_grad_norm = optax.tree.norm(update_grad)
             optimizer.update(grads)
             metrics = dict(aux_metrics)
+            metrics["update_grad_norm"] = update_grad_norm
             metrics["grad_norm"] = optax.tree.norm(grads)
             return loss, metrics
 
@@ -1226,6 +1239,13 @@ def run_pretrain(
             -common_update_plan["chains_per_update"] // PLANNED_MICROBATCH_CHAINS
         ):
             raise ValueError("Accumulation must match common plan groups of four chains")
+        if train_cfg.learning_rate != common_update_plan["lr"]["peak"]:
+            # The plan's token schedule replaces the TrainConfig schedule; a different
+            # learning_rate would be recorded in the contracts but never applied.
+            raise ValueError(
+                f"learning_rate={train_cfg.learning_rate} differs from the common plan's peak "
+                f"lr {common_update_plan['lr']['peak']}"
+            )
         if pretrain_mode is not PretrainMode.STATEPASSING_BPTT:
             raise ValueError("Common comparison requires full BPTT mode")
         if (
@@ -1424,6 +1444,19 @@ def run_pretrain(
             restore_input_iter=restore_input_iter,
         )
         rng = jax.device_put(rng, replicated_rng_sharding)
+        if common_update_plan is not None and save_path is not None and is_primary_process:
+            import json
+
+            # A restart from an older checkpoint replays the updates after it; their rows from
+            # the abandoned attempt are dropped so that each update is recorded once.
+            for name in ("update_metrics.jsonl", "update_identities.jsonl"):
+                side_file = save_path / name
+                if side_file.exists():
+                    rows = side_file.read_text().splitlines(keepends=True)
+                    kept = [row for row in rows if json.loads(row)["step"] <= start_step]
+                    if len(kept) != len(rows):
+                        side_file.with_suffix(".tmp").write_text("".join(kept))
+                        side_file.with_suffix(".tmp").replace(side_file)
 
     local_stop_step = (
         train_cfg.num_steps if stop_after_local_step is None else int(stop_after_local_step)
@@ -1497,9 +1530,7 @@ def run_pretrain(
     _autotune_ctx = autotune_result if autotune_result is not None else contextlib.nullcontext()
     _autotune_ctx.__enter__()
 
-    val_initial_state = (
-        val_data_iter.get_state() if teacher_objective and val_data_iter is not None else None
-    )
+    val_initial_state = val_data_iter.get_state() if val_data_iter is not None else None
 
     startup_log(f"entering pretrain loop mode={pretrain_mode}")
     for step_idx in range(start_step, local_stop_step):
@@ -1602,6 +1633,11 @@ def run_pretrain(
             else _finalize_accumulated_metrics(accum)
         )
         window_metrics["grad_norm"] = accum_grad_norm / accum_steps
+        # Stop before a non-finite update is logged as a result or checkpointed.
+        if not all(np.isfinite(float(window_metrics[k])) for k in ("loss", "grad_norm")):
+            raise FloatingPointError(f"Nonfinite update {step}: {window_metrics}")
+        if teacher_objective:
+            window_metrics["update_grad_norm"] = _host_float(metrics["update_grad_norm"])
         window_metrics["lr"] = current_lr
         if block_len is not None:
             window_metrics["block_len"] = block_len
@@ -1639,7 +1675,8 @@ def run_pretrain(
             import math
 
             if not all(
-                math.isfinite(float(window_metrics[k])) for k in ("teacher_kl", "grad_norm", "lr")
+                math.isfinite(float(window_metrics[k]))
+                for k in ("teacher_kl", "grad_norm", "update_grad_norm", "lr")
             ):
                 raise FloatingPointError(f"Nonfinite common update {step}: {window_metrics}")
             global_tokens_per_step = common_update_plan["updates"][step_idx]["context_tokens"]
@@ -1703,17 +1740,13 @@ def run_pretrain(
             val_block_lens = [None] if val_every and step % val_every == 0 else []
         for val_block_len in val_block_lens if val_data_iter is not None else []:
             val_acc = {}
-            if teacher_objective:
-                # Every teacher validation replays the same deterministic val batches; a
-                # finite val iterator ends the pass early instead of failing.
-                val_data_iter.set_state(val_initial_state)
+            # Every validation replays the same deterministic val batches, also after a resume;
+            # a finite val iterator ends the pass early instead of failing.
+            val_data_iter.set_state(val_initial_state)
             for _ in range(val_steps):
-                if teacher_objective:
-                    raw_val_batch = next(val_data_iter, None)
-                    if raw_val_batch is None:
-                        break
-                else:
-                    raw_val_batch = next(val_data_iter)
+                raw_val_batch = next(val_data_iter, None)
+                if raw_val_batch is None:
+                    break
                 val_batch, _, _ = prepare_pretrain_batch(
                     raw_val_batch,
                     pretrain_mode,
@@ -1760,10 +1793,9 @@ def run_pretrain(
 
         if requeue_requested():
             startup_log(f"[signal] saving checkpoint at step={step} after signal")
+            _log_prev_metrics(force=True)
             if checkpoint_manager is not None:
-                if not save_this_update and (
-                    common_update_plan is None or step <= common_update_plan["preanneal_update"]
-                ):
+                if not save_this_update:
                     _save_sft_checkpoint(
                         checkpoint_manager,
                         optimizer,
@@ -1776,10 +1808,11 @@ def run_pretrain(
                 checkpoint_manager.wait_until_finished()
                 checkpoint_manager.close()
             if step < local_stop_step:
+                if wandb_run is not None and is_primary_process:
+                    wandb_run.finish()
                 _request_slurm_requeue_if_primary(is_primary_process)
                 _autotune_ctx.__exit__(None, None, None)
                 return optimizer, last_metrics
-            _log_prev_metrics(force=True)
             _autotune_ctx.__exit__(None, None, None)
             return optimizer, last_metrics
 
@@ -1849,6 +1882,14 @@ def run_statepassing_curriculum(
     total_phase_steps = sum(phase_steps_by_c[num_segments] for num_segments in train_order)
     if total_phase_steps <= 0:
         raise ValueError("Curriculum has no training steps")
+    # The loss rejects a BPTT span longer than the chain; check every phase before training
+    # instead of failing at the switch to the first shorter phase.
+    shortest_c = min(c for c in train_order if phase_steps_by_c[c] > 0)
+    if bptt_chunks is not None and not 0 <= bptt_chunks <= shortest_c:
+        raise ValueError(
+            f"bptt_chunks must be in [0, {shortest_c}] for curriculum phases {train_order}, "
+            f"got {bptt_chunks}"
+        )
     if train_cfg.num_steps != total_phase_steps:
         train_cfg = dataclasses.replace(train_cfg, num_steps=total_phase_steps)
 
@@ -2053,6 +2094,8 @@ def run_statepassing_curriculum(
                 )
             window_metrics = _finalize_accumulated_metrics(accum)
             window_metrics["grad_norm"] = accum_grad_norm / accum_steps
+            if not all(math.isfinite(float(window_metrics[k])) for k in ("loss", "grad_norm")):
+                raise FloatingPointError(f"Nonfinite update {step}: {window_metrics}")
             window_metrics["lr"] = current_lr
             window_metrics["total_tokens"] = step * global_tokens_per_step
             window_metrics["data_wait_s"] = accum_data_wait_s
@@ -2098,18 +2141,21 @@ def run_statepassing_curriculum(
                 startup_log(
                     f"[signal] saving curriculum checkpoint at step={global_step} before requeue"
                 )
+                _log_prev_metrics(force=True)
                 if checkpoint_manager is not None:
-                    _save_curriculum_checkpoint(
-                        checkpoint_manager,
-                        optimizer,
-                        rng,
-                        global_step=global_step,
-                        phase_idx=phase_idx,
-                        phase_step=phase_step,
-                        input_iter=data_iter,
-                        lr_contract=lr_contract,
-                        force=True,
-                    )
+                    # The periodic save may already have written this step.
+                    if checkpoint_manager.latest_step() != global_step:
+                        _save_curriculum_checkpoint(
+                            checkpoint_manager,
+                            optimizer,
+                            rng,
+                            global_step=global_step,
+                            phase_idx=phase_idx,
+                            phase_step=phase_step,
+                            input_iter=data_iter,
+                            lr_contract=lr_contract,
+                            force=True,
+                        )
                     checkpoint_manager.wait_until_finished()
                     checkpoint_manager.close()
                 _request_slurm_requeue_if_primary(is_primary_process)
@@ -2118,7 +2164,8 @@ def run_statepassing_curriculum(
         next_phase_idx = _first_runnable_phase(phase_idx + 1)
         if next_phase_idx < len(train_order):
             data_iter = phase_iter_factory(int(train_order[next_phase_idx]))
-            if checkpoint_manager is not None:
+            # A run resumed from a signal checkpoint on the phase's last step already has it.
+            if checkpoint_manager is not None and checkpoint_manager.latest_step() != global_step:
                 _save_curriculum_checkpoint(
                     checkpoint_manager,
                     optimizer,
@@ -2138,7 +2185,11 @@ def run_statepassing_curriculum(
     _log_prev_metrics(force=True)
 
     if checkpoint_manager is not None:
-        if global_step and (not save_every or global_step % save_every != 0):
+        if (
+            global_step
+            and (not save_every or global_step % save_every != 0)
+            and checkpoint_manager.latest_step() != global_step
+        ):
             _save_curriculum_checkpoint(
                 checkpoint_manager,
                 optimizer,

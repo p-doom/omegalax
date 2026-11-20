@@ -230,6 +230,8 @@ def finalize_experts(
     *,
     num_experts: int,
     jax_layer_prefix: str = "layers",
+    mesh: Mesh | None = None,
+    pspec_dict: dict[str, Any] | None = None,
 ) -> None:
     """Verify expert fill counts, convert to JAX, and assign into state_dict."""
     for key in list(expert_arrays.keys()):
@@ -246,6 +248,8 @@ def finalize_experts(
             f"{jax_layer_prefix}.{layer_idx}.mlp.{proj_name}",
             value,
             f"expert layer {layer_idx} {proj_name}",
+            mesh=mesh,
+            pspec_dict=pspec_dict,
         )
     for layer_idx, router_tensor in router_buf.items():
         value = jnp.asarray(router_tensor.T)
@@ -254,6 +258,8 @@ def finalize_experts(
             f"{jax_layer_prefix}.{layer_idx}.mlp.router.kernel",
             value,
             f"router layer {layer_idx}",
+            mesh=mesh,
+            pspec_dict=pspec_dict,
         )
 
 

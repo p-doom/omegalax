@@ -11,6 +11,7 @@ import tempfile
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import torch
@@ -47,6 +48,13 @@ HF_SMOKE_CFG = HFQwen3Config(
     tie_word_embeddings=False,
     hidden_act="silu",
 )
+
+
+def _has_cuda_device() -> bool:
+    try:
+        return any(device.platform == "gpu" for device in jax.devices())
+    except Exception:
+        return False
 
 
 def _random_input(batch_size: int = 1, seq_len: int = 16, vocab_size: int = 1024, pad_id: int = 0):
@@ -96,6 +104,7 @@ class Qwen3DenseSmokeTest(absltest.TestCase):
     def test_weight_loading_succeeds(self):
         self.assertIsNotNone(self.jax_model)
 
+    @absltest.skipIf(not _has_cuda_device(), "requires CUDA GPU (default attention backend)")
     def test_prefill_logits_match_hf(self):
         token_ids_BT = _random_input(batch_size=1, seq_len=16, vocab_size=HF_SMOKE_CFG.vocab_size)
         attention_mask_BT = (token_ids_BT != self.pad_id).astype(np.int64)
@@ -112,6 +121,7 @@ class Qwen3DenseSmokeTest(absltest.TestCase):
         mask = attention_mask_BT.astype(bool)
         assert_logits_close(self, jax_logits_BTV, hf_logits_BTV, mask)
 
+    @absltest.skipIf(not _has_cuda_device(), "requires CUDA GPU (default attention backend)")
     def test_prefill_logits_match_hf_batched(self):
         token_ids_a_BT = _random_input(batch_size=1, seq_len=16, vocab_size=HF_SMOKE_CFG.vocab_size)
         token_ids_b_BT = _random_input(batch_size=1, seq_len=10, vocab_size=HF_SMOKE_CFG.vocab_size)
@@ -133,6 +143,7 @@ class Qwen3DenseSmokeTest(absltest.TestCase):
         mask = attention_mask_BT.astype(bool)
         assert_logits_close(self, jax_logits_BTV, hf_logits_BTV, mask)
 
+    @absltest.skipIf(not _has_cuda_device(), "requires CUDA GPU (default attention backend)")
     def test_round_trip_preserves_logits(self):
         from flax import nnx
 

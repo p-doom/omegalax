@@ -283,7 +283,9 @@ class TrainingContractTest(absltest.TestCase):
                 "horizon_by_step": [{"start_step": 1, "end_step": None, "c_train": 4}],
             }
             ensure_training_contract(checkpoint, contract)
-            resolved_checkpoint = SimpleNamespace(root=checkpoint.resolve(), step=12)
+            resolved_checkpoint = SimpleNamespace(
+                root=checkpoint.resolve(), step=12, step_path=checkpoint.resolve() / "000012"
+            )
             with mock.patch.object(
                 runner,
                 "resolve_checkpoint",

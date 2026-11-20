@@ -80,6 +80,15 @@ def resolve_checkpoint(path: str | Path) -> ResolvedCheckpoint:
     )
 
 
+def _leaf_paths(tree) -> set[str]:
+    # Saved nnx variables carry a trailing "value" key that the pure model state does not.
+    paths = set()
+    for path, _ in jax.tree_util.tree_flatten_with_path(tree)[0]:
+        keys = [str(getattr(key, "key", getattr(key, "idx", key))) for key in path]
+        paths.add("/".join(keys[:-1] if keys[-1] == "value" else keys))
+    return paths
+
+
 def restore_model_params(model: nnx.Module, checkpoint: ResolvedCheckpoint) -> nnx.Module:
     """Restore only ``train_state/optimizer/model`` into an initialized model."""
     mesh = ensure_mesh()
@@ -136,6 +145,17 @@ def restore_model_params(model: nnx.Module, checkpoint: ResolvedCheckpoint) -> n
         )
         manager = _checkpoint_manager(checkpoint.root)
         try:
+            # partial_restore ignores checkpoint leaves the model lacks and leaves model leaves
+            # the checkpoint lacks as placeholders; both mean the trees do not belong together.
+            saved = manager.item_metadata(checkpoint.step)["train_state"]["optimizer"]["model"]
+            saved_paths = _leaf_paths(saved)
+            model_paths = _leaf_paths(nnx.to_pure_dict(nnx.state(model)))
+            if saved_paths != model_paths:
+                raise ValueError(
+                    f"Checkpoint {checkpoint.step_path} does not match the model's parameter "
+                    f"tree; only in the checkpoint: {sorted(saved_paths - model_paths)[:5]}, "
+                    f"only in the model: {sorted(model_paths - saved_paths)[:5]}"
+                )
             restored = manager.restore(
                 checkpoint.step,
                 args=ocp.args.Composite(

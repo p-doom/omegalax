@@ -289,6 +289,14 @@ def _make_iterator(
         grain_read_threads=FLAGS.grain_read_threads,
         grain_read_prefetch_buffer_size=FLAGS.grain_read_prefetch_buffer_size,
     )
+    # Each process loads one data shard of per_process_batch rows; a shard without a loading
+    # process is never read, an extra process duplicates another process's rows.
+    if common["dp_size"] * common["fsdp_size"] != jax.process_count():
+        raise ValueError(
+            f"Iterator data shards iterator_dp_size={common['dp_size']} x "
+            f"iterator_fsdp_size={common['fsdp_size']} must equal the "
+            f"{jax.process_count()} loading processes."
+        )
     if mode is pretrain_trainer.PretrainMode.IID_BASELINE:
         return make_iid_iterator(index_path, **common)
     return make_statepassing_iterator(
@@ -657,6 +665,12 @@ def main(_) -> None:
         f"lr_schedule_steps={train_cfg.lr_schedule_steps!r} "
         f"warmup_steps={train_cfg.warmup_steps}"
     )
+    if train_cfg.warmup_steps >= train_cfg.resolved_lr_schedule_steps:
+        startup_log(
+            f"WARNING: warmup_steps={train_cfg.warmup_steps} (--warmup_tokens="
+            f"{FLAGS.warmup_tokens}) is not shorter than the {train_cfg.resolved_lr_schedule_steps} "
+            "schedule steps; the learning rate never reaches its peak"
+        )
     lr_contract_explicit_fields = _explicit_lr_contract_fields()
     resume_mode = ResumeMode(FLAGS.resume)
     save_dir = (

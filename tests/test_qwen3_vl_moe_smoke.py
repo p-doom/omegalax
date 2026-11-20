@@ -6,6 +6,7 @@ import tempfile
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import torch
@@ -24,6 +25,13 @@ _JNP_TO_TORCH = {
     jnp.bfloat16: torch.bfloat16,
     jnp.float16: torch.float16,
 }
+
+
+def _has_cuda_device() -> bool:
+    try:
+        return any(device.platform == "gpu" for device in jax.devices())
+    except Exception:
+        return False
 
 
 def _random_tokens(batch: int, seq: int, vocab: int, seed: int = 0):
@@ -117,6 +125,7 @@ class Qwen3VLMoeSmokeTest(absltest.TestCase):
         torch_dtype = _JNP_TO_TORCH[cls.jax_cfg.dtype]
         cls.hf_model = hf_model.to(torch_dtype)
 
+    @absltest.skipIf(not _has_cuda_device(), "requires CUDA GPU (default attention backend)")
     def test_forward_logits_match_hf(self):
         token_ids_BT = _random_tokens(
             batch=1, seq=8, vocab=self.config_dict["text_config"]["vocab_size"]

@@ -228,6 +228,35 @@ print(json.dumps({
         self.assertEqual(output["grain_workers"], 3)
         self.assertTrue(output["shuffle"])
 
+    def test_make_iterator_rejects_shards_without_loading_process(self):
+        # Regression P2: one process with iterator_fsdp_size=8 read only every eighth window.
+        output = self._run_train_script_probe(
+            """
+import json
+from absl.testing import flagsaver
+from scripts import train_text_pretrain
+from omegalax.trainers.pretrain import PretrainMode
+
+train_text_pretrain.FLAGS(["probe", "--train_index_path=/idx"])
+
+with flagsaver.flagsaver(iterator_dp_size=None, iterator_fsdp_size=8):
+    try:
+        train_text_pretrain._make_iterator(
+            "/idx", PretrainMode.STATEPASSING_BPTT, 12, shuffle=True
+        )
+        error = None
+    except ValueError as raised:
+        error = str(raised)
+
+print(json.dumps({"error": error}))
+"""
+        )
+
+        self.assertIn(
+            "iterator_dp_size=1 x iterator_fsdp_size=8 must equal the 1 loading processes",
+            output["error"],
+        )
+
     def test_iterator_migration_applies_to_train_not_validation(self):
         output = self._run_train_script_probe(
             """
