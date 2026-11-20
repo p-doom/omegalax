@@ -186,23 +186,28 @@ def export_qwen3_5_to_safetensors(
         if not cfg.text_config.is_moe:
             return False
 
-        # MoE expert fused gate/up: stored as-is (E, 2F, D)
-        m = re.fullmatch(r"text\.layers\.([0-9]+)\.mlp\.gate_up_proj", jax_key)
+        # MoE experts: gate_proj and up_proj (E, D, F) -> fused HF gate_up_proj (E, 2F, D),
+        # the inverse of the loader's split.
+        m = re.fullmatch(r"text\.layers\.([0-9]+)\.mlp\.(gate_proj|up_proj)", jax_key)
         if m:
             layer_idx = m.group(1)
-            arr = np.asarray(jax.device_get(value))
-            hf_tensors[f"model.language_model.layers.{layer_idx}.mlp.experts.gate_up_proj"] = (
-                arr.astype(np.float32)
-            )
+            if m.group(2) == "gate_proj":
+                gate_EDF = np.asarray(jax.device_get(value))
+                up_EDF = np.asarray(
+                    jax.device_get(flat_state[f"text.layers.{layer_idx}.mlp.up_proj"])
+                )
+                hf_tensors[f"model.language_model.layers.{layer_idx}.mlp.experts.gate_up_proj"] = (
+                    np.concatenate([gate_EDF.swapaxes(1, 2), up_EDF.swapaxes(1, 2)], axis=1)
+                ).astype(np.float32)
             return True
 
-        # MoE expert down_proj: stored as-is (E, D, F)
+        # MoE expert down_proj: JAX (E, F, D) -> HF (E, D, F)
         m = re.fullmatch(r"text\.layers\.([0-9]+)\.mlp\.down_proj", jax_key)
         if m:
             layer_idx = m.group(1)
             arr = np.asarray(jax.device_get(value))
             hf_tensors[f"model.language_model.layers.{layer_idx}.mlp.experts.down_proj"] = (
-                arr.astype(np.float32)
+                arr.swapaxes(1, 2).astype(np.float32)
             )
             return True
 

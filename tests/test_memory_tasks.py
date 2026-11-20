@@ -51,14 +51,18 @@ from omegalax.models.shard_config import ShardConfig
 from omegalax.text import api as text_api
 from omegalax.trainers import pretrain as pretrain_trainer
 from omegalax.trainers import checkpoint_utils
-from scripts import (
+
+# eval_memory_tasks imports structured_interference_compat from its own directory, which is on
+# sys.path when it runs as a script.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+from scripts import (  # noqa: E402
     audit_memory_task_overlap,
     build_memory_task_eval_manifest,
     eval_memory_tasks,
     train_memory_tasks,
 )
-from scripts.train_memory_tasks import TrainingCondition, training_layout
-from scripts.eval_memory_tasks import (
+from scripts.train_memory_tasks import TrainingCondition, training_layout  # noqa: E402
+from scripts.eval_memory_tasks import (  # noqa: E402
     _canonical_json_sha256,
     _ensure_not_complete,
     _plot,
@@ -68,7 +72,7 @@ from scripts.eval_memory_tasks import (
     _write_mirror_file,
     summarize_rows,
 )
-from tests.pretrain_real_data_test_utils import test_temp_dir
+from tests.pretrain_real_data_test_utils import test_temp_dir  # noqa: E402
 
 
 def _tiny_gdn_config() -> Qwen3_5TextConfig:
@@ -1347,11 +1351,11 @@ class MemoryTaskTest(parameterized.TestCase):
                 options=ocp.CheckpointManagerOptions(save_interval_steps=1),
                 handler_registry=registry,
             )
+            # Train states hold sharded jax arrays, as in the trainer.
+            step = jnp.asarray(1, dtype=jnp.int32)
             manager.save(
                 1,
-                args=checkpoint_utils.make_grain_save_args(
-                    {"step": np.asarray(1, dtype=np.int32)}, iterator
-                ),
+                args=checkpoint_utils.make_grain_save_args({"step": step}, iterator),
             )
             manager.wait_until_finished()
 
@@ -1367,7 +1371,7 @@ class MemoryTaskTest(parameterized.TestCase):
             restored_state = manager.restore(
                 1,
                 args=checkpoint_utils.make_grain_restore_args(
-                    {"step": jax.ShapeDtypeStruct((), jnp.int32)}, restored
+                    {"step": jax.ShapeDtypeStruct((), jnp.int32, sharding=step.sharding)}, restored
                 ),
             )
             restored = checkpoint_utils.restored_input_iter(restored_state)

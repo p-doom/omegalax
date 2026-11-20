@@ -49,7 +49,11 @@ from omegalax.text.checkpoint import (
     resolve_checkpoint,
     restore_model_params,
 )
-from omegalax.training_contract import ManualEvalConfig, resolve_eval_config
+from omegalax.training_contract import (
+    ManualEvalConfig,
+    load_training_contract,
+    resolve_eval_config,
+)
 
 
 _CONDITIONS = {
@@ -112,13 +116,15 @@ def resolve_checkpoint_eval_request(request: CheckpointEvalRequest) -> Checkpoin
         checkpoint_root = checkpoint.root
         checkpoint_step = checkpoint.step
     except ValueError:
+        checkpoint = None
         run_dir = _result_dir_from_checkpoint_request(request.checkpoint)
         identity = _identity_from_path(run_dir / "eval_config.json")
         checkpoint_root = Path(identity.checkpoint_root)
         checkpoint_step = identity.checkpoint_step
     config = resolve_eval_config(checkpoint_root, checkpoint_step, request.manual_config)
     return CheckpointEvalSpec(
-        checkpoint=request.checkpoint,
+        # The resolved config belongs to this step; a root would later resolve to a newer one.
+        checkpoint=checkpoint.step_path if checkpoint is not None else request.checkpoint,
         c_train=config.c_train,
         pass_gdn_state=config.pass_gdn_state,
         gdn_layer_limit=config.gdn_layer_limit,
@@ -1348,6 +1354,19 @@ def run_checkpoint_eval(
         raise ValueError(
             f"batch_size={batch_size} must be divisible by fsdp_size*dp_size={fsdp_size * dp_size}"
         )
+    loaded = load_training_contract(resolve_checkpoint(spec.checkpoint).root)
+    if loaded is not None:
+        # Rollout-teacher contracts record the training segment length; the eval hands the state
+        # over at manifest chunk boundaries and counts c_train in those chunks.
+        contract = loaded[0]
+        segment_length = contract.get("teacher_distillation", {}).get(
+            "segment_length", contract.get("train_config", {}).get("seq_len")
+        )
+        if segment_length is not None and int(segment_length) != manifest.chunk_length:
+            raise ValueError(
+                f"Training segment length {segment_length} differs from the manifest chunk "
+                f"length {manifest.chunk_length}"
+            )
     applicable = applicable_experiments(spec)
     if selected_experiments is None:
         selected_experiments = applicable

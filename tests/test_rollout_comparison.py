@@ -79,7 +79,7 @@ class CommonUpdateTest(unittest.TestCase):
             "warmup_end_update": 1,
             "preanneal_update": 2,
             "checkpoint_updates": [1, 2, 3],
-            "lr": {"peak": 2e-5},
+            "lr": {"peak": 2e-5, "warmup_token_fraction": 0.02, "decay_token_fraction": 0.1},
         }
         plan["plan_sha256"] = _json_sha256(plan)
         iterator = lambda: make_planned_rollout_teacher_iterator(plan, segment_length=512)
@@ -266,7 +266,9 @@ cli.main()
             (root / "scontrol.log").read_text(), f"requeue {os.environ['SLURM_JOB_ID']}\n"
         )
         self.assertTrue((root / "cli" / "000001").is_dir())
-        self.assertEqual(list((root / "cli").glob("result_step*.json")), [])
+        # The signalled update is logged before the requeue, so its result is written.
+        result = json.loads((root / "cli" / "result_step1.json").read_text())
+        self.assertEqual(result["metrics"]["step"], 1)
         run = subprocess.run(
             [sys.executable, "-c", driver, "none", *cli_args, "--resume", "required"]
             + ["--stop-after-update", "2"],

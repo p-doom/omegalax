@@ -20,6 +20,7 @@ def main():
     if not job or not node or node.split(".")[0] != host:
         raise SystemExit(f"Not a Slurm compute node: {job=} {node=} {host=}")
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--fsdp-size", type=int, choices=[4, 8], default=4)
     parser.add_argument("--plan", required=True)
     parser.add_argument("--segment-length", type=int, choices=[8192, 2048, 512], required=True)
     parser.add_argument("--init-hf-model-path", required=True)
@@ -55,6 +56,10 @@ def main():
     import jax
     import numpy as np
     from flax import nnx
+    import omegalax.data.rollout_teacher_pipeline as pipeline
+
+    # One chain per device: the planned microbatch holds fsdp_size chains.
+    pipeline.PLANNED_MICROBATCH_CHAINS = args.fsdp_size
     from omegalax.data.rollout_teacher_pipeline import (
         load_rollout_update_plan,
         make_planned_rollout_teacher_iterator,
@@ -67,16 +72,20 @@ def main():
         TrainingObjective,
         PretrainMode,
     )
+    import omegalax.trainers.pretrain as trainer
+
+    trainer.PLANNED_MICROBATCH_CHAINS = args.fsdp_size
     from omegalax.trainers.checkpoint_utils import ResumeMode
     from omegalax.trainers.perf import resolve_peak_tflops
 
     if (
         jax.process_count() != 1
-        or len(jax.devices()) != 4
+        or len(jax.devices()) != args.fsdp_size
         or any(d.platform != "gpu" for d in jax.devices())
     ):
         raise SystemExit(
-            "Comparison requires one independent JAX controller with exactly four local GPUs"
+            "Comparison requires one independent JAX controller with exactly "
+            f"{args.fsdp_size} local GPUs"
         )
     plan = load_rollout_update_plan(args.plan)
     C = -(-plan["max_context_tokens"] // args.segment_length)
@@ -103,7 +112,7 @@ def main():
         "checkpoint_updates": plan["checkpoint_updates"],
         "train_config": vars(train_cfg),
         "pretrained_snapshot": str(Path(args.init_hf_model_path).resolve()),
-        "mesh": {"dp": 1, "fsdp": 4, "tp": 1},
+        "mesh": {"dp": 1, "fsdp": args.fsdp_size, "tp": 1},
         "text_attn_backend": args.text_attn_backend,
         "xla_flags": os.environ.get("XLA_FLAGS", ""),
         "objective": "teacher_top512_special_tail_kl",
@@ -116,7 +125,8 @@ def main():
             "eos_id": 248046,
         },
         "horizon_by_step": [{"start_step": 1, "end_step": None, "c_train": C}],
-        "resume": "optimizer update cursor = restored Grain cursor / ceil(chains_per_update / 4); verified before every update",
+        "resume": "optimizer update cursor = restored Grain cursor / ceil(chains_per_update / "
+        f"{args.fsdp_size}); verified before every update",
     }
     ensure_training_contract(output, contract)
     wandb_run = None
@@ -127,6 +137,7 @@ def main():
         suffix = "_nostate_fast" if args.no_state_passing else "_fast"
         wandb_run = wandb.init(
             project=args.wandb_project,
+            entity="pdoom",
             name=f"rollouts_{arm}{suffix}",
             id=f"{plan['plan_sha256'][:12]}_{arm}{suffix}",
             resume="allow",
@@ -149,7 +160,7 @@ def main():
         resume=ResumeMode(args.resume),
         stop_after_local_step=args.stop_after_update,
         tp_size=1,
-        fsdp_size=4,
+        fsdp_size=args.fsdp_size,
         dp_size=1,
         bptt_chunks=None,
         pass_gdn_state=not args.no_state_passing,

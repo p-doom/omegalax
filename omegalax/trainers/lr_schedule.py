@@ -76,11 +76,12 @@ def build_common_token_schedule(plan):
     import jax.numpy as jnp
 
     total = plan["total_context_tokens"]
+    warmup, decay = plan["lr"]["warmup_token_fraction"], plan["lr"]["decay_token_fraction"]
     rates = []
     for update in plan["updates"]:
         fraction = update["cumulative_tokens"] / total
         rates.append(
-            plan["lr"]["peak"] * min(1.0, fraction / 0.02, max(0.0, (1.0 - fraction) / 0.1))
+            plan["lr"]["peak"] * min(1.0, fraction / warmup, max(0.0, (1.0 - fraction) / decay))
         )
     values = jnp.asarray(rates, dtype=jnp.float32)
     return lambda count: values[jnp.minimum(count, len(rates) - 1)]

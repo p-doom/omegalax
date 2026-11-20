@@ -8,6 +8,8 @@ from pathlib import Path
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
 from absl.testing import absltest
+import jax
+import jax.numpy as jnp
 import numpy as np
 import orbax.checkpoint as ocp
 
@@ -336,7 +338,8 @@ class DataMixingTest(absltest.TestCase):
                 ),
                 handler_registry=registry,
             )
-            train_state = {"step": np.asarray(1, dtype=np.int32)}
+            # Train states hold sharded jax arrays, as in the trainer.
+            train_state = {"step": jnp.asarray(1, dtype=jnp.int32)}
             manager.save(1, args=checkpoint_utils.make_grain_save_args(train_state, it))
             manager.wait_until_finished()
 
@@ -351,7 +354,9 @@ class DataMixingTest(absltest.TestCase):
                 num_epochs=None,
                 **_FAST_OPTS,
             )
-            abstract = {"step": np.asarray(0, dtype=np.int32)}
+            abstract = {
+                "step": jax.ShapeDtypeStruct((), jnp.int32, sharding=train_state["step"].sharding)
+            }
             restored = manager.restore(
                 1,
                 args=checkpoint_utils.make_grain_restore_args(abstract, restored_it),
