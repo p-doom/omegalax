@@ -1357,6 +1357,19 @@ def run_pretrain(
             restore_input_iter=restore_input_iter,
         )
         rng = jax.device_put(rng, replicated_rng_sharding)
+        if common_update_plan is not None and save_path is not None and is_primary_process:
+            import json
+
+            # A restart from an older checkpoint replays the updates after it; their rows from
+            # the abandoned attempt are dropped so that each update is recorded once.
+            for name in ("update_metrics.jsonl", "update_identities.jsonl"):
+                side_file = save_path / name
+                if side_file.exists():
+                    rows = side_file.read_text().splitlines(keepends=True)
+                    kept = [row for row in rows if json.loads(row)["step"] <= start_step]
+                    if len(kept) != len(rows):
+                        side_file.with_suffix(".tmp").write_text("".join(kept))
+                        side_file.with_suffix(".tmp").replace(side_file)
 
     local_stop_step = (
         train_cfg.num_steps if stop_after_local_step is None else int(stop_after_local_step)
@@ -1666,10 +1679,9 @@ def run_pretrain(
 
         if requeue_requested():
             startup_log(f"[signal] saving checkpoint at step={step} after signal")
+            _log_prev_metrics(force=True)
             if checkpoint_manager is not None:
-                if not save_this_update and (
-                    common_update_plan is None or step <= common_update_plan["preanneal_update"]
-                ):
+                if not save_this_update:
                     _save_sft_checkpoint(
                         checkpoint_manager,
                         optimizer,
@@ -1682,10 +1694,11 @@ def run_pretrain(
                 checkpoint_manager.wait_until_finished()
                 checkpoint_manager.close()
             if step < local_stop_step:
+                if wandb_run is not None and is_primary_process:
+                    wandb_run.finish()
                 _request_slurm_requeue_if_primary(is_primary_process)
                 _autotune_ctx.__exit__(None, None, None)
                 return optimizer, last_metrics
-            _log_prev_metrics(force=True)
             _autotune_ctx.__exit__(None, None, None)
             return optimizer, last_metrics
 

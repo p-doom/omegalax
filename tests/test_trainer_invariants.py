@@ -58,6 +58,9 @@ class _WandbRecorder:
     def series(self, key):
         return {step: values[key] for step, values in self.rows if key in values}
 
+    def finish(self):
+        pass
+
 
 def _write_doc(root: Path, split: str, n_tokens: int, seed: int) -> None:
     rng = np.random.RandomState(seed)

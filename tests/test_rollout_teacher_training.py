@@ -153,6 +153,9 @@ class _Recorder:
     def values(self, key):
         return {step: values[key] for step, values in self.logs if key in values}
 
+    def finish(self):
+        pass
+
 
 def _recording_prepare(records: list):
     real_prepare = pretrain_trainer.prepare_pretrain_batch

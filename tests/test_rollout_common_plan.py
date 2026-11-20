@@ -15,7 +15,6 @@ import signal
 import subprocess
 import sys
 import tempfile
-import unittest
 from unittest import mock
 
 import jax
@@ -174,6 +173,9 @@ class Recorder:
 
     def steps(self, key):
         return [step for step, values in self.logs if key in values]
+
+    def finish(self):
+        pass
 
 
 def _run(plan, save_dir, recorder=None, train=None, **kwargs):
@@ -770,20 +772,17 @@ class ResumeSideEffectsTest(absltest.TestCase):
         self.assertEqual(run["metrics"], list(range(1, 13)))
         self.assertEqual(run["identities"], list(range(1, 13)))
 
-    # Pins: after a signal before the pre-anneal point and resume, every step reaches W&B exactly once (finding D5 = F4: the step during which the signal arrived is never logged).
-    @unittest.expectedFailure
+    # Pins: after a signal before the pre-anneal point and resume, every step reaches W&B exactly once (regression D5: the step during which the signal arrived was never logged).
     def test_signal_before_preanneal_every_step_reaches_wandb(self):
         self.assertEqual(sorted(set(_interrupted_run("signal_early")["wandb"])), list(range(1, 13)))
 
-    # Pins: after a signal in the decay phase and resume, both side files hold steps 1..12 exactly once (finding D3 = F2: no checkpoint, replayed steps appended twice).
-    @unittest.expectedFailure
+    # Pins: after a signal in the decay phase and resume, both side files hold steps 1..12 exactly once (regression D3: no checkpoint, replayed steps appended twice).
     def test_signal_after_preanneal_side_files_once(self):
         run = _interrupted_run("signal_decay")
         self.assertEqual(run["metrics"], list(range(1, 13)))
         self.assertEqual(run["identities"], list(range(1, 13)))
 
-    # Pins: after a stop without checkpoint in the decay phase and resume, both side files hold steps 1..12 exactly once (finding D4 = F3: append-only side files).
-    @unittest.expectedFailure
+    # Pins: after a stop without checkpoint in the decay phase and resume, both side files hold steps 1..12 exactly once (regression D4: append-only side files).
     def test_stop_without_checkpoint_side_files_once(self):
         run = _interrupted_run("stop_decay")
         self.assertEqual(run["metrics"], list(range(1, 13)))
