@@ -266,7 +266,9 @@ cli.main()
             (root / "scontrol.log").read_text(), f"requeue {os.environ['SLURM_JOB_ID']}\n"
         )
         self.assertTrue((root / "cli" / "000001").is_dir())
-        self.assertEqual(list((root / "cli").glob("result_step*.json")), [])
+        # The signalled update is logged before the requeue, so its result is written.
+        result = json.loads((root / "cli" / "result_step1.json").read_text())
+        self.assertEqual(result["metrics"]["step"], 1)
         run = subprocess.run(
             [sys.executable, "-c", driver, "none", *cli_args, "--resume", "required"]
             + ["--stop-after-update", "2"],
