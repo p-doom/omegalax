@@ -217,6 +217,14 @@ def _make_tail_iterator(
         grain_read_threads=FLAGS.grain_read_threads,
         grain_read_prefetch_buffer_size=FLAGS.grain_read_prefetch_buffer_size,
     )
+    # Each process loads one data shard of per_process_batch rows; a shard without a loading
+    # process is never read, an extra process duplicates another process's rows.
+    if FLAGS.iterator_dp_size * FLAGS.iterator_fsdp_size != jax.process_count():
+        raise ValueError(
+            f"Iterator data shards iterator_dp_size={FLAGS.iterator_dp_size} x "
+            f"iterator_fsdp_size={FLAGS.iterator_fsdp_size} must equal the "
+            f"{jax.process_count()} loading processes."
+        )
     if mode is not PretrainMode.IID_BASELINE:
         iterator_kwargs["excluded_prefix_stride"] = FLAGS.iterator_excluded_prefix_stride
         iterator_kwargs["excluded_prefix_count"] = FLAGS.iterator_excluded_prefix_count
