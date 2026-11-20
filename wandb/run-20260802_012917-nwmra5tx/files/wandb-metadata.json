@@ -1,0 +1,24 @@
+{
+  "os": "Linux-5.14.0-570.128.1.el9_6.x86_64-x86_64-with-glibc2.34",
+  "python": "CPython 3.12.9",
+  "startedAt": "2026-08-01T23:29:17.757985Z",
+  "program": "/fast/home/salan.isaqzoi/gh_projects/p(doom)/omegalax_optimization/Salan_DONT_PUSH/mfu_opt/wandb_backfill.py",
+  "codePath": "Salan_DONT_PUSH/mfu_opt/wandb_backfill.py",
+  "codePathLocal": "Salan_DONT_PUSH/mfu_opt/wandb_backfill.py",
+  "email": "salan.isaqzoi@cdtm.com",
+  "root": "/fast/home/salan.isaqzoi/gh_projects/p(doom)/omegalax_optimization",
+  "host": "hai-login2.haicore.berlin",
+  "executable": "/fast/home/salan.isaqzoi/gh_projects/p(doom)/omegalax_optimization/.venv/bin/python",
+  "cpu_count": 32,
+  "cpu_count_logical": 64,
+  "disk": {
+    "/": {
+      "total": "107306024960",
+      "used": "4344229888"
+    }
+  },
+  "memory": {
+    "total": "133974896640"
+  },
+  "writerId": "xrsk6fojmrorxnd65r8saau4av0u8tdu"
+}

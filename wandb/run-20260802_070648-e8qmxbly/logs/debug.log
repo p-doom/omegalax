@@ -1,0 +1,24 @@
+2026-08-02 07:06:48,559 INFO    MainThread:3623739 [wandb_setup.py:_flush():81] Current SDK version is 0.25.1
+2026-08-02 07:06:48,559 INFO    MainThread:3623739 [wandb_setup.py:_flush():81] Configure stats pid to 3623739
+2026-08-02 07:06:48,560 INFO    MainThread:3623739 [wandb_setup.py:_flush():81] Loading settings from environment variables
+2026-08-02 07:06:48,561 INFO    MainThread:3623739 [wandb_init.py:setup_run_log_directory():717] Logging user logs to /fast/home/salan.isaqzoi/gh_projects/p(doom)/omegalax_optimization/wandb/run-20260802_070648-e8qmxbly/logs/debug.log
+2026-08-02 07:06:48,561 INFO    MainThread:3623739 [wandb_init.py:setup_run_log_directory():718] Logging internal logs to /fast/home/salan.isaqzoi/gh_projects/p(doom)/omegalax_optimization/wandb/run-20260802_070648-e8qmxbly/logs/debug-internal.log
+2026-08-02 07:06:48,562 INFO    MainThread:3623739 [wandb_init.py:init():844] calling init triggers
+2026-08-02 07:06:48,562 INFO    MainThread:3623739 [wandb_init.py:init():849] wandb.init called with sweep_config: {}
+config: {'note': 'alle Benchmarks aus den Slurm-Logs, Median ueber Steps 2..n', '_wandb': {}}
+2026-08-02 07:06:48,563 INFO    MainThread:3623739 [wandb_init.py:init():892] starting backend
+2026-08-02 07:06:48,908 INFO    MainThread:3623739 [wandb_init.py:init():895] sending inform_init request
+2026-08-02 07:06:48,917 INFO    MainThread:3623739 [wandb_init.py:init():903] backend started and connected
+2026-08-02 07:06:48,945 INFO    MainThread:3623739 [wandb_init.py:init():973] updated telemetry
+2026-08-02 07:06:48,951 INFO    MainThread:3623739 [wandb_init.py:init():997] communicating run to backend with 90.0 second timeout
+2026-08-02 07:06:49,651 INFO    MainThread:3623739 [wandb_init.py:init():1042] starting run threads in backend
+2026-08-02 07:06:49,927 INFO    MainThread:3623739 [wandb_run.py:_console_start():2524] atexit reg
+2026-08-02 07:06:49,927 INFO    MainThread:3623739 [wandb_run.py:_redirect():2373] redirect: wrap_raw
+2026-08-02 07:06:49,928 INFO    MainThread:3623739 [wandb_run.py:_redirect():2442] Wrapping output streams.
+2026-08-02 07:06:49,928 INFO    MainThread:3623739 [wandb_run.py:_redirect():2465] Redirects installed.
+2026-08-02 07:06:49,932 INFO    MainThread:3623739 [wandb_init.py:init():1082] run started, returning control to user process
+2026-08-02 07:06:52,779 INFO    MainThread:3623739 [wandb_run.py:_finish():2291] finishing run pdoom/omegalax_mfu/e8qmxbly
+2026-08-02 07:06:52,780 INFO    MainThread:3623739 [wandb_run.py:_atexit_cleanup():2490] got exitcode: 0
+2026-08-02 07:06:52,781 INFO    MainThread:3623739 [wandb_run.py:_restore():2472] restore
+2026-08-02 07:06:52,782 INFO    MainThread:3623739 [wandb_run.py:_restore():2478] restore done
+2026-08-02 07:06:56,225 INFO    MainThread:3623739 [wandb_run.py:_footer_sync_info():3868] logging synced files

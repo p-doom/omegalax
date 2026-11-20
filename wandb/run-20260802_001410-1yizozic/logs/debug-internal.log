@@ -1,0 +1,17 @@
+{"time":"2026-08-02T00:14:10.413023155+02:00","level":"INFO","msg":"wandb-core"}
+{"time":"2026-08-02T00:14:10.417837788+02:00","level":"INFO","msg":"stream: starting","core version":"0.25.1"}
+{"time":"2026-08-02T00:14:10.735102417+02:00","level":"INFO","msg":"stream: created new stream","id":"1yizozic"}
+{"time":"2026-08-02T00:14:10.735696478+02:00","level":"INFO","msg":"handler: started"}
+{"time":"2026-08-02T00:14:10.738071149+02:00","level":"INFO","msg":"stream: started"}
+{"time":"2026-08-02T00:14:10.738089719+02:00","level":"INFO","msg":"sender: started"}
+{"time":"2026-08-02T00:14:10.738087152+02:00","level":"INFO","msg":"writer: started","stream_id":"1yizozic"}
+{"time":"2026-08-02T00:14:11.472076685+02:00","level":"INFO","msg":"filestream: sending request","total_files":1,"console_offset":0,"console_lines":1}
+{"time":"2026-08-02T00:14:11.791080127+02:00","level":"INFO","msg":"filestream: request sent","status":"200 OK"}
+{"time":"2026-08-02T00:14:26.472304686+02:00","level":"INFO","msg":"filestream: sending request","total_files":2,"events_offset":0,"events_lines":2,"console_offset":0,"console_lines":3,"uploaded_len":2}
+{"time":"2026-08-02T00:14:26.863153101+02:00","level":"INFO","msg":"filestream: request sent","status":"200 OK"}
+{"time":"2026-08-02T00:14:41.472259235+02:00","level":"INFO","msg":"filestream: sending request","total_files":1,"events_offset":2,"events_lines":2}
+{"time":"2026-08-02T00:14:41.818874282+02:00","level":"INFO","msg":"filestream: request sent","status":"200 OK"}
+{"time":"2026-08-02T00:14:56.472356851+02:00","level":"INFO","msg":"filestream: sending request","total_files":1,"events_offset":4,"events_lines":2}
+{"time":"2026-08-02T00:14:56.687236611+02:00","level":"INFO","msg":"filestream: request sent","status":"200 OK"}
+{"time":"2026-08-02T00:15:11.472574522+02:00","level":"INFO","msg":"filestream: sending request","total_files":1,"events_offset":6,"events_lines":2}
+{"time":"2026-08-02T00:15:11.780618378+02:00","level":"INFO","msg":"filestream: request sent","status":"200 OK"}

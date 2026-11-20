@@ -1,0 +1,3 @@
+[startup] effective LR contract={'learning_rate': 2e-05, 'warmup_steps': 813, 'lr_schedule': 'wsd', 'lr_end_factor': 0.0, 'lr_stable_fraction': 0.8, 'lr_schedule_steps': 1000} train_stop=10
+[startup] loaded text model parameters from /fast/project/HFMI_SynergyUnit/p-doom_shared/salan/models/Qwen/Qwen3.5-2B
+[startup] entering pretrain loop mode=statepassing_bptt

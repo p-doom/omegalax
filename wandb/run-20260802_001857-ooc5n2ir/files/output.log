@@ -1,0 +1,5 @@
+[startup] effective LR contract={'learning_rate': 2e-05, 'warmup_steps': 678, 'lr_schedule': 'wsd', 'lr_end_factor': 0.0, 'lr_stable_fraction': 0.8, 'lr_schedule_steps': 1000} train_stop=10
+[startup] loaded text model parameters from /fast/project/HFMI_SynergyUnit/p-doom_shared/salan/models/Qwen/Qwen3.5-2B
+[startup] entering pretrain loop mode=statepassing_bptt
+[mfu-mem] step=1 dev=0 peak=77.25GB in_use=9.44GB limit=80.76GB largest_free=0.00GB
+[mfu-mem] step=1 dev=1 peak=77.25GB in_use=9.43GB limit=80.76GB largest_free=0.00GB

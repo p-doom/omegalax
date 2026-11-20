@@ -1,0 +1,39 @@
+_wandb:
+    value:
+        cli_version: 0.25.1
+        e:
+            ek589zc7a94gtz53zkx1noz8d27mjvpg:
+                codePath: Salan_DONT_PUSH/mfu_opt/wandb_backfill.py
+                codePathLocal: Salan_DONT_PUSH/mfu_opt/wandb_backfill.py
+                cpu_count: 32
+                cpu_count_logical: 64
+                disk:
+                    /:
+                        total: "107306024960"
+                        used: "4344229888"
+                email: salan.isaqzoi@cdtm.com
+                executable: /fast/home/salan.isaqzoi/gh_projects/p(doom)/omegalax_optimization/.venv/bin/python
+                host: hai-login2.haicore.berlin
+                memory:
+                    total: "133974896640"
+                os: Linux-5.14.0-570.128.1.el9_6.x86_64-x86_64-with-glibc2.34
+                program: /fast/home/salan.isaqzoi/gh_projects/p(doom)/omegalax_optimization/Salan_DONT_PUSH/mfu_opt/wandb_backfill.py
+                python: CPython 3.12.9
+                root: /fast/home/salan.isaqzoi/gh_projects/p(doom)/omegalax_optimization
+                startedAt: "2026-08-02T06:36:30.059407Z"
+                writerId: ek589zc7a94gtz53zkx1noz8d27mjvpg
+        m: []
+        python_version: 3.12.9
+        t:
+            "3":
+                - 2
+                - 13
+                - 15
+                - 16
+                - 62
+            "4": 3.12.9
+            "5": 0.25.1
+            "12": 0.25.1
+            "13": linux-x86_64
+note:
+    value: alle Benchmarks aus den Slurm-Logs, Median ueber Steps 2..n; loss_ok=False markiert Laeufe mit loss=nan (E49)

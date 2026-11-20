@@ -1,0 +1,397 @@
+'?':
+    value: false
+_wandb:
+    value:
+        cli_version: 0.25.1
+        e:
+            9a9gt0c2va6a8bssmxadm166saayxbuq:
+                args:
+                    - --pretrain_mode=statepassing_bptt
+                    - --init_hf_model_path=/fast/project/HFMI_SynergyUnit/p-doom_shared/salan/models/Qwen/Qwen3.5-2B
+                    - --train_index_path=/fast/project/HFMI_SynergyUnit/p-doom_shared/salan/pretrain_indexes/fineweb_edu_dedup_2048_2kto32k_2048_c6_bptt6_lr3e4_eos248046
+                    - --seq_len=2048
+                    - --batch_size=168
+                    - --grad_accum_steps=1
+                    - --num_steps=10
+                    - --lr_schedule_steps=1000
+                    - --warmup_tokens=100000000
+                    - --learning_rate=2e-5
+                    - --lr_schedule=wsd
+                    - --lr_stable_fraction=0.8
+                    - --lr_end_factor=0.0
+                    - --weight_decay=0.01
+                    - --adam_beta1=0.9
+                    - --adam_beta2=0.95
+                    - --adam_eps=1e-8
+                    - --max_grad_norm=1.0
+                    - --tp_size=1
+                    - --fsdp_size=4
+                    - --dp_size=1
+                    - --iterator_fsdp_size=4
+                    - --iterator_dp_size=1
+                    - --bptt_chunks=6
+                    - --pass_gdn_state=true
+                    - --gdn_state_routing=same_layer
+                    - --pass_rope_positions=false
+                    - --pass_conv_state=false
+                    - --jax_cache_dir=/fast/project/HFMI_SynergyUnit/p-doom_shared/salan/jax_cache/mfu_opt
+                    - --save_every=0
+                    - --log_every=1
+                    - --resume=never
+                    - --text_attn_backend=mosaic_gpu
+                    - --peak_tflops=h100_sxm
+                    - --wandb_entity=pdoom
+                    - --wandb_project=omegalax_mfu
+                    - --wandb_group=mfu_opt
+                    - --wandb_name=valid_g4_v2
+                    - --wandb_tags=c=6,b=168,gpus=4,cascade=1,convbtc=1,remat=none,mu=fp32
+                    - --seed=0
+                    - --text_attn_backend=cudnn
+                codePath: Salan_DONT_PUSH/mfu_opt/run_bench.py
+                codePathLocal: Salan_DONT_PUSH/mfu_opt/run_bench.py
+                cpu_count: 112
+                cpu_count_logical: 224
+                cudaVersion: "13.3"
+                disk:
+                    /:
+                        total: "80463527936"
+                        used: "13343383552"
+                email: salan.isaqzoi@cdtm.com
+                executable: /fast/home/salan.isaqzoi/gh_projects/p(doom)/omegalax_optimization/.venv/bin/python
+                gpu: NVIDIA H100 80GB HBM3
+                gpu_count: 4
+                gpu_nvidia:
+                    - architecture: Hopper
+                      cudaCores: 16896
+                      memoryTotal: "85520809984"
+                      name: NVIDIA H100 80GB HBM3
+                      uuid: GPU-c173752b-4483-0652-e505-83708d4e2880
+                    - architecture: Hopper
+                      cudaCores: 16896
+                      memoryTotal: "85520809984"
+                      name: NVIDIA H100 80GB HBM3
+                      uuid: GPU-d0861de5-2397-071a-27f4-fa4d7e6bef42
+                    - architecture: Hopper
+                      cudaCores: 16896
+                      memoryTotal: "85520809984"
+                      name: NVIDIA H100 80GB HBM3
+                      uuid: GPU-562602d0-78ee-4b3b-53d2-417586afe38a
+                    - architecture: Hopper
+                      cudaCores: 16896
+                      memoryTotal: "85520809984"
+                      name: NVIDIA H100 80GB HBM3
+                      uuid: GPU-d11e6d14-7546-a32c-fd4e-e4b99059c717
+                host: hai004.haicore.berlin
+                memory:
+                    total: "1081088712704"
+                os: Linux-5.14.0-570.128.1.el9_6.x86_64-x86_64-with-glibc2.34
+                program: /fast/home/salan.isaqzoi/gh_projects/p(doom)/omegalax_optimization/Salan_DONT_PUSH/mfu_opt/run_bench.py
+                python: CPython 3.12.9
+                root: /fast/home/salan.isaqzoi/gh_projects/p(doom)/omegalax_optimization
+                slurm:
+                    cluster_name: haicore
+                    conf: /etc/slurm/slurm.conf
+                    cpu_bind: quiet,mask_cpu:0x00000414000404140004001004140000041400040414000400100414
+                    cpu_bind_list: 0x00000414000404140004001004140000041400040414000400100414
+                    cpu_bind_type: 'mask_cpu:'
+                    cpu_bind_verbose: quiet
+                    cpus_on_node: "48"
+                    cpus_per_task: "24"
+                    distribution: cyclic
+                    gpus_on_node: "4"
+                    gtids: "0"
+                    interact_port: "18084"
+                    job_account: hfmi_synergyunit
+                    job_cpus_per_node: "24"
+                    job_end_time: "1785649814"
+                    job_exclusive: "NO"
+                    job_gid: "961800107"
+                    job_gpus: 4,5,6,7
+                    job_group: salan.isaqzoi
+                    job_id: "136866"
+                    job_name: mfuopt_valid_g4_v2
+                    job_nodelist: hai004
+                    job_num_nodes: "1"
+                    job_oversubscribe: "NO"
+                    job_partition: standard
+                    job_qos: normal
+                    job_sluid: s4VDKZ088GVF00
+                    job_start_time: "1785647414"
+                    job_uid: "961800107"
+                    job_user: salan.isaqzoi
+                    jobid: "136866"
+                    launch_node_ipaddr: 10.86.2.40
+                    localid: "0"
+                    mem_per_node: "122880"
+                    nnodes: "1"
+                    nodeid: "0"
+                    nodelist: hai004
+                    nprocs: "1"
+                    ntasks: "1"
+                    ntasks_per_node: "1"
+                    oom_kill_step: "0"
+                    prio_process: "0"
+                    procid: "0"
+                    srun_comm_host: 10.86.2.40
+                    srun_comm_port: "61084"
+                    step_gpus: 4,5,6,7
+                    step_id: "0"
+                    step_launcher_port: "61084"
+                    step_nodelist: hai004
+                    step_num_nodes: "1"
+                    step_num_tasks: "1"
+                    step_tasks_per_node: "1"
+                    stepid: "0"
+                    submit_dir: /fast/home/salan.isaqzoi/gh_projects/p(doom)/omegalax_optimization/Salan_DONT_PUSH/mfu_opt
+                    submit_host: hai-login2.haicore.berlin
+                    task_pid: "3884354"
+                    tasks_per_node: "1"
+                    topology_addr: hai004
+                    topology_addr_pattern: node
+                    tres_per_task: cpu=24
+                    umask: "0022"
+                startedAt: "2026-08-02T05:11:04.994237Z"
+                writerId: 9a9gt0c2va6a8bssmxadm166saayxbuq
+        m: []
+        python_version: 3.12.9
+        t:
+            "1":
+                - 1
+                - 11
+                - 12
+                - 45
+                - 49
+            "2":
+                - 1
+                - 11
+                - 12
+                - 45
+                - 49
+            "3":
+                - 2
+                - 13
+                - 15
+                - 16
+                - 61
+            "4": 3.12.9
+            "5": 0.25.1
+            "6": 5.2.0
+            "12": 0.25.1
+            "13": linux-x86_64
+adam_beta1:
+    value: 0.9
+adam_beta2:
+    value: 0.95
+adam_eps:
+    value: 1e-08
+alsologtostderr:
+    value: false
+batch_size:
+    value: 168
+bptt_chunks:
+    value: 6
+chex_assert_multiple_cpu_devices:
+    value: false
+chex_n_cpu_devices:
+    value: 1
+chex_skip_pmap_variant_if_single_device:
+    value: true
+derived_lr_schedule_steps:
+    value: 1000
+derived_num_steps:
+    value: 10
+derived_warmup_steps:
+    value: 290
+dp_size:
+    value: 1
+eos_id:
+    value: 248046
+experimental_orbax_use_distributed_barrier:
+    value: false
+experimental_orbax_use_distributed_process_id:
+    value: false
+fsdp_size:
+    value: 4
+gc_period:
+    value: 0
+gdn_layer_limit:
+    value: null
+gdn_state_routing:
+    value: same_layer
+grad_accum_steps:
+    value: 1
+grain_num_threads_computing_num_records:
+    value: 64
+grain_num_threads_fetching_records:
+    value: 64
+grain_py_dataset_visualization_output_dir:
+    value: null
+grain_py_debug_mode:
+    value: false
+grain_py_relay_sigterm_to_main:
+    value: false
+grain_py_traceback_filtering:
+    value: auto
+grain_read_prefetch_buffer_size:
+    value: 4
+grain_read_threads:
+    value: 2
+grain_tf_interleaved_shuffle:
+    value: false
+grain_tf_interleaved_shuffle_block_size:
+    value: 10
+grain_tf_interleaved_shuffle_parallel_blocks:
+    value: 10
+grain_tf_lookup_batch_size:
+    value: 100
+grain_tf_lookup_fast_warmup:
+    value: false
+grain_tf_lookup_num_parallel_calls:
+    value: -1
+grain_tf_optimized_sequential_read:
+    value: false
+grain_tf_prefetch_buffer_size:
+    value: -1
+grain_worker_buffer_size:
+    value: 1
+grain_workers:
+    value: 8
+help:
+    value: false
+helpfull:
+    value: false
+helpshort:
+    value: false
+helpxml:
+    value: false
+init_hf_model_path:
+    value: /fast/project/HFMI_SynergyUnit/p-doom_shared/salan/models/Qwen/Qwen3.5-2B
+iterator_dp_size:
+    value: 1
+iterator_fsdp_size:
+    value: 4
+jax_cache_dir:
+    value: /fast/project/HFMI_SynergyUnit/p-doom_shared/salan/jax_cache/mfu_opt
+keep_latest:
+    value: 10
+learning_rate:
+    value: 2e-05
+log_dir:
+    value: ""
+log_every:
+    value: 1
+logtostderr:
+    value: false
+lr_end_factor:
+    value: 0
+lr_schedule:
+    value: wsd
+lr_schedule_steps:
+    value: 1000
+lr_stable_fraction:
+    value: 0.8
+max_grad_norm:
+    value: 1
+max_tokens:
+    value: 15000000000
+model_id:
+    value: null
+num_steps:
+    value: 10
+only_check_args:
+    value: false
+pad_id:
+    value: 0
+pass_conv_state:
+    value: false
+pass_gdn_state:
+    value: true
+pass_rope_positions:
+    value: false
+pdb:
+    value: false
+pdb_post_mortem:
+    value: false
+peak_tflops:
+    value: h100_sxm
+pretrain_mode:
+    value: statepassing_bptt
+profile_file:
+    value: null
+resume:
+    value: never
+run_with_pdb:
+    value: false
+run_with_profiling:
+    value: false
+save_dir:
+    value: null
+save_every:
+    value: 0
+seed:
+    value: 0
+seq_len:
+    value: 2048
+showprefixforinfo:
+    value: true
+stderrthreshold:
+    value: fatal
+test_random_seed:
+    value: 301
+test_randomize_ordering_seed:
+    value: ""
+test_srcdir:
+    value: ""
+test_tmpdir:
+    value: /tmp/salan.isaqzoi/absl_testing
+text_attn_backend:
+    value: cudnn
+tokamax_autotuning_cache_miss_fallback:
+    value: heuristics
+tokamax_cross_compile:
+    value: false
+tokenizer:
+    value: Qwen/Qwen3.5-0.8B
+tp_size:
+    value: 1
+train_index_path:
+    value: /fast/project/HFMI_SynergyUnit/p-doom_shared/salan/pretrain_indexes/fineweb_edu_dedup_2048_2kto32k_2048_c6_bptt6_lr3e4_eos248046
+use_cprofile_for_profiling:
+    value: true
+v:
+    value: 0
+val_every:
+    value: null
+val_index_path:
+    value: null
+val_steps:
+    value: 10
+verbosity:
+    value: 0
+wandb_entity:
+    value: pdoom
+wandb_group:
+    value: mfu_opt
+wandb_id:
+    value: null
+wandb_name:
+    value: valid_g4_v2
+wandb_project:
+    value: omegalax_mfu
+wandb_resume:
+    value: null
+wandb_tags:
+    value:
+        - c=6
+        - b=168
+        - gpus=4
+        - cascade=1
+        - convbtc=1
+        - remat=none
+        - mu=fp32
+warmup_tokens:
+    value: 100000000
+weight_decay:
+    value: 0.01
+xml_output_file:
+    value: ""
