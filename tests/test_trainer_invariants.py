@@ -740,7 +740,7 @@ class TrainerInvariantsTest(absltest.TestCase):
             with self.assertRaises(ValueError):
                 pretrain_trainer.make_pretrain_train_step(NO_BPTT, cfg, bptt_chunks=3)
 
-    def _run_curriculum(self, index, phase_steps, num_steps, save_dir, resume):
+    def _run_curriculum(self, index, phase_steps, num_steps, save_dir, resume, save_every=0):
         train_cfg = pretrain_trainer.TrainConfig(
             seed=0,
             batch_size=6,
@@ -758,7 +758,7 @@ class TrainerInvariantsTest(absltest.TestCase):
             phase_steps=phase_steps,
             pretrain_mode=BPTT,
             save_dir=save_dir,
-            save_every=0,
+            save_every=save_every,
             log_every=0,
             resume=resume,
             tp_size=1,
@@ -766,7 +766,7 @@ class TrainerInvariantsTest(absltest.TestCase):
             dp_size=1,
         )
 
-    def _curriculum_resume_matches(self, phase_steps, num_steps):
+    def _curriculum_resume_matches(self, phase_steps, num_steps, save_every=0):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             tmp = Path(tmp)
             data_root = tmp / "docs"
@@ -788,7 +788,12 @@ class TrainerInvariantsTest(absltest.TestCase):
             install_patch, requeue_patch = _signal_patches()
             with install_patch, requeue_patch as request_requeue:
                 self._run_curriculum(
-                    index, phase_steps, num_steps, tmp / "signal", checkpoint_utils.ResumeMode.NEVER
+                    index,
+                    phase_steps,
+                    num_steps,
+                    tmp / "signal",
+                    checkpoint_utils.ResumeMode.NEVER,
+                    save_every,
                 )
             request_requeue.assert_called_once_with(True)
             resumed, resumed_metrics = self._run_curriculum(
@@ -797,6 +802,7 @@ class TrainerInvariantsTest(absltest.TestCase):
                 num_steps,
                 tmp / "signal",
                 checkpoint_utils.ResumeMode.REQUIRED,
+                save_every,
             )
         for key in ("step", "phase_C", "phase_step"):
             self.assertEqual(resumed_metrics[key], control_metrics[key], msg=key)
@@ -809,11 +815,16 @@ class TrainerInvariantsTest(absltest.TestCase):
         self._curriculum_resume_matches({2: 2, 3: 2}, num_steps=4)
 
     # Pins: a signal on the last step of a curriculum phase is resumable and matches.
-    # Defect: the resume writes the phase-boundary checkpoint again at the already saved step,
-    # which orbax rejects, so every resume of that run fails.
-    @unittest.expectedFailure
+    # Regression N5: the resume wrote the phase-boundary checkpoint again at the already saved
+    # step, which orbax rejects, so every resume of that run failed.
     def test_curriculum_resume_after_signal_on_last_step_of_phase(self):
         self._curriculum_resume_matches({2: 1, 3: 2}, num_steps=3)
+
+    # Pins: a signal on a regular curriculum save step checkpoints, requeues and resumes.
+    # Regression N5b: the signal branch saved the step the periodic save had just written, and
+    # orbax raised StepAlreadyExistsError instead of requeueing.
+    def test_curriculum_resume_after_signal_on_regular_save_step(self):
+        self._curriculum_resume_matches({2: 2, 3: 2}, num_steps=4, save_every=1)
 
     # Pins: a non-finite loss stops the run with FloatingPointError before a non-finite
     # checkpoint is written.

@@ -2027,18 +2027,21 @@ def run_statepassing_curriculum(
                 startup_log(
                     f"[signal] saving curriculum checkpoint at step={global_step} before requeue"
                 )
+                _log_prev_metrics(force=True)
                 if checkpoint_manager is not None:
-                    _save_curriculum_checkpoint(
-                        checkpoint_manager,
-                        optimizer,
-                        rng,
-                        global_step=global_step,
-                        phase_idx=phase_idx,
-                        phase_step=phase_step,
-                        input_iter=data_iter,
-                        lr_contract=lr_contract,
-                        force=True,
-                    )
+                    # The periodic save may already have written this step.
+                    if checkpoint_manager.latest_step() != global_step:
+                        _save_curriculum_checkpoint(
+                            checkpoint_manager,
+                            optimizer,
+                            rng,
+                            global_step=global_step,
+                            phase_idx=phase_idx,
+                            phase_step=phase_step,
+                            input_iter=data_iter,
+                            lr_contract=lr_contract,
+                            force=True,
+                        )
                     checkpoint_manager.wait_until_finished()
                     checkpoint_manager.close()
                 _request_slurm_requeue_if_primary(is_primary_process)
@@ -2047,7 +2050,8 @@ def run_statepassing_curriculum(
         next_phase_idx = _first_runnable_phase(phase_idx + 1)
         if next_phase_idx < len(train_order):
             data_iter = phase_iter_factory(int(train_order[next_phase_idx]))
-            if checkpoint_manager is not None:
+            # A run resumed from a signal checkpoint on the phase's last step already has it.
+            if checkpoint_manager is not None and checkpoint_manager.latest_step() != global_step:
                 _save_curriculum_checkpoint(
                     checkpoint_manager,
                     optimizer,
@@ -2067,7 +2071,11 @@ def run_statepassing_curriculum(
     _log_prev_metrics(force=True)
 
     if checkpoint_manager is not None:
-        if global_step and (not save_every or global_step % save_every != 0):
+        if (
+            global_step
+            and (not save_every or global_step % save_every != 0)
+            and checkpoint_manager.latest_step() != global_step
+        ):
             _save_curriculum_checkpoint(
                 checkpoint_manager,
                 optimizer,
