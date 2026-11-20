@@ -828,9 +828,8 @@ class TrainerInvariantsTest(absltest.TestCase):
 
     # Pins: a non-finite loss stops the run with FloatingPointError before a non-finite
     # checkpoint is written.
-    # Defect: outside the common-plan branch the loop has no finiteness check, so NaN updates
-    # are applied, logged and checkpointed until the last finite checkpoint rotates out.
-    @unittest.expectedFailure
+    # Regression N7: outside the common-plan branch the loop had no finiteness check, so NaN
+    # updates were applied, logged and checkpointed until the last finite checkpoint rotated out.
     def test_nonfinite_loss_stops_run_before_next_checkpoint(self):
         cfg = _tiny_qwen3_5_config()
         train_cfg = pretrain_trainer.TrainConfig(

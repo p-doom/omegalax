@@ -1556,6 +1556,9 @@ def run_pretrain(
             else _finalize_accumulated_metrics(accum)
         )
         window_metrics["grad_norm"] = accum_grad_norm / accum_steps
+        # Stop before a non-finite update is logged as a result or checkpointed.
+        if not all(np.isfinite(float(window_metrics[k])) for k in ("loss", "grad_norm")):
+            raise FloatingPointError(f"Nonfinite update {step}: {window_metrics}")
         if teacher_objective:
             window_metrics["update_grad_norm"] = _host_float(metrics["update_grad_norm"])
         window_metrics["lr"] = current_lr
@@ -1982,6 +1985,8 @@ def run_statepassing_curriculum(
                 )
             window_metrics = _finalize_accumulated_metrics(accum)
             window_metrics["grad_norm"] = accum_grad_norm / accum_steps
+            if not all(math.isfinite(float(window_metrics[k])) for k in ("loss", "grad_norm")):
+                raise FloatingPointError(f"Nonfinite update {step}: {window_metrics}")
             window_metrics["lr"] = current_lr
             window_metrics["total_tokens"] = step * global_tokens_per_step
             window_metrics["data_wait_s"] = accum_data_wait_s

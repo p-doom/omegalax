@@ -6,6 +6,7 @@ import dataclasses
 import datetime
 import hashlib
 import json
+import math
 import time
 from pathlib import Path
 from typing import Any
@@ -633,6 +634,9 @@ def run_tail_pretrain(
             current_lr = float(schedule(local_step_idx)) if callable(schedule) else float(schedule)
         metrics = _finalize_accumulated_metrics(accum)
         metrics["grad_norm"] = accum_grad_norm / config.grad_accum_steps
+        # Stop before a non-finite update is logged as a result or checkpointed.
+        if not all(math.isfinite(float(metrics[k])) for k in ("loss", "grad_norm")):
+            raise FloatingPointError(f"Nonfinite update {global_step}: {metrics}")
         metrics["lr"] = current_lr
         metrics["total_tokens"] = global_step * global_tokens_per_step
         metrics["tail_step"] = local_step
