@@ -22,7 +22,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--fsdp-size", type=int, choices=[4, 8], default=4)
     parser.add_argument("--plan", required=True)
-    parser.add_argument("--segment-length", type=int, choices=[8192, 2048, 512], required=True)
+    parser.add_argument(
+        "--segment-length", type=int, choices=[8192, 2048, 512, 57344], required=True
+    )
     parser.add_argument("--init-hf-model-path", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--resume", choices=["never", "if_present", "required"], default="never")
@@ -49,12 +51,21 @@ def main():
     output = Path(args.output).resolve()
     output.mkdir(parents=True, exist_ok=True)
     environment = {
-        key: value for key, value in sorted(os.environ.items())
+        key: value
+        for key, value in sorted(os.environ.items())
         if key.startswith(("JAX", "XLA", "NCCL", "TF_", "OMEGALAX"))
     }
     (output / f"numerical_environment_{job}_{os.getpid()}.json").write_text(
-        json.dumps({"job": job, "host": host, "source": str(Path(__file__).resolve().parents[1]),
-                    "text_attn_backend": args.text_attn_backend, "environment": environment}, indent=2)
+        json.dumps(
+            {
+                "job": job,
+                "host": host,
+                "source": str(Path(__file__).resolve().parents[1]),
+                "text_attn_backend": args.text_attn_backend,
+                "environment": environment,
+            },
+            indent=2,
+        )
         + "\n"
     )
     from absl import flags
@@ -102,6 +113,8 @@ def main():
         )
     plan = load_rollout_update_plan(args.plan)
     C = -(-plan["max_context_tokens"] // args.segment_length)
+    if args.segment_length == 57344 and C != 1:
+        raise SystemExit("Full-rollout arm 57344 must hold every planned chain in one segment")
     train_cfg = TrainConfig(
         seed=0,
         batch_size=PLANNED_MICROBATCH_CHAINS * C,
@@ -151,7 +164,7 @@ def main():
         import wandb
 
         arm = (
-            f"T{args.segment_length}"
+            ("full" if args.segment_length == 57344 else f"T{args.segment_length}")
             if curriculum_phases is None
             else f"curr{curriculum_phases[0][0]}to{curriculum_phases[-1][0]}"
         ) + ("_conv" if args.pass_conv_state else "")

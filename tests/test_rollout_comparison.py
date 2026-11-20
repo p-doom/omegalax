@@ -8,6 +8,7 @@ assert os.environ.get("SLURMD_NODENAME") == socket.gethostname().split(".")[0]
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 os.environ["OMEGALAX_DELTANET_KERNEL"] = "xla"
 
+import dataclasses
 import json
 from pathlib import Path
 import subprocess
@@ -85,7 +86,7 @@ class CommonUpdateTest(unittest.TestCase):
         iterator = lambda: make_planned_rollout_teacher_iterator(plan, segment_length=512)
         # Same true tokens/targets at all supported segment lengths, regardless of padding.
         reference = None
-        for T in (8192, 2048, 512):
+        for T in (8192, 2048, 512, 57344):
             batch = next(make_planned_rollout_teacher_iterator(plan, segment_length=T))
             tokens = batch["token_ids_BCT"].reshape(-1)[
                 batch["attention_mask_BCT"].reshape(-1).astype(bool)
@@ -188,7 +189,7 @@ class CommonUpdateTest(unittest.TestCase):
         self.assertEqual(rm["teacher_boundary_windows"], 0)
         self.assertNotIn("teacher_boundary_nll", rm)
         self.assertEqual(int(resumed.step[...]), 3)
-        # Control arm: no GDN state passing.
+        # Control arms: no GDN state passing, and the whole chain as one 57344 segment.
         _, nm = trainer.run_pretrain(
             str(root / "pretrained"),
             train_cfg,
@@ -197,6 +198,13 @@ class CommonUpdateTest(unittest.TestCase):
             pass_gdn_state=False,
             **kwargs,
         )
+        _, fm = trainer.run_pretrain(
+            str(root / "pretrained"),
+            dataclasses.replace(train_cfg, batch_size=4, seq_len=57344),
+            make_planned_rollout_teacher_iterator(plan, segment_length=57344),
+            save_dir=root / "full",
+            **{**kwargs, "teacher_segment_buckets": [1]},
+        )
 
         def per_update(arm):
             with (root / arm / "update_metrics.jsonl").open() as stream:
@@ -204,7 +212,9 @@ class CommonUpdateTest(unittest.TestCase):
             return [(r["step"], r["teacher_targets"], r["context_tokens"]) for r in rows]
 
         self.assertEqual(per_update("nostate"), per_update("continuous"))
+        self.assertEqual(per_update("full"), per_update("continuous"))
         self.assertEqual(nm["total_tokens"], cm["total_tokens"])
+        self.assertEqual(fm["total_tokens"], cm["total_tokens"])
         self.assertNotEqual(nm["teacher_kl"], cm["teacher_kl"])
         # Conv1D state passing through the full-BPTT segment scan.
         _, conv_m = trainer.run_pretrain(
