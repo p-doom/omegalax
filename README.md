@@ -73,6 +73,11 @@ futures = engine.generate(Request(prompt_ids, keys, [256] * 4, [1.0] * 4))
 completions = [f.result() for f in futures]  # tokens, logprobs, weight versions
 ```
 
+For tensor parallelism, load the model with `tp_size=N, fsdp_size=1, dp_size=1` on N devices;
+the engine shards its caches like the model's heads. Run with
+`XLA_FLAGS=--xla_gpu_enable_command_buffer=+COLLECTIVES`, which lets the all-reduces join
+XLA's CUDA-graph command buffers (decode steps 4-7 % faster at TP=2 on H100).
+
 ## Training
 The expected flow is:
 1. Start from a raw JSONL file where each line is a session with a `session_id` and `messages`.

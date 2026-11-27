@@ -27,6 +27,12 @@ def _logits_BV(model, hidden_BD: jax.Array) -> jax.Array:
     return logits_BTV[:, 0].astype(jnp.float32)
 
 
+def _pick(logp_XV, tok_X):
+    """``logp_XV[..., tok_X]`` as a reduction, which works on vocab-sharded (TP) logits."""
+    hit_XV = jnp.arange(logp_XV.shape[-1], dtype=tok_X.dtype) == tok_X[..., None]
+    return jnp.sum(jnp.where(hit_XV, logp_XV, 0.0), axis=-1)
+
+
 def _sample(logits_BV, temp_B, key_B, pos_B):
     """Gumbel-max sample of the token at ``pos_B``; noise is a function of (key, position)."""
     logp_BV = jax.nn.log_softmax(logits_BV / temp_B[:, None], axis=-1)
@@ -35,7 +41,7 @@ def _sample(logits_BV, temp_B, key_B, pos_B):
         key_B, pos_B
     )
     tok_B = jnp.argmax(logp_BV + gumbel_BV, axis=-1).astype(jnp.int32)
-    return tok_B, jnp.take_along_axis(logp_BV, tok_B[:, None], axis=1)[:, 0]
+    return tok_B, _pick(logp_BV, tok_B)
 
 
 def _forward(model, pools, tokens_BT, paged: PagedBatch, linear):
@@ -183,4 +189,4 @@ def score(graphdef, state, tokens_BT, pad_id: int):
     hidden_BTD, _ = model(tokens_BT, 1 * (tokens_BT != pad_id), None, None)
     logits_BTV = jnp.einsum("BTD,DV->BTV", hidden_BTD, model.lm_head.kernel[...])
     logp_BTV = jax.nn.log_softmax(logits_BTV.astype(jnp.float32), axis=-1)
-    return jnp.take_along_axis(logp_BTV[:, :-1], tokens_BT[:, 1:, None], axis=-1)[..., 0]
+    return _pick(logp_BTV[:, :-1], tokens_BT[:, 1:])

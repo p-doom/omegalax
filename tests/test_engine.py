@@ -2,6 +2,7 @@
 
 import logging
 import os
+import unittest
 from concurrent.futures import ThreadPoolExecutor
 
 os.environ.setdefault("JAX_PLATFORMS", "cuda")
@@ -12,6 +13,8 @@ import numpy as np
 import torch
 from absl.testing import absltest
 from flax import nnx
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
 from huggingface_hub import snapshot_download
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForConditionalGeneration
@@ -22,6 +25,7 @@ from omegalax.text import api as text_api
 from omegalax.models.qwen3.loader import create_qwen3_from_safetensors
 from omegalax.models.qwen3_5.loader import create_qwen3_5_from_safetensors
 from omegalax.models.qwen3_5.model import Qwen3_5ForCausalLM
+from omegalax.models.sharding_runtime import _finalize_q_shardings
 from tests.real_weights import requires_real_weights
 
 torch.backends.cuda.matmul.allow_tf32 = False
@@ -52,8 +56,8 @@ def _keys(rng, n):
     return rng.integers(0, 2**32, size=(n, 2), dtype=np.uint32)
 
 
-def _qwen3_5_causal_lm(path):
-    vlm, cfg = create_qwen3_5_from_safetensors(path, tp_size=1, fsdp_size=1, dp_size=1)
+def _qwen3_5_causal_lm(path, tp):
+    vlm, cfg = create_qwen3_5_from_safetensors(path, tp_size=tp, fsdp_size=1, dp_size=1)
     mesh = jax.tree.leaves(nnx.state(vlm))[0].sharding.mesh
     text_cfg = text_api.align_config_to_mesh(cfg.text_config, mesh)
     with mesh_rules(mesh):
@@ -66,17 +70,24 @@ def _qwen3_5_causal_lm(path):
             "lm_head": nnx.to_pure_dict(nnx.state(vlm.lm_head)),
         },
     )
-    return nnx.merge(nnx.graphdef(abstract), state)
+    model = nnx.merge(nnx.graphdef(abstract), state)
+    _finalize_q_shardings(model, mesh)
+    return model
 
 
 class _EngineTest:
+    """Runs with tensor parallelism over all visible devices; each class covers one TP size."""
+
     MODEL_ID: str
+    TP = 1
 
     @classmethod
     def setUpClass(cls):
+        if jax.device_count() != cls.TP:
+            raise unittest.SkipTest(f"needs {cls.TP} visible devices")
         cls.path = snapshot_download(cls.MODEL_ID)
         cls.tok = AutoTokenizer.from_pretrained(cls.path)
-        cls.model = cls.load(cls.path)
+        cls.model = cls.load(cls.path, cls.TP)
         eos = cls.tok.convert_tokens_to_ids("<|im_end|>")
         pad = cls.tok.convert_tokens_to_ids("<|endoftext|>")
         cls.cfg = EngineConfig(
@@ -192,7 +203,8 @@ class _EngineTest:
 
         def perturb(x):
             noise = jax.random.normal(jax.random.key(0), x.shape, jnp.float32) * 0.05 * jnp.std(x)
-            return jax.device_put((x + noise).astype(x.dtype), x.sharding)
+            # Replicated, so that under TP the engine has to reshard what it receives.
+            return jax.device_put((x + noise).astype(x.dtype), NamedSharding(x.sharding.mesh, P()))
 
         new_params = jax.tree.map(perturb, old_params)
         jax.block_until_ready(new_params)
@@ -249,6 +261,8 @@ class EvictionTest(absltest.TestCase):
     and waiting sessions and re-extends must leave every logprob consistent with the trainer."""
 
     def test_logprobs_under_eviction(self):
+        if jax.device_count() != 1:
+            self.skipTest("single-device test")
         model, _ = text_api.init_model(
             "qwen3-smoke", jax.random.key(0), tp_size=1, fsdp_size=1, dp_size=1
         )
@@ -317,8 +331,20 @@ class Qwen3EngineTest(_EngineTest, absltest.TestCase):
     HF_CLASS = AutoModelForCausalLM
 
     @staticmethod
-    def load(path):
-        return create_qwen3_from_safetensors(path, tp_size=1, fsdp_size=1, dp_size=1)
+    def load(path, tp):
+        return create_qwen3_from_safetensors(path, tp_size=tp, fsdp_size=1, dp_size=1)
+
+
+class Qwen3TP2EngineTest(Qwen3EngineTest):
+    TP = 2
+
+
+class Qwen3TP4EngineTest(Qwen3EngineTest):
+    TP = 4
+
+
+class Qwen3TP8EngineTest(Qwen3EngineTest):
+    TP = 8
 
 
 @requires_real_weights
@@ -326,6 +352,15 @@ class Qwen3_5EngineTest(_EngineTest, absltest.TestCase):
     MODEL_ID = "Qwen/Qwen3.5-0.8B"
     HF_CLASS = Qwen3_5ForConditionalGeneration
     load = staticmethod(_qwen3_5_causal_lm)
+
+
+class Qwen3_5TP2EngineTest(Qwen3_5EngineTest):
+    TP = 2
+
+
+class Qwen3_5TP4EngineTest(Qwen3_5EngineTest):
+    MODEL_ID = "Qwen/Qwen3.5-4B"  # 0.8B has 2 KV heads.
+    TP = 4
 
 
 if __name__ == "__main__":
