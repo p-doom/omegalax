@@ -622,10 +622,12 @@ class Engine:
 
     def _step_decode(self) -> None:
         K = self.cfg.decode_steps
-        for s in sorted(self._decoding.values(), key=lambda s: s.id):
+        # The oldest sessions decode first; the rest wait for a call with room in the largest bucket.
+        rows = sorted(self._decoding.values(), key=lambda s: s.id)[: self.cfg.decode_buckets[-1]]
+        for s in rows:
             if s.id in self._decoding:
                 self._alloc(s, s.length + min(K, s.turn.remaining), preempt=True)
-        rows = sorted(self._decoding.values(), key=lambda s: s.id)
+        rows = [s for s in rows if s.id in self._decoding]
         B = next(b for b in self.cfg.decode_buckets if b >= len(rows))
         tok_KB, logp_KB, valid_KB = self._run_decode_call(self._decode_inputs(rows, B))
         self.stats["decode_calls"] += 1
