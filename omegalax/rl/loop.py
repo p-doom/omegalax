@@ -31,6 +31,7 @@ class LoopConfig:
     eval_every: int
     eval_concurrency: int
     drop_zero_variance: bool
+    dump_every: int
 
 
 def jsonl_tasks(path: str, seed: int) -> Iterator[dict]:
@@ -72,9 +73,10 @@ def _engine_busy_s(engines):
 
 
 async def run(trainer: Trainer, engines, sync: WeightSync, env: Env, tasks: Iterator[dict],
-              eval_tasks: list[dict], cfg: LoopConfig, log):
+              eval_tasks: list[dict], cfg: LoopConfig, log, dump):
     """Trains ``cfg.num_steps`` steps; ``log`` receives each step's metrics and each evaluation
-    (started before step 1 and after every ``eval_every`` steps)."""
+    (started before step 1 and after every ``eval_every`` steps), ``dump`` the trained samples of
+    every ``dump_every``-th step."""
     G = cfg.groups_per_step
     capacity = asyncio.Semaphore((cfg.rollout_ahead + 1) * G)
     ready: asyncio.Queue = asyncio.Queue()
@@ -148,6 +150,8 @@ async def run(trainer: Trainer, engines, sync: WeightSync, env: Env, tasks: Iter
         samples = [s for g in batch for s in g]
         lags = np.asarray([trainer.version - v for s in samples for v, m in zip(s.versions, s.mask) if m])
         rewards = np.asarray([[s.reward for s in g] for g in batch])
+        if (step + 1) % cfg.dump_every == 0:
+            dump(step + 1, samples)
         metrics = await loop.run_in_executor(train_thread, train, batch)
         if step == 0:
             metrics["train/warmup_s"] = await warmup

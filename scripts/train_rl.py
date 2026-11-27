@@ -9,6 +9,7 @@ new weights to every engine, which apply them at their next decode-call boundary
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import multiprocessing
 import time
@@ -69,6 +70,7 @@ flags.DEFINE_string("eval_path", None, "JSONL evaluated with one sample per row.
 flags.DEFINE_integer("eval_every", 10, "Steps between evaluations (also one before step 1).")
 flags.DEFINE_integer("eval_concurrency", 64, "Evaluation samples in flight.")
 flags.DEFINE_bool("drop_zero_variance", False, "Train only on groups whose rewards differ (dynamic sampling).")
+flags.DEFINE_integer("dump_every", 50, "Steps between dumps of the trained samples (samples/step_*.jsonl).")
 
 
 def main(argv):
@@ -145,6 +147,13 @@ def main(argv):
 
     metrics_file = open(out / "metrics.jsonl", "a")
 
+    (out / "samples").mkdir(exist_ok=True)
+
+    def dump(step, samples):
+        with open(out / "samples" / f"step_{step:06d}.jsonl", "w") as f:
+            for s in samples:
+                f.write(json.dumps(dataclasses.asdict(s)) + "\n")
+
     def log(m):
         line = json.dumps(m)
         print(line, flush=True)
@@ -161,10 +170,11 @@ def main(argv):
         eval_every=FLAGS.eval_every,
         eval_concurrency=FLAGS.eval_concurrency,
         drop_zero_variance=FLAGS.drop_zero_variance,
+        dump_every=FLAGS.dump_every,
     )
     tasks = loop.jsonl_tasks(FLAGS.data_path, FLAGS.seed)
     try:
-        asyncio.run(loop.run(trainer, engines, sync, env, tasks, eval_tasks, lcfg, log))
+        asyncio.run(loop.run(trainer, engines, sync, env, tasks, eval_tasks, lcfg, log, dump))
     finally:
         for e in engines:
             e.stop()

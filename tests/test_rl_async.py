@@ -86,10 +86,11 @@ class AsyncInvariantsTest(absltest.TestCase):
         tasks = ({"prompt": [{"role": "user", "content": p}]} for _ in iter(int, 1) for p in prompts)
         cfg_loop = loop.LoopConfig(num_steps=4, groups_per_step=2, rollout_ahead=2,
                                    max_staleness=MAX_STALENESS, rollout=RolloutConfig(4, 400, 1.0), seed=0,
-                                   eval_every=2, eval_concurrency=4, drop_zero_variance=False)
+                                   eval_every=2, eval_concurrency=4, drop_zero_variance=False,
+                                   dump_every=1000)
         metrics = []
         try:
-            asyncio.run(loop.run(trainer, [engine], sync, ParityEnv(tok), tasks, [{"prompt": [{"role": "user", "content": p}]} for p in prompts], cfg_loop, metrics.append))
+            asyncio.run(loop.run(trainer, [engine], sync, ParityEnv(tok), tasks, [{"prompt": [{"role": "user", "content": p}]} for p in prompts], cfg_loop, metrics.append, None))
         finally:
             engine.stop()
 
