@@ -68,8 +68,9 @@ async def evaluate(engines, env: Env, tasks: list[dict], cfg: RolloutConfig, con
     }
 
 
-def _engine_busy_s(engines):
-    return sum(e.stats["decode_s"] + e.stats["extend_s"] for e in engines)
+def _engine_totals(engines) -> np.ndarray:
+    keys = ("decode_s", "extend_s", "decode_tokens", "decode_row_steps", "extend_tokens")
+    return np.asarray([sum(e.stats[k] for e in engines) for k in keys], np.float64)
 
 
 async def run(trainer: Trainer, engines, sync: WeightSync, env: Env, tasks: Iterator[dict],
@@ -124,7 +125,7 @@ async def run(trainer: Trainer, engines, sync: WeightSync, env: Env, tasks: Iter
     producer = asyncio.create_task(produce())
     dropped = {"error": 0, "stale": 0, "zero_variance": 0}
     errors = []
-    busy0, gen0, t_prev = _engine_busy_s(engines), 0, t_start
+    totals0, t_prev = _engine_totals(engines), t_start
     for step in range(cfg.num_steps):
         t_wait = time.perf_counter()
         batch = []
@@ -159,8 +160,8 @@ async def run(trainer: Trainer, engines, sync: WeightSync, env: Env, tasks: Iter
         for _ in batch:
             capacity.release()
         now = time.perf_counter()
-        busy = _engine_busy_s(engines)
-        gen = sum(e.stats["decode_tokens"] for e in engines)
+        totals = _engine_totals(engines)
+        decode_s, extend_s, decode_tokens, row_steps, extend_tokens = totals - totals0
         metrics.update(summarize(samples))
         metrics.update({
             "step": step + 1,
@@ -174,11 +175,14 @@ async def run(trainer: Trainer, engines, sync: WeightSync, env: Env, tasks: Iter
             "groups/dropped_error": dropped["error"],
             "groups/dropped_stale": dropped["stale"],
             "groups/dropped_zero_variance": dropped["zero_variance"],
-            "engine/busy_frac": (busy - busy0) / (len(engines) * (now - t_prev)),
-            "engine/decode_tokens_per_s": (gen - gen0) / (now - t_prev),
+            "engine/busy_frac": (decode_s + extend_s) / (len(engines) * (now - t_prev)),
+            "engine/extend_frac": extend_s / max(decode_s + extend_s, 1e-9),
+            "engine/decode_tokens_per_s": decode_tokens / (now - t_prev),
+            "engine/decode_occupancy": decode_tokens / max(row_steps, 1.0),
+            "engine/extend_tokens_per_s": extend_tokens / (now - t_prev),
             "groups/outstanding": len(running) + ready.qsize(),
         })
-        busy0, gen0, t_prev = busy, gen, now
+        totals0, t_prev = totals, now
         log(metrics)
         if (step + 1) % cfg.eval_every == 0:
             evals.append(asyncio.create_task(eval_at(step + 1)))
