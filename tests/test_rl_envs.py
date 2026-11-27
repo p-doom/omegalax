@@ -92,7 +92,7 @@ class EnvTest(absltest.TestCase):
         self.assertTrue(prompt.endswith("<|im_start|>assistant\n<think>\n\n</think>\n\n"))
 
     def test_python_tool_turns_observations_and_reward(self):
-        env = PythonToolEnv(self.tok, self.pool, 10.0, max_turns=4, tool_timeout_s=5.0,
+        env = PythonToolEnv(self.tok, self.pool, 10.0, thinking=True, max_turns=4, tool_timeout_s=5.0,
                             tool_memory_bytes=2 << 30, tool_output_chars=2000, max_tool_procs=4)
         s = self._run(env, [
             [("compute it</think>\n\n" + CALL.format("print(6 * 7)") + "<|im_end|>", "stop"),

@@ -67,9 +67,9 @@ class PythonToolEnv(MathEnv):
     limit; it is checked once at construction so a broken sandbox never becomes tool output.
     """
 
-    def __init__(self, tokenizer, executor: Executor, grade_timeout_s: float, *, max_turns: int,
+    def __init__(self, tokenizer, executor: Executor, grade_timeout_s: float, *, thinking: bool, max_turns: int,
                  tool_timeout_s: float, tool_memory_bytes: int, tool_output_chars: int, max_tool_procs: int):
-        super().__init__(tokenizer, executor, grade_timeout_s, thinking=True)
+        super().__init__(tokenizer, executor, grade_timeout_s, thinking=thinking)
         self.max_turns = max_turns
         self.tool_timeout_s = tool_timeout_s
         self.tool_output_chars = tool_output_chars
@@ -86,13 +86,14 @@ class PythonToolEnv(MathEnv):
         if check.stdout != "42\n":
             raise RuntimeError(f"Python sandbox does not work: {check.stdout!r} {check.stderr!r}")
         self._base = [{"role": "user", "content": "x"}, {"role": "assistant", "content": "x"}]
-        self._without = tokenizer.apply_chat_template(self._base, tokenize=False, enable_thinking=True)
+        self._without = tokenizer.apply_chat_template(self._base, tokenize=False, enable_thinking=thinking)
         if not self._without.endswith("<|im_end|>\n"):
             raise ValueError("Expected the chat template to end an assistant turn with '<|im_end|>\\n'.")
 
     def prompt(self, task: dict) -> list[int]:
         text = self.tokenizer.apply_chat_template(
-            task["prompt"], tools=[CODE_TOOL], tokenize=False, add_generation_prompt=True, enable_thinking=True
+            task["prompt"], tools=[CODE_TOOL], tokenize=False, add_generation_prompt=True,
+            enable_thinking=self.thinking,
         )
         return self.tokenizer(text, add_special_tokens=False)["input_ids"]
 
@@ -107,10 +108,10 @@ class PythonToolEnv(MathEnv):
         return self.observation(outputs)
 
     def observation(self, outputs: list[str]) -> list[int]:
-        """Tokens from the policy's ``<|im_end|>`` to the next turn's ``<think>\\n``."""
+        """Tokens from the policy's ``<|im_end|>`` to the start of the next policy turn."""
         tools = [{"role": "tool", "content": o} for o in outputs]
         full = self.tokenizer.apply_chat_template(
-            self._base + tools, tokenize=False, add_generation_prompt=True, enable_thinking=True
+            self._base + tools, tokenize=False, add_generation_prompt=True, enable_thinking=self.thinking
         )
         if not full.startswith(self._without):
             raise ValueError("Tool messages changed the rendering of earlier turns.")

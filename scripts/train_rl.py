@@ -56,7 +56,7 @@ flags.DEFINE_integer("decode_steps", 8, "Decode steps per engine device call.")
 flags.DEFINE_list("decode_buckets", ["16", "32", "64", "128", "256"], "Engine decode batch buckets.")
 flags.DEFINE_list("extend_buckets", ["512", "1024", "2048", "4096", "8192"], "Engine extend token buckets.")
 flags.DEFINE_enum("env", "math", ["math", "python_tool"], "Single-turn math, or math with a Python tool.")
-flags.DEFINE_bool("thinking", None, "math: thinking mode (deepscaler grading) or not (last \\boxed).", required=True)
+flags.DEFINE_bool("thinking", None, "Thinking mode (deepscaler grading) or not (last \\boxed).", required=True)
 flags.DEFINE_integer("max_turns", 16, "python_tool: policy turns per episode.")
 flags.DEFINE_float("tool_timeout_s", 30.0, "python_tool: execution timeout (reported to the policy).")
 flags.DEFINE_integer("tool_memory_gb", 4, "python_tool: address-space limit per execution.")
@@ -90,10 +90,8 @@ def main(argv):
     if FLAGS.env == "math":
         env = MathEnv(tokenizer, grader, FLAGS.grade_timeout_s, thinking=FLAGS.thinking)
     else:
-        if not FLAGS.thinking:
-            raise ValueError("python_tool runs in thinking mode.")
         env = PythonToolEnv(
-            tokenizer, grader, FLAGS.grade_timeout_s, max_turns=FLAGS.max_turns,
+            tokenizer, grader, FLAGS.grade_timeout_s, thinking=FLAGS.thinking, max_turns=FLAGS.max_turns,
             tool_timeout_s=FLAGS.tool_timeout_s, tool_memory_bytes=FLAGS.tool_memory_gb << 30,
             tool_output_chars=FLAGS.tool_output_chars, max_tool_procs=FLAGS.max_tool_procs,
         )
