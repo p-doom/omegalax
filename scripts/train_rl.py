@@ -158,6 +158,8 @@ def main(argv):
                 f.write(json.dumps(dataclasses.asdict(s)) + "\n")
 
     def log(m):
+        if "step" in m:
+            m["mem/peak_gb"] = [round(d.memory_stats()["peak_bytes_in_use"] / 2**30, 1) for d in devices]
         line = json.dumps({"time": time.time(), **m})
         print(line, flush=True)
         metrics_file.write(line + "\n")
