@@ -75,7 +75,7 @@ class TrainerTest(absltest.TestCase):
         set_attn_backend(model, "xla")
         trainer = Trainer(model, cfg, TrainConfig(
             lr=1e-3, weight_decay=0.0, adam_b1=0.9, adam_b2=0.98, adam_eps=1e-8, max_grad_norm=1e9,
-            eps_low=0.2, eps_high=0.28, tokens_per_microbatch=256, length_buckets=(32, 64),
+            eps_low=0.2, eps_high=0.28, tokens_per_microbatch=32, length_buckets=(32, 64),
             logit_tile_tokens=64, pad_id=0,
         ))
         rng = np.random.default_rng(0)
@@ -86,6 +86,7 @@ class TrainerTest(absltest.TestCase):
             samples.append(Sample(0, toks, 8, mask, list(rng.normal(-2, 0.5, L)), [0] * L))
         adv = [1.0, 0.0, -1.0, 0.0]
 
+        # One sample per microbatch: the active-only sum is the full sum minus exact zeros.
         def grads(subset):
             with jax.set_mesh(trainer.mesh):
                 acc = trainer._zeros(trainer.params)
@@ -96,7 +97,7 @@ class TrainerTest(absltest.TestCase):
         full, active = grads([0, 1, 2, 3]), grads([0, 2])
         self.assertGreater(max(float(jnp.abs(g).max()) for g in active), 1e-4)
         for f, a in zip(full, active):
-            np.testing.assert_allclose(np.asarray(f), np.asarray(a), atol=1e-7)
+            np.testing.assert_array_equal(np.asarray(f), np.asarray(a))
 
 
 if __name__ == "__main__":

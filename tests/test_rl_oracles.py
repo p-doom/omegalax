@@ -52,7 +52,7 @@ class RLOracleTest(absltest.TestCase):
             cfg,
             TrainConfig(
                 lr=1e-4, weight_decay=0.1, adam_b1=0.9, adam_b2=0.98, adam_eps=1e-8,
-                max_grad_norm=1.0, eps_low=0.2, eps_high=0.28, tokens_per_microbatch=8192,
+                max_grad_norm=1.0, eps_low=0.2, eps_high=0.28, tokens_per_microbatch=2048,
                 length_buckets=(1024, 2048, 4096), logit_tile_tokens=4096, pad_id=cls.pad,
             ),
         )
@@ -124,12 +124,15 @@ class RLOracleTest(absltest.TestCase):
         old = jax.tree.map(lambda x: x.copy(), self.sync.gather(self.trainer.params))
         samples = self._rollouts(1)
         adv = [1.0, -1.0, 0.5, -0.5]
-        self.trainer.step(samples, adv)  # compiles the train programs
-        print("warmup push", self.sync.push(self.trainer.params, self.trainer.version))
+        print("trainer warmup s", self.trainer.warmup())
         counter = _CompileLog()
         logging.getLogger("jax").addHandler(counter)
         jax.config.update("jax_log_compiles", True)
         try:
+            first = self.trainer.step(samples, adv)
+            first_compiles = list(counter.compiles)
+            print("warmup push", self.sync.push(self.trainer.params, self.trainer.version))
+            counter.compiles.clear()
             metrics = self.trainer.step(samples, adv)
             push = self.sync.push(self.trainer.params, self.trainer.version)
             fresh = self._rollouts(2)
@@ -137,6 +140,9 @@ class RLOracleTest(absltest.TestCase):
             jax.config.update("jax_log_compiles", False)
             logging.getLogger("jax").removeHandler(counter)
         print("step", {k: round(v, 4) for k, v in metrics.items()}, "push", push)
+        self.assertGreater(first["train/microbatches"], 1)
+        # After warmup the first step may only load the AOT-compiled update.
+        self.assertTrue(all("_apply_fn" in c for c in first_compiles), first_compiles)
         self.assertEqual(counter.compiles, [])
         self.assertTrue(all(v == 2 for s in fresh for v, m in zip(s.versions, s.mask) if m))
         new_errs = self._errors(fresh)

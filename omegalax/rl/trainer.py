@@ -87,7 +87,10 @@ class Trainer:
         self._zeros = jax.jit(
             lambda p: jax.tree.map(jnp.zeros_like, p), out_shardings=param_shardings
         )
-        self._accumulate = jax.jit(self._accumulate_fn, donate_argnums=(1,))
+        # The gradient sum must leave in the zeros' sharding, or each chained call recompiles.
+        self._accumulate = jax.jit(
+            self._accumulate_fn, donate_argnums=(1,), out_shardings=(param_shardings, None)
+        )
         self._apply = jax.jit(self._apply_fn, donate_argnums=(0, 1))
         self._logprobs = jax.jit(self._logprobs_fn)
         self.version = 0
@@ -174,7 +177,8 @@ class Trainer:
         }
 
     def warmup(self) -> float:
-        """Compiles the gradient program of every length bucket on all-masked rows."""
+        """Compiles the gradient program of every length bucket on all-masked rows, and the update
+        ahead of time (it then loads from the persistent compilation cache)."""
         t0 = time.perf_counter()
         with jax.set_mesh(self.mesh):
             acc = self._zeros(self.params)
@@ -184,6 +188,7 @@ class Trainer:
                       for k in ("tokens", "segment_ids", "mask", "behavior_logp", "fresh")}
                 mb["advantage"] = np.zeros(rows, np.float32)
                 acc, _ = self._accumulate(self.params, acc, self._put(mb), jnp.float32(0.0))
+            self._apply.lower(self.params, self.opt_state, acc).compile()
             jax.block_until_ready(acc)
         return time.perf_counter() - t0
 
