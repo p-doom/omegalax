@@ -84,6 +84,27 @@ class StateContinuationTest(parameterized.TestCase):
         self.assertLess(np.abs(np.asarray(state[0, 0] - state1[0, 0])).max(), 2e-3)
         self.assertLess(np.abs(np.asarray(state[0, 1] - state2[0, 0])).max(), 2e-3)
 
+    def test_packed_resets_grad_matches_xla(self):
+        q1, k1, v1, g1, b1, i1 = _inputs(128, 4)
+        q2, k2, v2, g2, b2, i2 = _inputs(64, 5)
+        cat = lambda x, y: jnp.concatenate([x, y], axis=1)
+        args = (cat(q1, q2), cat(k1, k2), cat(v1, v2), cat(g1, g2), cat(b1, b2))
+        init = jnp.concatenate([i1, i2])
+        idx, final = jnp.asarray([[0, -1, 1]], jnp.int32), jnp.asarray([[1, 2]], jnp.int32)
+
+        def loss(fn):
+            def f(q, k, v, g, beta, init):
+                out, state = fn(q, k, v, g, beta, init, idx, final)
+                return jnp.sum(out**2) + jnp.sum(state**2)
+
+            return jax.grad(f, argnums=(0, 1, 2, 3, 4, 5))
+
+        ref = loss(chunk_gated_delta_rule_xla)(*args, init)
+        got = loss(chunk_gated_delta_rule_pallas)(*args, init)
+        for r, x in zip(ref, got):
+            r, x = np.asarray(r, np.float32), np.asarray(x, np.float32)
+            self.assertLess(np.abs(x - r).max() / np.abs(r).max(), 1e-2)
+
     def test_pallas_init_grad_matches_xla(self):
         q, k, v, g, beta, init = _inputs(128, 3)
         _, idx, final = _from(init, 128)

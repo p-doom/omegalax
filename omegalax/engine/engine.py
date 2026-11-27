@@ -174,11 +174,20 @@ class Engine:
         self._free_slots = list(range(num_slots - 1, steps.TRASH_SLOT, -1))
         self._pools = None
         bind = lambda fn: lambda *args, **kwargs: fn(graphdef, *args, **kwargs)
+        # XLA's dot merger would concatenate the weights of sibling projections (DeltaNet's four
+        # in_proj) on every call, a full extra weight copy per decode step.
+        no_merge = {"xla_gpu_dot_merger_threshold_mb": 0}
         self._decode = jax.jit(
-            bind(steps.decode), static_argnames=("num_steps", "num_work"), donate_argnums=(1,)
+            bind(steps.decode),
+            static_argnames=("num_steps", "num_work"),
+            donate_argnums=(1,),
+            compiler_options=no_merge,
         )
         self._extend = jax.jit(
-            bind(steps.extend), static_argnames=("block_q", "num_work"), donate_argnums=(1,)
+            bind(steps.extend),
+            static_argnames=("block_q", "num_work"),
+            donate_argnums=(1,),
+            compiler_options=no_merge,
         )
         self._score = jax.jit(bind(steps.score), static_argnames=("pad_id",))
         self._eos = np.asarray(cfg.eos_token_ids, np.int32)
