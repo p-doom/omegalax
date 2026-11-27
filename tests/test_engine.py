@@ -161,6 +161,32 @@ class _EngineTest:
         for sid in seqs:
             self.engine.release(sid)
 
+    def test_forked_groups_share_extends(self):
+        """Forked groups submitted while the engine is busy share extends; together they carry
+        more forks than one extend may and more decoding sessions than the largest bucket."""
+        rng = np.random.default_rng(3)
+        n = self.cfg.max_group - 1
+        prompts = [self._chat(text) for text in PROMPTS[:3]]
+        self.engine.stats.clear()
+        busy = self.engine.generate(
+            Request(self._chat(PROMPTS[3]), _keys(rng, 1), [200], [1.0], stop_at_eos=False)
+        )
+        groups = [
+            self.engine.generate(Request(p, _keys(rng, n), [96] * n, [1.0] * n, stop_at_eos=False))
+            for p in prompts
+        ]
+        seqs, scored = {}, {}
+        for prompt, futures in zip([self._chat(PROMPTS[3]), *prompts], [busy, *groups]):
+            for f in futures:
+                c = f.result()
+                seqs[c.session] = prompt + c.tokens
+                scored[c.session] = [(len(prompt) + i, lp) for i, lp in enumerate(c.logprobs)]
+        print(dict(self.engine.stats))
+        self.assertLess(self.engine.stats["extend_calls"], 1 + len(groups))
+        self._assert_logp_close(self._logp_errors(seqs, scored))
+        for sid in seqs:
+            self.engine.release(sid)
+
     def test_update_weights_no_recompile(self):
         old_params = nnx.to_pure_dict(nnx.state(self.model))
 

@@ -440,7 +440,7 @@ class Engine:
     def _step_extend(self) -> None:
         cap = self.cfg.extend_buckets[-1]
         S, A = self.cfg.page_size, self._align
-        items, used, rows, fork_writes = [], 0, 0, 0
+        items, used, rows, forks = [], 0, 0, 0
         reserve = (len(self._decoding) + 1) * (-(-self.cfg.decode_steps // S) + 1)
         while self._extend_queue:
             s = self._extend_queue[0]
@@ -448,12 +448,14 @@ class Engine:
             room = (cap - used) // A * A
             take = todo if -(-todo // A) * A <= room else room // max(A, S) * max(A, S)
             final = take == todo
-            new_rows = 1 + len(s.forks) if final else 0
-            new_fork_writes = len(s.forks) * (len(s.tokens) % S) if final else 0
+            new_forks = len(s.forks) if final else 0
+            new_rows = 1 + new_forks if final else 0
+            # At most max_group forks per extend bounds both the forks' KV page-tail writes
+            # (_fork_slack) and the DeltaNet state writes (W in _linear_extend).
             if (
                 take <= 0
                 or rows + new_rows > self.cfg.extend_rows
-                or fork_writes + new_fork_writes > self._fork_slack
+                or forks + new_forks > self.cfg.max_group
             ):
                 break
             # Admit only what fits beside idle sessions' pages; once nothing decodes, the queue
@@ -477,7 +479,7 @@ class Engine:
             items.append((s, s.length, s.length + take, final))
             used += -(-take // A) * A
             rows += new_rows
-            fork_writes += new_fork_writes
+            forks += new_forks
         if not items:
             if not self._decoding:
                 raise OutOfPages(
