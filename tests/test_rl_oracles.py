@@ -176,8 +176,13 @@ class RLOracleTest(absltest.TestCase):
             print(f"host_optimizer={host}: step {m['train/seconds']:.2f} s, grad norm {m['train/grad_norm']:.4f}")
             params.append(jax.device_get(trainer.params))
             del trainer
-        for a, b in zip(jax.tree.leaves(params[0]), jax.tree.leaves(params[1])):
-            np.testing.assert_allclose(a, b, rtol=1e-5, atol=1e-7)
+        # CPU and GPU float32 arithmetic differ in the last bits; Adam turns that into a full
+        # lr-sized sign flip where a gradient is ~0. Bound those and require the rest to agree.
+        diff = np.concatenate([np.abs(a - b).ravel() for a, b in zip(jax.tree.leaves(params[0]), jax.tree.leaves(params[1]))])
+        lr = self.trainer.cfg.lr
+        print(f"device vs host optimizer: max |dp| {diff.max():.2e}, frac > 1e-3 lr: {(diff > 1e-3 * lr).mean():.2e}")
+        self.assertLessEqual(diff.max(), 2 * lr * 2 * 1.01)
+        self.assertLess((diff > 1e-3 * lr).mean(), 1e-3)
 
 
 if __name__ == "__main__":

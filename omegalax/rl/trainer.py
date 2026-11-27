@@ -92,7 +92,9 @@ class Trainer:
             else param_shardings
         )
         self.master = jax.device_put(self.params, self._opt_shardings)
-        with jax.set_mesh(self.mesh):
+        # The update runs outside the trainer's mesh context; with host_optimizer, on the CPU
+        # (where Adam's step counter must be created too).
+        with jax.default_device(jax.devices("cpu")[0] if cfg.host_optimizer else None):
             self.opt_state = jax.jit(self.tx.init)(self.master)
         self._zeros = jax.jit(
             lambda p: jax.tree.map(jnp.zeros_like, p), out_shardings=param_shardings
@@ -194,16 +196,23 @@ class Trainer:
         """Compiles the gradient program of every length bucket on all-masked rows, and the update
         ahead of time (it then loads from the persistent compilation cache)."""
         t0 = time.perf_counter()
+
+        def masked_rows(T):
+            rows = self._rows(T)
+            mb = {k: np.zeros((rows, T), np.int32 if k in ("tokens", "segment_ids") else np.float32)
+                  for k in ("tokens", "segment_ids", "mask", "behavior_logp", "fresh")}
+            mb["advantage"] = np.zeros(rows, np.float32)
+            return self._put(mb)
+
         with jax.set_mesh(self.mesh):
+            # The first trace of the model extends JAX's trace context, which keys every jit
+            # cache; trace once before compiling anything, or the first step recompiles.
+            self._accumulate.trace(self.params, self.params, masked_rows(self.cfg.length_buckets[0]), np.float32(0.0))
             acc = self._zeros(self.params)
             for T in self.cfg.length_buckets:
-                rows = self._rows(T)
-                mb = {k: np.zeros((rows, T), np.int32 if k in ("tokens", "segment_ids") else np.float32)
-                      for k in ("tokens", "segment_ids", "mask", "behavior_logp", "fresh")}
-                mb["advantage"] = np.zeros(rows, np.float32)
-                acc, _ = self._accumulate(self.params, acc, self._put(mb), jnp.float32(0.0))
-            self._apply.lower(self.master, self.opt_state, jax.device_put(acc, self._opt_shardings)).compile()
-            jax.block_until_ready(acc)
+                acc, _ = self._accumulate(self.params, acc, masked_rows(T), np.float32(0.0))
+        self._apply.lower(self.master, self.opt_state, jax.device_put(acc, self._opt_shardings)).compile()
+        jax.block_until_ready(acc)
         return time.perf_counter() - t0
 
     def step(self, samples: Sequence[Sample], advantages: Sequence[float]) -> dict[str, float]:
@@ -215,17 +224,17 @@ class Trainer:
         # token normalizer, so its forward/backward is skipped.
         active = [i for i, a in enumerate(advantages) if a != 0.0]
         mbs = self.microbatches([samples[i] for i in active], [advantages[i] for i in active])
-        inv_tokens = jnp.float32(1.0 / total_tokens)
+        inv_tokens = np.float32(1.0 / total_tokens)
         with jax.set_mesh(self.mesh):
             acc = self._zeros(self.params)
             sums = []
             for mb in mbs:
                 acc, m = self._accumulate(self.params, acc, self._put(mb), inv_tokens)
                 sums.append(m)
-            self.master, self.opt_state, grad_norm = self._apply(
-                self.master, self.opt_state, jax.device_put(acc, self._opt_shardings)
-            )
-            self.params = jax.device_put(self.master, self._param_shardings)
+        self.master, self.opt_state, grad_norm = self._apply(
+            self.master, self.opt_state, jax.device_put(acc, self._opt_shardings)
+        )
+        self.params = jax.device_put(self.master, self._param_shardings)
         sums = jax.device_get(sums)
         totals = {k: sum(float(s[k]) for s in sums) for k in (sums[0] if sums else ())}
         jax.block_until_ready(self.params)
