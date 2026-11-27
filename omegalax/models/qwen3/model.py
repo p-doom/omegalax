@@ -156,14 +156,15 @@ class DecoderLayer(nnx.Module):
     @partial(jax.remat, static_argnums=0)
     def __call__(self, hidden_BTD: jax.Array, cache, segment_ids_BT: jax.Array):
         normed_BTD = self.input_layernorm(hidden_BTD)
-        attn_out_BTD = hidden_BTD + self.attn(normed_BTD, cache, segment_ids_BT)
+        attn_BTD, cache = self.attn(normed_BTD, cache, segment_ids_BT)
+        attn_out_BTD = hidden_BTD + attn_BTD
         post_norm_BTD = self.post_attention_layernorm(attn_out_BTD)
         if self.is_moe:
             ff_out_BTD, aux_loss = self.mlp(post_norm_BTD)
         else:
             ff_out_BTD = self.mlp(post_norm_BTD)
             aux_loss = jnp.array(0.0, dtype=jnp.float32)
-        return attn_out_BTD + ff_out_BTD, aux_loss
+        return attn_out_BTD + ff_out_BTD, aux_loss, cache
 
 
 class Qwen3(nnx.Module):
@@ -203,7 +204,9 @@ class Qwen3(nnx.Module):
         )
         for i, layer in enumerate(self.layers):
             layer_cache = None if cache is None else cache[i]
-            hidden_BTD, aux = layer(hidden_BTD, layer_cache, segment_ids_BT)
+            hidden_BTD, aux, layer_cache = layer(hidden_BTD, layer_cache, segment_ids_BT)
+            if cache is not None:
+                cache[i] = layer_cache
             aux_losses.append(aux)
         hidden_BTD = self.final_norm(hidden_BTD)
         total_aux = (

@@ -1,29 +1,77 @@
-import math
+"""Paged KV cache threaded through ``Attention`` by the rollout engine."""
+
+import dataclasses
+import functools
 from typing import TypeAlias
 
+import jax
 import jax.numpy as jnp
-from flax import nnx
-from jax.sharding import PartitionSpec as P, reshard
+
+from omegalax.kernels.paged_attention import paged_attention
 
 
-Cache: TypeAlias = list["LayerCache"]
+@functools.partial(
+    jax.tree_util.register_dataclass,
+    data_fields=["positions_BT", "write_src_W", "write_slot_W", "page_table_NP", "q_pos_N", "kv_len_N"],
+    meta_fields=["block_q", "num_work"],
+)
+@dataclasses.dataclass(frozen=True)
+class PagedBatch:
+    """Token placement shared by all layers; see ``omegalax.kernels.paged_attention``.
+
+    KV write ``w`` stores flattened token ``write_src_W[w]`` at ``write_slot_W[w]`` (``page *
+    page_size + offset``). A token may be written to several slots (forked prompts); slots
+    are unique, and writes to skip carry distinct out-of-range slots.
+    """
+
+    positions_BT: jax.Array
+    write_src_W: jax.Array
+    write_slot_W: jax.Array
+    page_table_NP: jax.Array
+    q_pos_N: jax.Array
+    kv_len_N: jax.Array
+    block_q: int
+    num_work: int
 
 
-class LayerCache(nnx.Module):
-    def __init__(self, cfg, batch_size: int, cache_size: int, dtype: jnp.dtype):
-        cache_shape = (batch_size, cache_size, cfg.num_kv_heads, cfg.head_dim)
-        self.k_cache = nnx.Cache(reshard(jnp.zeros(cache_shape, dtype=dtype), cfg.shd_cfg.act_btnh))
-        self.v_cache = nnx.Cache(reshard(jnp.zeros(cache_shape, dtype=dtype), cfg.shd_cfg.act_btnh))
-        self.size = self.k_cache.shape[1]
-        batch_sharding = P(cfg.shd_cfg.act_btnh[0]) if cfg.shd_cfg.act_btnh else P(None)
-        self.start_ind = nnx.Variable(
-            reshard(-1 * jnp.ones((batch_size,), dtype=jnp.int32), batch_sharding)
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True)
+class LayerCache:
+    k_pages_GPSK: jax.Array
+    v_pages_GPSK: jax.Array
+    batch: PagedBatch
+
+    def write(self, k_BTGK: jax.Array, v_BTGK: jax.Array) -> "LayerCache":
+        G, P, S, K = self.k_pages_GPSK.shape
+        src_W, slot_W = self.batch.write_src_W, self.batch.write_slot_W
+
+        def put(pages_GPSK, x_BTGK):
+            x_GWK = jnp.swapaxes(x_BTGK.reshape(-1, G, K)[src_W], 0, 1).astype(pages_GPSK.dtype)
+            pages_GTK = pages_GPSK.reshape(G, P * S, K).at[:, slot_W].set(
+                x_GWK, mode="drop", unique_indices=True
+            )
+            return pages_GTK.reshape(G, P, S, K)
+
+        return dataclasses.replace(
+            self,
+            k_pages_GPSK=put(self.k_pages_GPSK, k_BTGK),
+            v_pages_GPSK=put(self.v_pages_GPSK, v_BTGK),
         )
-        self.cur_ind = nnx.Variable(jnp.zeros((), dtype=jnp.int32))
+
+    def attend(self, q_BTHK: jax.Array, scale: float) -> jax.Array:
+        B, T, H, K = q_BTHK.shape
+        Q = self.batch.block_q
+        out_NQHK = paged_attention(
+            q_BTHK.reshape(B * T // Q, Q, H, K),
+            self.k_pages_GPSK,
+            self.v_pages_GPSK,
+            self.batch.page_table_NP,
+            self.batch.q_pos_N,
+            self.batch.kv_len_N,
+            scale=scale,
+            num_work=self.batch.num_work,
+        )
+        return out_NQHK.reshape(B, T, H, K)
 
 
-def init_cache(
-    cfg, batch_size: int, token_len: int, generate_steps: int, dtype: jnp.dtype = jnp.bfloat16
-) -> Cache:
-    cache_size = 2 ** math.ceil(math.log2(max(token_len + generate_steps, 1)))
-    return [LayerCache(cfg, batch_size, cache_size, dtype) for _ in range(cfg.num_layers)]
+Cache: TypeAlias = list[LayerCache]

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import gc
 from typing import Any
 
@@ -11,6 +12,8 @@ from etils import epath
 from flax import nnx
 
 from omegalax.distributed.mesh import ensure_mesh, mesh_rules
+from omegalax.models.sharding_runtime import _finalize_q_shardings
+from omegalax.models.shard_config import shard_config_for_mesh
 from omegalax.models.params_utils import (
     Transform,
     assign_weights_from_eval_shape,
@@ -134,10 +137,12 @@ def create_qwen3_from_safetensors(
     hf_cfg = load_hf_config(epath.Path(file_dir))
     cfg = make_config_from_hf(hf_cfg)
     _assert_config(cfg, hf_cfg)
+    cfg = dataclasses.replace(cfg, shd_cfg=shard_config_for_mesh(cfg.shd_cfg, mesh))
 
     with mesh_rules(mesh):
         model = nnx.eval_shape(lambda: Qwen3(cfg, rngs=nnx.Rngs(params=0)))
-    graph_def, abs_state = nnx.split(model)
+        graph_def, abs_state = nnx.split(model)
+        pspec_dict = nnx.to_pure_dict(nnx.get_partition_spec(abs_state))
     state_dict = nnx.to_pure_dict(abs_state)
 
     key_mapping = _get_key_mapping()
@@ -176,6 +181,8 @@ def create_qwen3_from_safetensors(
                     state_dict,
                     torch_key,
                     transform.value,
+                    mesh=mesh,
+                    pspec_dict=pspec_dict,
                 )
         gc.collect()
 
@@ -187,6 +194,8 @@ def create_qwen3_from_safetensors(
             state_dict,
             num_experts=cfg.num_experts,
             jax_layer_prefix="layers",
+            mesh=mesh,
+            pspec_dict=pspec_dict,
         )
     gc.collect()
 
@@ -197,4 +206,5 @@ def create_qwen3_from_safetensors(
 
     gc.collect()
     model = nnx.merge(graph_def, state_dict)
+    _finalize_q_shardings(model, mesh)
     return model
