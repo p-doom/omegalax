@@ -174,12 +174,29 @@ class Trainer:
             for k, v in mb.items()
         }
 
+    def warmup(self) -> float:
+        """Compiles the gradient program of every length bucket on all-masked rows."""
+        t0 = time.perf_counter()
+        with jax.set_mesh(self.mesh):
+            acc = self._zeros(self.params)
+            for T in self.cfg.length_buckets:
+                rows = self._rows(T)
+                mb = {k: np.zeros((rows, T), np.int32 if k in ("tokens", "segment_ids") else np.float32)
+                      for k in ("tokens", "segment_ids", "mask", "behavior_logp", "fresh")}
+                mb["advantage"] = np.zeros(rows, np.float32)
+                acc, _ = self._accumulate(self.params, acc, self._put(mb), jnp.float32(0.0))
+            jax.block_until_ready(acc)
+        return time.perf_counter() - t0
+
     def step(self, samples: Sequence[Sample], advantages: Sequence[float]) -> dict[str, float]:
         t0 = time.perf_counter()
-        mbs = self.microbatches(samples, advantages)
-        total_tokens = sum(float(mb["mask"].sum()) for mb in mbs)
+        total_tokens = float(sum(sum(s.mask) for s in samples))
         if total_tokens == 0:
             raise ValueError("A training batch needs at least one masked token.")
+        # A zero advantage zeroes a sample's loss and gradient exactly; it only counts in the
+        # token normalizer, so its forward/backward is skipped.
+        active = [i for i, a in enumerate(advantages) if a != 0.0]
+        mbs = self.microbatches([samples[i] for i in active], [advantages[i] for i in active])
         inv_tokens = jnp.float32(1.0 / total_tokens)
         with jax.set_mesh(self.mesh):
             acc = self._zeros(self.params)
@@ -189,7 +206,7 @@ class Trainer:
                 sums.append(m)
             self.params, self.opt_state, grad_norm = self._apply(self.params, self.opt_state, acc)
         sums = jax.device_get(sums)
-        totals = {k: sum(float(s[k]) for s in sums) for k in sums[0]}
+        totals = {k: sum(float(s[k]) for s in sums) for k in (sums[0] if sums else ())}
         jax.block_until_ready(self.params)
         seconds = time.perf_counter() - t0
         self.version += 1
@@ -200,21 +217,23 @@ class Trainer:
             * float(mb["segment_ids"].sum())
             for mb in mbs
         )
-        padded = sum(mb["tokens"].size for mb in mbs)
-        n, nf = totals["tokens"], max(totals["fresh_tokens"], 1.0)
+        padded = max(sum(mb["tokens"].size for mb in mbs), 1)
+        get = lambda k: totals.get(k, 0.0)
+        n, nf = max(get("tokens"), 1.0), max(get("fresh_tokens"), 1.0)
         return {
             "train/seconds": seconds,
             "train/microbatches": len(mbs),
             "train/grad_norm": float(grad_norm),
-            "train/loss_tokens": n,
-            "train/entropy": totals["entropy"] / n,
-            "train/neg_logp": totals["neg_logp"] / n,
-            "train/clip_frac": totals["clipped"] / n,
-            "train/abs_log_ratio": totals["abs_log_ratio"] / n,
-            "train/kl_k3": totals["kl_k3"] / n,
-            "train/fresh_frac": totals["fresh_tokens"] / n,
-            "train/fresh_abs_log_ratio": totals["fresh_abs_log_ratio"] / nf,
-            "train/fresh_kl_k3": totals["fresh_kl_k3"] / nf,
+            "train/loss_tokens": total_tokens,
+            "train/active_frac": get("tokens") / total_tokens,
+            "train/entropy": get("entropy") / n,
+            "train/neg_logp": get("neg_logp") / n,
+            "train/clip_frac": get("clipped") / n,
+            "train/abs_log_ratio": get("abs_log_ratio") / n,
+            "train/kl_k3": get("kl_k3") / n,
+            "train/fresh_frac": get("fresh_tokens") / n,
+            "train/fresh_abs_log_ratio": get("fresh_abs_log_ratio") / nf,
+            "train/fresh_kl_k3": get("fresh_kl_k3") / nf,
             "train/pad_frac": 1.0 - sum(float(mb["segment_ids"].sum()) for mb in mbs) / padded,
             "train/model_tflop": flops / 1e12,
         }

@@ -64,5 +64,40 @@ class TokenLogprobsTest(absltest.TestCase):
             np.testing.assert_array_equal(np.asarray(logp[:, 0]), 0.0)
 
 
+class TrainerTest(absltest.TestCase):
+    def test_zero_advantage_samples_only_count_in_the_normalizer(self):
+        from omegalax.rl.rollout import Sample
+        from omegalax.rl.trainer import TrainConfig, Trainer
+        from omegalax.models.sharding_runtime import set_attn_backend
+        from omegalax.text import api as text_api
+
+        model, cfg = text_api.init_model("qwen3-smoke", jax.random.key(0), tp_size=1, fsdp_size=1, dp_size=1)
+        set_attn_backend(model, "xla")
+        trainer = Trainer(model, cfg, TrainConfig(
+            lr=1e-3, weight_decay=0.0, adam_b1=0.9, adam_b2=0.98, adam_eps=1e-8, max_grad_norm=1e9,
+            eps_low=0.2, eps_high=0.28, tokens_per_microbatch=256, length_buckets=(32, 64),
+            logit_tile_tokens=64, pad_id=0,
+        ))
+        rng = np.random.default_rng(0)
+        samples = []
+        for L in (20, 40, 30, 50):
+            toks = rng.integers(1, 100, L).tolist()
+            mask = [0] * 8 + [1] * (L - 8)
+            samples.append(Sample(0, toks, 8, mask, list(rng.normal(-2, 0.5, L)), [0] * L))
+        adv = [1.0, 0.0, -1.0, 0.0]
+
+        def grads(subset):
+            with jax.set_mesh(trainer.mesh):
+                acc = trainer._zeros(trainer.params)
+                for mb in trainer.microbatches([samples[i] for i in subset], [adv[i] for i in subset]):
+                    acc, _ = trainer._accumulate(trainer.params, acc, trainer._put(mb), jnp.float32(1 / 100))
+            return jax.tree.leaves(acc)
+
+        full, active = grads([0, 1, 2, 3]), grads([0, 2])
+        self.assertGreater(max(float(jnp.abs(g).max()) for g in active), 1e-4)
+        for f, a in zip(full, active):
+            np.testing.assert_allclose(np.asarray(f), np.asarray(a), atol=1e-7)
+
+
 if __name__ == "__main__":
     absltest.main()

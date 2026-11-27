@@ -65,6 +65,9 @@ flags.DEFINE_integer("max_tool_procs", 64, "python_tool: concurrent executions."
 flags.DEFINE_integer("grade_workers", 16, "Reward grading processes.")
 flags.DEFINE_float("grade_timeout_s", 30.0, "Grading timeout; a timed-out sample is missing.")
 flags.DEFINE_integer("seed", 0, "Seed for prompt order and sampling keys.")
+flags.DEFINE_string("eval_path", None, "JSONL evaluated with one sample per row.", required=True)
+flags.DEFINE_integer("eval_every", 10, "Steps between evaluations (also one before step 1).")
+flags.DEFINE_integer("eval_concurrency", 64, "Evaluation samples in flight.")
 
 
 def main(argv):
@@ -76,12 +79,30 @@ def main(argv):
     nt, ne = FLAGS.trainer_devices, FLAGS.engine_devices
     if nt + ne > len(devices):
         raise ValueError(f"{nt} trainer + {ne} engine devices > {len(devices)} visible.")
-    per_engine = -(-(FLAGS.rollout_ahead + 1) * FLAGS.groups_per_step // ne) * FLAGS.group_size
+    per_engine = (-(-(FLAGS.rollout_ahead + 1) * FLAGS.groups_per_step // ne) * FLAGS.group_size
+                  + -(-FLAGS.eval_concurrency // ne))
     if per_engine > FLAGS.max_sessions:
         raise ValueError(f"Up to {per_engine} sessions per engine exceed max_sessions={FLAGS.max_sessions}.")
     tokenizer = AutoTokenizer.from_pretrained(FLAGS.model_path)
     eos = (tokenizer.convert_tokens_to_ids("<|im_end|>"), tokenizer.convert_tokens_to_ids("<|endoftext|>"))
     pad = eos[1]
+    grader = ProcessPoolExecutor(FLAGS.grade_workers, mp_context=multiprocessing.get_context("forkserver"))
+    if FLAGS.env == "math":
+        env = MathEnv(tokenizer, grader, FLAGS.grade_timeout_s, thinking=FLAGS.thinking)
+    else:
+        if not FLAGS.thinking:
+            raise ValueError("python_tool runs in thinking mode.")
+        env = PythonToolEnv(
+            tokenizer, grader, FLAGS.grade_timeout_s, max_turns=FLAGS.max_turns,
+            tool_timeout_s=FLAGS.tool_timeout_s, tool_memory_bytes=FLAGS.tool_memory_gb << 30,
+            tool_output_chars=FLAGS.tool_output_chars, max_tool_procs=FLAGS.max_tool_procs,
+        )
+    eval_tasks = [json.loads(line) for line in open(FLAGS.eval_path)]
+    rows = [json.loads(line) for line in open(FLAGS.data_path)] + eval_tasks
+    max_context = max(len(env.prompt(r)) for r in rows) + FLAGS.max_response
+    buckets = tuple(int(x) for x in FLAGS.length_buckets)
+    if max_context > buckets[-1]:
+        raise ValueError(f"Longest prompt + max_response = {max_context} exceeds the last length bucket {buckets[-1]}.")
 
     t0 = time.perf_counter()
     model, cfg = load_causal_lm(FLAGS.model_path, sub_mesh(devices[:nt], 1, nt, 1))
@@ -93,14 +114,14 @@ def main(argv):
             adam_b2=FLAGS.adam_b2, adam_eps=FLAGS.adam_eps, max_grad_norm=FLAGS.max_grad_norm,
             eps_low=FLAGS.eps_low, eps_high=FLAGS.eps_high,
             tokens_per_microbatch=FLAGS.tokens_per_microbatch,
-            length_buckets=tuple(int(x) for x in FLAGS.length_buckets),
+            length_buckets=buckets,
             logit_tile_tokens=FLAGS.logit_tile_tokens, pad_id=pad,
         ),
     )
     del model
     ecfg = EngineConfig(
         num_pages=FLAGS.num_pages,
-        max_context=FLAGS.max_response + 2048,
+        max_context=max_context,
         decode_steps=FLAGS.decode_steps,
         decode_buckets=tuple(int(x) for x in FLAGS.decode_buckets),
         extend_buckets=tuple(int(x) for x in FLAGS.extend_buckets),
@@ -131,17 +152,6 @@ def main(argv):
         metrics_file.write(line + "\n")
         metrics_file.flush()
 
-    grader = ProcessPoolExecutor(FLAGS.grade_workers, mp_context=multiprocessing.get_context("forkserver"))
-    if FLAGS.env == "math":
-        env = MathEnv(tokenizer, grader, FLAGS.grade_timeout_s, thinking=FLAGS.thinking)
-    else:
-        if not FLAGS.thinking:
-            raise ValueError("python_tool runs in thinking mode.")
-        env = PythonToolEnv(
-            tokenizer, grader, FLAGS.grade_timeout_s, max_turns=FLAGS.max_turns,
-            tool_timeout_s=FLAGS.tool_timeout_s, tool_memory_bytes=FLAGS.tool_memory_gb << 30,
-            tool_output_chars=FLAGS.tool_output_chars, max_tool_procs=FLAGS.max_tool_procs,
-        )
     lcfg = loop.LoopConfig(
         num_steps=FLAGS.num_steps,
         groups_per_step=FLAGS.groups_per_step,
@@ -149,10 +159,12 @@ def main(argv):
         max_staleness=FLAGS.max_staleness,
         rollout=RolloutConfig(FLAGS.group_size, FLAGS.max_response, FLAGS.temperature),
         seed=FLAGS.seed,
+        eval_every=FLAGS.eval_every,
+        eval_concurrency=FLAGS.eval_concurrency,
     )
     tasks = loop.jsonl_tasks(FLAGS.data_path, FLAGS.seed)
     try:
-        asyncio.run(loop.run(trainer, engines, sync, env, tasks, lcfg, log))
+        asyncio.run(loop.run(trainer, engines, sync, env, tasks, eval_tasks, lcfg, log))
     finally:
         for e in engines:
             e.stop()

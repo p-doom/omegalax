@@ -85,10 +85,11 @@ class AsyncInvariantsTest(absltest.TestCase):
                    "Explain recursion with three examples.", "List twenty animals and a fact each."]
         tasks = ({"prompt": [{"role": "user", "content": p}]} for _ in iter(int, 1) for p in prompts)
         cfg_loop = loop.LoopConfig(num_steps=4, groups_per_step=2, rollout_ahead=2,
-                                   max_staleness=MAX_STALENESS, rollout=RolloutConfig(4, 400, 1.0), seed=0)
+                                   max_staleness=MAX_STALENESS, rollout=RolloutConfig(4, 400, 1.0), seed=0,
+                                   eval_every=2, eval_concurrency=4)
         metrics = []
         try:
-            asyncio.run(loop.run(trainer, [engine], sync, ParityEnv(tok), tasks, cfg_loop, metrics.append))
+            asyncio.run(loop.run(trainer, [engine], sync, ParityEnv(tok), tasks, [{"prompt": [{"role": "user", "content": p}]} for p in prompts], cfg_loop, metrics.append))
         finally:
             engine.stop()
 
@@ -103,7 +104,7 @@ class AsyncInvariantsTest(absltest.TestCase):
                 if v.min() == v.max():
                     single.append((int(v[0]), s))
         print(f"{len(single)} single-version and {spanning} version-spanning trajectories;",
-              "staleness max per step:", [m["staleness/max"] for m in metrics])
+              "staleness max per step:", [m["staleness/max"] for m in metrics if "step" in m])
         self.assertGreater(spanning, 0, "no trajectory saw an in-flight weight update")
 
         own, other = [], []
