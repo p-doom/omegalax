@@ -142,7 +142,7 @@ def main(argv):
     t1 = time.perf_counter()
     with ThreadPoolExecutor(len(engines)) as pool:
         warm = list(pool.map(lambda e: e.start(), engines))
-    print(json.dumps({"load_s": t1 - t0, "engine_warmup_s": time.perf_counter() - t1,
+    print(json.dumps({"time": time.time(), "load_s": t1 - t0, "engine_warmup_s": time.perf_counter() - t1,
                       "warmup_buckets_s": warm[0]}), flush=True)
 
     metrics_file = open(out / "metrics.jsonl", "a")
@@ -155,7 +155,7 @@ def main(argv):
                 f.write(json.dumps(dataclasses.asdict(s)) + "\n")
 
     def log(m):
-        line = json.dumps(m)
+        line = json.dumps({"time": time.time(), **m})
         print(line, flush=True)
         metrics_file.write(line + "\n")
         metrics_file.flush()
