@@ -22,6 +22,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import nnx
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
 
 from omegalax.engine import steps
 from omegalax.models.qwen3_5.cache import LinearExtend
@@ -124,6 +126,11 @@ class Engine:
         self._max_pages = -(-cfg.max_context // S)
         graphdef, state = nnx.split(model)
         self._mesh = jax.tree.leaves(state)[0].sharding.mesh
+        tp = self._mesh.shape["tp"]
+        if self._mesh.shape["fsdp"] != 1 or self._mesh.shape["dp"] != 1:
+            raise ValueError(
+                f"The engine shards over 'tp' only; got mesh {dict(self._mesh.shape)}."
+            )
         # The jitted programs take the state as a flat leaf list so their cache keys depend on
         # array types only, not on nnx variable metadata.
         self._abstract = jax.tree.map(
@@ -135,20 +142,33 @@ class Engine:
         graphdef = (graphdef, jax.tree.structure(state))
         layers = model.text.layers if isinstance(model, steps.Qwen3_5ForCausalLM) else model.layers
         num_slots = cfg.max_sessions + 2
-        self._pool_shapes = []
+        # Pools are sharded like the activations they hold: KV and DeltaNet states by head, the
+        # conv window by channel (the sharding of in_proj_qkv's output).
+        self._pool_specs = []
         for layer in layers:
             if hasattr(layer, "attn"):
                 a = layer.attn
-                page_shape = (a.num_kv_heads, cfg.num_pages, S, a.head_dim)
-                self._pool_shapes.append(((page_shape, jnp.bfloat16), (page_shape, jnp.bfloat16)))
+                if a.num_kv_heads % tp:
+                    raise ValueError(f"{a.num_kv_heads} KV heads do not split over tp={tp}.")
+                page = ((a.num_kv_heads, cfg.num_pages, S, a.head_dim), jnp.bfloat16, P("tp"))
+                self._pool_specs.append((page, page))
                 self._block_q = max(1, min(128, 128 * 128 // a.head_dim) // a.n_rep)
             else:
                 d = layer.linear_attn
+                if d.num_k_heads % tp:
+                    raise ValueError(
+                        f"{d.num_k_heads} DeltaNet key heads do not split over tp={tp}."
+                    )
                 self._conv_k = d.conv_kernel_size
                 conv_shape = (num_slots, d.conv_kernel_size - 1, 2 * d.key_dim + d.value_dim)
                 state_shape = (num_slots, d.num_v_heads, d.head_k_dim, d.head_v_dim)
-                self._pool_shapes.append(((conv_shape, jnp.bfloat16), (state_shape, jnp.float32)))
-        self._linear = len(self._pool_shapes) != sum(hasattr(x, "attn") for x in layers)
+                self._pool_specs.append(
+                    (
+                        (conv_shape, jnp.bfloat16, P(None, None, "tp")),
+                        (state_shape, jnp.float32, P(None, "tp")),
+                    )
+                )
+        self._linear = len(self._pool_specs) != sum(hasattr(x, "attn") for x in layers)
         self._align = max(self._block_q, _DELTANET_CHUNK if self._linear else 1)
         self._fork_slack = cfg.max_group * S
         self._free_slots = list(range(num_slots - 1, steps.TRASH_SLOT, -1))
@@ -195,7 +215,10 @@ class Engine:
         # parses absl flags from sys.argv at that point unless the caller already has.
         self._score.trace(self._state, np.zeros((1, 128), np.int32), pad_id=self.cfg.pad_id)
         self._state = self._to_inference(self._state)
-        self._pools = [tuple(jnp.zeros(*spec) for spec in specs) for specs in self._pool_shapes]
+        zeros = lambda shape, dtype, spec: jax.jit(
+            lambda: jnp.zeros(shape, dtype), out_shardings=NamedSharding(self._mesh, spec)
+        )()
+        self._pools = [tuple(zeros(*spec) for spec in specs) for specs in self._pool_specs]
         runs = {
             f"decode_{B}": (self._run_decode_call, self._decode_inputs([], B))
             for B in self.cfg.decode_buckets
@@ -314,10 +337,12 @@ class Engine:
     def _set_weights(self, params: dict, version: int) -> None:
         state = jax.tree.map(lambda x: x, self._abstract)
         nnx.replace_by_pure_dict(state, params)
-        leaves = jax.tree.leaves(state)
-        spec = lambda x: (x.shape, x.dtype, x.sharding)
-        if list(map(spec, leaves)) != list(map(spec, jax.tree.leaves(self._abstract))):
-            raise ValueError("update_weights needs the initial shapes, dtypes and shardings.")
+        leaves, abstract = jax.tree.leaves(state), jax.tree.leaves(self._abstract)
+        spec = lambda x: (x.shape, x.dtype)
+        if list(map(spec, leaves)) != list(map(spec, abstract)):
+            raise ValueError("update_weights needs the initial shapes and dtypes.")
+        # Params may live on the trainer's mesh; one device_put reshards them onto the engine's.
+        leaves = jax.device_put(leaves, [x.sharding for x in abstract])
         self._state = self._to_inference(leaves)
         self._version = version
 

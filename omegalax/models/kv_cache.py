@@ -5,8 +5,14 @@ import functools
 
 import jax
 import jax.numpy as jnp
+from jax.sharding import PartitionSpec as P
 
 from omegalax.kernels.paged_attention import paged_attention
+from omegalax.models.sharding_runtime import per_shard
+
+# Pages hold the KV heads of omegalax's tensor-parallel mesh axis.
+_PAGES = P("tp", None, None, None)
+_HEADS = P(None, None, "tp", None)
 
 
 @functools.partial(
@@ -48,38 +54,60 @@ class LayerCache:
     batch: PagedBatch
 
     def write(self, k_BTGK: jax.Array, v_BTGK: jax.Array) -> "LayerCache":
-        G, P, S, K = self.k_pages_GPSK.shape
-        src_W, slot_W = self.batch.write_src_W, self.batch.write_slot_W
-
-        def put(pages_GPSK, x_BTGK):
+        def put(pages_GPSK, x_BTGK, src_W, slot_W):
+            G, _, _, K = pages_GPSK.shape
             x_GWK = jnp.swapaxes(x_BTGK.reshape(-1, G, K)[src_W], 0, 1).astype(pages_GPSK.dtype)
             pages_GTK = (
-                pages_GPSK.reshape(G, P * S, K)
+                pages_GPSK.reshape(G, -1, K)
                 .at[:, slot_W]
                 .set(x_GWK, mode="drop", unique_indices=True)
             )
-            return pages_GTK.reshape(G, P, S, K)
+            return pages_GTK.reshape(pages_GPSK.shape)
 
-        return dataclasses.replace(
-            self,
-            k_pages_GPSK=put(self.k_pages_GPSK, k_BTGK),
-            v_pages_GPSK=put(self.v_pages_GPSK, v_BTGK),
+        def put_kv(k_pages, v_pages, k, v, src_W, slot_W):
+            return put(k_pages, k, src_W, slot_W), put(v_pages, v, src_W, slot_W)
+
+        k_pages, v_pages = per_shard(
+            put_kv,
+            (_PAGES, _PAGES, _HEADS, _HEADS, P(), P()),
+            (_PAGES, _PAGES),
+            self.k_pages_GPSK,
+            self.v_pages_GPSK,
+            k_BTGK,
+            v_BTGK,
+            self.batch.write_src_W,
+            self.batch.write_slot_W,
         )
+        return dataclasses.replace(self, k_pages_GPSK=k_pages, v_pages_GPSK=v_pages)
 
     def attend(self, q_BTHK: jax.Array, scale: float) -> jax.Array:
-        B, T, H, K = q_BTHK.shape
-        Q = self.batch.block_q
-        out_NQHK = paged_attention(
-            q_BTHK.reshape(B * T // Q, Q, H, K),
+        Q, num_work = self.batch.block_q, self.batch.num_work
+
+        def attend(q_BTHK, k_pages, v_pages, page_table_NP, q_pos_N, kv_len_N):
+            B, T, H, K = q_BTHK.shape
+            out_NQHK = paged_attention(
+                q_BTHK.reshape(B * T // Q, Q, H, K),
+                k_pages,
+                v_pages,
+                page_table_NP,
+                q_pos_N,
+                kv_len_N,
+                scale=scale,
+                num_work=num_work,
+                # Tuned on H100: decode is bandwidth-bound, extend (Q x R = 128 rows) compute-bound.
+                min_chunk_pages=16 if Q == 1 else 64,
+                num_stages=3 if Q == 1 else 2,
+            )
+            return out_NQHK.reshape(B, T, H, K)
+
+        return per_shard(
+            attend,
+            (_HEADS, _PAGES, _PAGES, P(), P(), P()),
+            _HEADS,
+            q_BTHK,
             self.k_pages_GPSK,
             self.v_pages_GPSK,
             self.batch.page_table_NP,
             self.batch.q_pos_N,
             self.batch.kv_len_N,
-            scale=scale,
-            num_work=self.batch.num_work,
-            # Tuned on H100: decode is bandwidth-bound, extend (Q x R = 128 rows) compute-bound.
-            min_chunk_pages=16 if Q == 1 else 64,
-            num_stages=3 if Q == 1 else 2,
         )
-        return out_NQHK.reshape(B, T, H, K)

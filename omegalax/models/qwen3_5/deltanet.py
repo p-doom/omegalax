@@ -26,6 +26,8 @@ import jax.numpy as jnp
 from flax import nnx
 from jax.sharding import PartitionSpec
 
+from omegalax.models.sharding_runtime import per_shard
+
 from .cache import LinearCache, LinearDecode
 from .kernels import chunk_gated_delta_rule, recurrent_gated_delta_step
 from .config import Qwen3_5TextConfig
@@ -238,69 +240,109 @@ class GatedDeltaNet(nnx.Module):
         return out_BTD, None
 
     def _cached(self, hidden_BTD: jax.Array, cache: LinearCache) -> tuple[jax.Array, LinearCache]:
-        """Engine path on flattened tokens: conv and recurrence continue the pooled states."""
+        """Engine path on flattened tokens: conv and recurrence continue the pooled states.
+
+        Under tensor parallelism the conv runs on contiguous channel shards (the sharding of
+        ``in_proj_qkv``), the recurrence on head shards.
+        """
         B, T, _ = hidden_BTD.shape
         N, K = B * T, self.conv_kernel_size
         batch = cache.batch
-        x_NC = self.in_proj_qkv(hidden_BTD).reshape(N, -1)
-        z_NHU = self.in_proj_z(hidden_BTD).reshape(N, self.num_v_heads, self.head_v_dim)
-        b_NH = self.in_proj_b(hidden_BTD).reshape(N, self.num_v_heads)
-        a_NH = self.in_proj_a(hidden_BTD).reshape(N, self.num_v_heads)
+        channels, heads = P(None, "tp"), P(None, "tp", None)
+        x_NC = self.in_proj_qkv(hidden_BTD, out_sharding=self.shd_cfg.act_btf).reshape(N, -1)
 
-        S = cache.conv_SKC.shape[0]
-        pool_RC = cache.conv_SKC.reshape(S * (K - 1), -1)
+        def conv_shard(x_NC, conv_SKC, weight_CK, batch):
+            pool_RC = conv_SKC.reshape(-1, x_NC.shape[1])
 
-        def rows(idx):
-            in_x = (idx < N)[..., None]
-            return jnp.where(in_x, x_NC[jnp.minimum(idx, N - 1)], pool_RC[jnp.maximum(idx - N, 0)])
+            def rows(idx):
+                in_x = (idx < N)[..., None]
+                return jnp.where(
+                    in_x, x_NC[jnp.minimum(idx, N - 1)], pool_RC[jnp.maximum(idx - N, 0)]
+                )
 
-        weight_CK = self.conv_weight[...].astype(x_NC.dtype)
+            def conv(taps):
+                out = jnp.zeros_like(taps[0])
+                for k in range(K):
+                    out = out + weight_CK[None, :, k] * taps[k]
+                return out
 
-        def conv(taps):
-            out = jnp.zeros_like(taps[0])
-            for k in range(K):
-                out = out + weight_CK[None, :, k] * taps[k]
-            return out
+            x_pad_RC = jnp.pad(x_NC, ((K - 1, 0), (0, 0)))
+            conv_NC = conv([x_pad_RC[k : k + N] for k in range(K)])
+            taps_FKC = rows(batch.conv_src_FK)
+            conv_NC = conv_NC.at[batch.conv_fix_F].set(
+                conv([taps_FKC[:, k] for k in range(K)]), mode="drop", unique_indices=True
+            )
+            conv_SKC = conv_SKC.at[batch.write_slot_W].set(
+                rows(batch.conv_out_src_WK), mode="drop", unique_indices=True
+            )
+            return conv_NC, conv_SKC
 
-        x_pad_RC = jnp.pad(x_NC, ((K - 1, 0), (0, 0)))
-        conv_NC = conv([x_pad_RC[k : k + N] for k in range(K)])
-        taps_FKC = rows(batch.conv_src_FK)
-        conv_NC = conv_NC.at[batch.conv_fix_F].set(
-            conv([taps_FKC[:, k] for k in range(K)]), mode="drop", unique_indices=True
-        )
-        conv_SKC = cache.conv_SKC.at[batch.write_slot_W].set(
-            rows(batch.conv_out_src_WK), mode="drop", unique_indices=True
+        conv_NC, conv_SKC = per_shard(
+            conv_shard,
+            (channels, P(None, None, "tp"), P("tp", None), P()),
+            (channels, P(None, None, "tp")),
+            x_NC,
+            cache.conv_SKC,
+            self.conv_weight[...].astype(x_NC.dtype),
+            batch,
         )
         q_NP, k_NP, v_NO = jnp.split(nnx.silu(conv_NC), [self.key_dim, self.key_dim * 2], axis=-1)
-        q_NHA = jnp.repeat(q_NP.reshape(N, self.num_k_heads, self.head_k_dim), self.gqa_factor, 1)
-        k_NHA = jnp.repeat(k_NP.reshape(N, self.num_k_heads, self.head_k_dim), self.gqa_factor, 1)
-        v_NHU = v_NO.reshape(N, self.num_v_heads, self.head_v_dim)
+        q_NHA = jax.lax.reshape(q_NP, (N, self.num_k_heads, self.head_k_dim), out_sharding=heads)
+        k_NHA = jax.lax.reshape(k_NP, (N, self.num_k_heads, self.head_k_dim), out_sharding=heads)
+        v_NHU = jax.lax.reshape(v_NO, (N, self.num_v_heads, self.head_v_dim), out_sharding=heads)
+        z_NHU = jax.lax.reshape(
+            self.in_proj_z(hidden_BTD, out_sharding=self.shd_cfg.act_btf),
+            (N, self.num_v_heads, self.head_v_dim),
+            out_sharding=heads,
+        )
+        b_NH = self.in_proj_b(hidden_BTD, out_sharding=self.shd_cfg.act_btf).reshape(N, -1)
+        a_NH = self.in_proj_a(hidden_BTD, out_sharding=self.shd_cfg.act_btf).reshape(N, -1)
         beta_NH = jax.nn.sigmoid(b_NH)
         g_NH = -jnp.exp(self.A_log[...].astype(jnp.float32)) * jax.nn.softplus(
             a_NH.astype(jnp.float32) + self.dt_bias[...]
         )
+        gqa, eps = self.gqa_factor, self.norm.eps
 
-        if isinstance(batch, LinearDecode):
-            out_NHU, state_SHAU = recurrent_gated_delta_step(
-                q_NHA, k_NHA, v_NHU, g_NH, beta_NH, cache.state_SHAU, batch.row_slot_N
-            )
-        else:
-            valid_N1 = batch.valid_N[:, None]
-            out_1NHU, state_1WHAU = chunk_gated_delta_rule(
-                q_NHA[None],
-                k_NHA[None],
-                v_NHU[None],
-                jnp.where(valid_N1, g_NH, 0.0)[None],
-                jnp.where(valid_N1, beta_NH, 0.0)[None],
-                cache.state_SHAU[batch.init_slot_I],
-                batch.init_idx_1J,
-                batch.final_chunk_W[None],
-                CHUNK_SIZE,
-            )
-            out_NHU = out_1NHU[0]
-            state_SHAU = cache.state_SHAU.at[batch.write_slot_W].set(
-                state_1WHAU[0], mode="drop", unique_indices=True
-            )
-        normed_ND = _gated_norm(out_NHU[None], z_NHU[None], self.norm.weight[...], self.norm.eps)
-        out_BTD = self.out_proj(normed_ND.reshape(B, T, -1))
+        def recur_shard(q_NHA, k_NHA, v_NHU, z_NHU, g_NH, beta_NH, state_SHAU, norm_U, batch):
+            q_NHA = jnp.repeat(q_NHA, gqa, 1)
+            k_NHA = jnp.repeat(k_NHA, gqa, 1)
+            if isinstance(batch, LinearDecode):
+                out_NHU, state_SHAU = recurrent_gated_delta_step(
+                    q_NHA, k_NHA, v_NHU, g_NH, beta_NH, state_SHAU, batch.row_slot_N
+                )
+            else:
+                valid_N1 = batch.valid_N[:, None]
+                out_1NHU, state_1WHAU = chunk_gated_delta_rule(
+                    q_NHA[None],
+                    k_NHA[None],
+                    v_NHU[None],
+                    jnp.where(valid_N1, g_NH, 0.0)[None],
+                    jnp.where(valid_N1, beta_NH, 0.0)[None],
+                    state_SHAU[batch.init_slot_I],
+                    batch.init_idx_1J,
+                    batch.final_chunk_W[None],
+                    CHUNK_SIZE,
+                )
+                out_NHU = out_1NHU[0]
+                state_SHAU = state_SHAU.at[batch.write_slot_W].set(
+                    state_1WHAU[0], mode="drop", unique_indices=True
+                )
+            return _gated_norm(out_NHU[None], z_NHU[None], norm_U, eps)[0], state_SHAU
+
+        state_spec = P(None, "tp", None, None)
+        normed_NO, state_SHAU = per_shard(
+            recur_shard,
+            (heads, heads, heads, heads, channels, channels, state_spec, P(), P()),
+            (channels, state_spec),
+            q_NHA,
+            k_NHA,
+            v_NHU,
+            z_NHU,
+            g_NH,
+            beta_NH,
+            cache.state_SHAU,
+            self.norm.weight[...],
+            batch,
+        )
+        out_BTD = self.out_proj(normed_NO.reshape(B, T, -1), out_sharding=self.shd_cfg.act_btd)
         return out_BTD, LinearCache(conv_SKC, state_SHAU, batch)
