@@ -33,7 +33,8 @@ class ScriptedEngine:
         self.turn[sid] += 1
         toks = self.tok(text, add_special_tokens=False)["input_ids"]
         f = Future()
-        f.set_result(Completion(sid, toks, [-0.5] * len(toks), [self.version] * len(toks), reason))
+        f.set_result(Completion(sid, toks, [-0.5] * len(toks), [self.version] * len(toks), reason,
+                                np.zeros((len(toks), 1), np.int32), np.zeros((len(toks), 1), np.float32)))
         return f
 
     def generate(self, req):

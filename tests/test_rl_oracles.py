@@ -54,7 +54,7 @@ class RLOracleTest(absltest.TestCase):
             TrainConfig(
                 lr=1e-4, weight_decay=0.1, adam_b1=0.9, adam_b2=0.98, adam_eps=1e-8,
                 max_grad_norm=1.0, eps_low=0.2, eps_high=0.28, tokens_per_microbatch=2048,
-                length_buckets=(1024, 2048, 4096), logit_tile_tokens=4096, pad_id=cls.pad, host_optimizer=False,
+                length_buckets=(1024, 2048, 4096), logit_tile_tokens=4096, pad_id=cls.pad, host_optimizer=False, objective="ppo", topk=1,
             ),
         )
         cls.sync = WeightSync(cls.trainer.graphdef, cls.trainer.params)
@@ -90,6 +90,7 @@ class RLOracleTest(absltest.TestCase):
             c = f.result()
             s = Sample(0, list(prompt), len(prompt), [0] * len(prompt), [0.0] * len(prompt), [-1] * len(prompt))
             s.append(c.tokens, c.logprobs, c.weight_versions)
+            s.heads.append((c.topk_ids, c.topk_logprobs))
             for t in range(turns):
                 obs = self.tok(
                     f"<|im_end|>\n<|im_start|>user\n<tool_response>\nresult {t}: "
@@ -100,6 +101,7 @@ class RLOracleTest(absltest.TestCase):
                 s.append(obs, None, None)
                 c = self.engine.generate(Request(obs, key[None], [int(rng.integers(50, 200))], [1.0], session=c.session, stop_at_eos=False))[0].result()
                 s.append(c.tokens, c.logprobs, c.weight_versions)
+                s.heads.append((c.topk_ids, c.topk_logprobs))
             self.engine.release(c.session)
             samples.append(s)
         return samples
@@ -163,7 +165,8 @@ class RLOracleTest(absltest.TestCase):
         samples = []
         for L in (300, 700, 500, 900):
             toks = rng.integers(10, 50000, L).tolist()
-            samples.append(Sample(0, toks, 50, [0] * 50 + [1] * (L - 50), list(rng.normal(-2, 0.5, L)), [0] * L))
+            samples.append(Sample(0, toks, 50, [0] * 50 + [1] * (L - 50), list(rng.normal(-2, 0.5, L)), [0] * L,
+                                  heads=[(np.zeros((L - 50, 1), np.int32), np.zeros((L - 50, 1), np.float32))]))
         adv = [1.0, -1.0, 0.5, -0.5]
         params = []
         for host in (False, True):

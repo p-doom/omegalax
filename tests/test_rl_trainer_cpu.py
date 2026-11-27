@@ -36,11 +36,12 @@ class FsdpTrainerTest(absltest.TestCase):
         trainer = Trainer(model, cfg, TrainConfig(
             lr=1e-3, weight_decay=0.1, adam_b1=0.9, adam_b2=0.98, adam_eps=1e-8, max_grad_norm=1.0,
             eps_low=0.2, eps_high=0.28, tokens_per_microbatch=256, length_buckets=(32, 64),
-            logit_tile_tokens=64, pad_id=0, host_optimizer=host_optimizer,
+            logit_tile_tokens=64, pad_id=0, host_optimizer=host_optimizer, objective="ppo", topk=1,
         ))
         rng = np.random.default_rng(0)
         samples = [
-            Sample(0, rng.integers(1, 100, L).tolist(), 4, [0] * 4 + [1] * (L - 4), [-1.0] * L, [0] * L)
+            Sample(0, rng.integers(1, 100, L).tolist(), 4, [0] * 4 + [1] * (L - 4), [-1.0] * L, [0] * L,
+                   heads=[(np.zeros((L - 4, 1), np.int32), np.zeros((L - 4, 1), np.float32))])
             for L in rng.integers(10, 60, 24)
         ]
         advantages = list(rng.normal(size=24))

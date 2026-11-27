@@ -42,6 +42,7 @@ class Sample:
     status: str = ""
     reward: float | None = None
     error: str = ""
+    heads: list = dataclasses.field(default_factory=list)  # per policy turn: sampler top-k (ids, logprobs)
 
     def append(self, tokens: list[int], logprobs: list[float] | None, versions: list[int] | None):
         self.tokens += tokens
@@ -80,6 +81,7 @@ async def _trajectory(engine, env, task, sample: Sample, future, key, cfg: Rollo
     try:
         while True:
             sample.append(c.tokens, c.logprobs, c.weight_versions)
+            sample.heads.append((c.topk_ids, c.topk_logprobs))
             sample.turns += 1
             if c.finish_reason == "length":
                 sample.status = "length"

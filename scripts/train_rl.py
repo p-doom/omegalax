@@ -53,6 +53,8 @@ flags.DEFINE_integer("tokens_per_microbatch", 65536, "Padded tokens per trainer 
 flags.DEFINE_list("length_buckets", ["1024", "2048", "4096", "8192", "16384"], "Trainer sequence buckets.")
 flags.DEFINE_integer("logit_tile_tokens", 4096, "Positions per float32 logits tile in the trainer.")
 flags.DEFINE_bool("host_optimizer", False, "Keep the float32 master and Adam state in host memory (large models).")
+flags.DEFINE_enum("objective", "ppo", ["ppo", "pg_sc", "ppo_sc"], "PPO clip on p/q; plain PG + score centering; PPO + score centering.")
+flags.DEFINE_integer("topk", 1, "Sampler top-k candidates recorded per token (score centering head).")
 flags.DEFINE_integer("num_pages", 32768, "KV pages per engine (64 tokens each).")
 flags.DEFINE_integer("max_sessions", 256, "Concurrent sessions per engine.")
 flags.DEFINE_integer("decode_steps", 8, "Decode steps per engine device call.")
@@ -123,7 +125,7 @@ def main(argv):
             tokens_per_microbatch=FLAGS.tokens_per_microbatch,
             length_buckets=buckets,
             logit_tile_tokens=FLAGS.logit_tile_tokens, pad_id=pad,
-            host_optimizer=FLAGS.host_optimizer,
+            host_optimizer=FLAGS.host_optimizer, objective=FLAGS.objective, topk=FLAGS.topk,
         ),
     )
     del model
@@ -137,6 +139,7 @@ def main(argv):
         pad_id=pad,
         max_group=FLAGS.group_size,
         max_sessions=FLAGS.max_sessions,
+        topk=FLAGS.topk,
     )
     sync = WeightSync(trainer.graphdef, trainer.params)
     params = sync.gather(trainer.params)
@@ -160,7 +163,7 @@ def main(argv):
     def dump(step, samples):
         with open(out / "samples" / f"step_{step:06d}.jsonl", "w") as f:
             for s in samples:
-                f.write(json.dumps(dataclasses.asdict(s)) + "\n")
+                f.write(json.dumps({k: v for k, v in dataclasses.asdict(s).items() if k != "heads"}) + "\n")
 
     def log(m):
         if "step" in m:

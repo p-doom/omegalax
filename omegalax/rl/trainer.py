@@ -13,7 +13,7 @@ import optax
 from flax import nnx
 from jax.sharding import NamedSharding, PartitionSpec as P
 
-from omegalax.rl.loss import policy_loss, token_logprobs
+from omegalax.rl.loss import policy_loss, score_centering, token_logprobs
 from omegalax.rl.rollout import Sample
 from omegalax.trainers.perf import forward_flops_per_token
 
@@ -33,6 +33,8 @@ class TrainConfig:
     logit_tile_tokens: int
     pad_id: int
     host_optimizer: bool
+    objective: str
+    topk: int
 
 
 def _metric_sums(logp_BT, entropy_BT, log_ratio_BT, clipped_BT, mask_BT, fresh_BT):
@@ -75,6 +77,7 @@ class Trainer:
         )
         self._batch_sharding = NamedSharding(self.mesh, P(batch_axis, None))
         self._row_sharding = NamedSharding(self.mesh, P(batch_axis))
+        self._cand_sharding = NamedSharding(self.mesh, P(batch_axis, None, None))
         param_shardings = jax.tree.map(lambda x: x.sharding, self.params)
         decay_mask = jax.tree.map(lambda x: x.ndim >= 2, self.params)
         self.tx = optax.chain(
@@ -110,7 +113,7 @@ class Trainer:
         self._logprobs = jax.jit(self._logprobs_fn)
         self.version = 0
 
-    def _forward(self, params, tokens_BT, segment_ids_BT):
+    def _forward(self, params, tokens_BT, segment_ids_BT, cand_BTK):
         model = nnx.merge(self.graphdef, params)
         hidden_BTD, _ = model(tokens_BT, segment_ids_BT, None, jnp.array(0, jnp.int32))
         B, T = tokens_BT.shape
@@ -120,15 +123,24 @@ class Trainer:
             tokens_BT,
             -(-B * T // self.cfg.logit_tile_tokens),
             self.model_cfg.shd_cfg.logits_btv,
+            cand_BTK,
         )
 
     def _accumulate_fn(self, params, acc, mb, inv_tokens):
         def loss_fn(params):
-            logp_BT, entropy_BT = self._forward(params, mb["tokens"], mb["segment_ids"])
+            logp_BT, entropy_BT, cand_logp_BTK = self._forward(
+                params, mb["tokens"], mb["segment_ids"], mb["cand"]
+            )
             adv_BT = jnp.broadcast_to(mb["advantage"][:, None], logp_BT.shape)
             loss, log_ratio_BT, clipped_BT = policy_loss(
-                logp_BT, mb["behavior_logp"], adv_BT, mb["mask"], self.cfg.eps_low, self.cfg.eps_high
+                logp_BT, mb["behavior_logp"], adv_BT, mb["mask"], self.cfg.eps_low, self.cfg.eps_high,
+                self.cfg.objective,
             )
+            if self.cfg.objective != "ppo":
+                loss = loss + score_centering(
+                    cand_logp_BTK, mb["cand_logq"], adv_BT, mb["mask"], self.cfg.objective,
+                    self.cfg.eps_low, self.cfg.eps_high,
+                )
             metrics = _metric_sums(
                 logp_BT, entropy_BT, log_ratio_BT, clipped_BT, mb["mask"], mb["fresh"]
             )
@@ -143,7 +155,8 @@ class Trainer:
         return optax.apply_updates(params, updates), opt_state, grad_norm
 
     def _logprobs_fn(self, params, tokens_BT, segment_ids_BT):
-        return self._forward(params, tokens_BT, segment_ids_BT)[0]
+        cand_BTK = jnp.zeros(tokens_BT.shape + (1,), jnp.int32)
+        return self._forward(params, tokens_BT, segment_ids_BT, cand_BTK)[0]
 
     def _bucket(self, length: int) -> int:
         for b in self.cfg.length_buckets:
@@ -172,6 +185,8 @@ class Trainer:
                 "behavior_logp": np.zeros((rows, T), np.float32),
                 "fresh": np.zeros((rows, T), np.float32),
                 "advantage": np.zeros(rows, np.float32),
+                "cand": np.zeros((rows, T, self.cfg.topk), np.int32),
+                "cand_logq": np.full((rows, T, self.cfg.topk), -np.inf, np.float32),
             }
             for r, i in enumerate(chunk):
                 s = samples[i]
@@ -182,12 +197,17 @@ class Trainer:
                 mb["behavior_logp"][r, :L] = s.logprobs
                 mb["fresh"][r, :L] = np.asarray(s.versions) == self.version
                 mb["advantage"][r] = advantages[i]
+                policy = np.flatnonzero(s.mask)
+                mb["cand"][r, policy] = np.concatenate([h[0] for h in s.heads])
+                mb["cand_logq"][r, policy] = np.concatenate([h[1] for h in s.heads])
             out.append(mb)
         return out
 
     def _put(self, mb):
         return {
-            k: jax.device_put(v, self._row_sharding if v.ndim == 1 else self._batch_sharding)
+            k: jax.device_put(
+                v, self._row_sharding if v.ndim == 1 else self._batch_sharding if v.ndim == 2 else self._cand_sharding
+            )
             for k, v in mb.items()
         }
 
@@ -201,6 +221,8 @@ class Trainer:
             mb = {k: np.zeros((rows, T), np.int32 if k in ("tokens", "segment_ids") else np.float32)
                   for k in ("tokens", "segment_ids", "mask", "behavior_logp", "fresh")}
             mb["advantage"] = np.zeros(rows, np.float32)
+            mb["cand"] = np.zeros((rows, T, self.cfg.topk), np.int32)
+            mb["cand_logq"] = np.full((rows, T, self.cfg.topk), -np.inf, np.float32)
             return self._put(mb)
 
         with jax.set_mesh(self.mesh):
