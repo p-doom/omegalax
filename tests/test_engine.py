@@ -17,6 +17,7 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForConditionalGe
 
 from omegalax.distributed.mesh import mesh_rules
 from omegalax.engine import Engine, EngineConfig, Request
+from omegalax.text import api as text_api
 from omegalax.models.qwen3.loader import create_qwen3_from_safetensors
 from omegalax.models.qwen3_5.loader import create_qwen3_5_from_safetensors
 from omegalax.models.qwen3_5.model import Qwen3_5ForCausalLM
@@ -53,8 +54,9 @@ def _keys(rng, n):
 def _qwen3_5_causal_lm(path):
     vlm, cfg = create_qwen3_5_from_safetensors(path, tp_size=1, fsdp_size=1, dp_size=1)
     mesh = jax.tree.leaves(nnx.state(vlm))[0].sharding.mesh
+    text_cfg = text_api.align_config_to_mesh(cfg.text_config, mesh)
     with mesh_rules(mesh):
-        abstract = nnx.eval_shape(lambda: Qwen3_5ForCausalLM(cfg.text_config, rngs=nnx.Rngs(0)))
+        abstract = nnx.eval_shape(lambda: Qwen3_5ForCausalLM(text_cfg, rngs=nnx.Rngs(0)))
     state = nnx.state(abstract)
     nnx.replace_by_pure_dict(
         state,

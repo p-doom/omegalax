@@ -272,7 +272,8 @@ def create_qwen3_5_from_safetensors(
         model = nnx.eval_shape(
             lambda: Qwen3_5ForConditionalGeneration(cfg, rngs=nnx.Rngs(params=0))
         )
-    graph_def, abs_state = nnx.split(model)
+        graph_def, abs_state = nnx.split(model)
+        placement = dict(mesh=mesh, pspec_dict=nnx.to_pure_dict(nnx.get_partition_spec(abs_state)))
     state_dict = nnx.to_pure_dict(abs_state)
 
     non_expert_mapping = _get_non_expert_mapping()
@@ -286,21 +287,21 @@ def create_qwen3_5_from_safetensors(
             layer_idx = int(m.group(1))
             value = jnp.asarray(tensor.squeeze(1))
             target = f"text.layers.{layer_idx}.linear_attn.conv_weight"
-            assign_to_state_dict(state_dict, target, value, torch_key)
+            assign_to_state_dict(state_dict, target, value, torch_key, **placement)
             return True
 
         m = _DT_BIAS_RE.match(torch_key)
         if m:
             layer_idx = int(m.group(1))
             target = f"text.layers.{layer_idx}.linear_attn.dt_bias"
-            assign_to_state_dict(state_dict, target, jnp.asarray(tensor), torch_key)
+            assign_to_state_dict(state_dict, target, jnp.asarray(tensor), torch_key, **placement)
             return True
 
         m = _A_LOG_RE.match(torch_key)
         if m:
             layer_idx = int(m.group(1))
             target = f"text.layers.{layer_idx}.linear_attn.A_log"
-            assign_to_state_dict(state_dict, target, jnp.asarray(tensor), torch_key)
+            assign_to_state_dict(state_dict, target, jnp.asarray(tensor), torch_key, **placement)
             return True
         return False
 
@@ -317,11 +318,9 @@ def create_qwen3_5_from_safetensors(
                 state_dict,
                 f"text.layers.{layer_idx}.mlp.gate_proj",
                 jnp.asarray(gate_EDF),
-                torch_key,
-            )
+                torch_key, **placement)
             assign_to_state_dict(
-                state_dict, f"text.layers.{layer_idx}.mlp.up_proj", jnp.asarray(up_EDF), torch_key
-            )
+                state_dict, f"text.layers.{layer_idx}.mlp.up_proj", jnp.asarray(up_EDF), torch_key, **placement)
             return True
 
         # Batched down_proj: HF (E, D, F) → JAX (E, F, D)
@@ -334,8 +333,7 @@ def create_qwen3_5_from_safetensors(
                 state_dict,
                 f"text.layers.{layer_idx}.mlp.down_proj",
                 jnp.asarray(down_EFD),
-                torch_key,
-            )
+                torch_key, **placement)
             return True
 
         m = _EXPERT_PER_RE.match(torch_key)
@@ -351,7 +349,7 @@ def create_qwen3_5_from_safetensors(
             layer_idx = int(m.group(1))
             value = jnp.asarray(tensor.T)
             target = f"text.layers.{layer_idx}.mlp.router.kernel"
-            assign_to_state_dict(state_dict, target, value, torch_key)
+            assign_to_state_dict(state_dict, target, value, torch_key, **placement)
             return True
 
         m = _SHARED_EXPERT_GATE_RE.match(torch_key)
@@ -359,21 +357,23 @@ def create_qwen3_5_from_safetensors(
             layer_idx = int(m.group(1))
             value = jnp.asarray(tensor.T)
             target = f"text.layers.{layer_idx}.mlp.shared_expert_gate.kernel"
-            assign_to_state_dict(state_dict, target, value, torch_key)
+            assign_to_state_dict(state_dict, target, value, torch_key, **placement)
             return True
         return False
 
     for f in files:
         with safetensors.safe_open(f, framework="numpy") as sf:
             for torch_key in sf.keys():
+                # The multi-token-prediction head is not part of the model.
+                if torch_key.startswith("mtp."):
+                    continue
                 tensor = sf.get_tensor(torch_key)
 
                 # Special: Conv3D patch embedding
                 if _CONV3D_RE.match(torch_key):
                     value = jnp.asarray(tensor.transpose(2, 3, 4, 1, 0))
                     assign_to_state_dict(
-                        state_dict, "vision.patch_embed.proj.kernel", value, torch_key
-                    )
+                        state_dict, "vision.patch_embed.proj.kernel", value, torch_key, **placement)
                     continue
 
                 # Linear attention specials
@@ -391,7 +391,7 @@ def create_qwen3_5_from_safetensors(
                     continue
 
                 keys = [stoi(k) for k in jax_key.split(".")]
-                assign_weights_from_eval_shape(keys, tensor, state_dict, torch_key, transform.value)
+                assign_weights_from_eval_shape(keys, tensor, state_dict, torch_key, transform.value, **placement)
         gc.collect()
 
     # Assemble per-expert weights into batched format (per-expert HF format)
@@ -413,8 +413,7 @@ def create_qwen3_5_from_safetensors(
                     state_dict,
                     f"text.layers.{layer_idx}.mlp.gate_proj",
                     jnp.asarray(gate_EDF),
-                    "experts.*.gate_proj",
-                )
+                    "experts.*.gate_proj", **placement)
 
             if "up_proj" in projs:
                 ups = [projs["up_proj"][i] for i in range(num_experts)]
@@ -424,8 +423,7 @@ def create_qwen3_5_from_safetensors(
                     state_dict,
                     f"text.layers.{layer_idx}.mlp.up_proj",
                     jnp.asarray(up_EDF),
-                    "experts.*.up_proj",
-                )
+                    "experts.*.up_proj", **placement)
 
             if "down_proj" in projs:
                 # HF per-expert down_proj.weight is (D, F). Stack → (E, D, F). Swap → (E, F, D).
@@ -436,8 +434,7 @@ def create_qwen3_5_from_safetensors(
                     state_dict,
                     f"text.layers.{layer_idx}.mlp.down_proj",
                     jnp.asarray(down_EFD),
-                    "experts.*.down_proj",
-                )
+                    "experts.*.down_proj", **placement)
 
     check_conversion_errors(unmatched_hf_keys)
 

@@ -292,7 +292,8 @@ class Engine:
     def _set_weights(self, state: nnx.State, version: int) -> None:
         if _signature(state) != self._signature:
             raise ValueError("update_weights needs the same tree, shapes, dtypes and shardings.")
-        self._state = self._to_inference(state)
+        # Equal treedefs can still hash differently (nnx metadata), which would miss the jit cache.
+        self._state = self._to_inference(jax.tree.unflatten(self._signature[0], jax.tree.leaves(state)))
         self._version = version
 
     def _new_session(self, tokens: list[int]) -> _Session:
