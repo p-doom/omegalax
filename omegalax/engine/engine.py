@@ -236,6 +236,8 @@ class Engine:
         return future
 
     def score(self, token_lists: Sequence[Sequence[int]]) -> Future:
+        if any(self.cfg.pad_id in t for t in token_lists):
+            raise ValueError("score input contains pad_id, which the trainer forward masks out.")
         future = Future()
         self._submit(("score", [list(t) for t in token_lists], future))
         return future
@@ -344,14 +346,19 @@ class Engine:
         s.length = min(s.length, keep * self.cfg.page_size)
 
     def _evict_one(self, keep: _Session, preempt: bool, pages: int) -> None:
-        """Frees ``pages`` tail pages of the least recently used idle session, else (if allowed)
-        of the newest decoder, which then re-extends its dropped tail. DeltaNet state cannot be
-        rewound, so a model with DeltaNet layers drops the whole session.
+        """Frees ``pages`` tail pages of the least recently used idle session, else of the newest
+        session waiting for an extend, else (if allowed) of the newest decoder; the victim
+        re-extends its dropped tail. DeltaNet state cannot be rewound, so a model with DeltaNet
+        layers drops the whole session.
         """
         idle = [s for s in self._sessions.values() if s.turn is None and s.pages]
+        waiting = [s for s in self._extend_queue if s is not keep and s.pages]
         if idle:
             victim = min(idle, key=lambda s: s.last_used)
             self.stats["evict_idle"] += 1
+        elif waiting:
+            victim = max(waiting, key=lambda s: s.id)
+            self.stats["evict_waiting"] += 1
         else:
             running = [s for s in self._decoding.values() if s is not keep] if preempt else []
             if not running:
@@ -425,14 +432,15 @@ class Engine:
                 evictable = sum(len(x.pages) for x in self._sessions.values() if x.turn is None)
                 if pages > len(self._free) + evictable:
                     break
+            self._extend_queue.popleft()
             try:
                 self._alloc(s, s.length + take, preempt=False)
                 if final:
                     for f in s.forks:
                         self._alloc_fork(s, f)
             except OutOfPages:
+                self._extend_queue.appendleft(s)
                 break
-            self._extend_queue.popleft()
             items.append((s, s.length, s.length + take, final))
             used += -(-take // A) * A
             rows += new_rows
@@ -616,8 +624,6 @@ class Engine:
         B = 1 << (len(token_lists) - 1).bit_length()
         tokens = np.full((B, T), self.cfg.pad_id, np.int32)
         for b, t in enumerate(token_lists):
-            if self.cfg.pad_id in t:
-                raise ValueError("score input contains pad_id, which the trainer forward masks out.")
             tokens[b, : len(t)] = t
         logp_BT = np.asarray(self._score(self._state, tokens, pad_id=self.cfg.pad_id))
         return [logp_BT[b, : len(t) - 1] for b, t in enumerate(token_lists)]

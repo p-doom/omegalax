@@ -239,14 +239,19 @@ class GatedDeltaNet(nnx.Module):
         a_NH = self.in_proj_a(hidden_BTD).reshape(N, self.num_v_heads)
 
         S = cache.conv_SKC.shape[0]
-        src_RC = jnp.concatenate([x_NC, cache.conv_SKC.reshape(S * (K - 1), -1)])
-        taps_NKC = src_RC[batch.conv_src_NK]
+        pool_RC = cache.conv_SKC.reshape(S * (K - 1), -1)
+
+        def rows(idx):
+            in_x = (idx < N)[..., None]
+            return jnp.where(in_x, x_NC[jnp.minimum(idx, N - 1)], pool_RC[jnp.maximum(idx - N, 0)])
+
+        taps_NKC = rows(batch.conv_src_NK)
         weight_CK = self.conv_weight[...].astype(x_NC.dtype)
         conv_NC = jnp.zeros_like(x_NC)
         for k in range(K):
             conv_NC = conv_NC + weight_CK[None, :, k] * taps_NKC[:, k]
         conv_SKC = cache.conv_SKC.at[batch.write_slot_W].set(
-            src_RC[batch.conv_out_src_WK], mode="drop", unique_indices=True
+            rows(batch.conv_out_src_WK), mode="drop", unique_indices=True
         )
         q_NP, k_NP, v_NO = jnp.split(nnx.silu(conv_NC), [self.key_dim, self.key_dim * 2], axis=-1)
         q_NHA = jnp.repeat(q_NP.reshape(N, self.num_k_heads, self.head_k_dim), self.gqa_factor, 1)
