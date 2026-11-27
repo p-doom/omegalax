@@ -29,6 +29,7 @@ class LoopConfig:
     rollout: RolloutConfig
     seed: int
     eval_every: int
+    eval_samples: int
     eval_concurrency: int
     drop_zero_variance: bool
     dump_every: int
@@ -43,21 +44,26 @@ def jsonl_tasks(path: str, seed: int) -> Iterator[dict]:
             yield rows[i]
 
 
-async def evaluate(engines, env: Env, tasks: list[dict], cfg: RolloutConfig, concurrency: int, rng) -> dict:
-    """One sample per task, at most ``concurrency`` in flight, concurrent with training."""
-    one_sample = dataclasses.replace(cfg, group_size=1)
-    slots = asyncio.Semaphore(concurrency)
+async def evaluate(engines, env: Env, tasks: list[dict], cfg: RolloutConfig, samples_per_task: int,
+                   concurrency: int, rng) -> dict:
+    """``samples_per_task`` samples per task (one group), at most ``concurrency`` samples in flight,
+    concurrent with training. Reports the mean reward and its standard error over tasks."""
+    group = dataclasses.replace(cfg, group_size=samples_per_task)
+    slots = asyncio.Semaphore(max(1, concurrency // samples_per_task))
 
     async def one(i, task):
         async with slots:
-            return (await rollout_group(engines[i % len(engines)], env, task, -1, one_sample, rng))[0]
+            return await rollout_group(engines[i % len(engines)], env, task, -1, group, rng)
 
     t0 = time.perf_counter()
-    samples = await asyncio.gather(*(one(i, t) for i, t in enumerate(tasks)))
+    groups = await asyncio.gather(*(one(i, t) for i, t in enumerate(tasks)))
+    samples = [s for g in groups for s in g]
     ok = [s for s in samples if s.status != "error"]
+    per_task = [np.mean([s.reward for s in g if s.status != "error"]) for g in groups if any(s.status != "error" for s in g)]
     versions = [v for s in ok for v, m in zip(s.versions, s.mask) if m]
     return {
         "eval/reward": float(np.mean([s.reward for s in ok])),
+        "eval/reward_se": float(np.std(per_task, ddof=1) / np.sqrt(len(per_task))),
         "eval/samples": len(ok),
         "eval/errors": len(samples) - len(ok),
         "eval/response_len": float(np.mean([len(s.tokens) - s.prompt_len for s in ok])),
@@ -115,7 +121,7 @@ async def run(trainer: Trainer, engines, sync: WeightSync, env: Env, tasks: Iter
 
     async def eval_at(step):
         start = time.perf_counter() - t_start
-        metrics = await evaluate(engines, env, eval_tasks, cfg.rollout, cfg.eval_concurrency, rng)
+        metrics = await evaluate(engines, env, eval_tasks, cfg.rollout, cfg.eval_samples, cfg.eval_concurrency, rng)
         log({"eval_step": step, "eval/start_wall_s": start, **metrics})
 
     t_start = time.perf_counter()

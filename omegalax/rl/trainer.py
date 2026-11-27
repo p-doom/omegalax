@@ -50,6 +50,7 @@ def _metric_sums(logp_BT, entropy_BT, log_ratio_BT, clipped_BT, mask_BT, fresh_B
         "fresh_tokens": jnp.sum(fresh),
         "fresh_abs_log_ratio": jnp.sum(abs_lr * fresh),
         "fresh_kl_k3": jnp.sum(k3 * fresh),
+        "abs_log_ratio_BT": abs_lr * mask_BT,
     }
 
 
@@ -236,6 +237,14 @@ class Trainer:
         )
         self.params = jax.device_put(self.master, self._param_shardings)
         sums = jax.device_get(sums)
+        # Per-token |log pi - log mu| on trained tokens, for quantiles and Miles' sample mean.
+        per_token, per_sample = [np.zeros(0)], [np.zeros(0)]
+        for s, mb in zip(sums, mbs):
+            a, m = s.pop("abs_log_ratio_BT"), mb["mask"] > 0
+            per_token.append(a[m])
+            rows = m.sum(1) > 0
+            per_sample.append(a.sum(1)[rows] / m.sum(1)[rows])
+        per_token, per_sample = np.concatenate(per_token), np.concatenate(per_sample)
         totals = {k: sum(float(s[k]) for s in sums) for k in (sums[0] if sums else ())}
         jax.block_until_ready(self.params)
         seconds = time.perf_counter() - t0
@@ -260,6 +269,9 @@ class Trainer:
             "train/neg_logp": get("neg_logp") / n,
             "train/clip_frac": get("clipped") / n,
             "train/abs_log_ratio": get("abs_log_ratio") / n,
+            "train/abs_log_ratio_sample_mean": float(per_sample.mean()) if per_sample.size else 0.0,
+            "train/abs_log_ratio_p99": float(np.quantile(per_token, 0.99)) if per_token.size else 0.0,
+            "train/abs_log_ratio_p999": float(np.quantile(per_token, 0.999)) if per_token.size else 0.0,
             "train/kl_k3": get("kl_k3") / n,
             "train/fresh_frac": get("fresh_tokens") / n,
             "train/fresh_abs_log_ratio": get("fresh_abs_log_ratio") / nf,

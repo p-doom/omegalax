@@ -70,6 +70,7 @@ flags.DEFINE_float("grade_timeout_s", 30.0, "Grading timeout; a timed-out sample
 flags.DEFINE_integer("seed", 0, "Seed for prompt order and sampling keys.")
 flags.DEFINE_string("eval_path", None, "JSONL evaluated with one sample per row.", required=True)
 flags.DEFINE_integer("eval_every", 10, "Steps between evaluations (also one before step 1).")
+flags.DEFINE_integer("eval_samples", 1, "Samples per evaluation task.")
 flags.DEFINE_integer("eval_concurrency", 64, "Evaluation samples in flight.")
 flags.DEFINE_bool("drop_zero_variance", False, "Train only on groups whose rewards differ (dynamic sampling).")
 flags.DEFINE_integer("dump_every", 50, "Steps between dumps of the trained samples (samples/step_*.jsonl).")
@@ -87,6 +88,8 @@ def main(argv):
     ne = FLAGS.engine_devices // tp
     per_engine = (-(-(FLAGS.rollout_ahead + 1) * FLAGS.groups_per_step // ne) * FLAGS.group_size
                   + -(-FLAGS.eval_concurrency // ne))
+    if FLAGS.eval_samples > FLAGS.group_size:
+        raise ValueError("eval_samples must not exceed group_size (the engine's max_group).")
     if per_engine > FLAGS.max_sessions:
         raise ValueError(f"Up to {per_engine} sessions per engine exceed max_sessions={FLAGS.max_sessions}.")
     tokenizer = AutoTokenizer.from_pretrained(FLAGS.model_path)
@@ -175,6 +178,7 @@ def main(argv):
         rollout=RolloutConfig(FLAGS.group_size, FLAGS.max_response, FLAGS.temperature),
         seed=FLAGS.seed,
         eval_every=FLAGS.eval_every,
+        eval_samples=FLAGS.eval_samples,
         eval_concurrency=FLAGS.eval_concurrency,
         drop_zero_variance=FLAGS.drop_zero_variance,
         dump_every=FLAGS.dump_every,
