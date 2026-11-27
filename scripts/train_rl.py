@@ -68,6 +68,7 @@ flags.DEFINE_integer("seed", 0, "Seed for prompt order and sampling keys.")
 flags.DEFINE_string("eval_path", None, "JSONL evaluated with one sample per row.", required=True)
 flags.DEFINE_integer("eval_every", 10, "Steps between evaluations (also one before step 1).")
 flags.DEFINE_integer("eval_concurrency", 64, "Evaluation samples in flight.")
+flags.DEFINE_bool("drop_zero_variance", False, "Train only on groups whose rewards differ (dynamic sampling).")
 
 
 def main(argv):
@@ -159,6 +160,7 @@ def main(argv):
         seed=FLAGS.seed,
         eval_every=FLAGS.eval_every,
         eval_concurrency=FLAGS.eval_concurrency,
+        drop_zero_variance=FLAGS.drop_zero_variance,
     )
     tasks = loop.jsonl_tasks(FLAGS.data_path, FLAGS.seed)
     try:
