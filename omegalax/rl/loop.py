@@ -19,8 +19,7 @@ from omegalax.rl.weights import WeightSync
 @dataclasses.dataclass(frozen=True)
 class LoopConfig:
     """At most ``(rollout_ahead + 1) * groups_per_step`` groups are outstanding; groups with a
-    token sampled more than ``max_staleness`` versions before the training step are dropped, and
-    with ``drop_zero_variance`` so are groups whose rewards are all equal (DAPO dynamic sampling)."""
+    token sampled more than ``max_staleness`` versions before the training step are dropped."""
 
     num_steps: int
     groups_per_step: int
@@ -31,7 +30,6 @@ class LoopConfig:
     eval_every: int
     eval_samples: int
     eval_concurrency: int
-    drop_zero_variance: bool
     dump_every: int
 
 
@@ -129,7 +127,7 @@ async def run(trainer: Trainer, engines, sync: WeightSync, env: Env, tasks: Iter
     # The trainer compiles on its own thread while the first groups are generated.
     warmup = loop.run_in_executor(train_thread, trainer.warmup)
     producer = asyncio.create_task(produce())
-    dropped = {"error": 0, "stale": 0, "zero_variance": 0}
+    dropped = {"error": 0, "stale": 0}
     errors = []
     totals0, t_prev = _engine_totals(engines), t_start
     for step in range(cfg.num_steps):
@@ -147,10 +145,6 @@ async def run(trainer: Trainer, engines, sync: WeightSync, env: Env, tasks: Iter
             oldest = min(v for s in group for v, m in zip(s.versions, s.mask) if m)
             if trainer.version - oldest > cfg.max_staleness:
                 dropped["stale"] += 1
-                capacity.release()
-                continue
-            if cfg.drop_zero_variance and len({s.reward for s in group}) == 1:
-                dropped["zero_variance"] += 1
                 capacity.release()
                 continue
             batch.append(group)
@@ -180,7 +174,6 @@ async def run(trainer: Trainer, engines, sync: WeightSync, env: Env, tasks: Iter
             "groups/zero_variance": int(np.sum(rewards.std(axis=1) == 0)),
             "groups/dropped_error": dropped["error"],
             "groups/dropped_stale": dropped["stale"],
-            "groups/dropped_zero_variance": dropped["zero_variance"],
             "engine/busy_frac": (decode_s + extend_s) / (len(engines) * (now - t_prev)),
             "engine/extend_frac": extend_s / max(decode_s + extend_s, 1e-9),
             "engine/decode_tokens_per_s": decode_tokens / (now - t_prev),
