@@ -138,34 +138,33 @@ class Trainer:
         return max(R, self.cfg.tokens_per_microbatch // T // R * R)
 
     def microbatches(self, samples: Sequence[Sample], advantages: Sequence[float]):
-        """Host arrays per microbatch; rows sorted by length, padded rows are fully masked."""
-        order = sorted(range(len(samples)), key=lambda i: len(samples[i].tokens))
-        by_bucket: dict[int, list[int]] = {}
-        for i in order:
-            by_bucket.setdefault(self._bucket(len(samples[i].tokens)), []).append(i)
+        """Host arrays per microbatch. Samples go longest first; each microbatch takes the next
+        ``rows`` samples, where its first (longest) sample picks the length bucket ``T`` and
+        ``rows = tokens_per_microbatch // T``. Only the last microbatch has fully masked rows."""
+        order = sorted(range(len(samples)), key=lambda i: -len(samples[i].tokens))
         out = []
-        for T, idx in sorted(by_bucket.items()):
+        while order:
+            T = self._bucket(len(samples[order[0]].tokens))
             rows = self._rows(T)
-            for start in range(0, len(idx), rows):
-                chunk = idx[start : start + rows]
-                mb = {
-                    "tokens": np.full((rows, T), self.cfg.pad_id, np.int32),
-                    "segment_ids": np.zeros((rows, T), np.int32),
-                    "mask": np.zeros((rows, T), np.float32),
-                    "behavior_logp": np.zeros((rows, T), np.float32),
-                    "fresh": np.zeros((rows, T), np.float32),
-                    "advantage": np.zeros(rows, np.float32),
-                }
-                for r, i in enumerate(chunk):
-                    s = samples[i]
-                    L = len(s.tokens)
-                    mb["tokens"][r, :L] = s.tokens
-                    mb["segment_ids"][r, :L] = 1
-                    mb["mask"][r, :L] = s.mask
-                    mb["behavior_logp"][r, :L] = s.logprobs
-                    mb["fresh"][r, :L] = np.asarray(s.versions) == self.version
-                    mb["advantage"][r] = advantages[i]
-                out.append(mb)
+            chunk, order = order[:rows], order[rows:]
+            mb = {
+                "tokens": np.full((rows, T), self.cfg.pad_id, np.int32),
+                "segment_ids": np.zeros((rows, T), np.int32),
+                "mask": np.zeros((rows, T), np.float32),
+                "behavior_logp": np.zeros((rows, T), np.float32),
+                "fresh": np.zeros((rows, T), np.float32),
+                "advantage": np.zeros(rows, np.float32),
+            }
+            for r, i in enumerate(chunk):
+                s = samples[i]
+                L = len(s.tokens)
+                mb["tokens"][r, :L] = s.tokens
+                mb["segment_ids"][r, :L] = 1
+                mb["mask"][r, :L] = s.mask
+                mb["behavior_logp"][r, :L] = s.logprobs
+                mb["fresh"][r, :L] = np.asarray(s.versions) == self.version
+                mb["advantage"][r] = advantages[i]
+            out.append(mb)
         return out
 
     def _put(self, mb):
