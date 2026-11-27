@@ -38,6 +38,18 @@ def _make_inputs(B, T, H, A, U, dtype=jnp.bfloat16, seed=0):
     return q, k, v, g, beta
 
 
+def _fresh(fn):
+    """Runs ``fn`` from a zero state in every row, returning only the outputs."""
+
+    def run(q, k, v, g, beta):
+        B, T, H, A = q.shape
+        init_idx = jnp.full((B, -(-T // 64)), -1, jnp.int32).at[:, 0].set(0)
+        init = jnp.zeros((1, H, A, v.shape[-1]), jnp.float32)
+        return fn(q, k, v, g, beta, init, init_idx)[0]
+
+    return run
+
+
 class ForwardEquivalenceTest(parameterized.TestCase):
     @parameterized.parameters(
         # (B, T, H, A, U, name)
@@ -47,8 +59,8 @@ class ForwardEquivalenceTest(parameterized.TestCase):
     )
     def test_forward_matches_xla(self, B, T, H, A, U, name):
         q, k, v, g, beta = _make_inputs(B, T, H, A, U)
-        ref = chunk_gated_delta_rule_xla(q, k, v, g, beta)
-        out = chunk_gated_delta_rule_pallas(q, k, v, g, beta)
+        ref = _fresh(chunk_gated_delta_rule_xla)(q, k, v, g, beta)
+        out = _fresh(chunk_gated_delta_rule_pallas)(q, k, v, g, beta)
         ref_np = np.asarray(ref, dtype=np.float32)
         out_np = np.asarray(out, dtype=np.float32)
         abs_err = np.abs(out_np - ref_np)
@@ -66,8 +78,8 @@ class TestSeqLenNotMultipleOfChunk(absltest.TestCase):
     def test_padding_path(self):
         # T=2049 forces internal padding to 2112 (chunk=64) then trim to 2049.
         q, k, v, g, beta = _make_inputs(1, 2049, 2, 64, 64)
-        ref = chunk_gated_delta_rule_xla(q, k, v, g, beta)
-        out = chunk_gated_delta_rule_pallas(q, k, v, g, beta)
+        ref = _fresh(chunk_gated_delta_rule_xla)(q, k, v, g, beta)
+        out = _fresh(chunk_gated_delta_rule_pallas)(q, k, v, g, beta)
         np.testing.assert_array_less(
             np.abs(np.asarray(out, dtype=np.float32) - np.asarray(ref, dtype=np.float32)).max(),
             5e-2,

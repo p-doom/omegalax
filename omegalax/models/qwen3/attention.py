@@ -3,7 +3,7 @@ from flax import nnx
 from jax.sharding import PartitionSpec as P
 from tokamax import dot_product_attention
 
-from .cache import LayerCache
+from omegalax.models.kv_cache import LayerCache
 from .norms import RMSNorm
 from .rope import apply_rope, generate_pos_embeddings
 from .utils import compute_positions_from_segment_ids

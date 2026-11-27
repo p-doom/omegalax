@@ -1,4 +1,4 @@
-"""Paged KV cache threaded through ``Attention`` by the rollout engine."""
+"""Paged KV cache threaded through attention layers by the rollout engine."""
 
 import dataclasses
 import functools

@@ -1,4 +1,4 @@
-"""Rollout engine against the trainer forward and HF transformers (Qwen3-1.7B, GPU)."""
+"""Rollout engine against the trainer forward and HF transformers (GPU, real weights)."""
 
 import logging
 import os
@@ -13,15 +13,18 @@ from absl.testing import absltest
 from flax import nnx
 from huggingface_hub import snapshot_download
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForConditionalGeneration
 
+from omegalax.distributed.mesh import mesh_rules
 from omegalax.engine import Engine, EngineConfig, Request
 from omegalax.models.qwen3.loader import create_qwen3_from_safetensors
+from omegalax.models.qwen3_5.loader import create_qwen3_5_from_safetensors
+from omegalax.models.qwen3_5.model import Qwen3_5ForCausalLM
 from tests.real_weights import requires_real_weights
 
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
 
-MODEL_ID = "Qwen/Qwen3-1.7B"
 PROMPTS = [
     "Write a Python function that checks whether a string is a palindrome, with tests.",
     "Explain how a B-tree insertion splits nodes.",
@@ -47,22 +50,39 @@ def _keys(rng, n):
     return rng.integers(0, 2**32, size=(n, 2), dtype=np.uint32)
 
 
-@requires_real_weights
-class EngineTest(absltest.TestCase):
+def _qwen3_5_causal_lm(path):
+    vlm, cfg = create_qwen3_5_from_safetensors(path, tp_size=1, fsdp_size=1, dp_size=1)
+    mesh = jax.tree.leaves(nnx.state(vlm))[0].sharding.mesh
+    with mesh_rules(mesh):
+        abstract = nnx.eval_shape(lambda: Qwen3_5ForCausalLM(cfg.text_config, rngs=nnx.Rngs(0)))
+    state = nnx.state(abstract)
+    nnx.replace_by_pure_dict(
+        state,
+        {"text": nnx.to_pure_dict(nnx.state(vlm.text)), "lm_head": nnx.to_pure_dict(nnx.state(vlm.lm_head))},
+    )
+    return nnx.merge(nnx.graphdef(abstract), state)
+
+
+class _EngineTest:
+    MODEL_ID: str
+
     @classmethod
     def setUpClass(cls):
-        cls.path = snapshot_download(MODEL_ID)
+        cls.path = snapshot_download(cls.MODEL_ID)
         cls.tok = AutoTokenizer.from_pretrained(cls.path)
-        cls.model = create_qwen3_from_safetensors(cls.path, tp_size=1, fsdp_size=1, dp_size=1)
+        cls.model = cls.load(cls.path)
+        eos = cls.tok.convert_tokens_to_ids("<|im_end|>")
+        pad = cls.tok.convert_tokens_to_ids("<|endoftext|>")
         cls.cfg = EngineConfig(
             num_pages=48,
             max_context=4096,
             decode_steps=8,
             decode_buckets=(1, 2, 4),
             extend_buckets=(256, 512, 1024),
-            eos_token_ids=(151645, 151643),
-            pad_id=151643,
+            eos_token_ids=(eos, pad),
+            pad_id=pad,
             max_group=4,
+            max_sessions=16,
         )
         cls.engine = Engine(cls.model, cls.cfg)
         cls.engine.warmup()
@@ -163,7 +183,7 @@ class EngineTest(absltest.TestCase):
             self.engine.release(sid)
 
     def test_greedy_matches_hf_until_near_tie(self):
-        hf = AutoModelForCausalLM.from_pretrained(self.path, dtype=torch.float32).cuda().eval()
+        hf = self.HF_CLASS.from_pretrained(self.path, dtype=torch.float32).cuda().eval()
         rng = np.random.default_rng(2)
         for text in PROMPTS:
             prompt = self._chat(text)
@@ -189,6 +209,23 @@ class EngineTest(absltest.TestCase):
             self.engine.release(c.session)
         del hf
         torch.cuda.empty_cache()
+
+
+@requires_real_weights
+class Qwen3EngineTest(_EngineTest, absltest.TestCase):
+    MODEL_ID = "Qwen/Qwen3-1.7B"
+    HF_CLASS = AutoModelForCausalLM
+
+    @staticmethod
+    def load(path):
+        return create_qwen3_from_safetensors(path, tp_size=1, fsdp_size=1, dp_size=1)
+
+
+@requires_real_weights
+class Qwen3_5EngineTest(_EngineTest, absltest.TestCase):
+    MODEL_ID = "Qwen/Qwen3.5-0.8B"
+    HF_CLASS = Qwen3_5ForConditionalGeneration
+    load = staticmethod(_qwen3_5_causal_lm)
 
 
 if __name__ == "__main__":

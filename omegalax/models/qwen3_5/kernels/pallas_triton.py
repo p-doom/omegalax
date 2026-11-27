@@ -32,6 +32,7 @@ import jax
 import jax.experimental.pallas as pl
 from jax.experimental.pallas import triton as plt
 import jax.numpy as jnp
+import numpy as np
 
 
 def _l2norm(x: jax.Array, axis: int = -1, eps: float = 1e-6) -> jax.Array:
@@ -49,6 +50,8 @@ def _state_pass_kernel(
     k_dec_ref,  # (J, C, A)  fp32  — k * exp(g_last - g_cum)
     u_pre_ref,  # (J, C, U)  fp32  — A_inv @ vb
     df_ref,  # (J,)       fp32  — exp(g_last)
+    idx_ref,  # (J,)       int32 — initial state index, or -1 to continue
+    init_ref,  # (N, A, U)  fp32  — initial states
     state_out_ref,  # (J, A, U)  fp32  — state at the *start* of each chunk
     v_new_out_ref,  # (J, C, U)  fp32  — corrected v
     *,
@@ -61,6 +64,8 @@ def _state_pass_kernel(
     state_init = jnp.zeros((A, U), dtype=jnp.float32)
 
     def body(j, state):
+        idx = idx_ref[j]
+        state = jax.lax.cond(idx >= 0, lambda: init_ref[jnp.maximum(idx, 0)], lambda: state)
         kcd = kcd_ref[j]  # (C, A)
         k_dec = k_dec_ref[j]  # (C, A)
         u_pre = u_pre_ref[j]  # (C, U)
@@ -85,23 +90,26 @@ def _state_pass_pallas(
     k_dec_BHJCA: jax.Array,
     u_pre_BHJCU: jax.Array,
     df_BHJ: jax.Array,
+    init_idx_BJ: jax.Array,
+    init_NHAU: jax.Array,
 ) -> tuple[jax.Array, jax.Array]:
     """Sequential gated-delta state pass.
 
     Forward equations (per (B, H), J chunks):
       state[0]    = 0
-      state_in[j] = state[j]
-      v_new[j]    = u_pre[j] - kcd[j] @ state[j]
-      state[j+1]  = df[j] * state[j] + k_dec[j].T @ v_new[j]
+      state_in[j] = init[idx[j]] if idx[j] >= 0 else state[j]
+      v_new[j]    = u_pre[j] - kcd[j] @ state_in[j]
+      state[j+1]  = df[j] * state_in[j] + k_dec[j].T @ v_new[j]
 
     Returns ``(state_in, v_new)`` — both shape ``(B, H, J, ...)``.
     """
-    return _state_pass_pallas_fwd_only(kcd_BHJCA, k_dec_BHJCA, u_pre_BHJCU, df_BHJ)
+    return _state_pass_pallas_fwd_only(kcd_BHJCA, k_dec_BHJCA, u_pre_BHJCU, df_BHJ, init_idx_BJ, init_NHAU)
 
 
-def _state_pass_pallas_fwd_only(kcd, k_dec, u_pre, df):
+def _state_pass_pallas_fwd_only(kcd, k_dec, u_pre, df, init_idx, init):
     B, H, J, C, A = kcd.shape
     U = u_pre.shape[-1]
+    N = init.shape[0]
     state_out_shape = jax.ShapeDtypeStruct((B, H, J, A, U), jnp.float32)
     v_new_out_shape = jax.ShapeDtypeStruct((B, H, J, C, U), jnp.float32)
     kernel = functools.partial(_state_pass_kernel, A=A, U=U, C=C, J=J)
@@ -110,20 +118,22 @@ def _state_pass_pallas_fwd_only(kcd, k_dec, u_pre, df):
     spec_u = pl.BlockSpec((None, None, J, C, U), lambda b, h: (b, h, 0, 0, 0))
     spec_s = pl.BlockSpec((None, None, J, A, U), lambda b, h: (b, h, 0, 0, 0))
     spec_d = pl.BlockSpec((None, None, J), lambda b, h: (b, h, 0))
+    spec_i = pl.BlockSpec((None, J), lambda b, h: (b, 0))
+    spec_init = pl.BlockSpec((N, None, A, U), lambda b, h: (0, h, 0, 0))
 
     return pl.pallas_call(
         kernel,
         out_shape=(state_out_shape, v_new_out_shape),
         grid=(B, H),
-        in_specs=(spec_a, spec_a, spec_u, spec_d),
+        in_specs=(spec_a, spec_a, spec_u, spec_d, spec_i, spec_init),
         out_specs=(spec_s, spec_u),
         compiler_params=plt.CompilerParams(num_warps=4, num_stages=2),
-    )(kcd, k_dec, u_pre, df)
+    )(kcd, k_dec, u_pre, df, init_idx, init.astype(jnp.float32))
 
 
-def _state_pass_fwd_for_vjp(kcd, k_dec, u_pre, df):
-    state_in, v_new = _state_pass_pallas_fwd_only(kcd, k_dec, u_pre, df)
-    residuals = (kcd, k_dec, u_pre, df, state_in, v_new)
+def _state_pass_fwd_for_vjp(kcd, k_dec, u_pre, df, init_idx, init):
+    state_in, v_new = _state_pass_pallas_fwd_only(kcd, k_dec, u_pre, df, init_idx, init)
+    residuals = (kcd, k_dec, u_pre, df, state_in, v_new, init_idx, init)
     return (state_in, v_new), residuals
 
 
@@ -151,12 +161,13 @@ def _state_pass_bwd(residuals, cotangents):
 
       Total dstate carry = dstate_via_df + dstate_via_kcd + dstate_in[j]
     """
-    kcd, k_dec, u_pre, df, state_in, v_new = residuals
+    kcd, k_dec, u_pre, df, state_in, v_new, init_idx, init = residuals
     dstate_in, dv_new = cotangents
     B, H, J, C, A = kcd.shape
     U = u_pre.shape[-1]
 
-    def body(dstate, j):
+    def body(carry, j):
+        dstate, dinit = carry
         kcd_j = kcd[:, :, j]  # (B, H, C, A)
         k_dec_j = k_dec[:, :, j]
         v_new_j = v_new[:, :, j]
@@ -180,12 +191,16 @@ def _state_pass_bwd(residuals, cotangents):
         dstate_via_kcd = -jnp.einsum("BHCA,BHCU->BHAU", kcd_j, dv_new_total)
 
         new_dstate = dstate_via_df + dstate_via_kcd + dstate_in_j
-        return new_dstate, (dkcd_j, dk_dec_j, du_pre_j, ddf_j)
+        idx_B = init_idx[:, j]
+        reset_B = (idx_B >= 0)[:, None, None, None]
+        dinit = dinit.at[jnp.where(idx_B >= 0, idx_B, init.shape[0])].add(new_dstate, mode="drop")
+        new_dstate = jnp.where(reset_B, 0.0, new_dstate)
+        return (new_dstate, dinit), (dkcd_j, dk_dec_j, du_pre_j, ddf_j)
 
-    dstate_init = jnp.zeros((B, H, A, U), dtype=jnp.float32)
-    _, (dkcd_JBHCA, dk_dec_JBHCA, du_pre_JBHCU, ddf_JBH) = jax.lax.scan(
+    carry_init = (jnp.zeros((B, H, A, U), jnp.float32), jnp.zeros(init.shape, jnp.float32))
+    (_, dinit), (dkcd_JBHCA, dk_dec_JBHCA, du_pre_JBHCU, ddf_JBH) = jax.lax.scan(
         body,
-        dstate_init,
+        carry_init,
         jnp.arange(J),
         reverse=True,
     )
@@ -194,7 +209,8 @@ def _state_pass_bwd(residuals, cotangents):
     dk_dec_BHJCA = jnp.transpose(dk_dec_JBHCA, (1, 2, 0, 3, 4))
     du_pre_BHJCU = jnp.transpose(du_pre_JBHCU, (1, 2, 0, 3, 4))
     ddf_BHJ = jnp.transpose(ddf_JBH, (1, 2, 0))
-    return dkcd_BHJCA, dk_dec_BHJCA, du_pre_BHJCU, ddf_BHJ
+    dinit_idx = np.zeros(init_idx.shape, jax.dtypes.float0)
+    return dkcd_BHJCA, dk_dec_BHJCA, du_pre_BHJCU, ddf_BHJ, dinit_idx, dinit.astype(init.dtype)
 
 
 _state_pass_pallas.defvjp(_state_pass_fwd_for_vjp, _state_pass_bwd)
@@ -211,8 +227,10 @@ def chunk_gated_delta_rule_pallas(
     v_BTHU: jax.Array,
     g_BTH: jax.Array,
     beta_BTH: jax.Array,
+    init_NHAU: jax.Array,
+    init_idx_BJ: jax.Array,
     chunk_size: int = 64,
-) -> jax.Array:
+) -> tuple[jax.Array, jax.Array]:
     """Chunked gated delta rule with a Pallas state-pass kernel on Hopper.
 
     Same numeric contract as the XLA reference. The WY/UT solve runs in JAX
@@ -291,6 +309,8 @@ def chunk_gated_delta_rule_pallas(
         k_dec_BHJCA.astype(jnp.float32),
         u_pre_BHJCU.astype(jnp.float32),
         df_BHJ.astype(jnp.float32),
+        init_idx_BJ,
+        init_NHAU,
     )
 
     # Output (parallel across chunks via batched JAX einsums).
@@ -305,4 +325,58 @@ def chunk_gated_delta_rule_pallas(
     out_BHJCU = inter + jnp.einsum("BHJLM,BHJMU->BHJLU", intra, v_new_BHJCU)
 
     out_BHTU = out_BHJCU.reshape(B, H, Tp, U)[:, :, :T, :]
-    return out_BHTU.transpose(0, 2, 1, 3).astype(out_dtype)
+    state_BHJAU = df_BHJ[..., None, None] * state_in_BHJAU + jnp.einsum(
+        "BHJCA,BHJCU->BHJAU", k_dec_BHJCA, v_new_BHJCU
+    )
+    return out_BHTU.transpose(0, 2, 1, 3).astype(out_dtype), state_BHJAU.transpose(0, 2, 1, 3, 4)
+
+
+def _recurrent_step_kernel(slot_ref, q_ref, k_ref, v_ref, g_ref, beta_ref, state_ref, out_ref, state_out_ref):
+    """One program per (row, head); the head's (A, U) state is read and rewritten in place."""
+    b, h = pl.program_id(0), pl.program_id(1)
+    slot = slot_ref[b]
+    st_AU = state_ref[slot, h] * jnp.exp(g_ref[b, h])
+    k_A = k_ref[...]
+    kv_U = jnp.sum(st_AU * k_A[:, None], axis=0)
+    st_AU = st_AU + k_A[:, None] * ((v_ref[...] - kv_U) * beta_ref[b, h])[None, :]
+    out_ref[...] = jnp.sum(st_AU * q_ref[...][:, None], axis=0)
+    state_out_ref[slot, h] = st_AU
+
+
+def recurrent_gated_delta_step_pallas(
+    q_BHA: jax.Array,
+    k_BHA: jax.Array,
+    v_BHU: jax.Array,
+    g_BH: jax.Array,
+    beta_BH: jax.Array,
+    state_SHAU: jax.Array,
+    slot_B: jax.Array,
+) -> tuple[jax.Array, jax.Array]:
+    """Pallas version of :func:`recurrent_gated_delta_step_xla`; ``state_SHAU`` is aliased."""
+    B, H, A = q_BHA.shape
+    U = v_BHU.shape[-1]
+    q_BHA = _l2norm(q_BHA).astype(jnp.float32) * A**-0.5
+    k_BHA = _l2norm(k_BHA).astype(jnp.float32)
+    whole = pl.BlockSpec()
+    row = lambda n: pl.BlockSpec((None, None, n), lambda b, h: (b, h, 0))
+    return pl.pallas_call(
+        _recurrent_step_kernel,
+        grid=(B, H),
+        in_specs=[whole, row(A), row(A), row(U), whole, whole, whole],
+        out_specs=[row(U), whole],
+        out_shape=[
+            jax.ShapeDtypeStruct((B, H, U), jnp.float32),
+            jax.ShapeDtypeStruct(state_SHAU.shape, state_SHAU.dtype),
+        ],
+        input_output_aliases={6: 1},
+        compiler_params=plt.CompilerParams(num_warps=8, num_stages=1),
+        name="recurrent_gated_delta_step",
+    )(
+        slot_B,
+        q_BHA,
+        k_BHA,
+        v_BHU.astype(jnp.float32),
+        g_BH.astype(jnp.float32),
+        beta_BH.astype(jnp.float32),
+        state_SHAU,
+    )

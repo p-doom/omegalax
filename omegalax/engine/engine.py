@@ -25,6 +25,9 @@ import numpy as np
 from flax import nnx
 
 from omegalax.engine import steps
+from omegalax.models.qwen3_5.cache import LinearExtend
+
+_DELTANET_CHUNK = 64
 
 
 @dataclasses.dataclass(frozen=True)
@@ -37,6 +40,7 @@ class EngineConfig:
     eos_token_ids: tuple[int, ...]
     pad_id: int
     max_group: int = 16
+    max_sessions: int = 256
     page_size: int = 64
     extend_rows: int = 128
     spare_work: int = 132
@@ -85,6 +89,7 @@ class _Session:
     id: int
     tokens: list[int]
     page_row: np.ndarray
+    slot: int
     pages: list[int] = dataclasses.field(default_factory=list)
     length: int = 0
     turn: _Turn | None = None
@@ -133,11 +138,26 @@ class Engine:
         self._signature = _signature(state)
         self._to_inference = jax.jit(_inference_cast(model))
         self._state = self._to_inference(state)
-        attn = model.layers[0].attn
-        self._kv_shape = (len(model.layers), attn.num_kv_heads, cfg.num_pages, S, attn.head_dim)
-        self._block_q = max(1, 128 // attn.n_rep)
+        layers = model.text.layers if isinstance(model, steps.Qwen3_5ForCausalLM) else model.layers
+        num_slots = cfg.max_sessions + 2
+        self._pool_shapes = []
+        for layer in layers:
+            if hasattr(layer, "attn"):
+                a = layer.attn
+                page_shape = (a.num_kv_heads, cfg.num_pages, S, a.head_dim)
+                self._pool_shapes.append(((page_shape, jnp.bfloat16), (page_shape, jnp.bfloat16)))
+                self._block_q = max(1, min(128, 128 * 128 // a.head_dim) // a.n_rep)
+            else:
+                d = layer.linear_attn
+                self._conv_k = d.conv_kernel_size
+                conv_shape = (num_slots, d.conv_kernel_size - 1, 2 * d.key_dim + d.value_dim)
+                state_shape = (num_slots, d.num_v_heads, d.head_k_dim, d.head_v_dim)
+                self._pool_shapes.append(((conv_shape, jnp.bfloat16), (state_shape, jnp.float32)))
+        self._linear = len(self._pool_shapes) != sum(hasattr(x, "attn") for x in layers)
+        self._align = max(self._block_q, _DELTANET_CHUNK if self._linear else 1)
         self._fork_slack = cfg.max_group * S
-        self._kv = None
+        self._free_slots = list(range(num_slots - 1, steps.TRASH_SLOT, -1))
+        self._pools = None
         self._decode = jax.jit(
             functools.partial(steps.decode, graphdef),
             static_argnames=("num_steps", "num_work"),
@@ -169,13 +189,12 @@ class Engine:
         The pool is allocated here, not in ``__init__``, so a caller can drop its float32
         model between the two.
         """
-        L, *shape = self._kv_shape
-        self._kv = [(jnp.zeros(shape, jnp.bfloat16), jnp.zeros(shape, jnp.bfloat16)) for _ in range(L)]
+        self._pools = [tuple(jnp.zeros(*spec) for spec in specs) for specs in self._pool_shapes]
         for B in self.cfg.decode_buckets:
             self._run_decode_call(self._decode_inputs([], B))
         for T in self.cfg.extend_buckets:
             self._run_extend_call(self._extend_inputs([], T))
-        jax.block_until_ready(self._kv)
+        jax.block_until_ready(self._pools)
 
     def start(self) -> None:
         self._thread = threading.Thread(target=self._loop, daemon=True)
@@ -277,7 +296,7 @@ class Engine:
         self._version = version
 
     def _new_session(self, tokens: list[int]) -> _Session:
-        s = _Session(next(self._ids), tokens, np.zeros(self._max_pages, np.int32))
+        s = _Session(next(self._ids), tokens, np.zeros(self._max_pages, np.int32), self._free_slots.pop())
         self._sessions[s.id] = s
         return s
 
@@ -289,6 +308,9 @@ class Engine:
         base = 0 if lead is None else len(lead.tokens)
         if base + len(req.tokens) + max(req.max_new_tokens) > self.cfg.max_context:
             futures[0].set_exception(ValueError(f"Request exceeds max_context={self.cfg.max_context}."))
+            return
+        if lead is None and len(futures) > len(self._free_slots):
+            futures[0].set_exception(ValueError(f"More than max_sessions={self.cfg.max_sessions}."))
             return
         if lead is None:
             lead = self._new_session(list(req.tokens))
@@ -304,43 +326,48 @@ class Engine:
     def _alloc(self, s: _Session, num_tokens: int, preempt: bool) -> None:
         need = -(-num_tokens // self.cfg.page_size) - len(s.pages)
         while need > len(self._free):
-            self._evict_one(s, preempt)
+            self._evict_one(s, preempt, need - len(self._free))
         for _ in range(need):
             page = self._free.pop()
             self._refs[page] = 1
             s.page_row[len(s.pages)] = page
             s.pages.append(page)
 
-    def _drop_pages(self, s: _Session) -> None:
-        for page in s.pages:
+    def _drop_pages(self, s: _Session, keep: int) -> None:
+        for page in s.pages[keep:]:
             self._refs[page] -= 1
             if self._refs[page] == 0:
                 self._free.append(page)
-        s.pages = []
-        s.page_row[:] = 0
-        s.length = 0
+        s.page_row[keep : len(s.pages)] = 0
+        s.pages = s.pages[:keep]
+        s.length = min(s.length, keep * self.cfg.page_size)
 
-    def _evict_one(self, keep: _Session, preempt: bool) -> None:
-        """Drops the least recently used idle session, else (if allowed) the newest decoder."""
+    def _evict_one(self, keep: _Session, preempt: bool, pages: int) -> None:
+        """Frees ``pages`` tail pages of the least recently used idle session, else (if allowed)
+        of the newest decoder, which then re-extends its dropped tail. DeltaNet state cannot be
+        rewound, so a model with DeltaNet layers drops the whole session.
+        """
         idle = [s for s in self._sessions.values() if s.turn is None and s.pages]
         if idle:
             victim = min(idle, key=lambda s: s.last_used)
-            self._drop_pages(victim)
             self.stats["evict_idle"] += 1
-            return
-        running = [s for s in self._decoding.values() if s is not keep] if preempt else []
-        if not running:
-            raise OutOfPages
-        victim = max(running, key=lambda s: s.id)
-        del self._decoding[victim.id]
-        self._drop_pages(victim)
-        self._extend_queue.appendleft(victim)
-        self.stats["evict_running"] += 1
+        else:
+            running = [s for s in self._decoding.values() if s is not keep] if preempt else []
+            if not running:
+                raise OutOfPages
+            victim = max(running, key=lambda s: s.id)
+            del self._decoding[victim.id]
+            self._extend_queue.appendleft(victim)
+            self.stats["evict_running"] += 1
+        kept = 0 if self._linear else max(0, len(victim.pages) - pages)
+        self.stats["evicted_tokens"] += victim.length - min(victim.length, kept * self.cfg.page_size)
+        self._drop_pages(victim, kept)
 
     def _release(self, s: _Session) -> None:
         if s.turn is not None:
             raise ValueError(f"Session {s.id} is still generating; abort it instead.")
-        self._drop_pages(s)
+        self._drop_pages(s, 0)
+        self._free_slots.append(s.slot)
         del self._sessions[s.id]
 
     def _abort(self, s: _Session) -> None:
@@ -375,14 +402,14 @@ class Engine:
 
     def _step_extend(self) -> None:
         cap = self.cfg.extend_buckets[-1]
-        S, Q = self.cfg.page_size, self._block_q
+        S, A = self.cfg.page_size, self._align
         items, used, rows, fork_writes = [], 0, 0, 0
         reserve = (len(self._decoding) + 1) * (-(-self.cfg.decode_steps // S) + 1)
         while self._extend_queue:
             s = self._extend_queue[0]
             todo = len(s.tokens) - s.length
-            room = (cap - used) // Q * Q
-            take = todo if -(-todo // Q) * Q <= room else room // max(Q, S) * max(Q, S)
+            room = (cap - used) // A * A
+            take = todo if -(-todo // A) * A <= room else room // max(A, S) * max(A, S)
             final = take == todo
             new_rows = 1 + len(s.forks) if final else 0
             new_fork_writes = len(s.forks) * (len(s.tokens) % S) if final else 0
@@ -393,7 +420,7 @@ class Engine:
             ):
                 break
             if s.length == 0:
-                pages = -(-(take + Q) // self.cfg.page_size) + len(s.forks) + reserve
+                pages = -(-(take + A) // S) + len(s.forks) + reserve
                 evictable = sum(len(x.pages) for x in self._sessions.values() if x.turn is None)
                 if pages > len(self._free) + evictable:
                     break
@@ -406,7 +433,7 @@ class Engine:
                 break
             self._extend_queue.popleft()
             items.append((s, s.length, s.length + take, final))
-            used += -(-take // Q) * Q
+            used += -(-take // A) * A
             rows += new_rows
             fork_writes += new_fork_writes
         if not items:
@@ -439,7 +466,7 @@ class Engine:
         self._alloc(fork, len(lead.tokens), preempt=False)
 
     def _extend_inputs(self, items, T: int):
-        S, Q = self.cfg.page_size, self._block_q
+        S, Q, A = self.cfg.page_size, self._block_q, self._align
         N = T // Q
         R = self.cfg.extend_rows
         W = T + self._fork_slack
@@ -476,16 +503,51 @@ class Engine:
                         write_src[w : w + len(tail)] = o + tail - start
                         write_slot[w : w + len(tail)] = f.page_row[tail // S] * S + tail % S
                         w += len(tail)
-            o += -(-n // Q) * Q
-        args = (tokens, positions, write_src, write_slot, page_table, q_pos, kv_len, sample_idx, temp, key_data)
+            o += -(-n // A) * A
+        linear = self._linear_extend(items, T) if self._linear else None
+        args = (tokens, positions, write_src, write_slot, page_table, q_pos, kv_len, sample_idx, temp, key_data, linear)
         return args, N
+
+    def _linear_extend(self, items, T: int) -> LinearExtend:
+        """DeltaNet metadata for the packed batch; see ``omegalax.models.qwen3_5.cache``."""
+        K, A, C = self._conv_k, self._align, _DELTANET_CHUNK
+        K1 = K - 1
+        W = T // A + self.cfg.max_group
+        zero_row = T + steps.ZERO_SLOT * K1
+        valid = np.zeros(T, bool)
+        conv_src = np.full((T, K), zero_row, np.int32)
+        conv_out_src = np.full((W, K1), zero_row, np.int32)
+        write_slot = self.cfg.max_sessions + 2 + np.arange(W, dtype=np.int32)
+        init_slot = np.zeros(T // A, np.int32)
+        init_idx = np.full((1, T // C), -1, np.int32)
+        final_chunk = np.zeros(W, np.int32)
+
+        def rows(pos, s, start, o):
+            prev = np.where(pos >= 0, T + s.slot * K1 + pos - (start - K1), zero_row)
+            return np.where(pos >= start, o + pos - start, prev).astype(np.int32)
+
+        o, w = 0, 0
+        for i, (s, start, end, final) in enumerate(items):
+            n = end - start
+            valid[o : o + n] = True
+            conv_src[o : o + n] = rows(start + np.arange(n)[:, None] - K1 + np.arange(K), s, start, o)
+            init_idx[0, o // C] = i
+            init_slot[i] = steps.ZERO_SLOT if start == 0 else s.slot
+            out_rows = rows(end - K1 + np.arange(K1), s, start, o)
+            for f in [s, *s.forks] if final else [s]:
+                write_slot[w] = f.slot
+                final_chunk[w] = (o + n - 1) // C
+                conv_out_src[w] = out_rows
+                w += 1
+            o += -(-n // A) * A
+        return LinearExtend(valid, conv_src, conv_out_src, write_slot, init_slot, init_idx, final_chunk)
 
     def _run_extend_call(self, inputs):
         args, N = inputs
         t = time.perf_counter()
-        self._kv, tok_R, logp_R = self._extend(
+        self._pools, tok_R, logp_R = self._extend(
             self._state,
-            self._kv,
+            self._pools,
             *args,
             block_q=self._block_q,
             num_work=N + self.cfg.spare_work,
@@ -520,6 +582,7 @@ class Engine:
         key_data = np.zeros((B, 2), np.uint32)
         stop = np.zeros(B, bool)
         page_table = np.zeros((B, self._max_pages), np.int32)
+        slot = np.full(B, steps.TRASH_SLOT, np.int32)
         for b, s in enumerate(rows):
             tok[b] = s.tokens[-1]
             pos[b] = s.length
@@ -528,14 +591,15 @@ class Engine:
             key_data[b] = s.turn.key_data
             stop[b] = s.turn.stop_at_eos
             page_table[b] = s.page_row
-        return tok, pos, remaining, temp, key_data, stop, page_table
+            slot[b] = s.slot
+        return tok, pos, remaining, temp, key_data, stop, page_table, slot
 
     def _run_decode_call(self, args):
         B = args[0].shape[0]
         t = time.perf_counter()
-        self._kv, tok_KB, logp_KB, valid_KB = self._decode(
+        self._pools, tok_KB, logp_KB, valid_KB = self._decode(
             self._state,
-            self._kv,
+            self._pools,
             *args,
             self._eos,
             num_steps=self.cfg.decode_steps,

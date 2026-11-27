@@ -26,12 +26,25 @@ import jax.numpy as jnp
 from flax import nnx
 from jax.sharding import PartitionSpec
 
-from .kernels import chunk_gated_delta_rule
+from .cache import LinearCache, LinearDecode
+from .kernels import chunk_gated_delta_rule, recurrent_gated_delta_step
 from .config import Qwen3_5TextConfig
 from .norms import RMSNormGated
 
 P = PartitionSpec
 wp = nnx.with_partitioning
+_CHUNK = 64
+
+
+def _gated_norm(out_BTHU, z_BTHU, weight_U, eps):
+    """RMSNormGated over each head's output, flattened to (B, T, H * U)."""
+    B, T, H, U = out_BTHU.shape
+    x_f32 = out_BTHU.reshape(B * T * H, U).astype(jnp.float32)
+    variance = jnp.mean(x_f32**2, axis=-1, keepdims=True)
+    normed = (x_f32 * jax.lax.rsqrt(variance + eps)).astype(out_BTHU.dtype)
+    normed = weight_U.astype(out_BTHU.dtype) * normed
+    gated = normed * jax.nn.silu(z_BTHU.reshape(B * T * H, U).astype(jnp.float32))
+    return gated.astype(out_BTHU.dtype).reshape(B, T, H * U)
 
 
 def _causal_depthwise_conv1d(x_BCT: jax.Array, weight_CK: jax.Array) -> jax.Array:
@@ -123,7 +136,14 @@ class GatedDeltaNet(nnx.Module):
         )
 
     @jax.named_scope("gated_delta_net")
-    def __call__(self, hidden_BTD: jax.Array, attention_mask_BT: jax.Array | None = None) -> jax.Array:
+    def __call__(
+        self,
+        hidden_BTD: jax.Array,
+        attention_mask_BT: jax.Array | None = None,
+        cache: LinearCache | None = None,
+    ) -> tuple[jax.Array, LinearCache | None]:
+        if cache is not None:
+            return self._cached(hidden_BTD, cache)
         if attention_mask_BT is not None and attention_mask_BT.shape[1] > 1:
             hidden_BTD = hidden_BTD * attention_mask_BT[:, :, None]
 
@@ -190,19 +210,13 @@ class GatedDeltaNet(nnx.Module):
                     k_BTHA[:, :, :, None, :],
                     (B, T, local_k_heads, gqa_factor, head_k_dim),
                 ).reshape(B, T, local_v_heads, head_k_dim)
-            out = chunk_gated_delta_rule(q_BTHA, k_BTHA, v_BTHU, g_BTH, beta_BTH)
-            # Inline RMSNormGated
-            BL = out.shape[0] * out.shape[1]
-            H, U = out.shape[2], out.shape[3]
-            core_flat = out.reshape(BL * H, U)
-            z_flat = z_BTHU.reshape(BL * H, U)
-            dtype = core_flat.dtype
-            x_f32 = core_flat.astype(jnp.float32)
-            variance = jnp.mean(x_f32 ** 2, axis=-1, keepdims=True)
-            normed = (x_f32 * jax.lax.rsqrt(variance + norm_eps)).astype(dtype)
-            normed = nw.astype(dtype) * normed
-            gated = normed * jax.nn.silu(z_flat.astype(jnp.float32))
-            return gated.astype(dtype).reshape(out.shape[0], out.shape[1], H * U)
+            J = -(-T // _CHUNK)
+            init_idx_BJ = jnp.full((B, J), -1, jnp.int32).at[:, 0].set(0)
+            init_NHAU = jnp.zeros((1, local_v_heads, head_k_dim, v_BTHU.shape[3]), jnp.float32)
+            out, _ = chunk_gated_delta_rule(
+                q_BTHA, k_BTHA, v_BTHU, g_BTH, beta_BTH, init_NHAU, init_idx_BJ, _CHUNK
+            )
+            return _gated_norm(out, z_BTHU, nw, norm_eps)
 
         normed_BTD = shard_map(
             _full_deltanet, mesh,
@@ -212,4 +226,57 @@ class GatedDeltaNet(nnx.Module):
         )(q_BTHA, k_BTHA, v_BTHU, z_BTHU, g_BTH, beta_BTH, norm_w)
 
         out_BTD = self.out_proj(normed_BTD, out_sharding=self.shd_cfg.act_btd)
-        return out_BTD
+        return out_BTD, None
+
+    def _cached(self, hidden_BTD: jax.Array, cache: LinearCache) -> tuple[jax.Array, LinearCache]:
+        """Engine path on flattened tokens: conv and recurrence continue the pooled states."""
+        B, T, _ = hidden_BTD.shape
+        N, K = B * T, self.conv_kernel_size
+        batch = cache.batch
+        x_NC = self.in_proj_qkv(hidden_BTD).reshape(N, -1)
+        z_NHU = self.in_proj_z(hidden_BTD).reshape(N, self.num_v_heads, self.head_v_dim)
+        b_NH = self.in_proj_b(hidden_BTD).reshape(N, self.num_v_heads)
+        a_NH = self.in_proj_a(hidden_BTD).reshape(N, self.num_v_heads)
+
+        S = cache.conv_SKC.shape[0]
+        src_RC = jnp.concatenate([x_NC, cache.conv_SKC.reshape(S * (K - 1), -1)])
+        taps_NKC = src_RC[batch.conv_src_NK]
+        weight_CK = self.conv_weight[...].astype(x_NC.dtype)
+        conv_NC = jnp.zeros_like(x_NC)
+        for k in range(K):
+            conv_NC = conv_NC + weight_CK[None, :, k] * taps_NKC[:, k]
+        conv_SKC = cache.conv_SKC.at[batch.write_slot_W].set(
+            src_RC[batch.conv_out_src_WK], mode="drop", unique_indices=True
+        )
+        q_NP, k_NP, v_NO = jnp.split(nnx.silu(conv_NC), [self.key_dim, self.key_dim * 2], axis=-1)
+        q_NHA = jnp.repeat(q_NP.reshape(N, self.num_k_heads, self.head_k_dim), self.gqa_factor, 1)
+        k_NHA = jnp.repeat(k_NP.reshape(N, self.num_k_heads, self.head_k_dim), self.gqa_factor, 1)
+        v_NHU = v_NO.reshape(N, self.num_v_heads, self.head_v_dim)
+        beta_NH = jax.nn.sigmoid(b_NH)
+        g_NH = -jnp.exp(self.A_log[...].astype(jnp.float32)) * jax.nn.softplus(
+            a_NH.astype(jnp.float32) + self.dt_bias[...]
+        )
+
+        if isinstance(batch, LinearDecode):
+            out_NHU, state_SHAU = recurrent_gated_delta_step(
+                q_NHA, k_NHA, v_NHU, g_NH, beta_NH, cache.state_SHAU, batch.row_slot_N
+            )
+        else:
+            valid_N1 = batch.valid_N[:, None]
+            out_1NHU, state_1JHAU = chunk_gated_delta_rule(
+                q_NHA[None],
+                k_NHA[None],
+                v_NHU[None],
+                jnp.where(valid_N1, g_NH, 0.0)[None],
+                jnp.where(valid_N1, beta_NH, 0.0)[None],
+                cache.state_SHAU[batch.init_slot_I],
+                batch.init_idx_1J,
+                _CHUNK,
+            )
+            out_NHU = out_1NHU[0]
+            state_SHAU = cache.state_SHAU.at[batch.write_slot_W].set(
+                state_1JHAU[0, batch.final_chunk_W], mode="drop", unique_indices=True
+            )
+        normed_ND = _gated_norm(out_NHU[None], z_NHU[None], self.norm.weight[...], self.norm.eps)
+        out_BTD = self.out_proj(normed_ND.reshape(B, T, -1))
+        return out_BTD, LinearCache(conv_SKC, state_SHAU, batch)
