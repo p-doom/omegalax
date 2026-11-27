@@ -54,7 +54,7 @@ def _metric_sums(logp_BT, entropy_BT, log_ratio_BT, clipped_BT, mask_BT, fresh_B
 
 
 class Trainer:
-    """Owns the float32 master params and the optimizer state on ``mesh``.
+    """Owns float32 params on ``mesh`` and the optimizer state (on ``mesh`` or in host memory).
 
     ``step`` packs samples into length-bucketed microbatches (one compiled shape per bucket),
     sums token-normalized gradients and applies one AdamW update.
