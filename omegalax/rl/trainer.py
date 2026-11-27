@@ -32,6 +32,7 @@ class TrainConfig:
     length_buckets: tuple[int, ...]
     logit_tile_tokens: int
     pad_id: int
+    host_optimizer: bool
 
 
 def _metric_sums(logp_BT, entropy_BT, log_ratio_BT, clipped_BT, mask_BT, fresh_BT):
@@ -82,16 +83,29 @@ class Trainer:
                 weight_decay=cfg.weight_decay, mask=decay_mask,
             ),
         )
+        self._param_shardings = param_shardings
+        # With host_optimizer the float32 master copy and the Adam moments live in host memory and
+        # the update runs on the CPU; the devices keep the params and the gradient sum only.
+        self._opt_shardings = (
+            jax.tree.map(lambda _: jax.sharding.SingleDeviceSharding(jax.devices("cpu")[0]), self.params)
+            if cfg.host_optimizer
+            else param_shardings
+        )
+        self.master = jax.device_put(self.params, self._opt_shardings)
         with jax.set_mesh(self.mesh):
-            self.opt_state = jax.jit(self.tx.init)(self.params)
+            self.opt_state = jax.jit(self.tx.init)(self.master)
         self._zeros = jax.jit(
             lambda p: jax.tree.map(jnp.zeros_like, p), out_shardings=param_shardings
         )
-        # The gradient sum must leave in the zeros' sharding, or each chained call recompiles.
+        # Outputs fed back as inputs keep their input shardings, or the next call recompiles.
         self._accumulate = jax.jit(
             self._accumulate_fn, donate_argnums=(1,), out_shardings=(param_shardings, None)
         )
-        self._apply = jax.jit(self._apply_fn, donate_argnums=(0, 1))
+        self._apply = jax.jit(
+            self._apply_fn,
+            donate_argnums=(0, 1),
+            out_shardings=(self._opt_shardings, jax.tree.map(lambda x: x.sharding, self.opt_state), None),
+        )
         self._logprobs = jax.jit(self._logprobs_fn)
         self.version = 0
 
@@ -188,7 +202,7 @@ class Trainer:
                       for k in ("tokens", "segment_ids", "mask", "behavior_logp", "fresh")}
                 mb["advantage"] = np.zeros(rows, np.float32)
                 acc, _ = self._accumulate(self.params, acc, self._put(mb), jnp.float32(0.0))
-            self._apply.lower(self.params, self.opt_state, acc).compile()
+            self._apply.lower(self.master, self.opt_state, jax.device_put(acc, self._opt_shardings)).compile()
             jax.block_until_ready(acc)
         return time.perf_counter() - t0
 
@@ -208,7 +222,10 @@ class Trainer:
             for mb in mbs:
                 acc, m = self._accumulate(self.params, acc, self._put(mb), inv_tokens)
                 sums.append(m)
-            self.params, self.opt_state, grad_norm = self._apply(self.params, self.opt_state, acc)
+            self.master, self.opt_state, grad_norm = self._apply(
+                self.master, self.opt_state, jax.device_put(acc, self._opt_shardings)
+            )
+            self.params = jax.device_put(self.master, self._param_shardings)
         sums = jax.device_get(sums)
         totals = {k: sum(float(s[k]) for s in sums) for k in (sums[0] if sums else ())}
         jax.block_until_ready(self.params)

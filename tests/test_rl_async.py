@@ -70,7 +70,7 @@ class AsyncInvariantsTest(absltest.TestCase):
         trainer = RecordingTrainer(model, cfg, TrainConfig(
             lr=3e-5, weight_decay=0.0, adam_b1=0.9, adam_b2=0.98, adam_eps=1e-8, max_grad_norm=1.0,
             eps_low=0.2, eps_high=0.28, tokens_per_microbatch=16384, length_buckets=(512, 1024),
-            logit_tile_tokens=4096, pad_id=pad,
+            logit_tile_tokens=4096, pad_id=pad, host_optimizer=False,
         ))
         sync = WeightSync(trainer.graphdef, trainer.params)
         replica, shardings = engine_replica(sync.gather(trainer.params), cfg, sub_mesh(devices[1:2], 1, 1, 1))

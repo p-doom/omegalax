@@ -52,6 +52,7 @@ flags.DEFINE_float("eps_high", 0.28, "PPO clip above 1.")
 flags.DEFINE_integer("tokens_per_microbatch", 65536, "Padded tokens per trainer microbatch.")
 flags.DEFINE_list("length_buckets", ["1024", "2048", "4096", "8192", "16384"], "Trainer sequence buckets.")
 flags.DEFINE_integer("logit_tile_tokens", 4096, "Positions per float32 logits tile in the trainer.")
+flags.DEFINE_bool("host_optimizer", False, "Keep the float32 master and Adam state in host memory (large models).")
 flags.DEFINE_integer("num_pages", 32768, "KV pages per engine (64 tokens each).")
 flags.DEFINE_integer("max_sessions", 256, "Concurrent sessions per engine.")
 flags.DEFINE_integer("decode_steps", 8, "Decode steps per engine device call.")
@@ -119,6 +120,7 @@ def main(argv):
             tokens_per_microbatch=FLAGS.tokens_per_microbatch,
             length_buckets=buckets,
             logit_tile_tokens=FLAGS.logit_tile_tokens, pad_id=pad,
+            host_optimizer=FLAGS.host_optimizer,
         ),
     )
     del model
