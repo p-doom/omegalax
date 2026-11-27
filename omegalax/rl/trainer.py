@@ -86,16 +86,14 @@ class Trainer:
         )
         self._param_shardings = param_shardings
         # With host_optimizer the float32 master copy and the Adam moments live in host memory and
-        # the update runs on the CPU; the devices keep the params and the gradient sum only.
-        self._opt_shardings = (
-            jax.tree.map(lambda _: jax.sharding.SingleDeviceSharding(jax.devices("cpu")[0]), self.params)
-            if cfg.host_optimizer
-            else param_shardings
-        )
+        # the update runs on a one-device CPU mesh; the devices keep the params and gradient sum.
+        if cfg.host_optimizer:
+            self._opt_mesh = jax.make_mesh((1, 1, 1), self.mesh.axis_names, devices=jax.devices("cpu")[:1])
+            self._opt_shardings = jax.tree.map(lambda _: NamedSharding(self._opt_mesh, P()), self.params)
+        else:
+            self._opt_mesh, self._opt_shardings = self.mesh, param_shardings
         self.master = jax.device_put(self.params, self._opt_shardings)
-        # The update runs outside the trainer's mesh context; with host_optimizer, on the CPU
-        # (where Adam's step counter must be created too).
-        with jax.default_device(jax.devices("cpu")[0] if cfg.host_optimizer else None):
+        with jax.set_mesh(self._opt_mesh):
             self.opt_state = jax.jit(self.tx.init)(self.master)
         self._zeros = jax.jit(
             lambda p: jax.tree.map(jnp.zeros_like, p), out_shardings=param_shardings
@@ -212,7 +210,8 @@ class Trainer:
             acc = self._zeros(self.params)
             for T in self.cfg.length_buckets:
                 acc, _ = self._accumulate(self.params, acc, masked_rows(T), np.float32(0.0))
-        self._apply.lower(self.master, self.opt_state, jax.device_put(acc, self._opt_shardings)).compile()
+        with jax.set_mesh(self._opt_mesh):
+            self._apply.lower(self.master, self.opt_state, jax.device_put(acc, self._opt_shardings)).compile()
         jax.block_until_ready(acc)
         return time.perf_counter() - t0
 
@@ -232,9 +231,10 @@ class Trainer:
             for mb in mbs:
                 acc, m = self._accumulate(self.params, acc, self._put(mb), inv_tokens)
                 sums.append(m)
-        self.master, self.opt_state, grad_norm = self._apply(
-            self.master, self.opt_state, jax.device_put(acc, self._opt_shardings)
-        )
+        with jax.set_mesh(self._opt_mesh):
+            self.master, self.opt_state, grad_norm = self._apply(
+                self.master, self.opt_state, jax.device_put(acc, self._opt_shardings)
+            )
         self.params = jax.device_put(self.master, self._param_shardings)
         sums = jax.device_get(sums)
         # Per-token |log pi - log mu| on trained tokens, for quantiles and Miles' sample mean.
