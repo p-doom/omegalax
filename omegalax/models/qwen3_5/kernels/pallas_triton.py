@@ -90,6 +90,34 @@ def _state_pass_kernel(
     jax.lax.fori_loop(0, J, body, state_init)
 
 
+def _state_pass_bwd_kernel(
+    kcd_ref,  # (J, C, A)  fp32
+    k_dec_ref,  # (J, C, A)  fp32
+    dv_new_ref,  # (J, C, U)  fp32  — cotangent of v_new
+    df_ref,  # (J,)       fp32
+    idx_ref,  # (J,)       int32
+    dstate_in_ref,  # (J, A, U)  fp32  — cotangent of state_in
+    dstate_in_out_ref,  # (J, A, U)  fp32  — total gradient w.r.t. state_in[j]
+    dv_total_out_ref,  # (J, C, U)  fp32  — total gradient w.r.t. v_new[j]
+    *,
+    A: int,
+    U: int,
+    J: int,
+):
+    """Reverse of :func:`_state_pass_kernel`; the carry is the gradient w.r.t. the state after
+    chunk ``j``, which a reset at ``j`` disconnects from the chunks before it."""
+
+    def body(i, dstate):
+        j = J - 1 - i
+        dv_total = dv_new_ref[j] + pl.dot(k_dec_ref[j], dstate)
+        dv_total_out_ref[j] = dv_total
+        dstate_in = df_ref[j] * dstate - pl.dot(kcd_ref[j].T, dv_total) + dstate_in_ref[j]
+        dstate_in_out_ref[j] = dstate_in
+        return jnp.where(idx_ref[j] >= 0, 0.0, dstate_in)
+
+    jax.lax.fori_loop(0, J, body, jnp.zeros((A, U), jnp.float32))
+
+
 @functools.partial(jax.custom_vjp, nondiff_argnums=())
 def _state_pass_pallas(
     kcd_BHJCA: jax.Array,
@@ -147,79 +175,50 @@ def _state_pass_fwd_for_vjp(kcd, k_dec, u_pre, df, init_idx, init):
 
 
 def _state_pass_bwd(residuals, cotangents):
-    """Reverse-scan VJP for the sequential state pass.
+    """VJP of the state pass: the sequential reverse recurrence runs in
+    :func:`_state_pass_bwd_kernel`; the per-chunk parameter gradients are batched einsums.
 
-    Backward derivation per chunk j (notation: dX = ∂L/∂X):
-      Forward:
-        v_new[j] = u_pre[j] - kcd[j] @ state[j]
-        new_state = df[j] * state[j] + k_dec[j].T @ v_new[j]
-
-      Receives in reverse: ``dstate`` (carry, ∂L/∂new_state) plus the
-      cotangents ``dstate_in[j]`` and ``dv_new[j]`` from saved outputs.
-
-      Through new_state:
-        ddf[j]            = ⟨state[j], dstate⟩  (element-wise sum)
-        dv_new += k_dec[j] @ dstate            (shape (C, U))
-        dk_dec[j]          = v_new[j] @ dstate.T (shape (C, A))
-        dstate_via_df      = df[j] * dstate
-
-      Through v_new:
-        du_pre[j]          = dv_new            (shape (C, U))
-        dkcd[j]            = -dv_new @ state[j].T (shape (C, A))
-        dstate_via_kcd     = -kcd[j].T @ dv_new (shape (A, U))
-
-      Total dstate carry = dstate_via_df + dstate_via_kcd + dstate_in[j]
+    With ``D[j]`` the gradient w.r.t. the state after chunk ``j`` (``dstate_in[j + 1]`` unless
+    chunk ``j + 1`` resets) and ``dv[j]`` the total gradient w.r.t. ``v_new[j]``:
+      ddf[j] = <state_in[j], D[j]>,  dk_dec[j] = v_new[j] @ D[j].T,
+      dkcd[j] = -dv[j] @ state_in[j].T,  du_pre[j] = dv[j],
+    and each reset chunk adds its ``dstate_in`` to the gradient of the initial state it read.
     """
     kcd, k_dec, u_pre, df, state_in, v_new, init_idx, init = residuals
     dstate_in, dv_new = cotangents
     B, H, J, C, A = kcd.shape
     U = u_pre.shape[-1]
+    UB = min(U, _STATE_U_BLOCK)
+    spec_a = pl.BlockSpec((None, None, J, C, A), lambda b, h, u: (b, h, 0, 0, 0))
+    spec_u = pl.BlockSpec((None, None, J, C, UB), lambda b, h, u: (b, h, 0, 0, u))
+    spec_s = pl.BlockSpec((None, None, J, A, UB), lambda b, h, u: (b, h, 0, 0, u))
+    spec_d = pl.BlockSpec((None, None, J), lambda b, h, u: (b, h, 0))
+    spec_i = pl.BlockSpec((None, J), lambda b, h, u: (b, 0))
+    dstate_in_total, dv_total = pl.pallas_call(
+        functools.partial(_state_pass_bwd_kernel, A=A, U=UB, J=J),
+        out_shape=(
+            jax.ShapeDtypeStruct((B, H, J, A, U), jnp.float32),
+            jax.ShapeDtypeStruct((B, H, J, C, U), jnp.float32),
+        ),
+        grid=(B, H, U // UB),
+        in_specs=(spec_a, spec_a, spec_u, spec_d, spec_i, spec_s),
+        out_specs=(spec_s, spec_u),
+        compiler_params=plt.CompilerParams(num_warps=4, num_stages=2),
+    )(kcd, k_dec, dv_new.astype(jnp.float32), df, init_idx, dstate_in.astype(jnp.float32))
 
-    def body(carry, j):
-        dstate, dinit = carry
-        kcd_j = kcd[:, :, j]  # (B, H, C, A)
-        k_dec_j = k_dec[:, :, j]
-        v_new_j = v_new[:, :, j]
-        df_j = df[:, :, j]  # (B, H)
-        state_j = state_in[:, :, j]  # (B, H, A, U)
-        dstate_in_j = dstate_in[:, :, j]
-        dv_new_saved_j = dv_new[:, :, j]
-
-        # gradients through new_state
-        ddf_j = jnp.einsum("BHAU,BHAU->BH", state_j, dstate)
-        dk_dec_j = jnp.einsum("BHCU,BHAU->BHCA", v_new_j, dstate)
-        dv_new_via_new_state = jnp.einsum("BHCA,BHAU->BHCU", k_dec_j, dstate)
-        dstate_via_df = df_j[..., None, None] * dstate
-
-        # total cotangent flowing into v_new[j]
-        dv_new_total = dv_new_saved_j + dv_new_via_new_state
-
-        # gradients through v_new
-        du_pre_j = dv_new_total
-        dkcd_j = -jnp.einsum("BHCU,BHAU->BHCA", dv_new_total, state_j)
-        dstate_via_kcd = -jnp.einsum("BHCA,BHCU->BHAU", kcd_j, dv_new_total)
-
-        new_dstate = dstate_via_df + dstate_via_kcd + dstate_in_j
-        idx_B = init_idx[:, j]
-        reset_B = (idx_B >= 0)[:, None, None, None]
-        dinit = dinit.at[jnp.where(idx_B >= 0, idx_B, init.shape[0])].add(new_dstate, mode="drop")
-        new_dstate = jnp.where(reset_B, 0.0, new_dstate)
-        return (new_dstate, dinit), (dkcd_j, dk_dec_j, du_pre_j, ddf_j)
-
-    carry_init = (jnp.zeros((B, H, A, U), jnp.float32), jnp.zeros(init.shape, jnp.float32))
-    (_, dinit), (dkcd_JBHCA, dk_dec_JBHCA, du_pre_JBHCU, ddf_JBH) = jax.lax.scan(
-        body,
-        carry_init,
-        jnp.arange(J),
-        reverse=True,
+    reset_BJ = init_idx >= 0
+    after_BHJAU = jnp.where(reset_BJ[:, None, 1:, None, None], 0.0, dstate_in_total[:, :, 1:])
+    after_BHJAU = jnp.concatenate([after_BHJAU, jnp.zeros_like(after_BHJAU[:, :, :1])], axis=2)
+    ddf_BHJ = jnp.einsum("BHJAU,BHJAU->BHJ", state_in, after_BHJAU)
+    dk_dec_BHJCA = jnp.einsum("BHJCU,BHJAU->BHJCA", v_new, after_BHJAU)
+    dkcd_BHJCA = -jnp.einsum("BHJCU,BHJAU->BHJCA", dv_total, state_in)
+    dinit = (
+        jnp.zeros(init.shape, jnp.float32)
+        .at[jnp.where(reset_BJ, init_idx, init.shape[0])]
+        .add(dstate_in_total.transpose(0, 2, 1, 3, 4), mode="drop")
     )
-    # scan stacks outputs along axis 0 → reorder to (B, H, J, ...)
-    dkcd_BHJCA = jnp.transpose(dkcd_JBHCA, (1, 2, 0, 3, 4))
-    dk_dec_BHJCA = jnp.transpose(dk_dec_JBHCA, (1, 2, 0, 3, 4))
-    du_pre_BHJCU = jnp.transpose(du_pre_JBHCU, (1, 2, 0, 3, 4))
-    ddf_BHJ = jnp.transpose(ddf_JBH, (1, 2, 0))
     dinit_idx = np.zeros(init_idx.shape, jax.dtypes.float0)
-    return dkcd_BHJCA, dk_dec_BHJCA, du_pre_BHJCU, ddf_BHJ, dinit_idx, dinit.astype(init.dtype)
+    return dkcd_BHJCA, dk_dec_BHJCA, dv_total, ddf_BHJ, dinit_idx, dinit.astype(init.dtype)
 
 
 _state_pass_pallas.defvjp(_state_pass_fwd_for_vjp, _state_pass_bwd)
