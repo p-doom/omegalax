@@ -24,6 +24,7 @@ def chunk_gated_delta_rule_xla(
     beta_BTH: jax.Array,
     init_NHAU: jax.Array,
     init_idx_BJ: jax.Array,
+    final_idx_BW: jax.Array,
     chunk_size: int = 64,
 ) -> tuple[jax.Array, jax.Array]:
     """Chunked gated delta rule (XLA reference).
@@ -35,9 +36,10 @@ def chunk_gated_delta_rule_xla(
         init_NHAU:      (N, H, A, U) initial states
         init_idx_BJ:    (B, J) chunk ``j`` of row ``b`` starts from ``init_NHAU[i]`` when
                         ``i = init_idx_BJ[b, j] >= 0``, else from the previous chunk's state
+        final_idx_BW:   (B, W) chunks whose end states to return
     Returns:
         out_BTHU: (B, T, H, U)
-        state_BJHAU: (B, J, H, A, U) state after each chunk
+        state_BWHAU: (B, W, H, A, U) state after chunk ``final_idx_BW[b, w]``
 
     Internally l2-normalizes q and k. Pads T up to a multiple of ``chunk_size``
     and trims at the end.
@@ -141,7 +143,9 @@ def chunk_gated_delta_rule_xla(
     _, (core_out_chunks, state_JBHAU) = jax.lax.scan(chunk_step, state_BHAU, jnp.arange(J))
     core_out_BHJLU = core_out_chunks.transpose(1, 2, 0, 3, 4)
     core_out_BHTU = core_out_BHJLU.reshape(B, H, -1, U)[:, :, :T, :]
-    return core_out_BHTU.transpose(0, 2, 1, 3), jnp.swapaxes(state_JBHAU, 0, 1)
+    state_BJHAU = jnp.swapaxes(state_JBHAU, 0, 1)
+    state_BWHAU = jnp.take_along_axis(state_BJHAU, final_idx_BW[:, :, None, None, None], axis=1)
+    return core_out_BHTU.transpose(0, 2, 1, 3), state_BWHAU
 
 
 def recurrent_gated_delta_step_xla(

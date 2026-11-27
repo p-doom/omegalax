@@ -213,8 +213,9 @@ class GatedDeltaNet(nnx.Module):
             J = -(-T // _CHUNK)
             init_idx_BJ = jnp.full((B, J), -1, jnp.int32).at[:, 0].set(0)
             init_NHAU = jnp.zeros((1, local_v_heads, head_k_dim, v_BTHU.shape[3]), jnp.float32)
+            final_idx_BW = jnp.full((B, 1), J - 1, jnp.int32)
             out, _ = chunk_gated_delta_rule(
-                q_BTHA, k_BTHA, v_BTHU, g_BTH, beta_BTH, init_NHAU, init_idx_BJ, _CHUNK
+                q_BTHA, k_BTHA, v_BTHU, g_BTH, beta_BTH, init_NHAU, init_idx_BJ, final_idx_BW, _CHUNK
             )
             return _gated_norm(out, z_BTHU, nw, norm_eps)
 
@@ -245,11 +246,20 @@ class GatedDeltaNet(nnx.Module):
             in_x = (idx < N)[..., None]
             return jnp.where(in_x, x_NC[jnp.minimum(idx, N - 1)], pool_RC[jnp.maximum(idx - N, 0)])
 
-        taps_NKC = rows(batch.conv_src_NK)
         weight_CK = self.conv_weight[...].astype(x_NC.dtype)
-        conv_NC = jnp.zeros_like(x_NC)
-        for k in range(K):
-            conv_NC = conv_NC + weight_CK[None, :, k] * taps_NKC[:, k]
+
+        def conv(taps):
+            out = jnp.zeros_like(taps[0])
+            for k in range(K):
+                out = out + weight_CK[None, :, k] * taps[k]
+            return out
+
+        x_pad_RC = jnp.pad(x_NC, ((K - 1, 0), (0, 0)))
+        conv_NC = conv([x_pad_RC[k : k + N] for k in range(K)])
+        taps_FKC = rows(batch.conv_src_FK)
+        conv_NC = conv_NC.at[batch.conv_fix_F].set(
+            conv([taps_FKC[:, k] for k in range(K)]), mode="drop", unique_indices=True
+        )
         conv_SKC = cache.conv_SKC.at[batch.write_slot_W].set(
             rows(batch.conv_out_src_WK), mode="drop", unique_indices=True
         )
@@ -268,7 +278,7 @@ class GatedDeltaNet(nnx.Module):
             )
         else:
             valid_N1 = batch.valid_N[:, None]
-            out_1NHU, state_1JHAU = chunk_gated_delta_rule(
+            out_1NHU, state_1WHAU = chunk_gated_delta_rule(
                 q_NHA[None],
                 k_NHA[None],
                 v_NHU[None],
@@ -276,11 +286,12 @@ class GatedDeltaNet(nnx.Module):
                 jnp.where(valid_N1, beta_NH, 0.0)[None],
                 cache.state_SHAU[batch.init_slot_I],
                 batch.init_idx_1J,
+                batch.final_chunk_W[None],
                 _CHUNK,
             )
             out_NHU = out_1NHU[0]
             state_SHAU = cache.state_SHAU.at[batch.write_slot_W].set(
-                state_1JHAU[0, batch.final_chunk_W], mode="drop", unique_indices=True
+                state_1WHAU[0], mode="drop", unique_indices=True
             )
         normed_ND = _gated_norm(out_NHU[None], z_NHU[None], self.norm.weight[...], self.norm.eps)
         out_BTD = self.out_proj(normed_ND.reshape(B, T, -1))

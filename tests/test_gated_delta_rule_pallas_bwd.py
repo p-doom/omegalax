@@ -41,7 +41,8 @@ def _fresh(fn):
         B, T, H, A = q.shape
         init_idx = jnp.full((B, -(-T // 64)), -1, jnp.int32).at[:, 0].set(0)
         init = jnp.zeros((1, H, A, v.shape[-1]), jnp.float32)
-        return fn(q, k, v, g, beta, init, init_idx)[0]
+        final_idx = jnp.full((B, 1), init_idx.shape[1] - 1, jnp.int32)
+        return fn(q, k, v, g, beta, init, init_idx, final_idx)[0]
 
     return run
 

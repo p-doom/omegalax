@@ -16,6 +16,12 @@ from omegalax.models.qwen3_5.model import Qwen3_5ForCausalLM
 ZERO_SLOT, TRASH_SLOT = 0, 1
 
 
+def _model(graphdef, leaves):
+    """``graphdef`` is ``(nnx graphdef, state treedef)``; ``leaves`` the flat state."""
+    nnx_graphdef, treedef = graphdef
+    return nnx.merge(nnx_graphdef, jax.tree.unflatten(treedef, leaves))
+
+
 def _logits_BV(model, hidden_BD: jax.Array) -> jax.Array:
     logits_BTV = jnp.einsum("BTD,DV->BTV", hidden_BD[:, None], model.lm_head.kernel[...])
     return logits_BTV[:, 0].astype(jnp.float32)
@@ -63,7 +69,8 @@ def _linear_decode(pools, slot_B, active_B):
     base_B1 = (B + row_slot_B * K1)[:, None]
     taps_BK = jnp.concatenate([base_B1 + jnp.arange(K1)[None], rows_B[:, None]], axis=1)
     return LinearDecode(
-        conv_src_NK=taps_BK,
+        conv_fix_F=rows_B,
+        conv_src_FK=taps_BK,
         conv_out_src_WK=taps_BK[:, 1:],
         write_slot_W=jnp.where(active_B, slot_B, S + rows_B),
         row_slot_N=row_slot_B,
@@ -92,7 +99,7 @@ def decode(
     ``tok_B`` is each row's last sampled token, not yet in the cache, at position
     ``pos_B``. Returns the updated pools and per-step ``(token, logprob, valid)``.
     """
-    model = nnx.merge(graphdef, state)
+    model = _model(graphdef, state)
     key_B = jax.random.wrap_key_data(key_data_B2)
     _, P, S, _ = next(a for a, _ in pools if a.ndim == 4).shape
     rows_B = jnp.arange(tok_B.shape[0], dtype=jnp.int32)
@@ -149,7 +156,7 @@ def extend(
     Each sequence occupies whole query blocks of ``block_q`` tokens. Row ``r`` samples
     from the hidden state at ``sample_idx_R[r]``.
     """
-    model = nnx.merge(graphdef, state)
+    model = _model(graphdef, state)
     paged = PagedBatch(
         positions_BT=positions_T[None],
         write_src_W=write_src_W,
@@ -172,7 +179,7 @@ def extend(
 
 def score(graphdef, state, tokens_BT, pad_id: int):
     """Trainer-forward log-probability of each next token: ``logp_BT[:, t]`` scores ``t + 1``."""
-    model = nnx.merge(graphdef, state)
+    model = _model(graphdef, state)
     hidden_BTD, _ = model(tokens_BT, 1 * (tokens_BT != pad_id), None, None)
     logits_BTV = jnp.einsum("BTD,DV->BTV", hidden_BTD, model.lm_head.kernel[...])
     logp_BTV = jax.nn.log_softmax(logits_BTV.astype(jnp.float32), axis=-1)

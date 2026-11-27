@@ -101,15 +101,11 @@ class OutOfPages(Exception):
     pass
 
 
-def _signature(state: nnx.State):
-    leaves, treedef = jax.tree.flatten(state)
-    return treedef, [(x.shape, x.dtype, x.sharding) for x in leaves]
-
-
-def _inference_cast(model: nnx.Module):
-    """Stores every Linear kernel (but the lm_head) and embedding table in its module's
-    compute dtype, which the forward pass casts them to before every use anyway. The
-    lm_head stays in its storage dtype because the trainer's loss multiplies it directly.
+def _inference_dtypes(model: nnx.Module, state: nnx.State) -> list:
+    """Per state leaf, the dtype the engine stores it in: every Linear kernel (but the
+    lm_head) and embedding table in its module's compute dtype, which the forward pass casts
+    them to before every use anyway. The lm_head keeps its storage dtype because the trainer's
+    loss multiplies it directly.
     """
     cast = {}
     for path, m in nnx.iter_modules(model):
@@ -117,15 +113,10 @@ def _inference_cast(model: nnx.Module):
             cast[(*path, "kernel")] = m.dtype
         elif isinstance(m, nnx.Embed):
             cast[(*path, "embedding")] = m.dtype
-
-    def to_inference(state):
-        def leaf(path, x):
-            dtype = cast.get(tuple(k.key for k in path if isinstance(k, jax.tree_util.DictKey)))
-            return x if dtype is None else x.astype(dtype)
-
-        return jax.tree_util.tree_map_with_path(leaf, state)
-
-    return to_inference
+    return [
+        cast.get(tuple(k.key for k in path if isinstance(k, jax.tree_util.DictKey)), x.dtype)
+        for path, x in jax.tree_util.tree_leaves_with_path(state)
+    ]
 
 
 class Engine:
@@ -135,9 +126,15 @@ class Engine:
         self._max_pages = -(-cfg.max_context // (8 * S)) * 8
         graphdef, state = nnx.split(model)
         self._mesh = jax.tree.leaves(state)[0].sharding.mesh
-        self._signature = _signature(state)
-        self._to_inference = jax.jit(_inference_cast(model))
-        self._state = self._to_inference(state)
+        # The jitted programs take the state as a flat leaf list: nnx metadata in the treedef
+        # must not be part of their cache keys, or a weight update recompiles them.
+        self._abstract = jax.tree.map(
+            lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=x.sharding), state
+        )
+        dtypes = _inference_dtypes(model, state)
+        self._to_inference = jax.jit(lambda leaves: [x.astype(d) for x, d in zip(leaves, dtypes)])
+        self._state = jax.tree.leaves(state)
+        graphdef = (graphdef, jax.tree.structure(state))
         layers = model.text.layers if isinstance(model, steps.Qwen3_5ForCausalLM) else model.layers
         num_slots = cfg.max_sessions + 2
         self._pool_shapes = []
@@ -158,17 +155,14 @@ class Engine:
         self._fork_slack = cfg.max_group * S
         self._free_slots = list(range(num_slots - 1, steps.TRASH_SLOT, -1))
         self._pools = None
+        bind = lambda fn: lambda *args, **kwargs: fn(graphdef, *args, **kwargs)
         self._decode = jax.jit(
-            functools.partial(steps.decode, graphdef),
-            static_argnames=("num_steps", "num_work"),
-            donate_argnums=(1,),
+            bind(steps.decode), static_argnames=("num_steps", "num_work"), donate_argnums=(1,)
         )
         self._extend = jax.jit(
-            functools.partial(steps.extend, graphdef),
-            static_argnames=("block_q", "num_work"),
-            donate_argnums=(1,),
+            bind(steps.extend), static_argnames=("block_q", "num_work"), donate_argnums=(1,)
         )
-        self._score = jax.jit(functools.partial(steps.score, graphdef), static_argnames=("pad_id",))
+        self._score = jax.jit(bind(steps.score), static_argnames=("pad_id",))
         self._eos = np.asarray(cfg.eos_token_ids, np.int32)
         self._free = list(range(cfg.num_pages - 1, 0, -1))
         self._refs = np.zeros(cfg.num_pages, np.int32)
@@ -180,25 +174,38 @@ class Engine:
         self._commands: queue.SimpleQueue = queue.SimpleQueue()
         self._lock = threading.Lock()
         self._error: BaseException | None = None
+        self._command: tuple = ()
         self._thread: threading.Thread | None = None
         self.stats = collections.Counter()
 
-    def warmup(self) -> None:
-        """Allocates the page pool and compiles every bucket by running it on inactive rows.
+    def start(self) -> dict[str, float]:
+        """Starts the engine thread and returns once it is ready to serve.
 
-        The pool is allocated here, not in ``__init__``, so a caller can drop its float32
-        model between the two.
+        The thread casts the weights, allocates the page pool and compiles every bucket by
+        running it on inactive rows; it returns the seconds each bucket took. All device work
+        stays on this thread because JAX's trace and compile caches are thread-local. The pool
+        is allocated here, not in ``__init__``, so a caller can drop its float32 model first.
         """
-        self._pools = [tuple(jnp.zeros(*spec) for spec in specs) for specs in self._pool_shapes]
-        for B in self.cfg.decode_buckets:
-            self._run_decode_call(self._decode_inputs([], B))
-        for T in self.cfg.extend_buckets:
-            self._run_extend_call(self._extend_inputs([], T))
-        jax.block_until_ready(self._pools)
-
-    def start(self) -> None:
-        self._thread = threading.Thread(target=self._loop, daemon=True)
+        ready = Future()
+        self._thread = threading.Thread(target=self._loop, args=(ready,), daemon=True)
         self._thread.start()
+        return ready.result()
+
+    def _warmup(self) -> dict[str, float]:
+        # The first trace of the trainer forward extends JAX's trace context, which is part of
+        # every jit cache key; trace it before anything is compiled.
+        self._score.trace(self._state, np.zeros((1, 128), np.int32), pad_id=self.cfg.pad_id)
+        self._state = self._to_inference(self._state)
+        self._pools = [tuple(jnp.zeros(*spec) for spec in specs) for specs in self._pool_shapes]
+        runs = {f"decode_{B}": (self._run_decode_call, self._decode_inputs([], B)) for B in self.cfg.decode_buckets}
+        runs |= {f"extend_{T}": (self._run_extend_call, self._extend_inputs([], T)) for T in self.cfg.extend_buckets}
+        seconds = {}
+        for name, (run, inputs) in runs.items():
+            t = time.perf_counter()
+            run(inputs)
+            seconds[name] = time.perf_counter() - t
+        self.stats.clear()
+        return seconds
 
     def stop(self) -> None:
         self._submit(("stop",))
@@ -230,9 +237,10 @@ class Engine:
     def abort(self, sessions: Sequence[int]) -> None:
         self._submit(("abort", list(sessions)))
 
-    def update_weights(self, state: nnx.State, version: int) -> Future:
+    def update_weights(self, params: dict, version: int) -> Future:
+        """Swaps in ``params``, an ``nnx.to_pure_dict`` of the model state (trainer layout)."""
         future = Future()
-        self._submit(("weights", state, version, future))
+        self._submit(("weights", params, version, future))
         return future
 
     def score(self, token_lists: Sequence[Sequence[int]]) -> Future:
@@ -242,16 +250,22 @@ class Engine:
         self._submit(("score", [list(t) for t in token_lists], future))
         return future
 
-    def _loop(self) -> None:
+    def _loop(self, ready: Future) -> None:
         try:
             with jax.set_mesh(self._mesh):
+                ready.set_result(self._warmup())
                 self._serve()
         except BaseException as exc:
+            if not ready.done():
+                ready.set_exception(exc)
             with self._lock:
                 self._error = exc
             pending = [s.turn.future for s in self._sessions.values() if s.turn is not None]
+            commands = [self._command]
             while not self._commands.empty():
-                for x in self._commands.get():
+                commands.append(self._commands.get())
+            for cmd in commands:
+                for x in cmd:
                     pending += x if isinstance(x, list) else [x] if isinstance(x, Future) else []
             for future in pending:
                 if not future.done():
@@ -275,6 +289,7 @@ class Engine:
             except queue.Empty:
                 return True
             block = False
+            self._command = cmd
             kind = cmd[0]
             if kind == "stop":
                 return False
@@ -291,11 +306,14 @@ class Engine:
             elif kind == "score":
                 cmd[2].set_result(self._run_score(cmd[1]))
 
-    def _set_weights(self, state: nnx.State, version: int) -> None:
-        if _signature(state) != self._signature:
-            raise ValueError("update_weights needs the same tree, shapes, dtypes and shardings.")
-        # Equal treedefs can still hash differently (nnx metadata), which would miss the jit cache.
-        self._state = self._to_inference(jax.tree.unflatten(self._signature[0], jax.tree.leaves(state)))
+    def _set_weights(self, params: dict, version: int) -> None:
+        state = jax.tree.map(lambda x: x, self._abstract)
+        nnx.replace_by_pure_dict(state, params)
+        leaves = jax.tree.leaves(state)
+        spec = lambda x: (x.shape, x.dtype, x.sharding)
+        if list(map(spec, leaves)) != list(map(spec, jax.tree.leaves(self._abstract))):
+            raise ValueError("update_weights needs the initial shapes, dtypes and shardings.")
+        self._state = self._to_inference(leaves)
         self._version = version
 
     def _new_session(self, tokens: list[int]) -> _Session:
@@ -346,13 +364,14 @@ class Engine:
         s.length = min(s.length, keep * self.cfg.page_size)
 
     def _evict_one(self, keep: _Session, preempt: bool, pages: int) -> None:
-        """Frees ``pages`` tail pages of the least recently used idle session, else of the newest
-        session waiting for an extend, else (if allowed) of the newest decoder; the victim
-        re-extends its dropped tail. DeltaNet state cannot be rewound, so a model with DeltaNet
-        layers drops the whole session.
+        """Frees ``pages`` tail pages of the least recently used idle session; a decode
+        (``preempt``) may then take them from the newest session waiting for an extend, then from
+        the newest decoder. The victim re-extends its dropped tail. DeltaNet state cannot be
+        rewound, so a model with DeltaNet layers drops the whole session.
         """
         idle = [s for s in self._sessions.values() if s.turn is None and s.pages]
-        waiting = [s for s in self._extend_queue if s is not keep and s.pages]
+        waiting = [s for s in self._extend_queue if s is not keep and s.pages] if preempt else []
+        running = [s for s in self._decoding.values() if s is not keep] if preempt else []
         if idle:
             victim = min(idle, key=lambda s: s.last_used)
             self.stats["evict_idle"] += 1
@@ -360,7 +379,6 @@ class Engine:
             victim = max(waiting, key=lambda s: s.id)
             self.stats["evict_waiting"] += 1
         else:
-            running = [s for s in self._decoding.values() if s is not keep] if preempt else []
             if not running:
                 raise OutOfPages
             victim = max(running, key=lambda s: s.id)
@@ -427,14 +445,18 @@ class Engine:
                 or fork_writes + new_fork_writes > self._fork_slack
             ):
                 break
-            if s.length == 0:
-                pages = -(-(take + A) // S) + len(s.forks) + reserve
-                evictable = sum(len(x.pages) for x in self._sessions.values() if x.turn is None)
-                if pages > len(self._free) + evictable:
-                    break
+            # Admit only what fits beside idle sessions' pages; once nothing decodes, the queue
+            # must make progress, so the head may also take pages from sessions behind it.
+            stalled = not self._decoding
+            pages = -(-(s.length + take) // S) - len(s.pages) + len(s.forks) + reserve
+            evictable = sum(
+                len(x.pages) for x in self._sessions.values() if x.turn is None or stalled
+            ) - (len(s.pages) if stalled else 0)
+            if pages > len(self._free) + evictable:
+                break
             self._extend_queue.popleft()
             try:
-                self._alloc(s, s.length + take, preempt=False)
+                self._alloc(s, s.length + take, preempt=stalled)
                 if final:
                     for f in s.forks:
                         self._alloc_fork(s, f)
@@ -472,7 +494,7 @@ class Engine:
             self._refs[page] += 1
             fork.page_row[len(fork.pages)] = page
             fork.pages.append(page)
-        self._alloc(fork, len(lead.tokens), preempt=False)
+        self._alloc(fork, len(lead.tokens), preempt=not self._decoding)
 
     def _extend_inputs(self, items, T: int):
         S, Q, A = self.cfg.page_size, self._block_q, self._align
@@ -523,8 +545,10 @@ class Engine:
         K1 = K - 1
         W = T // A + self.cfg.max_group
         zero_row = T + steps.ZERO_SLOT * K1
+        F = T // A * K1
         valid = np.zeros(T, bool)
-        conv_src = np.full((T, K), zero_row, np.int32)
+        conv_fix = T + np.arange(F, dtype=np.int32)
+        conv_src = np.full((F, K), zero_row, np.int32)
         conv_out_src = np.full((W, K1), zero_row, np.int32)
         write_slot = self.cfg.max_sessions + 2 + np.arange(W, dtype=np.int32)
         init_slot = np.zeros(T // A, np.int32)
@@ -539,7 +563,9 @@ class Engine:
         for i, (s, start, end, final) in enumerate(items):
             n = end - start
             valid[o : o + n] = True
-            conv_src[o : o + n] = rows(start + np.arange(n)[:, None] - K1 + np.arange(K), s, start, o)
+            head = np.arange(min(n, K1))
+            conv_fix[i * K1 : i * K1 + len(head)] = o + head
+            conv_src[i * K1 : i * K1 + len(head)] = rows(start + head[:, None] - K1 + np.arange(K), s, start, o)
             init_idx[0, o // C] = i
             init_slot[i] = steps.ZERO_SLOT if start == 0 else s.slot
             out_rows = rows(end - K1 + np.arange(K1), s, start, o)
@@ -549,7 +575,9 @@ class Engine:
                 conv_out_src[w] = out_rows
                 w += 1
             o += -(-n // A) * A
-        return LinearExtend(valid, conv_src, conv_out_src, write_slot, init_slot, init_idx, final_chunk)
+        return LinearExtend(
+            valid, conv_fix, conv_src, conv_out_src, write_slot, init_slot, init_idx, final_chunk
+        )
 
     def _run_extend_call(self, inputs):
         args, N = inputs

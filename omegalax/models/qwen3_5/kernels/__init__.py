@@ -17,7 +17,7 @@ otherwise ``xla``. Override with ``OMEGALAX_DELTANET_KERNEL=xla|pallas``.
 Both share the same signature so callers don't care which path runs:
 
     chunk_gated_delta_rule(q_BTHA, k_BTHA, v_BTHU, g_BTH, beta_BTH, init_NHAU, init_idx_BJ,
-                           chunk_size=64) -> (out_BTHU, state_after_each_chunk_BJHAU)
+                           final_idx_BW, chunk_size=64) -> (out_BTHU, final_state_BWHAU)
 """
 
 import os
@@ -51,10 +51,11 @@ def chunk_gated_delta_rule(
     beta_BTH,
     init_NHAU,
     init_idx_BJ,
+    final_idx_BW,
     chunk_size: int = 64,
 ):
     """Dispatcher. Late-binds the backend so env-var changes take effect per process."""
-    args = (q_BTHA, k_BTHA, v_BTHU, g_BTH, beta_BTH, init_NHAU, init_idx_BJ, chunk_size)
+    args = (q_BTHA, k_BTHA, v_BTHU, g_BTH, beta_BTH, init_NHAU, init_idx_BJ, final_idx_BW, chunk_size)
     backend = _resolve_backend()
     if backend == "xla":
         return chunk_gated_delta_rule_xla(*args)

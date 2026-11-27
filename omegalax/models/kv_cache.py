@@ -70,6 +70,9 @@ class LayerCache:
             self.batch.kv_len_N,
             scale=scale,
             num_work=self.batch.num_work,
+            # Tuned on H100: decode is bandwidth-bound, extend (Q x R = 128 rows) compute-bound.
+            min_chunk_pages=16 if Q == 1 else 64,
+            num_stages=3 if Q == 1 else 2,
         )
         return out_NQHK.reshape(B, T, H, K)
 

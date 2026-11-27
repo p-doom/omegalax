@@ -34,6 +34,9 @@ from jax.experimental.pallas import triton as plt
 import jax.numpy as jnp
 import numpy as np
 
+# Value columns per state-pass program: more programs when B * H is small (packed extend).
+_STATE_U_BLOCK = 32
+
 
 def _l2norm(x: jax.Array, axis: int = -1, eps: float = 1e-6) -> jax.Array:
     inv_norm = jax.lax.rsqrt((x * x).sum(axis=axis, keepdims=True) + eps)
@@ -60,7 +63,10 @@ def _state_pass_kernel(
     C: int,
     J: int,
 ):
-    """One program per (B, H). state stays in registers across the J chunks."""
+    """One program per (B, H, U block); value columns of the state evolve independently.
+
+    The state stays in registers across the J chunks.
+    """
     state_init = jnp.zeros((A, U), dtype=jnp.float32)
 
     def body(j, state):
@@ -112,19 +118,20 @@ def _state_pass_pallas_fwd_only(kcd, k_dec, u_pre, df, init_idx, init):
     N = init.shape[0]
     state_out_shape = jax.ShapeDtypeStruct((B, H, J, A, U), jnp.float32)
     v_new_out_shape = jax.ShapeDtypeStruct((B, H, J, C, U), jnp.float32)
-    kernel = functools.partial(_state_pass_kernel, A=A, U=U, C=C, J=J)
+    UB = min(U, _STATE_U_BLOCK)
+    kernel = functools.partial(_state_pass_kernel, A=A, U=UB, C=C, J=J)
 
-    spec_a = pl.BlockSpec((None, None, J, C, A), lambda b, h: (b, h, 0, 0, 0))
-    spec_u = pl.BlockSpec((None, None, J, C, U), lambda b, h: (b, h, 0, 0, 0))
-    spec_s = pl.BlockSpec((None, None, J, A, U), lambda b, h: (b, h, 0, 0, 0))
-    spec_d = pl.BlockSpec((None, None, J), lambda b, h: (b, h, 0))
-    spec_i = pl.BlockSpec((None, J), lambda b, h: (b, 0))
-    spec_init = pl.BlockSpec((N, None, A, U), lambda b, h: (0, h, 0, 0))
+    spec_a = pl.BlockSpec((None, None, J, C, A), lambda b, h, u: (b, h, 0, 0, 0))
+    spec_u = pl.BlockSpec((None, None, J, C, UB), lambda b, h, u: (b, h, 0, 0, u))
+    spec_s = pl.BlockSpec((None, None, J, A, UB), lambda b, h, u: (b, h, 0, 0, u))
+    spec_d = pl.BlockSpec((None, None, J), lambda b, h, u: (b, h, 0))
+    spec_i = pl.BlockSpec((None, J), lambda b, h, u: (b, 0))
+    spec_init = pl.BlockSpec((N, None, A, UB), lambda b, h, u: (0, h, 0, u))
 
     return pl.pallas_call(
         kernel,
         out_shape=(state_out_shape, v_new_out_shape),
-        grid=(B, H),
+        grid=(B, H, U // UB),
         in_specs=(spec_a, spec_a, spec_u, spec_d, spec_i, spec_init),
         out_specs=(spec_s, spec_u),
         compiler_params=plt.CompilerParams(num_warps=4, num_stages=2),
@@ -229,6 +236,7 @@ def chunk_gated_delta_rule_pallas(
     beta_BTH: jax.Array,
     init_NHAU: jax.Array,
     init_idx_BJ: jax.Array,
+    final_idx_BW: jax.Array,
     chunk_size: int = 64,
 ) -> tuple[jax.Array, jax.Array]:
     """Chunked gated delta rule with a Pallas state-pass kernel on Hopper.
@@ -325,10 +333,14 @@ def chunk_gated_delta_rule_pallas(
     out_BHJCU = inter + jnp.einsum("BHJLM,BHJMU->BHJLU", intra, v_new_BHJCU)
 
     out_BHTU = out_BHJCU.reshape(B, H, Tp, U)[:, :, :T, :]
-    state_BHJAU = df_BHJ[..., None, None] * state_in_BHJAU + jnp.einsum(
-        "BHJCA,BHJCU->BHJAU", k_dec_BHJCA, v_new_BHJCU
+    def at(x):
+        idx = final_idx_BW.reshape(B, 1, -1, *[1] * (x.ndim - 3))
+        return jnp.take_along_axis(x, idx, axis=2)
+
+    state_BHWAU = at(df_BHJ[..., None, None]) * at(state_in_BHJAU) + jnp.einsum(
+        "BHWCA,BHWCU->BHWAU", at(k_dec_BHJCA), at(v_new_BHJCU)
     )
-    return out_BHTU.transpose(0, 2, 1, 3).astype(out_dtype), state_BHJAU.transpose(0, 2, 1, 3, 4)
+    return out_BHTU.transpose(0, 2, 1, 3).astype(out_dtype), state_BHWAU.transpose(0, 2, 1, 3, 4)
 
 
 def _recurrent_step_kernel(slot_ref, q_ref, k_ref, v_ref, g_ref, beta_ref, state_ref, out_ref, state_out_ref):

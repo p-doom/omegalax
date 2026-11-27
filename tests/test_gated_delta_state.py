@@ -34,8 +34,10 @@ def _inputs(T, seed):
     return q, k, v, g, beta, init
 
 
-def _from(init, T, row=0):
-    return init, jnp.full((1, -(-T // C)), -1, jnp.int32).at[0, 0].set(row)
+def _from(init, T):
+    """Row 0 starts from ``init``; returns its state after the last chunk."""
+    J = -(-T // C)
+    return init, jnp.full((1, J), -1, jnp.int32).at[0, 0].set(0), jnp.full((1, 1), J - 1, jnp.int32)
 
 
 class StateContinuationTest(parameterized.TestCase):
@@ -47,7 +49,7 @@ class StateContinuationTest(parameterized.TestCase):
         out0, state0 = CHUNKED[impl](
             q[:, :T0], k[:, :T0], v[:, :T0], g[:, :T0], beta[:, :T0], *_from(init, T0)
         )
-        pool = jnp.zeros((3, H, A, U), jnp.float32).at[2].set(state0[0, -1])
+        pool = jnp.zeros((3, H, A, U), jnp.float32).at[2].set(state0[0, 0])
         slot = jnp.asarray([2], jnp.int32)
         steps = []
         for t in range(T0, T):
@@ -56,7 +58,7 @@ class StateContinuationTest(parameterized.TestCase):
         ref, got = np.asarray(out[0, T0:]), np.asarray(jnp.stack(steps, axis=1)[0])
         self.assertLess(np.abs(np.asarray(out0[0]) - np.asarray(out[0, :T0])).max(), 1e-4)
         self.assertLess(np.abs(got - ref).max(), 2e-3, f"max ref {np.abs(ref).max()}")
-        self.assertLess(np.abs(np.asarray(pool[2] - state[0, -1])).max(), 2e-3)
+        self.assertLess(np.abs(np.asarray(pool[2] - state[0, 0])).max(), 2e-3)
 
     @parameterized.product(impl=["xla", "pallas"])
     def test_packed_resets_match_separate_rows(self, impl):
@@ -66,21 +68,22 @@ class StateContinuationTest(parameterized.TestCase):
         init = jnp.concatenate([i1, i2])
         idx = jnp.asarray([[0, -1, 1]], jnp.int32)
         out, state = CHUNKED[impl](
-            cat(q1, q2), cat(k1, k2), cat(v1, v2), cat(g1, g2), cat(b1, b2), init, idx
+            cat(q1, q2), cat(k1, k2), cat(v1, v2), cat(g1, g2), cat(b1, b2), init, idx,
+            jnp.asarray([[1, 2]], jnp.int32),
         )
         out1, state1 = CHUNKED["xla"](q1, k1, v1, g1, b1, *_from(i1, 128))
         out2, state2 = CHUNKED["xla"](q2, k2, v2, g2, b2, *_from(i2, 64))
         self.assertLess(np.abs(np.asarray(out[0, :128] - out1[0])).max(), 2e-3)
         self.assertLess(np.abs(np.asarray(out[0, 128:] - out2[0])).max(), 2e-3)
-        self.assertLess(np.abs(np.asarray(state[0, 1] - state1[0, -1])).max(), 2e-3)
-        self.assertLess(np.abs(np.asarray(state[0, 2] - state2[0, -1])).max(), 2e-3)
+        self.assertLess(np.abs(np.asarray(state[0, 0] - state1[0, 0])).max(), 2e-3)
+        self.assertLess(np.abs(np.asarray(state[0, 1] - state2[0, 0])).max(), 2e-3)
 
     def test_pallas_init_grad_matches_xla(self):
         q, k, v, g, beta, init = _inputs(128, 3)
-        _, idx = _from(init, 128)
+        _, idx, final = _from(init, 128)
 
         def loss(fn):
-            return lambda init: jnp.sum(fn(q, k, v, g, beta, init, idx)[0] ** 2)
+            return lambda init: jnp.sum(fn(q, k, v, g, beta, init, idx, final)[0] ** 2)
 
         ref = jax.grad(loss(chunk_gated_delta_rule_xla))(init)
         got = jax.grad(loss(chunk_gated_delta_rule_pallas))(init)

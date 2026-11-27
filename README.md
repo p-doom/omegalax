@@ -66,8 +66,7 @@ from omegalax.engine import Engine, EngineConfig, Request
 engine = Engine(model, EngineConfig(
     num_pages=1024, max_context=8192, decode_steps=16, decode_buckets=(1, 2, 4, 8),
     extend_buckets=(256, 1024, 4096), eos_token_ids=(151645,), pad_id=151643))
-engine.warmup()
-engine.start()
+engine.start()  # compiles every bucket
 keys = np.random.default_rng(0).integers(0, 2**32, size=(4, 2), dtype=np.uint32)
 futures = engine.generate(Request(prompt_ids, keys, [256] * 4, [1.0] * 4))
 completions = [f.result() for f in futures]  # tokens, logprobs, weight versions

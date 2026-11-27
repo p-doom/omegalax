@@ -1,10 +1,11 @@
 """DeltaNet state threaded through ``GatedDeltaNet`` by the rollout engine.
 
-Tokens are flattened to ``N = B * T`` rows. Conv tap ``k`` of token ``n`` is row
-``conv_src_NK[n, k]`` of ``concat(x_NC, conv pool rows)``, where pool slot ``s`` owns
-rows ``N + s * (K - 1) + j``. Write ``w`` stores a state into pool slot ``write_slot_W[w]``
-(distinct out-of-range slots are skipped); its conv rows are ``conv_out_src_WK[w]`` of the
-same concatenation.
+Tokens are flattened to ``N = B * T`` rows. The conv of token ``n`` reads the ``K - 1``
+preceding rows of ``x_NC``, except for tokens ``conv_fix_F[f]`` (distinct; out-of-range
+entries are skipped), whose taps are rows ``conv_src_FK[f]`` of ``concat(x_NC, conv pool
+rows)``, where pool slot ``s`` owns rows ``N + s * (K - 1) + j``. Write ``w`` stores a state
+into pool slot ``write_slot_W[w]`` (distinct out-of-range slots are skipped); its conv rows
+are ``conv_out_src_WK[w]`` of the same concatenation.
 """
 
 import dataclasses
@@ -17,7 +18,8 @@ import jax
 class LinearDecode:
     """One token per row; row ``n`` steps pool slot ``row_slot_N[n]`` in place."""
 
-    conv_src_NK: jax.Array
+    conv_fix_F: jax.Array
+    conv_src_FK: jax.Array
     conv_out_src_WK: jax.Array
     write_slot_W: jax.Array
     row_slot_N: jax.Array
@@ -32,7 +34,8 @@ class LinearExtend:
     """
 
     valid_N: jax.Array
-    conv_src_NK: jax.Array
+    conv_fix_F: jax.Array
+    conv_src_FK: jax.Array
     conv_out_src_WK: jax.Array
     write_slot_W: jax.Array
     init_slot_I: jax.Array

@@ -2,6 +2,7 @@
 
 import logging
 import os
+from concurrent.futures import ThreadPoolExecutor
 
 os.environ.setdefault("JAX_PLATFORMS", "cuda")
 
@@ -87,7 +88,6 @@ class _EngineTest:
             max_sessions=16,
         )
         cls.engine = Engine(cls.model, cls.cfg)
-        cls.engine.warmup()
         cls.engine.start()
 
     @classmethod
@@ -157,19 +157,19 @@ class _EngineTest:
             self.engine.release(sid)
 
     def test_update_weights_no_recompile(self):
-        old_state = nnx.state(self.model)
+        old_params = nnx.to_pure_dict(nnx.state(self.model))
 
         def perturb(x):
             noise = jax.random.normal(jax.random.key(0), x.shape, jnp.float32) * 0.05 * jnp.std(x)
             return jax.device_put((x + noise).astype(x.dtype), x.sharding)
 
-        new_state = jax.tree.map(perturb, old_state)
-        jax.block_until_ready(new_state)
+        new_params = jax.tree.map(perturb, old_params)
+        jax.block_until_ready(new_params)
         counter = _CompileLog()
         logging.getLogger("jax").addHandler(counter)
         jax.config.update("jax_log_compiles", True)
         try:
-            self.engine.update_weights(new_state, version=7).result()
+            self.engine.update_weights(new_params, version=7).result()
             seqs, scored = self._rollouts(np.random.default_rng(1), turns=1)
         finally:
             jax.config.update("jax_log_compiles", False)
@@ -177,7 +177,7 @@ class _EngineTest:
         self.assertEqual(counter.compiles, [])
         new_errs = self._logp_errors(seqs, scored)
         self._assert_logp_close(new_errs)
-        self.engine.update_weights(old_state, version=0).result()
+        self.engine.update_weights(old_params, version=0).result()
         old_errs = self._logp_errors(seqs, scored)
         print(f"same tokens under the old weights: mean |dlogp| {old_errs.mean():.3f}")
         self.assertGreater(old_errs.mean(), 5 * new_errs.mean())
@@ -211,6 +211,57 @@ class _EngineTest:
             self.engine.release(c.session)
         del hf
         torch.cuda.empty_cache()
+
+
+class EvictionTest(absltest.TestCase):
+    """Random-init model, page pool far below the working set: forks, tail evictions of idle
+    and waiting sessions and re-extends must leave every logprob consistent with the trainer."""
+
+    def test_logprobs_under_eviction(self):
+        model, _ = text_api.init_model("qwen3-smoke", jax.random.key(0), tp_size=1, fsdp_size=1, dp_size=1)
+        cfg = EngineConfig(
+            num_pages=40,
+            max_context=4096,
+            decode_steps=8,
+            decode_buckets=(4, 8, 16),
+            extend_buckets=(256, 512, 1024),
+            eos_token_ids=(5,),
+            pad_id=model.lm_head.kernel.shape[1],
+            max_group=4,
+            max_sessions=32,
+        )
+        engine = Engine(model, cfg)
+        engine.start()
+
+        def rollout(seed):
+            rng = np.random.default_rng(seed)
+            prompt = rng.integers(10, 1000, size=int(rng.integers(30, 200))).tolist()
+            max_new = [int(x) for x in rng.integers(1, 80, 4)]
+            futures = engine.generate(Request(prompt, _keys(rng, 4), max_new, [1.0] * 4, stop_at_eos=False))
+            out = []
+            for f in futures:
+                c = f.result()
+                seq, scored = prompt + c.tokens, [(len(prompt) + i, lp) for i, lp in enumerate(c.logprobs)]
+                for _ in range(6):
+                    tool = rng.integers(10, 1000, size=int(rng.integers(5, 120))).tolist()
+                    seq += tool
+                    req = Request(tool, _keys(rng, 1), [int(rng.integers(1, 80))], [1.0], session=c.session, stop_at_eos=False)
+                    c = engine.generate(req)[0].result()
+                    scored += [(len(seq) + i, lp) for i, lp in enumerate(c.logprobs)]
+                    seq += c.tokens
+                out.append((seq, scored))
+            return out
+
+        with ThreadPoolExecutor(4) as pool:
+            results = [r for rs in pool.map(rollout, range(4)) for r in rs]
+        stats = dict(engine.stats)
+        ref = engine.score([seq for seq, _ in results]).result()
+        engine.stop()
+        errs = np.asarray([abs(lp - r[pos - 1]) for (_, scored), r in zip(results, ref) for pos, lp in scored])
+        print(stats, f"mean {errs.mean():.4f} max {errs.max():.4f} over {errs.size} tokens")
+        self.assertGreater(stats["evict_idle"], 0)
+        self.assertLess(errs.mean(), LOGP_MEAN)
+        self.assertLess(np.quantile(errs, 0.999), LOGP_P999)
 
 
 @requires_real_weights
