@@ -68,7 +68,13 @@ class StateContinuationTest(parameterized.TestCase):
         init = jnp.concatenate([i1, i2])
         idx = jnp.asarray([[0, -1, 1]], jnp.int32)
         out, state = CHUNKED[impl](
-            cat(q1, q2), cat(k1, k2), cat(v1, v2), cat(g1, g2), cat(b1, b2), init, idx,
+            cat(q1, q2),
+            cat(k1, k2),
+            cat(v1, v2),
+            cat(g1, g2),
+            cat(b1, b2),
+            init,
+            idx,
             jnp.asarray([[1, 2]], jnp.int32),
         )
         out1, state1 = CHUNKED["xla"](q1, k1, v1, g1, b1, *_from(i1, 128))

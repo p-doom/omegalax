@@ -109,7 +109,9 @@ def _state_pass_pallas(
 
     Returns ``(state_in, v_new)`` — both shape ``(B, H, J, ...)``.
     """
-    return _state_pass_pallas_fwd_only(kcd_BHJCA, k_dec_BHJCA, u_pre_BHJCU, df_BHJ, init_idx_BJ, init_NHAU)
+    return _state_pass_pallas_fwd_only(
+        kcd_BHJCA, k_dec_BHJCA, u_pre_BHJCU, df_BHJ, init_idx_BJ, init_NHAU
+    )
 
 
 def _state_pass_pallas_fwd_only(kcd, k_dec, u_pre, df, init_idx, init):
@@ -333,6 +335,7 @@ def chunk_gated_delta_rule_pallas(
     out_BHJCU = inter + jnp.einsum("BHJLM,BHJMU->BHJLU", intra, v_new_BHJCU)
 
     out_BHTU = out_BHJCU.reshape(B, H, Tp, U)[:, :, :T, :]
+
     def at(x):
         idx = final_idx_BW.reshape(B, 1, -1, *[1] * (x.ndim - 3))
         return jnp.take_along_axis(x, idx, axis=2)
@@ -343,7 +346,9 @@ def chunk_gated_delta_rule_pallas(
     return out_BHTU.transpose(0, 2, 1, 3).astype(out_dtype), state_BHWAU.transpose(0, 2, 1, 3, 4)
 
 
-def _recurrent_step_kernel(slot_ref, q_ref, k_ref, v_ref, g_ref, beta_ref, state_ref, out_ref, state_out_ref):
+def _recurrent_step_kernel(
+    slot_ref, q_ref, k_ref, v_ref, g_ref, beta_ref, state_ref, out_ref, state_out_ref
+):
     """One program per (row, head); the head's (A, U) state is read and rewritten in place."""
     b, h = pl.program_id(0), pl.program_id(1)
     slot = slot_ref[b]

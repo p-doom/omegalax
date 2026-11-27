@@ -25,7 +25,8 @@
 
 ## Overview
 - Qwen3 dense and MoE (`omegalax/models/qwen3`).
-- A token-in/token-out rollout engine over a paged KV cache (`omegalax/engine`, Qwen3 dense).
+- A token-in/token-out rollout engine over a paged KV cache (`omegalax/engine`; Qwen3 dense and
+  the Qwen3.5 dense text decoder).
 - Qwen3.5 MoE and Qwen3-VL (`omegalax/models/qwen3_5`, `omegalax/models/qwen3_vl`, `omegalax/vlm/api.py`).
 - HuggingFace safetensor loaders for all architectures: `create_qwen3_from_safetensors`, `create_qwen3_5_from_safetensors`, and `create_qwen3_vl_from_safetensors`.
 - Supported models:
@@ -64,7 +65,7 @@ import numpy as np
 from omegalax.engine import Engine, EngineConfig, Request
 
 engine = Engine(model, EngineConfig(
-    num_pages=1024, max_context=8192, decode_steps=16, decode_buckets=(1, 2, 4, 8),
+    num_pages=1024, max_context=8192, decode_steps=8, decode_buckets=(2, 4, 8),
     extend_buckets=(256, 1024, 4096), eos_token_ids=(151645,), pad_id=151643))
 engine.start()  # compiles every bucket
 keys = np.random.default_rng(0).integers(0, 2**32, size=(4, 2), dtype=np.uint32)

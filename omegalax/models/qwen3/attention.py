@@ -114,7 +114,9 @@ class Attention(nnx.Module):
             cache = cache.write(k_BTGK, v_BTGK)
             attn_BTHK = cache.attend(q_BTHK, self.scale)
         out_BTD = self.o_proj(
-            jax.lax.reshape(attn_BTHK, (B, T, self.num_heads * K), out_sharding=self.shd_cfg.act_btf),
+            jax.lax.reshape(
+                attn_BTHK, (B, T, self.num_heads * K), out_sharding=self.shd_cfg.act_btf
+            ),
             out_sharding=self.shd_cfg.act_btd,
         )
         return out_BTD, cache

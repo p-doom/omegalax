@@ -19,7 +19,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plt
 
-_MIN_ROWS = 16
+_MIN_ROWS = 16  # Triton dots need at least 16 rows.
 
 
 def _kernel(
@@ -152,7 +152,9 @@ def paged_attention(
     chunks_N = (pages_N + chunk_pages - 1) // chunk_pages
     ends_N = jnp.cumsum(chunks_N)
     w_W = jnp.arange(num_work, dtype=jnp.int32)
-    work_n_W = jnp.minimum(jnp.sum(w_W[:, None] >= ends_N[None, :], axis=1), N - 1).astype(jnp.int32)
+    work_n_W = jnp.minimum(jnp.sum(w_W[:, None] >= ends_N[None, :], axis=1), N - 1).astype(
+        jnp.int32
+    )
     starts_N = ends_N - chunks_N
     work_c_W = jnp.where(w_W < ends_N[-1], w_W - starts_N[work_n_W], max_pages).astype(jnp.int32)
 

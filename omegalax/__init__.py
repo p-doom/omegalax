@@ -2,7 +2,7 @@ from . import registry
 from .text import api as text_api
 from .trainers import text as text_trainer, vlm as vlm_trainer
 from .vlm import api as vlm_api
-from .models.kv_cache import Cache, LayerCache
+from .models.kv_cache import LayerCache
 from .models.shard_config import ShardConfig
 from .models.qwen3.config import list_qwen3_dense_model_ids, list_qwen3_moe_model_ids
 from .models.qwen3_5 import (
@@ -15,7 +15,6 @@ from .models.qwen3_5 import (
 )
 
 __all__ = [
-    "Cache",
     "LayerCache",
     "registry",
     "text_api",

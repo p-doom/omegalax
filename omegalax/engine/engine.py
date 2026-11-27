@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import collections
 import dataclasses
-import functools
 import itertools
 import queue
 import threading
@@ -26,8 +25,7 @@ from flax import nnx
 
 from omegalax.engine import steps
 from omegalax.models.qwen3_5.cache import LinearExtend
-
-_DELTANET_CHUNK = 64
+from omegalax.models.qwen3_5.deltanet import CHUNK_SIZE as _DELTANET_CHUNK
 
 
 @dataclasses.dataclass(frozen=True)
@@ -123,11 +121,11 @@ class Engine:
     def __init__(self, model: nnx.Module, cfg: EngineConfig):
         self.cfg = cfg
         S = cfg.page_size
-        self._max_pages = -(-cfg.max_context // (8 * S)) * 8
+        self._max_pages = -(-cfg.max_context // S)
         graphdef, state = nnx.split(model)
         self._mesh = jax.tree.leaves(state)[0].sharding.mesh
-        # The jitted programs take the state as a flat leaf list: nnx metadata in the treedef
-        # must not be part of their cache keys, or a weight update recompiles them.
+        # The jitted programs take the state as a flat leaf list so their cache keys depend on
+        # array types only, not on nnx variable metadata.
         self._abstract = jax.tree.map(
             lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=x.sharding), state
         )
@@ -192,13 +190,20 @@ class Engine:
         return ready.result()
 
     def _warmup(self) -> dict[str, float]:
-        # The first trace of the trainer forward extends JAX's trace context, which is part of
-        # every jit cache key; trace it before anything is compiled.
+        # The first trace of the trainer forward (tokamax attention) extends JAX's trace context,
+        # which is part of every jit cache key, so trace it before anything is compiled. tokamax
+        # parses absl flags from sys.argv at that point unless the caller already has.
         self._score.trace(self._state, np.zeros((1, 128), np.int32), pad_id=self.cfg.pad_id)
         self._state = self._to_inference(self._state)
         self._pools = [tuple(jnp.zeros(*spec) for spec in specs) for specs in self._pool_shapes]
-        runs = {f"decode_{B}": (self._run_decode_call, self._decode_inputs([], B)) for B in self.cfg.decode_buckets}
-        runs |= {f"extend_{T}": (self._run_extend_call, self._extend_inputs([], T)) for T in self.cfg.extend_buckets}
+        runs = {
+            f"decode_{B}": (self._run_decode_call, self._decode_inputs([], B))
+            for B in self.cfg.decode_buckets
+        }
+        runs |= {
+            f"extend_{T}": (self._run_extend_call, self._extend_inputs([], T))
+            for T in self.cfg.extend_buckets
+        }
         seconds = {}
         for name, (run, inputs) in runs.items():
             t = time.perf_counter()
@@ -317,7 +322,9 @@ class Engine:
         self._version = version
 
     def _new_session(self, tokens: list[int]) -> _Session:
-        s = _Session(next(self._ids), tokens, np.zeros(self._max_pages, np.int32), self._free_slots.pop())
+        s = _Session(
+            next(self._ids), tokens, np.zeros(self._max_pages, np.int32), self._free_slots.pop()
+        )
         self._sessions[s.id] = s
         return s
 
@@ -328,7 +335,9 @@ class Engine:
             return
         base = 0 if lead is None else len(lead.tokens)
         if base + len(req.tokens) + max(req.max_new_tokens) > self.cfg.max_context:
-            futures[0].set_exception(ValueError(f"Request exceeds max_context={self.cfg.max_context}."))
+            futures[0].set_exception(
+                ValueError(f"Request exceeds max_context={self.cfg.max_context}.")
+            )
             return
         if lead is None and len(futures) > len(self._free_slots):
             futures[0].set_exception(ValueError(f"More than max_sessions={self.cfg.max_sessions}."))
@@ -386,7 +395,9 @@ class Engine:
             self._extend_queue.appendleft(victim)
             self.stats["evict_running"] += 1
         kept = 0 if self._linear else max(0, len(victim.pages) - pages)
-        self.stats["evicted_tokens"] += victim.length - min(victim.length, kept * self.cfg.page_size)
+        self.stats["evicted_tokens"] += victim.length - min(
+            victim.length, kept * self.cfg.page_size
+        )
         self._drop_pages(victim, kept)
 
     def _release(self, s: _Session) -> None:
@@ -469,7 +480,9 @@ class Engine:
             fork_writes += new_fork_writes
         if not items:
             if not self._decoding:
-                raise OutOfPages(f"Session {self._extend_queue[0].id} does not fit in the page pool.")
+                raise OutOfPages(
+                    f"Session {self._extend_queue[0].id} does not fit in the page pool."
+                )
             return
         T = next(b for b in self.cfg.extend_buckets if b >= used)
         tok_R, logp_R = self._run_extend_call(self._extend_inputs(items, T))
@@ -536,7 +549,19 @@ class Engine:
                         w += len(tail)
             o += -(-n // A) * A
         linear = self._linear_extend(items, T) if self._linear else None
-        args = (tokens, positions, write_src, write_slot, page_table, q_pos, kv_len, sample_idx, temp, key_data, linear)
+        args = (
+            tokens,
+            positions,
+            write_src,
+            write_slot,
+            page_table,
+            q_pos,
+            kv_len,
+            sample_idx,
+            temp,
+            key_data,
+            linear,
+        )
         return args, N
 
     def _linear_extend(self, items, T: int) -> LinearExtend:
@@ -565,7 +590,9 @@ class Engine:
             valid[o : o + n] = True
             head = np.arange(min(n, K1))
             conv_fix[i * K1 : i * K1 + len(head)] = o + head
-            conv_src[i * K1 : i * K1 + len(head)] = rows(start + head[:, None] - K1 + np.arange(K), s, start, o)
+            conv_src[i * K1 : i * K1 + len(head)] = rows(
+                start + head[:, None] - K1 + np.arange(K), s, start, o
+            )
             init_idx[0, o // C] = i
             init_slot[i] = steps.ZERO_SLOT if start == 0 else s.slot
             out_rows = rows(end - K1 + np.arange(K1), s, start, o)
@@ -594,7 +621,7 @@ class Engine:
         return tok_R, logp_R
 
     def _step_decode(self) -> None:
-        K, S = self.cfg.decode_steps, self.cfg.page_size
+        K = self.cfg.decode_steps
         for s in sorted(self._decoding.values(), key=lambda s: s.id):
             if s.id in self._decoding:
                 self._alloc(s, s.length + min(K, s.turn.remaining), preempt=True)

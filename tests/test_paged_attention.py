@@ -12,7 +12,9 @@ from absl.testing import absltest, parameterized
 from omegalax.kernels.paged_attention import paged_attention
 
 
-def paged_attention_xla(q_NQHK, k_pages_GPSK, v_pages_GPSK, page_table_NP, q_pos_N, kv_len_N, scale):
+def paged_attention_xla(
+    q_NQHK, k_pages_GPSK, v_pages_GPSK, page_table_NP, q_pos_N, kv_len_N, scale
+):
     N, Q, H, K = q_NQHK.shape
     G, _, S, _ = k_pages_GPSK.shape
     T = page_table_NP.shape[1] * S

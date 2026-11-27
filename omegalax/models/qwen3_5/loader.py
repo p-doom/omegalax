@@ -318,9 +318,16 @@ def create_qwen3_5_from_safetensors(
                 state_dict,
                 f"text.layers.{layer_idx}.mlp.gate_proj",
                 jnp.asarray(gate_EDF),
-                torch_key, **placement)
+                torch_key,
+                **placement,
+            )
             assign_to_state_dict(
-                state_dict, f"text.layers.{layer_idx}.mlp.up_proj", jnp.asarray(up_EDF), torch_key, **placement)
+                state_dict,
+                f"text.layers.{layer_idx}.mlp.up_proj",
+                jnp.asarray(up_EDF),
+                torch_key,
+                **placement,
+            )
             return True
 
         # Batched down_proj: HF (E, D, F) → JAX (E, F, D)
@@ -333,7 +340,9 @@ def create_qwen3_5_from_safetensors(
                 state_dict,
                 f"text.layers.{layer_idx}.mlp.down_proj",
                 jnp.asarray(down_EFD),
-                torch_key, **placement)
+                torch_key,
+                **placement,
+            )
             return True
 
         m = _EXPERT_PER_RE.match(torch_key)
@@ -373,7 +382,8 @@ def create_qwen3_5_from_safetensors(
                 if _CONV3D_RE.match(torch_key):
                     value = jnp.asarray(tensor.transpose(2, 3, 4, 1, 0))
                     assign_to_state_dict(
-                        state_dict, "vision.patch_embed.proj.kernel", value, torch_key, **placement)
+                        state_dict, "vision.patch_embed.proj.kernel", value, torch_key, **placement
+                    )
                     continue
 
                 # Linear attention specials
@@ -391,7 +401,9 @@ def create_qwen3_5_from_safetensors(
                     continue
 
                 keys = [stoi(k) for k in jax_key.split(".")]
-                assign_weights_from_eval_shape(keys, tensor, state_dict, torch_key, transform.value, **placement)
+                assign_weights_from_eval_shape(
+                    keys, tensor, state_dict, torch_key, transform.value, **placement
+                )
         gc.collect()
 
     # Assemble per-expert weights into batched format (per-expert HF format)
@@ -413,7 +425,9 @@ def create_qwen3_5_from_safetensors(
                     state_dict,
                     f"text.layers.{layer_idx}.mlp.gate_proj",
                     jnp.asarray(gate_EDF),
-                    "experts.*.gate_proj", **placement)
+                    "experts.*.gate_proj",
+                    **placement,
+                )
 
             if "up_proj" in projs:
                 ups = [projs["up_proj"][i] for i in range(num_experts)]
@@ -423,7 +437,9 @@ def create_qwen3_5_from_safetensors(
                     state_dict,
                     f"text.layers.{layer_idx}.mlp.up_proj",
                     jnp.asarray(up_EDF),
-                    "experts.*.up_proj", **placement)
+                    "experts.*.up_proj",
+                    **placement,
+                )
 
             if "down_proj" in projs:
                 # HF per-expert down_proj.weight is (D, F). Stack → (E, D, F). Swap → (E, F, D).
@@ -434,7 +450,9 @@ def create_qwen3_5_from_safetensors(
                     state_dict,
                     f"text.layers.{layer_idx}.mlp.down_proj",
                     jnp.asarray(down_EFD),
-                    "experts.*.down_proj", **placement)
+                    "experts.*.down_proj",
+                    **placement,
+                )
 
     check_conversion_errors(unmatched_hf_keys)
 

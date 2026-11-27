@@ -55,7 +55,17 @@ def chunk_gated_delta_rule(
     chunk_size: int = 64,
 ):
     """Dispatcher. Late-binds the backend so env-var changes take effect per process."""
-    args = (q_BTHA, k_BTHA, v_BTHU, g_BTH, beta_BTH, init_NHAU, init_idx_BJ, final_idx_BW, chunk_size)
+    args = (
+        q_BTHA,
+        k_BTHA,
+        v_BTHU,
+        g_BTH,
+        beta_BTH,
+        init_NHAU,
+        init_idx_BJ,
+        final_idx_BW,
+        chunk_size,
+    )
     backend = _resolve_backend()
     if backend == "xla":
         return chunk_gated_delta_rule_xla(*args)

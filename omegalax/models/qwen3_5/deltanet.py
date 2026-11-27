@@ -33,7 +33,7 @@ from .norms import RMSNormGated
 
 P = PartitionSpec
 wp = nnx.with_partitioning
-_CHUNK = 64
+CHUNK_SIZE = 64
 
 
 def _gated_norm(out_BTHU, z_BTHU, weight_U, eps):
@@ -210,12 +210,20 @@ class GatedDeltaNet(nnx.Module):
                     k_BTHA[:, :, :, None, :],
                     (B, T, local_k_heads, gqa_factor, head_k_dim),
                 ).reshape(B, T, local_v_heads, head_k_dim)
-            J = -(-T // _CHUNK)
+            J = -(-T // CHUNK_SIZE)
             init_idx_BJ = jnp.full((B, J), -1, jnp.int32).at[:, 0].set(0)
             init_NHAU = jnp.zeros((1, local_v_heads, head_k_dim, v_BTHU.shape[3]), jnp.float32)
             final_idx_BW = jnp.full((B, 1), J - 1, jnp.int32)
             out, _ = chunk_gated_delta_rule(
-                q_BTHA, k_BTHA, v_BTHU, g_BTH, beta_BTH, init_NHAU, init_idx_BJ, final_idx_BW, _CHUNK
+                q_BTHA,
+                k_BTHA,
+                v_BTHU,
+                g_BTH,
+                beta_BTH,
+                init_NHAU,
+                init_idx_BJ,
+                final_idx_BW,
+                CHUNK_SIZE,
             )
             return _gated_norm(out, z_BTHU, nw, norm_eps)
 
@@ -287,7 +295,7 @@ class GatedDeltaNet(nnx.Module):
                 cache.state_SHAU[batch.init_slot_I],
                 batch.init_idx_1J,
                 batch.final_chunk_W[None],
-                _CHUNK,
+                CHUNK_SIZE,
             )
             out_NHU = out_1NHU[0]
             state_SHAU = cache.state_SHAU.at[batch.write_slot_W].set(

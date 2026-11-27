@@ -2,7 +2,6 @@
 
 import dataclasses
 import functools
-from typing import TypeAlias
 
 import jax
 import jax.numpy as jnp
@@ -12,7 +11,14 @@ from omegalax.kernels.paged_attention import paged_attention
 
 @functools.partial(
     jax.tree_util.register_dataclass,
-    data_fields=["positions_BT", "write_src_W", "write_slot_W", "page_table_NP", "q_pos_N", "kv_len_N"],
+    data_fields=[
+        "positions_BT",
+        "write_src_W",
+        "write_slot_W",
+        "page_table_NP",
+        "q_pos_N",
+        "kv_len_N",
+    ],
     meta_fields=["block_q", "num_work"],
 )
 @dataclasses.dataclass(frozen=True)
@@ -47,8 +53,10 @@ class LayerCache:
 
         def put(pages_GPSK, x_BTGK):
             x_GWK = jnp.swapaxes(x_BTGK.reshape(-1, G, K)[src_W], 0, 1).astype(pages_GPSK.dtype)
-            pages_GTK = pages_GPSK.reshape(G, P * S, K).at[:, slot_W].set(
-                x_GWK, mode="drop", unique_indices=True
+            pages_GTK = (
+                pages_GPSK.reshape(G, P * S, K)
+                .at[:, slot_W]
+                .set(x_GWK, mode="drop", unique_indices=True)
             )
             return pages_GTK.reshape(G, P, S, K)
 
@@ -75,6 +83,3 @@ class LayerCache:
             num_stages=3 if Q == 1 else 2,
         )
         return out_NQHK.reshape(B, T, H, K)
-
-
-Cache: TypeAlias = list[LayerCache]

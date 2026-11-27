@@ -61,7 +61,10 @@ def _qwen3_5_causal_lm(path):
     state = nnx.state(abstract)
     nnx.replace_by_pure_dict(
         state,
-        {"text": nnx.to_pure_dict(nnx.state(vlm.text)), "lm_head": nnx.to_pure_dict(nnx.state(vlm.lm_head))},
+        {
+            "text": nnx.to_pure_dict(nnx.state(vlm.text)),
+            "lm_head": nnx.to_pure_dict(nnx.state(vlm.lm_head)),
+        },
     )
     return nnx.merge(nnx.graphdef(abstract), state)
 
@@ -141,8 +144,10 @@ class _EngineTest:
 
     def _assert_logp_close(self, errs):
         mean, p99, p999 = errs.mean(), np.quantile(errs, 0.99), np.quantile(errs, 0.999)
-        print(f"logprob |engine - trainer| over {errs.size} tokens: "
-              f"mean {mean:.4f} p99 {p99:.4f} p99.9 {p999:.4f} max {errs.max():.4f}")
+        print(
+            f"logprob |engine - trainer| over {errs.size} tokens: "
+            f"mean {mean:.4f} p99 {p99:.4f} p99.9 {p999:.4f} max {errs.max():.4f}"
+        )
         self.assertLess(mean, LOGP_MEAN)
         self.assertLess(p99, LOGP_P99)
         self.assertLess(p999, LOGP_P999)
@@ -218,7 +223,9 @@ class EvictionTest(absltest.TestCase):
     and waiting sessions and re-extends must leave every logprob consistent with the trainer."""
 
     def test_logprobs_under_eviction(self):
-        model, _ = text_api.init_model("qwen3-smoke", jax.random.key(0), tp_size=1, fsdp_size=1, dp_size=1)
+        model, _ = text_api.init_model(
+            "qwen3-smoke", jax.random.key(0), tp_size=1, fsdp_size=1, dp_size=1
+        )
         cfg = EngineConfig(
             num_pages=40,
             max_context=4096,
@@ -237,15 +244,27 @@ class EvictionTest(absltest.TestCase):
             rng = np.random.default_rng(seed)
             prompt = rng.integers(10, 1000, size=int(rng.integers(30, 200))).tolist()
             max_new = [int(x) for x in rng.integers(1, 80, 4)]
-            futures = engine.generate(Request(prompt, _keys(rng, 4), max_new, [1.0] * 4, stop_at_eos=False))
+            futures = engine.generate(
+                Request(prompt, _keys(rng, 4), max_new, [1.0] * 4, stop_at_eos=False)
+            )
             out = []
             for f in futures:
                 c = f.result()
-                seq, scored = prompt + c.tokens, [(len(prompt) + i, lp) for i, lp in enumerate(c.logprobs)]
+                seq, scored = (
+                    prompt + c.tokens,
+                    [(len(prompt) + i, lp) for i, lp in enumerate(c.logprobs)],
+                )
                 for _ in range(6):
                     tool = rng.integers(10, 1000, size=int(rng.integers(5, 120))).tolist()
                     seq += tool
-                    req = Request(tool, _keys(rng, 1), [int(rng.integers(1, 80))], [1.0], session=c.session, stop_at_eos=False)
+                    req = Request(
+                        tool,
+                        _keys(rng, 1),
+                        [int(rng.integers(1, 80))],
+                        [1.0],
+                        session=c.session,
+                        stop_at_eos=False,
+                    )
                     c = engine.generate(req)[0].result()
                     scored += [(len(seq) + i, lp) for i, lp in enumerate(c.logprobs)]
                     seq += c.tokens
@@ -257,7 +276,9 @@ class EvictionTest(absltest.TestCase):
         stats = dict(engine.stats)
         ref = engine.score([seq for seq, _ in results]).result()
         engine.stop()
-        errs = np.asarray([abs(lp - r[pos - 1]) for (_, scored), r in zip(results, ref) for pos, lp in scored])
+        errs = np.asarray(
+            [abs(lp - r[pos - 1]) for (_, scored), r in zip(results, ref) for pos, lp in scored]
+        )
         print(stats, f"mean {errs.mean():.4f} max {errs.max():.4f} over {errs.size} tokens")
         self.assertGreater(stats["evict_idle"], 0)
         self.assertLess(errs.mean(), LOGP_MEAN)
