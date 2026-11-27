@@ -113,14 +113,15 @@ async def run(trainer: Trainer, engines, sync: WeightSync, env: Env, tasks: Iter
         return metrics
 
     async def eval_at(step):
+        start = time.perf_counter() - t_start
         metrics = await evaluate(engines, env, eval_tasks, cfg.rollout, cfg.eval_concurrency, rng)
-        log({"eval_step": step, **metrics})
+        log({"eval_step": step, "eval/start_wall_s": start, **metrics})
 
+    t_start = time.perf_counter()
     evals = [asyncio.create_task(eval_at(0))]
     # The trainer compiles on its own thread while the first groups are generated.
     warmup = loop.run_in_executor(train_thread, trainer.warmup)
     producer = asyncio.create_task(produce())
-    t_start = time.perf_counter()
     dropped = {"error": 0, "stale": 0, "zero_variance": 0}
     errors = []
     busy0, gen0, t_prev = _engine_busy_s(engines), 0, t_start
