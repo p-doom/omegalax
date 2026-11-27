@@ -44,6 +44,7 @@ class EngineConfig:
     page_size: int = 64
     extend_rows: int = 128
     spare_work: int = 132
+    topk: int = 1
 
 
 @dataclasses.dataclass(frozen=True)
@@ -65,11 +66,16 @@ class Request:
 
 @dataclasses.dataclass(frozen=True)
 class Completion:
+    """``topk_ids``/``topk_logprobs`` (``(len(tokens), cfg.topk)``) are the most likely tokens of
+    the distribution each token was sampled from, with their logprobs."""
+
     session: int
     tokens: list[int]
     logprobs: list[float]
     weight_versions: list[int]
     finish_reason: str
+    topk_ids: np.ndarray
+    topk_logprobs: np.ndarray
 
 
 @dataclasses.dataclass(eq=False)
@@ -82,6 +88,8 @@ class _Turn:
     tokens: list[int] = dataclasses.field(default_factory=list)
     logprobs: list[float] = dataclasses.field(default_factory=list)
     versions: list[int] = dataclasses.field(default_factory=list)
+    topk_ids: list[np.ndarray] = dataclasses.field(default_factory=list)
+    topk_logprobs: list[np.ndarray] = dataclasses.field(default_factory=list)
 
 
 @dataclasses.dataclass(eq=False)
@@ -179,13 +187,13 @@ class Engine:
         no_merge = {"xla_gpu_dot_merger_threshold_mb": 0}
         self._decode = jax.jit(
             bind(steps.decode),
-            static_argnames=("num_steps", "num_work"),
+            static_argnames=("num_steps", "num_work", "topk"),
             donate_argnums=(1,),
             compiler_options=no_merge,
         )
         self._extend = jax.jit(
             bind(steps.extend),
-            static_argnames=("block_q", "num_work"),
+            static_argnames=("block_q", "num_work", "topk"),
             donate_argnums=(1,),
             compiler_options=no_merge,
         )
@@ -455,13 +463,18 @@ class Engine:
         t = s.turn
         s.turn = None
         s.last_used = time.monotonic()
-        t.future.set_result(Completion(s.id, t.tokens, t.logprobs, t.versions, reason))
+        k = self.cfg.topk
+        ids = np.concatenate(t.topk_ids) if t.topk_ids else np.zeros((0, k), np.int32)
+        logps = np.concatenate(t.topk_logprobs) if t.topk_logprobs else np.zeros((0, k), np.float32)
+        t.future.set_result(Completion(s.id, t.tokens, t.logprobs, t.versions, reason, ids, logps))
 
-    def _record(self, s: _Session, toks, logps) -> None:
+    def _record(self, s: _Session, toks, logps, topk_ids, topk_logps) -> None:
         t = s.turn
         s.tokens.extend(toks)
         t.tokens.extend(toks)
         t.logprobs.extend(logps)
+        t.topk_ids.append(topk_ids)
+        t.topk_logprobs.append(topk_logps)
         t.versions.extend([self._version] * len(toks))
         t.remaining -= len(toks)
         if t.stop_at_eos and toks[-1] in self._eos:
@@ -521,7 +534,7 @@ class Engine:
                 )
             return
         T = next(b for b in self.cfg.extend_buckets if b >= used)
-        tok_R, logp_R = self._run_extend_call(self._extend_inputs(items, T))
+        tok_R, logp_R, head_Rk, head_logp_Rk = self._run_extend_call(self._extend_inputs(items, T))
         self.stats["extend_calls"] += 1
         self.stats["extend_tokens"] += used
         r = 0
@@ -532,7 +545,7 @@ class Engine:
                 continue
             for f in [s, *s.forks]:
                 f.length = end
-                self._record(f, [int(tok_R[r])], [float(logp_R[r])])
+                self._record(f, [int(tok_R[r])], [float(logp_R[r])], head_Rk[r : r + 1], head_logp_Rk[r : r + 1])
                 r += 1
             s.forks = []
 
@@ -645,16 +658,17 @@ class Engine:
     def _run_extend_call(self, inputs):
         args, N = inputs
         t = time.perf_counter()
-        self._pools, tok_R, logp_R = self._extend(
+        self._pools, *out = self._extend(
             self._state,
             self._pools,
             *args,
             block_q=self._block_q,
             num_work=N + self.cfg.spare_work,
+            topk=self.cfg.topk,
         )
-        tok_R, logp_R = np.asarray(tok_R), np.asarray(logp_R)
+        out = [np.asarray(x) for x in out]
         self.stats["extend_s"] += time.perf_counter() - t
-        return tok_R, logp_R
+        return out
 
     def _step_decode(self) -> None:
         K = self.cfg.decode_steps
@@ -665,7 +679,7 @@ class Engine:
                 self._alloc(s, s.length + min(K, s.turn.remaining), preempt=True)
         rows = [s for s in rows if s.id in self._decoding]
         B = next(b for b in self.cfg.decode_buckets if b >= len(rows))
-        tok_KB, logp_KB, valid_KB = self._run_decode_call(self._decode_inputs(rows, B))
+        tok_KB, logp_KB, valid_KB, head_KBk, head_logp_KBk = self._run_decode_call(self._decode_inputs(rows, B))
         self.stats["decode_calls"] += 1
         counts = valid_KB.sum(axis=0)
         self.stats["decode_tokens"] += int(counts.sum())
@@ -674,7 +688,9 @@ class Engine:
             n = int(counts[b])
             del self._decoding[s.id]
             s.length += n
-            self._record(s, tok_KB[:n, b].tolist(), logp_KB[:n, b].tolist())
+            self._record(
+                s, tok_KB[:n, b].tolist(), logp_KB[:n, b].tolist(), head_KBk[:n, b], head_logp_KBk[:n, b]
+            )
 
     def _decode_inputs(self, rows, B: int):
         tok = np.zeros(B, np.int32)
@@ -699,15 +715,16 @@ class Engine:
     def _run_decode_call(self, args):
         B = args[0].shape[0]
         t = time.perf_counter()
-        self._pools, tok_KB, logp_KB, valid_KB = self._decode(
+        self._pools, *out = self._decode(
             self._state,
             self._pools,
             *args,
             self._eos,
             num_steps=self.cfg.decode_steps,
             num_work=B + self.cfg.spare_work,
+            topk=self.cfg.topk,
         )
-        out = np.asarray(tok_KB), np.asarray(logp_KB), np.asarray(valid_KB)
+        out = [np.asarray(x) for x in out]
         self.stats["decode_s"] += time.perf_counter() - t
         return out
 

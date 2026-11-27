@@ -33,15 +33,17 @@ def _pick(logp_XV, tok_X):
     return jnp.sum(jnp.where(hit_XV, logp_XV, 0.0), axis=-1)
 
 
-def _sample(logits_BV, temp_B, key_B, pos_B):
-    """Gumbel-max sample of the token at ``pos_B``; noise is a function of (key, position)."""
+def _sample(logits_BV, temp_B, key_B, pos_B, topk: int):
+    """Gumbel-max sample of the token at ``pos_B``; noise is a function of (key, position).
+    Also returns the ``topk`` most likely tokens of the sampled distribution and their logprobs."""
     logp_BV = jax.nn.log_softmax(logits_BV / temp_B[:, None], axis=-1)
     V = logits_BV.shape[-1]
     gumbel_BV = jax.vmap(lambda k, p: jax.random.gumbel(jax.random.fold_in(k, p), (V,)))(
         key_B, pos_B
     )
     tok_B = jnp.argmax(logp_BV + gumbel_BV, axis=-1).astype(jnp.int32)
-    return tok_B, _pick(logp_BV, tok_B)
+    head_logp_Bk, head_Bk = jax.lax.top_k(logp_BV, topk)
+    return tok_B, _pick(logp_BV, tok_B), head_Bk.astype(jnp.int32), head_logp_Bk
 
 
 def _forward(model, pools, tokens_BT, paged: PagedBatch, linear):
@@ -99,6 +101,7 @@ def decode(
     *,
     num_steps: int,
     num_work: int,
+    topk: int,
 ):
     """Runs ``num_steps`` decode steps for every row with ``remaining_B > 0``.
 
@@ -126,16 +129,18 @@ def decode(
         )
         linear = _linear_decode(pools, slot_B, active_B)
         hidden_BTD, pools = _forward(model, pools, tok_B[:, None], paged, linear)
-        new_B, logp_B = _sample(_logits_BV(model, hidden_BTD[:, 0]), temp_B, key_B, pos_B + 1)
+        new_B, logp_B, head_Bk, head_logp_Bk = _sample(
+            _logits_BV(model, hidden_BTD[:, 0]), temp_B, key_B, pos_B + 1, topk
+        )
         stopped_B = stop_B & jnp.isin(new_B, eos_E)
         remaining_B = jnp.where(active_B & ~stopped_B, remaining_B - 1, 0)
         carry = (pools, jnp.where(active_B, new_B, tok_B), pos_B + active_B, remaining_B)
-        return carry, (new_B, logp_B, active_B)
+        return carry, (new_B, logp_B, active_B, head_Bk, head_logp_Bk)
 
-    (pools, *_), (tok_KB, logp_KB, valid_KB) = jax.lax.scan(
+    (pools, *_), (tok_KB, logp_KB, valid_KB, head_KBk, head_logp_KBk) = jax.lax.scan(
         step, (pools, tok_B, pos_B, remaining_B), length=num_steps
     )
-    return pools, tok_KB, logp_KB, valid_KB
+    return pools, tok_KB, logp_KB, valid_KB, head_KBk, head_logp_KBk
 
 
 def extend(
@@ -156,6 +161,7 @@ def extend(
     *,
     block_q: int,
     num_work: int,
+    topk: int,
 ):
     """Writes a packed batch of token chunks to the cache, then samples one token per row.
 
@@ -174,13 +180,14 @@ def extend(
         num_work=num_work,
     )
     hidden_BTD, pools = _forward(model, pools, tokens_T[None], paged, linear)
-    tok_R, logp_R = _sample(
+    tok_R, logp_R, head_Rk, head_logp_Rk = _sample(
         _logits_BV(model, hidden_BTD[0, sample_idx_R]),
         temp_R,
         jax.random.wrap_key_data(key_data_R2),
         positions_T[sample_idx_R] + 1,
+        topk,
     )
-    return pools, tok_R, logp_R
+    return pools, tok_R, logp_R, head_Rk, head_logp_Rk
 
 
 def score(graphdef, state, tokens_BT, pad_id: int):
