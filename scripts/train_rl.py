@@ -1,6 +1,6 @@
 """Single-controller asynchronous GRPO in one process.
 
-The trainer owns a device sub-mesh; every remaining device runs one rollout engine. An asyncio
+The trainer owns a device sub-mesh; the remaining devices run rollout engines (TP each). An asyncio
 controller keeps at most ``(rollout_ahead + 1) * groups_per_step`` prompt groups outstanding,
 the trainer thread consumes completed groups, takes one optimizer step per batch and pushes the
 new weights to every engine, which apply them at their next decode-call boundary.
@@ -32,7 +32,8 @@ flags.DEFINE_string("model_path", None, "HF safetensors directory.", required=Tr
 flags.DEFINE_string("data_path", None, "JSONL of {prompt: messages, label}.", required=True)
 flags.DEFINE_string("out_dir", None, "Run directory (metrics.jsonl, config.json).", required=True)
 flags.DEFINE_integer("trainer_devices", None, "Leading devices forming the trainer's FSDP mesh.", required=True)
-flags.DEFINE_integer("engine_devices", None, "Following devices, one rollout engine each.", required=True)
+flags.DEFINE_integer("engine_devices", None, "Following devices, split into engines of engine_tp each.", required=True)
+flags.DEFINE_integer("engine_tp", 1, "Tensor-parallel devices per engine.")
 flags.DEFINE_integer("num_steps", None, "Optimizer steps.", required=True)
 flags.DEFINE_integer("groups_per_step", 32, "Prompt groups per optimizer step.")
 flags.DEFINE_integer("group_size", 8, "Samples per prompt.")
@@ -79,9 +80,10 @@ def main(argv):
     out.mkdir(parents=True, exist_ok=True)
     (out / "config.json").write_text(json.dumps(FLAGS.flag_values_dict(), indent=1, default=str))
     devices = jax.devices()
-    nt, ne = FLAGS.trainer_devices, FLAGS.engine_devices
-    if nt + ne > len(devices):
-        raise ValueError(f"{nt} trainer + {ne} engine devices > {len(devices)} visible.")
+    nt, tp = FLAGS.trainer_devices, FLAGS.engine_tp
+    if nt + FLAGS.engine_devices > len(devices) or FLAGS.engine_devices % tp:
+        raise ValueError(f"{nt} trainer + {FLAGS.engine_devices} engine devices (tp={tp}) on {len(devices)} visible.")
+    ne = FLAGS.engine_devices // tp
     per_engine = (-(-(FLAGS.rollout_ahead + 1) * FLAGS.groups_per_step // ne) * FLAGS.group_size
                   + -(-FLAGS.eval_concurrency // ne))
     if per_engine > FLAGS.max_sessions:
@@ -133,8 +135,9 @@ def main(argv):
     )
     sync = WeightSync(trainer.graphdef, trainer.params)
     params = sync.gather(trainer.params)
-    for d in devices[nt : nt + ne]:
-        replica, shardings = engine_replica(params, cfg, sub_mesh([d], 1, 1, 1))
+    for i in range(ne):
+        mesh = sub_mesh(devices[nt + i * tp : nt + (i + 1) * tp], tp, 1, 1)
+        replica, shardings = engine_replica(params, cfg, mesh)
         sync.add(Engine(replica, ecfg), shardings)
         del replica
     del params
