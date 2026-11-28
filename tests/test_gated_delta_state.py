@@ -1,4 +1,5 @@
-"""Gated delta rule state continuation: chunked prefill + recurrent steps == one chunked forward."""
+"""Gated delta rule state continuation: chunked prefill + recurrent steps == one chunked forward,
+and the fused Pallas decode == its XLA reference."""
 
 import os
 
@@ -11,16 +12,16 @@ from absl.testing import absltest, parameterized
 
 from omegalax.models.qwen3_5.kernels.pallas_triton import (
     chunk_gated_delta_rule_pallas,
-    recurrent_gated_delta_step_pallas,
+    gated_delta_decode_pallas,
 )
 from omegalax.models.qwen3_5.kernels.xla_reference import (
     chunk_gated_delta_rule_xla,
+    gated_delta_decode_xla,
     recurrent_gated_delta_step_xla,
 )
 
 H, A, U, C = 4, 128, 128, 64
 CHUNKED = dict(xla=chunk_gated_delta_rule_xla, pallas=chunk_gated_delta_rule_pallas)
-STEP = dict(xla=recurrent_gated_delta_step_xla, pallas=recurrent_gated_delta_step_pallas)
 
 
 def _inputs(T, seed):
@@ -53,7 +54,9 @@ class StateContinuationTest(parameterized.TestCase):
         slot = jnp.asarray([2], jnp.int32)
         steps = []
         for t in range(T0, T):
-            o, pool = STEP[impl](q[:, t], k[:, t], v[:, t], g[:, t], beta[:, t], pool, slot)
+            o, pool = recurrent_gated_delta_step_xla(
+                q[:, t], k[:, t], v[:, t], g[:, t], beta[:, t], pool, slot
+            )
             steps.append(o)
         ref, got = np.asarray(out[0, T0:]), np.asarray(jnp.stack(steps, axis=1)[0])
         self.assertLess(np.abs(np.asarray(out0[0]) - np.asarray(out[0, :T0])).max(), 1e-4)
@@ -83,6 +86,55 @@ class StateContinuationTest(parameterized.TestCase):
         self.assertLess(np.abs(np.asarray(out[0, 128:] - out2[0])).max(), 2e-3)
         self.assertLess(np.abs(np.asarray(state[0, 0] - state1[0, 0])).max(), 2e-3)
         self.assertLess(np.abs(np.asarray(state[0, 1] - state2[0, 0])).max(), 2e-3)
+
+    def test_fused_decode_matches_xla(self):
+        """Four decode steps, GQA 3: two rows on their own slots, two inactive rows sharing the
+        trash slot (not compared). The chain rounds to bf16 several times, so the kernel must stay
+        within the XLA oracle's own precision: its distance to the oracle may not exceed the
+        oracle's distance to the same math in f32 (mean of output and state, max of output).
+        The conv window is only moved, so it must match exactly."""
+        rng = np.random.default_rng(6)
+        num_k, heads, D, K, S, N = 2, 6, 128, 4, 5, 4
+        C = (2 * num_k + heads) * D
+        normal = lambda shape, scale, dtype: jnp.asarray(rng.standard_normal(shape) * scale, dtype)
+        f32 = lambda x: x.astype(jnp.float32)
+        slot, live = jnp.asarray([2, 4, 1, 1], jnp.int32), [0, 1]
+        weight = normal((C, K), 0.5, jnp.bfloat16)
+        A_log, dt = normal((heads,), 0.5, jnp.float32), normal((heads,), 0.5, jnp.float32)
+        norm = jnp.asarray(rng.uniform(0.3, 1.0, D), jnp.float32)
+        conv = normal((S, K - 1, C), 0.5, jnp.bfloat16)
+        state = normal((S, heads, D, D), 0.1, jnp.float32)
+        pools = {"xla": (conv, state), "pallas": (conv, state), "f32": (f32(conv), state)}
+        for _ in range(4):
+            x, z = normal((N, C), 0.5, jnp.bfloat16), normal((N, heads, D), 1.0, jnp.bfloat16)
+            b, a = normal((N, heads), 1.0, jnp.bfloat16), normal((N, heads), 1.0, jnp.bfloat16)
+            outs = {}
+            for impl, fn, cast in (
+                ("xla", gated_delta_decode_xla, lambda v: v),
+                ("pallas", gated_delta_decode_pallas, lambda v: v),
+                ("f32", gated_delta_decode_xla, f32),
+            ):
+                conv, state = pools[impl]
+                out, conv, state = fn(
+                    cast(x), z, cast(b), a, conv, cast(weight), state, A_log, dt, norm, slot,
+                    eps=1e-6,
+                )
+                outs[impl], pools[impl] = np.asarray(out, np.float32)[live], (conv, state)
+            got, own = (np.abs(outs[i] - outs["xla"]) for i in ("pallas", "f32"))
+            got_st, own_st = (
+                np.abs(np.asarray(pools[i][1] - pools["xla"][1])[2::2]) for i in ("pallas", "f32")
+            )
+            print(
+                f"fused decode out max/mean {got.max():.2e}/{got.mean():.2e}, oracle's own "
+                f"{own.max():.2e}/{own.mean():.2e}; state mean {got_st.mean():.2e} vs "
+                f"{own_st.mean():.2e}"
+            )
+            self.assertLessEqual(got.max(), own.max())
+            self.assertLessEqual(got.mean(), own.mean())
+            self.assertLessEqual(got_st.mean(), own_st.mean())
+        np.testing.assert_array_equal(
+            np.asarray(pools["pallas"][0][2::2]), np.asarray(pools["xla"][0][2::2])
+        )
 
     def test_packed_resets_grad_matches_xla(self):
         q1, k1, v1, g1, b1, i1 = _inputs(128, 4)

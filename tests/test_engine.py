@@ -1,8 +1,10 @@
 """Rollout engine against the trainer forward and HF transformers (GPU, real weights)."""
 
+import collections
 import dataclasses
 import logging
 import os
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 
@@ -397,6 +399,73 @@ class KVPressureTest(absltest.TestCase):
         # An admitted turn is extended at most once: its context, padded per extend item.
         self.assertGreater(stats["evict_idle"] + stats["evict_waiting"], 0)
         self.assertLessEqual(stats["extend_tokens"], sum(turn_contexts) + 128 * len(turn_contexts))
+
+
+class OverlapTest(absltest.TestCase):
+    """Decode call n + 1 is queued before call n's results are read. A turn that samples EOS
+    runs at most one more call, masked; aborts and continuations right after a completion reuse
+    pages and slots while that call is in flight, and every logprob stays consistent with the
+    trainer."""
+
+    def test_eos_turns_and_aborts(self):
+        if jax.device_count() != 1:
+            self.skipTest("single-device test")
+        model = _smoke_model()
+        vocab = model.lm_head.kernel.shape[1]
+        cfg = EngineConfig(
+            num_pages=64,
+            max_context=4096,
+            decode_steps=8,
+            decode_buckets=(4, 8, 16),
+            extend_buckets=(256, 512, 1024),
+            eos_token_ids=tuple(range(10, vocab, 16)),  # turns end by EOS after ~16 tokens
+            pad_id=vocab,
+            max_group=4,
+            max_sessions=32,
+        )
+        engine = Engine(model, cfg)
+        engine.start()
+
+        def rollout(seed):
+            rng = np.random.default_rng(seed)
+            seq = rng.integers(10, 1000, size=int(rng.integers(30, 200))).tolist()
+            scored, reasons, session, new = [], [], None, seq
+            for turn in range(6):
+                req = Request(new, _keys(rng, 1), [200], [1.0], session)
+                c = engine.generate(req)[0].result()
+                reasons.append(c.finish_reason)
+                scored += [(len(seq) + i, lp) for i, lp in enumerate(c.logprobs)]
+                seq, session = seq + c.tokens, c.session
+                if turn % 2:
+                    # A long continuation, aborted while its decode calls are in flight; the
+                    # session's pages and slot go back to the pool.
+                    tool = rng.integers(10, 1000, size=20).tolist()
+                    long = Request(tool, _keys(rng, 1), [1000], [1.0], session, stop_at_eos=False)
+                    future = engine.generate(long)[0]
+                    time.sleep(0.05)
+                    engine.abort([session])
+                    reasons.append(future.result().finish_reason)
+                    break
+                new = rng.integers(10, 1000, size=int(rng.integers(5, 120))).tolist()
+                seq += new
+            return seq, scored, reasons
+
+        with ThreadPoolExecutor(8) as pool:
+            results = list(pool.map(rollout, range(8)))
+        stats = dict(engine.stats)
+        ref = engine.score([seq for seq, _, _ in results]).result()
+        engine.stop()
+        reasons = collections.Counter(r for _, _, rs in results for r in rs)
+        errs = np.asarray(
+            [abs(lp - r[pos - 1]) for (_, scored, _), r in zip(results, ref) for pos, lp in scored]
+        )
+        print(stats, dict(reasons), f"mean {errs.mean():.4f} over {errs.size} tokens")
+        self.assertGreater(reasons["stop"], 0)
+        self.assertGreater(stats["decode_masked_rows"], 0)
+        # An EOS turn runs at most one masked call; an aborted turn at most two (both in flight).
+        self.assertLessEqual(stats["decode_masked_rows"], reasons["stop"] + 2 * reasons["abort"])
+        self.assertLess(errs.mean(), LOGP_MEAN)
+        self.assertLess(np.quantile(errs, 0.999), LOGP_P999)
 
 
 class SettlementTest(absltest.TestCase):
