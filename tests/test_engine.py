@@ -66,13 +66,9 @@ def _qwen3_5_causal_lm(path, tp):
     with mesh_rules(mesh):
         abstract = nnx.eval_shape(lambda: Qwen3_5ForCausalLM(text_cfg, rngs=nnx.Rngs(0)))
     state = nnx.state(abstract)
-    nnx.replace_by_pure_dict(
-        state,
-        {
-            "text": nnx.to_pure_dict(nnx.state(vlm.text)),
-            "lm_head": nnx.to_pure_dict(nnx.state(vlm.lm_head)),
-        },
-    )
+    params = nnx.to_pure_dict(nnx.state(vlm))
+    del params["vision"]
+    nnx.replace_by_pure_dict(state, params)
     model = nnx.merge(nnx.graphdef(abstract), state)
     _finalize_q_shardings(model, mesh)
     return model

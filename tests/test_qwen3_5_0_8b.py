@@ -77,7 +77,7 @@ class Qwen3_5_0_8B_Test(absltest.TestCase):
             None,
             jnp.array(0, dtype=jnp.int32),
         )
-        logits_BTV = self.jax_model.lm_head(hidden_BTD)
+        logits_BTV = hidden_BTD @ self.jax_model.output_weight()
         return np.asarray(logits_BTV, dtype=np.float32)
 
     def test_prefill_logits_match_hf(self):

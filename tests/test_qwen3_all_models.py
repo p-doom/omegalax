@@ -93,7 +93,7 @@ class Qwen3AllModelsTest(parameterized.TestCase):
 
         segment_ids_BT = 1 * (token_ids_BT != pad_id)
         hidden_BTD, _ = jax_model(token_ids_BT, segment_ids_BT, None, jnp.array(0, dtype=jnp.int32))
-        jax_logits_BTV = np.asarray(jax_model.lm_head(hidden_BTD), dtype=np.float32)
+        jax_logits_BTV = np.asarray(hidden_BTD @ jax_model.output_weight(), dtype=np.float32)
 
         mask = inputs["attention_mask"].numpy().astype(bool)
         j, h = jax_logits_BTV[mask], hf_logits_BTV[mask]
