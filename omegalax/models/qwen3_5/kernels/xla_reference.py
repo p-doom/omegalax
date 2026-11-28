@@ -171,3 +171,44 @@ def recurrent_gated_delta_step_xla(
     st_BHAU = st_BHAU + k_BHA[..., None] * delta_BHU[..., None, :]
     out_BHU = jnp.einsum("BHAU,BHA->BHU", st_BHAU, q_BHA)
     return out_BHU, state_SHAU.at[slot_B].set(st_BHAU)
+
+
+def gated_delta_decode_xla(
+    x_NC: jax.Array,
+    z_NHU: jax.Array,
+    b_NH: jax.Array,
+    a_NH: jax.Array,
+    conv_SKC: jax.Array,
+    weight_CK: jax.Array,
+    state_SHAU: jax.Array,
+    A_log_H: jax.Array,
+    dt_H: jax.Array,
+    norm_U: jax.Array,
+    slot_N: jax.Array,
+    *,
+    eps: float,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """One decode token per row of a gated DeltaNet layer after its input projections (XLA
+    reference): the causal conv continues pool slot ``slot_N[n]``'s window of ``x_NC`` (channels
+    ``[q | k | v]``, key heads repeated over value heads), then the delta rule step on that
+    slot's state and the gated RMSNorm. Returns the normed ``(N, H * U)`` output and both pools.
+    """
+    N, C = x_NC.shape
+    H, U = z_NHU.shape[1:]
+    A = state_SHAU.shape[2]
+    num_k = (C - H * U) // (2 * A)
+    taps_NKC = jnp.concatenate([conv_SKC[slot_N], x_NC[:, None]], axis=1)
+    conv_NC = jnp.zeros_like(x_NC)
+    for k in range(weight_CK.shape[1]):
+        conv_NC = conv_NC + weight_CK[None, :, k] * taps_NKC[:, k]
+    conv_SKC = conv_SKC.at[slot_N].set(taps_NKC[:, 1:])
+    q_NP, k_NP, v_NO = jnp.split(jax.nn.silu(conv_NC), [num_k * A, 2 * num_k * A], axis=-1)
+    q_NHA = jnp.repeat(q_NP.reshape(N, num_k, A), H // num_k, 1)
+    k_NHA = jnp.repeat(k_NP.reshape(N, num_k, A), H // num_k, 1)
+    g_NH = -jnp.exp(A_log_H.astype(jnp.float32)) * jax.nn.softplus(a_NH.astype(jnp.float32) + dt_H)
+    out_NHU, state_SHAU = recurrent_gated_delta_step_xla(
+        q_NHA, k_NHA, v_NO.reshape(N, H, U), g_NH, jax.nn.sigmoid(b_NH), state_SHAU, slot_N
+    )
+    normed_NHU = out_NHU * jax.lax.rsqrt(jnp.mean(out_NHU**2, axis=-1, keepdims=True) + eps)
+    gated_NHU = norm_U.astype(jnp.float32) * normed_NHU * jax.nn.silu(z_NHU.astype(jnp.float32))
+    return gated_NHU.astype(x_NC.dtype).reshape(N, H * U), conv_SKC, state_SHAU

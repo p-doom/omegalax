@@ -92,6 +92,18 @@ class _Turn:
     versions: list[int] = dataclasses.field(default_factory=list)
     topk_ids: list[np.ndarray] = dataclasses.field(default_factory=list)
     topk_logprobs: list[np.ndarray] = dataclasses.field(default_factory=list)
+    # Decode calls with this turn dispatched but not yet processed; while any is, the device
+    # carry holds the turn's latest token, position and remaining count.
+    inflight: int = 0
+
+
+@dataclasses.dataclass(eq=False)
+class _DecodeCall:
+    """A dispatched decode call: its rows' turns, device outputs and weights version."""
+
+    rows: list[tuple["_Session", _Turn]]
+    out: list[jax.Array]
+    version: int
 
 
 @dataclasses.dataclass(eq=False)
@@ -221,6 +233,7 @@ class Engine:
         self._align = max(self._block_q, _DELTANET_CHUNK if self._linear else 1)
         self._fork_slack = cfg.max_group * S
         self._free_slots = list(range(num_slots - 1, steps.TRASH_SLOT, -1))
+        self._carry_shape = (num_slots, 3)
         self._pools = None
         bind = lambda fn: lambda *args, **kwargs: fn(graphdef, *args, **kwargs)
         # XLA's dot merger would concatenate the weights of sibling projections (DeltaNet's four
@@ -229,7 +242,7 @@ class Engine:
         self._decode_jit = jax.jit(
             bind(steps.decode),
             static_argnames=("num_steps", "num_work", "topk"),
-            donate_argnums=(1,),
+            donate_argnums=(1, 2),
             compiler_options=no_merge,
         )
         self._extend_jit = jax.jit(
@@ -246,6 +259,7 @@ class Engine:
         self._ids = itertools.count()
         self._extend_queue: collections.deque[_Session] = collections.deque()
         self._decoding: dict[int, _Session] = {}
+        self._inflight: collections.deque[_DecodeCall] = collections.deque()
         self._version = 0
         self._commands: queue.SimpleQueue = queue.SimpleQueue()
         self._lock = threading.Lock()
@@ -254,6 +268,7 @@ class Engine:
         self._thread: threading.Thread | None = None
         # Cumulative counters, read from any thread: extend_s / decode_s (seconds in device
         # calls), extend_calls, extend_tokens, decode_calls, decode_tokens, decode_row_steps,
+        # decode_masked_rows (rows of turns that had ended before their call was processed),
         # evict_idle / evict_waiting (evictions by victim kind) and evicted_tokens.
         self.stats = collections.Counter()
 
@@ -277,6 +292,7 @@ class Engine:
             lambda: jnp.zeros(shape, dtype), out_shardings=NamedSharding(self._mesh, spec)
         )()
         self._pools = [tuple(zeros(*spec) for spec in specs) for specs in self._pool_specs]
+        self._carry = zeros(self._carry_shape, jnp.int32, P())
         # Ahead-of-time executables: a jitted call would recompile whenever JAX's jit cache key
         # changes, as it does on each thread's first tokamax op (jax.make_user_context).
         self._decode, self._extend, seconds = {}, {}, {}
@@ -286,13 +302,14 @@ class Engine:
             self._decode[B] = self._decode_jit.lower(
                 self._state,
                 self._pools,
+                self._carry,
                 *inputs,
                 self._eos,
                 num_steps=self.cfg.decode_steps,
                 num_work=B + self.cfg.spare_work,
                 topk=self.cfg.topk,
             ).compile()
-            self._run_decode_call(inputs)
+            jax.block_until_ready(self._decode_call(inputs))
             seconds[f"decode_{B}"] = time.perf_counter() - t
         for T in self.cfg.extend_buckets:
             t = time.perf_counter()
@@ -378,13 +395,15 @@ class Engine:
 
     def _serve(self) -> None:
         while True:
-            idle = not self._extend_queue and not self._decoding
+            idle = not self._extend_queue and not self._decoding and not self._inflight
             if not self._drain(block=idle):
                 return
             if self._extend_queue:
                 self._step_extend()
-            if self._decoding:
-                self._step_decode()
+            dispatched = self._dispatch_decode()
+            # The next call is queued on the device before the host waits for this one.
+            if self._inflight and (len(self._inflight) > 1 or not dispatched):
+                self._process_decode()
 
     def _drain(self, block: bool) -> bool:
         while True:
@@ -524,7 +543,6 @@ class Engine:
         if s.turn is not None:
             if s in self._extend_queue:
                 self._extend_queue.remove(s)
-            self._decoding.pop(s.id, None)
             for f in [s, *s.forks]:
                 self._finish(f, "abort")
         for f in [s, *s.forks]:
@@ -534,20 +552,21 @@ class Engine:
         t = s.turn
         s.turn = None
         s.admitted = False
+        self._decoding.pop(s.id, None)
         s.last_used = time.monotonic()
         k = self.cfg.topk
         ids = np.concatenate(t.topk_ids) if t.topk_ids else np.zeros((0, k), np.int32)
         logps = np.concatenate(t.topk_logprobs) if t.topk_logprobs else np.zeros((0, k), np.float32)
         t.future.set_result(Completion(s.id, t.tokens, t.logprobs, t.versions, reason, ids, logps))
 
-    def _record(self, s: _Session, toks, logps, topk_ids, topk_logps) -> None:
+    def _record(self, s: _Session, toks, logps, version: int, topk_ids, topk_logps) -> None:
         t = s.turn
         s.tokens.extend(toks)
         t.tokens.extend(toks)
         t.logprobs.extend(logps)
         t.topk_ids.append(topk_ids)
         t.topk_logprobs.append(topk_logps)
-        t.versions.extend([self._version] * len(toks))
+        t.versions.extend([version] * len(toks))
         t.remaining -= len(toks)
         if t.stop_at_eos and toks[-1] in self._eos:
             self._finish(s, "stop")
@@ -607,7 +626,9 @@ class Engine:
                 continue
             for f in [s, *s.forks]:
                 f.length = end
-                self._record(f, [int(tok_R[r])], [float(logp_R[r])], head_Rk[r : r + 1], head_logp_Rk[r : r + 1])
+                self._record(
+                    f, [int(tok_R[r])], [float(logp_R[r])], self._version, head_Rk[r : r + 1], head_logp_Rk[r : r + 1]
+                )
                 r += 1
             s.forks = []
 
@@ -725,30 +746,52 @@ class Engine:
         self.stats["extend_s"] += time.perf_counter() - t
         return out
 
-    def _step_decode(self) -> None:
+    def _dispatch_decode(self) -> bool:
+        """Queues one decode call without waiting for the previous one. A turn with a call in
+        flight continues from the device carry; one that may end in that call by length is left
+        out, so only a turn that samples EOS runs one more call, masked."""
         K = self.cfg.decode_steps
+        live = [s for s in self._decoding.values() if s.turn.remaining > s.turn.inflight * K]
         # The oldest sessions decode first; the rest wait for a call with room in the largest bucket.
-        rows = sorted(self._decoding.values(), key=lambda s: s.id)[: self.cfg.decode_buckets[-1]]
+        rows = sorted(live, key=lambda s: s.id)[: self.cfg.decode_buckets[-1]]
+        if not rows:
+            return False
         for s in rows:
-            self._alloc(s, s.length + min(K, s.turn.remaining))
+            self._alloc(s, s.length + min((s.turn.inflight + 1) * K, s.turn.remaining))
         B = next(b for b in self.cfg.decode_buckets if b >= len(rows))
-        tok_KB, logp_KB, valid_KB, head_KBk, head_logp_KBk = self._run_decode_call(self._decode_inputs(rows, B))
+        t = time.perf_counter()
+        out = self._decode_call(self._decode_inputs(rows, B))
+        self.stats["decode_s"] += time.perf_counter() - t
+        for s in rows:
+            s.turn.inflight += 1
+        self._inflight.append(_DecodeCall([(s, s.turn) for s in rows], out, self._version))
         self.stats["decode_calls"] += 1
+        self.stats["decode_row_steps"] += K * B
+        return True
+
+    def _process_decode(self) -> None:
+        call = self._inflight.popleft()
+        t = time.perf_counter()
+        tok_KB, logp_KB, valid_KB, head_KBk, head_logp_KBk = (np.asarray(x) for x in call.out)
+        self.stats["decode_s"] += time.perf_counter() - t
         counts = valid_KB.sum(axis=0)
         self.stats["decode_tokens"] += int(counts.sum())
-        self.stats["decode_row_steps"] += K * B
-        for b, s in enumerate(rows):
+        for b, (s, turn) in enumerate(call.rows):
+            turn.inflight -= 1
+            if s.turn is not turn:
+                self.stats["decode_masked_rows"] += 1
+                continue
             n = int(counts[b])
-            del self._decoding[s.id]
             s.length += n
             self._record(
-                s, tok_KB[:n, b].tolist(), logp_KB[:n, b].tolist(), head_KBk[:n, b], head_logp_KBk[:n, b]
+                s, tok_KB[:n, b].tolist(), logp_KB[:n, b].tolist(), call.version, head_KBk[:n, b], head_logp_KBk[:n, b]
             )
 
     def _decode_inputs(self, rows, B: int):
         tok = np.zeros(B, np.int32)
         pos = np.zeros(B, np.int32)
         remaining = np.zeros(B, np.int32)
+        carried = np.zeros(B, bool)
         temp = np.ones(B, np.float32)
         key_data = np.zeros((B, 2), np.uint32)
         stop = np.zeros(B, bool)
@@ -758,18 +801,18 @@ class Engine:
             tok[b] = s.tokens[-1]
             pos[b] = s.length
             remaining[b] = s.turn.remaining
+            carried[b] = s.turn.inflight > 0
             temp[b] = s.turn.temperature
             key_data[b] = s.turn.key_data
             stop[b] = s.turn.stop_at_eos
             page_table[b] = s.page_row
             slot[b] = s.slot
-        return tok, pos, remaining, temp, key_data, stop, page_table, slot
+        return tok, pos, remaining, carried, temp, key_data, stop, page_table, slot
 
-    def _run_decode_call(self, args):
-        t = time.perf_counter()
-        self._pools, *out = self._decode[args[0].shape[0]](self._state, self._pools, *args, self._eos)
-        out = [np.asarray(x) for x in out]
-        self.stats["decode_s"] += time.perf_counter() - t
+    def _decode_call(self, args) -> list[jax.Array]:
+        self._pools, self._carry, *out = self._decode[args[0].shape[0]](
+            self._state, self._pools, self._carry, *args, self._eos
+        )
         return out
 
     def _run_score(self, token_lists: list[list[int]]) -> list[np.ndarray]:

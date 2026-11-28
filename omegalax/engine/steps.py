@@ -79,31 +79,20 @@ def _forward(model, pools, tokens_BT, paged: PagedBatch, linear):
 
 
 def _linear_decode(pools, slot_B, active_B):
-    conv = next((a for a, _ in pools if a.ndim == 3), None)
-    if conv is None:
+    if not any(a.ndim == 3 for a, _ in pools):
         return None
-    S, K1, _ = conv.shape
-    B = slot_B.shape[0]
-    rows_B = jnp.arange(B, dtype=jnp.int32)
-    row_slot_B = jnp.where(active_B, slot_B, TRASH_SLOT)
-    base_B1 = (B + row_slot_B * K1)[:, None]
-    taps_BK = jnp.concatenate([base_B1 + jnp.arange(K1)[None], rows_B[:, None]], axis=1)
-    return LinearDecode(
-        conv_fix_F=rows_B,
-        conv_src_FK=taps_BK,
-        conv_out_src_WK=taps_BK[:, 1:],
-        write_slot_W=jnp.where(active_B, slot_B, S + rows_B),
-        row_slot_N=row_slot_B,
-    )
+    return LinearDecode(row_slot_N=jnp.where(active_B, slot_B, TRASH_SLOT))
 
 
 def decode(
     graphdef,
     state,
     pools,
+    carry_S3,
     tok_B,
     pos_B,
     remaining_B,
+    carried_B,
     temp_B,
     key_data_B2,
     stop_B,
@@ -118,8 +107,15 @@ def decode(
     """Runs ``num_steps`` decode steps for every row with ``remaining_B > 0``.
 
     ``tok_B`` is each row's last sampled token, not yet in the cache, at position
-    ``pos_B``. Returns the updated pools and per-step ``(token, logprob, valid)``.
+    ``pos_B``. Rows with ``carried_B`` instead continue from ``carry_S3[slot_B]``, the
+    (token, position, remaining) a previous call left there, so the host can queue this call
+    before reading the previous one's results. Returns the updated pools and carry and the
+    per-step ``(token, logprob, valid)``.
     """
+    prev_B3 = carry_S3[slot_B]
+    tok_B = jnp.where(carried_B, prev_B3[:, 0], tok_B)
+    pos_B = jnp.where(carried_B, prev_B3[:, 1], pos_B)
+    remaining_B = jnp.where(carried_B, prev_B3[:, 2], remaining_B)
     model = _model(graphdef, state)
     key_B = jax.random.wrap_key_data(key_data_B2)
     _, P, S, _ = next(a for a, _ in pools if a.ndim == 4).shape
@@ -149,10 +145,11 @@ def decode(
         carry = (pools, jnp.where(active_B, new_B, tok_B), pos_B + active_B, remaining_B)
         return carry, (new_B, logp_B, active_B, head_Bk, head_logp_Bk)
 
-    (pools, *_), (tok_KB, logp_KB, valid_KB, head_KBk, head_logp_KBk) = jax.lax.scan(
+    (pools, tok_B, pos_B, remaining_B), (tok_KB, logp_KB, valid_KB, head_KBk, head_logp_KBk) = jax.lax.scan(
         step, (pools, tok_B, pos_B, remaining_B), length=num_steps
     )
-    return pools, tok_KB, logp_KB, valid_KB, head_KBk, head_logp_KBk
+    carry_S3 = carry_S3.at[slot_B].set(jnp.stack([tok_B, pos_B, remaining_B], axis=1))
+    return pools, carry_S3, tok_KB, logp_KB, valid_KB, head_KBk, head_logp_KBk
 
 
 def extend(
