@@ -1,7 +1,9 @@
 """Trainer on an FSDP-2 mesh of forced CPU host devices: no compiles after warmup, the host
 optimizer placement takes the same steps as the device placement, a power-of-two loss scale is
-undone exactly, and Linear weight gradients are float32 sums across devices."""
+undone exactly, Linear weight gradients are float32 sums across devices, and packed rows train like
+one sample per row."""
 
+import dataclasses
 import logging
 import os
 
@@ -12,6 +14,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from absl.testing import absltest
+from flax import nnx
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from omegalax.models.sharding_runtime import set_attn_backend
@@ -34,11 +37,11 @@ class _Compiles(logging.Handler):
 class FsdpTrainerTest(absltest.TestCase):
     def _run(self, host_optimizer: bool, loss_scale: float = 1.0):
         with jax.set_mesh(sub_mesh(jax.devices()[:2], 1, 2, 1)):
-            model, cfg = text_api.init_model("qwen3-smoke", jax.random.key(0), tp_size=1, fsdp_size=2, dp_size=1)
+            model, cfg = text_api.init_model("qwen3.5-smoke-dense", jax.random.key(0), tp_size=1, fsdp_size=2, dp_size=1)
         set_attn_backend(model, "xla")
         trainer = Trainer(model, cfg, TrainConfig(
             lr=1e-3, weight_decay=0.1, adam_b1=0.9, adam_b2=0.98, adam_eps=1e-8, max_grad_norm=1.0,
-            eps_low=0.2, eps_high=0.28, tokens_per_microbatch=256, length_buckets=(32, 64),
+            eps_low=0.2, eps_high=0.28, tokens_per_microbatch=256, row_tokens=128,
             logit_tile_tokens=64, pad_id=0, host_optimizer=host_optimizer, loss_scale=loss_scale,
         ))
         rng = np.random.default_rng(0)
@@ -106,6 +109,60 @@ class LinearDotTest(absltest.TestCase):
         self.assertGreater(err(dw_bf16), 1e-4)
         dx_ref = np.einsum("btf,df->btd", r64, np.asarray(np.asarray(w, jnp.bfloat16), np.float64))
         np.testing.assert_allclose(np.asarray(dx, np.float64), dx_ref, rtol=1e-2, atol=1e-2)
+
+
+class PackingTest(absltest.TestCase):
+    def test_packed_rows_match_one_sample_per_row(self):
+        # float32 activations: bfloat16 reduction-order noise would be ~1 %, a leak is ~10 %.
+        cfg = dataclasses.replace(text_api.resolve_config("qwen3.5-smoke-dense"), dtype=jnp.float32)
+        with jax.set_mesh(sub_mesh(jax.devices()[:1], 1, 1, 1)):
+            model, cfg = text_api.init_model(cfg, jax.random.key(0), tp_size=1, fsdp_size=1, dp_size=1)
+        set_attn_backend(model, "xla")
+        trainer = Trainer(model, cfg, TrainConfig(
+            lr=1e-3, weight_decay=0.1, adam_b1=0.9, adam_b2=0.98, adam_eps=1e-8, max_grad_norm=1.0,
+            eps_low=0.2, eps_high=0.28, tokens_per_microbatch=512, row_tokens=512,
+            logit_tile_tokens=128, pad_id=0, host_optimizer=False, loss_scale=1.0,
+        ))
+        rng = np.random.default_rng(0)
+        # 64 and 128 fill their chunks, so the next segment in the row starts right after a real token.
+        tokens = [rng.integers(1, 1000, L).tolist() for L in (64, 150, 37, 128, 90, 64)]
+        # Behaviour logprobs = the trainer's own: every ratio is 1, so no token's gradient is clipped away.
+        samples = [Sample(0, t, 8, [0] * 8 + [1] * (len(t) - 8), list(trainer.logprobs([t])[0]), [0] * len(t)) for t in tokens]
+        adv = [1.0, -0.5, 0.8, -1.2, 0.6, -0.9]
+        packed = trainer.microbatches(samples, adv)
+        alone = [trainer.microbatches([s], [a])[0] for s, a in zip(samples, adv)]
+        self.assertEqual(len(packed), 2)
+
+        def grads(mbs):
+            with jax.set_mesh(trainer.mesh):
+                acc = trainer._zeros(trainer.params)
+                for mb in mbs:
+                    acc, _ = trainer._accumulate(trainer.params, acc, trainer._put(mb), np.float32(1 / 1000))
+            return [np.asarray(g) for g in jax.tree.leaves(acc)]
+
+        def max_rel_err(a, b):
+            return max(float(np.abs(x - y).max() / np.abs(y).max()) for x, y in zip(a, b))
+
+        reference = grads(alone)
+        self.assertLess(max_rel_err(grads(packed), reference), 1e-5)
+        # The check sees leaks: one segment per row (positions, attention, conv and recurrence span it) differs.
+        leaky = [dict(mb, segment_ids=(mb["segment_ids"] > 0).astype(np.int32)) for mb in packed]
+        self.assertGreater(max_rel_err(grads(leaky), reference), 1e-2)
+
+        for s, logp in zip(samples, trainer.logprobs([s.tokens for s in samples])):
+            np.testing.assert_allclose(logp, trainer.logprobs([s.tokens])[0], rtol=1e-5, atol=1e-5)
+
+        # RoPE is relative, so the checks above barely see positions; the engine counts each sequence from 0.
+        seg = packed[0]["segment_ids"]
+        restarted = np.zeros_like(seg)
+        for row, ids in zip(restarted, seg):
+            for t in range(1, len(ids)):
+                row[t] = 0 if ids[t] != ids[t - 1] else row[t - 1] + 1
+        hidden = jax.jit(lambda p, *a: nnx.merge(trainer.graphdef, p).text(*a)[0])
+        with jax.set_mesh(trainer.mesh):
+            default = hidden(trainer.params, packed[0]["tokens"], None, seg)
+            explicit = hidden(trainer.params, packed[0]["tokens"], None, seg, restarted)
+        np.testing.assert_array_equal(np.asarray(default)[seg > 0], np.asarray(explicit)[seg > 0])
 
 
 if __name__ == "__main__":

@@ -51,8 +51,8 @@ flags.DEFINE_float("adam_eps", 1e-8, "Adam epsilon.")
 flags.DEFINE_float("max_grad_norm", 1.0, "Global gradient-norm clip.")
 flags.DEFINE_float("eps_low", 0.2, "PPO clip below 1.")
 flags.DEFINE_float("eps_high", 0.28, "PPO clip above 1.")
-flags.DEFINE_integer("tokens_per_microbatch", 65536, "Padded tokens per trainer microbatch.")
-flags.DEFINE_list("length_buckets", ["1024", "2048", "4096", "8192", "16384"], "Trainer sequence buckets.")
+flags.DEFINE_integer("tokens_per_microbatch", 32768, "Tokens per trainer microbatch (rows x row_tokens).")
+flags.DEFINE_integer("row_tokens", 8192, "Trainer row length; samples are packed into rows.")
 flags.DEFINE_integer("logit_tile_tokens", 4096, "Positions per float32 logits tile in the trainer.")
 flags.DEFINE_enum("compute_dtype", "bfloat16", ["bfloat16", "float16"], "Trainer and engine compute dtype.")
 flags.DEFINE_bool("host_optimizer", False, "Keep the float32 master and Adam state in host memory (large models).")
@@ -112,9 +112,8 @@ def main(argv):
     eval_tasks = [json.loads(line) for line in open(FLAGS.eval_path)]
     rows = [json.loads(line) for line in open(FLAGS.data_path)] + eval_tasks
     max_context = max(len(env.prompt(r)) for r in rows) + FLAGS.max_response
-    buckets = tuple(int(x) for x in FLAGS.length_buckets)
-    if max_context > buckets[-1]:
-        raise ValueError(f"Longest prompt + max_response = {max_context} exceeds the last length bucket {buckets[-1]}.")
+    if max_context > FLAGS.row_tokens:
+        raise ValueError(f"Longest prompt + max_response = {max_context} exceeds row_tokens={FLAGS.row_tokens}.")
 
     t0 = time.perf_counter()
     model, cfg = load_causal_lm(FLAGS.model_path, sub_mesh(devices[:nt], 1, nt, 1), getattr(jnp, FLAGS.compute_dtype))
@@ -126,7 +125,7 @@ def main(argv):
             adam_b2=FLAGS.adam_b2, adam_eps=FLAGS.adam_eps, max_grad_norm=FLAGS.max_grad_norm,
             eps_low=FLAGS.eps_low, eps_high=FLAGS.eps_high,
             tokens_per_microbatch=FLAGS.tokens_per_microbatch,
-            length_buckets=buckets,
+            row_tokens=FLAGS.row_tokens,
             logit_tile_tokens=FLAGS.logit_tile_tokens, pad_id=pad,
             host_optimizer=FLAGS.host_optimizer,
             loss_scale={"bfloat16": 1.0, "float16": 2.0**16}[FLAGS.compute_dtype],

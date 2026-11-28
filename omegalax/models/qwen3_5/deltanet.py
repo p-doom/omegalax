@@ -24,7 +24,7 @@ M — chunk position (column / source)
 import jax
 import jax.numpy as jnp
 from flax import nnx
-from jax.sharding import PartitionSpec
+from jax.sharding import PartitionSpec, reshard
 
 from omegalax.models.sharding_runtime import per_shard
 
@@ -49,21 +49,24 @@ def _gated_norm(out_BTHU, z_BTHU, weight_U, eps):
     return gated.astype(out_BTHU.dtype).reshape(B, T, H * U)
 
 
-def _causal_depthwise_conv1d(x_BCT: jax.Array, weight_CK: jax.Array) -> jax.Array:
-    """Depthwise causal conv1d.
+def _causal_depthwise_conv1d(x_BCT: jax.Array, weight_CK: jax.Array, segment_ids_BT: jax.Array) -> jax.Array:
+    """Depthwise causal conv1d within segments: taps that reach into another segment read zero.
 
     Args:
         x_BCT: (B, C, T)
         weight_CK: (C, K), per-channel kernel
+        segment_ids_BT: (B, T)
     Returns:
         (B, C, T)
     """
     K = weight_CK.shape[1]
     T = x_BCT.shape[2]
     x_padded = jnp.pad(x_BCT, ((0, 0), (0, 0), (K - 1, 0)))
+    seg_padded = jnp.pad(segment_ids_BT, ((0, 0), (K - 1, 0)), constant_values=-1)
     result = jnp.zeros_like(x_BCT)
     for k in range(K):
-        result = result + weight_CK[None, :, k : k + 1] * x_padded[:, :, k : k + T]
+        same_B1T = (seg_padded[:, k : k + T] == segment_ids_BT)[:, None, :]
+        result = result + weight_CK[None, :, k : k + 1] * jnp.where(same_B1T, x_padded[:, :, k : k + T], 0)
     return result
 
 
@@ -141,13 +144,15 @@ class GatedDeltaNet(nnx.Module):
     def __call__(
         self,
         hidden_BTD: jax.Array,
-        attention_mask_BT: jax.Array | None = None,
+        segment_ids_BT: jax.Array,
         cache: LinearCache | None = None,
     ) -> tuple[jax.Array, LinearCache | None]:
+        """Without a cache, each segment (``segment_ids_BT`` > 0; 0 = padding) runs from a zero
+        state. The recurrence restarts only at chunk starts, so a segment that follows another
+        one in its row must start at a multiple of CHUNK_SIZE."""
         if cache is not None:
             return self._cached(hidden_BTD, cache)
-        if attention_mask_BT is not None and attention_mask_BT.shape[1] > 1:
-            hidden_BTD = hidden_BTD * attention_mask_BT[:, :, None]
+        hidden_BTD = jnp.where((segment_ids_BT != 0)[:, :, None], hidden_BTD, 0)
 
         B, T, _ = hidden_BTD.shape
 
@@ -164,7 +169,9 @@ class GatedDeltaNet(nnx.Module):
         b_BTH = self.in_proj_b(hidden_BTD, out_sharding=beta_g_shd)
         a_BTH = self.in_proj_a(hidden_BTD, out_sharding=beta_g_shd)
 
-        mixed_qkv_BCT = nnx.silu(_causal_depthwise_conv1d(mixed_qkv_BCT, self.conv_weight[...].astype(mixed_qkv_BCT.dtype)))
+        mixed_qkv_BCT = nnx.silu(
+            _causal_depthwise_conv1d(mixed_qkv_BCT, self.conv_weight[...].astype(mixed_qkv_BCT.dtype), segment_ids_BT)
+        )
         mixed_qkv_BTC = mixed_qkv_BCT.transpose(0, 2, 1)
         q_BTP, k_BTP, v_BTO = jnp.split(mixed_qkv_BTC, [self.key_dim, self.key_dim * 2], axis=-1)
         q_BTHA = jax.lax.reshape(
@@ -194,7 +201,12 @@ class GatedDeltaNet(nnx.Module):
         head_k_dim = self.head_k_dim
         gqa_factor = self.gqa_factor
 
-        def _full_deltanet(q_BTHA, k_BTHA, v_BTHU, z_BTHU, g_BTH, beta_BTH, nw):
+        J = -(-T // CHUNK_SIZE)
+        first_BJ = segment_ids_BT[:, ::CHUNK_SIZE]
+        before_BJ = jnp.pad(segment_ids_BT[:, CHUNK_SIZE - 1 :: CHUNK_SIZE], ((0, 0), (1, 0)), constant_values=-1)[:, :J]
+        init_idx_BJ = reshard(jnp.where(first_BJ != before_BJ, 0, -1).astype(jnp.int32), P(batch_axis, None))
+
+        def _full_deltanet(q_BTHA, k_BTHA, v_BTHU, z_BTHU, g_BTH, beta_BTH, init_idx_BJ, nw):
             """GQA → DeltaNet → norm. All inputs have shard-local head axes."""
             B, T = q_BTHA.shape[:2]
             local_k_heads = q_BTHA.shape[2]
@@ -212,8 +224,7 @@ class GatedDeltaNet(nnx.Module):
                     k_BTHA[:, :, :, None, :],
                     (B, T, local_k_heads, gqa_factor, head_k_dim),
                 ).reshape(B, T, local_v_heads, head_k_dim)
-            J = -(-T // CHUNK_SIZE)
-            init_idx_BJ = jnp.full((B, J), -1, jnp.int32).at[:, 0].set(0)
+            J = init_idx_BJ.shape[1]
             init_NHAU = jnp.zeros((1, local_v_heads, head_k_dim, v_BTHU.shape[3]), jnp.float32)
             final_idx_BW = jnp.full((B, 1), J - 1, jnp.int32)
             out, _ = chunk_gated_delta_rule(
@@ -231,10 +242,10 @@ class GatedDeltaNet(nnx.Module):
 
         normed_BTD = shard_map(
             _full_deltanet, mesh,
-            in_specs=(heads_shd, heads_shd, heads_shd, heads_shd, beta_g_shd, beta_g_shd, P(None)),
+            in_specs=(heads_shd, heads_shd, heads_shd, heads_shd, beta_g_shd, beta_g_shd, P(batch_axis, None), P(None)),
             out_specs=self.shd_cfg.act_btf,
             check_rep=False,
-        )(q_BTHA, k_BTHA, v_BTHU, z_BTHU, g_BTH, beta_BTH, norm_w)
+        )(q_BTHA, k_BTHA, v_BTHU, z_BTHU, g_BTH, beta_BTH, init_idx_BJ, norm_w)
 
         out_BTD = self.out_proj(normed_BTD, out_sharding=self.shd_cfg.act_btd)
         return out_BTD, None

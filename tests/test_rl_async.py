@@ -71,7 +71,7 @@ class AsyncInvariantsTest(absltest.TestCase):
         # A large lr makes consecutive versions' logprobs clearly distinguishable.
         trainer = RecordingTrainer(model, cfg, TrainConfig(
             lr=3e-5, weight_decay=0.0, adam_b1=0.9, adam_b2=0.98, adam_eps=1e-8, max_grad_norm=1.0,
-            eps_low=0.2, eps_high=0.28, tokens_per_microbatch=16384, length_buckets=(512, 1024, 2048),
+            eps_low=0.2, eps_high=0.28, tokens_per_microbatch=8192, row_tokens=2048,
             logit_tile_tokens=4096, pad_id=pad, host_optimizer=False, loss_scale=1.0,
         ))
         sync = WeightSync(trainer.graphdef, trainer.params)

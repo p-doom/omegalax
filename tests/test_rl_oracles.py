@@ -54,8 +54,8 @@ class RLOracleTest(absltest.TestCase):
             cfg,
             TrainConfig(
                 lr=1e-4, weight_decay=0.1, adam_b1=0.9, adam_b2=0.98, adam_eps=1e-8,
-                max_grad_norm=1.0, eps_low=0.2, eps_high=0.28, tokens_per_microbatch=2048,
-                length_buckets=(1024, 2048, 4096), logit_tile_tokens=4096, pad_id=cls.pad, host_optimizer=False, loss_scale=1.0,
+                max_grad_norm=1.0, eps_low=0.2, eps_high=0.28, tokens_per_microbatch=5120,
+                row_tokens=2560, logit_tile_tokens=4096, pad_id=cls.pad, host_optimizer=False, loss_scale=1.0,
             ),
         )
         cls.sync = WeightSync(cls.trainer.graphdef, cls.trainer.params)
@@ -124,8 +124,9 @@ class RLOracleTest(absltest.TestCase):
 
     def test_2_weight_sync_no_compile_and_matching_logprobs(self):
         old = jax.tree.map(lambda x: x.copy(), self.sync.gather(self.trainer.params))
-        samples = self._rollouts(1)
-        adv = [1.0, -1.0, 0.5, -0.5]
+        # Eight samples: rows hold several each, and the batch spans more than one microbatch.
+        samples = self._rollouts(1) + self._rollouts(11)
+        adv = [1.0, -1.0, 0.5, -0.5] * 2
         print("trainer warmup s", self.trainer.warmup())
         counter = _CompileLog()
         logging.getLogger("jax").addHandler(counter)
