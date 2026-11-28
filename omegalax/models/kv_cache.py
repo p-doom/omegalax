@@ -8,6 +8,8 @@ import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
 
 from omegalax.kernels.paged_attention import paged_attention
+from omegalax.kernels.paged_extend_attention import TILE as EXTEND_TILE
+from omegalax.kernels.paged_extend_attention import paged_extend_attention
 from omegalax.models.sharding_runtime import per_shard
 
 # Pages hold the KV heads of omegalax's tensor-parallel mesh axis.
@@ -33,7 +35,8 @@ class PagedBatch:
 
     KV write ``w`` stores flattened token ``write_src_W[w]`` at ``write_slot_W[w]`` (``page *
     page_size + offset``). A token may be written to several slots (forked prompts); slots
-    are unique, and writes to skip carry distinct out-of-range slots.
+    are unique, and writes to skip carry distinct out-of-range slots. ``num_work`` sizes the
+    decode kernel's work list; extends do not split work.
     """
 
     positions_BT: jax.Array
@@ -81,12 +84,14 @@ class LayerCache:
         return dataclasses.replace(self, k_pages_GPSK=k_pages, v_pages_GPSK=v_pages)
 
     def attend(self, q_BTHK: jax.Array, scale: float) -> jax.Array:
+        """Decode steps (one token per query block) use the split-KV Triton kernel; extends
+        (``EXTEND_TILE`` tokens per query block) the Mosaic GPU kernel."""
         Q, num_work = self.batch.block_q, self.batch.num_work
 
-        def attend(q_BTHK, k_pages, v_pages, page_table_NP, q_pos_N, kv_len_N):
+        def decode(q_BTHK, k_pages, v_pages, page_table_NP, q_pos_N, kv_len_N):
             B, T, H, K = q_BTHK.shape
             out_NQHK = paged_attention(
-                q_BTHK.reshape(B * T // Q, Q, H, K),
+                q_BTHK.reshape(B * T, 1, H, K),
                 k_pages,
                 v_pages,
                 page_table_NP,
@@ -94,14 +99,26 @@ class LayerCache:
                 kv_len_N,
                 scale=scale,
                 num_work=num_work,
-                # Tuned on H100: decode is bandwidth-bound, extend (Q x R = 128 rows) compute-bound.
-                min_chunk_pages=16 if Q == 1 else 64,
-                num_stages=3 if Q == 1 else 2,
             )
             return out_NQHK.reshape(B, T, H, K)
 
+        def extend(q_BTHK, k_pages, v_pages, page_table_NP, q_pos_N, kv_len_N):
+            B, T, H, K = q_BTHK.shape
+            out_THK = paged_extend_attention(
+                q_BTHK.reshape(B * T, H, K),
+                k_pages,
+                v_pages,
+                page_table_NP,
+                q_pos_N,
+                kv_len_N,
+                scale=scale,
+            )
+            return out_THK.reshape(B, T, H, K)
+
+        if Q not in (1, EXTEND_TILE):
+            raise ValueError(f"Query blocks must hold 1 or {EXTEND_TILE} tokens, got {Q}.")
         return per_shard(
-            attend,
+            decode if Q == 1 else extend,
             (_HEADS, _PAGES, _PAGES, P(), P(), P()),
             _HEADS,
             q_BTHK,

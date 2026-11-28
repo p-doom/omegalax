@@ -26,8 +26,10 @@ from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from omegalax.engine import steps
+from omegalax.models.kv_cache import EXTEND_TILE
 from omegalax.models.qwen3_5.cache import LinearExtend
 from omegalax.models.qwen3_5.deltanet import CHUNK_SIZE as _DELTANET_CHUNK
+from omegalax.models.qwen3_5.deltanet import GatedDeltaNet
 
 
 @dataclasses.dataclass(frozen=True)
@@ -104,22 +106,41 @@ class OutOfPages(Exception):
     pass
 
 
-def _inference_dtypes(model: nnx.Module, state: nnx.State) -> list:
-    """Per state leaf, the dtype the engine stores it in: every Linear kernel (but the
-    lm_head) and embedding table in its module's compute dtype, which the forward pass casts
-    them to before every use anyway. The lm_head keeps its storage dtype because the trainer's
-    loss multiplies it directly.
+def _qkv_shard_order(d: GatedDeltaNet, tp: int) -> np.ndarray:
+    """``d``'s ``[q | k | v]`` channels regrouped per tensor-parallel shard: ``[q_r | k_r | v_r]``."""
+    q_TP = np.arange(d.key_dim).reshape(tp, -1)
+    v_TO = np.arange(d.value_dim).reshape(tp, -1)
+    return np.concatenate([q_TP, d.key_dim + q_TP, 2 * d.key_dim + v_TO], axis=1).reshape(-1)
+
+
+def _inference_layout(model: nnx.Module, state: nnx.State, tp: int) -> list:
+    """Per state leaf, ``(dtype, axis, order)``: how the engine stores it.
+
+    Every Linear kernel (but the lm_head) and embedding table is stored in its module's compute
+    dtype, which the forward pass casts it to before every use anyway; the lm_head keeps its
+    storage dtype because the trainer's loss multiplies it directly. A DeltaNet layer's
+    ``in_proj_qkv`` kernel (columns) and ``conv_weight`` (rows) are reordered to
+    ``_qkv_shard_order`` along ``axis``, the layout ``GatedDeltaNet._cached`` expects.
     """
-    cast = {}
+    dtypes, orders = {}, {}
     for path, m in nnx.iter_modules(model):
         if isinstance(m, nnx.Linear) and m is not model.lm_head:
-            cast[(*path, "kernel")] = m.dtype
+            dtypes[(*path, "kernel")] = m.dtype
         elif isinstance(m, nnx.Embed):
-            cast[(*path, "embedding")] = m.dtype
-    return [
-        cast.get(tuple(k.key for k in path if isinstance(k, jax.tree_util.DictKey)), x.dtype)
-        for path, x in jax.tree_util.tree_leaves_with_path(state)
-    ]
+            dtypes[(*path, "embedding")] = m.dtype
+        elif isinstance(m, GatedDeltaNet):
+            order = _qkv_shard_order(m, tp)
+            orders[(*path, "in_proj_qkv", "kernel")] = (1, order)
+            orders[(*path, "conv_weight")] = (0, order)
+    layout = []
+    for path, x in jax.tree_util.tree_leaves_with_path(state):
+        key = tuple(k.key for k in path if isinstance(k, jax.tree_util.DictKey))
+        layout.append((dtypes.get(key, x.dtype), *orders.get(key, (None, None))))
+    return layout
+
+
+def _reorder(x: jax.Array, axis: int, order: np.ndarray) -> jax.Array:
+    return x.at[(slice(None),) * axis + (order,)].get(out_sharding=jax.typeof(x).sharding.spec)
 
 
 class Engine:
@@ -139,8 +160,21 @@ class Engine:
         self._abstract = jax.tree.map(
             lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=x.sharding), state
         )
-        dtypes = _inference_dtypes(model, state)
-        self._to_inference = jax.jit(lambda leaves: [x.astype(d) for x, d in zip(leaves, dtypes)])
+        layout = _inference_layout(model, state, tp)
+        self._to_inference = jax.jit(
+            lambda leaves: [
+                x.astype(d) if order is None else _reorder(x.astype(d), axis, order)
+                for x, (d, axis, order) in zip(leaves, layout)
+            ]
+        )
+        # Score runs the trainer forward, which needs the trainer's channel order back.
+        self._reordered = [i for i, (_, _, order) in enumerate(layout) if order is not None]
+        self._to_trainer_order = jax.jit(
+            lambda leaves: [
+                _reorder(x, layout[i][1], np.argsort(layout[i][2]))
+                for i, x in zip(self._reordered, leaves)
+            ]
+        )
         self._state = jax.tree.leaves(state)
         graphdef = (graphdef, jax.tree.structure(state))
         layers = model.text.layers if isinstance(model, steps.Qwen3_5ForCausalLM) else model.layers
@@ -155,7 +189,6 @@ class Engine:
                     raise ValueError(f"{a.num_kv_heads} KV heads do not split over tp={tp}.")
                 page = ((a.num_kv_heads, cfg.num_pages, S, a.head_dim), jnp.bfloat16, P("tp"))
                 self._pool_specs.append((page, page))
-                self._block_q = max(1, min(128, 128 * 128 // a.head_dim) // a.n_rep)
             else:
                 d = layer.linear_attn
                 if d.num_k_heads % tp:
@@ -172,6 +205,7 @@ class Engine:
                     )
                 )
         self._linear = len(self._pool_specs) != sum(hasattr(x, "attn") for x in layers)
+        self._block_q = EXTEND_TILE
         self._align = max(self._block_q, _DELTANET_CHUNK if self._linear else 1)
         self._fork_slack = cfg.max_group * S
         self._free_slots = list(range(num_slots - 1, steps.TRASH_SLOT, -1))
@@ -188,7 +222,7 @@ class Engine:
         )
         self._extend = jax.jit(
             bind(steps.extend),
-            static_argnames=("block_q", "num_work"),
+            static_argnames=("block_q",),
             donate_argnums=(1,),
             compiler_options=no_merge,
         )
@@ -206,6 +240,9 @@ class Engine:
         self._error: BaseException | None = None
         self._command: tuple = ()
         self._thread: threading.Thread | None = None
+        # Cumulative counters, read from any thread: extend_s / decode_s (seconds in device
+        # calls), extend_calls, extend_tokens, decode_calls, decode_tokens, decode_row_steps,
+        # evict_idle / evict_waiting (evictions by victim kind) and evicted_tokens.
         self.stats = collections.Counter()
 
     def start(self) -> dict[str, float]:
@@ -604,7 +641,7 @@ class Engine:
             key_data,
             linear,
         )
-        return args, N
+        return args
 
     def _linear_extend(self, items, T: int) -> LinearExtend:
         """DeltaNet metadata for the packed batch; see ``omegalax.models.qwen3_5.cache``."""
@@ -648,15 +685,13 @@ class Engine:
             valid, conv_fix, conv_src, conv_out_src, write_slot, init_slot, init_idx, final_chunk
         )
 
-    def _run_extend_call(self, inputs):
-        args, N = inputs
+    def _run_extend_call(self, args):
         t = time.perf_counter()
         self._pools, tok_R, logp_R = self._extend(
             self._state,
             self._pools,
             *args,
             block_q=self._block_q,
-            num_work=N + self.cfg.spare_work,
         )
         tok_R, logp_R = np.asarray(tok_R), np.asarray(logp_R)
         self.stats["extend_s"] += time.perf_counter() - t
@@ -722,5 +757,9 @@ class Engine:
         tokens = np.full((B, T), self.cfg.pad_id, np.int32)
         for b, t in enumerate(token_lists):
             tokens[b, : len(t)] = t
-        logp_BT = np.asarray(self._score(self._state, tokens, pad_id=self.cfg.pad_id))
+        state = list(self._state)
+        restored = self._to_trainer_order([state[i] for i in self._reordered])
+        for i, x in zip(self._reordered, restored):
+            state[i] = x
+        logp_BT = np.asarray(self._score(state, tokens, pad_id=self.cfg.pad_id))
         return [logp_BT[b, : len(t) - 1] for b, t in enumerate(token_lists)]
