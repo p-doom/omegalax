@@ -150,9 +150,12 @@ class RLOracleTest(absltest.TestCase):
         new_errs = self._errors(fresh)
         self._assert_close(new_errs, "oracle 2 after sync")
         self.engine.update_weights(jax.device_put(old, self.shardings), version=0).result()
-        old_ref = self.engine.score([s.tokens for s in fresh]).result()
+        # score() rejects pad, which these stop_at_eos=False rollouts can sample anywhere: score the prefix before it.
+        scored = [s.tokens[: s.tokens.index(self.pad)] if self.pad in s.tokens else s.tokens for s in fresh]
+        old_ref = self.engine.score(scored).result()
         old_errs = np.concatenate([
-            np.abs(np.asarray(s.logprobs)[1:] - r)[np.asarray(s.mask)[1:] == 1] for s, r in zip(fresh, old_ref)
+            np.abs(np.asarray(s.logprobs)[1 : len(t)] - r)[np.asarray(s.mask)[1 : len(t)] == 1]
+            for s, t, r in zip(fresh, scored, old_ref)
         ])
         print(f"same tokens under the pre-step weights: mean |dlogp| {old_errs.mean():.4f}")
         self.assertGreater(old_errs.mean(), 5 * new_errs.mean())
