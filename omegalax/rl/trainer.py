@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import functools
 import time
 from typing import Sequence
 
@@ -54,6 +55,47 @@ def _metric_sums(logp_BT, entropy_BT, log_ratio_BT, clipped_BT, mask_BT, fresh_B
     }
 
 
+@functools.partial(jax.custom_vjp, nondiff_argnums=(2, 3))
+def _linear_dot(x, w, dimension_numbers, out_sharding):
+    """``x @ w.astype(x.dtype)`` with float32 accumulation, output in ``x.dtype``. The weight
+    gradient leaves the backward matmul in float32, so the FSDP reduce-scatter sums float32
+    partials (as Megatron's fp32 gradient reduction does) instead of compute-dtype ones."""
+    return jax.lax.dot_general(
+        x, w.astype(x.dtype), dimension_numbers, preferred_element_type=jnp.float32, out_sharding=out_sharding
+    ).astype(x.dtype)
+
+
+def _linear_dot_fwd(x, w, dimension_numbers, out_sharding):
+    if dimension_numbers != (((x.ndim - 1,), (0,)), ((), ())):
+        raise ValueError(f"Unsupported Linear dimension numbers {dimension_numbers}.")
+    return _linear_dot(x, w, dimension_numbers, out_sharding), (x, w)
+
+
+def _linear_dot_bwd(dimension_numbers, out_sharding, residuals, g):
+    x, w = residuals
+    batch = tuple(range(x.ndim - 1))
+    dx = jax.lax.dot_general(
+        g, w.astype(g.dtype), (((g.ndim - 1,), (1,)), ((), ())), preferred_element_type=jnp.float32,
+        out_sharding=jax.typeof(x).sharding,
+    ).astype(x.dtype)
+    dw = jax.lax.dot_general(
+        x, g, ((batch, batch), ((), ())), preferred_element_type=jnp.float32, out_sharding=jax.typeof(w).sharding
+    )
+    return dx, dw.astype(w.dtype)
+
+
+_linear_dot.defvjp(_linear_dot_fwd, _linear_dot_bwd)
+
+
+def _linear_dot_general(lhs, rhs, dimension_numbers, precision=None, out_sharding=None):
+    return _linear_dot(lhs, rhs, dimension_numbers, out_sharding)
+
+
+def _cast_inputs_only(args, *, dtype, **_):
+    inputs, kernel, bias = args
+    return inputs.astype(dtype), kernel, bias
+
+
 class Trainer:
     """Owns float32 params on ``mesh`` and the optimizer state (on ``mesh`` or in host memory).
 
@@ -64,6 +106,11 @@ class Trainer:
     def __init__(self, model: nnx.Module, model_cfg, cfg: TrainConfig):
         self.cfg = cfg
         self.model_cfg = model_cfg
+        # Linear kernels enter their matmul as float32 params (cast inside _linear_dot), so their
+        # gradients stay float32 through the cross-device reduction; the lm_head is float32 already.
+        for _, m in nnx.iter_modules(model):
+            if isinstance(m, nnx.Linear) and m is not model.lm_head:
+                m.dot_general, m.promote_dtype = _linear_dot_general, _cast_inputs_only
         self.graphdef, self.params = nnx.split(model, nnx.Param)
         leaves = jax.tree.leaves(self.params)
         if len(leaves) != len(jax.tree.leaves(nnx.state(model))):
