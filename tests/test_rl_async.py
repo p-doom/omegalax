@@ -69,23 +69,24 @@ class AsyncInvariantsTest(absltest.TestCase):
         # A large lr makes consecutive versions' logprobs clearly distinguishable.
         trainer = RecordingTrainer(model, cfg, TrainConfig(
             lr=3e-5, weight_decay=0.0, adam_b1=0.9, adam_b2=0.98, adam_eps=1e-8, max_grad_norm=1.0,
-            eps_low=0.2, eps_high=0.28, tokens_per_microbatch=16384, length_buckets=(512, 1024),
+            eps_low=0.2, eps_high=0.28, tokens_per_microbatch=16384, length_buckets=(512, 1024, 2048),
             logit_tile_tokens=4096, pad_id=pad, host_optimizer=False,
         ))
         sync = WeightSync(trainer.graphdef, trainer.params)
         replica, shardings = engine_replica(sync.gather(trainer.params), cfg, sub_mesh(devices[1:2], 1, 1, 1))
         engine = Engine(replica, EngineConfig(
-            num_pages=512, max_context=1024, decode_steps=8, decode_buckets=(8, 16, 32),
-            extend_buckets=(512, 1024), eos_token_ids=(eos, pad), pad_id=pad, max_group=4, max_sessions=32,
+            num_pages=1024, max_context=2048, decode_steps=8, decode_buckets=(8, 16, 32, 64),
+            extend_buckets=(512, 1024, 2048), eos_token_ids=(eos, pad), pad_id=pad, max_group=4, max_sessions=64,
         ))
         del replica, model
         engine.start()
         sync.add(engine, shardings)
-        prompts = ["Count from one to fifty in words.", "Write a long poem about rivers.",
-                   "Explain recursion with three examples.", "List twenty animals and a fact each."]
+        # Long answers keep trajectories generating across several weight pushes.
+        prompts = ["Count from one to three hundred in words.", "Write a very long epic poem about rivers.",
+                   "Explain recursion with ten detailed examples.", "List one hundred animals and a fact each."]
         tasks = ({"prompt": [{"role": "user", "content": p}]} for _ in iter(int, 1) for p in prompts)
-        cfg_loop = loop.LoopConfig(num_steps=4, groups_per_step=2, rollout_ahead=2,
-                                   max_staleness=MAX_STALENESS, rollout=RolloutConfig(4, 400, 1.0), seed=0,
+        cfg_loop = loop.LoopConfig(num_steps=6, groups_per_step=3, rollout_ahead=2,
+                                   max_staleness=MAX_STALENESS, rollout=RolloutConfig(4, 1500, 1.0), seed=0,
                                    eval_every=2, eval_samples=1, eval_concurrency=4,
                                    dump_every=1000)
         metrics = []

@@ -75,8 +75,14 @@ async def rollout_group(
     return samples
 
 
+def _completion(future):
+    # Shielded: cancelling the trajectory must not cancel the engine's future, which the engine
+    # thread resolves later (a cancelled future would kill that thread).
+    return asyncio.shield(asyncio.wrap_future(future))
+
+
 async def _trajectory(engine, env, task, sample: Sample, future, key, cfg: RolloutConfig) -> None:
-    c = await asyncio.wrap_future(future)
+    c = await _completion(future)
     try:
         while True:
             sample.append(c.tokens, c.logprobs, c.weight_versions)
@@ -94,7 +100,7 @@ async def _trajectory(engine, env, task, sample: Sample, future, key, cfg: Rollo
                 break
             sample.append(obs, None, None)
             req = Request(obs, key[None], [budget], [cfg.temperature], session=c.session)
-            c = await asyncio.wrap_future(engine.generate(req)[0])
+            c = await _completion(engine.generate(req)[0])
         sample.reward = float(await env.reward(task, sample))
     except Exception as exc:  # noqa: BLE001 - env and reward failures make the sample missing
         sample.status, sample.reward, sample.error = "error", None, f"{type(exc).__name__}: {exc}"

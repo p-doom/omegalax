@@ -189,7 +189,7 @@ async def run(trainer: Trainer, engines, sync: WeightSync, env: Env, tasks: Iter
             print(f"step {step + 1} sample errors (first): {errors[:3]}", flush=True)
             errors.clear()
     producer.cancel()
+    await asyncio.gather(*evals)
     for t in list(running):
         t.cancel()
-    await asyncio.gather(*evals)
     train_thread.shutdown()
