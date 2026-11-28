@@ -366,6 +366,9 @@ def create_qwen3_5_from_safetensors(
     for f in files:
         with safetensors.safe_open(f, framework="numpy") as sf:
             for torch_key in sf.keys():
+                # A tied model has no head of its own; HF ignores a saved one too.
+                if cfg.text_config.tie_word_embeddings and torch_key == "lm_head.weight":
+                    continue
                 tensor = sf.get_tensor(torch_key)
 
                 # Special: Conv3D patch embedding
@@ -440,9 +443,6 @@ def create_qwen3_5_from_safetensors(
                 )
 
     check_conversion_errors(unmatched_hf_keys)
-
-    if cfg.text_config.tie_word_embeddings:
-        state_dict["lm_head"]["kernel"] = state_dict["text"]["embedder"]["embedding"].T
 
     gc.collect()
     model = nnx.merge(graph_def, state_dict)

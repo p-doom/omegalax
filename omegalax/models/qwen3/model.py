@@ -184,15 +184,24 @@ class Qwen3(nnx.Module):
             [DecoderLayer(cfg=cfg, layer_idx=i, rngs=rngs) for i in range(cfg.num_layers)]
         )
         self.final_norm = RMSNorm(cfg.emb_dim, cfg.norm_eps, rngs=rngs)
-        lm_head_init = nnx.initializers.lecun_normal()
-        self.lm_head = nnx.Linear(
-            cfg.emb_dim,
-            cfg.vocab_size,
-            use_bias=False,
-            rngs=rngs,
-            dtype=cfg.dtype,
-            kernel_init=wp(lm_head_init, ("embed", "vocab")),
-        )
+        if cfg.tie_word_embeddings:
+            self.lm_head = None
+        else:
+            lm_head_init = nnx.initializers.lecun_normal()
+            self.lm_head = nnx.Linear(
+                cfg.emb_dim,
+                cfg.vocab_size,
+                use_bias=False,
+                rngs=rngs,
+                dtype=cfg.dtype,
+                kernel_init=wp(lm_head_init, ("embed", "vocab")),
+            )
+
+    def output_weight(self) -> jax.Array:
+        """The (emb_dim, vocab) output projection: the embedding, transposed, when tied."""
+        if self.lm_head is None:
+            return self.embedder.embedding[...].T
+        return self.lm_head.kernel[...]
 
     def __call__(self, token_ids_BT, segment_ids_BT, cache, num_right_pads):
         del num_right_pads

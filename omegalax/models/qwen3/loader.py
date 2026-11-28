@@ -165,6 +165,9 @@ def create_qwen3_from_safetensors(
                 ):
                     continue
 
+                # A tied model has no head of its own; HF ignores a saved one too.
+                if cfg.tie_word_embeddings and torch_key == "lm_head.weight":
+                    continue
                 jax_key, transform = map_to_bonsai_key(key_mapping, torch_key)
                 if jax_key is None:
                     unmatched_hf_keys.append(torch_key)
@@ -191,9 +194,6 @@ def create_qwen3_from_safetensors(
     gc.collect()
 
     check_conversion_errors(unmatched_hf_keys)
-
-    if cfg.tie_word_embeddings:
-        state_dict["lm_head"]["kernel"] = state_dict["embedder"]["embedding"].T
 
     gc.collect()
     model = nnx.merge(graph_def, state_dict)

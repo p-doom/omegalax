@@ -318,6 +318,27 @@ class TextModel(nnx.Module):
         return hidden_BTD, total_aux
 
 
+def _lm_head(cfg: Qwen3_5TextConfig, rngs: nnx.Rngs) -> nnx.Linear | None:
+    """No separate head when tied: the logits use the embedding (``_output_weight``)."""
+    if cfg.tie_word_embeddings:
+        return None
+    return nnx.Linear(
+        cfg.hidden_size,
+        cfg.vocab_size,
+        use_bias=False,
+        rngs=rngs,
+        dtype=cfg.dtype,
+        kernel_init=wp(nnx.initializers.lecun_normal(), ("embed", "vocab")),
+    )
+
+
+def _output_weight(model) -> jax.Array:
+    """The (hidden, vocab) output projection: the embedding, transposed, when tied."""
+    if model.lm_head is None:
+        return model.text.embedder.embedding[...].T
+    return model.lm_head.kernel[...]
+
+
 # Causal LM
 class Qwen3_5ForCausalLM(nnx.Module):
     """Text-only causal language model."""
@@ -325,15 +346,10 @@ class Qwen3_5ForCausalLM(nnx.Module):
     def __init__(self, cfg: Qwen3_5TextConfig, *, rngs: nnx.Rngs):
         self.text = TextModel(cfg, rngs=rngs)
         self.logits_shd = P(cfg.shd_cfg.act_btd[0], None, None)
-        lm_head_init = nnx.initializers.lecun_normal()
-        self.lm_head = nnx.Linear(
-            cfg.hidden_size,
-            cfg.vocab_size,
-            use_bias=False,
-            rngs=rngs,
-            dtype=cfg.dtype,
-            kernel_init=wp(lm_head_init, ("embed", "vocab")),
-        )
+        self.lm_head = _lm_head(cfg, rngs)
+
+    def output_weight(self) -> jax.Array:
+        return _output_weight(self)
 
     def __call__(self, token_ids_BT, segment_ids_BT, cache, num_right_pads):
         del cache, num_right_pads
@@ -349,15 +365,10 @@ class Qwen3_5ForConditionalGeneration(nnx.Module):
         self.vision = VisionModel(cfg.vision_config, shd_cfg=cfg.text_config.shd_cfg, rngs=rngs)
         self.text = TextModel(cfg.text_config, rngs=rngs)
         self.logits_shd = P(cfg.text_config.shd_cfg.act_btd[0], None, None)
-        lm_head_init = nnx.initializers.lecun_normal()
-        self.lm_head = nnx.Linear(
-            cfg.text_config.hidden_size,
-            cfg.text_config.vocab_size,
-            use_bias=False,
-            rngs=rngs,
-            dtype=cfg.text_config.dtype,
-            kernel_init=wp(lm_head_init, ("embed", "vocab")),
-        )
+        self.lm_head = _lm_head(cfg.text_config, rngs)
+
+    def output_weight(self) -> jax.Array:
+        return _output_weight(self)
 
     def __call__(
         self,
