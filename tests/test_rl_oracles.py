@@ -165,24 +165,27 @@ class RLOracleTest(absltest.TestCase):
             toks = rng.integers(10, 50000, L).tolist()
             samples.append(Sample(0, toks, 50, [0] * 50 + [1] * (L - 50), list(rng.normal(-2, 0.5, L)), [0] * L))
         adv = [1.0, -1.0, 0.5, -0.5]
-        params = []
+        states = []
         for host in (False, True):
             model, cfg = load_causal_lm(path, sub_mesh(jax.devices()[:2], 1, 2, 1))
             trainer = Trainer(model, cfg, dataclasses.replace(self.trainer.cfg, host_optimizer=host))
             del model
             trainer.warmup()
-            for _ in range(2):
-                m = trainer.step(samples, adv)
-            print(f"host_optimizer={host}: step {m['train/seconds']:.2f} s, grad norm {m['train/grad_norm']:.4f}")
-            params.append(jax.device_get(trainer.params))
+            m = trainer.step(samples, adv)
+            print(f"host_optimizer={host}: step {m['train/seconds']:.2f} s, grad norm {m['train/grad_norm']:.6f}")
+            states.append(jax.device_get((trainer.params, trainer.opt_state)))
             del trainer
-        # CPU and GPU float32 arithmetic differ in the last bits; Adam turns that into a full
-        # lr-sized sign flip where a gradient is ~0. Bound those and require the rest to agree.
-        diff = np.concatenate([np.abs(a - b).ravel() for a, b in zip(jax.tree.leaves(params[0]), jax.tree.leaves(params[1]))])
+        # One step from identical params sees identical gradients, so params and Adam moments may differ
+        # only by CPU vs GPU float32 rounding. A second step would compare gradients of last-bit-different
+        # params, which the bfloat16 forward amplifies into ~1 % gradient noise.
         lr = self.trainer.cfg.lr
-        print(f"device vs host optimizer: max |dp| {diff.max():.2e}, frac > 1e-3 lr: {(diff > 1e-3 * lr).mean():.2e}")
-        self.assertLessEqual(diff.max(), 2 * lr * 2 * 1.01)
-        self.assertLess((diff > 1e-3 * lr).mean(), 1e-3)
+        diff = max(float(np.max(np.abs(a - b))) for a, b in zip(jax.tree.leaves(states[0][0]), jax.tree.leaves(states[1][0])))
+        print(f"device vs host optimizer after one step: max |dp| {diff:.2e} ({diff / lr:.1e} lr)")
+        for a, b in zip(jax.tree.leaves(states[0][0]), jax.tree.leaves(states[1][0])):
+            np.testing.assert_allclose(a, b, rtol=5e-7, atol=1e-3 * lr)
+        # The GPU flushes float32 subnormals (second moments of ~1e-20 gradients) to zero; the CPU keeps them.
+        for a, b in zip(jax.tree.leaves(states[0][1]), jax.tree.leaves(states[1][1])):
+            np.testing.assert_allclose(a, b, rtol=5e-7, atol=1e-37)
 
 
 if __name__ == "__main__":
