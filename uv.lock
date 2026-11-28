@@ -1969,7 +1969,7 @@ requires-dist = [
     { name = "orbax-checkpoint" },
     { name = "pillow" },
     { name = "safetensors" },
-    { name = "tokamax", git = "https://github.com/p-doom/tokamax.git?rev=nested-mask" },
+    { name = "tokamax", git = "https://github.com/p-doom/tokamax.git?rev=6c2d755763d1a1906448719c1c23bf6dc5034a93" },
     { name = "torch", marker = "sys_platform == 'linux' and extra == 'torch-tests'", specifier = "==2.10.*" },
     { name = "transformers" },
     { name = "triton" },
@@ -2975,7 +2975,7 @@ wheels = [
 [[package]]
 name = "tokamax"
 version = "0.0.12"
-source = { git = "https://github.com/p-doom/tokamax.git?rev=nested-mask#d81bc23bc80f01728984bcda5161ff2569cd7cc5" }
+source = { git = "https://github.com/p-doom/tokamax.git?rev=6c2d755763d1a1906448719c1c23bf6dc5034a93#6c2d755763d1a1906448719c1c23bf6dc5034a93" }
 dependencies = [
     { name = "absl-py" },
     { name = "einshape" },
