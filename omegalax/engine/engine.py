@@ -175,16 +175,18 @@ class Engine:
             lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=x.sharding), state
         )
         layout = _inference_layout(model, state, tp)
-        self._to_inference = (
-            jax.jit(
-                lambda leaves: [
-                    x.astype(d) if order is None else _reorder(x.astype(d), axis, order)
-                    for x, (d, axis, order) in zip(leaves, layout)
-                ]
+        # The engine traces under its own mesh, whatever mesh the caller has set, if any.
+        with jax.set_mesh(self._mesh):
+            self._to_inference = (
+                jax.jit(
+                    lambda leaves: [
+                        x.astype(d) if order is None else _reorder(x.astype(d), axis, order)
+                        for x, (d, axis, order) in zip(leaves, layout)
+                    ]
+                )
+                .lower(jax.tree.leaves(self._abstract))
+                .compile()
             )
-            .lower(jax.tree.leaves(self._abstract))
-            .compile()
-        )
         # Score runs the trainer forward, which needs the trainer's channel order back.
         self._reordered = [i for i, (_, _, order) in enumerate(layout) if order is not None]
         self._to_trainer_order = jax.jit(
