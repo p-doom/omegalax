@@ -39,6 +39,8 @@ _STATE_U_BLOCK = 32
 
 
 def _l2norm(x: jax.Array, axis: int = -1, eps: float = 1e-6) -> jax.Array:
+    # float32: in float16 the backward of rsqrt(eps) on zero (padding) rows overflows to inf * 0.
+    x = x.astype(jnp.float32)
     inv_norm = jax.lax.rsqrt((x * x).sum(axis=axis, keepdims=True) + eps)
     return x * inv_norm
 
