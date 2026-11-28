@@ -31,6 +31,7 @@ class LoopConfig:
     eval_samples: int
     eval_concurrency: int
     dump_every: int
+    save_every: int
 
 
 def jsonl_tasks(path: str, seed: int) -> Iterator[dict]:
@@ -79,10 +80,11 @@ def _engine_totals(engines) -> np.ndarray:
 
 
 async def run(trainer: Trainer, engines, sync: WeightSync, env: Env, tasks: Iterator[dict],
-              eval_tasks: list[dict], cfg: LoopConfig, log, dump):
+              eval_tasks: list[dict], cfg: LoopConfig, log, dump, save):
     """Trains ``cfg.num_steps`` steps; ``log`` receives each step's metrics and each evaluation
     (started before step 1 and after every ``eval_every`` steps), ``dump`` the trained samples of
-    every ``dump_every``-th step."""
+    every ``dump_every``-th step, ``save`` the policy (``sync.gather`` output) after every
+    ``save_every``-th step (0: never)."""
     G = cfg.groups_per_step
     capacity = asyncio.Semaphore((cfg.rollout_ahead + 1) * G)
     ready: asyncio.Queue = asyncio.Queue()
@@ -116,6 +118,10 @@ async def run(trainer: Trainer, engines, sync: WeightSync, env: Env, tasks: Iter
         advantages = [a for g in batch for a in group_advantages([s.reward for s in g])]
         metrics = trainer.step(samples, advantages)
         metrics.update(sync.push(trainer.params, trainer.version))
+        if cfg.save_every and trainer.version % cfg.save_every == 0:
+            t = time.perf_counter()
+            save(trainer.version, sync.gather(trainer.params))
+            metrics["save_s"] = time.perf_counter() - t
         return metrics
 
     # Evaluations can outlast eval_every steps; one budget per engine for all of them keeps every
