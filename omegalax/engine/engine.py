@@ -161,11 +161,15 @@ class Engine:
             lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=x.sharding), state
         )
         layout = _inference_layout(model, state, tp)
-        self._to_inference = jax.jit(
-            lambda leaves: [
-                x.astype(d) if order is None else _reorder(x.astype(d), axis, order)
-                for x, (d, axis, order) in zip(leaves, layout)
-            ]
+        self._to_inference = (
+            jax.jit(
+                lambda leaves: [
+                    x.astype(d) if order is None else _reorder(x.astype(d), axis, order)
+                    for x, (d, axis, order) in zip(leaves, layout)
+                ]
+            )
+            .lower(jax.tree.leaves(self._abstract))
+            .compile()
         )
         # Score runs the trainer forward, which needs the trainer's channel order back.
         self._reordered = [i for i, (_, _, order) in enumerate(layout) if order is not None]
@@ -214,13 +218,13 @@ class Engine:
         # XLA's dot merger would concatenate the weights of sibling projections (DeltaNet's four
         # in_proj) on every call, a full extra weight copy per decode step.
         no_merge = {"xla_gpu_dot_merger_threshold_mb": 0}
-        self._decode = jax.jit(
+        self._decode_jit = jax.jit(
             bind(steps.decode),
             static_argnames=("num_steps", "num_work"),
             donate_argnums=(1,),
             compiler_options=no_merge,
         )
-        self._extend = jax.jit(
+        self._extend_jit = jax.jit(
             bind(steps.extend),
             static_argnames=("block_q",),
             donate_argnums=(1,),
@@ -248,10 +252,11 @@ class Engine:
     def start(self) -> dict[str, float]:
         """Starts the engine thread and returns once it is ready to serve.
 
-        The thread casts the weights, allocates the page pool and compiles every bucket by
-        running it on inactive rows; it returns the seconds each bucket took. All device work
-        stays on this thread because JAX's trace and compile caches are thread-local. The pool
-        is allocated here, not in ``__init__``, so a caller can drop its float32 model first.
+        The thread casts the weights, allocates the page pool and compiles every bucket ahead of
+        time, running it once on inactive rows; it returns the seconds each bucket took. All
+        device work stays on this thread because JAX's trace and compile caches are thread-local.
+        The pool is allocated here, not in ``__init__``, so a caller can drop its float32 model
+        first.
         """
         ready = Future()
         self._thread = threading.Thread(target=self._loop, args=(ready,), daemon=True)
@@ -259,28 +264,35 @@ class Engine:
         return ready.result()
 
     def _warmup(self) -> dict[str, float]:
-        # The first trace of the trainer forward (tokamax attention) extends JAX's trace context,
-        # which is part of every jit cache key, so trace it before anything is compiled. tokamax
-        # parses absl flags from sys.argv at that point unless the caller already has.
-        self._score.trace(self._state, np.zeros((1, 128), np.int32), pad_id=self.cfg.pad_id)
         self._state = self._to_inference(self._state)
         zeros = lambda shape, dtype, spec: jax.jit(
             lambda: jnp.zeros(shape, dtype), out_shardings=NamedSharding(self._mesh, spec)
         )()
         self._pools = [tuple(zeros(*spec) for spec in specs) for specs in self._pool_specs]
-        runs = {
-            f"decode_{B}": (self._run_decode_call, self._decode_inputs([], B))
-            for B in self.cfg.decode_buckets
-        }
-        runs |= {
-            f"extend_{T}": (self._run_extend_call, self._extend_inputs([], T))
-            for T in self.cfg.extend_buckets
-        }
-        seconds = {}
-        for name, (run, inputs) in runs.items():
+        # Ahead-of-time executables: a jitted call would recompile whenever JAX's jit cache key
+        # changes, as it does on each thread's first tokamax op (jax.make_user_context).
+        self._decode, self._extend, seconds = {}, {}, {}
+        for B in self.cfg.decode_buckets:
             t = time.perf_counter()
-            run(inputs)
-            seconds[name] = time.perf_counter() - t
+            inputs = self._decode_inputs([], B)
+            self._decode[B] = self._decode_jit.lower(
+                self._state,
+                self._pools,
+                *inputs,
+                self._eos,
+                num_steps=self.cfg.decode_steps,
+                num_work=B + self.cfg.spare_work,
+            ).compile()
+            self._run_decode_call(inputs)
+            seconds[f"decode_{B}"] = time.perf_counter() - t
+        for T in self.cfg.extend_buckets:
+            t = time.perf_counter()
+            inputs = self._extend_inputs([], T)
+            self._extend[T] = self._extend_jit.lower(
+                self._state, self._pools, *inputs, block_q=self._block_q
+            ).compile()
+            self._run_extend_call(inputs)
+            seconds[f"extend_{T}"] = time.perf_counter() - t
         self.stats.clear()
         return seconds
 
@@ -687,11 +699,8 @@ class Engine:
 
     def _run_extend_call(self, args):
         t = time.perf_counter()
-        self._pools, tok_R, logp_R = self._extend(
-            self._state,
-            self._pools,
-            *args,
-            block_q=self._block_q,
+        self._pools, tok_R, logp_R = self._extend[args[0].shape[0]](
+            self._state, self._pools, *args
         )
         tok_R, logp_R = np.asarray(tok_R), np.asarray(logp_R)
         self.stats["extend_s"] += time.perf_counter() - t
@@ -736,15 +745,9 @@ class Engine:
         return tok, pos, remaining, temp, key_data, stop, page_table, slot
 
     def _run_decode_call(self, args):
-        B = args[0].shape[0]
         t = time.perf_counter()
-        self._pools, tok_KB, logp_KB, valid_KB = self._decode(
-            self._state,
-            self._pools,
-            *args,
-            self._eos,
-            num_steps=self.cfg.decode_steps,
-            num_work=B + self.cfg.spare_work,
+        self._pools, tok_KB, logp_KB, valid_KB = self._decode[args[0].shape[0]](
+            self._state, self._pools, *args, self._eos
         )
         out = np.asarray(tok_KB), np.asarray(logp_KB), np.asarray(valid_KB)
         self.stats["decode_s"] += time.perf_counter() - t
