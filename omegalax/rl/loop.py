@@ -73,7 +73,8 @@ async def evaluate(engines, env: Env, tasks: list[dict], cfg: RolloutConfig, sam
 
 
 def _engine_totals(engines) -> np.ndarray:
-    keys = ("decode_s", "extend_s", "decode_tokens", "decode_row_steps", "extend_tokens")
+    keys = ("decode_s", "extend_s", "decode_tokens", "decode_row_steps", "extend_tokens",
+            "evict_idle", "evict_waiting", "evicted_tokens")
     return np.asarray([sum(e.stats[k] for e in engines) for k in keys], np.float64)
 
 
@@ -161,7 +162,8 @@ async def run(trainer: Trainer, engines, sync: WeightSync, env: Env, tasks: Iter
             capacity.release()
         now = time.perf_counter()
         totals = _engine_totals(engines)
-        decode_s, extend_s, decode_tokens, row_steps, extend_tokens = totals - totals0
+        decode_s, extend_s, decode_tokens, row_steps, extend_tokens, *_ = totals - totals0
+        evictions = totals[5:]
         metrics.update(summarize(samples))
         metrics.update({
             "step": step + 1,
@@ -179,6 +181,9 @@ async def run(trainer: Trainer, engines, sync: WeightSync, env: Env, tasks: Iter
             "engine/decode_tokens_per_s": decode_tokens / (now - t_prev),
             "engine/decode_occupancy": decode_tokens / max(row_steps, 1.0),
             "engine/extend_tokens_per_s": extend_tokens / (now - t_prev),
+            "engine/evict_idle": int(evictions[0]),
+            "engine/evict_waiting": int(evictions[1]),
+            "engine/evicted_tokens": int(evictions[2]),
             "groups/outstanding": len(running) + ready.qsize(),
         })
         totals0, t_prev = totals, now
