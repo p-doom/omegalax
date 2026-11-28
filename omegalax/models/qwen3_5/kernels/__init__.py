@@ -16,16 +16,17 @@ otherwise ``xla``. Override with ``OMEGALAX_DELTANET_KERNEL=xla|pallas``.
 
 Both share the same signature so callers don't care which path runs:
 
-    chunk_gated_delta_rule(q_BTHA, k_BTHA, v_BTHU, g_BTH, beta_BTH, chunk_size=64)
+    chunk_gated_delta_rule(q_BTHA, k_BTHA, v_BTHU, g_BTH, beta_BTH, init_NHAU, init_idx_BJ,
+                           final_idx_BW, chunk_size=64) -> (out_BTHU, final_state_BWHAU)
 """
 
 import os
 
 import jax
 
-from .xla_reference import chunk_gated_delta_rule_xla
+from .xla_reference import chunk_gated_delta_rule_xla, gated_delta_decode_xla
 
-__all__ = ["chunk_gated_delta_rule_xla"]
+__all__ = ["chunk_gated_delta_rule_xla", "gated_delta_decode_xla"]
 
 
 def _resolve_backend():
@@ -48,14 +49,41 @@ def chunk_gated_delta_rule(
     v_BTHU,
     g_BTH,
     beta_BTH,
+    init_NHAU,
+    init_idx_BJ,
+    final_idx_BW,
     chunk_size: int = 64,
 ):
     """Dispatcher. Late-binds the backend so env-var changes take effect per process."""
+    args = (
+        q_BTHA,
+        k_BTHA,
+        v_BTHU,
+        g_BTH,
+        beta_BTH,
+        init_NHAU,
+        init_idx_BJ,
+        final_idx_BW,
+        chunk_size,
+    )
     backend = _resolve_backend()
     if backend == "xla":
-        return chunk_gated_delta_rule_xla(q_BTHA, k_BTHA, v_BTHU, g_BTH, beta_BTH, chunk_size)
+        return chunk_gated_delta_rule_xla(*args)
     if backend == "pallas":
         from .pallas_triton import chunk_gated_delta_rule_pallas
 
-        return chunk_gated_delta_rule_pallas(q_BTHA, k_BTHA, v_BTHU, g_BTH, beta_BTH, chunk_size)
+        return chunk_gated_delta_rule_pallas(*args)
+    raise ValueError(f"Unknown OMEGALAX_DELTANET_KERNEL={backend!r}. Use 'xla' or 'pallas'.")
+
+
+def gated_delta_decode(*args, eps):
+    """Dispatcher for one decode token per row; same backends as ``chunk_gated_delta_rule``.
+    Arguments as :func:`gated_delta_decode_xla`."""
+    backend = _resolve_backend()
+    if backend == "xla":
+        return gated_delta_decode_xla(*args, eps=eps)
+    if backend == "pallas":
+        from .pallas_triton import gated_delta_decode_pallas
+
+        return gated_delta_decode_pallas(*args, eps=eps)
     raise ValueError(f"Unknown OMEGALAX_DELTANET_KERNEL={backend!r}. Use 'xla' or 'pallas'.")

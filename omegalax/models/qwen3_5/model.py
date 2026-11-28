@@ -9,6 +9,7 @@ from jax.sharding import PartitionSpec, reshard
 
 from omegalax.models.shard_config import ShardConfig
 from .attention import Attention
+from .cache import Cache
 from .config import Qwen3_5Config, Qwen3_5TextConfig
 from .deltanet import GatedDeltaNet
 from .norms import RMSNorm
@@ -215,14 +216,17 @@ class DecoderLayer(nnx.Module):
         segment_ids_BT: jax.Array,
         position_ids_BT: jax.Array,
         attention_mask_BT: jax.Array | None = None,
-    ) -> tuple[jax.Array, jax.Array]:
+        cache=None,
+    ):
         residual_BTD = hidden_BTD
         normed_BTD = self.input_layernorm(hidden_BTD)
 
         if self.layer_type == "full_attention":
-            attn_out_BTD = self.attn(normed_BTD, cos_BTK, sin_BTK, segment_ids_BT, position_ids_BT)
+            attn_out_BTD, cache = self.attn(
+                normed_BTD, cos_BTK, sin_BTK, segment_ids_BT, position_ids_BT, cache
+            )
         else:
-            attn_out_BTD = self.linear_attn(normed_BTD, attention_mask_BT)
+            attn_out_BTD, cache = self.linear_attn(normed_BTD, attention_mask_BT, cache)
 
         hidden_BTD = residual_BTD + attn_out_BTD
 
@@ -235,7 +239,7 @@ class DecoderLayer(nnx.Module):
             aux_loss = jnp.array(0.0, dtype=jnp.float32)
         hidden_BTD = residual_BTD + ff_out_BTD
 
-        return hidden_BTD, aux_loss
+        return hidden_BTD, aux_loss, cache
 
 
 # Text Model
@@ -265,8 +269,11 @@ class TextModel(nnx.Module):
         inputs_embeds_BTD: jax.Array | None = None,
         segment_ids_BT: jax.Array | None = None,
         position_ids_ZBT: jax.Array | None = None,
+        cache: Cache | None = None,
     ) -> tuple[jax.Array, jax.Array]:
         cfg = self.cfg
+        if cache is not None:
+            position_ids_ZBT = cache.positions_BT
 
         if inputs_embeds_BTD is None:
             hidden_BTD = jnp.astype(
@@ -302,20 +309,44 @@ class TextModel(nnx.Module):
         text_position_ids_BT = position_ids_ZBT[0]
 
         aux_losses = []
-        for layer in self.layers:
-            hidden_BTD, aux = layer(
+        for i, layer in enumerate(self.layers):
+            hidden_BTD, aux, layer_cache = layer(
                 hidden_BTD,
                 cos_BTK,
                 sin_BTK,
                 segment_ids_BT,
                 text_position_ids_BT,
                 attention_mask_BT,
+                None if cache is None else cache.layers[i],
             )
+            if cache is not None:
+                cache.layers[i] = layer_cache
             aux_losses.append(aux)
 
         hidden_BTD = self.final_norm(hidden_BTD)
         total_aux = jnp.sum(jnp.stack(aux_losses)) if aux_losses else jnp.array(0.0)
         return hidden_BTD, total_aux
+
+
+def _lm_head(cfg: Qwen3_5TextConfig, rngs: nnx.Rngs) -> nnx.Linear | None:
+    """No separate head when tied: the logits use the embedding (``_output_weight``)."""
+    if cfg.tie_word_embeddings:
+        return None
+    return nnx.Linear(
+        cfg.hidden_size,
+        cfg.vocab_size,
+        use_bias=False,
+        rngs=rngs,
+        dtype=cfg.dtype,
+        kernel_init=wp(nnx.initializers.lecun_normal(), ("embed", "vocab")),
+    )
+
+
+def _output_weight(model) -> jax.Array:
+    """The (hidden, vocab) output projection: the embedding, transposed, when tied."""
+    if model.lm_head is None:
+        return model.text.embedder.embedding[...].T
+    return model.lm_head.kernel[...]
 
 
 # Causal LM
@@ -325,19 +356,14 @@ class Qwen3_5ForCausalLM(nnx.Module):
     def __init__(self, cfg: Qwen3_5TextConfig, *, rngs: nnx.Rngs):
         self.text = TextModel(cfg, rngs=rngs)
         self.logits_shd = P(cfg.shd_cfg.act_btd[0], None, None)
-        lm_head_init = nnx.initializers.lecun_normal()
-        self.lm_head = nnx.Linear(
-            cfg.hidden_size,
-            cfg.vocab_size,
-            use_bias=False,
-            rngs=rngs,
-            dtype=cfg.dtype,
-            kernel_init=wp(lm_head_init, ("embed", "vocab")),
-        )
+        self.lm_head = _lm_head(cfg, rngs)
+
+    def output_weight(self) -> jax.Array:
+        return _output_weight(self)
 
     def __call__(self, token_ids_BT, segment_ids_BT, cache, num_right_pads):
-        del cache, num_right_pads
-        return self.text(token_ids_BT=token_ids_BT, segment_ids_BT=segment_ids_BT)
+        del num_right_pads
+        return self.text(token_ids_BT=token_ids_BT, segment_ids_BT=segment_ids_BT, cache=cache)
 
 
 # VLM
@@ -349,15 +375,10 @@ class Qwen3_5ForConditionalGeneration(nnx.Module):
         self.vision = VisionModel(cfg.vision_config, shd_cfg=cfg.text_config.shd_cfg, rngs=rngs)
         self.text = TextModel(cfg.text_config, rngs=rngs)
         self.logits_shd = P(cfg.text_config.shd_cfg.act_btd[0], None, None)
-        lm_head_init = nnx.initializers.lecun_normal()
-        self.lm_head = nnx.Linear(
-            cfg.text_config.hidden_size,
-            cfg.text_config.vocab_size,
-            use_bias=False,
-            rngs=rngs,
-            dtype=cfg.text_config.dtype,
-            kernel_init=wp(lm_head_init, ("embed", "vocab")),
-        )
+        self.lm_head = _lm_head(cfg.text_config, rngs)
+
+    def output_weight(self) -> jax.Array:
+        return _output_weight(self)
 
     def __call__(
         self,

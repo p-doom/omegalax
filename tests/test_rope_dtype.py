@@ -122,9 +122,9 @@ class Qwen3_5TextRopeDtypeTest(_RopeDtypeTestBase):
         layer_calls = []
         orig_layer_call = model_mod.DecoderLayer.__call__
 
-        def layer_spy(self_layer, hidden, cos_BTK, sin_BTK, seg, pos, attn_mask=None):
+        def layer_spy(self_layer, hidden, cos_BTK, sin_BTK, *rest):
             layer_calls.append({"cos": cos_BTK.dtype, "sin": sin_BTK.dtype})
-            return orig_layer_call(self_layer, hidden, cos_BTK, sin_BTK, seg, pos, attn_mask)
+            return orig_layer_call(self_layer, hidden, cos_BTK, sin_BTK, *rest)
 
         B, T = 1, 8
         tokens = jnp.ones((B, T), dtype=jnp.int32)

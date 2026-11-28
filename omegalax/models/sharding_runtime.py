@@ -78,3 +78,13 @@ def shard_batch_dict(
         sharding = NamedSharding(mesh, spec)
         result[key] = jax.make_array_from_process_local_data(sharding, arr)
     return result
+
+
+def per_shard(fn, in_specs: tuple, out_specs, *args):
+    """Runs ``fn`` on each device's shard (``jax.shard_map``) after resharding every argument
+    pytree to its ``in_specs`` entry; used around kernels that only see local heads."""
+    args = [
+        jax.tree.map(lambda x, spec=spec: jax.sharding.reshard(x, spec), arg)
+        for arg, spec in zip(args, in_specs, strict=True)
+    ]
+    return jax.shard_map(fn, in_specs=in_specs, out_specs=out_specs, check_vma=False)(*args)
