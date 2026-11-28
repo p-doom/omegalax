@@ -100,7 +100,7 @@ async def run(trainer: Trainer, engines, sync: WeightSync, env: Env, tasks: Iter
         except Exception as exc:
             result = exc
         load[e] -= 1
-        await ready.put(result)
+        await ready.put((gid, result))
 
     async def produce():
         for gid, task in enumerate(tasks):
@@ -134,14 +134,21 @@ async def run(trainer: Trainer, engines, sync: WeightSync, env: Env, tasks: Iter
     producer = asyncio.create_task(produce())
     dropped = {"error": 0, "stale": 0}
     errors = []
+    # Batches take groups in launch order: completion order would train every step on the groups
+    # that happened to finish first (short responses) and push long ones to later, staler steps.
+    done, next_gid = {}, 0
     totals0, t_prev = _engine_totals(engines), t_start
     for step in range(cfg.num_steps):
         t_wait = time.perf_counter()
         batch = []
         while len(batch) < G:
-            group = await ready.get()
-            if isinstance(group, Exception):
-                raise group
+            while next_gid not in done:
+                gid, result = await ready.get()
+                if isinstance(result, Exception):
+                    raise result
+                done[gid] = result
+            group = done.pop(next_gid)
+            next_gid += 1
             if any(s.status == "error" for s in group):
                 dropped["error"] += 1
                 errors += [s.error for s in group if s.error][:1]
@@ -154,6 +161,7 @@ async def run(trainer: Trainer, engines, sync: WeightSync, env: Env, tasks: Iter
                 continue
             batch.append(group)
         wait_s = time.perf_counter() - t_wait
+        finished_ahead = len(done)
         samples = [s for g in batch for s in g]
         lags = np.asarray([trainer.version - v for s in samples for v, m in zip(s.versions, s.mask) if m])
         rewards = np.asarray([[s.reward for s in g] for g in batch])
@@ -175,6 +183,8 @@ async def run(trainer: Trainer, engines, sync: WeightSync, env: Env, tasks: Iter
             "wall_s": now - t_start,
             "step_s": now - t_prev,
             "trainer_wait_s": wait_s,
+            # Groups that finished but wait behind an older unfinished one (head-of-line blocking).
+            "groups/finished_ahead": finished_ahead,
             "staleness/mean": float(lags.mean()),
             "staleness/max": int(lags.max()),
             "groups/zero_variance": int(np.sum(rewards.std(axis=1) == 0)),

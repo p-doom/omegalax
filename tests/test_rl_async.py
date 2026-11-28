@@ -96,6 +96,10 @@ class AsyncInvariantsTest(absltest.TestCase):
         finally:
             engine.stop()
 
+        # Batches take groups in launch order (prompts of very different lengths would finish out of it).
+        launched = [s.group for _, samples in trainer.batches for s in samples[:: cfg_loop.rollout.group_size]]
+        self.assertEqual(launched, sorted(set(launched)))
+
         spanning, single = 0, []
         for train_version, samples in trainer.batches:
             for s in samples:

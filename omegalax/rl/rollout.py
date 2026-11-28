@@ -128,6 +128,7 @@ def summarize(samples: list[Sample]) -> dict[str, Any]:
         "rollout/reward": float(np.mean([s.reward for s in ok])) if ok else float("nan"),
         "rollout/truncated_frac": float(np.mean([s.status == "length" for s in ok])) if ok else 0.0,
         "rollout/response_len": float(np.mean(resp)) if ok else 0.0,
+        **{f"rollout/response_len_p{q}": float(np.percentile(resp, q)) if ok else 0.0 for q in (10, 50, 90)},
         "rollout/generated_tokens": int(sum(gen)),
         "rollout/turns": float(np.mean([s.turns for s in ok])) if ok else 0.0,
     }
