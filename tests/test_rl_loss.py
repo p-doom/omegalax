@@ -1,5 +1,6 @@
 """Policy loss and token log-probabilities against hand-computed values (CPU)."""
 
+import dataclasses
 import os
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
@@ -121,11 +122,11 @@ class TrainerTest(absltest.TestCase):
         from omegalax.models.sharding_runtime import set_attn_backend
         from omegalax.text import api as text_api
 
-        model, cfg = text_api.init_model("qwen3-smoke", jax.random.key(0), tp_size=1, fsdp_size=1, dp_size=1)
+        model, cfg = text_api.init_model("qwen3.5-smoke-dense", jax.random.key(0), tp_size=1, fsdp_size=1, dp_size=1)
         set_attn_backend(model, "xla")
         trainer = Trainer(model, cfg, TrainConfig(
             lr=1e-3, weight_decay=0.0, adam_b1=0.9, adam_b2=0.98, adam_eps=1e-8, max_grad_norm=1e9,
-            eps_low=0.2, eps_high=0.28, tokens_per_microbatch=32, length_buckets=(32, 64),
+            eps_low=0.2, eps_high=0.28, tokens_per_microbatch=64, row_tokens=64,
             logit_tile_tokens=64, pad_id=0, host_optimizer=False, loss_scale=1.0, objective="ppo", topk=1, drift_every=0,
         ))
         rng = np.random.default_rng(0)
@@ -168,11 +169,13 @@ class TrainerTest(absltest.TestCase):
         adv = [1.0, -0.5, -1.0, 0.5]
         out = {}
         for objective in ("ppo", "ppo_sc"):
-            model, cfg = text_api.init_model("qwen3-smoke", jax.random.key(0), tp_size=1, fsdp_size=1, dp_size=1)
+            # float32: bfloat16 DeltaNet conv gradients alone differ by ~2e-3 between separate programs.
+            cfg = dataclasses.replace(text_api.resolve_config("qwen3.5-smoke-dense"), dtype=jnp.float32)
+            model, cfg = text_api.init_model(cfg, jax.random.key(0), tp_size=1, fsdp_size=1, dp_size=1)
             set_attn_backend(model, "xla")
             trainer = Trainer(model, cfg, TrainConfig(
                 lr=1e-3, weight_decay=0.0, adam_b1=0.9, adam_b2=0.98, adam_eps=1e-8, max_grad_norm=1e9,
-                eps_low=0.2, eps_high=0.28, tokens_per_microbatch=64, length_buckets=(32, 64),
+                eps_low=0.2, eps_high=0.28, tokens_per_microbatch=64, row_tokens=64,
                 logit_tile_tokens=64, pad_id=0, host_optimizer=False, loss_scale=1.0, objective=objective, topk=4,
                 drift_every=1,
             ))

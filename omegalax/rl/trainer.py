@@ -14,6 +14,8 @@ import optax
 from flax import nnx
 from jax.sharding import NamedSharding, PartitionSpec as P
 
+from omegalax.models.qwen3_5.deltanet import CHUNK_SIZE
+from omegalax.models.qwen3_5.model import Qwen3_5ForCausalLM
 from omegalax.rl.loss import policy_loss, score_centering, token_logprobs
 from omegalax.rl.rollout import Sample
 from omegalax.trainers.perf import forward_flops_per_token
@@ -30,7 +32,7 @@ class TrainConfig:
     eps_low: float
     eps_high: float
     tokens_per_microbatch: int
-    length_buckets: tuple[int, ...]
+    row_tokens: int
     logit_tile_tokens: int
     pad_id: int
     host_optimizer: bool
@@ -114,11 +116,18 @@ def _cast_inputs_only(args, *, dtype, **_):
 class Trainer:
     """Owns float32 params on ``mesh`` and the optimizer state (on ``mesh`` or in host memory).
 
-    ``step`` packs samples into length-bucketed microbatches (one compiled shape per bucket),
-    sums token-normalized gradients and applies one AdamW update.
+    ``step`` packs samples into microbatches of ``tokens_per_microbatch // row_tokens`` rows of
+    ``row_tokens`` (one compiled shape), sums token-normalized gradients and applies one AdamW update.
     """
 
     def __init__(self, model: nnx.Module, model_cfg, cfg: TrainConfig):
+        # Packed rows need a model that keeps segments apart (attention, positions, DeltaNet).
+        if not isinstance(model, Qwen3_5ForCausalLM):
+            raise ValueError(f"The trainer packs segments, which {type(model).__name__} does not separate.")
+        if cfg.row_tokens % CHUNK_SIZE or cfg.tokens_per_microbatch % cfg.row_tokens:
+            raise ValueError(
+                f"row_tokens must be a multiple of {CHUNK_SIZE} and divide tokens_per_microbatch."
+            )
         self.cfg = cfg
         self.model_cfg = model_cfg
         # Linear kernels enter their matmul as float32 params (cast inside _linear_dot), so their
@@ -135,8 +144,10 @@ class Trainer:
         self._rows_multiple = 1 if batch_axis is None else int(
             np.prod([self.mesh.shape[a] for a in ((batch_axis,) if isinstance(batch_axis, str) else batch_axis)])
         )
+        self._rows = cfg.tokens_per_microbatch // cfg.row_tokens
+        if self._rows % self._rows_multiple:
+            raise ValueError(f"{self._rows} rows per microbatch do not split over {self._rows_multiple} devices.")
         self._batch_sharding = NamedSharding(self.mesh, P(batch_axis, None))
-        self._row_sharding = NamedSharding(self.mesh, P(batch_axis))
         self._cand_sharding = NamedSharding(self.mesh, P(batch_axis, None, None))
         param_shardings = jax.tree.map(lambda x: x.sharding, self.params)
         decay_mask = jax.tree.map(lambda x: x.ndim >= 2, self.params)
@@ -197,7 +208,7 @@ class Trainer:
             logp_BT, entropy_BT, cand_logp_BTK = self._forward(
                 params, mb["tokens"], mb["segment_ids"], mb["cand"]
             )
-            adv_BT = jnp.broadcast_to(mb["advantage"][:, None], logp_BT.shape)
+            adv_BT = mb["advantage"]
             loss, log_ratio_BT, clipped_BT = policy_loss(
                 logp_BT, mb["behavior_logp"], adv_BT, mb["mask"], self.cfg.eps_low, self.cfg.eps_high,
                 self.cfg.objective,
@@ -227,7 +238,7 @@ class Trainer:
 
         def loss_fn(params):
             logp_BT, _, cand_logp_BTK = self._forward(params, mb["tokens"], mb["segment_ids"], mb["cand"])
-            adv_BT = jnp.broadcast_to(mb["advantage"][:, None], logp_BT.shape)
+            adv_BT = mb["advantage"]
             return inv_tokens * score_centering(
                 cand_logp_BTK, mb["cand_logq"], adv_BT, mb["mask"], objective, self.cfg.eps_low, self.cfg.eps_high
             )
@@ -244,83 +255,72 @@ class Trainer:
         cand_BTK = jnp.zeros(tokens_BT.shape + (1,), jnp.int32)
         return self._forward(params, tokens_BT, segment_ids_BT, cand_BTK)[0]
 
-    def _bucket(self, length: int) -> int:
-        for b in self.cfg.length_buckets:
-            if b >= length:
-                return b
-        raise ValueError(f"Sample length {length} exceeds the largest bucket {self.cfg.length_buckets[-1]}.")
-
-    def _rows(self, T: int) -> int:
-        R = self._rows_multiple
-        return max(R, self.cfg.tokens_per_microbatch // T // R * R)
+    def _pack(self, lengths: Sequence[int]) -> tuple[int, list[tuple[int, int]]]:
+        """First-fit decreasing into rows of ``row_tokens``: the number of rows (a whole number of
+        microbatches) and each sequence's (row, start). Starts are multiples of CHUNK_SIZE, where
+        the DeltaNet recurrence can restart."""
+        T = self.cfg.row_tokens
+        if max(lengths, default=0) > T:
+            raise ValueError(f"Sequence length {max(lengths)} exceeds row_tokens={T}.")
+        used, placed = [], [None] * len(lengths)
+        for i in sorted(range(len(lengths)), key=lambda i: -lengths[i]):
+            slot = -(-lengths[i] // CHUNK_SIZE) * CHUNK_SIZE
+            r = next((r for r, u in enumerate(used) if u + slot <= T), len(used))
+            if r == len(used):
+                used.append(0)
+            placed[i] = (r, used[r])
+            used[r] += slot
+        return -(-len(used) // self._rows) * self._rows, placed
 
     def microbatches(self, samples: Sequence[Sample], advantages: Sequence[float]):
-        """Host arrays per microbatch. Samples go longest first; each microbatch takes the next
-        ``rows`` samples, where its first (longest) sample picks the length bucket ``T`` and
-        ``rows = tokens_per_microbatch // T``. Only the last microbatch has fully masked rows."""
-        order = sorted(range(len(samples)), key=lambda i: -len(samples[i].tokens))
-        out = []
-        while order:
-            T = self._bucket(len(samples[order[0]].tokens))
-            rows = self._rows(T)
-            chunk, order = order[:rows], order[rows:]
-            mb = {
-                "tokens": np.full((rows, T), self.cfg.pad_id, np.int32),
-                "segment_ids": np.zeros((rows, T), np.int32),
-                "mask": np.zeros((rows, T), np.float32),
-                "behavior_logp": np.zeros((rows, T), np.float32),
-                "fresh": np.zeros((rows, T), np.float32),
-                "advantage": np.zeros(rows, np.float32),
-                "cand": np.zeros((rows, T, self.cfg.topk), np.int32),
-                "cand_logq": np.full((rows, T, self.cfg.topk), -np.inf, np.float32),
-            }
-            for r, i in enumerate(chunk):
-                s = samples[i]
-                L = len(s.tokens)
-                mb["tokens"][r, :L] = s.tokens
-                mb["segment_ids"][r, :L] = 1
-                mb["mask"][r, :L] = s.mask
-                mb["behavior_logp"][r, :L] = s.logprobs
-                mb["fresh"][r, :L] = np.asarray(s.versions) == self.version
-                mb["advantage"][r] = advantages[i]
-                policy = np.flatnonzero(s.mask)
-                mb["cand"][r, policy] = np.concatenate([h[0] for h in s.heads])
-                mb["cand_logq"][r, policy] = np.concatenate([h[1] for h in s.heads])
-            out.append(mb)
-        return out
+        """Host arrays per microbatch; sample ``i`` is segment ``i + 1`` of a packed row (0 = padding)."""
+        rows, placed = self._pack([len(s.tokens) for s in samples])
+        shape = (rows, self.cfg.row_tokens)
+        packed = {
+            "tokens": np.full(shape, self.cfg.pad_id, np.int32),
+            "segment_ids": np.zeros(shape, np.int32),
+            "mask": np.zeros(shape, np.float32),
+            "behavior_logp": np.zeros(shape, np.float32),
+            "fresh": np.zeros(shape, np.float32),
+            "advantage": np.zeros(shape, np.float32),
+            "cand": np.zeros(shape + (self.cfg.topk,), np.int32),
+            "cand_logq": np.full(shape + (self.cfg.topk,), -np.inf, np.float32),
+        }
+        for i, (s, (r, start)) in enumerate(zip(samples, placed)):
+            seg = slice(start, start + len(s.tokens))
+            packed["tokens"][r, seg] = s.tokens
+            packed["segment_ids"][r, seg] = i + 1
+            packed["mask"][r, seg] = s.mask
+            packed["behavior_logp"][r, seg] = s.logprobs
+            packed["fresh"][r, seg] = np.asarray(s.versions) == self.version
+            packed["advantage"][r, seg] = advantages[i]
+            policy = start + np.flatnonzero(s.mask)
+            packed["cand"][r, policy] = np.concatenate([h[0] for h in s.heads])
+            packed["cand_logq"][r, policy] = np.concatenate([h[1] for h in s.heads])
+        return [{k: v[j : j + self._rows] for k, v in packed.items()} for j in range(0, rows, self._rows)]
 
     def _put(self, mb):
-        return {
-            k: jax.device_put(
-                v, self._row_sharding if v.ndim == 1 else self._batch_sharding if v.ndim == 2 else self._cand_sharding
-            )
-            for k, v in mb.items()
-        }
+        return {k: jax.device_put(v, self._batch_sharding if v.ndim == 2 else self._cand_sharding) for k, v in mb.items()}
 
     def warmup(self) -> float:
-        """Compiles the gradient program of every length bucket on all-masked rows, and the update
-        ahead of time (it then loads from the persistent compilation cache)."""
+        """Compiles the gradient program on all-masked rows, and the update ahead of time (it then
+        loads from the persistent compilation cache)."""
         t0 = time.perf_counter()
-
-        def masked_rows(T):
-            rows = self._rows(T)
-            mb = {k: np.zeros((rows, T), np.int32 if k in ("tokens", "segment_ids") else np.float32)
-                  for k in ("tokens", "segment_ids", "mask", "behavior_logp", "fresh")}
-            mb["advantage"] = np.zeros(rows, np.float32)
-            mb["cand"] = np.zeros((rows, T, self.cfg.topk), np.int32)
-            mb["cand_logq"] = np.full((rows, T, self.cfg.topk), -np.inf, np.float32)
-            return self._put(mb)
-
+        shape = (self._rows, self.cfg.row_tokens)
+        masked = {
+            k: np.zeros(shape, np.int32 if k in ("tokens", "segment_ids") else np.float32)
+            for k in ("tokens", "segment_ids", "mask", "behavior_logp", "fresh", "advantage")
+        }
+        masked["cand"] = np.zeros(shape + (self.cfg.topk,), np.int32)
+        masked["cand_logq"] = np.full(shape + (self.cfg.topk,), -np.inf, np.float32)
+        masked = self._put(masked)
         with jax.set_mesh(self.mesh):
             # The first trace of the model extends JAX's trace context, which keys every jit
             # cache; trace once before compiling anything, or the first step recompiles.
-            self._accumulate.trace(self.params, self.params, masked_rows(self.cfg.length_buckets[0]), np.float32(0.0))
-            acc = self._zeros(self.params)
-            for T in self.cfg.length_buckets:
-                acc, _ = self._accumulate(self.params, acc, masked_rows(T), np.float32(0.0))
-                if self.cfg.drift_every:
-                    acc, _ = self._drift(self.params, acc, masked_rows(T), np.float32(0.0))
+            self._accumulate.trace(self.params, self.params, masked, np.float32(0.0))
+            acc, _ = self._accumulate(self.params, self._zeros(self.params), masked, np.float32(0.0))
             if self.cfg.drift_every:
+                acc, _ = self._drift(self.params, acc, masked, np.float32(0.0))
                 self._drift_stats(acc, acc, self._zeros(self.params), self.cfg.objective != "ppo")
         with jax.set_mesh(self._opt_mesh):
             self._apply.lower(self.master, self.opt_state, jax.device_put(acc, self._opt_shardings)).compile()
@@ -368,21 +368,19 @@ class Trainer:
         # Per-token |log pi - log mu| on trained tokens, for quantiles and Miles' sample mean.
         per_token, per_sample = [np.zeros(0)], [np.zeros(0)]
         for s, mb in zip(sums, mbs):
-            a, m = s.pop("abs_log_ratio_BT"), mb["mask"] > 0
+            a, m, seg = s.pop("abs_log_ratio_BT"), mb["mask"] > 0, mb["segment_ids"].ravel()
             per_token.append(a[m])
-            rows = m.sum(1) > 0
-            per_sample.append(a.sum(1)[rows] / m.sum(1)[rows])
+            num, den = np.bincount(seg, a.ravel()), np.bincount(seg, m.ravel().astype(np.float64))
+            per_sample.append(num[den > 0] / den[den > 0])
         per_token, per_sample = np.concatenate(per_token), np.concatenate(per_sample)
         totals = {k: sum(float(s[k]) for s in sums) for k in (sums[0] if sums else ())}
         jax.block_until_ready(self.params)
         seconds = time.perf_counter() - t0
         self.version += 1
         flops = sum(
-            forward_flops_per_token(self.model_cfg, mb["tokens"].shape[1]).model_flops(
-                base_weights_trainable=True
-            )
-            * float(mb["segment_ids"].sum())
-            for mb in mbs
+            forward_flops_per_token(self.model_cfg, len(samples[i].tokens)).model_flops(base_weights_trainable=True)
+            * len(samples[i].tokens)
+            for i in active
         )
         padded = max(sum(mb["tokens"].size for mb in mbs), 1)
         get = lambda k: totals.get(k, 0.0)
@@ -406,25 +404,29 @@ class Trainer:
             "train/fresh_frac": get("fresh_tokens") / n,
             "train/fresh_abs_log_ratio": get("fresh_abs_log_ratio") / nf,
             "train/fresh_kl_k3": get("fresh_kl_k3") / nf,
-            "train/pad_frac": 1.0 - sum(float(mb["segment_ids"].sum()) for mb in mbs) / padded,
+            "train/pad_frac": 1.0 - sum(float(np.count_nonzero(mb["segment_ids"])) for mb in mbs) / padded,
             "train/model_tflop": flops / 1e12,
         }
 
     def logprobs(self, token_lists: Sequence[Sequence[int]]) -> list[np.ndarray]:
-        """Trainer-forward ``logp[t]`` of each token given its prefix (``logp[0] = 0``)."""
-        T = self._bucket(max(len(t) for t in token_lists))
-        R = self._rows_multiple
-        B = -(-len(token_lists) // R) * R
-        tokens = np.full((B, T), self.cfg.pad_id, np.int32)
-        segment_ids = np.zeros((B, T), np.int32)
-        for b, t in enumerate(token_lists):
-            tokens[b, : len(t)] = t
-            segment_ids[b, : len(t)] = 1
+        """Trainer-forward ``logp[t]`` of each token given its prefix (``logp[0] = 0``), packed
+        like training microbatches."""
+        rows, placed = self._pack([len(t) for t in token_lists])
+        tokens = np.full((rows, self.cfg.row_tokens), self.cfg.pad_id, np.int32)
+        segment_ids = np.zeros_like(tokens)
+        for i, (t, (r, start)) in enumerate(zip(token_lists, placed)):
+            tokens[r, start : start + len(t)] = t
+            segment_ids[r, start : start + len(t)] = i + 1
         with jax.set_mesh(self.mesh):
-            logp = self._logprobs(
-                self.params,
-                jax.device_put(tokens, self._batch_sharding),
-                jax.device_put(segment_ids, self._batch_sharding),
-            )
-        logp = np.asarray(logp)
-        return [logp[b, : len(t)] for b, t in enumerate(token_lists)]
+            logp = np.concatenate([
+                np.asarray(self._logprobs(
+                    self.params,
+                    jax.device_put(tokens[j : j + self._rows], self._batch_sharding),
+                    jax.device_put(segment_ids[j : j + self._rows], self._batch_sharding),
+                ))
+                for j in range(0, rows, self._rows)
+            ])
+        out = [logp[r, start : start + len(t)].copy() for t, (r, start) in zip(token_lists, placed)]
+        for x in out:
+            x[0] = 0.0  # scored from the previous segment's last token
+        return out

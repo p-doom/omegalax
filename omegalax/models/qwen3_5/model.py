@@ -7,6 +7,7 @@ import jax.numpy as jnp
 from flax import nnx
 from jax.sharding import PartitionSpec, reshard
 
+from omegalax.attention import segment_ids_to_kstart
 from omegalax.models.shard_config import ShardConfig
 from .attention import Attention
 from .cache import Cache
@@ -215,7 +216,6 @@ class DecoderLayer(nnx.Module):
         sin_BTK: jax.Array,
         segment_ids_BT: jax.Array,
         position_ids_BT: jax.Array,
-        attention_mask_BT: jax.Array | None = None,
         cache=None,
     ):
         residual_BTD = hidden_BTD
@@ -226,7 +226,7 @@ class DecoderLayer(nnx.Module):
                 normed_BTD, cos_BTK, sin_BTK, segment_ids_BT, position_ids_BT, cache
             )
         else:
-            attn_out_BTD, cache = self.linear_attn(normed_BTD, attention_mask_BT, cache)
+            attn_out_BTD, cache = self.linear_attn(normed_BTD, segment_ids_BT, cache)
 
         hidden_BTD = residual_BTD + attn_out_BTD
 
@@ -289,8 +289,7 @@ class TextModel(nnx.Module):
             segment_ids_BT = jnp.ones((B, T), dtype=jnp.int32)
 
         if position_ids_ZBT is None:
-            seq_pos = jnp.arange(T, dtype=jnp.int32)[None, :]
-            position_ids_BT = jnp.broadcast_to(seq_pos, (B, T))
+            position_ids_BT = jnp.arange(T, dtype=jnp.int32)[None, :] - segment_ids_to_kstart(segment_ids_BT)
             position_ids_ZBT = jnp.stack([position_ids_BT] * 3, axis=0)
         elif position_ids_ZBT.ndim == 2:
             position_ids_ZBT = jnp.stack([position_ids_ZBT] * 3, axis=0)
@@ -305,7 +304,6 @@ class TextModel(nnx.Module):
         cos_BTK = cos_BTK.astype(cfg.dtype)
         sin_BTK = sin_BTK.astype(cfg.dtype)
 
-        attention_mask_BT = (segment_ids_BT != 0).astype(jnp.float32)
         text_position_ids_BT = position_ids_ZBT[0]
 
         aux_losses = []
@@ -316,7 +314,6 @@ class TextModel(nnx.Module):
                 sin_BTK,
                 segment_ids_BT,
                 text_position_ids_BT,
-                attention_mask_BT,
                 None if cache is None else cache.layers[i],
             )
             if cache is not None:

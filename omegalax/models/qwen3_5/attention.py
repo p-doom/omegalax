@@ -11,8 +11,9 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 from jax.sharding import PartitionSpec
-from tokamax import dot_product_attention
+from tokamax._src.ops.attention import api as attention_api, base as attention_base
 
+from omegalax.attention import segment_ids_to_kstart
 from omegalax.models.kv_cache import LayerCache
 from .config import Qwen3_5TextConfig
 from .norms import RMSNorm
@@ -119,14 +120,10 @@ class Attention(nnx.Module):
         q_BTHK, k_BTGK = apply_text_rope(q_BTHK, k_BTGK, cos_BTK, sin_BTK)
 
         if cache is None:
-            attn_BTHK = dot_product_attention(
-                q_BTHK,
-                k_BTGK,
-                v_BTGK,
-                is_causal=True,
-                scale=self.scale,
-                implementation=self._attn_backend,
-                q_sharding=self._q_sharding,
+            # tokamax's public dot_product_attention takes no k_start; segments need the Mask.
+            mask = attention_base.Mask(k_start=segment_ids_to_kstart(segment_ids_BT)[:, None, :], is_causal=True)
+            attn_BTHK = attention_api.IMPLEMENTATIONS[self._attn_backend](
+                q_BTHK, k_BTGK, v_BTGK, mask=mask, logits_scale=self.scale, q_sharding=self._q_sharding
             )
         else:
             cache = cache.write(k_BTGK, v_BTGK)

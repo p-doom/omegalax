@@ -18,15 +18,10 @@ def segment_ids_to_kstart(segment_ids_BT: jax.Array) -> jax.Array:
         k_start_BT: (B, T) where k_start[b, t] is the start position
         of the segment containing token t in batch element b.
     """
-    B, T = segment_ids_BT.shape
+    T = segment_ids_BT.shape[1]
     pos = jnp.arange(T)[None, :]
-    changes = jnp.concatenate(
-        [
-            jnp.ones((B, 1), dtype=jnp.bool_),
-            segment_ids_BT[:, 1:] != segment_ids_BT[:, :-1],
-        ],
-        axis=1,
-    )
+    # Pad, not concatenate with a fresh column: it keeps segment_ids_BT's (explicit) sharding.
+    changes = jnp.pad(segment_ids_BT[:, 1:] != segment_ids_BT[:, :-1], ((0, 0), (1, 0)), constant_values=True)
     boundary_positions = jnp.where(changes, pos, 0)
     return jax.lax.cummax(boundary_positions, axis=1)
 
