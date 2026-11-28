@@ -11,7 +11,7 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 
 from omegalax.distributed.mesh import mesh_rules
 from omegalax.engine import Engine
-from omegalax.engine.engine import _inference_dtypes
+from omegalax.engine.engine import _inference_layout
 from omegalax.models.qwen3.loader import create_qwen3_from_safetensors
 from omegalax.models.qwen3_5.loader import create_qwen3_5_from_safetensors
 from omegalax.models.qwen3_5.model import Qwen3_5ForCausalLM
@@ -84,14 +84,16 @@ class WeightSync:
     """Trainer params -> engines. One jitted program casts every leaf to the engine's inference
     dtype and replicates it on the trainer mesh; one ``device_put`` per engine then copies it
     device to device. (An FSDP-sharded array crossing meshes goes through the host, ~30x slower.)
-    Engines built by ``engine_replica`` hold the same dtypes, so their own cast is the identity.
+    Engines built by ``engine_replica`` hold the same dtypes, so their own cast is the identity
+    (they still regroup DeltaNet qkv channels per TP shard on every update).
     """
 
     def __init__(self, graphdef: nnx.GraphDef, params: nnx.State):
         mesh = jax.tree.leaves(params)[0].sharding.mesh
         pure = nnx.to_pure_dict(params)
         model = nnx.merge(graphdef, params)
-        dtypes = jax.tree.unflatten(jax.tree.structure(pure), _inference_dtypes(model, nnx.state(model)))
+        layout = _inference_layout(model, nnx.state(model), 1)
+        dtypes = jax.tree.unflatten(jax.tree.structure(pure), [d for d, _, _ in layout])
         self.mesh = mesh
         self._gather = jax.jit(
             lambda p: jax.tree.map(lambda x, d: x.astype(d), p, dtypes),
