@@ -65,22 +65,9 @@ def _forward(model, pools, tokens_BT, paged: PagedBatch, linear):
 
 
 def _linear_decode(pools, slot_B, active_B):
-    conv = next((a for a, _ in pools if a.ndim == 3), None)
-    if conv is None:
+    if not any(a.ndim == 3 for a, _ in pools):
         return None
-    S, K1, _ = conv.shape
-    B = slot_B.shape[0]
-    rows_B = jnp.arange(B, dtype=jnp.int32)
-    row_slot_B = jnp.where(active_B, slot_B, TRASH_SLOT)
-    base_B1 = (B + row_slot_B * K1)[:, None]
-    taps_BK = jnp.concatenate([base_B1 + jnp.arange(K1)[None], rows_B[:, None]], axis=1)
-    return LinearDecode(
-        conv_fix_F=rows_B,
-        conv_src_FK=taps_BK,
-        conv_out_src_WK=taps_BK[:, 1:],
-        write_slot_W=jnp.where(active_B, slot_B, S + rows_B),
-        row_slot_N=row_slot_B,
-    )
+    return LinearDecode(row_slot_N=jnp.where(active_B, slot_B, TRASH_SLOT))
 
 
 def decode(

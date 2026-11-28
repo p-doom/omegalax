@@ -24,9 +24,9 @@ import os
 
 import jax
 
-from .xla_reference import chunk_gated_delta_rule_xla, recurrent_gated_delta_step_xla
+from .xla_reference import chunk_gated_delta_rule_xla, gated_delta_decode_xla
 
-__all__ = ["chunk_gated_delta_rule_xla", "recurrent_gated_delta_step_xla"]
+__all__ = ["chunk_gated_delta_rule_xla", "gated_delta_decode_xla"]
 
 
 def _resolve_backend():
@@ -76,14 +76,14 @@ def chunk_gated_delta_rule(
     raise ValueError(f"Unknown OMEGALAX_DELTANET_KERNEL={backend!r}. Use 'xla' or 'pallas'.")
 
 
-def recurrent_gated_delta_step(q_BHA, k_BHA, v_BHU, g_BH, beta_BH, state_SHAU, slot_B):
-    """Dispatcher for the single-token step; same backends as ``chunk_gated_delta_rule``."""
-    args = (q_BHA, k_BHA, v_BHU, g_BH, beta_BH, state_SHAU, slot_B)
+def gated_delta_decode(*args, eps):
+    """Dispatcher for one decode token per row; same backends as ``chunk_gated_delta_rule``.
+    Arguments as :func:`gated_delta_decode_xla`."""
     backend = _resolve_backend()
     if backend == "xla":
-        return recurrent_gated_delta_step_xla(*args)
+        return gated_delta_decode_xla(*args, eps=eps)
     if backend == "pallas":
-        from .pallas_triton import recurrent_gated_delta_step_pallas
+        from .pallas_triton import gated_delta_decode_pallas
 
-        return recurrent_gated_delta_step_pallas(*args)
+        return gated_delta_decode_pallas(*args, eps=eps)
     raise ValueError(f"Unknown OMEGALAX_DELTANET_KERNEL={backend!r}. Use 'xla' or 'pallas'.")

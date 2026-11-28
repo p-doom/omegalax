@@ -1,6 +1,7 @@
 """DeltaNet state threaded through ``GatedDeltaNet`` by the rollout engine.
 
-Tokens are flattened to ``N = B * T`` rows. The conv of token ``n`` reads the ``K - 1``
+A decode row continues its pool slot's conv window and state in place. An extend flattens
+tokens to ``N = B * T`` rows; the conv of token ``n`` reads the ``K - 1``
 preceding rows of ``x_NC``, except for tokens ``conv_fix_F[f]`` (distinct; out-of-range
 entries are skipped), whose taps are rows ``conv_src_FK[f]`` of ``concat(x_NC, conv pool
 rows)``, where pool slot ``s`` owns rows ``N + s * (K - 1) + j``. Write ``w`` stores a state
@@ -18,10 +19,6 @@ import jax
 class LinearDecode:
     """One token per row; row ``n`` steps pool slot ``row_slot_N[n]`` in place."""
 
-    conv_fix_F: jax.Array
-    conv_src_FK: jax.Array
-    conv_out_src_WK: jax.Array
-    write_slot_W: jax.Array
     row_slot_N: jax.Array
 
 
