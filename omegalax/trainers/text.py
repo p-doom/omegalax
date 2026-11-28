@@ -179,7 +179,7 @@ def make_sft_train_step(cfg, pad_id: int = 0):
 
         def loss_fn(model):
             hidden_BTD, aux_loss = text_api.forward(model, token_ids_BT, pad_id, cfg)
-            lm_weight = model.lm_head.kernel[...]
+            lm_weight = model.output_weight()
             loss = (
                 chunked_cross_entropy_loss(
                     hidden_BTD,
@@ -217,7 +217,7 @@ def make_sft_eval_step(cfg, pad_id: int = 0):
         loss_mask_BT = batch["loss_mask_BT"]
 
         hidden_BTD, aux_loss = text_api.forward(model, token_ids_BT, pad_id, cfg)
-        lm_weight = model.lm_head.kernel[...]
+        lm_weight = model.output_weight()
         loss = (
             chunked_cross_entropy_loss(
                 hidden_BTD,

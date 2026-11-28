@@ -34,6 +34,19 @@ def _make_inputs(B, T, H, A, U, dtype=jnp.bfloat16, seed=0):
     return q, k, v, g, beta
 
 
+def _fresh(fn):
+    """Runs ``fn`` from a zero state in every row, returning only the outputs."""
+
+    def run(q, k, v, g, beta):
+        B, T, H, A = q.shape
+        init_idx = jnp.full((B, -(-T // 64)), -1, jnp.int32).at[:, 0].set(0)
+        init = jnp.zeros((1, H, A, v.shape[-1]), jnp.float32)
+        final_idx = jnp.full((B, 1), init_idx.shape[1] - 1, jnp.int32)
+        return fn(q, k, v, g, beta, init, init_idx, final_idx)[0]
+
+    return run
+
+
 def _loss(fn):
     def loss_fn(q, k, v, g, beta):
         out = fn(q, k, v, g, beta)
@@ -49,10 +62,10 @@ class BackwardEquivalenceTest(parameterized.TestCase):
     )
     def test_grad_matches_xla(self, B, T, H, A, U, name):
         q, k, v, g, beta = _make_inputs(B, T, H, A, U)
-        grads_ref = jax.grad(_loss(chunk_gated_delta_rule_xla), argnums=(0, 1, 2, 3, 4))(
+        grads_ref = jax.grad(_loss(_fresh(chunk_gated_delta_rule_xla)), argnums=(0, 1, 2, 3, 4))(
             q, k, v, g, beta
         )
-        grads_pal = jax.grad(_loss(chunk_gated_delta_rule_pallas), argnums=(0, 1, 2, 3, 4))(
+        grads_pal = jax.grad(_loss(_fresh(chunk_gated_delta_rule_pallas)), argnums=(0, 1, 2, 3, 4))(
             q, k, v, g, beta
         )
         names = ("dq", "dk", "dv", "dg", "dbeta")

@@ -1,19 +1,5 @@
 import jax
 import jax.numpy as jnp
-from jaxtyping import Array
-
-
-def count_left_pads(token_ids_BT: Array) -> Array:
-    return jnp.sum(jnp.cumsum(token_ids_BT != 0, axis=-1) == 0, -1)
-
-
-def count_right_pads(token_ids_BT: jax.Array, pad_id: int) -> jax.Array:
-    result = jnp.where(
-        jnp.all(token_ids_BT == pad_id, axis=1),
-        token_ids_BT.shape[1],
-        jnp.argmin(jnp.flip(token_ids_BT == pad_id, axis=1).astype(jnp.int32), axis=1),
-    )
-    return jnp.max(result)
 
 
 def compute_positions_from_segment_ids(seg_ids_BT: jax.Array) -> jax.Array:

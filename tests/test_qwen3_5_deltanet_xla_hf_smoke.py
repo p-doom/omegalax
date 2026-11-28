@@ -147,7 +147,7 @@ class Qwen3_5DeltaNetXLAHFSmokeTest(absltest.TestCase):
         with mesh_rules_for(tp_size=1, fsdp_size=1, dp_size=1):
             jax_module = GatedDeltaNet(_jax_config(), rngs=nnx.Rngs(0))
             _copy_hf_weights(hf_module, jax_module)
-            jax_out = jax_module(
+            jax_out, _ = jax_module(
                 jnp.asarray(hidden_states.numpy(), dtype=jnp.float32),
                 jnp.asarray(attention_mask.numpy(), dtype=jnp.float32),
             )

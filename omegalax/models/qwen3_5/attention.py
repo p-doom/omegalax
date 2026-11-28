@@ -11,8 +11,10 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 from jax.sharding import PartitionSpec
-from tokamax import dot_product_attention
+from tokamax._src.ops.attention import api as attention_api, base as attention_base
 
+from omegalax.attention import segment_ids_to_kstart
+from omegalax.models.kv_cache import LayerCache
 from .config import Qwen3_5TextConfig
 from .norms import RMSNorm
 from .rope import apply_text_rope
@@ -86,7 +88,8 @@ class Attention(nnx.Module):
         sin_BTK: jax.Array,
         segment_ids_BT: jax.Array,
         position_ids_BT: jax.Array,
-    ) -> jax.Array:
+        cache: LayerCache | None = None,
+    ) -> tuple[jax.Array, LayerCache | None]:
         B, T, _ = hidden_BTD.shape
 
         heads_shd = self.shd_cfg.act_btnh
@@ -116,19 +119,19 @@ class Attention(nnx.Module):
 
         q_BTHK, k_BTGK = apply_text_rope(q_BTHK, k_BTGK, cos_BTK, sin_BTK)
 
-        attn_BTHK = dot_product_attention(
-            q_BTHK,
-            k_BTGK,
-            v_BTGK,
-            is_causal=True,
-            scale=self.scale,
-            implementation=self._attn_backend,
-            q_sharding=self._q_sharding,
-        )
+        if cache is None:
+            # tokamax's public dot_product_attention takes no k_start; segments need the Mask.
+            mask = attention_base.Mask(k_start=segment_ids_to_kstart(segment_ids_BT)[:, None, :], is_causal=True)
+            attn_BTHK = attention_api.IMPLEMENTATIONS[self._attn_backend](
+                q_BTHK, k_BTGK, v_BTGK, mask=mask, logits_scale=self.scale, q_sharding=self._q_sharding
+            )
+        else:
+            cache = cache.write(k_BTGK, v_BTGK)
+            attn_BTHK = cache.attend(q_BTHK, self.scale)
         attn_out_BTD = jax.lax.reshape(
             attn_BTHK, (B, T, self.num_heads * self.head_dim), out_sharding=self.shd_cfg.act_btf
         )
 
         attn_out_BTD = attn_out_BTD * jax.nn.sigmoid(gate_BTD)
         out_BTD = self.o_proj(attn_out_BTD, out_sharding=self.shd_cfg.act_btd)
-        return out_BTD
+        return out_BTD, cache
