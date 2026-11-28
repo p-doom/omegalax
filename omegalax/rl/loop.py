@@ -43,11 +43,10 @@ def jsonl_tasks(path: str, seed: int) -> Iterator[dict]:
 
 
 async def evaluate(engines, env: Env, tasks: list[dict], cfg: RolloutConfig, samples_per_task: int,
-                   concurrency: int, rng) -> dict:
-    """``samples_per_task`` samples per task (one group), at most ``concurrency`` samples in flight,
-    concurrent with training. Reports the mean reward and its standard error over tasks."""
+                   slots: asyncio.Semaphore, rng) -> dict:
+    """``samples_per_task`` samples per task (one group), one group per ``slots`` permit, concurrent
+    with training. Reports the mean reward and its standard error over tasks."""
     group = dataclasses.replace(cfg, group_size=samples_per_task)
-    slots = asyncio.Semaphore(max(1, concurrency // samples_per_task))
 
     async def one(i, task):
         async with slots:
@@ -118,9 +117,13 @@ async def run(trainer: Trainer, engines, sync: WeightSync, env: Env, tasks: Iter
         metrics.update(sync.push(trainer.params, trainer.version))
         return metrics
 
+    # Evaluations can outlast eval_every steps; one budget for all of them keeps the engines' session
+    # count within the bound scripts/train_rl.py checks against max_sessions.
+    eval_slots = asyncio.Semaphore(max(1, cfg.eval_concurrency // cfg.eval_samples))
+
     async def eval_at(step):
         start = time.perf_counter() - t_start
-        metrics = await evaluate(engines, env, eval_tasks, cfg.rollout, cfg.eval_samples, cfg.eval_concurrency, rng)
+        metrics = await evaluate(engines, env, eval_tasks, cfg.rollout, cfg.eval_samples, eval_slots, rng)
         log({"eval_step": step, "eval/start_wall_s": start, **metrics})
 
     t_start = time.perf_counter()
