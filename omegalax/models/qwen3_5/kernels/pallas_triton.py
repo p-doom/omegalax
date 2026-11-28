@@ -345,54 +345,131 @@ def chunk_gated_delta_rule_pallas(
     return out_BHTU.transpose(0, 2, 1, 3).astype(out_dtype), state_BHWAU.transpose(0, 2, 1, 3, 4)
 
 
-def _recurrent_step_kernel(
-    slot_ref, q_ref, k_ref, v_ref, g_ref, beta_ref, state_ref, out_ref, state_out_ref
+def _conv_step_kernel(slot_ref, x_ref, w_ref, pool_ref, out_ref, pool_out_ref, *, num_q, num_qk):
+    """One program per (row, head-sized channel block): the causal conv over the slot's K - 1
+    previous inputs and this one, SiLU, and for q/k blocks the L2 norm (q also scaled). The
+    block's window in the conv pool shifts in place; each channel belongs to one program."""
+    b, j = pl.program_id(0), pl.program_id(1)
+    slot = slot_ref[b]
+    D = x_ref.shape[-1]
+    cols = pl.ds(j * D, D)
+    K1 = pool_ref.shape[1]
+    taps = [pool_ref[slot, k, cols] for k in range(K1)]
+    # Triton loads no single column of a block; mask the (D, K) tile instead.
+    w_DK = w_ref[...].astype(jnp.float32)
+    col_DK = jax.lax.broadcasted_iota(jnp.int32, w_DK.shape, 1)
+    tap_w = lambda k: jnp.sum(jnp.where(col_DK == k, w_DK, 0.0), axis=1)
+    # The conv and SiLU round every op to the input dtype, as the trainer's XLA ops do.
+    rnd = lambda v: v.astype(x_ref.dtype).astype(jnp.float32)
+    acc = jnp.zeros_like(tap_w(0))
+    for k, tap in enumerate([*taps, x_ref[...]]):
+        acc = rnd(acc + rnd(tap_w(k) * tap.astype(jnp.float32)))
+    act = rnd(acc * rnd(1.0 / (1.0 + jnp.exp(-acc))))
+    for k in range(K1 - 1):
+        pool_out_ref[slot, k, cols] = taps[k + 1]
+    pool_out_ref[slot, K1 - 1, cols] = x_ref[...]
+    # q and k blocks are L2-normed in the input dtype like the trainer's chunked rule (q also
+    # scaled), v blocks pass; selected arithmetically, as Triton lowers a select on the scalar
+    # program id to a mask.
+    is_q, is_qk = (j < num_q).astype(jnp.float32), (j < num_qk).astype(jnp.float32)
+    unit = rnd(act * rnd(jax.lax.rsqrt(rnd(rnd(jnp.sum(rnd(act * act))) + 1e-6))))
+    unit = unit * (1.0 + is_q * (D**-0.5 - 1.0))
+    out_ref[...] = act + is_qk * (unit - act)
+
+
+def _decode_step_kernel(
+    slot_ref, q_ref, k_ref, v_ref, b_ref, a_ref, alog_ref, dt_ref, z_ref, w_ref, state_ref,
+    out_ref, state_out_ref, *, eps,
 ):
-    """One program per (row, head); the head's (A, U) state is read and rewritten in place."""
+    """One program per (row, value head): the gates, one delta rule step on the head's (A, U)
+    state (rewritten in place) and the gated RMSNorm of its output."""
     b, h = pl.program_id(0), pl.program_id(1)
     slot = slot_ref[b]
-    st_AU = state_ref[slot, h] * jnp.exp(g_ref[b, h])
+    b_x = b_ref[b, h]
+    beta = (1.0 / (1.0 + jnp.exp(-b_x.astype(jnp.float32)))).astype(b_x.dtype).astype(jnp.float32)
+    x = a_ref[b, h].astype(jnp.float32) + dt_ref[h]
+    softplus = jnp.maximum(x, 0.0) + jnp.log(1.0 + jnp.exp(-jnp.abs(x)))
+    st_AU = state_ref[slot, h] * jnp.exp(-jnp.exp(alog_ref[h]) * softplus)
     k_A = k_ref[...]
     kv_U = jnp.sum(st_AU * k_A[:, None], axis=0)
-    st_AU = st_AU + k_A[:, None] * ((v_ref[...] - kv_U) * beta_ref[b, h])[None, :]
-    out_ref[...] = jnp.sum(st_AU * q_ref[...][:, None], axis=0)
+    st_AU = st_AU + k_A[:, None] * ((v_ref[...] - kv_U) * beta)[None, :]
     state_out_ref[slot, h] = st_AU
+    o_U = jnp.sum(st_AU * q_ref[...][:, None], axis=0)
+    normed_U = o_U / jnp.sqrt(jnp.sum(o_U * o_U) / o_U.shape[0] + eps)
+    z_U = z_ref[...].astype(jnp.float32)
+    out_ref[...] = (w_ref[...].astype(jnp.float32) * normed_U * z_U / (1.0 + jnp.exp(-z_U))).astype(
+        out_ref.dtype
+    )
 
 
-def recurrent_gated_delta_step_pallas(
-    q_BHA: jax.Array,
-    k_BHA: jax.Array,
-    v_BHU: jax.Array,
-    g_BH: jax.Array,
-    beta_BH: jax.Array,
+def gated_delta_decode_pallas(
+    x_NC: jax.Array,
+    z_NHU: jax.Array,
+    b_NH: jax.Array,
+    a_NH: jax.Array,
+    conv_SKC: jax.Array,
+    weight_CK: jax.Array,
     state_SHAU: jax.Array,
-    slot_B: jax.Array,
-) -> tuple[jax.Array, jax.Array]:
-    """Pallas version of :func:`recurrent_gated_delta_step_xla`; ``state_SHAU`` is aliased."""
-    B, H, A = q_BHA.shape
-    U = v_BHU.shape[-1]
-    q_BHA = _l2norm(q_BHA).astype(jnp.float32) * A**-0.5
-    k_BHA = _l2norm(k_BHA).astype(jnp.float32)
+    A_log_H: jax.Array,
+    dt_H: jax.Array,
+    norm_U: jax.Array,
+    slot_N: jax.Array,
+    *,
+    eps: float,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Pallas version of :func:`gated_delta_decode_xla`; the conv and state pools are aliased."""
+    N, C = x_NC.shape
+    H, U = z_NHU.shape[1:]
+    num_k = (C - H * U) // (2 * U)
+    if C != (2 * num_k + H) * U or state_SHAU.shape[2:] != (U, U):
+        raise ValueError(f"Fused decode needs head_k_dim == head_v_dim; got C={C}, H={H}, U={U}.")
+    gqa = H // num_k
     whole = pl.BlockSpec()
-    row = lambda n: pl.BlockSpec((None, None, n), lambda b, h: (b, h, 0))
-    return pl.pallas_call(
-        _recurrent_step_kernel,
-        grid=(B, H),
-        in_specs=[whole, row(A), row(A), row(U), whole, whole, whole],
-        out_specs=[row(U), whole],
+    act_NC, conv_SKC = pl.pallas_call(
+        functools.partial(_conv_step_kernel, num_q=num_k, num_qk=2 * num_k),
+        grid=(N, C // U),
+        in_specs=[
+            whole,
+            pl.BlockSpec((None, U), lambda n, j: (n, j)),
+            pl.BlockSpec((U, weight_CK.shape[1]), lambda n, j: (j, 0)),
+            whole,
+        ],
+        out_specs=[pl.BlockSpec((None, U), lambda n, j: (n, j)), whole],
         out_shape=[
-            jax.ShapeDtypeStruct((B, H, U), jnp.float32),
+            jax.ShapeDtypeStruct((N, C), jnp.float32),
+            jax.ShapeDtypeStruct(conv_SKC.shape, conv_SKC.dtype),
+        ],
+        input_output_aliases={3: 1},
+        compiler_params=plt.CompilerParams(num_warps=4, num_stages=1),
+        name="gated_delta_decode_conv",
+    )(slot_N, x_NC, weight_CK, conv_SKC)
+    head = lambda block: pl.BlockSpec((None, U), lambda n, h: (n, block(h)))
+    out_NHU, state_SHAU = pl.pallas_call(
+        functools.partial(_decode_step_kernel, eps=eps),
+        grid=(N, H),
+        in_specs=[
+            whole,
+            head(lambda h: h // gqa),
+            head(lambda h: num_k + h // gqa),
+            head(lambda h: 2 * num_k + h),
+            whole,
+            whole,
+            whole,
+            whole,
+            pl.BlockSpec((None, None, U), lambda n, h: (n, h, 0)),
+            whole,
+            whole,
+        ],
+        out_specs=[pl.BlockSpec((None, None, U), lambda n, h: (n, h, 0)), whole],
+        out_shape=[
+            jax.ShapeDtypeStruct((N, H, U), x_NC.dtype),
             jax.ShapeDtypeStruct(state_SHAU.shape, state_SHAU.dtype),
         ],
-        input_output_aliases={6: 1},
+        input_output_aliases={10: 1},
         compiler_params=plt.CompilerParams(num_warps=8, num_stages=1),
-        name="recurrent_gated_delta_step",
+        name="gated_delta_decode_step",
     )(
-        slot_B,
-        q_BHA,
-        k_BHA,
-        v_BHU.astype(jnp.float32),
-        g_BH.astype(jnp.float32),
-        beta_BH.astype(jnp.float32),
-        state_SHAU,
+        slot_N, act_NC, act_NC, act_NC, b_NH, a_NH, A_log_H.astype(jnp.float32),
+        dt_H.astype(jnp.float32), z_NHU, norm_U, state_SHAU,
     )
+    return out_NHU.reshape(N, H * U), conv_SKC, state_SHAU

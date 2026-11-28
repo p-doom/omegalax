@@ -29,7 +29,7 @@ from jax.sharding import PartitionSpec
 from omegalax.models.sharding_runtime import per_shard
 
 from .cache import LinearCache, LinearDecode
-from .kernels import chunk_gated_delta_rule, recurrent_gated_delta_step
+from .kernels import chunk_gated_delta_rule, gated_delta_decode
 from .config import Qwen3_5TextConfig
 from .norms import RMSNormGated
 
@@ -270,6 +270,11 @@ class GatedDeltaNet(nnx.Module):
         def shard(
             x_NC, z_NHU, b_NH, a_NH, conv_SKC, weight_CK, state_SHAU, A_log_H, dt_H, norm_U, batch
         ):
+            if isinstance(batch, LinearDecode):
+                return gated_delta_decode(
+                    x_NC, z_NHU, b_NH, a_NH, conv_SKC, weight_CK, state_SHAU, A_log_H, dt_H,
+                    norm_U, batch.row_slot_N, eps=eps,
+                )
             pool_RC = conv_SKC.reshape(-1, x_NC.shape[1])
 
             def rows(idx):
@@ -302,27 +307,22 @@ class GatedDeltaNet(nnx.Module):
             g_NH = -jnp.exp(A_log_H.astype(jnp.float32)) * jax.nn.softplus(
                 a_NH.astype(jnp.float32) + dt_H
             )
-            if isinstance(batch, LinearDecode):
-                out_NHU, state_SHAU = recurrent_gated_delta_step(
-                    q_NHA, k_NHA, v_NHU, g_NH, beta_NH, state_SHAU, batch.row_slot_N
-                )
-            else:
-                valid_N1 = batch.valid_N[:, None]
-                out_1NHU, state_1WHAU = chunk_gated_delta_rule(
-                    q_NHA[None],
-                    k_NHA[None],
-                    v_NHU[None],
-                    jnp.where(valid_N1, g_NH, 0.0)[None],
-                    jnp.where(valid_N1, beta_NH, 0.0)[None],
-                    state_SHAU[batch.init_slot_I],
-                    batch.init_idx_1J,
-                    batch.final_chunk_W[None],
-                    CHUNK_SIZE,
-                )
-                out_NHU = out_1NHU[0]
-                state_SHAU = state_SHAU.at[batch.write_slot_W].set(
-                    state_1WHAU[0], mode="drop", unique_indices=True
-                )
+            valid_N1 = batch.valid_N[:, None]
+            out_1NHU, state_1WHAU = chunk_gated_delta_rule(
+                q_NHA[None],
+                k_NHA[None],
+                v_NHU[None],
+                jnp.where(valid_N1, g_NH, 0.0)[None],
+                jnp.where(valid_N1, beta_NH, 0.0)[None],
+                state_SHAU[batch.init_slot_I],
+                batch.init_idx_1J,
+                batch.final_chunk_W[None],
+                CHUNK_SIZE,
+            )
+            out_NHU = out_1NHU[0]
+            state_SHAU = state_SHAU.at[batch.write_slot_W].set(
+                state_1WHAU[0], mode="drop", unique_indices=True
+            )
             normed_NO = _gated_norm(out_NHU[None], z_NHU[None], norm_U, eps)[0]
             return normed_NO, conv_SKC, state_SHAU
 
