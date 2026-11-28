@@ -19,8 +19,7 @@ from omegalax.rl.weights import WeightSync
 @dataclasses.dataclass(frozen=True)
 class LoopConfig:
     """At most ``(rollout_ahead + 1) * groups_per_step`` groups are outstanding; groups with a
-    token sampled more than ``max_staleness`` versions before the training step are dropped, and
-    with ``drop_zero_variance`` so are groups whose rewards are all equal (DAPO dynamic sampling)."""
+    token sampled more than ``max_staleness`` versions before the training step are dropped."""
 
     num_steps: int
     groups_per_step: int
@@ -31,7 +30,6 @@ class LoopConfig:
     eval_every: int
     eval_samples: int
     eval_concurrency: int
-    drop_zero_variance: bool
     dump_every: int
 
 
@@ -75,7 +73,8 @@ async def evaluate(engines, env: Env, tasks: list[dict], cfg: RolloutConfig, sam
 
 
 def _engine_totals(engines) -> np.ndarray:
-    keys = ("decode_s", "extend_s", "decode_tokens", "decode_row_steps", "extend_tokens")
+    keys = ("decode_s", "extend_s", "decode_tokens", "decode_row_steps", "extend_tokens",
+            "evict_idle", "evict_waiting", "evicted_tokens")
     return np.asarray([sum(e.stats[k] for e in engines) for k in keys], np.float64)
 
 
@@ -129,7 +128,7 @@ async def run(trainer: Trainer, engines, sync: WeightSync, env: Env, tasks: Iter
     # The trainer compiles on its own thread while the first groups are generated.
     warmup = loop.run_in_executor(train_thread, trainer.warmup)
     producer = asyncio.create_task(produce())
-    dropped = {"error": 0, "stale": 0, "zero_variance": 0}
+    dropped = {"error": 0, "stale": 0}
     errors = []
     totals0, t_prev = _engine_totals(engines), t_start
     for step in range(cfg.num_steps):
@@ -149,10 +148,6 @@ async def run(trainer: Trainer, engines, sync: WeightSync, env: Env, tasks: Iter
                 dropped["stale"] += 1
                 capacity.release()
                 continue
-            if cfg.drop_zero_variance and len({s.reward for s in group}) == 1:
-                dropped["zero_variance"] += 1
-                capacity.release()
-                continue
             batch.append(group)
         wait_s = time.perf_counter() - t_wait
         samples = [s for g in batch for s in g]
@@ -167,7 +162,8 @@ async def run(trainer: Trainer, engines, sync: WeightSync, env: Env, tasks: Iter
             capacity.release()
         now = time.perf_counter()
         totals = _engine_totals(engines)
-        decode_s, extend_s, decode_tokens, row_steps, extend_tokens = totals - totals0
+        decode_s, extend_s, decode_tokens, row_steps, extend_tokens, *_ = totals - totals0
+        evictions = totals[5:]
         metrics.update(summarize(samples))
         metrics.update({
             "step": step + 1,
@@ -180,12 +176,14 @@ async def run(trainer: Trainer, engines, sync: WeightSync, env: Env, tasks: Iter
             "groups/zero_variance": int(np.sum(rewards.std(axis=1) == 0)),
             "groups/dropped_error": dropped["error"],
             "groups/dropped_stale": dropped["stale"],
-            "groups/dropped_zero_variance": dropped["zero_variance"],
             "engine/busy_frac": (decode_s + extend_s) / (len(engines) * (now - t_prev)),
             "engine/extend_frac": extend_s / max(decode_s + extend_s, 1e-9),
             "engine/decode_tokens_per_s": decode_tokens / (now - t_prev),
             "engine/decode_occupancy": decode_tokens / max(row_steps, 1.0),
             "engine/extend_tokens_per_s": extend_tokens / (now - t_prev),
+            "engine/evict_idle": int(evictions[0]),
+            "engine/evict_waiting": int(evictions[1]),
+            "engine/evicted_tokens": int(evictions[2]),
             "groups/outstanding": len(running) + ready.qsize(),
         })
         totals0, t_prev = totals, now
@@ -196,7 +194,7 @@ async def run(trainer: Trainer, engines, sync: WeightSync, env: Env, tasks: Iter
             print(f"step {step + 1} sample errors (first): {errors[:3]}", flush=True)
             errors.clear()
     producer.cancel()
+    await asyncio.gather(*evals)
     for t in list(running):
         t.cancel()
-    await asyncio.gather(*evals)
     train_thread.shutdown()

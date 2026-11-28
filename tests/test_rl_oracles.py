@@ -4,7 +4,7 @@ import dataclasses
 import logging
 import os
 
-os.environ.setdefault("JAX_PLATFORMS", "cuda")
+os.environ.setdefault("JAX_PLATFORMS", "cuda,cpu")  # cpu: the host-optimizer placement
 
 import jax
 import numpy as np
