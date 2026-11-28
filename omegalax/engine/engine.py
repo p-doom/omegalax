@@ -153,7 +153,7 @@ class Engine:
                 a = layer.attn
                 if a.num_kv_heads % tp:
                     raise ValueError(f"{a.num_kv_heads} KV heads do not split over tp={tp}.")
-                page = ((a.num_kv_heads, cfg.num_pages, S, a.head_dim), jnp.bfloat16, P("tp"))
+                page = ((a.num_kv_heads, cfg.num_pages, S, a.head_dim), a.k_proj.dtype, P("tp"))
                 self._pool_specs.append((page, page))
                 self._block_q = max(1, min(128, 128 * 128 // a.head_dim) // a.n_rep)
             else:
@@ -167,7 +167,7 @@ class Engine:
                 state_shape = (num_slots, d.num_v_heads, d.head_k_dim, d.head_v_dim)
                 self._pool_specs.append(
                     (
-                        (conv_shape, jnp.bfloat16, P(None, None, "tp")),
+                        (conv_shape, d.in_proj_qkv.dtype, P(None, None, "tp")),
                         (state_shape, jnp.float32, P(None, "tp")),
                     )
                 )
