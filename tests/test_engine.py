@@ -1,5 +1,6 @@
 """Rollout engine against the trainer forward and HF transformers (GPU, real weights)."""
 
+import dataclasses
 import logging
 import os
 import unittest
@@ -73,6 +74,12 @@ def _qwen3_5_causal_lm(path, tp):
     model = nnx.merge(nnx.graphdef(abstract), state)
     _finalize_q_shardings(model, mesh)
     return model
+
+
+def _smoke_model():
+    """Random-init Qwen3 smoke model; the extend kernel needs head_dim % 64 == 0."""
+    cfg = dataclasses.replace(text_api.resolve_config("qwen3-smoke"), head_dim=64)
+    return text_api.init_model(cfg, jax.random.key(0), tp_size=1, fsdp_size=1, dp_size=1)[0]
 
 
 class _EngineTest:
@@ -263,9 +270,7 @@ class EvictionTest(absltest.TestCase):
     def test_logprobs_under_eviction(self):
         if jax.device_count() != 1:
             self.skipTest("single-device test")
-        model, _ = text_api.init_model(
-            "qwen3-smoke", jax.random.key(0), tp_size=1, fsdp_size=1, dp_size=1
-        )
+        model = _smoke_model()
         cfg = EngineConfig(
             num_pages=40,
             max_context=4096,
@@ -332,9 +337,7 @@ class KVPressureTest(absltest.TestCase):
     def test_decode_concurrency_under_kv_pressure(self):
         if jax.device_count() != 1:
             self.skipTest("single-device test")
-        model, _ = text_api.init_model(
-            "qwen3-smoke", jax.random.key(0), tp_size=1, fsdp_size=1, dp_size=1
-        )
+        model = _smoke_model()
         cfg = EngineConfig(
             num_pages=128,
             max_context=8192,

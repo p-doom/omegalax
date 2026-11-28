@@ -26,6 +26,7 @@ from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from omegalax.engine import steps
+from omegalax.models.kv_cache import EXTEND_TILE
 from omegalax.models.qwen3_5.cache import LinearExtend
 from omegalax.models.qwen3_5.deltanet import CHUNK_SIZE as _DELTANET_CHUNK
 from omegalax.models.qwen3_5.deltanet import GatedDeltaNet
@@ -188,7 +189,6 @@ class Engine:
                     raise ValueError(f"{a.num_kv_heads} KV heads do not split over tp={tp}.")
                 page = ((a.num_kv_heads, cfg.num_pages, S, a.head_dim), jnp.bfloat16, P("tp"))
                 self._pool_specs.append((page, page))
-                self._block_q = max(1, min(128, 128 * 128 // a.head_dim) // a.n_rep)
             else:
                 d = layer.linear_attn
                 if d.num_k_heads % tp:
@@ -205,6 +205,7 @@ class Engine:
                     )
                 )
         self._linear = len(self._pool_specs) != sum(hasattr(x, "attn") for x in layers)
+        self._block_q = EXTEND_TILE
         self._align = max(self._block_q, _DELTANET_CHUNK if self._linear else 1)
         self._fork_slack = cfg.max_group * S
         self._free_slots = list(range(num_slots - 1, steps.TRASH_SLOT, -1))
@@ -221,7 +222,7 @@ class Engine:
         )
         self._extend = jax.jit(
             bind(steps.extend),
-            static_argnames=("block_q", "num_work"),
+            static_argnames=("block_q",),
             donate_argnums=(1,),
             compiler_options=no_merge,
         )
@@ -640,7 +641,7 @@ class Engine:
             key_data,
             linear,
         )
-        return args, N
+        return args
 
     def _linear_extend(self, items, T: int) -> LinearExtend:
         """DeltaNet metadata for the packed batch; see ``omegalax.models.qwen3_5.cache``."""
@@ -684,15 +685,13 @@ class Engine:
             valid, conv_fix, conv_src, conv_out_src, write_slot, init_slot, init_idx, final_chunk
         )
 
-    def _run_extend_call(self, inputs):
-        args, N = inputs
+    def _run_extend_call(self, args):
         t = time.perf_counter()
         self._pools, tok_R, logp_R = self._extend(
             self._state,
             self._pools,
             *args,
             block_q=self._block_q,
-            num_work=N + self.cfg.spare_work,
         )
         tok_R, logp_R = np.asarray(tok_R), np.asarray(logp_R)
         self.stats["extend_s"] += time.perf_counter() - t
