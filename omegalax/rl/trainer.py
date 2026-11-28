@@ -35,6 +35,7 @@ class TrainConfig:
     host_optimizer: bool
     objective: str
     topk: int
+    drift_every: int
 
 
 def _metric_sums(logp_BT, entropy_BT, log_ratio_BT, clipped_BT, mask_BT, fresh_BT):
@@ -54,6 +55,17 @@ def _metric_sums(logp_BT, entropy_BT, log_ratio_BT, clipped_BT, mask_BT, fresh_B
         "fresh_kl_k3": jnp.sum(k3 * fresh),
         "abs_log_ratio_BT": abs_lr * mask_BT,
     }
+
+
+def _drift_stats(total, drift, drift_sum, centered: bool):
+    """Norms and alignment of one step's drift gradient against the rest of the gradient (which
+    contains the drift itself unless centering subtracted it), and the running drift sum."""
+    base = jax.tree.map(lambda t, d: t - d, total, drift) if centered else total
+    dot = lambda a, b: sum(jnp.sum(x.astype(jnp.float32) * y.astype(jnp.float32)) for x, y in zip(jax.tree.leaves(a), jax.tree.leaves(b)))
+    drift_sum = jax.tree.map(jnp.add, drift_sum, drift)
+    nd, nb = jnp.sqrt(dot(drift, drift)), jnp.sqrt(dot(base, base))
+    return {"norm": nd, "base_norm": nb, "cos_base": dot(drift, base) / (nd * nb + 1e-30),
+            "sum_norm": jnp.sqrt(dot(drift_sum, drift_sum))}, drift_sum
 
 
 class Trainer:
@@ -111,6 +123,12 @@ class Trainer:
             out_shardings=(self._opt_shardings, jax.tree.map(lambda x: x.sharding, self.opt_state), None),
         )
         self._logprobs = jax.jit(self._logprobs_fn)
+        self._drift = jax.jit(self._drift_fn, donate_argnums=(1,), out_shardings=(param_shardings, None))
+        self._drift_stats = jax.jit(
+            _drift_stats, static_argnums=(3,), donate_argnums=(2,), out_shardings=(None, param_shardings)
+        )
+        self._drift_sum = None
+        self._drift_sq = 0.0
         self.version = 0
 
     def _forward(self, params, tokens_BT, segment_ids_BT, cand_BTK):
@@ -144,10 +162,29 @@ class Trainer:
             metrics = _metric_sums(
                 logp_BT, entropy_BT, log_ratio_BT, clipped_BT, mb["mask"], mb["fresh"]
             )
+            # ||q - p||_1 per trained token over the sampler's head, plus the tail mass difference.
+            p_BTK, q_BTK = jnp.exp(jax.lax.stop_gradient(cand_logp_BTK)), jnp.exp(mb["cand_logq"])
+            tv_BT = jnp.sum(jnp.abs(q_BTK - p_BTK), -1) + jnp.abs(jnp.sum(q_BTK, -1) - jnp.sum(p_BTK, -1))
+            metrics["head_l1"] = jnp.sum(tv_BT * mb["mask"])
+            metrics["adv_head_l1"] = jnp.sum(jnp.abs(adv_BT) * tv_BT * mb["mask"])
             return loss * inv_tokens, metrics
 
         grads, metrics = jax.grad(loss_fn, has_aux=True)(params)
         return jax.tree.map(jnp.add, acc, grads), metrics
+
+    def _drift_fn(self, params, acc, mb, inv_tokens):
+        """Gradient of the score-centering term alone: the estimate of the mismatch drift
+        ``E_q[A * score]`` that centering removes (ppo_sc form for PPO runs, pg_sc for PG)."""
+        objective = "pg_sc" if self.cfg.objective == "pg_sc" else "ppo_sc"
+
+        def loss_fn(params):
+            logp_BT, _, cand_logp_BTK = self._forward(params, mb["tokens"], mb["segment_ids"], mb["cand"])
+            adv_BT = jnp.broadcast_to(mb["advantage"][:, None], logp_BT.shape)
+            return inv_tokens * score_centering(
+                cand_logp_BTK, mb["cand_logq"], adv_BT, mb["mask"], objective, self.cfg.eps_low, self.cfg.eps_high
+            )
+
+        return jax.tree.map(jnp.add, acc, jax.grad(loss_fn)(params)), None
 
     def _apply_fn(self, params, opt_state, grads):
         grad_norm = optax.global_norm(grads)
@@ -253,6 +290,18 @@ class Trainer:
             for mb in mbs:
                 acc, m = self._accumulate(self.params, acc, self._put(mb), inv_tokens)
                 sums.append(m)
+            drift = {}
+            if self.cfg.drift_every and self.version % self.cfg.drift_every == 0 and mbs:
+                dacc = self._zeros(self.params)
+                for mb in mbs:
+                    dacc, _ = self._drift(self.params, dacc, self._put(mb), inv_tokens)
+                if self._drift_sum is None:
+                    self._drift_sum = self._zeros(self.params)
+                stats, self._drift_sum = self._drift_stats(acc, dacc, self._drift_sum, self.cfg.objective != "ppo")
+                stats = {k: float(v) for k, v in jax.device_get(stats).items()}
+                self._drift_sq += stats["norm"] ** 2
+                drift = {f"drift/{k}": v for k, v in stats.items()}
+                drift["drift/coherence"] = stats["sum_norm"] / max(self._drift_sq, 1e-30) ** 0.5
         with jax.set_mesh(self._opt_mesh):
             self.master, self.opt_state, grad_norm = self._apply(
                 self.master, self.opt_state, jax.device_put(acc, self._opt_shardings)
@@ -281,7 +330,9 @@ class Trainer:
         padded = max(sum(mb["tokens"].size for mb in mbs), 1)
         get = lambda k: totals.get(k, 0.0)
         n, nf = max(get("tokens"), 1.0), max(get("fresh_tokens"), 1.0)
-        return {
+        return drift | {
+            "train/head_l1": get("head_l1") / n,
+            "train/adv_head_l1": get("adv_head_l1") / n,
             "train/seconds": seconds,
             "train/microbatches": len(mbs),
             "train/grad_norm": float(grad_norm),

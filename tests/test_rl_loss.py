@@ -126,7 +126,7 @@ class TrainerTest(absltest.TestCase):
         trainer = Trainer(model, cfg, TrainConfig(
             lr=1e-3, weight_decay=0.0, adam_b1=0.9, adam_b2=0.98, adam_eps=1e-8, max_grad_norm=1e9,
             eps_low=0.2, eps_high=0.28, tokens_per_microbatch=32, length_buckets=(32, 64),
-            logit_tile_tokens=64, pad_id=0, host_optimizer=False, objective="ppo", topk=1,
+            logit_tile_tokens=64, pad_id=0, host_optimizer=False, objective="ppo", topk=1, drift_every=0,
         ))
         rng = np.random.default_rng(0)
         samples = []
@@ -149,6 +149,42 @@ class TrainerTest(absltest.TestCase):
         self.assertGreater(max(float(jnp.abs(g).max()) for g in active), 1e-4)
         for f, a in zip(full, active):
             np.testing.assert_array_equal(np.asarray(f), np.asarray(a))
+
+    def test_drift_is_the_centering_gradient(self):
+        """A ppo_sc step's gradient minus its measured drift is the plain ppo gradient."""
+        from omegalax.rl.rollout import Sample
+        from omegalax.rl.trainer import TrainConfig, Trainer
+        from omegalax.models.sharding_runtime import set_attn_backend
+        from omegalax.text import api as text_api
+
+        rng = np.random.default_rng(1)
+        samples = []
+        for L in (20, 40, 30, 50):
+            n = L - 8
+            cand = np.stack([rng.choice(100, 4, replace=False) for _ in range(n)]).astype(np.int32)
+            q = rng.dirichlet(np.ones(5), n)[:, :4] * 0.9
+            samples.append(Sample(0, rng.integers(1, 100, L).tolist(), 8, [0] * 8 + [1] * n,
+                                  list(rng.normal(-2, 0.5, L)), [0] * L, heads=[(cand, np.log(q).astype(np.float32))]))
+        adv = [1.0, -0.5, -1.0, 0.5]
+        out = {}
+        for objective in ("ppo", "ppo_sc"):
+            model, cfg = text_api.init_model("qwen3-smoke", jax.random.key(0), tp_size=1, fsdp_size=1, dp_size=1)
+            set_attn_backend(model, "xla")
+            trainer = Trainer(model, cfg, TrainConfig(
+                lr=1e-3, weight_decay=0.0, adam_b1=0.9, adam_b2=0.98, adam_eps=1e-8, max_grad_norm=1e9,
+                eps_low=0.2, eps_high=0.28, tokens_per_microbatch=64, length_buckets=(32, 64),
+                logit_tile_tokens=64, pad_id=0, host_optimizer=False, objective=objective, topk=4, drift_every=1,
+            ))
+            out[objective] = trainer.step(samples, adv)
+        ppo, sc = out["ppo"], out["ppo_sc"]
+        self.assertGreater(sc["drift/norm"], 1e-6)
+        self.assertAlmostEqual(sc["drift/coherence"], 1.0, places=5)
+        np.testing.assert_allclose(ppo["drift/norm"], sc["drift/norm"], rtol=1e-5)
+        np.testing.assert_allclose(ppo["drift/base_norm"], ppo["train/grad_norm"], rtol=1e-5)
+        # Separate programs sum in different orders; a drift that were not the centering gradient
+        # would be off by ~|drift| / |base| ~ 0.3.
+        np.testing.assert_allclose(sc["drift/base_norm"], ppo["train/grad_norm"], rtol=1e-3)
+        self.assertGreater(abs(sc["train/grad_norm"] - ppo["train/grad_norm"]), 1e-6)
 
 
 class EngineTopkTest(absltest.TestCase):

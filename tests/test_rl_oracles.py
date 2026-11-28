@@ -54,7 +54,7 @@ class RLOracleTest(absltest.TestCase):
             TrainConfig(
                 lr=1e-4, weight_decay=0.1, adam_b1=0.9, adam_b2=0.98, adam_eps=1e-8,
                 max_grad_norm=1.0, eps_low=0.2, eps_high=0.28, tokens_per_microbatch=2048,
-                length_buckets=(1024, 2048, 4096), logit_tile_tokens=4096, pad_id=cls.pad, host_optimizer=False, objective="ppo", topk=1,
+                length_buckets=(1024, 2048, 4096), logit_tile_tokens=4096, pad_id=cls.pad, host_optimizer=False, objective="ppo", topk=1, drift_every=0,
             ),
         )
         cls.sync = WeightSync(cls.trainer.graphdef, cls.trainer.params)
