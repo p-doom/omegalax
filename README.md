@@ -24,7 +24,9 @@
 # `omegalax`:  A JAX-based training codebase for LLMs/VLMs.
 
 ## Overview
-- Qwen3 dense and MoE (`omegalax/models/qwen3`) with cache-aware decode in `omegalax/text/api.py`.
+- Qwen3 dense and MoE (`omegalax/models/qwen3`).
+- A token-in/token-out rollout engine over a paged KV cache (`omegalax/engine`; Qwen3 dense and
+  the Qwen3.5 dense text decoder).
 - Qwen3.5 MoE and Qwen3-VL (`omegalax/models/qwen3_5`, `omegalax/models/qwen3_vl`, `omegalax/vlm/api.py`).
 - HuggingFace safetensor loaders for all architectures: `create_qwen3_from_safetensors`, `create_qwen3_5_from_safetensors`, and `create_qwen3_vl_from_safetensors`.
 - Supported models:
@@ -44,19 +46,37 @@ uv sync
 ```
 
 ## Quickstart (language-only)
-Create a Qwen3 text model and run a forward+decode step:
+Create a Qwen3 text model and run a forward pass:
 ```python
 import jax
 import jax.numpy as jnp
 from omegalax.text import api
 
 rng = jax.random.key(0)
-model, cfg = api.init_model("Qwen/Qwen3-0.6B", rng, tp_size=1, fsdp_size=1)
+model, cfg = api.init_model("Qwen/Qwen3-0.6B", rng, tp_size=1, fsdp_size=1, dp_size=1)
 tokens = jax.random.randint(rng, (2, 32), 0, cfg.vocab_size, jnp.int32)
-logits, aux_loss = api.forward(model, tokens, pad_id=0, cfg=cfg)
-cache = api.make_cache(cfg, batch_size=2, token_len=32, generate_steps=8)
-next_logits, cache, aux_loss = api.decode(model, cache, tokens, pad_id=0, cfg=cfg)
+hidden, aux_loss = api.forward(model, tokens, pad_id=0, cfg=cfg)
 ```
+
+Sample from it with the rollout engine (one session per key; continue a session by
+passing `session=` with the appended tokens):
+```python
+import numpy as np
+from omegalax.engine import Engine, EngineConfig, Request
+
+engine = Engine(model, EngineConfig(
+    num_pages=1024, max_context=8192, decode_steps=8, decode_buckets=(2, 4, 8),
+    extend_buckets=(256, 1024, 4096), eos_token_ids=(151645,), pad_id=151643))
+engine.start()  # compiles every bucket
+keys = np.random.default_rng(0).integers(0, 2**32, size=(4, 2), dtype=np.uint32)
+futures = engine.generate(Request(prompt_ids, keys, [256] * 4, [1.0] * 4))
+completions = [f.result() for f in futures]  # tokens, logprobs, weight versions
+```
+
+For tensor parallelism, load the model with `tp_size=N, fsdp_size=1, dp_size=1` on N devices;
+the engine shards its caches like the model's heads. Run with
+`XLA_FLAGS=--xla_gpu_enable_command_buffer=+COLLECTIVES`, which lets the all-reduces join
+XLA's CUDA-graph command buffers (decode steps 4-7 % faster at TP=2 on H100).
 
 ## Training
 The expected flow is:

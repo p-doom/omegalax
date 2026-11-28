@@ -192,7 +192,7 @@ class Qwen3ModuleTest(absltest.TestCase):
             )
 
         jax_normed = _to_jax(hf_normed)
-        jax_attn_out = self.jax_model.layers[0].attn(jax_normed, None, self.segment_ids_BT)
+        jax_attn_out, _ = self.jax_model.layers[0].attn(jax_normed, None, self.segment_ids_BT)
         self._assert_close(jax_attn_out, hf_attn_out, atol=ATTENTION_ATOL, msg="attention")
 
     # 5. MLP
@@ -240,7 +240,7 @@ class Qwen3ModuleTest(absltest.TestCase):
                 position_ids=position_ids_torch,
             )
 
-        jax_out = self.jax_model.layers[0](_to_jax(self.hf_emb), None, self.segment_ids_BT)
+        jax_out, _, _ = self.jax_model.layers[0](_to_jax(self.hf_emb), None, self.segment_ids_BT)
         self._assert_close(jax_out, hf_out, atol=DECODER_LAYER_ATOL, msg="decoder layer 0")
 
 

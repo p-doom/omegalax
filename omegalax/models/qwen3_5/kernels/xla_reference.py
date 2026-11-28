@@ -12,6 +12,8 @@ import jax.numpy as jnp
 
 
 def _l2norm(x: jax.Array, axis: int = -1, eps: float = 1e-6) -> jax.Array:
+    # float32: in float16 the backward of rsqrt(eps) on zero (padding) rows overflows to inf * 0.
+    x = x.astype(jnp.float32)
     inv_norm = jax.lax.rsqrt((x * x).sum(axis=axis, keepdims=True) + eps)
     return x * inv_norm
 
@@ -22,16 +24,24 @@ def chunk_gated_delta_rule_xla(
     v_BTHU: jax.Array,
     g_BTH: jax.Array,
     beta_BTH: jax.Array,
+    init_NHAU: jax.Array,
+    init_idx_BJ: jax.Array,
+    final_idx_BW: jax.Array,
     chunk_size: int = 64,
-) -> jax.Array:
+) -> tuple[jax.Array, jax.Array]:
     """Chunked gated delta rule (XLA reference).
 
     Inputs:
         q_BTHA, k_BTHA: (B, T, H, A)
         v_BTHU:         (B, T, H, U)
         g_BTH, beta_BTH: (B, T, H)
+        init_NHAU:      (N, H, A, U) initial states
+        init_idx_BJ:    (B, J) chunk ``j`` of row ``b`` starts from ``init_NHAU[i]`` when
+                        ``i = init_idx_BJ[b, j] >= 0``, else from the previous chunk's state
+        final_idx_BW:   (B, W) chunks whose end states to return
     Returns:
         out_BTHU: (B, T, H, U)
+        state_BWHAU: (B, W, H, A, U) state after chunk ``final_idx_BW[b, w]``
 
     Internally l2-normalizes q and k. Pads T up to a multiple of ``chunk_size``
     and trims at the end.
@@ -94,9 +104,13 @@ def chunk_gated_delta_rule_xla(
 
     state_BHAU = jnp.zeros((B, H, A, U), dtype=jnp.float32)
     upper_mask_1_LM = jnp.triu(jnp.ones((chunk_size, chunk_size), dtype=jnp.bool_), k=1)
+    init_NHAU = init_NHAU.astype(jnp.float32)
 
     def chunk_step(carry, chunk_idx):
-        st_BHAU = carry
+        idx_B = init_idx_BJ[:, chunk_idx]
+        st_BHAU = jnp.where(
+            (idx_B >= 0)[:, None, None, None], init_NHAU[jnp.maximum(idx_B, 0)], carry
+        )
         q_j_BHLA = q_BHJLA[:, :, chunk_idx]
         k_j_BHMA = k_BHJLA[:, :, chunk_idx]
         v_j_BHLU = v_corrected_BHJLU[:, :, chunk_idx]
@@ -126,9 +140,75 @@ def chunk_gated_delta_rule_xla(
             v_new_BHLU,
         )
 
-        return new_st_BHAU, chunk_out_BHLU
+        return new_st_BHAU, (chunk_out_BHLU, new_st_BHAU)
 
-    state_BHAU, core_out_chunks = jax.lax.scan(chunk_step, state_BHAU, jnp.arange(J))
+    _, (core_out_chunks, state_JBHAU) = jax.lax.scan(chunk_step, state_BHAU, jnp.arange(J))
     core_out_BHJLU = core_out_chunks.transpose(1, 2, 0, 3, 4)
     core_out_BHTU = core_out_BHJLU.reshape(B, H, -1, U)[:, :, :T, :]
-    return core_out_BHTU.transpose(0, 2, 1, 3)
+    state_BJHAU = jnp.swapaxes(state_JBHAU, 0, 1)
+    state_BWHAU = jnp.take_along_axis(state_BJHAU, final_idx_BW[:, :, None, None, None], axis=1)
+    return core_out_BHTU.transpose(0, 2, 1, 3), state_BWHAU
+
+
+def recurrent_gated_delta_step_xla(
+    q_BHA: jax.Array,
+    k_BHA: jax.Array,
+    v_BHU: jax.Array,
+    g_BH: jax.Array,
+    beta_BH: jax.Array,
+    state_SHAU: jax.Array,
+    slot_B: jax.Array,
+) -> tuple[jax.Array, jax.Array]:
+    """One gated delta rule step per row on state ``state_SHAU[slot_B[b]]`` (XLA reference).
+
+    Returns ``(out_BHU, updated state_SHAU)``; same math as one token of the chunked rule.
+    """
+    q_BHA = _l2norm(q_BHA).astype(jnp.float32) * q_BHA.shape[-1] ** -0.5
+    k_BHA = _l2norm(k_BHA).astype(jnp.float32)
+    st_BHAU = state_SHAU[slot_B] * jnp.exp(g_BH.astype(jnp.float32))[..., None, None]
+    kv_BHU = jnp.einsum("BHAU,BHA->BHU", st_BHAU, k_BHA)
+    delta_BHU = (v_BHU.astype(jnp.float32) - kv_BHU) * beta_BH.astype(jnp.float32)[..., None]
+    st_BHAU = st_BHAU + k_BHA[..., None] * delta_BHU[..., None, :]
+    out_BHU = jnp.einsum("BHAU,BHA->BHU", st_BHAU, q_BHA)
+    return out_BHU, state_SHAU.at[slot_B].set(st_BHAU)
+
+
+def gated_delta_decode_xla(
+    x_NC: jax.Array,
+    z_NHU: jax.Array,
+    b_NH: jax.Array,
+    a_NH: jax.Array,
+    conv_SKC: jax.Array,
+    weight_CK: jax.Array,
+    state_SHAU: jax.Array,
+    A_log_H: jax.Array,
+    dt_H: jax.Array,
+    norm_U: jax.Array,
+    slot_N: jax.Array,
+    *,
+    eps: float,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """One decode token per row of a gated DeltaNet layer after its input projections (XLA
+    reference): the causal conv continues pool slot ``slot_N[n]``'s window of ``x_NC`` (channels
+    ``[q | k | v]``, key heads repeated over value heads), then the delta rule step on that
+    slot's state and the gated RMSNorm. Returns the normed ``(N, H * U)`` output and both pools.
+    """
+    N, C = x_NC.shape
+    H, U = z_NHU.shape[1:]
+    A = state_SHAU.shape[2]
+    num_k = (C - H * U) // (2 * A)
+    taps_NKC = jnp.concatenate([conv_SKC[slot_N], x_NC[:, None]], axis=1)
+    conv_NC = jnp.zeros_like(x_NC)
+    for k in range(weight_CK.shape[1]):
+        conv_NC = conv_NC + weight_CK[None, :, k] * taps_NKC[:, k]
+    conv_SKC = conv_SKC.at[slot_N].set(taps_NKC[:, 1:])
+    q_NP, k_NP, v_NO = jnp.split(jax.nn.silu(conv_NC), [num_k * A, 2 * num_k * A], axis=-1)
+    q_NHA = jnp.repeat(q_NP.reshape(N, num_k, A), H // num_k, 1)
+    k_NHA = jnp.repeat(k_NP.reshape(N, num_k, A), H // num_k, 1)
+    g_NH = -jnp.exp(A_log_H.astype(jnp.float32)) * jax.nn.softplus(a_NH.astype(jnp.float32) + dt_H)
+    out_NHU, state_SHAU = recurrent_gated_delta_step_xla(
+        q_NHA, k_NHA, v_NO.reshape(N, H, U), g_NH, jax.nn.sigmoid(b_NH), state_SHAU, slot_N
+    )
+    normed_NHU = out_NHU * jax.lax.rsqrt(jnp.mean(out_NHU**2, axis=-1, keepdims=True) + eps)
+    gated_NHU = norm_U.astype(jnp.float32) * normed_NHU * jax.nn.silu(z_NHU.astype(jnp.float32))
+    return gated_NHU.astype(x_NC.dtype).reshape(N, H * U), conv_SKC, state_SHAU
