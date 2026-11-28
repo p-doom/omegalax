@@ -415,19 +415,19 @@ class Engine:
         return s
 
     def _admit(self, req: Request, futures: list[Future]) -> None:
+        def reject(exc: Exception) -> None:
+            # Every future of a group: a caller awaiting a fork must not wait forever.
+            for f in futures:
+                f.set_exception(exc)
+
         lead = None if req.session is None else self._sessions[req.session]
         if lead is not None and lead.turn is not None:
-            futures[0].set_exception(ValueError(f"Session {lead.id} is still generating."))
-            return
+            return reject(ValueError(f"Session {lead.id} is still generating."))
         base = 0 if lead is None else len(lead.tokens)
         if base + len(req.tokens) + max(req.max_new_tokens) > self.cfg.max_context:
-            futures[0].set_exception(
-                ValueError(f"Request exceeds max_context={self.cfg.max_context}.")
-            )
-            return
+            return reject(ValueError(f"Request exceeds max_context={self.cfg.max_context}."))
         if lead is None and len(futures) > len(self._free_slots):
-            futures[0].set_exception(ValueError(f"More than max_sessions={self.cfg.max_sessions}."))
-            return
+            return reject(ValueError(f"More than max_sessions={self.cfg.max_sessions}."))
         if lead is None:
             lead = self._new_session(list(req.tokens))
             lead.forks = [self._new_session(list(req.tokens)) for _ in futures[1:]]

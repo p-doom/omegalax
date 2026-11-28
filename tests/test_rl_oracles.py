@@ -191,6 +191,17 @@ class RLOracleTest(absltest.TestCase):
         for a, b in zip(jax.tree.leaves(states[0][1]), jax.tree.leaves(states[1][1])):
             np.testing.assert_allclose(a, b, rtol=5e-7, atol=1e-37)
 
+    def test_4_rejected_group_fails_every_future(self):
+        group = lambda: self.engine.generate(Request([1, 2, 3], np.zeros((4, 2), np.uint32), [1] * 4, [1.0] * 4))
+        held = [f.result(timeout=60).session for _ in range(2) for f in group()]
+        try:
+            for f in group():
+                with self.assertRaisesRegex(ValueError, "max_sessions"):
+                    f.result(timeout=60)
+        finally:
+            for session in held:
+                self.engine.release(session)
+
 
 if __name__ == "__main__":
     absltest.main()
