@@ -33,6 +33,7 @@ class TrainConfig:
     logit_tile_tokens: int
     pad_id: int
     host_optimizer: bool
+    loss_scale: float
     objective: str
     topk: int
     drift_every: int
@@ -187,6 +188,7 @@ class Trainer:
         return jax.tree.map(jnp.add, acc, jax.grad(loss_fn)(params)), None
 
     def _apply_fn(self, params, opt_state, grads):
+        grads = jax.tree.map(lambda g: g / self.cfg.loss_scale, grads)
         grad_norm = optax.global_norm(grads)
         updates, opt_state = self.tx.update(grads, opt_state, params)
         return optax.apply_updates(params, updates), opt_state, grad_norm
@@ -283,7 +285,8 @@ class Trainer:
         # token normalizer, so its forward/backward is skipped.
         active = [i for i, a in enumerate(advantages) if a != 0.0]
         mbs = self.microbatches([samples[i] for i in active], [advantages[i] for i in active])
-        inv_tokens = np.float32(1.0 / total_tokens)
+        # The scale keeps float16 cotangents (~advantage / loss tokens) above the subnormal range.
+        inv_tokens = np.float32(self.cfg.loss_scale / total_tokens)
         with jax.set_mesh(self.mesh):
             acc = self._zeros(self.params)
             sums = []
@@ -298,7 +301,8 @@ class Trainer:
                 if self._drift_sum is None:
                     self._drift_sum = self._zeros(self.params)
                 stats, self._drift_sum = self._drift_stats(acc, dacc, self._drift_sum, self.cfg.objective != "ppo")
-                stats = {k: float(v) for k, v in jax.device_get(stats).items()}
+                stats = {k: float(v) / (1.0 if k == "cos_base" else self.cfg.loss_scale)
+                         for k, v in jax.device_get(stats).items()}
                 self._drift_sq += stats["norm"] ** 2
                 drift = {f"drift/{k}": v for k, v in stats.items()}
                 drift["drift/coherence"] = stats["sum_norm"] / max(self._drift_sq, 1e-30) ** 0.5
@@ -308,6 +312,8 @@ class Trainer:
             )
         self.params = jax.device_put(self.master, self._param_shardings)
         sums = jax.device_get(sums)
+        if not np.isfinite(float(grad_norm)):
+            raise FloatingPointError(f"Gradient norm {float(grad_norm)} at loss_scale {self.cfg.loss_scale}.")
         # Per-token |log pi - log mu| on trained tokens, for quantiles and Miles' sample mean.
         per_token, per_sample = [np.zeros(0)], [np.zeros(0)]
         for s, mb in zip(sums, mbs):

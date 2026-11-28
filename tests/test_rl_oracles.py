@@ -7,6 +7,7 @@ import os
 os.environ.setdefault("JAX_PLATFORMS", "cuda,cpu")  # cpu: the host-optimizer placement
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 from absl.testing import absltest
 from huggingface_hub import snapshot_download
@@ -47,14 +48,14 @@ class RLOracleTest(absltest.TestCase):
         cls.tok = AutoTokenizer.from_pretrained(path)
         eos = cls.tok.convert_tokens_to_ids("<|im_end|>")
         cls.pad = cls.tok.convert_tokens_to_ids("<|endoftext|>")
-        model, cfg = load_causal_lm(path, sub_mesh(devices[:2], 1, 2, 1))
+        model, cfg = load_causal_lm(path, sub_mesh(devices[:2], 1, 2, 1), jnp.bfloat16)
         cls.trainer = Trainer(
             model,
             cfg,
             TrainConfig(
                 lr=1e-4, weight_decay=0.1, adam_b1=0.9, adam_b2=0.98, adam_eps=1e-8,
                 max_grad_norm=1.0, eps_low=0.2, eps_high=0.28, tokens_per_microbatch=2048,
-                length_buckets=(1024, 2048, 4096), logit_tile_tokens=4096, pad_id=cls.pad, host_optimizer=False, objective="ppo", topk=1, drift_every=0,
+                length_buckets=(1024, 2048, 4096), logit_tile_tokens=4096, pad_id=cls.pad, host_optimizer=False, loss_scale=1.0, objective="ppo", topk=1, drift_every=0,
             ),
         )
         cls.sync = WeightSync(cls.trainer.graphdef, cls.trainer.params)
@@ -168,24 +169,27 @@ class RLOracleTest(absltest.TestCase):
             samples.append(Sample(0, toks, 50, [0] * 50 + [1] * (L - 50), list(rng.normal(-2, 0.5, L)), [0] * L,
                                   heads=[(np.zeros((L - 50, 1), np.int32), np.zeros((L - 50, 1), np.float32))]))
         adv = [1.0, -1.0, 0.5, -0.5]
-        params = []
+        states = []
         for host in (False, True):
-            model, cfg = load_causal_lm(path, sub_mesh(jax.devices()[:2], 1, 2, 1))
+            model, cfg = load_causal_lm(path, sub_mesh(jax.devices()[:2], 1, 2, 1), jnp.bfloat16)
             trainer = Trainer(model, cfg, dataclasses.replace(self.trainer.cfg, host_optimizer=host))
             del model
             trainer.warmup()
-            for _ in range(2):
-                m = trainer.step(samples, adv)
-            print(f"host_optimizer={host}: step {m['train/seconds']:.2f} s, grad norm {m['train/grad_norm']:.4f}")
-            params.append(jax.device_get(trainer.params))
+            m = trainer.step(samples, adv)
+            print(f"host_optimizer={host}: step {m['train/seconds']:.2f} s, grad norm {m['train/grad_norm']:.6f}")
+            states.append(jax.device_get((trainer.params, trainer.opt_state)))
             del trainer
-        # CPU and GPU float32 arithmetic differ in the last bits; Adam turns that into a full
-        # lr-sized sign flip where a gradient is ~0. Bound those and require the rest to agree.
-        diff = np.concatenate([np.abs(a - b).ravel() for a, b in zip(jax.tree.leaves(params[0]), jax.tree.leaves(params[1]))])
+        # One step from identical params sees identical gradients, so params and Adam moments may differ
+        # only by CPU vs GPU float32 rounding. A second step would compare gradients of last-bit-different
+        # params, which the bfloat16 forward amplifies into ~1 % gradient noise.
         lr = self.trainer.cfg.lr
-        print(f"device vs host optimizer: max |dp| {diff.max():.2e}, frac > 1e-3 lr: {(diff > 1e-3 * lr).mean():.2e}")
-        self.assertLessEqual(diff.max(), 2 * lr * 2 * 1.01)
-        self.assertLess((diff > 1e-3 * lr).mean(), 1e-3)
+        diff = max(float(np.max(np.abs(a - b))) for a, b in zip(jax.tree.leaves(states[0][0]), jax.tree.leaves(states[1][0])))
+        print(f"device vs host optimizer after one step: max |dp| {diff:.2e} ({diff / lr:.1e} lr)")
+        for a, b in zip(jax.tree.leaves(states[0][0]), jax.tree.leaves(states[1][0])):
+            np.testing.assert_allclose(a, b, rtol=5e-7, atol=1e-3 * lr)
+        # The GPU flushes float32 subnormals (second moments of ~1e-20 gradients) to zero; the CPU keeps them.
+        for a, b in zip(jax.tree.leaves(states[0][1]), jax.tree.leaves(states[1][1])):
+            np.testing.assert_allclose(a, b, rtol=5e-7, atol=1e-37)
 
 
 if __name__ == "__main__":

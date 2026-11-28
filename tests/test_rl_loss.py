@@ -126,7 +126,7 @@ class TrainerTest(absltest.TestCase):
         trainer = Trainer(model, cfg, TrainConfig(
             lr=1e-3, weight_decay=0.0, adam_b1=0.9, adam_b2=0.98, adam_eps=1e-8, max_grad_norm=1e9,
             eps_low=0.2, eps_high=0.28, tokens_per_microbatch=32, length_buckets=(32, 64),
-            logit_tile_tokens=64, pad_id=0, host_optimizer=False, objective="ppo", topk=1, drift_every=0,
+            logit_tile_tokens=64, pad_id=0, host_optimizer=False, loss_scale=1.0, objective="ppo", topk=1, drift_every=0,
         ))
         rng = np.random.default_rng(0)
         samples = []
@@ -173,7 +173,8 @@ class TrainerTest(absltest.TestCase):
             trainer = Trainer(model, cfg, TrainConfig(
                 lr=1e-3, weight_decay=0.0, adam_b1=0.9, adam_b2=0.98, adam_eps=1e-8, max_grad_norm=1e9,
                 eps_low=0.2, eps_high=0.28, tokens_per_microbatch=64, length_buckets=(32, 64),
-                logit_tile_tokens=64, pad_id=0, host_optimizer=False, objective=objective, topk=4, drift_every=1,
+                logit_tile_tokens=64, pad_id=0, host_optimizer=False, loss_scale=1.0, objective=objective, topk=4,
+                drift_every=1,
             ))
             out[objective] = trainer.step(samples, adv)
         ppo, sc = out["ppo"], out["ppo_sc"]

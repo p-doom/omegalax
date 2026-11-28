@@ -1,5 +1,6 @@
-"""Trainer on an FSDP-2 mesh of forced CPU host devices: no compiles after warmup, and the host
-optimizer placement takes the same steps as the device placement."""
+"""Trainer on an FSDP-2 mesh of forced CPU host devices: no compiles after warmup, the host
+optimizer placement takes the same steps as the device placement, and a power-of-two loss scale
+is undone exactly."""
 
 import logging
 import os
@@ -29,14 +30,14 @@ class _Compiles(logging.Handler):
 
 
 class FsdpTrainerTest(absltest.TestCase):
-    def _run(self, host_optimizer: bool):
+    def _run(self, host_optimizer: bool, loss_scale: float = 1.0):
         with jax.set_mesh(sub_mesh(jax.devices()[:2], 1, 2, 1)):
             model, cfg = text_api.init_model("qwen3-smoke", jax.random.key(0), tp_size=1, fsdp_size=2, dp_size=1)
         set_attn_backend(model, "xla")
         trainer = Trainer(model, cfg, TrainConfig(
             lr=1e-3, weight_decay=0.1, adam_b1=0.9, adam_b2=0.98, adam_eps=1e-8, max_grad_norm=1.0,
             eps_low=0.2, eps_high=0.28, tokens_per_microbatch=256, length_buckets=(32, 64),
-            logit_tile_tokens=64, pad_id=0, host_optimizer=host_optimizer, objective="ppo", topk=1, drift_every=0,
+            logit_tile_tokens=64, pad_id=0, host_optimizer=host_optimizer, loss_scale=loss_scale, objective="ppo", topk=1, drift_every=0,
         ))
         rng = np.random.default_rng(0)
         samples = [
@@ -70,6 +71,13 @@ class FsdpTrainerTest(absltest.TestCase):
         np.testing.assert_allclose(device_norms, host_norms, rtol=1e-5)
         for a, b in zip(jax.tree.leaves(device_params), jax.tree.leaves(host_params)):
             np.testing.assert_allclose(a, b, rtol=1e-4, atol=1e-6)
+
+    def test_loss_scale_is_exact(self):
+        norms, _, params = self._run(host_optimizer=False)
+        scaled_norms, _, scaled_params = self._run(host_optimizer=False, loss_scale=2.0**16)
+        np.testing.assert_array_equal(norms, scaled_norms)
+        for a, b in zip(jax.tree.leaves(params), jax.tree.leaves(scaled_params)):
+            np.testing.assert_array_equal(a, b)
 
 
 if __name__ == "__main__":

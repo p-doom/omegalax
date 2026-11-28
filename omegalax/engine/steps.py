@@ -172,7 +172,6 @@ def extend(
     linear: LinearExtend | None,
     *,
     block_q: int,
-    num_work: int,
     topk: int,
 ):
     """Writes a packed batch of token chunks to the cache, then samples one token per row.
@@ -189,7 +188,7 @@ def extend(
         q_pos_N=q_pos_N,
         kv_len_N=kv_len_N,
         block_q=block_q,
-        num_work=num_work,
+        num_work=0,
     )
     hidden_BTD, pools = _forward(model, pools, tokens_T[None], paged, linear)
     tok_R, logp_R, head_Rk, head_logp_Rk = _sample(
