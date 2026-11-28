@@ -23,7 +23,7 @@ def _model(graphdef, leaves):
 
 
 def _logits_BV(model, hidden_BD: jax.Array) -> jax.Array:
-    logits_BTV = jnp.einsum("BTD,DV->BTV", hidden_BD[:, None], model.lm_head.kernel[...])
+    logits_BTV = jnp.einsum("BTD,DV->BTV", hidden_BD[:, None], model.output_weight())
     return logits_BTV[:, 0].astype(jnp.float32)
 
 
@@ -202,6 +202,6 @@ def score(graphdef, state, tokens_BT, pad_id: int):
     """Trainer-forward log-probability of each next token: ``logp_BT[:, t]`` scores ``t + 1``."""
     model = _model(graphdef, state)
     hidden_BTD, _ = model(tokens_BT, 1 * (tokens_BT != pad_id), None, None)
-    logits_BTV = jnp.einsum("BTD,DV->BTV", hidden_BTD, model.lm_head.kernel[...])
+    logits_BTV = jnp.einsum("BTD,DV->BTV", hidden_BTD, model.output_weight())
     logp_BTV = jax.nn.log_softmax(logits_BTV.astype(jnp.float32), axis=-1)
     return _pick(logp_BTV[:, :-1], tokens_BT[:, 1:])

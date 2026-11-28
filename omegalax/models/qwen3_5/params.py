@@ -148,9 +148,6 @@ def export_qwen3_5_to_safetensors(
     unmatched: list[str] = []
 
     def _handle_special(jax_key: str, value) -> bool:
-        if jax_key == "lm_head.kernel" and cfg.text_config.tie_word_embeddings:
-            return True
-
         if jax_key == "vision.patch_embed.proj.kernel":
             arr = np.asarray(jax.device_get(value))
             hf_arr = arr.transpose(4, 3, 0, 1, 2)

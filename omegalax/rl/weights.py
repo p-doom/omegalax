@@ -46,13 +46,8 @@ def load_causal_lm(path: str, mesh: jax.sharding.Mesh, dtype) -> tuple[nnx.Modul
             with mesh_rules(mesh):
                 abstract = nnx.eval_shape(lambda: Qwen3_5ForCausalLM(cfg, rngs=nnx.Rngs(0)))
             state = nnx.state(abstract)
-            nnx.replace_by_pure_dict(
-                state,
-                {
-                    "text": nnx.to_pure_dict(nnx.state(vlm.text)),
-                    "lm_head": nnx.to_pure_dict(nnx.state(vlm.lm_head)),
-                },
-            )
+            vlm_state = nnx.to_pure_dict(nnx.state(vlm))
+            nnx.replace_by_pure_dict(state, {k: v for k, v in vlm_state.items() if k != "vision"})
             model = nnx.merge(nnx.graphdef(abstract), state)
             _finalize_q_shardings(model, mesh)
         else:

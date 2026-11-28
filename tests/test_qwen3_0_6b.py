@@ -101,7 +101,7 @@ class Qwen3MappingTest(absltest.TestCase):
         hidden_BTD, _ = self.jax_model(
             token_ids_BT, segment_ids_BT, None, jnp.array(0, dtype=jnp.int32)
         )
-        logits_BTV = self.jax_model.lm_head(hidden_BTD)
+        logits_BTV = hidden_BTD @ self.jax_model.output_weight()
         return np.asarray(logits_BTV, dtype=np.float32)
 
     def test_parameter_mapping_is_complete(self):

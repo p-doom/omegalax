@@ -136,9 +136,11 @@ def _qkv_shard_order(d: GatedDeltaNet, tp: int) -> np.ndarray:
 def _inference_layout(model: nnx.Module, state: nnx.State, tp: int) -> list:
     """Per state leaf, ``(dtype, axis, order)``: how the engine stores it.
 
-    Every Linear kernel (but the lm_head) and embedding table is stored in its module's compute
-    dtype, which the forward pass casts it to before every use anyway; the lm_head keeps its
-    storage dtype because the trainer's loss multiplies it directly. A DeltaNet layer's
+    Every Linear kernel and embedding table is stored in its module's compute dtype, which the
+    forward pass casts it to before every use anyway, except the output projection (the lm_head,
+    or a tied embedding): it keeps its storage dtype because the trainer's loss multiplies it
+    directly. A tied table's lookup casts the gathered rows, so it equals a compute-dtype
+    table's lookup bit for bit. A DeltaNet layer's
     ``in_proj_qkv`` kernel (columns) and ``conv_weight`` (rows) are reordered to
     ``_qkv_shard_order`` along ``axis``, the layout ``GatedDeltaNet._cached`` expects.
     """
@@ -146,7 +148,7 @@ def _inference_layout(model: nnx.Module, state: nnx.State, tp: int) -> list:
     for path, m in nnx.iter_modules(model):
         if isinstance(m, nnx.Linear) and m is not model.lm_head:
             dtypes[(*path, "kernel")] = m.dtype
-        elif isinstance(m, nnx.Embed):
+        elif isinstance(m, nnx.Embed) and model.lm_head is not None:
             dtypes[(*path, "embedding")] = m.dtype
         elif isinstance(m, GatedDeltaNet):
             order = _qkv_shard_order(m, tp)
@@ -181,7 +183,7 @@ class Engine:
             lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=x.sharding), state
         )
         layout = _inference_layout(model, state, tp)
-        # _reorder's out_sharding is a PartitionSpec, which needs the mesh in context.
+        # The engine traces under its own mesh, whatever mesh the caller has set, if any.
         with jax.set_mesh(self._mesh):
             self._to_inference = (
                 jax.jit(
