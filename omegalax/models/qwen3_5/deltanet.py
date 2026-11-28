@@ -242,16 +242,34 @@ class GatedDeltaNet(nnx.Module):
     def _cached(self, hidden_BTD: jax.Array, cache: LinearCache) -> tuple[jax.Array, LinearCache]:
         """Engine path on flattened tokens: conv and recurrence continue the pooled states.
 
-        Under tensor parallelism the conv runs on contiguous channel shards (the sharding of
-        ``in_proj_qkv``), the recurrence on head shards.
+        The engine stores ``in_proj_qkv``'s output channels, ``conv_weight``'s rows and the conv
+        pool's channels grouped per tensor-parallel shard (``[q_r | k_r | v_r]`` for shard ``r``),
+        so every device runs the conv and the recurrence on its own heads without exchanges.
         """
         B, T, _ = hidden_BTD.shape
         N, K = B * T, self.conv_kernel_size
         batch = cache.batch
         channels, heads = P(None, "tp"), P(None, "tp", None)
         x_NC = self.in_proj_qkv(hidden_BTD, out_sharding=self.shd_cfg.act_btf).reshape(N, -1)
+        z_NHU = jax.lax.reshape(
+            self.in_proj_z(hidden_BTD, out_sharding=self.shd_cfg.act_btf),
+            (N, self.num_v_heads, self.head_v_dim),
+            out_sharding=heads,
+        )
+        b_NH = self.in_proj_b(hidden_BTD, out_sharding=self.shd_cfg.act_btf).reshape(N, -1)
+        a_NH = self.in_proj_a(hidden_BTD, out_sharding=self.shd_cfg.act_btf).reshape(N, -1)
+        key_dim, A, U, gqa, eps = (
+            self.key_dim,
+            self.head_k_dim,
+            self.head_v_dim,
+            self.gqa_factor,
+            self.norm.eps,
+        )
+        conv_dim = 2 * key_dim + self.value_dim
 
-        def conv_shard(x_NC, conv_SKC, weight_CK, batch):
+        def shard(
+            x_NC, z_NHU, b_NH, a_NH, conv_SKC, weight_CK, state_SHAU, A_log_H, dt_H, norm_U, batch
+        ):
             pool_RC = conv_SKC.reshape(-1, x_NC.shape[1])
 
             def rows(idx):
@@ -275,37 +293,15 @@ class GatedDeltaNet(nnx.Module):
             conv_SKC = conv_SKC.at[batch.write_slot_W].set(
                 rows(batch.conv_out_src_WK), mode="drop", unique_indices=True
             )
-            return conv_NC, conv_SKC
-
-        conv_NC, conv_SKC = per_shard(
-            conv_shard,
-            (channels, P(None, None, "tp"), P("tp", None), P()),
-            (channels, P(None, None, "tp")),
-            x_NC,
-            cache.conv_SKC,
-            self.conv_weight[...].astype(x_NC.dtype),
-            batch,
-        )
-        q_NP, k_NP, v_NO = jnp.split(nnx.silu(conv_NC), [self.key_dim, self.key_dim * 2], axis=-1)
-        q_NHA = jax.lax.reshape(q_NP, (N, self.num_k_heads, self.head_k_dim), out_sharding=heads)
-        k_NHA = jax.lax.reshape(k_NP, (N, self.num_k_heads, self.head_k_dim), out_sharding=heads)
-        v_NHU = jax.lax.reshape(v_NO, (N, self.num_v_heads, self.head_v_dim), out_sharding=heads)
-        z_NHU = jax.lax.reshape(
-            self.in_proj_z(hidden_BTD, out_sharding=self.shd_cfg.act_btf),
-            (N, self.num_v_heads, self.head_v_dim),
-            out_sharding=heads,
-        )
-        b_NH = self.in_proj_b(hidden_BTD, out_sharding=self.shd_cfg.act_btf).reshape(N, -1)
-        a_NH = self.in_proj_a(hidden_BTD, out_sharding=self.shd_cfg.act_btf).reshape(N, -1)
-        beta_NH = jax.nn.sigmoid(b_NH)
-        g_NH = -jnp.exp(self.A_log[...].astype(jnp.float32)) * jax.nn.softplus(
-            a_NH.astype(jnp.float32) + self.dt_bias[...]
-        )
-        gqa, eps = self.gqa_factor, self.norm.eps
-
-        def recur_shard(q_NHA, k_NHA, v_NHU, z_NHU, g_NH, beta_NH, state_SHAU, norm_U, batch):
-            q_NHA = jnp.repeat(q_NHA, gqa, 1)
-            k_NHA = jnp.repeat(k_NHA, gqa, 1)
+            P_local = key_dim * x_NC.shape[1] // conv_dim  # this shard's q (and k) channels
+            q_NP, k_NP, v_NO = jnp.split(nnx.silu(conv_NC), [P_local, 2 * P_local], axis=-1)
+            q_NHA = jnp.repeat(q_NP.reshape(N, -1, A), gqa, 1)
+            k_NHA = jnp.repeat(k_NP.reshape(N, -1, A), gqa, 1)
+            v_NHU = v_NO.reshape(N, -1, U)
+            beta_NH = jax.nn.sigmoid(b_NH)
+            g_NH = -jnp.exp(A_log_H.astype(jnp.float32)) * jax.nn.softplus(
+                a_NH.astype(jnp.float32) + dt_H
+            )
             if isinstance(batch, LinearDecode):
                 out_NHU, state_SHAU = recurrent_gated_delta_step(
                     q_NHA, k_NHA, v_NHU, g_NH, beta_NH, state_SHAU, batch.row_slot_N
@@ -327,20 +323,24 @@ class GatedDeltaNet(nnx.Module):
                 state_SHAU = state_SHAU.at[batch.write_slot_W].set(
                     state_1WHAU[0], mode="drop", unique_indices=True
                 )
-            return _gated_norm(out_NHU[None], z_NHU[None], norm_U, eps)[0], state_SHAU
+            normed_NO = _gated_norm(out_NHU[None], z_NHU[None], norm_U, eps)[0]
+            return normed_NO, conv_SKC, state_SHAU
 
-        state_spec = P(None, "tp", None, None)
-        normed_NO, state_SHAU = per_shard(
-            recur_shard,
-            (heads, heads, heads, heads, channels, channels, state_spec, P(), P()),
-            (channels, state_spec),
-            q_NHA,
-            k_NHA,
-            v_NHU,
+        conv_spec, state_spec = P(None, None, "tp"), P(None, "tp", None, None)
+        normed_NO, conv_SKC, state_SHAU = per_shard(
+            shard,
+            (channels, heads, channels, channels, conv_spec, P("tp", None), state_spec)
+            + (P("tp"), P("tp"), P(), P()),
+            (channels, conv_spec, state_spec),
+            x_NC,
             z_NHU,
-            g_NH,
-            beta_NH,
+            b_NH,
+            a_NH,
+            cache.conv_SKC,
+            self.conv_weight[...].astype(x_NC.dtype),
             cache.state_SHAU,
+            self.A_log[...],
+            self.dt_bias[...],
             self.norm.weight[...],
             batch,
         )
