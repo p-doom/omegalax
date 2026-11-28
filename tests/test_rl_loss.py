@@ -9,6 +9,7 @@ import jax.numpy as jnp
 import numpy as np
 from absl.testing import absltest
 
+from omegalax.engine.steps import _topk
 from omegalax.rl.loss import policy_loss, score_centering, token_logprobs
 from omegalax.rl.rollout import group_advantages
 
@@ -148,6 +149,17 @@ class TrainerTest(absltest.TestCase):
         self.assertGreater(max(float(jnp.abs(g).max()) for g in active), 1e-4)
         for f, a in zip(full, active):
             np.testing.assert_array_equal(np.asarray(f), np.asarray(a))
+
+
+class EngineTopkTest(absltest.TestCase):
+    def test_blockwise_topk_is_exact(self):
+        rng = np.random.default_rng(0)
+        for V, k in ((1000, 32), (4099, 7), (300, 1)):
+            x = jnp.asarray(rng.normal(size=(5, V)) * 3, jnp.float32)
+            ref_v, ref_i = jax.lax.top_k(x, k)
+            got_v, got_i = _topk(x, k, block=16)
+            np.testing.assert_array_equal(got_v, ref_v)
+            np.testing.assert_array_equal(np.sort(got_i, 1), np.sort(ref_i, 1))
 
 
 if __name__ == "__main__":
