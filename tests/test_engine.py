@@ -66,13 +66,9 @@ def _qwen3_5_causal_lm(path, tp):
     with mesh_rules(mesh):
         abstract = nnx.eval_shape(lambda: Qwen3_5ForCausalLM(text_cfg, rngs=nnx.Rngs(0)))
     state = nnx.state(abstract)
-    nnx.replace_by_pure_dict(
-        state,
-        {
-            "text": nnx.to_pure_dict(nnx.state(vlm.text)),
-            "lm_head": nnx.to_pure_dict(nnx.state(vlm.lm_head)),
-        },
-    )
+    params = nnx.to_pure_dict(nnx.state(vlm))
+    del params["vision"]
+    nnx.replace_by_pure_dict(state, params)
     model = nnx.merge(nnx.graphdef(abstract), state)
     _finalize_q_shardings(model, mesh)
     return model
@@ -82,6 +78,21 @@ def _smoke_model():
     """Random-init Qwen3 smoke model; the extend kernel needs head_dim % 64 == 0."""
     cfg = dataclasses.replace(text_api.resolve_config("qwen3-smoke"), head_dim=64)
     return text_api.init_model(cfg, jax.random.key(0), tp_size=1, fsdp_size=1, dp_size=1)[0]
+
+
+def _engine(model, cfg, mesh=None):
+    """Builds the engine on a fresh thread, under ``mesh`` or none: the loaders leave their mesh
+    set on the calling thread, which would hide any dependence of the engine on it."""
+
+    def build():
+        if mesh is not None:
+            with jax.set_mesh(mesh):
+                return Engine(model, cfg)
+        assert jax.sharding.get_abstract_mesh().empty
+        return Engine(model, cfg)
+
+    with ThreadPoolExecutor(1) as pool:
+        return pool.submit(build).result()
 
 
 class _EngineTest:
@@ -110,7 +121,7 @@ class _EngineTest:
             max_group=4,
             max_sessions=16,
         )
-        cls.engine = Engine(cls.model, cls.cfg)
+        cls.engine = _engine(cls.model, cls.cfg)
         cls.engine.start()
 
     @classmethod
@@ -286,6 +297,31 @@ class _EngineTest:
         torch.cuda.empty_cache()
 
 
+class AmbientMeshTest(absltest.TestCase):
+    """The engine depends on no mesh context: none set, or another one (the trainer's)."""
+
+    def test_construction(self):
+        if jax.device_count() != 1:
+            self.skipTest("single-device test")
+        foreign = jax.make_mesh((1,), ("x",))
+        for name in ("qwen3-smoke", "qwen3.5-smoke-dense"):
+            model, _ = text_api.init_model(
+                name, jax.random.key(0), tp_size=1, fsdp_size=1, dp_size=1
+            )
+            cfg = EngineConfig(
+                num_pages=8,
+                max_context=1024,
+                decode_steps=8,
+                decode_buckets=(1,),
+                extend_buckets=(256,),
+                eos_token_ids=(0,),
+                pad_id=1,
+            )
+            for mesh in (None, foreign):
+                with self.subTest(model=name, mesh=mesh):
+                    _engine(model, cfg, mesh)
+
+
 class EvictionTest(absltest.TestCase):
     """Random-init model, page pool far below the working set: forks, tail evictions of idle
     and waiting sessions and re-extends must leave every logprob consistent with the trainer."""
@@ -305,7 +341,7 @@ class EvictionTest(absltest.TestCase):
             max_group=4,
             max_sessions=32,
         )
-        engine = Engine(model, cfg)
+        engine = _engine(model, cfg)
         engine.start()
 
         def rollout(seed):
@@ -372,7 +408,7 @@ class KVPressureTest(absltest.TestCase):
             max_group=4,
             max_sessions=32,
         )
-        engine = Engine(model, cfg)
+        engine = _engine(model, cfg)
         engine.start()
         turn_contexts = []
 
@@ -423,7 +459,7 @@ class OverlapTest(absltest.TestCase):
             max_group=4,
             max_sessions=32,
         )
-        engine = Engine(model, cfg)
+        engine = _engine(model, cfg)
         engine.start()
 
         def rollout(seed):
@@ -487,7 +523,7 @@ class SettlementTest(absltest.TestCase):
             max_group=4,
             max_sessions=4,
         )
-        self.engine = Engine(self.model, self.cfg)
+        self.engine = _engine(self.model, self.cfg)
         self.engine.start()
         self.rng = np.random.default_rng(0)
         self.prompt = self.rng.integers(10, 1000, 100).tolist()
@@ -516,7 +552,7 @@ class SettlementTest(absltest.TestCase):
         self._failed(in_flight, RuntimeError)
         with self.assertRaises(RuntimeError):
             self._group(16)
-        self.engine = Engine(self.model, self.cfg)
+        self.engine = _engine(self.model, self.cfg)
         self.engine.start()
         params = nnx.to_pure_dict(nnx.state(self.model))
         params["lm_head"]["kernel"] = jnp.zeros((1, 1))

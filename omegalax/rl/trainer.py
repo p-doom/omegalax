@@ -163,7 +163,7 @@ class Trainer:
         B, T = tokens_BT.shape
         return token_logprobs(
             hidden_BTD,
-            model.lm_head.kernel[...],
+            model.output_weight(),
             tokens_BT,
             -(-B * T // self.cfg.logit_tile_tokens),
             self.model_cfg.shd_cfg.logits_btv,
