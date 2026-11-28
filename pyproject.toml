@@ -21,7 +21,7 @@ dependencies = [
   "orbax-checkpoint",
   "Pillow",
   "safetensors",
-  "tokamax @ git+https://github.com/p-doom/tokamax.git@6c2d755763d1a1906448719c1c23bf6dc5034a93", # change after fix has been upstreamed
+  "tokamax @ git+https://github.com/p-doom/tokamax.git@6c2d755763d1a1906448719c1c23bf6dc5034a93", # 0.0.12 + backported ContextVar fix; replace the fork with upstream once JAX >= 0.12
   "transformers",
   "triton", 
   "huggingface-hub",
