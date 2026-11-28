@@ -271,6 +271,10 @@ class Trainer:
             acc = self._zeros(self.params)
             for T in self.cfg.length_buckets:
                 acc, _ = self._accumulate(self.params, acc, masked_rows(T), np.float32(0.0))
+                if self.cfg.drift_every:
+                    acc, _ = self._drift(self.params, acc, masked_rows(T), np.float32(0.0))
+            if self.cfg.drift_every:
+                self._drift_stats(acc, acc, self._zeros(self.params), self.cfg.objective != "ppo")
         with jax.set_mesh(self._opt_mesh):
             self._apply.lower(self.master, self.opt_state, jax.device_put(acc, self._opt_shardings)).compile()
         jax.block_until_ready(acc)

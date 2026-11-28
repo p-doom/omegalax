@@ -37,7 +37,7 @@ class FsdpTrainerTest(absltest.TestCase):
         trainer = Trainer(model, cfg, TrainConfig(
             lr=1e-3, weight_decay=0.1, adam_b1=0.9, adam_b2=0.98, adam_eps=1e-8, max_grad_norm=1.0,
             eps_low=0.2, eps_high=0.28, tokens_per_microbatch=256, length_buckets=(32, 64),
-            logit_tile_tokens=64, pad_id=0, host_optimizer=host_optimizer, loss_scale=loss_scale, objective="ppo", topk=1, drift_every=0,
+            logit_tile_tokens=64, pad_id=0, host_optimizer=host_optimizer, loss_scale=loss_scale, objective="ppo", topk=1, drift_every=1,
         ))
         rng = np.random.default_rng(0)
         samples = [
