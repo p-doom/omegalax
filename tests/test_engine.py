@@ -399,6 +399,68 @@ class KVPressureTest(absltest.TestCase):
         self.assertLessEqual(stats["extend_tokens"], sum(turn_contexts) + 128 * len(turn_contexts))
 
 
+class SettlementTest(absltest.TestCase):
+    """Every future of a request settles exactly once: the forks' futures of a rejected group,
+    turns in flight at stop, and commands still queued when the engine thread fails."""
+
+    def setUp(self):
+        if jax.device_count() != 1:
+            self.skipTest("single-device test")
+        self.model = _smoke_model()
+        self.cfg = EngineConfig(
+            num_pages=64,
+            max_context=2048,
+            decode_steps=8,
+            decode_buckets=(4,),
+            extend_buckets=(256,),
+            eos_token_ids=(5,),
+            pad_id=self.model.lm_head.kernel.shape[1],
+            max_group=4,
+            max_sessions=4,
+        )
+        self.engine = Engine(self.model, self.cfg)
+        self.engine.start()
+        self.rng = np.random.default_rng(0)
+        self.prompt = self.rng.integers(10, 1000, 100).tolist()
+
+    def _group(self, max_new):
+        keys = _keys(self.rng, 4)
+        return self.engine.generate(Request(self.prompt, keys, [max_new] * 4, [1.0] * 4))
+
+    def _failed(self, futures, kind):
+        for f in futures:
+            self.assertIsInstance(f.exception(timeout=60), kind)
+
+    def test_rejected_group_fails_every_future(self):
+        first = self._group(16)
+        sessions = [f.result(timeout=60).session for f in first]
+        self._failed(self._group(self.cfg.max_context), ValueError)
+        # The first group still holds every session slot.
+        self._failed(self._group(16), ValueError)
+        for sid in sessions:
+            self.engine.release(sid)
+        self.engine.stop()
+
+    def test_stop_and_failure_settle_pending_futures(self):
+        in_flight = self._group(1000)
+        self.engine.stop()
+        self._failed(in_flight, RuntimeError)
+        with self.assertRaises(RuntimeError):
+            self._group(16)
+        self.engine = Engine(self.model, self.cfg)
+        self.engine.start()
+        params = nnx.to_pure_dict(nnx.state(self.model))
+        params["lm_head"]["kernel"] = jnp.zeros((1, 1))
+        # Compiling the first score of this shape keeps the engine thread busy while the rest
+        # queue behind the update that kills it.
+        busy = self.engine.score([self.prompt * 8] * 16)
+        bad = self.engine.update_weights(params, version=1)
+        queued = [self.engine.score([self.prompt]), *self._group(16)]
+        self.assertEqual(len(busy.result(timeout=120)), 16)
+        self._failed([bad], ValueError)
+        self._failed(queued, ValueError)
+
+
 @requires_real_weights
 class Qwen3EngineTest(_EngineTest, absltest.TestCase):
     MODEL_ID = "Qwen/Qwen3-1.7B"

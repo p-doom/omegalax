@@ -303,7 +303,7 @@ class Engine:
     def _submit(self, cmd: tuple) -> None:
         with self._lock:
             if self._error is not None:
-                raise RuntimeError("The engine thread failed.") from self._error
+                raise RuntimeError("The engine is not running.") from self._error
             self._commands.put(cmd)
 
     def generate(self, request: Request) -> list[Future]:
@@ -347,19 +347,25 @@ class Engine:
         except BaseException as exc:
             if not ready.done():
                 ready.set_exception(exc)
-            with self._lock:
-                self._error = exc
-            pending = [s.turn.future for s in self._sessions.values() if s.turn is not None]
-            commands = [self._command]
-            while not self._commands.empty():
-                commands.append(self._commands.get())
-            for cmd in commands:
-                for x in cmd:
-                    pending += x if isinstance(x, list) else [x] if isinstance(x, Future) else []
-            for future in pending:
-                if not future.done():
-                    future.set_exception(exc)
+            self._fail_pending(exc)
             raise
+        self._fail_pending(RuntimeError("The engine stopped."))
+
+    def _fail_pending(self, exc: BaseException) -> None:
+        """Fails every future the engine still owes: turns in flight and unprocessed commands.
+        ``_submit`` refuses new commands from here on, so none can arrive after the drain."""
+        with self._lock:
+            self._error = exc
+        pending = [s.turn.future for s in self._sessions.values() if s.turn is not None]
+        commands = [self._command]
+        while not self._commands.empty():
+            commands.append(self._commands.get())
+        for cmd in commands:
+            for x in cmd:
+                pending += [f for f in (x if isinstance(x, list) else [x]) if isinstance(f, Future)]
+        for future in pending:
+            if not future.done():
+                future.set_exception(exc)
 
     def _serve(self) -> None:
         while True:
@@ -415,27 +421,28 @@ class Engine:
         return s
 
     def _admit(self, req: Request, futures: list[Future]) -> None:
+        """Every future of the request fails here or becomes one session's turn future."""
         lead = None if req.session is None else self._sessions[req.session]
-        if lead is not None and lead.turn is not None:
-            futures[0].set_exception(ValueError(f"Session {lead.id} is still generating."))
-            return
         base = 0 if lead is None else len(lead.tokens)
-        if base + len(req.tokens) + max(req.max_new_tokens) > self.cfg.max_context:
-            futures[0].set_exception(
-                ValueError(f"Request exceeds max_context={self.cfg.max_context}.")
-            )
-            return
-        if lead is None and len(futures) > len(self._free_slots):
-            futures[0].set_exception(ValueError(f"More than max_sessions={self.cfg.max_sessions}."))
+        if lead is not None and lead.turn is not None:
+            error = ValueError(f"Session {lead.id} is still generating.")
+        elif base + len(req.tokens) + max(req.max_new_tokens) > self.cfg.max_context:
+            error = ValueError(f"Request exceeds max_context={self.cfg.max_context}.")
+        elif lead is None and len(futures) > len(self._free_slots):
+            error = ValueError(f"More than max_sessions={self.cfg.max_sessions}.")
+        else:
+            error = None
+        if error is not None:
+            for future in futures:
+                future.set_exception(error)
             return
         if lead is None:
             lead = self._new_session(list(req.tokens))
             lead.forks = [self._new_session(list(req.tokens)) for _ in futures[1:]]
         else:
             lead.tokens.extend(req.tokens)
-        for s, future, key_data, max_new, temp in zip(
-            [lead, *lead.forks], futures, req.keys, req.max_new_tokens, req.temperatures
-        ):
+        rows = [lead, *lead.forks], futures, req.keys, req.max_new_tokens, req.temperatures
+        for s, future, key_data, max_new, temp in zip(*rows, strict=True):
             s.turn = _Turn(future, max_new, temp, key_data, req.stop_at_eos)
         self._extend_queue.append(lead)
 
