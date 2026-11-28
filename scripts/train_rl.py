@@ -89,6 +89,8 @@ def main(argv):
                   + -(-FLAGS.eval_concurrency // ne))
     if FLAGS.eval_samples > FLAGS.group_size:
         raise ValueError("eval_samples must not exceed group_size (the engine's max_group).")
+    if FLAGS.eval_concurrency < FLAGS.eval_samples * ne:
+        raise ValueError("eval_concurrency must allow one evaluation group per engine.")
     if per_engine > FLAGS.max_sessions:
         raise ValueError(f"Up to {per_engine} sessions per engine exceed max_sessions={FLAGS.max_sessions}.")
     tokenizer = AutoTokenizer.from_pretrained(FLAGS.model_path)

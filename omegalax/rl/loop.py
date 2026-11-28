@@ -43,13 +43,14 @@ def jsonl_tasks(path: str, seed: int) -> Iterator[dict]:
 
 
 async def evaluate(engines, env: Env, tasks: list[dict], cfg: RolloutConfig, samples_per_task: int,
-                   slots: asyncio.Semaphore, rng) -> dict:
-    """``samples_per_task`` samples per task (one group), one group per ``slots`` permit, concurrent
-    with training. Reports the mean reward and its standard error over tasks."""
+                   slots: list[asyncio.Semaphore], rng) -> dict:
+    """``samples_per_task`` samples per task (one group), concurrent with training: task ``i`` runs on
+    engine ``i % len(engines)`` under a permit of that engine's ``slots[i % len(engines)]``. Reports
+    the mean reward and its standard error over tasks."""
     group = dataclasses.replace(cfg, group_size=samples_per_task)
 
     async def one(i, task):
-        async with slots:
+        async with slots[i % len(engines)]:
             return await rollout_group(engines[i % len(engines)], env, task, -1, group, rng)
 
     t0 = time.perf_counter()
@@ -117,9 +118,9 @@ async def run(trainer: Trainer, engines, sync: WeightSync, env: Env, tasks: Iter
         metrics.update(sync.push(trainer.params, trainer.version))
         return metrics
 
-    # Evaluations can outlast eval_every steps; one budget for all of them keeps the engines' session
-    # count within the bound scripts/train_rl.py checks against max_sessions.
-    eval_slots = asyncio.Semaphore(max(1, cfg.eval_concurrency // cfg.eval_samples))
+    # Evaluations can outlast eval_every steps; one budget per engine for all of them keeps every
+    # engine's session count within the bound scripts/train_rl.py checks against max_sessions.
+    eval_slots = [asyncio.Semaphore(cfg.eval_concurrency // cfg.eval_samples // len(engines)) for _ in engines]
 
     async def eval_at(step):
         start = time.perf_counter() - t_start
