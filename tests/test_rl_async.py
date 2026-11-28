@@ -29,7 +29,8 @@ MAX_STALENESS = 2
 
 
 class ParityEnv:
-    """Reward 1 iff the last generated token id is even: random, so every group has variance."""
+    """Reward 1 iff the sum of the token ids is even: random, so groups almost always have variance.
+    (The last token is not: EOS and pad are even, so groups of finished answers had no variance.)"""
 
     def __init__(self, tokenizer):
         self.tok = tokenizer
@@ -42,7 +43,7 @@ class ParityEnv:
         return None
 
     async def reward(self, task, sample):
-        return float(sample.tokens[-1] % 2 == 0)
+        return float(sum(sample.tokens) % 2 == 0)
 
 
 class RecordingTrainer(Trainer):
