@@ -19,7 +19,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plt
 
-_MIN_ROWS = 16  # Triton dots need at least 16 rows.
+_MIN_ROWS = 16  # Triton dots need at least 16 rows (and power-of-two shapes).
 
 
 def _kernel(
@@ -138,7 +138,7 @@ def paged_attention(
     G, _, S, _ = k_pages_GPSK.shape
     R = H // G
     rows = Q * R
-    M = max(rows, _MIN_ROWS)
+    M = max(_MIN_ROWS, 1 << (rows - 1).bit_length())
     max_pages = page_table_NP.shape[1]
     if num_work < N:
         raise ValueError(f"num_work={num_work} must be >= number of query blocks {N}.")
@@ -205,10 +205,11 @@ def paged_attention(
             pl.BlockSpec((num_work, None, M, K), lambda n, g: (0, g, 0, 0)),
             pl.BlockSpec((num_work, None, M), lambda n, g: (0, g, 0)),
         ],
-        out_specs=pl.BlockSpec((None, None, rows, K), lambda n, g: (n, g, 0, 0)),
-        out_shape=jax.ShapeDtypeStruct((N, G, rows, K), q_NQHK.dtype),
+        out_specs=pl.BlockSpec((None, None, M, K), lambda n, g: (n, g, 0, 0)),
+        out_shape=jax.ShapeDtypeStruct((N, G, M, K), q_NQHK.dtype),
         compiler_params=plt.CompilerParams(num_warps=4, num_stages=3),
         name="paged_attention_combine",
     )(starts_N.astype(jnp.int32), chunks_N.astype(jnp.int32), o_WGMK, lse_WGM)
-    out_NQHK = jnp.transpose(out_NGMK.reshape(N, G, Q, R, K), (0, 2, 1, 3, 4)).reshape(N, Q, H, K)
+    out_NGQRK = out_NGMK[:, :, :rows].reshape(N, G, Q, R, K)
+    out_NQHK = jnp.transpose(out_NGQRK, (0, 2, 1, 3, 4)).reshape(N, Q, H, K)
     return out_NQHK

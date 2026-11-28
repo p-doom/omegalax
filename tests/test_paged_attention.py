@@ -35,6 +35,7 @@ class PagedAttentionTest(parameterized.TestCase):
     @parameterized.named_parameters(
         dict(testcase_name="decode_r2", N=16, Q=1, H=16, G=8, S=64, max_pages=32),
         dict(testcase_name="decode_r4", N=16, Q=1, H=32, G=8, S=64, max_pages=32),
+        dict(testcase_name="decode_r6", N=16, Q=1, H=24, G=4, S=64, max_pages=32),
         dict(testcase_name="small_pages", N=16, Q=1, H=16, G=8, S=16, max_pages=128),
     )
     def test_matches_xla(self, N, Q, H, G, S, max_pages):
