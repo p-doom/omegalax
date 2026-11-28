@@ -11,6 +11,7 @@ import os
 os.environ.setdefault("JAX_PLATFORMS", "cuda")
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 from absl.testing import absltest
 from huggingface_hub import snapshot_download
@@ -65,12 +66,12 @@ class AsyncInvariantsTest(absltest.TestCase):
         path = snapshot_download("Qwen/Qwen3.5-0.8B")
         tok = AutoTokenizer.from_pretrained(path)
         eos, pad = tok.convert_tokens_to_ids("<|im_end|>"), tok.convert_tokens_to_ids("<|endoftext|>")
-        model, cfg = load_causal_lm(path, sub_mesh(devices[:1], 1, 1, 1))
+        model, cfg = load_causal_lm(path, sub_mesh(devices[:1], 1, 1, 1), jnp.bfloat16)
         # A large lr makes consecutive versions' logprobs clearly distinguishable.
         trainer = RecordingTrainer(model, cfg, TrainConfig(
             lr=3e-5, weight_decay=0.0, adam_b1=0.9, adam_b2=0.98, adam_eps=1e-8, max_grad_norm=1.0,
             eps_low=0.2, eps_high=0.28, tokens_per_microbatch=16384, length_buckets=(512, 1024, 2048),
-            logit_tile_tokens=4096, pad_id=pad, host_optimizer=False,
+            logit_tile_tokens=4096, pad_id=pad, host_optimizer=False, loss_scale=1.0,
         ))
         sync = WeightSync(trainer.graphdef, trainer.params)
         replica, shardings = engine_replica(sync.gather(trainer.params), cfg, sub_mesh(devices[1:2], 1, 1, 1))

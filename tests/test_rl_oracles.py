@@ -7,6 +7,7 @@ import os
 os.environ.setdefault("JAX_PLATFORMS", "cuda,cpu")  # cpu: the host-optimizer placement
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 from absl.testing import absltest
 from huggingface_hub import snapshot_download
@@ -47,14 +48,14 @@ class RLOracleTest(absltest.TestCase):
         cls.tok = AutoTokenizer.from_pretrained(path)
         eos = cls.tok.convert_tokens_to_ids("<|im_end|>")
         cls.pad = cls.tok.convert_tokens_to_ids("<|endoftext|>")
-        model, cfg = load_causal_lm(path, sub_mesh(devices[:2], 1, 2, 1))
+        model, cfg = load_causal_lm(path, sub_mesh(devices[:2], 1, 2, 1), jnp.bfloat16)
         cls.trainer = Trainer(
             model,
             cfg,
             TrainConfig(
                 lr=1e-4, weight_decay=0.1, adam_b1=0.9, adam_b2=0.98, adam_eps=1e-8,
                 max_grad_norm=1.0, eps_low=0.2, eps_high=0.28, tokens_per_microbatch=2048,
-                length_buckets=(1024, 2048, 4096), logit_tile_tokens=4096, pad_id=cls.pad, host_optimizer=False,
+                length_buckets=(1024, 2048, 4096), logit_tile_tokens=4096, pad_id=cls.pad, host_optimizer=False, loss_scale=1.0,
             ),
         )
         cls.sync = WeightSync(cls.trainer.graphdef, cls.trainer.params)
@@ -167,7 +168,7 @@ class RLOracleTest(absltest.TestCase):
         adv = [1.0, -1.0, 0.5, -0.5]
         params = []
         for host in (False, True):
-            model, cfg = load_causal_lm(path, sub_mesh(jax.devices()[:2], 1, 2, 1))
+            model, cfg = load_causal_lm(path, sub_mesh(jax.devices()[:2], 1, 2, 1), jnp.bfloat16)
             trainer = Trainer(model, cfg, dataclasses.replace(self.trainer.cfg, host_optimizer=host))
             del model
             trainer.warmup()

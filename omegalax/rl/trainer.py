@@ -33,6 +33,7 @@ class TrainConfig:
     logit_tile_tokens: int
     pad_id: int
     host_optimizer: bool
+    loss_scale: float
 
 
 def _metric_sums(logp_BT, entropy_BT, log_ratio_BT, clipped_BT, mask_BT, fresh_BT):
@@ -138,6 +139,7 @@ class Trainer:
         return jax.tree.map(jnp.add, acc, grads), metrics
 
     def _apply_fn(self, params, opt_state, grads):
+        grads = jax.tree.map(lambda g: g / self.cfg.loss_scale, grads)
         grad_norm = optax.global_norm(grads)
         updates, opt_state = self.tx.update(grads, opt_state, params)
         return optax.apply_updates(params, updates), opt_state, grad_norm
@@ -224,7 +226,8 @@ class Trainer:
         # token normalizer, so its forward/backward is skipped.
         active = [i for i, a in enumerate(advantages) if a != 0.0]
         mbs = self.microbatches([samples[i] for i in active], [advantages[i] for i in active])
-        inv_tokens = np.float32(1.0 / total_tokens)
+        # The scale keeps float16 cotangents (~advantage / loss tokens) above the subnormal range.
+        inv_tokens = np.float32(self.cfg.loss_scale / total_tokens)
         with jax.set_mesh(self.mesh):
             acc = self._zeros(self.params)
             sums = []
@@ -237,6 +240,8 @@ class Trainer:
             )
         self.params = jax.device_put(self.master, self._param_shardings)
         sums = jax.device_get(sums)
+        if not np.isfinite(float(grad_norm)):
+            raise FloatingPointError(f"Gradient norm {float(grad_norm)} at loss_scale {self.cfg.loss_scale}.")
         # Per-token |log pi - log mu| on trained tokens, for quantiles and Miles' sample mean.
         per_token, per_sample = [np.zeros(0)], [np.zeros(0)]
         for s, mb in zip(sums, mbs):

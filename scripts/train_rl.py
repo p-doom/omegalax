@@ -18,6 +18,7 @@ from pathlib import Path
 
 from absl import app, flags
 import jax
+import jax.numpy as jnp
 from transformers import AutoTokenizer
 
 from omegalax.engine import Engine, EngineConfig
@@ -52,6 +53,7 @@ flags.DEFINE_float("eps_high", 0.28, "PPO clip above 1.")
 flags.DEFINE_integer("tokens_per_microbatch", 65536, "Padded tokens per trainer microbatch.")
 flags.DEFINE_list("length_buckets", ["1024", "2048", "4096", "8192", "16384"], "Trainer sequence buckets.")
 flags.DEFINE_integer("logit_tile_tokens", 4096, "Positions per float32 logits tile in the trainer.")
+flags.DEFINE_enum("compute_dtype", "bfloat16", ["bfloat16", "float16"], "Trainer and engine compute dtype.")
 flags.DEFINE_bool("host_optimizer", False, "Keep the float32 master and Adam state in host memory (large models).")
 flags.DEFINE_integer("num_pages", 32768, "KV pages per engine (64 tokens each).")
 flags.DEFINE_integer("max_sessions", 256, "Concurrent sessions per engine.")
@@ -111,7 +113,7 @@ def main(argv):
         raise ValueError(f"Longest prompt + max_response = {max_context} exceeds the last length bucket {buckets[-1]}.")
 
     t0 = time.perf_counter()
-    model, cfg = load_causal_lm(FLAGS.model_path, sub_mesh(devices[:nt], 1, nt, 1))
+    model, cfg = load_causal_lm(FLAGS.model_path, sub_mesh(devices[:nt], 1, nt, 1), getattr(jnp, FLAGS.compute_dtype))
     trainer = Trainer(
         model,
         cfg,
@@ -123,6 +125,7 @@ def main(argv):
             length_buckets=buckets,
             logit_tile_tokens=FLAGS.logit_tile_tokens, pad_id=pad,
             host_optimizer=FLAGS.host_optimizer,
+            loss_scale={"bfloat16": 1.0, "float16": 2.0**16}[FLAGS.compute_dtype],
         ),
     )
     del model

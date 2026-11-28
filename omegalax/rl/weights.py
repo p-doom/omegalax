@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import time
 from typing import Sequence
 
@@ -32,9 +33,10 @@ def _model_class(cfg):
     return Qwen3_5ForCausalLM if isinstance(cfg, text_api.Qwen3_5TextConfig) else Qwen3
 
 
-def load_causal_lm(path: str, mesh: jax.sharding.Mesh) -> tuple[nnx.Module, object]:
-    """Text-only causal LM from a HF safetensors directory, sharded on ``mesh``."""
-    cfg = text_api.align_config_to_mesh(text_api.resolve_config(path), mesh)
+def load_causal_lm(path: str, mesh: jax.sharding.Mesh, dtype) -> tuple[nnx.Module, object]:
+    """Text-only causal LM from a HF safetensors directory, sharded on ``mesh``, computing in ``dtype``."""
+    stored = text_api.align_config_to_mesh(text_api.resolve_config(path), mesh)
+    cfg = dataclasses.replace(stored, dtype=dtype)
     sizes = {a: int(mesh.shape[a]) for a in _AXES}
     with jax.set_mesh(mesh):
         if isinstance(cfg, text_api.Qwen3_5TextConfig):
@@ -54,6 +56,8 @@ def load_causal_lm(path: str, mesh: jax.sharding.Mesh) -> tuple[nnx.Module, obje
             model = nnx.merge(nnx.graphdef(abstract), state)
             _finalize_q_shardings(model, mesh)
         else:
+            if dtype != stored.dtype:
+                raise ValueError(f"Qwen3 checkpoints compute in their stored dtype {stored.dtype}, not {dtype}.")
             model = create_qwen3_from_safetensors(
                 path, tp_size=sizes["tp"], fsdp_size=sizes["fsdp"], dp_size=sizes["dp"]
             )
