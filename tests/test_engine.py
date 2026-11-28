@@ -167,7 +167,7 @@ class _EngineTest:
         self.engine.stats.clear()
         seqs, scored = self._rollouts(np.random.default_rng(0), turns=3)
         print(dict(self.engine.stats))
-        self.assertGreater(self.engine.stats["evict_idle"] + self.engine.stats["evict_running"], 0)
+        self.assertGreater(self.engine.stats["evict_idle"] + self.engine.stats["evict_waiting"], 0)
         self._assert_logp_close(self._logp_errors(seqs, scored))
         for sid in seqs:
             self.engine.release(sid)
@@ -323,6 +323,56 @@ class EvictionTest(absltest.TestCase):
         self.assertGreater(stats["evict_idle"], 0)
         self.assertLess(errs.mean(), LOGP_MEAN)
         self.assertLess(np.quantile(errs, 0.999), LOGP_P999)
+
+
+class KVPressureTest(absltest.TestCase):
+    """Random-init model, working set ~6x the page pool, near-zero tool waits: admitted turns
+    keep their pages, so decodes run side by side instead of evicting each other's tails."""
+
+    def test_decode_concurrency_under_kv_pressure(self):
+        if jax.device_count() != 1:
+            self.skipTest("single-device test")
+        model, _ = text_api.init_model(
+            "qwen3-smoke", jax.random.key(0), tp_size=1, fsdp_size=1, dp_size=1
+        )
+        cfg = EngineConfig(
+            num_pages=128,
+            max_context=8192,
+            decode_steps=8,
+            decode_buckets=(4, 8, 16),
+            extend_buckets=(256, 512, 1024),
+            eos_token_ids=(5,),
+            pad_id=model.lm_head.kernel.shape[1],
+            max_group=4,
+            max_sessions=32,
+        )
+        engine = Engine(model, cfg)
+        engine.start()
+        turn_contexts = []
+
+        def rollout(seed):
+            rng = np.random.default_rng(seed)
+            new, session, length = rng.integers(10, 1000, size=200).tolist(), None, 0
+            for _ in range(9):
+                length += len(new)
+                turn_contexts.append(length)
+                max_new = [int(rng.integers(100, 300))]
+                req = Request(new, _keys(rng, 1), max_new, [1.0], session, stop_at_eos=False)
+                c = engine.generate(req)[0].result()
+                session, length = c.session, length + len(c.tokens)
+                new = rng.integers(10, 1000, size=int(rng.integers(100, 200))).tolist()
+
+        with ThreadPoolExecutor(16) as pool:
+            list(pool.map(rollout, range(16)))
+        stats = dict(engine.stats)
+        engine.stop()
+        concurrency = stats["decode_tokens"] / (stats["decode_calls"] * cfg.decode_steps)
+        print(stats, f"decode concurrency {concurrency:.2f}")
+        # Decodes evicting the tails of sessions mid-extend held this at 1.3.
+        self.assertGreater(concurrency, 2.5)
+        # An admitted turn is extended at most once: its context, padded per extend item.
+        self.assertGreater(stats["evict_idle"] + stats["evict_waiting"], 0)
+        self.assertLessEqual(stats["extend_tokens"], sum(turn_contexts) + 128 * len(turn_contexts))
 
 
 @requires_real_weights

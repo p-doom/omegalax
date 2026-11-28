@@ -95,6 +95,9 @@ class _Session:
     turn: _Turn | None = None
     forks: list["_Session"] = dataclasses.field(default_factory=list)
     last_used: float = 0.0
+    # Admitted to the current turn: its pages are never evicted and the pages it may still
+    # allocate before the turn ends are reserved.
+    admitted: bool = False
 
 
 class OutOfPages(Exception):
@@ -387,10 +390,10 @@ class Engine:
             s.turn = _Turn(future, max_new, temp, key_data, req.stop_at_eos)
         self._extend_queue.append(lead)
 
-    def _alloc(self, s: _Session, num_tokens: int, preempt: bool) -> None:
+    def _alloc(self, s: _Session, num_tokens: int) -> None:
         need = -(-num_tokens // self.cfg.page_size) - len(s.pages)
         while need > len(self._free):
-            self._evict_one(s, preempt, need - len(self._free))
+            self._evict_one(s, need - len(self._free))
         for _ in range(need):
             page = self._free.pop()
             self._refs[page] = 1
@@ -406,33 +409,44 @@ class Engine:
         s.pages = s.pages[:keep]
         s.length = min(s.length, keep * self.cfg.page_size)
 
-    def _evict_one(self, keep: _Session, preempt: bool, pages: int) -> None:
-        """Frees ``pages`` tail pages of the least recently used idle session; a decode
-        (``preempt``) may then take them from the newest session waiting for an extend, then from
-        the newest decoder. The victim re-extends its dropped tail. DeltaNet state cannot be
-        rewound, so a model with DeltaNet layers drops the whole session.
+    def _evict_one(self, keep: _Session, pages: int) -> None:
+        """Frees ``pages`` tail pages of the least recently used idle session, else of the
+        unadmitted session last in the extend queue; it re-extends the dropped tail when admitted.
+        DeltaNet state cannot be rewound, so a model with DeltaNet layers drops whole sessions.
+        Admission reserves every page an admitted session can need, so one is always found.
         """
         idle = [s for s in self._sessions.values() if s.turn is None and s.pages]
-        waiting = [s for s in self._extend_queue if s is not keep and s.pages] if preempt else []
-        running = [s for s in self._decoding.values() if s is not keep] if preempt else []
+        waiting = [s for s in self._extend_queue if not s.admitted and s is not keep and s.pages]
         if idle:
             victim = min(idle, key=lambda s: s.last_used)
             self.stats["evict_idle"] += 1
         elif waiting:
-            victim = max(waiting, key=lambda s: s.id)
+            victim = waiting[-1]
             self.stats["evict_waiting"] += 1
         else:
-            if not running:
-                raise OutOfPages
-            victim = max(running, key=lambda s: s.id)
-            del self._decoding[victim.id]
-            self._extend_queue.appendleft(victim)
-            self.stats["evict_running"] += 1
+            raise OutOfPages("An admitted session outgrew its reserved pages.")
         kept = 0 if self._linear else max(0, len(victim.pages) - pages)
         self.stats["evicted_tokens"] += victim.length - min(
             victim.length, kept * self.cfg.page_size
         )
         self._drop_pages(victim, kept)
+
+    def _future_pages(self, s: _Session) -> int:
+        """Pages ``s`` and its not yet extended forks may still allocate before their turn ends;
+        a fork will share the lead's full prompt pages."""
+        S = self.cfg.page_size
+        pages = lambda x, have: max(0, -(-(len(x.tokens) + x.turn.remaining) // S) - have)
+        shared = len(s.tokens) // S
+        return pages(s, len(s.pages)) + sum(pages(f, shared) for f in s.forks)
+
+    def _admissible(self, s: _Session) -> bool:
+        """The one admission rule: ``s`` starts its turn only if its future pages fit in the free
+        pages plus those held by unadmitted sessions only, after the reservations of every
+        admitted session."""
+        held = {p for x in self._sessions.values() if x.admitted or x is s for p in x.pages}
+        evictable = {p for x in self._sessions.values() for p in x.pages} - held
+        reserved = sum(self._future_pages(x) for x in self._sessions.values() if x.admitted)
+        return self._future_pages(s) <= len(self._free) + len(evictable) - reserved
 
     def _release(self, s: _Session) -> None:
         if s.turn is not None:
@@ -454,6 +468,7 @@ class Engine:
     def _finish(self, s: _Session, reason: str) -> None:
         t = s.turn
         s.turn = None
+        s.admitted = False
         s.last_used = time.monotonic()
         t.future.set_result(Completion(s.id, t.tokens, t.logprobs, t.versions, reason))
 
@@ -475,7 +490,6 @@ class Engine:
         cap = self.cfg.extend_buckets[-1]
         S, A = self.cfg.page_size, self._align
         items, used, rows, forks = [], 0, 0, 0
-        reserve = (len(self._decoding) + 1) * (-(-self.cfg.decode_steps // S) + 1)
         while self._extend_queue:
             s = self._extend_queue[0]
             todo = len(s.tokens) - s.length
@@ -492,30 +506,21 @@ class Engine:
                 or forks + new_forks > self.cfg.max_group
             ):
                 break
-            # Admit only what fits beside idle sessions' pages; once nothing decodes, the queue
-            # must make progress, so the head may also take pages from sessions behind it.
-            stalled = not self._decoding
-            pages = -(-(s.length + take) // S) - len(s.pages) + len(s.forks) + reserve
-            evictable = sum(
-                len(x.pages) for x in self._sessions.values() if x.turn is None or stalled
-            ) - (len(s.pages) if stalled else 0)
-            if pages > len(self._free) + evictable:
-                break
+            if not s.admitted:
+                if not self._admissible(s):
+                    break
+                s.admitted = True
             self._extend_queue.popleft()
-            try:
-                self._alloc(s, s.length + take, preempt=stalled)
-                if final:
-                    for f in s.forks:
-                        self._alloc_fork(s, f)
-            except OutOfPages:
-                self._extend_queue.appendleft(s)
-                break
+            self._alloc(s, s.length + take)
+            if final:
+                for f in s.forks:
+                    self._alloc_fork(s, f)
             items.append((s, s.length, s.length + take, final))
             used += -(-take // A) * A
             rows += new_rows
             forks += new_forks
         if not items:
-            if not self._decoding:
+            if not any(x.admitted for x in self._sessions.values()):
                 raise OutOfPages(
                     f"Session {self._extend_queue[0].id} does not fit in the page pool."
                 )
@@ -543,7 +548,8 @@ class Engine:
             self._refs[page] += 1
             fork.page_row[len(fork.pages)] = page
             fork.pages.append(page)
-        self._alloc(fork, len(lead.tokens), preempt=not self._decoding)
+        fork.admitted = True
+        self._alloc(fork, len(lead.tokens))
 
     def _extend_inputs(self, items, T: int):
         S, Q, A = self.cfg.page_size, self._block_q, self._align
@@ -661,9 +667,7 @@ class Engine:
         # The oldest sessions decode first; the rest wait for a call with room in the largest bucket.
         rows = sorted(self._decoding.values(), key=lambda s: s.id)[: self.cfg.decode_buckets[-1]]
         for s in rows:
-            if s.id in self._decoding:
-                self._alloc(s, s.length + min(K, s.turn.remaining), preempt=True)
-        rows = [s for s in rows if s.id in self._decoding]
+            self._alloc(s, s.length + min(K, s.turn.remaining))
         B = next(b for b in self.cfg.decode_buckets if b >= len(rows))
         tok_KB, logp_KB, valid_KB = self._run_decode_call(self._decode_inputs(rows, B))
         self.stats["decode_calls"] += 1
