@@ -19,6 +19,7 @@ from pathlib import Path
 from absl import app, flags
 import jax
 import jax.numpy as jnp
+import numpy as np
 from transformers import AutoTokenizer
 
 from omegalax.engine import Engine, EngineConfig
@@ -78,6 +79,7 @@ flags.DEFINE_integer("eval_every", 10, "Steps between evaluations (also one befo
 flags.DEFINE_integer("eval_samples", 1, "Samples per evaluation task.")
 flags.DEFINE_integer("eval_concurrency", 64, "Evaluation samples in flight.")
 flags.DEFINE_integer("dump_every", 50, "Steps between dumps of the trained samples (samples/step_*.jsonl).")
+flags.DEFINE_integer("save_every", 0, "Steps between policy snapshots in inference dtypes (checkpoints/step_*.npz; 0: never).")
 
 
 def main(argv):
@@ -171,6 +173,17 @@ def main(argv):
             for s in samples:
                 f.write(json.dumps({k: v for k, v in dataclasses.asdict(s).items() if k != "heads"}) + "\n")
 
+    (out / "checkpoints").mkdir(exist_ok=True)
+    writer = ThreadPoolExecutor(1)
+
+    def save(step, params):
+        # bfloat16 has no numpy dtype: stored as its uint16 bits under a "|bfloat16" key.
+        arrays = {}
+        for path, x in jax.tree_util.tree_flatten_with_path(jax.device_get(params))[0]:
+            key = jax.tree_util.keystr(path)
+            arrays[key + "|bfloat16" if x.dtype == jnp.bfloat16 else key] = x.view(np.uint16) if x.dtype == jnp.bfloat16 else x
+        writer.submit(np.savez, out / "checkpoints" / f"step_{step:06d}.npz", **arrays)
+
     def log(m):
         if "step" in m:
             m["mem/peak_gb"] = [round(d.memory_stats()["peak_bytes_in_use"] / 2**30, 1) for d in devices]
@@ -190,11 +203,13 @@ def main(argv):
         eval_samples=FLAGS.eval_samples,
         eval_concurrency=FLAGS.eval_concurrency,
         dump_every=FLAGS.dump_every,
+        save_every=FLAGS.save_every,
     )
     tasks = loop.jsonl_tasks(FLAGS.data_path, FLAGS.seed)
     try:
-        asyncio.run(loop.run(trainer, engines, sync, env, tasks, eval_tasks, lcfg, log, dump))
+        asyncio.run(loop.run(trainer, engines, sync, env, tasks, eval_tasks, lcfg, log, dump, save))
     finally:
+        writer.shutdown()
         for e in engines:
             e.stop()
         grader.shutdown(cancel_futures=True)
