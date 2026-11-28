@@ -215,11 +215,32 @@ class _EngineTest:
 
         new_params = jax.tree.map(perturb, old_params)
         jax.block_until_ready(new_params)
+        # A trainer forward on a new thread, as in RL: each thread's first tokamax op adds a
+        # context to JAX's jit cache key.
+        mesh = jax.tree.leaves(old_params)[0].sharding.mesh
+        tokens = jnp.zeros((1, 128), jnp.int32)
+
+        def trainer_forward():
+            with jax.set_mesh(mesh):
+                nnx.eval_shape(lambda: self.model(tokens, jnp.ones_like(tokens), None, None))
+
+        with ThreadPoolExecutor(1) as pool:
+            pool.submit(trainer_forward).result()
+        rng = np.random.default_rng(2)
         counter = _CompileLog()
         logging.getLogger("jax").addHandler(counter)
         jax.config.update("jax_log_compiles", True)
         try:
             self.engine.update_weights(new_params, version=7).result()
+            # Prompts of 100, 300 and 700 tokens extend in buckets 256, 512 and 1024; n forks
+            # decode in bucket n.
+            for n, length in zip(self.cfg.decode_buckets, (100, 300, 700)):
+                prompt = rng.integers(10, 50000, length).tolist()
+                futures = self.engine.generate(
+                    Request(prompt, _keys(rng, n), [9] * n, [1.0] * n, stop_at_eos=False)
+                )
+                for f in futures:
+                    self.engine.release(f.result().session)
             seqs, scored = self._rollouts(np.random.default_rng(1), turns=1)
         finally:
             jax.config.update("jax_log_compiles", False)
